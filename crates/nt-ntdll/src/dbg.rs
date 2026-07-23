@@ -224,6 +224,106 @@ pub fn assert_action(response: Option<u8>) -> AssertAction {
     }
 }
 
+pub const DBGUI_WAIT_STATE_CHANGE_SIZE: usize = 0xb8;
+pub const DEBUG_EVENT_SIZE: usize = 0xb0;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xc000_0001;
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Convert an x64 `DBGUI_WAIT_STATE_CHANGE` into a Win32 `DEBUG_EVENT`.
+///
+/// The output is deliberately not cleared: native ntdll writes only the common fields and the
+/// active union member. `teb_for_thread` models the one fallible ThreadBasicInformation query.
+pub fn convert_state_change(
+    state: &[u8; DBGUI_WAIT_STATE_CHANGE_SIZE],
+    event: &mut [u8; DEBUG_EVENT_SIZE],
+    mut teb_for_thread: impl FnMut(u64) -> Option<u64>,
+) -> Result<(), u32> {
+    const DBG_PRINTEXCEPTION_C: u32 = 0x4001_0006;
+    const DBG_RIPEXCEPTION: u32 = 0x4001_0007;
+
+    write_u32(event, 4, read_u64(state, 8) as u32);
+    write_u32(event, 8, read_u64(state, 0x10) as u32);
+
+    match read_u32(state, 0) {
+        2 => {
+            let thread = read_u64(state, 0x18);
+            write_u32(event, 0, 2);
+            write_u64(event, 0x10, thread);
+            write_u64(event, 0x18, teb_for_thread(thread).unwrap_or(0));
+            write_u64(event, 0x20, read_u64(state, 0x28));
+        }
+        3 => {
+            let thread = read_u64(state, 0x20);
+            write_u32(event, 0, 3);
+            write_u64(event, 0x10, read_u64(state, 0x30));
+            write_u64(event, 0x18, read_u64(state, 0x18));
+            write_u64(event, 0x20, thread);
+            write_u64(event, 0x28, read_u64(state, 0x38));
+            write_u32(event, 0x30, read_u32(state, 0x40));
+            write_u32(event, 0x34, read_u32(state, 0x44));
+            write_u64(event, 0x38, teb_for_thread(thread).unwrap_or(0));
+            write_u64(event, 0x40, read_u64(state, 0x50));
+            write_u64(event, 0x48, 0);
+            write_u16(event, 0x50, 1);
+        }
+        4 | 5 => {
+            write_u32(event, 0, read_u32(state, 0));
+            write_u32(event, 0x10, read_u32(state, 0x18));
+        }
+        6..=8 => {
+            let exception_code = read_u32(state, 0x18);
+            if exception_code == DBG_PRINTEXCEPTION_C {
+                write_u32(event, 0, 8);
+                write_u64(event, 0x10, read_u64(state, 0x40));
+                write_u16(event, 0x18, 0);
+                write_u16(event, 0x1a, read_u64(state, 0x38) as u16);
+            } else if exception_code == DBG_RIPEXCEPTION {
+                write_u32(event, 0, 9);
+                write_u32(event, 0x10, read_u64(state, 0x38) as u32);
+                write_u32(event, 0x14, read_u64(state, 0x40) as u32);
+            } else {
+                write_u32(event, 0, 1);
+                event[0x10..0xa8].copy_from_slice(&state[0x18..0xb0]);
+                write_u32(event, 0xa8, read_u32(state, 0xb0));
+            }
+        }
+        9 => {
+            write_u32(event, 0, 6);
+            write_u64(event, 0x10, read_u64(state, 0x18));
+            write_u64(event, 0x18, read_u64(state, 0x20));
+            write_u32(event, 0x20, read_u32(state, 0x28));
+            write_u32(event, 0x24, read_u32(state, 0x2c));
+            write_u64(event, 0x28, read_u64(state, 0x30));
+            write_u16(event, 0x30, 1);
+        }
+        10 => {
+            write_u32(event, 0, 7);
+            write_u64(event, 0x10, read_u64(state, 0x18));
+        }
+        _ => return Err(STATUS_UNSUCCESSFUL),
+    }
+    Ok(())
+}
+
 /// The `int 0x2d` DebugService `ServiceClass` codes our kernel emulates (see
 /// `project_smss_sec_image`: the executive services `PRINT`/`PROMPT` and forwards to serial).
 pub mod service {
@@ -406,6 +506,142 @@ mod tests {
         assert_eq!(assert_action(Some(b'T')), AssertAction::TerminateThread);
         assert_eq!(assert_action(Some(b'?')), AssertAction::Reprompt);
         assert_eq!(assert_action(None), AssertAction::RaiseFailure);
+    }
+
+    fn set_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn set_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn state(kind: u32) -> [u8; DBGUI_WAIT_STATE_CHANGE_SIZE] {
+        let mut state = [0; DBGUI_WAIT_STATE_CHANGE_SIZE];
+        set_u32(&mut state, 0, kind);
+        set_u64(&mut state, 8, 0x1111_2222_3333_4444);
+        set_u64(&mut state, 0x10, 0xaaaa_bbbb_cccc_dddd);
+        state
+    }
+
+    #[test]
+    fn invalid_debug_state_still_publishes_truncated_ids() {
+        let input = state(1);
+        let mut event = [0x5a; DEBUG_EVENT_SIZE];
+        assert_eq!(
+            convert_state_change(&input, &mut event, |_| None),
+            Err(STATUS_UNSUCCESSFUL)
+        );
+        assert_eq!(read_u32(&event, 4), 0x3333_4444);
+        assert_eq!(read_u32(&event, 8), 0xcccc_dddd);
+        assert_eq!(read_u32(&event, 0), 0x5a5a_5a5a);
+        assert_eq!(event[0x10], 0x5a);
+    }
+
+    #[test]
+    fn create_events_query_the_thread_teb() {
+        let mut thread = state(2);
+        set_u64(&mut thread, 0x18, 0x1234);
+        set_u64(&mut thread, 0x28, 0x5678);
+        let mut event = [0xa5; DEBUG_EVENT_SIZE];
+        convert_state_change(&thread, &mut event, |handle| {
+            assert_eq!(handle, 0x1234);
+            Some(0x9abc)
+        })
+        .unwrap();
+        assert_eq!(read_u32(&event, 0), 2);
+        assert_eq!(read_u64(&event, 0x10), 0x1234);
+        assert_eq!(read_u64(&event, 0x18), 0x9abc);
+        assert_eq!(read_u64(&event, 0x20), 0x5678);
+
+        let mut process = state(3);
+        set_u64(&mut process, 0x18, 0x10);
+        set_u64(&mut process, 0x20, 0x20);
+        set_u64(&mut process, 0x30, 0x30);
+        set_u64(&mut process, 0x38, 0x40);
+        set_u32(&mut process, 0x40, 0x50);
+        set_u32(&mut process, 0x44, 0x60);
+        set_u64(&mut process, 0x50, 0x70);
+        event.fill(0xa5);
+        convert_state_change(&process, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 3);
+        assert_eq!(read_u64(&event, 0x10), 0x30);
+        assert_eq!(read_u64(&event, 0x18), 0x10);
+        assert_eq!(read_u64(&event, 0x20), 0x20);
+        assert_eq!(read_u64(&event, 0x28), 0x40);
+        assert_eq!(read_u64(&event, 0x38), 0);
+        assert_eq!(read_u64(&event, 0x40), 0x70);
+        assert_eq!(read_u64(&event, 0x48), 0);
+        assert_eq!(u16::from_le_bytes(event[0x50..0x52].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn exception_special_cases_match_win32_events() {
+        let mut print = state(6);
+        set_u32(&mut print, 0x18, 0x4001_0006);
+        set_u64(&mut print, 0x38, 0x1_0002);
+        set_u64(&mut print, 0x40, 0x1234_5678);
+        let mut event = [0xa5; DEBUG_EVENT_SIZE];
+        convert_state_change(&print, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 8);
+        assert_eq!(read_u64(&event, 0x10), 0x1234_5678);
+        assert_eq!(u16::from_le_bytes(event[0x18..0x1a].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(event[0x1a..0x1c].try_into().unwrap()), 2);
+
+        let mut rip = state(7);
+        set_u32(&mut rip, 0x18, 0x4001_0007);
+        set_u64(&mut rip, 0x38, 0x1111_2222_3333_4444);
+        set_u64(&mut rip, 0x40, 0xaaaa_bbbb_cccc_dddd);
+        convert_state_change(&rip, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 9);
+        assert_eq!(read_u32(&event, 0x10), 0x3333_4444);
+        assert_eq!(read_u32(&event, 0x14), 0xcccc_dddd);
+    }
+
+    #[test]
+    fn generic_exception_copies_the_complete_record() {
+        let mut input = state(8);
+        for (index, byte) in input[0x18..0xb0].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        set_u32(&mut input, 0x18, 0xc000_0005);
+        set_u32(&mut input, 0xb0, 1);
+        let mut event = [0xa5; DEBUG_EVENT_SIZE];
+        convert_state_change(&input, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 1);
+        assert_eq!(&event[0x10..0xa8], &input[0x18..0xb0]);
+        assert_eq!(read_u32(&event, 0xa8), 1);
+        assert_eq!(event[0xac], 0xa5);
+    }
+
+    #[test]
+    fn load_unload_and_exit_events_copy_active_fields_only() {
+        let mut load = state(9);
+        set_u64(&mut load, 0x18, 1);
+        set_u64(&mut load, 0x20, 2);
+        set_u32(&mut load, 0x28, 3);
+        set_u32(&mut load, 0x2c, 4);
+        set_u64(&mut load, 0x30, 5);
+        let mut event = [0xa5; DEBUG_EVENT_SIZE];
+        convert_state_change(&load, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 6);
+        assert_eq!(read_u64(&event, 0x10), 1);
+        assert_eq!(read_u64(&event, 0x18), 2);
+        assert_eq!(read_u32(&event, 0x20), 3);
+        assert_eq!(read_u32(&event, 0x24), 4);
+        assert_eq!(read_u64(&event, 0x28), 5);
+
+        let mut unload = state(10);
+        set_u64(&mut unload, 0x18, 0xfeed);
+        convert_state_change(&unload, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 7);
+        assert_eq!(read_u64(&event, 0x10), 0xfeed);
+
+        let mut exit = state(5);
+        set_u32(&mut exit, 0x18, 0xc000_0001);
+        convert_state_change(&exit, &mut event, |_| None).unwrap();
+        assert_eq!(read_u32(&event, 0), 5);
+        assert_eq!(read_u32(&event, 0x10), 0xc000_0001);
     }
 
     #[test]
