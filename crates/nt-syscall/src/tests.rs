@@ -237,6 +237,7 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtSetDebugFilterState, 222),
         (NativeService::NtOpenThreadToken, 135),
         (NativeService::NtOpenThreadTokenEx, 136),
+        (NativeService::NtOpenProcess, 128),
         (NativeService::NtOpenProcessTokenEx, 130),
         (NativeService::NtDuplicateToken, 72),
     ];
@@ -255,6 +256,8 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtQueryInformationProcess.arg_count(), (5, 5));
     assert_eq!(NativeService::NtOpenThreadToken.arg_count(), (4, 4));
     assert_eq!(NativeService::NtOpenThreadTokenEx.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtOpenProcess.name(), "NtOpenProcess");
+    assert_eq!(NativeService::NtOpenProcess.arg_count(), (4, 4));
     assert_eq!(NativeService::NtOpenProcessTokenEx.arg_count(), (4, 4));
     assert_eq!(NativeService::NtDuplicateToken.arg_count(), (6, 6));
     assert_eq!(NativeService::NtSetInformationThread.arg_count(), (4, 4));
