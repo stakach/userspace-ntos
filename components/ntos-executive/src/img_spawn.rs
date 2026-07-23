@@ -945,13 +945,14 @@ pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
 /// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
 pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
+    let end = va.checked_add(len)?;
     let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if va >= stack_base && va + len <= stack_base + stack_size {
+    if va >= stack_base && end <= stack_base + stack_size {
         Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - stack_base))
-    } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+    } else if va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
-    } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
+    } else if va >= PE_LOAD_BASE && end <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
         // Image .rdata/.idata/.data — only valid once the page has been demand-faulted (the process
         // reads a static string, faulting+mirroring its page, before passing it to a syscall). Uses
         // the ACTIVE process's image mirror so csrss's import-descriptor names read from ITS image.
@@ -1197,6 +1198,102 @@ pub(crate) unsafe fn client_copyout_mapped(
     }
     true
 }
+
+/// Copy bytes to any backed client range, demand-filling writable registry-DLL pages when needed.
+/// The walk is byte-oriented and page-aware so native out-parameters may be unaligned or straddle
+/// a page boundary without creating an unaligned Rust reference or assuming adjacent aliases.
+pub(crate) unsafe fn client_copyout_or_fill_mapped(
+    pi: u64,
+    va: u64,
+    src: &[u8],
+    filled_pages: &mut [u64; 512],
+    faults: &mut u64,
+    scratch_base: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    pml4: u64,
+) -> bool {
+    if src.is_empty() {
+        return true;
+    }
+    if va.checked_add(src.len() as u64).is_none() {
+        return false;
+    }
+    if smss_copyout(va, src) {
+        return true;
+    }
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let current = va + copied as u64;
+        let page = current & !0xFFF;
+        let chunk = (0x1000usize - (current as usize & 0xFFF)).min(src.len() - copied);
+        let mut temporary_cap = 0;
+        let persistent_alias = csrss_frame_alias_get(pi, page);
+        let destination = if persistent_alias != 0 {
+            persistent_alias + (current & 0xFFF)
+        } else {
+            let (frame, _) = csrss_frame_get_exact(pi, page);
+            if frame != 0 {
+                let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
+                let cap = client_copy_temp_cap();
+                let _ = cnode_delete_r(cap);
+                let copy_error = copy_cap_into_r(frame, cap);
+                temporary_cap = cap;
+                let map_error = if copy_error == 0 {
+                    page_map_r(cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE)
+                } else {
+                    copy_error
+                };
+                if map_error != 0 {
+                    let _ = cnode_delete_r(temporary_cap);
+                    return false;
+                }
+                alias + (current & 0xFFF)
+            } else if let Some(destination) =
+                scratch_for(current, filled_pages, *faults as usize, scratch_base)
+            {
+                destination
+            } else {
+                if (*faults as usize) >= filled_pages.len() {
+                    return false;
+                }
+                let Some((index, rva)) = reg.dll_for_page(page) else {
+                    return false;
+                };
+                let Some(pe) = dll_pes[index].as_ref() else {
+                    return false;
+                };
+                let scratch = scratch_base + *faults * 0x1000;
+                let (frame, retype_error) = alloc_frame_r();
+                if retype_error != 0 {
+                    let _ = cnode_delete_r(frame);
+                    return false;
+                }
+                if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+                    let _ = cnode_delete_r(frame);
+                    return false;
+                }
+                let rights = fill_image_page(pe, rva, scratch);
+                let (client_cap, copy_error) = copy_cap_r(frame);
+                if copy_error != 0 || page_map_r(client_cap, page, rights, pml4) != 0 {
+                    let _ = cnode_delete_r(client_cap);
+                    let _ = page_unmap(frame);
+                    let _ = cnode_delete_r(frame);
+                    return false;
+                }
+                filled_pages[*faults as usize] = page;
+                *faults += 1;
+                scratch + (current & 0xFFF)
+            }
+        };
+        core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination as *mut u8, chunk);
+        if temporary_cap != 0 {
+            let _ = cnode_delete_r(temporary_cap);
+        }
+        copied += chunk;
+    }
+    true
+}
 /// Write a u64 OUT-param to a csrss VA that may live ANYWHERE in its VSpace — not just the
 /// stack/heap/image mirrors, but also a csrsrv .data global (~0x8001xxxx). Tries the mirrors
 /// (smss_copyout), then an already-faulted page's scratch alias, then — for a not-yet-faulted csrsrv
@@ -1214,6 +1311,9 @@ pub(crate) unsafe fn csrss_out_write(
 ) -> bool {
     if smss_copyout(va, &val.to_le_bytes()) {
         return true;
+    }
+    if va & 0xFFF > 0xFF8 {
+        return false;
     }
     let page = va & !0xFFFu64;
     let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
@@ -1235,44 +1335,8 @@ pub(crate) unsafe fn csrss_out_write(
         }
     }
     if let Some(m) = sva {
-        core::ptr::write_volatile(m as *mut u64, val);
-        true
-    } else {
-        false
-    }
-}
-/// Write a 32-bit OUT-param through the same demand-fill path as [`csrss_out_write`].
-pub(crate) unsafe fn csrss_out_write32(
-    va: u64,
-    val: u32,
-    filled_pages: &mut [u64; 512],
-    faults: &mut u64,
-    scratch_base: u64,
-    reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
-    pml4: u64,
-) -> bool {
-    if smss_copyout(va, &val.to_le_bytes()) {
-        return true;
-    }
-    let page = va & !0xFFFu64;
-    let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
-    if sva.is_none() && (*faults as usize) < filled_pages.len() {
-        if let Some((i, rva)) = reg.dll_for_page(page) {
-            if let Some(pe) = dll_pes[i].as_ref() {
-                let scratch = scratch_base + *faults * 0x1000;
-                let f = alloc_frame();
-                let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                let rights = fill_image_page(pe, rva, scratch);
-                let _ = page_map(copy_cap(f), page, rights, pml4);
-                filled_pages[*faults as usize] = page;
-                sva = Some(scratch + (va & 0xFFF));
-                *faults += 1;
-            }
-        }
-    }
-    if let Some(m) = sva {
-        core::ptr::write_volatile(m as *mut u32, val);
+        let bytes = val.to_le_bytes();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), m as *mut u8, bytes.len());
         true
     } else {
         false

@@ -728,6 +728,7 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
 pub const SSN_NT_OPEN_THREAD_TOKEN_EX: u64 = 136;
+pub const SSN_NT_OPEN_PROCESS: u64 = 128;
 pub const SSN_NT_OPEN_PROCESS_TOKEN: u64 = 129;
 pub const SSN_NT_OPEN_PROCESS_TOKEN_EX: u64 = 130;
 /// NtQueryInformationToken — csrss's CsrServerInitialization queries its process token (identity,
@@ -739,7 +740,7 @@ pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
 /// NtClose=27/NtCreateProcess=49/NtCreateThread=55). NOT issued during the current boot (no hosted
 /// process self-terminates) — registering them is additive; the teardown POLICY is proven by the
-/// post-loop self-test. NtOpenProcess (128) stays a handler METHOD until a live caller appears.
+/// post-loop self-test.
 pub const SSN_NT_TERMINATE_PROCESS: u64 = 266;
 pub const SSN_NT_TERMINATE_THREAD: u64 = 267;
 /// A distinctive fake handle we hand back for objects we don't yet model (ports, sections, ...), so it
@@ -5135,6 +5136,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtAcceptConnectPort, SSN_NT_ACCEPT_CONNECT_PORT as u32),
             (NativeService::NtCompleteConnectPort, SSN_NT_COMPLETE_CONNECT_PORT as u32),
             (NativeService::NtRequestWaitReplyPort, SSN_NT_REQUEST_WAIT_REPLY_PORT as u32),
+            (NativeService::NtOpenProcess, SSN_NT_OPEN_PROCESS as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),

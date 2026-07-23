@@ -231,6 +231,50 @@ fn open_process_by_client_id_rejects_invalid_ids_without_minting() {
 }
 
 #[test]
+fn process_generic_access_mapping_matches_nt_object_policy() {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const PROCESS_TERMINATE: u32 = 0x0000_0001;
+
+    assert_eq!(map_process_access(PROCESS_TERMINATE), PROCESS_TERMINATE);
+    assert_eq!(map_process_access(GENERIC_READ), PROCESS_GENERIC_READ);
+    assert_eq!(map_process_access(GENERIC_WRITE), PROCESS_GENERIC_WRITE);
+    assert_eq!(map_process_access(GENERIC_EXECUTE), PROCESS_GENERIC_EXECUTE);
+    assert_eq!(map_process_access(GENERIC_ALL), PROCESS_ALL_ACCESS);
+    assert_eq!(map_process_access(MAXIMUM_ALLOWED), PROCESS_ALL_ACCESS);
+    assert_eq!(
+        map_process_access(GENERIC_READ | GENERIC_WRITE | PROCESS_TERMINATE),
+        PROCESS_GENERIC_READ | PROCESS_GENERIC_WRITE | PROCESS_TERMINATE
+    );
+}
+
+#[test]
+fn native_process_client_id_capture_never_truncates_handles() {
+    assert_eq!(
+        process_client_id_from_native(0x1234, 0x5678),
+        Ok(ClientId {
+            unique_process: 0x1234,
+            unique_thread: 0x5678,
+        })
+    );
+    assert_eq!(
+        process_client_id_from_native(u32::MAX as u64 + 1, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        process_client_id_from_native(u32::MAX as u64 + 1, 1),
+        Err(STATUS_INVALID_CID)
+    );
+    assert_eq!(
+        process_client_id_from_native(1, u32::MAX as u64 + 1),
+        Err(STATUS_INVALID_CID)
+    );
+}
+
+#[test]
 fn token_handles_preserve_owner_and_access() {
     let mut pm = ProcessManager::new();
     let caller = pm.create_process("caller.exe", None, None);

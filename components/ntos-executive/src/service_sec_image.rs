@@ -5184,7 +5184,17 @@ pub(crate) unsafe fn service_sec_image(
         if let (Some(smss_pid), Some(csrss_pid)) =
             (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1))
         {
-            if nt_handler.nt_open_process(csrss_pid).is_some() {
+            let object_attributes = nt_ntdll_layout::ObjectAttributes::default();
+            let client_id = nt_ntdll_layout::ClientId {
+                unique_process: csrss_pid as u64,
+                unique_thread: 0,
+            };
+            if let Ok((owner, _)) = nt_handler.open_process_captured(
+                object_attributes,
+                Some(client_id),
+                0x0400, // PROCESS_QUERY_INFORMATION
+            ) {
+                nt_handler.account_published_process_handle(owner);
                 open_ok |= 1;
             }
             if nt_handler

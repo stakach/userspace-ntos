@@ -71,35 +71,108 @@ pub(crate) unsafe fn sm_stack_read(va: u64) -> u64 {
         0
     }
 }
-unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
-    let mirror = if va >= SM_STACK_BASE
-        && va + bytes.len() as u64 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000
-    {
-        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
-    } else if va >= SMSS_ALLOC_VA
-        && va + bytes.len() as u64 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
-    {
-        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
-    } else {
+fn sm_stack_has_range(va: u64, len: usize) -> bool {
+    let Some(end) = va.checked_add(len as u64) else {
         return false;
+    };
+    va >= SM_STACK_BASE && end <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000
+        || va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
+}
+
+unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
+    if !sm_stack_has_range(va, bytes.len()) {
+        return false;
+    }
+    let mirror = if va >= SM_STACK_BASE {
+        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
+    } else {
+        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
     };
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), mirror as *mut u8, bytes.len());
     true
 }
 unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
-    let mirror = if va >= SM_STACK_BASE
-        && va + bytes.len() as u64 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000
-    {
-        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
-    } else if va >= SMSS_ALLOC_VA
-        && va + bytes.len() as u64 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
-    {
-        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
-    } else {
+    if !sm_stack_has_range(va, bytes.len()) {
         return false;
+    }
+    let mirror = if va >= SM_STACK_BASE {
+        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
+    } else {
+        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
     };
     core::ptr::copy_nonoverlapping(mirror as *const u8, bytes.as_mut_ptr(), bytes.len());
     true
+}
+
+unsafe fn sm_capture_object_attributes(
+    address: u64,
+) -> Option<nt_ntdll_layout::ObjectAttributes> {
+    let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ObjectAttributes>::uninit();
+    let bytes = core::slice::from_raw_parts_mut(
+        value.as_mut_ptr().cast::<u8>(),
+        core::mem::size_of::<nt_ntdll_layout::ObjectAttributes>(),
+    );
+    sm_stack_copyin(address, bytes).then(|| value.assume_init())
+}
+
+unsafe fn sm_capture_client_id(address: u64) -> Option<nt_ntdll_layout::ClientId> {
+    let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ClientId>::uninit();
+    let bytes = core::slice::from_raw_parts_mut(
+        value.as_mut_ptr().cast::<u8>(),
+        core::mem::size_of::<nt_ntdll_layout::ClientId>(),
+    );
+    sm_stack_copyin(address, bytes).then(|| value.assume_init())
+}
+
+unsafe fn sm_open_process_call(
+    nt_handler: &mut ExecNtHandler,
+    process_handle: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    client_id: u64,
+) -> u64 {
+    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
+    if !sm_stack_has_range(process_handle, core::mem::size_of::<u64>()) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let client_id = if client_id == 0 {
+        None
+    } else {
+        if client_id & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let Some(client_id) = sm_capture_client_id(client_id) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+        Some(client_id)
+    };
+    if object_attributes & 3 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    let Some(object_attributes) = sm_capture_object_attributes(object_attributes) else {
+        return STATUS_ACCESS_VIOLATION;
+    };
+    let saved_pi = nt_handler.pi;
+    nt_handler.pi = 0;
+    let result = match nt_handler.open_process_captured(
+        object_attributes,
+        client_id,
+        desired_access,
+    ) {
+        Ok((owner, handle)) => {
+            if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
+                nt_handler.account_published_process_handle(owner);
+                0
+            } else {
+                let _ = nt_handler.pm.take_handle(owner, handle);
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+        Err(status) => status as u64,
+    };
+    nt_handler.pi = saved_pi;
+    result
 }
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
 /// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
@@ -177,7 +250,6 @@ pub(crate) unsafe fn sm_rendezvous(
     const SSN_ACCEPT_CONNECT: u64 = 0;
     const SSN_COMPLETE_CONNECT: u64 = 31;
     const SSN_CONNECT_PORT: u64 = 33;
-    const SSN_OPEN_PROCESS: u64 = 128;
     const SSN_SET_EVENT: u64 = 228;
     const SSN_CLOSE: u64 = 27;
     let ep = SM_FAULT_EP.load(Ordering::Relaxed);
@@ -307,19 +379,17 @@ pub(crate) unsafe fn sm_rendezvous(
             }
             match ssn {
                 SSN_SET_INFO_THREAD => {} // RtlSetThreadIsCritical → no-op success
-                SSN_OPEN_PROCESS => {
+                SSN_NT_OPEN_PROCESS => {
                     // SmpHandleConnectionRequest opens the connecting CSRSS process by the real CID.
                     // Mint the handle in SMSS's real table; SmpSbCreateSession later uses the saved
                     // CSRSS process handle as NtDuplicateObject's target process.
-                    let client_id = get_recv_mr(8);
-                    let target_pid = sm_stack_read(client_id) as nt_process::ProcessId;
-                    let saved_pi = nt_handler.pi;
-                    nt_handler.pi = 0;
-                    match nt_handler.nt_open_process(target_pid) {
-                        Some(handle) => sm_stack_write(get_recv_mr(9), handle),
-                        None => result = nt_process::STATUS_INVALID_HANDLE as u64,
-                    }
-                    nt_handler.pi = saved_pi;
+                    result = sm_open_process_call(
+                        nt_handler,
+                        get_recv_mr(9),
+                        rdx as u32,
+                        get_recv_mr(7),
+                        get_recv_mr(8),
+                    );
                 }
                 SSN_QUERY_INFO_PROCESS => {
                     // ProcessBasicInformation initializes SmUniqueProcessId from the real SMSS
@@ -497,7 +567,6 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
-    const SSN_OPEN_PROCESS: u64 = 128;
     const SSN_QUERY_INFO_PROCESS: u64 = 161;
     const SSN_DUPLICATE_OBJECT: u64 = 71;
     const SSN_REQUEST_WAIT_REPLY: u64 = 208;
@@ -622,16 +691,14 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 print_str(b"\n");
                 match ssn {
                     SSN_SET_INFO_THREAD => {}
-                    SSN_OPEN_PROCESS => {
-                        let cid = get_recv_mr(8);
-                        let target_pid = sm_stack_read(cid) as nt_process::ProcessId;
-                        let saved_pi = nt_handler.pi;
-                        nt_handler.pi = 0;
-                        match nt_handler.nt_open_process(target_pid) {
-                            Some(handle) => sm_stack_write(get_recv_mr(9), handle),
-                            None => result = nt_process::STATUS_INVALID_HANDLE as u64,
-                        }
-                        nt_handler.pi = saved_pi;
+                    SSN_NT_OPEN_PROCESS => {
+                        result = sm_open_process_call(
+                            nt_handler,
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(7),
+                            get_recv_mr(8),
+                        );
                     }
                     SSN_QUERY_INFO_PROCESS => {
                         let class = rdx;

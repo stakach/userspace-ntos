@@ -31,6 +31,37 @@ pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
+pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
+pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
+pub const PROCESS_GENERIC_EXECUTE: u32 = 0x0012_0000;
+pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+
+/// Expand generic process access bits using the NT process-object generic mapping. Until process
+/// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full process mask.
+pub fn map_process_access(desired: u32) -> u32 {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+    let mut mapped =
+        desired & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL | MAXIMUM_ALLOWED);
+    if desired & GENERIC_READ != 0 {
+        mapped |= PROCESS_GENERIC_READ;
+    }
+    if desired & GENERIC_WRITE != 0 {
+        mapped |= PROCESS_GENERIC_WRITE;
+    }
+    if desired & GENERIC_EXECUTE != 0 {
+        mapped |= PROCESS_GENERIC_EXECUTE;
+    }
+    if desired & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+        mapped |= PROCESS_ALL_ACCESS;
+    }
+    mapped
+}
+
 pub type ProcessId = u32;
 pub type ThreadId = u32;
 pub type Handle = u32;
@@ -42,6 +73,23 @@ pub type AddressSpaceId = u32;
 pub struct ClientId {
     pub unique_process: ProcessId,
     pub unique_thread: ThreadId,
+}
+
+/// Capture the handle-width native `CLIENT_ID` values for `NtOpenProcess` without truncation.
+pub fn process_client_id_from_native(
+    unique_process: u64,
+    unique_thread: u64,
+) -> Result<ClientId, u32> {
+    let unique_process = match u32::try_from(unique_process) {
+        Ok(pid) => pid,
+        Err(_) if unique_thread != 0 => return Err(STATUS_INVALID_CID),
+        Err(_) => return Err(STATUS_INVALID_PARAMETER),
+    };
+    let unique_thread = u32::try_from(unique_thread).map_err(|_| STATUS_INVALID_CID)?;
+    Ok(ClientId {
+        unique_process,
+        unique_thread,
+    })
 }
 
 /// The architecture-neutral fields returned for `ThreadBasicInformation`.

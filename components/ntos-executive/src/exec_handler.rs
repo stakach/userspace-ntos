@@ -1193,21 +1193,113 @@ impl ExecNtHandler {
             }
         }
     }
-    /// `NtOpenProcess` (spec §9): open a handle to the process identified by `target_pid` in the
-    /// CURRENT process's (`self.pi`) EPROCESS handle table, returning the handle VALUE (the global
-    /// scheme, like every other mint) or `None` if the target/opener is unknown. The table entry is
-    /// a typed `Process(target_pid)` so a later lookup/terminate resolves the real EPROCESS.
-    pub(crate) fn nt_open_process(&mut self, target_pid: nt_process::ProcessId) -> Option<u64> {
-        let opener = self.pm_pid_for_pi(self.pi)?;
-        self.pm.process(target_pid)?; // target must exist
-                                      // Path 1b: the returned VALUE is the opener's process-local dense handle for the typed
-                                      // Process(target_pid) object — so a later value→object lookup resolves the real EPROCESS.
-        let h = self
-            .pm
-            .insert_handle(opener, nt_process::HandleObject::Process(target_pid), 0)
-            .ok()?;
+    /// Apply native `NtOpenProcess` selector and access policy after the caller structures have
+    /// been captured from its address space. Publication of the returned handle remains the
+    /// caller's responsibility so copyout can be transactional.
+    pub(crate) fn open_process_captured(
+        &mut self,
+        object_attributes: nt_ntdll_layout::ObjectAttributes,
+        client_id: Option<nt_ntdll_layout::ClientId>,
+        desired_access: u32,
+    ) -> Result<(nt_process::ProcessId, nt_process::Handle), u32> {
+        const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        let has_name = object_attributes.object_name != 0;
+        if has_name && client_id.is_some() || !has_name && client_id.is_none() {
+            return Err(STATUS_INVALID_PARAMETER_MIX);
+        }
+        if has_name {
+            // EPROCESS objects are not yet registered in the object-manager namespace.
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        let client_id = client_id.unwrap();
+        let client_id = nt_process::process_client_id_from_native(
+            client_id.unique_process,
+            client_id.unique_thread,
+        )?;
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let handle = self.pm.open_process_by_client_id(
+            caller_pid,
+            client_id,
+            nt_process::map_process_access(desired_access),
+        )?;
+        Ok((caller_pid, handle))
+    }
+
+    pub(crate) fn account_published_process_handle(&self, owner: nt_process::ProcessId) {
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        Some(h as u64)
+        let count = self.pm.handle_count(owner) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+    }
+
+    unsafe fn capture_object_attributes(
+        &self,
+        address: u64,
+    ) -> Option<nt_ntdll_layout::ObjectAttributes> {
+        let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ObjectAttributes>::uninit();
+        let bytes = core::slice::from_raw_parts_mut(
+            value.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<nt_ntdll_layout::ObjectAttributes>(),
+        );
+        self.xas_read(address, bytes).then(|| value.assume_init())
+    }
+
+    unsafe fn capture_client_id(&self, address: u64) -> Option<nt_ntdll_layout::ClientId> {
+        let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ClientId>::uninit();
+        let bytes = core::slice::from_raw_parts_mut(
+            value.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<nt_ntdll_layout::ClientId>(),
+        );
+        self.xas_read(address, bytes).then(|| value.assume_init())
+    }
+
+    unsafe fn nt_open_process(
+        &mut self,
+        process_handle: u64,
+        desired_access: u32,
+        object_attributes: u64,
+        client_id: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        if !self.probe_user_output(process_handle, core::mem::size_of::<u64>()) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let client_id = if client_id == 0 {
+            None
+        } else {
+            if client_id & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            let Some(client_id) = self.capture_client_id(client_id) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            Some(client_id)
+        };
+        if object_attributes & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let Some(object_attributes) = self.capture_object_attributes(object_attributes) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+        let (owner, handle) = match self.open_process_captured(
+            object_attributes,
+            client_id,
+            desired_access,
+        ) {
+            Ok(opened) => opened,
+            Err(status) => return status,
+        };
+        if !self.xas_write_u64(process_handle, handle as u64) {
+            let _ = self.pm.take_handle(owner, handle);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        self.account_published_process_handle(owner);
+        0
     }
     /// Resolve a `NtTerminateProcess`/`NtOpenProcess`-style ProcessHandle to the target EPROCESS pid.
     /// `NtCurrentProcess()` (`-1`) → the caller (self-terminate). A real child ProcessHandle is now
@@ -1840,6 +1932,9 @@ impl ExecNtHandler {
     /// not in any mirror or frame table — but its bytes are exactly the (relocation-free) `.rdata`
     /// file content, which we read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
+        if va.checked_add(dst.len() as u64).is_none() {
+            return false;
+        }
         let dynamic_stack = self.pi == 2 && wl_listener_stack_contains(va, dst.len());
         if dynamic_stack {
             let Some(ctx) = self.loop_ctx.as_ref() else {
@@ -1906,37 +2001,18 @@ impl ExecNtHandler {
     /// Cross-AS 8-byte out-param write to the current process's VA `va` — handles a target that lives
     /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
     /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
-    /// [`csrss_out_write`] (mirror → already-faulted page's scratch alias → demand-fill from the DLL
-    /// PE). No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
+    /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
+    /// No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
         if let Some(ctx) = self.loop_ctx {
-            if va & 0xFFF <= 0xFF8 {
-                let alias = csrss_frame_alias_get(self.pi as u64, va & !0xFFF);
-                if alias != 0 {
-                    core::ptr::write_volatile(
-                        (alias + (va & 0xFFF)) as *mut u64,
-                        val,
-                    );
-                    return true;
-                }
-            }
-            if self.pi == 2 && wl_listener_stack_contains(va, core::mem::size_of::<u64>()) {
-                return client_copyout_mapped(
-                    self.pi as u64,
-                    va,
-                    &val.to_le_bytes(),
-                    &*ctx.filled_pages,
-                    *ctx.faults as usize,
-                    ctx.scratch_base,
-                );
-            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
             let dll_pes = ctx.dll_pes();
-            csrss_out_write(
+            client_copyout_or_fill_mapped(
+                self.pi as u64,
                 va,
-                val,
+                &val.to_le_bytes(),
                 filled_pages,
                 faults,
                 ctx.scratch_base,
@@ -1952,33 +2028,14 @@ impl ExecNtHandler {
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
         if let Some(ctx) = self.loop_ctx {
-            if va & 0xFFF <= 0xFFC {
-                let alias = csrss_frame_alias_get(self.pi as u64, va & !0xFFF);
-                if alias != 0 {
-                    core::ptr::write_volatile(
-                        (alias + (va & 0xFFF)) as *mut u32,
-                        val,
-                    );
-                    return true;
-                }
-            }
-            if self.pi == 2 && wl_listener_stack_contains(va, core::mem::size_of::<u32>()) {
-                return client_copyout_mapped(
-                    self.pi as u64,
-                    va,
-                    &val.to_le_bytes(),
-                    &*ctx.filled_pages,
-                    *ctx.faults as usize,
-                    ctx.scratch_base,
-                );
-            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
             let dll_pes = ctx.dll_pes();
-            csrss_out_write32(
+            client_copyout_or_fill_mapped(
+                self.pi as u64,
                 va,
-                val,
+                &val.to_le_bytes(),
                 filled_pages,
                 faults,
                 ctx.scratch_base,
@@ -3050,6 +3107,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS
             }
+            NativeService::NtOpenProcess => unsafe {
+                self.nt_open_process(args[0], args[1] as u32, args[2], args[3])
+            },
             // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
             // DesiredAccess, HandleAttributes, Options). Resolve both process handles in the
             // caller's table, then duplicate the typed object into the target EPROCESS table. This
