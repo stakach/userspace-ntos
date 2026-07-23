@@ -239,6 +239,7 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtOpenThreadTokenEx, 136),
         (NativeService::NtOpenProcess, 128),
         (NativeService::NtOpenThread, 134),
+        (NativeService::NtQueryInformationThread, 162),
         (NativeService::NtOpenProcessTokenEx, 130),
         (NativeService::NtDuplicateToken, 72),
     ];
@@ -261,6 +262,14 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtOpenProcess.arg_count(), (4, 4));
     assert_eq!(NativeService::NtOpenThread.name(), "NtOpenThread");
     assert_eq!(NativeService::NtOpenThread.arg_count(), (4, 4));
+    assert_eq!(
+        NativeService::NtQueryInformationThread.name(),
+        "NtQueryInformationThread"
+    );
+    assert_eq!(
+        NativeService::NtQueryInformationThread.arg_count(),
+        (5, 5)
+    );
     assert_eq!(NativeService::NtOpenProcessTokenEx.arg_count(), (4, 4));
     assert_eq!(NativeService::NtDuplicateToken.arg_count(), (6, 6));
     assert_eq!(NativeService::NtSetInformationThread.arg_count(), (4, 4));

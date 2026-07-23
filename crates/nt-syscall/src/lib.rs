@@ -100,6 +100,7 @@ pub enum NativeService {
     NtSuspendProcess,
     NtOpenProcess,
     NtOpenThread,
+    NtQueryInformationThread,
     // Security / token (§16.7)
     NtOpenProcessToken,
     NtOpenProcessTokenEx,
@@ -244,6 +245,7 @@ impl NativeService {
             NtSuspendProcess => "NtSuspendProcess",
             NtOpenProcess => "NtOpenProcess",
             NtOpenThread => "NtOpenThread",
+            NtQueryInformationThread => "NtQueryInformationThread",
             NtOpenProcessToken => "NtOpenProcessToken",
             NtOpenProcessTokenEx => "NtOpenProcessTokenEx",
             NtDuplicateToken => "NtDuplicateToken",
@@ -331,6 +333,7 @@ impl NativeService {
             | NtCreateIoCompletion => (4, 4),
             NtOpenThreadTokenEx => (5, 5),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
+            | NtQueryInformationThread
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
             | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent
             | NtQuerySemaphore => {
@@ -498,6 +501,7 @@ impl NativeService {
         NativeService::NtQueryDirectoryFile,
         NativeService::NtOpenProcess,
         NativeService::NtOpenThread,
+        NativeService::NtQueryInformationThread,
     ];
 }
 
