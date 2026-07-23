@@ -10,10 +10,9 @@ use crate::*;
 /// `SM_FAULT_EP` (no standing receiver) and is resumed at spawn → PARKS on its first fault.
 pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
     // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
-    // thread must too — DON'T set TCBSetHostedSyscalls (native Call → MR0=SSN) and bind its kernel
-    // IPC buffer to smss's MAIN-thread ipcbuf frame at IPCBUF_VADDR (the VA the ntdll native stub
-    // writes MR4/MR5 to). Without this the SM-loop thread's native Call faults as UnknownSyscall with
-    // m0=RAX garbage → `[sm-rdv] WALL: unexpected SSN`.
+    // thread must too — DON'T set TCBSetHostedSyscalls (native Call → MR0=SSN). Its private IPC
+    // frame lives at the VA ntdll derives from the active TEB; otherwise the Call faults as an
+    // UnknownSyscall with m0=RAX garbage → `[sm-rdv] WALL: unexpected SSN`.
     spawn_hosted_thread(&HostedThread {
         pml4: smss_pml4,
         client_pi: 0,
@@ -35,7 +34,6 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         resume: true,
         prio: 0,
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[0].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -806,10 +804,9 @@ pub(crate) unsafe fn spawn_csr_loop_thread(
         cid_thread: tid,
         resume: false,
         prio: 0,
-        // BATCH 6: csrss (pi 1, badge 2) also runs on OUR native ntdll, so the CSR API thread uses the native
-        // transport, bound to csrss's main-thread ipcbuf frame at IPCBUF_VADDR.
+        // BATCH 6: csrss (pi 1, badge 2) also runs on OUR native ntdll, so the CSR API
+        // thread uses the native transport and its TEB-derived private IPC buffer.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[1].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -844,7 +841,6 @@ pub(crate) unsafe fn spawn_csr_sb_loop_thread(
         resume: false,
         prio: 0,
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[1].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -1027,15 +1023,13 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
         // server WORKER thread must too — mirror the BATCH-6 SM/CSR pattern: DON'T set
         // TCBSetHostedSyscalls (native Call → MR0=SSN, not an UnknownSyscall trap whose m0=RAX is
-        // garbage) and bind its kernel IPC buffer to winlogon's MAIN-thread ipcbuf frame at
-        // IPCBUF_VADDR (the VA the ntdll native stub writes MR4/MR5 to). All three worker slots run
-        // in winlogon's VSpace (pi 2). Its faults still arrive on the badged MAIN fault-EP (the loop's
+        // garbage). All three worker slots run in winlogon's VSpace (pi 2) with distinct TEB-derived
+        // IPC buffers. Their faults still arrive on the badged MAIN fault-EP (the loop's
         // NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them into the shared servicing body), so the
         // worker actually RUNS its rpcrt4 RPC-server init + NtSetEvent(s) the event winlogon's main
         // parks on. Without native:true the worker's first native Call faulted as UnknownSyscall with
         // SSN=garbage → `[wl-worker] PARK` (never ran its RPC init) → winlogon main stuck on the SAS wait.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -1081,12 +1075,11 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         // listener thread must too — mirror the BATCH 24 lsass-listener fix (was BATCH-6 native:false,
         // whose first native Call faulted as UnknownSyscall with SSN=garbage 0x100_105f_b000 →
         // `[svc-listener] blocking server syscall -> PARK (drop)` before it ever created/read its
-        // \pipe\ntsvcs server end). native:true + its kernel IPC buffer bound to services' MAIN-thread
-        // ipcbuf frame (the VA our ntdll native stub writes MR4/MR5 to) makes its Call dispatch
-        // (MR0=r10=SSN), so it runs its rpcrt4 ncacn_np receive loop (FSCTL_PIPE_LISTEN + NtReadFile on
-        // the server pipe) — the reads the pipe-pending park/re-drive edge then completes.
+        // \pipe\ntsvcs server end). native:true plus its TEB-derived private IPC buffer makes its
+        // Call dispatch (MR0=r10=SSN), so it runs its rpcrt4 ncacn_np receive loop
+        // (FSCTL_PIPE_LISTEN + NtReadFile on the server pipe) — the reads the pipe-pending
+        // park/re-drive edge then completes.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -1099,8 +1092,8 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
 /// thread that reads winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — its blocking pipe
 /// reads park via `pipe_wait_park` and re-drive on winlogon's write via `pipe_redrive_all` (which is
 /// already badge-general through `mirror_ctx_for`). A clone of `spawn_svc_listener_thread` with the
-/// SCM_WORKER VA window; native transport (services runs on OUR ntdll) + its kernel IPC buffer bound
-/// to services' MAIN-thread ipcbuf frame (the VA our ntdll native stub writes MR4/MR5 to).
+/// SCM_WORKER VA window, native transport (services runs on OUR ntdll), and a private IPC buffer
+/// derived from its TEB.
 pub(crate) unsafe fn spawn_scm_worker_thread(
     svc_pml4: u64,
     entry_rip: u64,
@@ -1133,7 +1126,6 @@ pub(crate) unsafe fn spawn_scm_worker_thread(
         resume,
         prio: 104, // same band as the listener (above winlogon/services main threads)
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
         diag: true, // BATCH 36 DIAG: surface silent SYS_SEND spawn errors for the 3rd hosted thread
     })
 }
@@ -1178,13 +1170,12 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
         // thread must too — mirror BATCH 6/19 (winlogon's RPC listener). Without native:true the thread's
         // first native Call faulted as UnknownSyscall with SSN=garbage (0x100_0080_0000 = RAX at trap) →
-        // `[lsass-listener] PARK (unserviced)` → then a stray fault at a garbage stack RIP. Set native →
-        // its Call dispatches (MR0=r10=SSN) + bind its kernel IPC buffer to lsass' MAIN-thread ipcbuf
-        // frame at IPCBUF_VADDR (the VA our ntdll native stub writes MR4/MR5 to). Its faults still arrive
-        // on the badged MAIN fault-EP (the loop's NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them),
-        // so it actually RUNS LsarStartRpcServer → SetEvent(LSA_RPC_SERVER_ACTIVE).
+        // `[lsass-listener] PARK (unserviced)` → then a stray fault at a garbage stack RIP. Set
+        // native → its Call dispatches (MR0=r10=SSN) through its TEB-derived private IPC buffer.
+        // Its faults still arrive on the badged MAIN fault-EP (the loop's NT_NATIVE_SYSCALL_LABEL
+        // NORMALIZE arm re-labels them), so it actually RUNS LsarStartRpcServer →
+        // SetEvent(LSA_RPC_SERVER_ACTIVE).
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -1224,7 +1215,6 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         prio: 105,
         // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
         diag: false,
     })
 }
@@ -1262,7 +1252,6 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
         prio: 105,
         // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
         diag: false,
     })
 }

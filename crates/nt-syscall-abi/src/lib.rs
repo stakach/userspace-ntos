@@ -69,6 +69,34 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 
+/// TEB VA used by the SEC_IMAGE hosted-process main thread.
+///
+/// Native syscall stubs read this value through the standard x64 `gs:[0x30]` TEB self pointer.
+pub const NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA: u64 = 0x0000_0100_0051_0000;
+
+/// TEB VA used by the older isolated-PE main-thread path.
+pub const NT_NATIVE_PE_MAIN_TEB_VA: u64 = 0x0000_0100_0057_0000;
+
+/// IPC-buffer VA shared by the two main-thread layouts (in their separate VSpaces).
+pub const NT_NATIVE_MAIN_IPC_BUFFER_VA: u64 = 0x0000_0100_105F_B000;
+
+/// Distance between a hosted worker's TEB and its dedicated IPC-buffer mapping.
+pub const NT_NATIVE_WORKER_IPC_BUFFER_DELTA: u64 = 0x0001_0000;
+
+/// Select the native seL4 IPC-buffer VA for the thread whose TEB is at `teb`.
+///
+/// The two historical main-thread layouts retain their fixed IPC-buffer VA. Runtime workers use
+/// dedicated buffers one 64-KiB allocation unit below their TEB, so concurrent native calls cannot
+/// overwrite another thread's MR4/MR5 spill words.
+#[inline]
+pub const fn native_ipc_buffer_va(teb: u64) -> u64 {
+    if teb == NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA || teb == NT_NATIVE_PE_MAIN_TEB_VA {
+        NT_NATIVE_MAIN_IPC_BUFFER_VA
+    } else {
+        teb - NT_NATIVE_WORKER_IPC_BUFFER_DELTA
+    }
+}
+
 /// The complete required `Nt*` SSN table: the hosted ReactOS x64 import set
 /// (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
 /// rpcrt4/csrsrv/basesrv/winsrv/… — measured 2026-07-16, see `ntdll_plan.md` Step 1 Results),

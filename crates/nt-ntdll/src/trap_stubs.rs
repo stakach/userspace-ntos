@@ -82,9 +82,23 @@ macro_rules! generate_trap_stubs {
                     "push rdi",
                     "push rsi",
                     "push r15",
-                    // Stash args3/4 into the IPC buffer as MR4/MR5 (only 4 MRs ride in registers).
-                    // IPC buffer word[i] = MR i at byte (8 + i*8); MR4 @ +0x28, MR5 @ +0x30.
-                    "movabs rax, 0x00000100105FB000",   // IPCBUF_VADDR (fixed per-process VA)
+                    // Stash args3/4 into this thread's IPC buffer as MR4/MR5 (only 4 MRs ride in
+                    // registers). Main threads retain the historical fixed VA; runtime workers map
+                    // a dedicated buffer 64 KiB below the TEB reported by the standard gs:[0x30]
+                    // self pointer. IPC word[i] = MR i at byte (8 + i*8).
+                    "mov rax, qword ptr gs:[0x30]",
+                    "movabs r11, {sec_image_main_teb}",
+                    "cmp rax, r11",
+                    "je 2f",
+                    "movabs r11, {pe_main_teb}",
+                    "cmp rax, r11",
+                    "jne 3f",
+                    "2:",
+                    "movabs rax, {main_ipc_buffer}",
+                    "jmp 4f",
+                    "3:",
+                    "sub rax, {worker_ipc_delta}",
+                    "4:",
                     "mov qword ptr [rax + 0x28], r8",   // MR4 = arg3
                     "mov qword ptr [rax + 0x30], r9",   // MR5 = arg4
                     // Build the register message with the entry RSP so executive stack-argument
@@ -105,6 +119,10 @@ macro_rules! generate_trap_stubs {
                     "pop rdi",
                     "mov rax, r10",
                     "ret",
+                    sec_image_main_teb = const nt_syscall_abi::NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA,
+                    pe_main_teb = const nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA,
+                    main_ipc_buffer = const nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,
+                    worker_ipc_delta = const nt_syscall_abi::NT_NATIVE_WORKER_IPC_BUFFER_DELTA,
                 );
             }
         )*

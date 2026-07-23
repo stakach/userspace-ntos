@@ -189,3 +189,41 @@ fn alpc_seam_is_reserved_above_the_reactos_range() {
     // Nothing in the current table sits in the ALPC reserved space.
     assert!(NT_SYSCALLS.iter().all(|e| e.ssn < ALPC_SSN_BASE));
 }
+
+#[test]
+fn native_ipc_buffer_selects_main_and_worker_layouts() {
+    assert_eq!(
+        native_ipc_buffer_va(NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA),
+        NT_NATIVE_MAIN_IPC_BUFFER_VA
+    );
+    assert_eq!(
+        native_ipc_buffer_va(NT_NATIVE_PE_MAIN_TEB_VA),
+        NT_NATIVE_MAIN_IPC_BUFFER_VA
+    );
+
+    let worker_layouts = [
+        (0x0000_0100_1049_0000, 0x0000_0100_1048_0000),
+        (0x0000_0100_104F_0000, 0x0000_0100_104E_0000),
+        (0x0000_0100_1055_0000, 0x0000_0100_1054_0000),
+    ];
+    for (teb, expected_ipc) in worker_layouts {
+        let ipc = native_ipc_buffer_va(teb);
+        assert_eq!(ipc, expected_ipc);
+        assert_eq!(ipc & 0xFFF, 0, "worker IPC buffer must be page aligned");
+    }
+}
+
+#[test]
+fn native_worker_ipc_buffers_are_distinct() {
+    let worker_tebs = [
+        0x0000_0100_1049_0000,
+        0x0000_0100_104F_0000,
+        0x0000_0100_1055_0000,
+    ];
+    let ipc = worker_tebs.map(native_ipc_buffer_va);
+    for (index, left) in ipc.iter().enumerate() {
+        for right in &ipc[index + 1..] {
+            assert_ne!(left, right);
+        }
+    }
+}

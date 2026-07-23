@@ -16,6 +16,67 @@ const IMAGE_FILE_DLL: u16 = 0x2000;
 // PE32+ optional-header magic.
 const PE32PLUS_MAGIC: u16 = 0x020b;
 
+const GS_SELF_LOAD_RAX_MODRM: &[u8] = &[0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00];
+const GS_SELF_LOAD_RAX_MOFFS: &[u8] = &[
+    0x65, 0x48, 0xa1, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const CMP_RAX_R11: &[u8] = &[0x4c, 0x39, 0xd8];
+const SUB_RAX_WORKER_DELTA_ACC: &[u8] = &[0x48, 0x2d, 0x00, 0x00, 0x01, 0x00];
+const SUB_RAX_WORKER_DELTA_RM: &[u8] = &[0x48, 0x81, 0xe8, 0x00, 0x00, 0x01, 0x00];
+const STORE_MR4_FROM_R8: &[u8] = &[0x4c, 0x89, 0x40, 0x28];
+const STORE_MR5_FROM_R9: &[u8] = &[0x4c, 0x89, 0x48, 0x30];
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn find_movabs(stub: &[u8], opcode: [u8; 2], immediate: u64) -> Option<usize> {
+    let immediate = immediate.to_le_bytes();
+    stub.windows(10)
+        .position(|window| window[..2] == opcode[..] && window[2..] == immediate[..])
+}
+
+fn find_gs_self_load(stub: &[u8]) -> Option<usize> {
+    find_bytes(stub, GS_SELF_LOAD_RAX_MODRM).or_else(|| find_bytes(stub, GS_SELF_LOAD_RAX_MOFFS))
+}
+
+fn find_main_teb_branch(stub: &[u8], teb: u64, short_jump: u8, near_jump: u8) -> Option<usize> {
+    let immediate = teb.to_le_bytes();
+    stub.windows(15).position(|window| {
+        let compare = window[..2] == [0x49, 0xbb][..]
+            && window[2..10] == immediate[..]
+            && window[10..13] == CMP_RAX_R11[..];
+        let branches = window[13] == short_jump || (window[13] == 0x0f && window[14] == near_jump);
+        compare && branches
+    })
+}
+
+fn find_main_ipc_jump(stub: &[u8]) -> Option<usize> {
+    let movabs = find_movabs(
+        stub,
+        [0x48, 0xb8],
+        nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,
+    )?;
+    stub.get(movabs + 10)
+        .is_some_and(|opcode| matches!(*opcode, 0xeb | 0xe9))
+        .then_some(movabs)
+}
+
+fn find_worker_delta_sub(stub: &[u8]) -> Option<usize> {
+    find_bytes(stub, SUB_RAX_WORKER_DELTA_ACC).or_else(|| find_bytes(stub, SUB_RAX_WORKER_DELTA_RM))
+}
+
+fn has_legacy_fixed_ipc_store(stub: &[u8]) -> bool {
+    let ipc = nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA.to_le_bytes();
+    stub.windows(14).any(|window| {
+        window[..2] == [0x48, 0xb8][..]
+            && window[2..10] == ipc[..]
+            && window[10..] == *STORE_MR4_FROM_R8
+    })
+}
+
 fn main() -> ExitCode {
     let path = std::env::args()
         .nth(1)
@@ -160,6 +221,70 @@ fn main() -> ExitCode {
     );
     if !bad_native_abi.is_empty() {
         eprintln!("   native ABI violations: {bad_native_abi:?}");
+    }
+
+    // Every native Nt* stub must select the caller TCB's bound IPC buffer from the standard TEB
+    // self pointer. The two main-thread TEB layouts retain the historical fixed IPC VA; workers use
+    // TEB-64KiB. Reject the old `movabs fixed_ipc; store MR4` body explicitly: it aliases concurrent
+    // workers onto the main thread's physical IPC frame.
+    let mut bad_native_ipc = Vec::new();
+    for syscall in NT_SYSCALLS {
+        let Some(export) = exports.iter().find(|export| export.name == syscall.name) else {
+            continue;
+        };
+        let Some(stub) = image
+            .bytes
+            .get(export.rva as usize..export.rva as usize + 128)
+        else {
+            bad_native_ipc.push(syscall.name);
+            continue;
+        };
+        let positions = (
+            find_gs_self_load(stub),
+            find_main_teb_branch(
+                stub,
+                nt_syscall_abi::NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA,
+                0x74,
+                0x84,
+            ),
+            find_main_teb_branch(stub, nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA, 0x75, 0x85),
+            find_main_ipc_jump(stub),
+            find_worker_delta_sub(stub),
+            find_bytes(stub, STORE_MR4_FROM_R8),
+            find_bytes(stub, STORE_MR5_FROM_R9),
+        );
+        let ordered = matches!(
+            positions,
+            (
+                Some(gs),
+                Some(sec_main),
+                Some(pe_main),
+                Some(main_ipc),
+                Some(worker),
+                Some(mr4),
+                Some(mr5),
+            )
+                if gs < sec_main
+                    && sec_main < pe_main
+                    && pe_main < main_ipc
+                    && main_ipc < worker
+                    && worker < mr4
+                    && mr4 < mr5
+        );
+        if !ordered || has_legacy_fixed_ipc_store(stub) {
+            bad_native_ipc.push(syscall.name);
+        }
+    }
+    check(
+        bad_native_ipc.is_empty(),
+        &format!(
+            "all {} native Nt* stubs derive a per-thread IPC buffer ({} violations)",
+            NT_SYSCALLS.len(),
+            bad_native_ipc.len()
+        ),
+    );
+    if !bad_native_ipc.is_empty() {
+        eprintln!("   native IPC-buffer derivation violations: {bad_native_ipc:?}");
     }
 
     // Base relocations parse cleanly (the .reloc directory the loader will apply).

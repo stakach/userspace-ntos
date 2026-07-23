@@ -412,6 +412,72 @@ pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1075_0000;
 /// Executive-side stack mirror for the SCM worker (its syscall out-params / stack-arg reads / the
 /// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
 pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
+
+const fn hosted_thread_layout_is_disjoint(
+    stack_base: u64,
+    stack_frames: u64,
+    ipcbuf_va: u64,
+    teb_va: u64,
+    tramp_va: u64,
+) -> bool {
+    stack_base + stack_frames * 0x1000 <= ipcbuf_va
+        && ipcbuf_va + 0x1000 <= teb_va
+        && teb_va + 0x2000 <= tramp_va
+}
+
+const _: () = {
+    assert!(nt_syscall_abi::native_ipc_buffer_va(SMSS_TEB_VA) == IPCBUF_VADDR);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(TEB_VA) == IPCBUF_VADDR);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(SM_TEB_VA) == SM_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(CSR_TEB_VA) == CSR_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(CSR_SB_TEB_VA) == CSR_SB_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(WL_LISTENER_TEB_VA) == WL_LISTENER_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER2_TEB_VA) == WL_WORKER2_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER3_TEB_VA) == WL_WORKER3_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(SVC_LISTENER_TEB_VA) == SVC_LISTENER_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(SCM_WORKER_TEB_VA) == SCM_WORKER_IPCBUF_VA);
+    assert!(
+        nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER_TEB_VA) == LSASS_LISTENER_IPCBUF_VA
+    );
+    assert!(
+        nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER2_TEB_VA) == LSASS_LISTENER2_IPCBUF_VA
+    );
+    assert!(
+        nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER3_TEB_VA) == LSASS_LISTENER3_IPCBUF_VA
+    );
+    assert!(SM_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
+    assert!(SM_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
+    assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
+    assert!(hosted_thread_layout_is_disjoint(
+        SM_STACK_BASE,
+        SM_STACK_FRAMES,
+        SM_IPCBUF_VA,
+        SM_TEB_VA,
+        SM_TRAMP_VA,
+    ));
+    assert!(hosted_thread_layout_is_disjoint(
+        SVC_LISTENER_STACK_BASE,
+        SVC_LISTENER_STACK_FRAMES,
+        SVC_LISTENER_IPCBUF_VA,
+        SVC_LISTENER_TEB_VA,
+        SVC_LISTENER_TRAMP_VA,
+    ));
+    assert!(hosted_thread_layout_is_disjoint(
+        WL_WORKER2_STACK_BASE,
+        WL_WORKER2_STACK_FRAMES,
+        WL_WORKER2_IPCBUF_VA,
+        WL_WORKER2_TEB_VA,
+        WL_WORKER2_TRAMP_VA,
+    ));
+    assert!(hosted_thread_layout_is_disjoint(
+        WL_WORKER3_STACK_BASE,
+        WL_WORKER3_STACK_FRAMES,
+        WL_WORKER3_IPCBUF_VA,
+        WL_WORKER3_TEB_VA,
+        WL_WORKER3_TRAMP_VA,
+    ));
+};
+
 /// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
 /// (pi 3, scm-worker), switching ACTIVE_STACK_MIRROR to the worker's mirror. N-threads sub-selection.
 pub const SCM_WORKER_BADGE: u64 = 15;
@@ -5013,17 +5079,11 @@ struct HostedThread {
     /// processes so that, once services' main thread parks (NtTerminateThread), the listener is the
     /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
     prio: u8,
-    /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this 2nd thread runs on
-    /// OUR ntdll's native transport just like the process's MAIN thread: DON'T set the per-thread
-    /// `TCBSetHostedSyscalls` flag (so its `seL4_Call` dispatches natively → MR0=SSN, not an
-    /// UnknownSyscall fault whose m0=RAX is garbage), and bind its kernel IPC buffer at the SAME
-    /// `IPCBUF_VADDR` the ntdll native stub writes MR4/MR5 to — reusing the process main thread's
-    /// ipcbuf FRAME (they share the VSpace and never run concurrently during a rendezvous, so the
-    /// shared VA→frame mapping is safe; a fresh frame at `ipcbuf_va` would either collide with the
-    /// main thread's mapping or leave MR4/MR5 where the kernel doesn't read them). `ipcbuf_frame`
-    /// (non-zero) is that reused frame cap; when 0 (trap/park-only threads) a fresh frame is used.
+    /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this thread runs on
+    /// OUR ntdll's native transport: don't set the per-thread `TCBSetHostedSyscalls` flag, so its
+    /// `seL4_Call` dispatches natively with MR0=SSN. Every thread still owns a distinct IPC frame at
+    /// `ipcbuf_va`; ntdll derives that VA from the active TEB through `gs:[0x30]`.
     native: bool,
-    ipcbuf_frame: u64,
     /// BATCH 36 DIAG: when true, `spawn_hosted_thread` uses the SYS_CALL/`_r` variants for the
     /// resource-critical invocations (retype/copy/map/set_space/write_registers/set_ipc/resume)
     /// and PRINTS every non-zero error label — to surface the silent SYS_SEND failure that leaves
@@ -5170,17 +5230,13 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         print_u64(teb2_live_map);
         print_str(b"\n");
     }
-    // IPC buffer. NATIVE transport (BATCH 6): reuse the process MAIN thread's ipcbuf FRAME at
-    // IPCBUF_VADDR (already mapped in the shared VSpace) so OUR ntdll's native stub — which writes
-    // MR4/MR5 to the hardcoded IPCBUF_VADDR and reads its reply there — hits the SAME frame the
-    // kernel binds to this TCB. Don't remap the VA (it's already mapped by the main thread's spawn).
-    // Trap/park-only threads (ipcbuf_frame==0): a fresh frame at t.ipcbuf_va, as before.
-    let (ipcbuf, ipcbuf_bind_va) = if t.native && t.ipcbuf_frame != 0 {
-        (copy_cap(t.ipcbuf_frame), IPCBUF_VADDR)
+    // Every hosted thread gets a distinct IPC frame. Native ntdll derives `ipcbuf_va` from the
+    // active TEB; trap threads use the same binding directly through the kernel fault transport.
+    let ipcbuf = alloc_frame();
+    let e_ipc_target_map = if t.diag {
+        page_map_r(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     } else {
-        let f = alloc_frame();
-        let _ = page_map(f, t.ipcbuf_va, RW_NX, t.pml4);
-        (f, t.ipcbuf_va)
+        page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     };
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let (tramp, e_tramp_frame) = if t.diag { alloc_frame_r() } else { (alloc_frame(), 0) };
@@ -5284,13 +5340,20 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let (e_tcb, e_space, e_ipc, e_regs) = if t.diag {
         let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
         let e_space = tcb_set_space_r(tcb, CT_FAULT, cnode, t.pml4);
-        let e_ipc = tcb_set_ipc_buffer_r(tcb, ipcbuf_bind_va, ipcbuf);
+        let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
         let e_regs = tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0);
         (e_tcb, e_space, e_ipc, e_regs)
     } else {
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
         let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
-        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_bind_va, ipcbuf, 0);
+        let _ = syscall5(
+            SYS_SEND,
+            tcb,
+            LBL_TCB_SET_IPC_BUFFER << 12,
+            t.ipcbuf_va,
+            ipcbuf,
+            0,
+        );
         let _ = tcb_write_registers(tcb, t.tramp_va, new_sp, 0);
         (0, 0, 0, 0)
     };
@@ -5305,6 +5368,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         print_u64(e_tcb);
         print_str(b" set_space=");
         print_u64(e_space);
+        print_str(b" ipc_map=");
+        print_u64(e_ipc_target_map);
         print_str(b" set_ipc=");
         print_u64(e_ipc);
         print_str(b" write_regs=");
@@ -5468,11 +5533,6 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// Each hosted process's MAIN-thread IPC buffer FRAME cap (bound at `IPCBUF_VADDR`). Retained so a
-/// runtime NATIVE 2nd thread (SmpApiLoop / CSR-API / listener on OUR ntdll) can bind ITS kernel IPC
-/// buffer to the SAME frame at IPCBUF_VADDR — the VA our ntdll native stub writes MR4/MR5 to
-/// (BATCH 6). They share the VSpace and never run concurrently during a rendezvous.
-pub(crate) static PM_MAIN_IPCBUF: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
 /// creation remains allocation-free. Three slots cover the live lsass worker fan-out.
 const PM_RUNTIME_THREAD_SLOTS: usize = 3;

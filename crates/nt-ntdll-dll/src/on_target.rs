@@ -3617,9 +3617,18 @@ unsafe fn native_syscall(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, 
     unsafe { native_syscall8(ssn, a1, a2, a3, a4, a5, a6, 0, 0) }
 }
 
-/// The IPC buffer fixed per-process VA. MR `i` lives at byte `8 + i*8`; MR4 @ +0x28, MR5 @ +0x30.
+/// Return the IPC-buffer VA bound to the current native-transport thread.
+///
+/// The address is derived from the standard TEB self pointer rather than process-global state, so
+/// concurrent hosted workers spill MR4/MR5 into their own kernel-bound IPC buffers.
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+#[inline]
+unsafe fn current_native_ipc_buffer_va() -> u64 {
+    // SAFETY: native transport is entered only after the executive installs this thread's TEB as
+    // its GS base and initializes NT_TIB.Self at offset 0x30.
+    let teb = unsafe { current_teb() } as u64;
+    nt_ntdll::abi::native_ipc_buffer_va(teb)
+}
 
 /// The general NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A) — up to 8 args.
 ///
@@ -3645,11 +3654,12 @@ unsafe fn native_syscall8(
     a7: u64,
     a8: u64,
 ) -> u64 {
-    // MR4/MR5 = a3/a4 into the IPC buffer (plain Rust — no live registers needed across the Call).
-    // SAFETY: IPCBUF_VADDR is this process's mapped IPC buffer frame; MR4/MR5 at +0x28/+0x30.
+    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
+    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
+    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x30) as *mut u64, a4);
+        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
     }
     // The register message words + the stack args, laid out for the asm to consume via ONE pointer:
     //   [0]=SSN(MR0)  [1]=a1(MR2)  [2]=a2(MR3)  [3]=a5  [4]=a6  [5]=a7  [6]=a8
@@ -3703,11 +3713,12 @@ unsafe fn native_syscall8(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) -> u64 {
-    // MR4/MR5 = a3/a4 into the IPC buffer (plain Rust — no live registers across the Call).
-    // SAFETY: IPCBUF_VADDR is this process's mapped IPC buffer; MR4/MR5 at +0x28/+0x30.
+    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
+    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
+    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x30) as *mut u64, a4);
+        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
     }
     // req: [0]=SSN(MR0) [1]=a1(MR2) [2]=a2(MR3) [3..9]=the six stack tail args.
     let req: [u64; 9] = [
@@ -3773,11 +3784,12 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    // MR4/MR5 = a3/a4 into the IPC buffer (plain Rust — no live registers across the Call).
-    // SAFETY: IPCBUF_VADDR is this process's mapped IPC buffer; MR4/MR5 at +0x28/+0x30.
+    // MR4/MR5 = a3/a4 into this thread's IPC buffer (plain Rust — no live registers across Call).
+    // SAFETY: GS names this thread's initialized TEB; the derived VA is its bound IPC-buffer frame.
+    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((IPCBUF_VADDR + 0x30) as *mut u64, a4);
+        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
     }
     // req: [0]=SSN(MR0) [1]=a1(MR2) [2]=a2(MR3) [3..8]=the five stack tail args (a5..a9).
     let req: [u64; 8] = [
