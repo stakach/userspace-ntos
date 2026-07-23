@@ -26,6 +26,7 @@ nt-alpc-abi = { path = "../nt-alpc-abi" }
 nt-kernel-exec = { path = "../nt-kernel-exec", default-features = false }
 nt-ntdll = { path = "../nt-ntdll", default-features = false }
 nt-ntdll-layout = { path = "../nt-ntdll-layout" }
+nt-rtl-work-item = { path = "../nt-rtl-work-item" }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

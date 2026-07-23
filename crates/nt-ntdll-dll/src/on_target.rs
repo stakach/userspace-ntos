@@ -27,7 +27,7 @@ extern crate alloc;
 use core::{
     ffi::c_void,
     marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use nt_ntdll::heap::{Backing, Heap};
@@ -5072,6 +5072,525 @@ pub unsafe fn rtl_create_user_thread(
             initial_teb.as_ptr() as u64,
             (create_suspended != 0) as u64,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ReactOS-compatible normal thread-pool lane.
+// ---------------------------------------------------------------------------------------------
+
+const SSN_NT_CREATE_IO_COMPLETION: u32 = 40;
+const SSN_NT_DELAY_EXECUTION: u32 = 61;
+const SSN_NT_REMOVE_IO_COMPLETION: u32 = 198;
+const SSN_NT_RESUME_THREAD: u32 = 214;
+const SSN_NT_SET_IO_COMPLETION: u32 = 241;
+const SSN_NT_TERMINATE_THREAD: u32 = 267;
+
+const IO_COMPLETION_ALL_ACCESS: u64 = 0x001F_0003;
+const TOKEN_IMPERSONATE: u64 = 0x0004;
+const THREAD_IMPERSONATION_TOKEN: u64 = 5;
+const STATUS_SUCCESS_U32: u32 = 0;
+const STATUS_UNSUCCESSFUL_U32: u32 = 0xC000_0001;
+const STATUS_NOT_SUPPORTED_U32: u32 = 0xC000_00BB;
+const STATUS_QUOTA_EXCEEDED_U32: u32 = 0xC000_0044;
+const STATUS_TIMEOUT_U32: u32 = 0x0000_0102;
+
+const POOL_UNINITIALIZED: u32 = 0;
+const POOL_INITIALIZING: u32 = 1;
+const POOL_READY: u32 = 2;
+const WORKER_STOPPED: u32 = 0;
+const WORKER_STARTING: u32 = 1;
+const WORKER_ALIVE: u32 = 2;
+
+static WORK_POOL_INIT_STATE: AtomicU32 = AtomicU32::new(POOL_UNINITIALIZED);
+static WORK_POOL_PORT: AtomicU64 = AtomicU64::new(0);
+static WORK_POOL_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
+static WORK_POOL_COUNTER_LOCK: AtomicBool = AtomicBool::new(false);
+static mut WORK_POOL_COUNTERS: nt_rtl_work_item::PoolCounters =
+    nt_rtl_work_item::PoolCounters::new();
+
+#[inline]
+fn work_pool_lock_counters() {
+    while WORK_POOL_COUNTER_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn work_pool_unlock_counters() {
+    WORK_POOL_COUNTER_LOCK.store(false, Ordering::Release);
+}
+
+unsafe fn work_pool_delay(interval_100ns: i64) -> u32 {
+    let interval = interval_100ns;
+    unsafe {
+        syscall4(
+            SSN_NT_DELAY_EXECUTION,
+            0,
+            core::ptr::addr_of!(interval) as u64,
+            0,
+            0,
+        ) as u32
+    }
+}
+
+unsafe fn initialize_work_pool() -> u32 {
+    loop {
+        match WORK_POOL_INIT_STATE.load(Ordering::Acquire) {
+            POOL_READY => return STATUS_SUCCESS_U32,
+            POOL_INITIALIZING => {
+                let _ = unsafe { work_pool_delay(-10_000_000) };
+            }
+            POOL_UNINITIALIZED => {
+                if WORK_POOL_INIT_STATE
+                    .compare_exchange(
+                        POOL_UNINITIALIZED,
+                        POOL_INITIALIZING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut port = 0u64;
+                let status = unsafe {
+                    syscall4(
+                        SSN_NT_CREATE_IO_COMPLETION,
+                        core::ptr::addr_of_mut!(port) as u64,
+                        IO_COMPLETION_ALL_ACCESS,
+                        0,
+                        0,
+                    ) as u32
+                };
+                if nt_rtl_work_item::nt_success(status) && port != 0 {
+                    WORK_POOL_PORT.store(port, Ordering::Release);
+                    WORK_POOL_INIT_STATE.store(POOL_READY, Ordering::Release);
+                    return STATUS_SUCCESS_U32;
+                }
+                WORK_POOL_INIT_STATE.store(POOL_UNINITIALIZED, Ordering::Release);
+                return if nt_rtl_work_item::nt_success(status) {
+                    STATUS_UNSUCCESSFUL_U32
+                } else {
+                    status
+                };
+            }
+            _ => WORK_POOL_INIT_STATE.store(POOL_UNINITIALIZED, Ordering::Release),
+        }
+    }
+}
+
+type PoolThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
+type StartPoolThread = unsafe extern "system" fn(
+    PoolThreadStart,
+    *mut c_void,
+    *mut u64,
+) -> u32;
+type ExitPoolThread = unsafe extern "system" fn(u32) -> u32;
+type CompletionRoutine =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
+
+unsafe fn default_start_pool_thread(
+    routine: PoolThreadStart,
+    parameter: *mut c_void,
+    thread_handle: *mut u64,
+) -> u32 {
+    unsafe {
+        rtl_create_user_thread(
+            NT_CURRENT_PROCESS,
+            0,
+            1,
+            0,
+            0,
+            0,
+            routine as usize as u64,
+            parameter as u64,
+            thread_handle,
+            core::ptr::null_mut(),
+        ) as u32
+    }
+}
+
+unsafe fn call_start_pool_thread(
+    routine: PoolThreadStart,
+    parameter: *mut c_void,
+    thread_handle: *mut u64,
+) -> u32 {
+    let hook = crate::exports::rtl_start_pool_thread_hook();
+    if hook == 0 {
+        unsafe { default_start_pool_thread(routine, parameter, thread_handle) }
+    } else {
+        let hook: StartPoolThread = unsafe { core::mem::transmute(hook as usize) };
+        unsafe { hook(routine, parameter, thread_handle) }
+    }
+}
+
+unsafe fn start_work_pool_worker() -> u32 {
+    loop {
+        match WORK_POOL_WORKER_STATE.load(Ordering::Acquire) {
+            WORKER_ALIVE => return STATUS_SUCCESS_U32,
+            WORKER_STARTING => {
+                let _ = unsafe { work_pool_delay(-10_000) };
+            }
+            WORKER_STOPPED => {
+                if WORK_POOL_WORKER_STATE
+                    .compare_exchange(
+                        WORKER_STOPPED,
+                        WORKER_STARTING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                break;
+            }
+            _ => WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release),
+        }
+    }
+
+    let latch = nt_rtl_work_item::WorkerStartLatch::new();
+    let mut start = nt_rtl_work_item::WorkerStart::new(
+        rtlp_worker_thread as usize as u64,
+        latch.as_parameter(),
+    );
+    loop {
+        let Some(action) = start.next_action() else {
+            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            return STATUS_UNSUCCESSFUL_U32;
+        };
+        let transition = match action {
+            nt_rtl_work_item::WorkerStartAction::CallStartHook {
+                worker_routine,
+                parameter,
+            } => {
+                let routine: PoolThreadStart =
+                    unsafe { core::mem::transmute(worker_routine as usize) };
+                let mut thread_handle = 0u64;
+                let status = unsafe {
+                    call_start_pool_thread(routine, parameter, &mut thread_handle)
+                };
+                start.advance(nt_rtl_work_item::WorkerStartEvent::StartReturned {
+                    status,
+                    thread_handle,
+                })
+            }
+            nt_rtl_work_item::WorkerStartAction::ResumeThread(thread_handle) => {
+                let mut previous = 0u32;
+                let status = unsafe {
+                    syscall4(
+                        SSN_NT_RESUME_THREAD,
+                        thread_handle,
+                        core::ptr::addr_of_mut!(previous) as u64,
+                        0,
+                        0,
+                    ) as u32
+                };
+                if !nt_rtl_work_item::nt_success(status) {
+                    let _ = unsafe { syscall4(SSN_NT_CLOSE, thread_handle, 0, 0, 0) };
+                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                    return status;
+                }
+                start.advance(nt_rtl_work_item::WorkerStartEvent::ResumeIssued)
+            }
+            nt_rtl_work_item::WorkerStartAction::PollLatch => start.advance(
+                nt_rtl_work_item::WorkerStartEvent::PollObserved(latch.is_acknowledged()),
+            ),
+            nt_rtl_work_item::WorkerStartAction::Delay(interval) => {
+                let _ = unsafe { work_pool_delay(interval) };
+                start.advance(nt_rtl_work_item::WorkerStartEvent::DelayCompleted)
+            }
+            nt_rtl_work_item::WorkerStartAction::CloseThread(thread_handle) => {
+                let _ = unsafe { syscall4(SSN_NT_CLOSE, thread_handle, 0, 0, 0) };
+                start.advance(nt_rtl_work_item::WorkerStartEvent::ThreadClosed)
+            }
+            nt_rtl_work_item::WorkerStartAction::Return(status) => {
+                let _ = start.advance(nt_rtl_work_item::WorkerStartEvent::ReturnDelivered);
+                if !nt_rtl_work_item::nt_success(status) {
+                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                }
+                return status;
+            }
+        };
+        if transition.is_err() {
+            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            return STATUS_UNSUCCESSFUL_U32;
+        }
+    }
+}
+
+unsafe fn cleanup_failed_submission(submission: nt_rtl_work_item::Submission) -> u32 {
+    work_pool_lock_counters();
+    let plan = unsafe {
+        submission.queue_failed(&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS))
+    };
+    work_pool_unlock_counters();
+    let Ok(plan) = plan else {
+        return STATUS_UNSUCCESSFUL_U32;
+    };
+    for action in plan.actions() {
+        match *action {
+            nt_rtl_work_item::CleanupAction::CloseToken(handle) => {
+                let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+            }
+            nt_rtl_work_item::CleanupAction::FreePacket(address) => {
+                let _ = unsafe { crate::process_heap_free(address as *mut u8) };
+            }
+        }
+    }
+    STATUS_SUCCESS_U32
+}
+
+unsafe extern "system" fn rtlp_execute_work_item(
+    _normal_context: *mut c_void,
+    _system_argument1: *mut c_void,
+    system_argument2: *mut c_void,
+) {
+    if system_argument2.is_null() {
+        return;
+    }
+    let packet = unsafe {
+        core::ptr::read_volatile(system_argument2.cast::<nt_rtl_work_item::WorkItemPacket>())
+    };
+    let worker = nt_rtl_work_item::WorkerPacket::from_dequeue(system_argument2 as u64, packet);
+    let mut execution = worker.begin_execution();
+    loop {
+        let Some(action) = execution.next_action() else {
+            break;
+        };
+        let transition = match action {
+            nt_rtl_work_item::ExecutionAction::FreePacket(address) => {
+                let _ = unsafe { crate::process_heap_free(address as *mut u8) };
+                execution.advance(nt_rtl_work_item::ActionResult::Done)
+            }
+            nt_rtl_work_item::ExecutionAction::SetThreadImpersonation(handle) => {
+                let token = handle;
+                let status = unsafe {
+                    syscall4(
+                        SSN_NT_SET_INFORMATION_THREAD,
+                        NT_CURRENT_THREAD,
+                        THREAD_IMPERSONATION_TOKEN,
+                        core::ptr::addr_of!(token) as u64,
+                        core::mem::size_of::<u64>() as u64,
+                    ) as u32
+                };
+                execution.advance(nt_rtl_work_item::ActionResult::Status(status))
+            }
+            nt_rtl_work_item::ExecutionAction::CloseToken(handle) => {
+                let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+                execution.advance(nt_rtl_work_item::ActionResult::Done)
+            }
+            nt_rtl_work_item::ExecutionAction::Invoke { callback, context } => {
+                let callback: unsafe extern "system" fn(*mut c_void) =
+                    unsafe { core::mem::transmute(callback as usize) };
+                unsafe { callback(context as *mut c_void) };
+                execution.advance(nt_rtl_work_item::ActionResult::Callback(
+                    nt_rtl_work_item::CallbackOutcome::Returned,
+                ))
+            }
+            nt_rtl_work_item::ExecutionAction::RevertToSelf => {
+                let token = 0u64;
+                let status = unsafe {
+                    syscall4(
+                        SSN_NT_SET_INFORMATION_THREAD,
+                        NT_CURRENT_THREAD,
+                        THREAD_IMPERSONATION_TOKEN,
+                        core::ptr::addr_of!(token) as u64,
+                        core::mem::size_of::<u64>() as u64,
+                    ) as u32
+                };
+                execution.advance(nt_rtl_work_item::ActionResult::Status(status))
+            }
+            nt_rtl_work_item::ExecutionAction::ClearIoWorkerLong => {
+                execution.advance(nt_rtl_work_item::ActionResult::Done)
+            }
+            nt_rtl_work_item::ExecutionAction::CompleteAccounting { .. } => {
+                work_pool_lock_counters();
+                let result = unsafe {
+                    execution.complete_accounting(
+                        &mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS),
+                    )
+                };
+                work_pool_unlock_counters();
+                if result.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        if transition.is_err() {
+            return;
+        }
+    }
+}
+
+unsafe fn exit_work_pool_thread(status: u32) -> ! {
+    let hook = crate::exports::rtl_exit_pool_thread_hook();
+    if hook != 0 {
+        let hook: ExitPoolThread = unsafe { core::mem::transmute(hook as usize) };
+        let _ = unsafe { hook(status) };
+    }
+    let _ = unsafe {
+        syscall4(
+            SSN_NT_TERMINATE_THREAD,
+            NT_CURRENT_THREAD,
+            status as u64,
+            0,
+            0,
+        )
+    };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[export_name = "RtlpWorkerThread"]
+pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 {
+    WORK_POOL_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
+    if parameter.is_null()
+        || !unsafe { nt_rtl_work_item::WorkerStartLatch::acknowledge_parameter(parameter) }
+    {
+        WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+        unsafe { exit_work_pool_thread(STATUS_INVALID_PARAMETER_U32) };
+    }
+
+    loop {
+        let port = WORK_POOL_PORT.load(Ordering::Acquire);
+        if port == 0 {
+            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            unsafe { exit_work_pool_thread(STATUS_UNSUCCESSFUL_U32) };
+        }
+        let mut key = 0u64;
+        let mut apc_context = 0u64;
+        let mut io_status = [0u64; 2];
+        let timeout = -50_000_000i64;
+        let status = unsafe {
+            syscall6(
+                SSN_NT_REMOVE_IO_COMPLETION,
+                port,
+                core::ptr::addr_of_mut!(key) as u64,
+                core::ptr::addr_of_mut!(apc_context) as u64,
+                io_status.as_mut_ptr() as u64,
+                core::ptr::addr_of!(timeout) as u64,
+                0,
+            ) as u32
+        };
+        if status == STATUS_TIMEOUT_U32 {
+            continue;
+        }
+        if !nt_rtl_work_item::nt_success(status) || key == 0 {
+            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            unsafe { exit_work_pool_thread(status) };
+        }
+        let routine: CompletionRoutine = unsafe { core::mem::transmute(key as usize) };
+        unsafe {
+            routine(
+                core::ptr::null_mut(),
+                io_status[1] as *mut c_void,
+                apc_context as *mut c_void,
+            )
+        };
+    }
+}
+
+pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u32 {
+    if function == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
+    if !matches!(
+        work_flags.queue_class(),
+        nt_rtl_work_item::QueueClass::NormalCompletion
+    ) {
+        return STATUS_NOT_SUPPORTED_U32;
+    }
+    let status = unsafe { initialize_work_pool() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+
+    let packet_address = unsafe {
+        crate::process_heap_alloc(core::mem::size_of::<nt_rtl_work_item::WorkItemPacket>())
+    };
+    if packet_address.is_null() {
+        return STATUS_NO_MEMORY as u32;
+    }
+    let mut token_handle = 0u64;
+    if work_flags.transfers_impersonation() {
+        let token_status = unsafe {
+            syscall4(
+                SSN_NT_OPEN_THREAD_TOKEN,
+                NT_CURRENT_THREAD,
+                TOKEN_IMPERSONATE,
+                1,
+                core::ptr::addr_of_mut!(token_handle) as u64,
+            ) as u32
+        };
+        let capture = nt_rtl_work_item::normalize_token_capture(
+            work_flags,
+            token_status,
+            token_handle,
+        );
+        if !nt_rtl_work_item::nt_success(capture.status()) {
+            let _ = unsafe { crate::process_heap_free(packet_address) };
+            return capture.status();
+        }
+        token_handle = capture.token_handle();
+    }
+
+    let packet = nt_rtl_work_item::WorkItemPacket::new(
+        function,
+        context,
+        work_flags,
+        token_handle,
+    );
+    unsafe {
+        core::ptr::write_volatile(
+            packet_address.cast::<nt_rtl_work_item::WorkItemPacket>(),
+            packet,
+        )
+    };
+    work_pool_lock_counters();
+    let submission = unsafe {
+        (&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS))
+            .reserve(packet_address as u64, packet)
+    };
+    work_pool_unlock_counters();
+    let Ok(submission) = submission else {
+        if token_handle != 0 {
+            let _ = unsafe { syscall4(SSN_NT_CLOSE, token_handle, 0, 0, 0) };
+        }
+        let _ = unsafe { crate::process_heap_free(packet_address) };
+        return STATUS_QUOTA_EXCEEDED_U32;
+    };
+
+    let status = unsafe { start_work_pool_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        let _ = unsafe { cleanup_failed_submission(submission) };
+        return status;
+    }
+    let port = WORK_POOL_PORT.load(Ordering::Acquire);
+    let status = unsafe {
+        syscall6(
+            SSN_NT_SET_IO_COMPLETION,
+            port,
+            rtlp_execute_work_item as usize as u64,
+            packet_address as u64,
+            STATUS_SUCCESS_U32 as u64,
+            0,
+            0,
+        ) as u32
+    };
+    if nt_rtl_work_item::nt_success(status) {
+        let _queued = submission.commit_queue_success();
+        STATUS_SUCCESS_U32
+    } else {
+        let _ = unsafe { cleanup_failed_submission(submission) };
+        status
     }
 }
 

@@ -475,7 +475,7 @@ impl Execution {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolCounters {
     normal_requests: u32,
     normal_long_requests: u32,
@@ -484,6 +484,17 @@ pub struct PoolCounters {
 }
 
 impl PoolCounters {
+    /// Creates an empty counter set. This is `const` so target adapters can keep the
+    /// process-local accounting state in static storage without a separate runtime initializer.
+    pub const fn new() -> Self {
+        Self {
+            normal_requests: 0,
+            normal_long_requests: 0,
+            io_requests: 0,
+            io_long_requests: 0,
+        }
+    }
+
     pub const fn requests(&self, lane: CounterLane) -> u32 {
         match lane {
             CounterLane::Normal => self.normal_requests,
@@ -586,6 +597,12 @@ impl PoolCounters {
         }
         *active = false;
         Ok(())
+    }
+}
+
+impl Default for PoolCounters {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -804,6 +821,17 @@ mod tests {
         assert_eq!(offset_of!(WorkItemPacket, context), 0x08);
         assert_eq!(offset_of!(WorkItemPacket, flags), 0x10);
         assert_eq!(offset_of!(WorkItemPacket, token_handle), 0x18);
+    }
+
+    #[test]
+    fn pool_counters_const_constructor_matches_default() {
+        const COUNTERS: PoolCounters = PoolCounters::new();
+
+        assert_eq!(COUNTERS, PoolCounters::default());
+        assert_eq!(COUNTERS.requests(CounterLane::Normal), 0);
+        assert_eq!(COUNTERS.long_requests(CounterLane::Normal), 0);
+        assert_eq!(COUNTERS.requests(CounterLane::Io), 0);
+        assert_eq!(COUNTERS.long_requests(CounterLane::Io), 0);
     }
 
     #[test]

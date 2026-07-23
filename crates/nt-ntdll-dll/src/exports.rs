@@ -104,6 +104,16 @@ static RTL_EXIT_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
 static LDR_TOP_LEVEL_CALLOUT_TEB: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn rtl_start_pool_thread_hook() -> u64 {
+    RTL_START_POOL_THREAD.load(Ordering::Acquire)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn rtl_exit_pool_thread_hook() -> u64 {
+    RTL_EXIT_POOL_THREAD.load(Ordering::Acquire)
+}
+
 /// Process-wide loader lock in the exact x64 `RTL_CRITICAL_SECTION` layout. The no-debug sentinel
 /// makes the statically initialized lock valid before the process heap exists.
 #[repr(C, align(8))]
@@ -16563,23 +16573,31 @@ pub unsafe extern "system" fn rtl_delete_timer_queue(timer_queue: *mut c_void) -
     }
 }
 
-/// `RtlQueueWorkItem(WORKERCALLBACKFUNC Function, PVOID Context, ULONG Flags) -> NTSTATUS`. No
-/// thread-pool plane. Rather than drop the work (which could hang a caller awaiting it), we run it
-/// SYNCHRONOUSLY inline — a legitimate degenerate thread pool (immediate execution on the caller's
-/// thread). This is the honest behavior for a single-threaded environment, not a no-op that loses
-/// the work.
+/// `RtlQueueWorkItem(WORKERCALLBACKFUNC Function, PVOID Context, ULONG Flags) -> NTSTATUS`.
+/// On target this submits to the process-local completion-port worker.
 ///
 /// # Safety
 /// `function` a valid `void(*)(PVOID)` callback; `context` its argument.
 #[export_name = "RtlQueueWorkItem"]
 pub unsafe extern "system" fn rtl_queue_work_item(
-    function: extern "system" fn(*mut c_void),
+    function: *mut c_void,
     context: *mut c_void,
-    _flags: u32,
+    flags: u32,
 ) -> NtStatus {
-    // Run inline (synchronous degenerate thread pool).
-    function(context);
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::rtl_queue_work_item(function as u64, context as u64, flags) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if function.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let callback: unsafe extern "system" fn(*mut c_void) =
+            unsafe { core::mem::transmute(function) };
+        unsafe { callback(context) };
+        STATUS_SUCCESS
+    }
 }
 
 /// `RtlRegisterWait(PHANDLE NewWaitObject, HANDLE Object, WAITORTIMERCALLBACK Callback,
@@ -16661,6 +16679,9 @@ pub unsafe extern "system" fn rtl_set_thread_pool_start_func(
     start_func: *mut c_void,
     exit_func: *mut c_void,
 ) -> NtStatus {
+    if start_func.is_null() != exit_func.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
     RTL_START_POOL_THREAD.store(start_func as u64, Ordering::Release);
     RTL_EXIT_POOL_THREAD.store(exit_func as u64, Ordering::Release);
     STATUS_SUCCESS
