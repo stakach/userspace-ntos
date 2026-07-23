@@ -79,7 +79,7 @@ pub unsafe fn format_narrow<A: Arguments, O: Output>(
     if format.is_null() {
         return Err(());
     }
-    unsafe { format_impl(NarrowFormat(format), false, args, output) }
+    unsafe { format_impl(NarrowFormat(format), false, true, args, output) }
 }
 
 /// Format a NUL-terminated UTF-16 format string.
@@ -94,12 +94,33 @@ pub unsafe fn format_wide<A: Arguments, O: Output>(
     if format.is_null() {
         return Err(());
     }
-    unsafe { format_impl(WideFormat(format), true, args, output) }
+    unsafe { format_impl(WideFormat(format), true, true, args, output) }
+}
+
+/// Format an `RtlFormatMessage` insertion fragment.
+///
+/// Message insertion fragments use the wide printf grammar, but unknown conversions omit the
+/// leading percent sign. `arguments_are_ansi` reverses the default `%s`/`%S` and `%c`/`%C`
+/// interpretation in the same way as the native routine.
+///
+/// # Safety
+/// `format` and every pointer described by it must satisfy the C printf contract.
+pub unsafe fn format_wide_message<A: Arguments, O: Output>(
+    format: *const u16,
+    arguments_are_ansi: bool,
+    args: &mut A,
+    output: &mut O,
+) -> Result<usize, ()> {
+    if format.is_null() {
+        return Err(());
+    }
+    unsafe { format_impl(WideFormat(format), !arguments_are_ansi, false, args, output) }
 }
 
 unsafe fn format_impl<F: FormatInput, A: Arguments, O: Output>(
     format: F,
     wide_output: bool,
+    unknown_with_percent: bool,
     args: &mut A,
     output: &mut O,
 ) -> Result<usize, ()> {
@@ -147,7 +168,9 @@ unsafe fn format_impl<F: FormatInput, A: Arguments, O: Output>(
             index += 1;
         } else {
             while let digit @ b'0'..=b'9' = unsafe { format.unit(index) } as u8 {
-                width = width.saturating_mul(10).saturating_add((digit - b'0') as usize);
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add((digit - b'0') as usize);
                 index += 1;
             }
         }
@@ -205,7 +228,13 @@ unsafe fn format_impl<F: FormatInput, A: Arguments, O: Output>(
             }
             b'u' | b'o' | b'x' | b'X' => {
                 let value = unsafe { next_unsigned(args, length) };
-                let base = if spec == b'o' { 8 } else if spec == b'u' { 10 } else { 16 };
+                let base = if spec == b'o' {
+                    8
+                } else if spec == b'u' {
+                    10
+                } else {
+                    16
+                };
                 emit_integer(
                     output,
                     &mut position,
@@ -285,18 +314,12 @@ unsafe fn format_impl<F: FormatInput, A: Arguments, O: Output>(
             }
             b'f' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
                 let value = f64::from_bits(unsafe { args.next(ArgumentKind::Double) });
-                emit_float(
-                    output,
-                    &mut position,
-                    value,
-                    spec,
-                    flags,
-                    width,
-                    precision,
-                )?;
+                emit_float(output, &mut position, value, spec, flags, width, precision)?;
             }
             other => {
-                emit(output, &mut position, b'%' as u16)?;
+                if unknown_with_percent {
+                    emit(output, &mut position, b'%' as u16)?;
+                }
                 emit(output, &mut position, other as u16)?;
             }
         }
@@ -382,12 +405,12 @@ unsafe fn write_count(pointer: usize, length: Length, value: usize) {
     match length {
         Length::Hh => unsafe { core::ptr::write_unaligned(pointer as *mut i8, value as i8) },
         Length::H => unsafe { core::ptr::write_unaligned(pointer as *mut i16, value as i16) },
-        Length::Ll | Length::I64 => {
-            unsafe { core::ptr::write_unaligned(pointer as *mut i64, value as i64) }
-        }
-        Length::I | Length::Z => {
-            unsafe { core::ptr::write_unaligned(pointer as *mut isize, value as isize) }
-        }
+        Length::Ll | Length::I64 => unsafe {
+            core::ptr::write_unaligned(pointer as *mut i64, value as i64)
+        },
+        Length::I | Length::Z => unsafe {
+            core::ptr::write_unaligned(pointer as *mut isize, value as isize)
+        },
         _ => unsafe { core::ptr::write_unaligned(pointer as *mut i32, value as i32) },
     }
 }
@@ -591,11 +614,7 @@ fn render_fixed(value: f64, precision: usize) -> Result<FloatText, ()> {
     Ok(text)
 }
 
-fn render_scientific(
-    value: f64,
-    precision: usize,
-    upper: bool,
-) -> Result<(FloatText, i32), ()> {
+fn render_scientific(value: f64, precision: usize, upper: bool) -> Result<(FloatText, i32), ()> {
     let computed = precision.min(17);
     let extra = precision.saturating_sub(computed);
     let mut exponent = decimal_exponent(value);
@@ -665,8 +684,7 @@ fn render_float_magnitude(
             let fractional = significant.saturating_sub(1);
             let exponent = decimal_exponent(value);
             if exponent < -4 || exponent >= fractional as i32 {
-                let (mut text, _) =
-                    render_scientific(value, fractional, spec == b'G')?;
+                let (mut text, _) = render_scientific(value, fractional, spec == b'G')?;
                 if alternate {
                     ensure_decimal_point(&mut text)?;
                 }
@@ -782,7 +800,11 @@ fn emit_integer<O: Output>(
         None
     };
     let prefix = if flags.alternate && base == 16 && value != 0 {
-        if upper { b'X' } else { b'x' }
+        if upper {
+            b'X'
+        } else {
+            b'x'
+        }
     } else {
         0
     };
@@ -920,7 +942,10 @@ mod tests {
             ),
             Ok(b"+00042 0X00002A 7     002a -9".to_vec())
         );
-        assert_eq!(render(b"%hhd %hu %p\0", &[0xff, 0x1_0001, 0x123]), Ok(b"-1 1 0000000000000123".to_vec()));
+        assert_eq!(
+            render(b"%hhd %hu %p\0", &[0xff, 0x1_0001, 0x123]),
+            Ok(b"-1 1 0000000000000123".to_vec())
+        );
     }
 
     #[test]
@@ -955,21 +980,39 @@ mod tests {
 
     #[test]
     fn bounded_output_distinguishes_exact_fit_and_overflow() {
-        let mut args = TestArgs { values: &[], index: 0 };
+        let mut args = TestArgs {
+            values: &[],
+            index: 0,
+        };
         let mut exact = TestOutput {
             units: Vec::new(),
             capacity: 4,
         };
-        assert_eq!(unsafe { format_narrow(b"test\0".as_ptr(), &mut args, &mut exact) }, Ok(4));
-        assert_eq!(exact.units, b"test".iter().map(|byte| *byte as u16).collect::<Vec<_>>());
+        assert_eq!(
+            unsafe { format_narrow(b"test\0".as_ptr(), &mut args, &mut exact) },
+            Ok(4)
+        );
+        assert_eq!(
+            exact.units,
+            b"test".iter().map(|byte| *byte as u16).collect::<Vec<_>>()
+        );
 
-        let mut args = TestArgs { values: &[], index: 0 };
+        let mut args = TestArgs {
+            values: &[],
+            index: 0,
+        };
         let mut short = TestOutput {
             units: Vec::new(),
             capacity: 3,
         };
-        assert_eq!(unsafe { format_narrow(b"test\0".as_ptr(), &mut args, &mut short) }, Err(()));
-        assert_eq!(short.units, b"tes".iter().map(|byte| *byte as u16).collect::<Vec<_>>());
+        assert_eq!(
+            unsafe { format_narrow(b"test\0".as_ptr(), &mut args, &mut short) },
+            Err(())
+        );
+        assert_eq!(
+            short.units,
+            b"tes".iter().map(|byte| *byte as u16).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1002,10 +1045,22 @@ mod tests {
             render(b"%.20f\0", &[1.0f64.to_bits()]),
             Ok(b"1.00000000000000000000".to_vec())
         );
-        assert_eq!(render(b"%a %A\0", &[8.6f64.to_bits(), 8.6f64.to_bits()]), Ok(b"8.600000 8.600000".to_vec()));
-        assert_eq!(render(b"%f\0", &[f64::NAN.to_bits()]), Ok(b"1.#QNAN".to_vec()));
-        assert_eq!(render(b"%f\0", &[f64::INFINITY.to_bits()]), Ok(b"1.#INF".to_vec()));
-        assert_eq!(render(b"%f\0", &[f64::NEG_INFINITY.to_bits()]), Ok(b"-1.#INF".to_vec()));
+        assert_eq!(
+            render(b"%a %A\0", &[8.6f64.to_bits(), 8.6f64.to_bits()]),
+            Ok(b"8.600000 8.600000".to_vec())
+        );
+        assert_eq!(
+            render(b"%f\0", &[f64::NAN.to_bits()]),
+            Ok(b"1.#QNAN".to_vec())
+        );
+        assert_eq!(
+            render(b"%f\0", &[f64::INFINITY.to_bits()]),
+            Ok(b"1.#INF".to_vec())
+        );
+        assert_eq!(
+            render(b"%f\0", &[f64::NEG_INFINITY.to_bits()]),
+            Ok(b"-1.#INF".to_vec())
+        );
     }
 
     #[test]
@@ -1023,7 +1078,10 @@ mod tests {
             Ok(b"1.25E-002".to_vec())
         );
         assert_eq!(render(b"%g\0", &[8.6f64.to_bits()]), Ok(b"8.6".to_vec()));
-        assert_eq!(render(b"%g\0", &[0.0005f64.to_bits()]), Ok(b"0.0005".to_vec()));
+        assert_eq!(
+            render(b"%g\0", &[0.0005f64.to_bits()]),
+            Ok(b"0.0005".to_vec())
+        );
         assert_eq!(
             render(b"%g\0", &[0.00005f64.to_bits()]),
             Ok(b"5.00000e-005".to_vec())

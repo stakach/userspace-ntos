@@ -12193,6 +12193,182 @@ pub unsafe extern "system" fn rtl_find_message(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+struct FormatMessageArguments {
+    cursor: *const u64,
+    cursor_storage: Option<*mut *const u64>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FormatMessageArguments {
+    unsafe fn new(arguments: *mut c_void, arguments_are_an_array: bool) -> Option<Self> {
+        if arguments.is_null() {
+            return None;
+        }
+        if arguments_are_an_array {
+            Some(Self {
+                cursor: arguments.cast(),
+                cursor_storage: None,
+            })
+        } else {
+            let storage = arguments as *mut *const u64;
+            Some(Self {
+                cursor: unsafe { core::ptr::read_unaligned(storage) },
+                cursor_storage: Some(storage),
+            })
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl nt_ntdll::rtl::message::MessageArguments for FormatMessageArguments {
+    fn next_slot(&mut self) -> Option<u64> {
+        if self.cursor.is_null() {
+            return None;
+        }
+        let value = unsafe { core::ptr::read_unaligned(self.cursor) };
+        self.cursor = unsafe { self.cursor.add(1) };
+        if let Some(storage) = self.cursor_storage {
+            unsafe { core::ptr::write_unaligned(storage, self.cursor) };
+        }
+        Some(value)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_format_message_common(
+    message: *const u16,
+    maximum_width: u32,
+    ignore_inserts: u8,
+    arguments_are_ansi: u8,
+    arguments_are_an_array: u8,
+    arguments: *mut c_void,
+    buffer: *mut u16,
+    buffer_size: u32,
+    return_length: *mut u32,
+) -> NtStatus {
+    if message.is_null() || buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let message = match unsafe { copy_utf16_z_bounded(message, 1024 * 1024) } {
+        Ok(message) => message,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    let mut arguments = unsafe {
+        FormatMessageArguments::new(arguments, arguments_are_an_array != 0)
+    };
+    let output = unsafe {
+        core::slice::from_raw_parts_mut(buffer, (buffer_size as usize) / core::mem::size_of::<u16>())
+    };
+    match nt_ntdll::rtl::message::format_message(
+        &message,
+        nt_ntdll::rtl::message::FormatMessageOptions {
+            maximum_width,
+            ignore_inserts: ignore_inserts != 0,
+            arguments_are_ansi: arguments_are_ansi != 0,
+            arguments_are_an_array: arguments_are_an_array != 0,
+        },
+        arguments
+            .as_mut()
+            .map(|arguments| arguments as &mut dyn nt_ntdll::rtl::message::MessageArguments),
+        output,
+    ) {
+        Ok(bytes) => {
+            if !return_length.is_null() {
+                unsafe { core::ptr::write_unaligned(return_length, bytes as u32) };
+            }
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// `RtlFormatMessage(PWSTR Message, ULONG MaxWidth, BOOLEAN IgnoreInserts,
+/// BOOLEAN ArgumentsAreAnsi, BOOLEAN ArgumentsAreAnArray, va_list *Arguments, PWSTR Buffer,
+/// ULONG BufferSize, PULONG ReturnLength) -> NTSTATUS`.
+///
+/// # Safety
+/// Strings, argument slots, and output pointers follow the native formatting contract.
+#[export_name = "RtlFormatMessage"]
+pub unsafe extern "system" fn rtl_format_message(
+    message: *const u16,
+    maximum_width: u32,
+    ignore_inserts: u8,
+    arguments_are_ansi: u8,
+    arguments_are_an_array: u8,
+    arguments: *mut c_void,
+    buffer: *mut u16,
+    buffer_size: u32,
+    return_length: *mut u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            rtl_format_message_common(
+                message,
+                maximum_width,
+                ignore_inserts,
+                arguments_are_ansi,
+                arguments_are_an_array,
+                arguments,
+                buffer,
+                buffer_size,
+                return_length,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            message,
+            maximum_width,
+            ignore_inserts,
+            arguments_are_ansi,
+            arguments_are_an_array,
+            arguments,
+            buffer,
+            buffer_size,
+            return_length,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlFormatMessageEx(..., PULONG ReturnLength, ULONG Flags) -> NTSTATUS`.
+///
+/// ReactOS and Wine define no flag bits; native implementations accept and ignore the field.
+///
+/// # Safety
+/// Strings, argument slots, and output pointers follow the native formatting contract.
+#[export_name = "RtlFormatMessageEx"]
+pub unsafe extern "system" fn rtl_format_message_ex(
+    message: *const u16,
+    maximum_width: u32,
+    ignore_inserts: u8,
+    arguments_are_ansi: u8,
+    arguments_are_an_array: u8,
+    arguments: *mut c_void,
+    buffer: *mut u16,
+    buffer_size: u32,
+    return_length: *mut u32,
+    flags: u32,
+) -> NtStatus {
+    let _ = flags;
+    unsafe {
+        rtl_format_message(
+            message,
+            maximum_width,
+            ignore_inserts,
+            arguments_are_ansi,
+            arguments_are_an_array,
+            arguments,
+            buffer,
+            buffer_size,
+            return_length,
+        )
+    }
+}
+
 // =================================================================================================
 // BATCH 4 — Rtl* activation-context (SxS) / path / guid / image / handle-table / resource-lock /
 // timer-queue / thread-pool / debug-buffer families.
@@ -28310,6 +28486,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_release_relative_name as usize,
         rtl_dos_search_path_ustr as usize,
         rtl_find_message as usize,
+        rtl_format_message as *const () as usize,
+        rtl_format_message_ex as *const () as usize,
     ];
     core::hint::black_box(anchors_pathenv);
     #[cfg(target_arch = "x86_64")]
