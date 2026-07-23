@@ -29,21 +29,455 @@ pub const ALLOCATION_GRANULARITY: u64 = 64 * 1024;
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
-pub const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_003E;
+pub const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_0045;
 pub const STATUS_COMMITMENT_LIMIT: u32 = 0xC000_012D;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_UNABLE_TO_FREE_VM: u32 = 0xC000_001A;
+pub const STATUS_FREE_VM_NOT_AT_BASE: u32 = 0xC000_009F;
+pub const STATUS_MEMORY_NOT_ALLOCATED: u32 = 0xC000_00A0;
+pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+pub const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+pub const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+pub const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
+
+pub const MEM_COMMIT: u32 = 0x1000;
+pub const MEM_RESERVE: u32 = 0x2000;
+pub const MEM_DECOMMIT: u32 = 0x4000;
+pub const MEM_RELEASE: u32 = 0x8000;
 
 // Page protection
 pub const PAGE_NOACCESS: u32 = 0x01;
 pub const PAGE_READONLY: u32 = 0x02;
 pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_WRITECOPY: u32 = 0x08;
+pub const PAGE_EXECUTE: u32 = 0x10;
+pub const PAGE_EXECUTE_READ: u32 = 0x20;
+pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+pub const PAGE_GUARD: u32 = 0x100;
+pub const PAGE_NOCACHE: u32 = 0x200;
+pub const PAGE_WRITECOMBINE: u32 = 0x400;
 
 fn writable(p: u32) -> bool {
     p == PAGE_READWRITE
 }
 fn valid_prot(p: u32) -> bool {
     matches!(p, PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE)
+}
+
+fn valid_private_vm_protection(protection: u32) -> bool {
+    const BASE_MASK: u32 = 0xff;
+    const MODIFIER_MASK: u32 = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+    let base = protection & BASE_MASK;
+    let valid_base = matches!(
+        base,
+        PAGE_NOACCESS
+            | PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_EXECUTE
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+    );
+    valid_base
+        && protection & !(BASE_MASK | MODIFIER_MASK) == 0
+        && !(base == PAGE_NOACCESS && protection & MODIFIER_MASK != 0)
+        && protection & (PAGE_NOCACHE | PAGE_WRITECOMBINE) != PAGE_NOCACHE | PAGE_WRITECOMBINE
+}
+
+/// Reservation state for one private-memory extent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VmExtentState {
+    Reserved,
+    Committed,
+}
+
+/// One contiguous part of a private allocation. Splitting an allocation preserves its original
+/// `allocation_base`, which lets release/decommit apply ReactOS VAD rules without heap allocation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmExtent {
+    pub base: u64,
+    pub size: u64,
+    pub allocation_base: u64,
+    pub protection: u32,
+    pub state: VmExtentState,
+}
+
+impl VmExtent {
+    pub const fn end(self) -> u64 {
+        self.base + self.size
+    }
+}
+
+/// The normalized range produced after a successful reserve/commit policy mutation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmAllocatePlan {
+    pub base: u64,
+    pub size: u64,
+}
+
+/// The normalized range whose committed pages must be unmapped after a successful policy mutation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmFreePlan {
+    pub base: u64,
+    pub size: u64,
+    pub free_type: u32,
+}
+
+/// Fixed-capacity private VAD policy for the executive. This deliberately owns no `Vec` or
+/// `BTreeMap`: syscall dispatch rewinds its transient bump heap after every call.
+#[derive(Copy, Clone)]
+pub struct VmRegionMap<const N: usize> {
+    lower_bound: u64,
+    upper_bound: u64,
+    extents: [Option<VmExtent>; N],
+}
+
+impl<const N: usize> VmRegionMap<N> {
+    pub const fn new(lower_bound: u64, upper_bound: u64) -> Self {
+        Self {
+            lower_bound,
+            upper_bound,
+            extents: [None; N],
+        }
+    }
+
+    pub fn extent_count(&self) -> usize {
+        self.extents
+            .iter()
+            .filter(|extent| extent.is_some())
+            .count()
+    }
+
+    pub fn extent_at(&self, address: u64) -> Option<VmExtent> {
+        self.extents
+            .iter()
+            .flatten()
+            .copied()
+            .find(|extent| address >= extent.base && address < extent.end())
+    }
+
+    pub fn is_committed(&self, address: u64) -> bool {
+        self.extent_at(address)
+            .is_some_and(|extent| extent.state == VmExtentState::Committed)
+    }
+
+    fn align_up(value: u64, alignment: u64) -> Option<u64> {
+        value
+            .checked_add(alignment - 1)
+            .map(|value| value & !(alignment - 1))
+    }
+
+    fn overlaps(&self, base: u64, end: u64) -> bool {
+        self.extents
+            .iter()
+            .flatten()
+            .any(|extent| base < extent.end() && extent.base < end)
+    }
+
+    fn insert(&mut self, extent: VmExtent) -> Result<(), u32> {
+        let slot = self
+            .extents
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *slot = Some(extent);
+        Ok(())
+    }
+
+    fn insert_normalized(&mut self, extent: VmExtent) -> Result<(), u32> {
+        for current in self.extents.iter_mut().flatten() {
+            if current.allocation_base == extent.allocation_base
+                && current.protection == extent.protection
+                && current.state == extent.state
+            {
+                if current.end() == extent.base {
+                    current.size += extent.size;
+                    self.normalize();
+                    return Ok(());
+                }
+                if extent.end() == current.base {
+                    current.base = extent.base;
+                    current.size += extent.size;
+                    self.normalize();
+                    return Ok(());
+                }
+            }
+        }
+        self.insert(extent)?;
+        self.normalize();
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        for left in 0..N {
+            for right in left + 1..N {
+                let swap = match (self.extents[left], self.extents[right]) {
+                    (None, Some(_)) => true,
+                    (Some(a), Some(b)) => b.base < a.base,
+                    _ => false,
+                };
+                if swap {
+                    self.extents.swap(left, right);
+                }
+            }
+        }
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read < N {
+            let Some(mut current) = self.extents[read] else {
+                break;
+            };
+            read += 1;
+            while read < N {
+                let Some(next) = self.extents[read] else {
+                    break;
+                };
+                if current.end() != next.base
+                    || current.allocation_base != next.allocation_base
+                    || current.protection != next.protection
+                    || current.state != next.state
+                {
+                    break;
+                }
+                current.size += next.size;
+                read += 1;
+            }
+            self.extents[write] = Some(current);
+            write += 1;
+        }
+        self.extents[write..].fill(None);
+    }
+
+    fn find_free(&self, size: u64) -> Option<u64> {
+        let mut candidate = Self::align_up(self.lower_bound, ALLOCATION_GRANULARITY)?;
+        loop {
+            let end = candidate.checked_add(size)?;
+            if end > self.upper_bound {
+                return None;
+            }
+            let mut next = None;
+            for extent in self.extents.iter().flatten() {
+                if candidate < extent.end() && extent.base < end {
+                    next = Some(Self::align_up(extent.end(), ALLOCATION_GRANULARITY)?);
+                    break;
+                }
+            }
+            match next {
+                Some(address) => candidate = address,
+                None => return Some(candidate),
+            }
+        }
+    }
+
+    fn allocation_for_range(&self, base: u64, end: u64) -> Result<u64, u32> {
+        let first = self.extent_at(base).ok_or(STATUS_MEMORY_NOT_ALLOCATED)?;
+        let allocation_base = first.allocation_base;
+        let mut position = base;
+        while position < end {
+            let extent = self.extent_at(position).ok_or(STATUS_UNABLE_TO_FREE_VM)?;
+            if extent.allocation_base != allocation_base {
+                return Err(STATUS_UNABLE_TO_FREE_VM);
+            }
+            position = extent.end().min(end);
+        }
+        Ok(allocation_base)
+    }
+
+    fn allocation_end(&self, allocation_base: u64) -> Option<u64> {
+        self.extents
+            .iter()
+            .flatten()
+            .filter(|extent| extent.allocation_base == allocation_base)
+            .map(|extent| extent.end())
+            .max()
+    }
+
+    fn rewrite_range(
+        &mut self,
+        base: u64,
+        end: u64,
+        replacement: Option<(VmExtentState, Option<u32>)>,
+    ) -> Result<(), u32> {
+        let mut next = Self::new(self.lower_bound, self.upper_bound);
+        for extent in self.extents.iter().flatten().copied() {
+            if extent.end() <= base || extent.base >= end {
+                next.insert_normalized(extent)?;
+                continue;
+            }
+            if extent.base < base {
+                next.insert_normalized(VmExtent {
+                    size: base - extent.base,
+                    ..extent
+                })?;
+            }
+            if let Some((state, protection)) = replacement {
+                let middle_base = extent.base.max(base);
+                let middle_end = extent.end().min(end);
+                next.insert_normalized(VmExtent {
+                    base: middle_base,
+                    size: middle_end - middle_base,
+                    protection: protection.unwrap_or(extent.protection),
+                    state,
+                    ..extent
+                })?;
+            }
+            if extent.end() > end {
+                next.insert_normalized(VmExtent {
+                    base: end,
+                    size: extent.end() - end,
+                    ..extent
+                })?;
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Apply `MEM_RESERVE`/`MEM_COMMIT` policy and return the page-normalized range to map.
+    pub fn allocate(
+        &mut self,
+        requested_base: Option<u64>,
+        requested_size: u64,
+        allocation_type: u32,
+        protection: u32,
+    ) -> Result<VmAllocatePlan, u32> {
+        if allocation_type & !(MEM_RESERVE | MEM_COMMIT) != 0
+            || allocation_type & (MEM_RESERVE | MEM_COMMIT) == 0
+        {
+            return Err(STATUS_INVALID_PARAMETER_5);
+        }
+        if !valid_private_vm_protection(protection) {
+            return Err(STATUS_INVALID_PAGE_PROTECTION);
+        }
+        if requested_base.is_some_and(|address| address >= self.upper_bound) {
+            return Err(STATUS_INVALID_PARAMETER_2);
+        }
+        let available = match requested_base {
+            Some(address) => self.upper_bound - address,
+            None => self.upper_bound,
+        };
+        if requested_size > available || requested_size == 0 {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        if allocation_type & MEM_RESERVE != 0 || requested_base.is_none() {
+            let (base, end) = match requested_base {
+                Some(address) => {
+                    let base = address & !(ALLOCATION_GRANULARITY - 1);
+                    let end = Self::align_up(
+                        address
+                            .checked_add(requested_size)
+                            .ok_or(STATUS_INVALID_PARAMETER_4)?,
+                        PAGE_SIZE,
+                    )
+                    .ok_or(STATUS_INVALID_PARAMETER_4)?;
+                    (base, end)
+                }
+                None => {
+                    let size = Self::align_up(requested_size, PAGE_SIZE)
+                        .ok_or(STATUS_INVALID_PARAMETER_4)?;
+                    let base = self.find_free(size).ok_or(STATUS_NO_MEMORY)?;
+                    (base, base + size)
+                }
+            };
+            if end > self.upper_bound || end <= base {
+                return Err(STATUS_INVALID_PARAMETER_4);
+            }
+            if base < self.lower_bound || self.overlaps(base, end) {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            self.insert(VmExtent {
+                base,
+                size: end - base,
+                allocation_base: base,
+                protection,
+                state: if allocation_type & MEM_COMMIT != 0 {
+                    VmExtentState::Committed
+                } else {
+                    VmExtentState::Reserved
+                },
+            })?;
+            self.normalize();
+            Ok(VmAllocatePlan {
+                base,
+                size: end - base,
+            })
+        } else {
+            let address = requested_base.unwrap();
+            let base = address & !(PAGE_SIZE - 1);
+            let end = Self::align_up(
+                address
+                    .checked_add(requested_size)
+                    .ok_or(STATUS_INVALID_PARAMETER_4)?,
+                PAGE_SIZE,
+            )
+            .ok_or(STATUS_INVALID_PARAMETER_4)?;
+            if end > self.upper_bound || end <= base {
+                return Err(STATUS_INVALID_PARAMETER_4);
+            }
+            if self.allocation_for_range(base, end).is_err() {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            self.rewrite_range(
+                base,
+                end,
+                Some((VmExtentState::Committed, Some(protection))),
+            )?;
+            Ok(VmAllocatePlan {
+                base,
+                size: end - base,
+            })
+        }
+    }
+
+    /// Apply ReactOS private-VAD release/decommit policy and return the normalized pages to unmap.
+    pub fn free(
+        &mut self,
+        requested_base: u64,
+        requested_size: u64,
+        free_type: u32,
+    ) -> Result<VmFreePlan, u32> {
+        if free_type != MEM_RELEASE && free_type != MEM_DECOMMIT {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        let base = requested_base & !(PAGE_SIZE - 1);
+        let first = self.extent_at(base).ok_or(STATUS_MEMORY_NOT_ALLOCATED)?;
+        let allocation_base = first.allocation_base;
+        let end = if requested_size == 0 {
+            if base != first.base || first.base != allocation_base {
+                return Err(STATUS_FREE_VM_NOT_AT_BASE);
+            }
+            self.allocation_end(allocation_base)
+                .ok_or(STATUS_MEMORY_NOT_ALLOCATED)?
+        } else {
+            Self::align_up(
+                requested_base
+                    .checked_add(requested_size)
+                    .ok_or(STATUS_UNABLE_TO_FREE_VM)?,
+                PAGE_SIZE,
+            )
+            .ok_or(STATUS_UNABLE_TO_FREE_VM)?
+        };
+        self.allocation_for_range(base, end)?;
+        self.rewrite_range(
+            base,
+            end,
+            (free_type == MEM_DECOMMIT).then_some((VmExtentState::Reserved, None)),
+        )?;
+        if free_type == MEM_RELEASE {
+            for extent in self.extents.iter_mut().flatten() {
+                if extent.allocation_base == allocation_base && extent.base >= end {
+                    extent.allocation_base = end;
+                }
+            }
+            self.normalize();
+        }
+        Ok(VmFreePlan {
+            base,
+            size: end - base,
+            free_type,
+        })
+    }
 }
 
 /// The kind of access that raised a fault (spec §12.1).
