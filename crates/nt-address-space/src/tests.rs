@@ -1,4 +1,69 @@
 use super::*;
+
+#[test]
+fn page_chunks_cover_in_page_boundary_and_cross_page_ranges() {
+    assert_eq!(page_chunks(0x1234, 0).unwrap().next(), None);
+    assert_eq!(
+        page_chunks(0x1234, 3).unwrap().collect::<Vec<_>>(),
+        vec![PageChunk {
+            page_base: 0x1000,
+            page_offset: 0x234,
+            length: 3,
+        }]
+    );
+    assert_eq!(
+        page_chunks(0x1fff, 1).unwrap().collect::<Vec<_>>(),
+        vec![PageChunk {
+            page_base: 0x1000,
+            page_offset: 0xfff,
+            length: 1,
+        }]
+    );
+    assert_eq!(
+        page_chunks(0x1ffe, 5).unwrap().collect::<Vec<_>>(),
+        vec![
+            PageChunk {
+                page_base: 0x1000,
+                page_offset: 0xffe,
+                length: 2,
+            },
+            PageChunk {
+                page_base: 0x2000,
+                page_offset: 0,
+                length: 3,
+            },
+        ]
+    );
+}
+
+#[test]
+fn page_chunks_reject_address_space_overflow() {
+    assert!(page_chunks(u64::MAX, 0).is_some());
+    assert!(page_chunks(u64::MAX, 1).is_none());
+    assert!(page_chunks(u64::MAX - 6, 8).is_none());
+}
+
+#[test]
+fn page_chunks_cover_the_grown_stack_native_tail_window() {
+    let chunks = page_chunks(0x0000_0100_105b_ffe0, 0x50)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunks,
+        vec![
+            PageChunk {
+                page_base: 0x0000_0100_105b_f000,
+                page_offset: 0xfe0,
+                length: 0x20,
+            },
+            PageChunk {
+                page_base: 0x0000_0100_105c_0000,
+                page_offset: 0,
+                length: 0x30,
+            },
+        ]
+    );
+}
 use nt_cache_manager::{FileSizes, MemoryBacking, SharedCacheMap};
 
 fn file_cache(bytes: &[u8]) -> SharedCacheMap<MemoryBacking> {

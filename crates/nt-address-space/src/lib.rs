@@ -25,6 +25,53 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 pub const PAGE_SIZE: u64 = 4096;
 pub const ALLOCATION_GRANULARITY: u64 = 64 * 1024;
 
+/// One contiguous part of a byte range that lies within a single native page.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PageChunk {
+    pub page_base: u64,
+    pub page_offset: usize,
+    pub length: usize,
+}
+
+/// Allocation-free iterator over the pages touched by a byte range.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PageChunks {
+    next_address: u64,
+    remaining: usize,
+}
+
+/// Split `[address, address + length)` into page-bounded chunks.
+///
+/// Returns `None` when the byte range would overflow the native address space.
+pub fn page_chunks(address: u64, length: usize) -> Option<PageChunks> {
+    let length_u64 = u64::try_from(length).ok()?;
+    address.checked_add(length_u64)?;
+    Some(PageChunks {
+        next_address: address,
+        remaining: length,
+    })
+}
+
+impl Iterator for PageChunks {
+    type Item = PageChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let page_base = self.next_address & !(PAGE_SIZE - 1);
+        let page_offset = (self.next_address - page_base) as usize;
+        let length = (PAGE_SIZE as usize - page_offset).min(self.remaining);
+        self.next_address += length as u64;
+        self.remaining -= length;
+        Some(PageChunk {
+            page_base,
+            page_offset,
+            length,
+        })
+    }
+}
+
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;

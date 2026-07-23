@@ -16,8 +16,8 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-pub mod system_information;
 pub mod hard_error;
+pub mod system_information;
 
 // NTSTATUS (spec §18)
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -322,75 +322,9 @@ impl NativeService {
 
     /// The `(min, max)` argument count for the service (spec §9.1).
     pub fn arg_count(self) -> (u8, u8) {
-        use NativeService::*;
-        match self {
-            NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom | NtClearEvent => (1, 1),
-            NtResumeProcess | NtSuspendProcess | NtSetUuidSeed => (1, 1),
-            NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
-            | NtQueryDebugFilterState | NtPulseEvent | NtResetEvent | NtSetEvent => (2, 2),
-            NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
-            | NtSetDebugFilterState | NtOpenEventPair | NtPlugPlayControl
-            | NtSetSystemPowerState | NtOpenEvent | NtOpenSemaphore | NtReleaseSemaphore => (3, 3),
-            NtGetPlugPlayEvent | NtOpenProcess | NtOpenThread | NtFreeVirtualMemory => (4, 4),
-            NtQueryValueKey => (4, 6),
-            NtOpenThreadToken | NtOpenProcessTokenEx | NtSetInformationThread
-            | NtCreateIoCompletion => (4, 4),
-            NtOpenThreadTokenEx => (5, 5),
-            NtReadVirtualMemory | NtWriteVirtualMemory | NtProtectVirtualMemory
-            | NtQueryInformationProcess | NtQueryInformationToken
-            | NtQueryInformationThread
-            | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
-            | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent
-            | NtQuerySemaphore => {
-                (5, 5)
-            }
-            NtWaitForSingleObject => (3, 3),
-            NtCreateKeyedEvent | NtReleaseKeyedEvent | NtWaitForKeyedEvent => (4, 4),
-            NtQueryPerformanceCounter => (2, 2),
-            NtQueryVirtualMemory | NtAllocateVirtualMemory | NtDuplicateToken => (6, 6),
-            NtRaiseHardError => (6, 6),
-            NtOpenSection => (0, 4),
-            // Group-C ladder migrations: these handlers read their register args via the executive's
-            // IPC helpers (get_recv_mr) + stack args off the caller's SP directly, and use the arg
-            // vector only for RDX (args[1]); cap at 4 register args (no stack-arg prefill needed).
-            NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtSetDefaultLocale
-            | NtCreateProcess | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
-            NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
-            | NtOpenSymbolicLinkObject => (0, 4),
-            // NtQueryDirectoryObject(Handle, Buffer, Length, ReturnSingleEntry, RestartScan,
-            // *Context, *ReturnLength): the handler reads out-ptrs via register/stack helpers → cap.
-            NtQueryDirectoryObject => (0, 4),
-            NtEnumerateValueKey => (6, 6),
-            NtQueryKey => (5, 5),
-            NtQuerySystemInformation => (4, 4),
-            NtReadFile | NtWriteFile => (5, 9),
-            NtQueryInformationFile => (5, 5),
-            NtCreateFile => (8, 11),
-            // Group-A services the executive handles by reading registers directly (out-handle in
-            // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
-            // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
-            NtCreatePort | NtCreateThread
-            | NtMakeTemporaryObject | NtOpenProcessToken | NtSetValueKey
-            | NtSetInformationProcess | NtTestAlert
-            | NtFlushInstructionCache
-            | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
-            | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
-            // CSR message plane: the handler reads Request/Reply message ptrs via the register
-            // args + the winlogon stack mirror directly; cap at 4 register args (no stack prefill).
-            | NtRequestWaitReplyPort
-            // Named-pipe / device I/O: the handler writes out-params (FileHandle in R10,
-            // IoStatusBlock in R9) via the executive's register/stack helpers; register-only cap.
-            | NtCreateNamedPipeFile => (0, 4),
-            NtAdjustPrivilegesToken => (6, 6),
-            // NtCreateSemaphore is a real 5-arg ntdll call. The executive currently mints an opaque
-            // closable handle, but ntdll must be allowed to pass the InitialCount stack arg.
-            NtCreateSemaphore => (5, 5),
-            NtCreateEvent => (5, 5),
-            // The filesystem-control handler forwards all native buffer arguments to the FSD.
-            NtFsControlFile => (10, 10),
-            NtQueryDirectoryFile => (11, 11),
-            _ => (0, 16), // permissive for the rest in v0.1
-        }
+        let count =
+            nt_syscall_abi::exact_argc_of(self.name()).unwrap_or(nt_syscall_abi::MAX_STUB_ARGS);
+        (count, count)
     }
 
     /// The v0.1 service list, in a stable order (the `Test` profile numbers them sequentially).

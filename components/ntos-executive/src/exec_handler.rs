@@ -215,6 +215,11 @@ impl ExecNtHandler {
                 ] {
                     v.push(ObjEntry::dir(d, 0));
                 }
+                let windows = v
+                    .iter()
+                    .position(|entry| entry.parent == 0 && entry.name() == b"windows")
+                    .expect("pre-created Windows object directory");
+                v.push(ObjEntry::dir(b"windowstations", windows as u8));
                 v
             },
             events: nt_kernel_exec::EventStore::with_capacity(192),

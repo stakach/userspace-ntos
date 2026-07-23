@@ -1131,6 +1131,9 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
 static ACTIVE_STACK_BASE: AtomicU64 = AtomicU64::new(STACK_BASE);
 static ACTIVE_STACK_SIZE: AtomicU64 = AtomicU64::new(STACK_FRAMES * 0x1000);
+/// Process identity and scratch window used when a user range falls outside the fixed mirrors.
+static ACTIVE_CLIENT_PI: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SCRATCH_BASE: AtomicU64 = AtomicU64::new(SMSS_SCRATCH_BASE);
 /// Executive image-mirror base for the process currently being serviced (smss vs csrss), so the
 /// shared copyin path reads import-descriptor DLL names etc. from the RIGHT process's image.
 static ACTIVE_IMAGE_MIRROR: AtomicU64 = AtomicU64::new(IMAGE_MIRROR_VA);

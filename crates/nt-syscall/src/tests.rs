@@ -101,8 +101,35 @@ fn service_table_numbering() {
 }
 
 #[test]
+fn create_named_pipe_keeps_native_fourteen_argument_contract() {
+    let expected = nt_syscall_abi::argc_of("NtCreateNamedPipeFile");
+    assert_eq!(expected, 14);
+    assert_eq!(
+        NativeService::NtCreateNamedPipeFile.arg_count(),
+        (expected, expected)
+    );
+}
+
+#[test]
+fn every_native_service_uses_the_canonical_exact_arity() {
+    for &service in NativeService::ALL {
+        let expected = nt_syscall_abi::exact_argc_of(service.name())
+            .unwrap_or_else(|| panic!("missing canonical arity for {}", service.name()));
+        assert_eq!(
+            service.arg_count(),
+            (expected, expected),
+            "{}",
+            service.name()
+        );
+    }
+}
+
+#[test]
 fn query_directory_file_keeps_native_eleven_argument_contract() {
-    assert_eq!(NativeService::NtQueryDirectoryFile.name(), "NtQueryDirectoryFile");
+    assert_eq!(
+        NativeService::NtQueryDirectoryFile.name(),
+        "NtQueryDirectoryFile"
+    );
     assert_eq!(NativeService::NtQueryDirectoryFile.arg_count(), (11, 11));
     assert!(NativeServiceTable::test_profile()
         .number_of(NativeService::NtQueryDirectoryFile)
@@ -177,7 +204,7 @@ fn end_to_end_registry_query() {
     let handle = u64::from_le_bytes(open.output[..8].try_into().unwrap());
     let q = d.dispatch_service(
         NativeService::NtQueryValueKey,
-        &[handle, 0, 0, 0],
+        &[handle, 0, 0, 0, 0, 0],
         &origin(ProcessorMode::UserMode),
         &mut ks,
     );
@@ -216,7 +243,7 @@ fn unimplemented_service_does_not_silently_succeed() {
     let mut ks = services();
     let r = d.dispatch_service(
         NativeService::NtCreateThreadEx,
-        &[0, 0, 0],
+        &[0; 11],
         &origin(ProcessorMode::UserMode),
         &mut ks,
     );
@@ -266,10 +293,7 @@ fn win7_table_registers_migrated_services() {
         NativeService::NtQueryInformationThread.name(),
         "NtQueryInformationThread"
     );
-    assert_eq!(
-        NativeService::NtQueryInformationThread.arg_count(),
-        (5, 5)
-    );
+    assert_eq!(NativeService::NtQueryInformationThread.arg_count(), (5, 5));
     assert_eq!(NativeService::NtOpenProcessTokenEx.arg_count(), (4, 4));
     assert_eq!(NativeService::NtDuplicateToken.arg_count(), (6, 6));
     assert_eq!(NativeService::NtSetInformationThread.arg_count(), (4, 4));
@@ -314,14 +338,14 @@ fn group_c_first_cut_services_register() {
         assert_eq!(t.lookup(num).unwrap().service, svc);
     }
     assert_eq!(NativeService::NtAllocateVirtualMemory.arg_count(), (6, 6));
-    assert_eq!(NativeService::NtOpenSection.arg_count(), (0, 4));
+    assert_eq!(NativeService::NtOpenSection.arg_count(), (3, 3));
 }
 
 #[test]
 fn group_c_ladder_migrations_register() {
     // Remaining group-C ladder cases migrated onto the table (name-scoped file fakes, section
-    // queries, locale demand-fill, and the csrss spawn). They register at their real Win7 SSNs
-    // and carry register-only (0,4) bounds (handlers read stack args off SP directly).
+    // queries, locale demand-fill, and the csrss spawn). They register at their real Win7 SSNs and
+    // expose their canonical exact contracts even while handlers still read some tail args from SP.
     let pairs = [
         (NativeService::NtQueryAttributesFile, 145u32),
         (NativeService::NtOpenFile, 122),
@@ -336,10 +360,11 @@ fn group_c_ladder_migrations_register() {
     for (svc, num) in pairs {
         let e = t.lookup(num).unwrap();
         assert_eq!(e.service, svc);
+        let expected = nt_syscall_abi::exact_argc_of(svc.name()).unwrap();
         assert_eq!(
-            e.max_args,
-            4,
-            "{} should cap at 4 register args",
+            (e.min_args, e.max_args),
+            (expected, expected),
+            "{} should use its canonical arity",
             svc.name()
         );
     }
@@ -377,9 +402,9 @@ fn reactos_global_atom_family_registers_with_exact_contracts() {
 }
 
 #[test]
-fn group_a_services_register_with_register_only_bounds() {
-    // Group A (create-handle + no-op) services register at their real Win7 SSNs and carry the
-    // capped (0,4) arg bounds so the executive's table-driven dispatch reads only registers.
+fn group_a_services_register_with_exact_bounds() {
+    // Group A (create-handle + no-op) services register at their real Win7 SSNs and publish the
+    // same exact contracts as the shared ntdll marshalling table.
     let pairs = [
         (NativeService::NtCreatePort, 48u32),
         (NativeService::NtCreateThread, 55),
@@ -395,10 +420,11 @@ fn group_a_services_register_with_register_only_bounds() {
     for (svc, num) in pairs {
         let e = t.lookup(num).unwrap();
         assert_eq!(e.service, svc);
+        let expected = nt_syscall_abi::exact_argc_of(svc.name()).unwrap();
         assert_eq!(
-            e.max_args,
-            4,
-            "{} should cap at 4 register args",
+            (e.min_args, e.max_args),
+            (expected, expected),
+            "{} should use its canonical arity",
             svc.name()
         );
     }
@@ -616,7 +642,7 @@ fn group_b_query_and_namespace_services_register() {
     assert_eq!(NativeService::NtQueryInformationToken.arg_count(), (5, 5));
     assert_eq!(NativeService::NtQueryObject.arg_count(), (5, 5));
     assert_eq!(NativeService::NtWaitForSingleObject.arg_count(), (3, 3));
-    assert_eq!(NativeService::NtOpenDirectoryObject.arg_count(), (0, 4));
+    assert_eq!(NativeService::NtOpenDirectoryObject.arg_count(), (3, 3));
 }
 
 #[test]

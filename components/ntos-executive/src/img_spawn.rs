@@ -462,11 +462,11 @@ pub(crate) unsafe fn spawn_sec_image(
                 CAP_INIT_THREAD_VSPACE,
             );
         }
-        // Record the INITIAL committed stack frames for a GUI client (csrss pi 1 / winlogon pi 2) so
-        // win32k can share them per-client. Unlike demand-grown stack pages (fault site), these are
-        // mapped at spawn, so they'd otherwise be absent from the client-frame table — and a client's
-        // stack-built OBJECT_ATTRIBUTES (e.g. winlogon's NtUserCreateWindowStation) lives here.
-        if pi == 1 || pi == 2 {
+        // Retain every process's initial stack frames for generic executive copyin/copyout. GUI
+        // clients also use the same record for win32k's per-client address-space attachment. The
+        // early transport diagnostic has `setup_env == false` and reuses pi 0 temporarily; do not
+        // let its throwaway frames occupy the real smss keys.
+        if setup_env {
             csrss_frame_put(pi, STACK_BASE + i * 0x1000, f);
         }
     }
@@ -926,14 +926,12 @@ pub(crate) unsafe fn spawn_sec_image(
     pml4
 }
 
-/// Read a u64 from a SEC_IMAGE process's stack VA (a syscall's pointer arg) via the executive's
-/// stack mirror. Returns 0 if the VA isn't in the mirrored stack range.
+/// Read a u64 from a SEC_IMAGE process VA. Fixed mirrors are the fast path; recorded frames cover
+/// dynamically grown stacks and other mapped private pages.
 pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
-    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if stack_va >= base && stack_va + 8 <= base + size {
-        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::read_volatile((mirror + (stack_va - base)) as *const u64)
+    let mut bytes = [0u8; 8];
+    if smss_copyin(stack_va, &mut bytes) {
+        u64::from_le_bytes(bytes)
     } else {
         0
     }
@@ -966,7 +964,12 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
             core::ptr::copy_nonoverlapping(m as *const u8, dst.as_mut_ptr(), dst.len());
             true
         }
-        None => false,
+        None => recorded_frame_copyin(
+            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+            va,
+            dst,
+            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        ),
     }
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
@@ -977,8 +980,111 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
             core::ptr::copy_nonoverlapping(src.as_ptr(), m as *mut u8, src.len());
             true
         }
-        None => false,
+        None => recorded_frame_copyout(
+            ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+            va,
+            src,
+            ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        ),
     }
+}
+
+unsafe fn with_recorded_frame_alias(
+    pi: u64,
+    page: u64,
+    scratch_base: u64,
+    writable: bool,
+    access: impl FnOnce(u64),
+) -> bool {
+    let persistent_alias = csrss_frame_alias_get(pi, page);
+    if persistent_alias != 0 {
+        access(persistent_alias);
+        return true;
+    }
+
+    let (frame, _) = csrss_frame_get_exact(pi, page);
+    if frame == 0 || scratch_base == 0 {
+        return false;
+    }
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
+    let cap = client_copy_temp_cap();
+    let _ = cnode_delete_r(cap);
+    let copy_error = copy_cap_into_r(frame, cap);
+    let map_error = if copy_error == 0 {
+        page_map_r(
+            cap,
+            alias,
+            if writable {
+                RW_NX
+            } else {
+                2 | PAGE_EXECUTE_NEVER
+            },
+            CAP_INIT_THREAD_VSPACE,
+        )
+    } else {
+        copy_error
+    };
+    if map_error != 0 {
+        let _ = cnode_delete_r(cap);
+        return false;
+    }
+    access(alias);
+    let _ = cnode_delete_r(cap);
+    true
+}
+
+unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: u64) -> bool {
+    let Some(chunks) = nt_address_space::page_chunks(va, dst.len()) else {
+        return false;
+    };
+    let mut copied = 0usize;
+    for chunk in chunks {
+        let ok = with_recorded_frame_alias(
+            pi,
+            chunk.page_base,
+            scratch_base,
+            false,
+            |alias| {
+                core::ptr::copy_nonoverlapping(
+                    (alias + chunk.page_offset as u64) as *const u8,
+                    dst.as_mut_ptr().add(copied),
+                    chunk.length,
+                );
+            },
+        );
+        if !ok {
+            return false;
+        }
+        copied += chunk.length;
+    }
+    true
+}
+
+unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64) -> bool {
+    let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
+        return false;
+    };
+    let mut copied = 0usize;
+    for chunk in chunks {
+        let ok = with_recorded_frame_alias(
+            pi,
+            chunk.page_base,
+            scratch_base,
+            true,
+            |alias| {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(copied),
+                    (alias + chunk.page_offset as u64) as *mut u8,
+                    chunk.length,
+                );
+            },
+        );
+        if !ok {
+            return false;
+        }
+        copied += chunk.length;
+    }
+    true
 }
 /// The executive's writable scratch mirror of an already demand-paged csrss page (any region:
 /// image, ntdll, csrsrv .data, …), so a syscall handler can copy OUT an out-param that doesn't live
@@ -1402,37 +1508,22 @@ pub(crate) unsafe fn smss_read_objattr_name(oa_va: u64) -> alloc::vec::Vec<u16> 
     }
     smss_read_unicode(u64::from_le_bytes(bp), u16::from_le_bytes(lm))
 }
-/// Write a u64 to a SEC_IMAGE process's stack VA via the mirror (copyout).
+/// Write a u64 to a SEC_IMAGE process VA through the active copyout path.
 pub(crate) unsafe fn smss_stack_write(stack_va: u64, v: u64) {
-    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if stack_va >= base && stack_va + 8 <= base + size {
-        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u64, v);
-    }
+    let _ = smss_copyout(stack_va, &v.to_le_bytes());
 }
 
-/// Write a 32-bit value to a stack VA (via the mirror). Use for DWORD out-params (e.g. an
+/// Write a 32-bit value to a process VA. Use for DWORD out-params (e.g. an
 /// NtProtectVirtualMemory *OldProtect) — an 8-byte write would clobber the adjacent local.
 pub(crate) unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
-    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if stack_va >= base && stack_va + 4 <= base + size {
-        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u32, v);
-    }
+    let _ = smss_copyout(stack_va, &v.to_le_bytes());
 }
 
-/// Write a 16-bit value to a stack VA (via the mirror). Use for the PORT_MESSAGE u2.s2.Type field
+/// Write a 16-bit value to a process VA. Use for the PORT_MESSAGE u2.s2.Type field
 /// (a CSHORT) when modeling an LPC reply in place — a wider write would clobber the adjacent
 /// DataInfoOffset / u1 length fields.
 pub(crate) unsafe fn smss_stack_write16(stack_va: u64, v: u16) {
-    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-    if stack_va >= base && stack_va + 2 <= base + size {
-        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u16, v);
-    }
+    let _ = smss_copyout(stack_va, &v.to_le_bytes());
 }
 
 /// Write an ASCII string as a NUL-terminated UTF-16LE buffer at an executive scratch VA (for building

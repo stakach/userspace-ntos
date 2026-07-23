@@ -681,6 +681,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtCreateSemaphore", 5),
     ("NtCreateSymbolicLinkObject", 4),
     ("NtCreateThread", 8),
+    ("NtCreateThreadEx", 11),
     ("NtCreateTimer", 4),
     ("NtCreateToken", 13),
     ("NtDelayExecution", 2),
@@ -853,19 +854,22 @@ pub const NT_ARGC: &[(&str, u8)] = &[
 /// = 14). A gatherer that lacks an exact arity uses this as a conservative sweep bound.
 pub const MAX_STUB_ARGS: u8 = 14;
 
-/// The parameter count of an `Nt*`/`Zw*` service (register-width args). Falls back to
-/// [`MAX_STUB_ARGS`] for an unknown name (conservative — sweep every possible arg). A `Zw*` name
-/// resolves to the arity of its underlying `Nt*` service.
-pub fn argc_of(name: &str) -> u8 {
+/// Return the exact parameter count of a known `Nt*`/`Zw*` service.
+pub fn exact_argc_of(name: &str) -> Option<u8> {
     if let Some(&(_, c)) = NT_ARGC.iter().find(|(n, _)| *n == name) {
-        return c;
+        return Some(c);
     }
     if let Some(z) = ZW_ALIASES.iter().find(|z| z.zw_name == name) {
         if let Some(&(_, c)) = NT_ARGC.iter().find(|(n, _)| *n == z.nt_name) {
-            return c;
+            return Some(c);
         }
     }
-    MAX_STUB_ARGS
+    None
+}
+
+/// Return a service's parameter count, conservatively using [`MAX_STUB_ARGS`] for an unknown name.
+pub fn argc_of(name: &str) -> u8 {
+    exact_argc_of(name).unwrap_or(MAX_STUB_ARGS)
 }
 
 /// `const` helper for [`NT_SYSCALLS`] rows.

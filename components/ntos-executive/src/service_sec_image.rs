@@ -883,6 +883,8 @@ pub(crate) unsafe fn service_sec_image(
         );
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
+        ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         let img_end = procs[pi].img_end;
         let pe: &nt_pe_loader::PeFile = match pi {
             1 => csrss_pe.as_ref().unwrap(),
@@ -1521,11 +1523,10 @@ pub(crate) unsafe fn service_sec_image(
             if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
-                if pi == 1 || pi == 2 {
-                    // A GUI client (csrss pi 1 / winlogon pi 2) stack pointer — shareable into win32k
-                    // at the same VA when this client dispatches an NtUser/NtGdi call (per-client).
-                    csrss_frame_put(pi as u64, page, f);
-                }
+                // Preserve the mapped frame cap so stack-based syscall arguments remain reachable
+                // after the stack grows below its fixed executive mirror. GUI clients also reuse
+                // this record for win32k's per-client attachment.
+                csrss_frame_put(pi as u64, page, f);
                 faults += 1;
                 procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
@@ -5501,14 +5502,11 @@ unsafe fn spawn_requested_tp_worker(
     });
 }
 
-/// BATCH 33 — the (stack_base, stack_size, stack_mirror_va, heap_mirror_va, image_mirror_va) for the
-/// thread identified by `badge` (its per-thread stack + its process's heap/image mirror windows). This
-/// is the SAME selection the main service loop makes at each iteration (`service_sec_image` ~585-650);
-/// the pipe re-drive reuses it to point the copyout helpers (`smss_copyout` via `xas_write_buf`) at a
-/// PARKED reader's own VSpace mirrors while the WRITER is the active process. `pi` = the reader's
-/// process index (0 smss, 1 csrss, 2 winlogon, 3 services, 4 lsass).
+/// The active memory context for the thread identified by `badge`: stack base/size/mirror, process
+/// heap/image mirrors, and its demand scratch window. This is the same selection the main service
+/// loop makes. Parked-I/O delivery temporarily switches to the parked thread's context.
 #[inline]
-fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
+fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
     let (stack_base, stack_frames, stack_mirror) = if let Some((tp_pi, tp_slot)) =
         tp_worker_identity_from_badge(badge)
     {
@@ -5587,7 +5585,21 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
         4 => LSASS_IMAGE_MIRROR_VA,
         _ => IMAGE_MIRROR_VA,
     };
-    (stack_base, stack_frames * 0x1000, stack_mirror, heap_mirror, image_mirror)
+    let scratch_base = match pi {
+        1 => CSRSS_SCRATCH_BASE,
+        2 => WINLOGON_SCRATCH_BASE,
+        3 => SERVICES_SCRATCH_BASE,
+        4 => LSASS_SCRATCH_BASE,
+        _ => SMSS_SCRATCH_BASE,
+    };
+    (
+        stack_base,
+        stack_frames * 0x1000,
+        stack_mirror,
+        heap_mirror,
+        image_mirror,
+        scratch_base,
+    )
 }
 
 unsafe fn io_completion_park(
@@ -5647,16 +5659,20 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
     let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take();
 
-    let (stack_base, stack_size, stack_mirror, heap_mirror, image_mirror) =
+    let (stack_base, stack_size, stack_mirror, heap_mirror, image_mirror, scratch_base) =
         mirror_ctx_for(waiter.badge, waiter.process_index as usize);
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
     ACTIVE_IMAGE_MIRROR.store(image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(waiter.process_index as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
     nt_handler.pi = waiter.process_index as usize;
 
     let copied = nt_handler
@@ -5673,6 +5689,8 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
     ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
@@ -5780,6 +5798,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
     let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take(); // copyout via mirrors only during the re-drive
     let mut woken = 0u64;
@@ -5821,12 +5841,14 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             continue; // still PENDING → stays parked (re-armable)
         }
         // Data (or a terminal status) available. Point the copyout at the READER's VSpace mirrors.
-        let (sb, ss, smv, hmv, imv) = mirror_ctx_for(w.badge, w.pi as usize);
+        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(w.badge, w.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
         ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(w.pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = w.pi as usize;
         let copy_len = (completed as usize).min(output.len());
         // BATCH 37: copy the delivered bytes for SUCCESS *and* STATUS_BUFFER_OVERFLOW (0x80000005) —
@@ -5890,6 +5912,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
     ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     woken
@@ -5920,18 +5944,23 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
     let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take();
     let mut completed = 0u64;
     {
         // Point the IOSB copyout at the SERVER listener's VSpace mirrors.
         let badge = l.badge;
-        let (sb, ss, smv, hmv, imv) = mirror_ctx_for(badge, l.pi as usize);
+        let (sb, ss, smv, hmv, imv, scratch_base) =
+            mirror_ctx_for(badge, l.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
         ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(l.pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = l.pi as usize;
         // Fill the listen IO_STATUS_BLOCK: {Status=STATUS_SUCCESS, Information=0}.
         if l.iosb_va != 0 {
@@ -5962,6 +5991,8 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
     ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     completed

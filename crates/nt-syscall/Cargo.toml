@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+nt-syscall-abi = { workspace = true }
+
 [dev-dependencies]
 nt-config-manager = { workspace = true }
 nt-process = { workspace = true }

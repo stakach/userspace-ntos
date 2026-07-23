@@ -153,7 +153,9 @@ fn every_service_has_an_exact_arity() {
             e.name
         );
     }
-    assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len());
+    // NtCreateThreadEx is an executive-hosted compatibility service on this target but is not in
+    // the pinned ReactOS system-service-number table.
+    assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len() + 1);
 }
 
 #[test]
@@ -163,10 +165,12 @@ fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtCreateFile"), 11);
     assert_eq!(argc_of("NtWaitForSingleObject"), 3);
     assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest
-                                                      // Zw* inherits its underlying Nt*'s arity.
+    assert_eq!(exact_argc_of("NtCreateThreadEx"), Some(11));
+    // Zw* inherits its underlying Nt*'s arity.
     assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));
     // Unknown falls back conservatively to MAX_STUB_ARGS (never 0 → never silently drops args).
     assert_eq!(argc_of("NtNotARealService"), MAX_STUB_ARGS);
+    assert_eq!(exact_argc_of("NtNotARealService"), None);
 }
 
 #[test]
