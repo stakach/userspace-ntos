@@ -33,6 +33,8 @@ fn peb_offsets() {
 #[test]
 fn teb_offsets() {
     assert_eq!(offset_of!(Teb, nt_tib), 0x000);
+    assert_eq!(offset_of!(NtTib, arbitrary_user_pointer), 0x028);
+    assert_eq!(TEB_ARBITRARY_USER_POINTER_OFFSET, 0x028);
     assert_eq!(offset_of!(Teb, environment_pointer), 0x038);
     assert_eq!(offset_of!(Teb, client_id), 0x040);
     assert_eq!(offset_of!(Teb, thread_local_storage_pointer), 0x058);

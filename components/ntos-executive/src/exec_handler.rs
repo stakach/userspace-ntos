@@ -1192,6 +1192,9 @@ impl ExecNtHandler {
                     .pm
                     .set_thread_start_address(tid as nt_process::ThreadId, entry)
             {
+                let _ = self
+                    .pm
+                    .set_thread_teb(tid as nt_process::ThreadId, SMSS_TEB_VA);
                 let _ = self.pm.set_thread_create_time(
                     tid as nt_process::ThreadId,
                     nt_system_time_100ns() as i64,
@@ -1898,9 +1901,12 @@ impl ExecNtHandler {
                 } else {
                     target_vm.permits_write(remote_address)
                 };
-            let copied = protection_allows
-                && if read {
-                client_copyin_process_mapped(
+            let mut local_copied = false;
+            let mut remote_copied = false;
+            let copied = if !protection_allows {
+                false
+            } else if read {
+                remote_copied = client_copyin_process_mapped(
                     target_pi as u64,
                     remote_address,
                     &mut buffer[..chunk],
@@ -1908,9 +1914,13 @@ impl ExecNtHandler {
                     target_faults,
                     target.scratch_base,
                     target_pi == self.pi,
-                ) && self.xas_try_write_buf(local_address, &buffer[..chunk])
+                );
+                local_copied =
+                    remote_copied && self.xas_try_write_buf(local_address, &buffer[..chunk]);
+                local_copied
             } else {
-                self.xas_read(local_address, &mut buffer[..chunk])
+                local_copied = self.xas_read(local_address, &mut buffer[..chunk]);
+                remote_copied = local_copied
                     && if target_pi == self.pi {
                         self.xas_try_write_buf(remote_address, &buffer[..chunk])
                     } else {
@@ -1922,9 +1932,35 @@ impl ExecNtHandler {
                             target_faults,
                             target.scratch_base,
                         )
-                    }
-                };
+                    };
+                remote_copied
+            };
             if !copied {
+                if self.pi == 2 && target_pi != self.pi {
+                    let (frame, _) =
+                        csrss_frame_get_exact(target_pi as u64, remote_address & !0xfff);
+                    print_str(b"[remote-vm] write failed target_pi=");
+                    print_u64(target_pi as u64);
+                    print_str(b" remote=0x");
+                    print_hex((remote_address >> 32) as u32);
+                    print_hex(remote_address as u32);
+                    print_str(b" local=0x");
+                    print_hex((local_address >> 32) as u32);
+                    print_hex(local_address as u32);
+                    print_str(b" chunk=0x");
+                    print_hex(chunk as u32);
+                    print_str(b" local_ok=");
+                    print_u64(local_copied as u64);
+                    print_str(b" remote_ok=");
+                    print_u64(remote_copied as u64);
+                    print_str(b" protection_ok=");
+                    print_u64(protection_allows as u64);
+                    print_str(b" frame=0x");
+                    print_hex(frame as u32);
+                    print_str(b" vad=");
+                    print_u64(private_extent.is_some() as u64);
+                    print_str(b"\n");
+                }
                 break;
             }
             transferred += chunk as u64;
@@ -2710,6 +2746,29 @@ impl ExecNtHandler {
         } else {
             smss_copyout(va, &val.to_le_bytes())
         }
+    }
+
+    /// Publish the two user-visible outputs of a successful `NtCreateProcess[Ex]`: the process
+    /// handle and the child PEB pointer returned through the creator TEB's ArbitraryUserPointer.
+    pub(crate) unsafe fn publish_created_process(
+        &self,
+        process_handle_out: u64,
+        process_handle: u64,
+        child_peb: u64,
+    ) -> bool {
+        let Some(teb) = self
+            .pm
+            .thread_teb(self.current_tid as nt_process::ThreadId)
+            .filter(|teb| *teb != 0)
+        else {
+            return false;
+        };
+        let Some(peb_out) = teb.checked_add(nt_ntdll_layout::TEB_ARBITRARY_USER_POINTER_OFFSET)
+        else {
+            return false;
+        };
+        self.xas_write_u64(peb_out, child_peb)
+            && self.xas_write_u64(process_handle_out, process_handle)
     }
 
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.

@@ -12,7 +12,7 @@ use nt_ntdll_layout::Teb;
 
 /// A subset of the `NTSTATUS` → Win32 `RtlNtStatusToDosError` mapping covering the codes the early
 /// boot / loader path produces. The full table is ~600 entries; this covers the common ones and
-/// falls through to `ERROR_MR_MID_NOT_FOUND` (13, the Windows default for an unmapped status),
+/// falls through to `ERROR_MR_MID_NOT_FOUND` (317, the Windows default for an unmapped status),
 /// matching real ntdll's behaviour for statuses absent from its table.
 pub fn nt_status_to_dos_error(status: u32) -> u32 {
     match status {
@@ -34,8 +34,9 @@ pub fn nt_status_to_dos_error(status: u32) -> u32 {
         0xC000_0135 => 126,  // STATUS_DLL_NOT_FOUND -> ERROR_MOD_NOT_FOUND
         0xC000_0139 => 127,  // STATUS_ENTRYPOINT_NOT_FOUND -> ERROR_PROC_NOT_FOUND
         0x8000_0005 => 234,  // STATUS_BUFFER_OVERFLOW -> ERROR_MORE_DATA
+        0x8000_000D => 299,  // STATUS_PARTIAL_COPY -> ERROR_PARTIAL_COPY
         0x0000_0102 => 258,  // STATUS_TIMEOUT -> WAIT_TIMEOUT
-        _ => 13,             // ERROR_MR_MID_NOT_FOUND (Windows default for unmapped)
+        _ => 317,            // ERROR_MR_MID_NOT_FOUND
     }
 }
 
@@ -358,7 +359,8 @@ mod tests {
         assert_eq!(nt_status_to_dos_error(0xC000_0022), 5); // ACCESS_DENIED
         assert_eq!(nt_status_to_dos_error(0xC000_0135), 126); // DLL_NOT_FOUND -> MOD_NOT_FOUND
         assert_eq!(nt_status_to_dos_error(0x8000_0005), 234); // BUFFER_OVERFLOW -> MORE_DATA
-        assert_eq!(nt_status_to_dos_error(0xDEAD_BEEF), 13); // unmapped default
+        assert_eq!(nt_status_to_dos_error(0x8000_000D), 299); // PARTIAL_COPY
+        assert_eq!(nt_status_to_dos_error(0xDEAD_BEEF), 317); // unmapped default
     }
 
     #[test]

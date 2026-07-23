@@ -461,6 +461,7 @@ const _: () = assert!(offset_of!(Peb, fls_high_index) == 0x350);
 
 // TEB — NDK peb_teb.h `_STRUCT64` C_ASSERT block + live-RE StaticUnicodeString/ActCtx offsets.
 const _: () = assert!(offset_of!(Teb, nt_tib) == 0x000); // C_ASSERT(... NtTib) == 0x000
+const _: () = assert!(offset_of!(NtTib, arbitrary_user_pointer) == 0x28);
 const _: () = assert!(offset_of!(Teb, environment_pointer) == 0x038); // C_ASSERT(...) == 0x038
 const _: () = assert!(offset_of!(Teb, client_id) == 0x040);
 const _: () = assert!(offset_of!(Teb, thread_local_storage_pointer) == 0x058);
@@ -489,6 +490,10 @@ const _: () = assert!(offset_of!(Teb, same_teb_flags) == 0x17EE); // C_ASSERT(..
 
 pub const TEB_IMPERSONATION_LOCALE_OFFSET: u64 = offset_of!(Teb, impersonation_locale) as u64;
 pub const TEB_IS_IMPERSONATING_OFFSET: u64 = offset_of!(Teb, is_impersonating) as u64;
+/// `TEB.NtTib.ArbitraryUserPointer`, used by `NtCreateProcess[Ex]` to return the child PEB to
+/// kernel32's `BasePushProcessParameters`.
+pub const TEB_ARBITRARY_USER_POINTER_OFFSET: u64 =
+    offset_of!(Teb, nt_tib) as u64 + offset_of!(NtTib, arbitrary_user_pointer) as u64;
 
 // PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY — ldrtypes.h.
 const _: () = assert!(offset_of!(PebLdrData, in_load_order_module_list) == 0x10);

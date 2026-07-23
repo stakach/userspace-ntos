@@ -2691,7 +2691,13 @@ pub(crate) unsafe fn service_sec_image(
                             g
                         }
                     };
-                    smss_stack_write(get_recv_mr(9), csrss_process_handle); // *ProcessHandle (R10)
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        csrss_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
@@ -2746,7 +2752,13 @@ pub(crate) unsafe fn service_sec_image(
                             g
                         }
                     };
-                    smss_stack_write(get_recv_mr(9), winlogon_process_handle); // *ProcessHandle (R10)
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        winlogon_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge 4) -> handle 0x");
                     print_hex((winlogon_process_handle >> 32) as u32);
                     print_hex(winlogon_process_handle as u32);
@@ -2799,14 +2811,26 @@ pub(crate) unsafe fn service_sec_image(
                             g
                         }
                     };
-                    smss_stack_write(get_recv_mr(9), services_process_handle); // *ProcessHandle (R10)
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        services_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
                     print_hex((services_process_handle >> 32) as u32);
                     print_hex(services_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                 } else if nt_handler.services_spawn_request && services_process_handle != 0 {
                     // Idempotent re-create: return the same handle.
-                    smss_stack_write(get_recv_mr(9), services_process_handle);
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        services_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                 }
                 // winlogon's StartLsass NtCreateProcessEx(50) — spawn lsass.exe (the 5th hosted process).
                 if nt_handler.lsass_spawn_request
@@ -2844,13 +2868,25 @@ pub(crate) unsafe fn service_sec_image(
                         }
                         _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
                     };
-                    smss_stack_write(get_recv_mr(9), lsass_process_handle); // *ProcessHandle (R10)
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        lsass_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
                     print_hex((lsass_process_handle >> 32) as u32);
                     print_hex(lsass_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                 } else if nt_handler.lsass_spawn_request && lsass_process_handle != 0 {
-                    smss_stack_write(get_recv_mr(9), lsass_process_handle);
+                    if !nt_handler.publish_created_process(
+                        get_recv_mr(9),
+                        lsass_process_handle,
+                        SMSS_PEB_VA,
+                    ) {
+                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
