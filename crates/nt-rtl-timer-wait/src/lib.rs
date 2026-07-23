@@ -865,6 +865,15 @@ pub mod registered_wait {
             }
         }
 
+        /// Retire this registration when its callback cannot be submitted to a worker.
+        pub fn callback_dispatch_failed(&mut self) -> Result<WaitAction, u32> {
+            if self.state != WaitState::Callback {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            self.state = WaitState::Exiting;
+            Ok(WaitAction::ExitWorker)
+        }
+
         pub fn deregister(&mut self, mode: CompletionMode) -> Result<DeregisterPlan, u32> {
             if self.deregistered || self.state == WaitState::Reclaimable {
                 return Err(STATUS_INVALID_HANDLE);
@@ -1378,6 +1387,20 @@ mod tests {
         assert_eq!(infinite.remaining(100), None);
         infinite.rearm(u64::MAX - 10);
         assert_eq!(infinite.remaining(u64::MAX), None);
+    }
+
+    #[test]
+    fn registered_wait_dispatch_failure_exits_without_stranding_callback_state() {
+        let mut wait = wait(WorkItemFlags::EXECUTE_DEFAULT);
+        wait.worker_started().unwrap();
+        assert!(matches!(
+            wait.observe_wait(WaitOutcome::Object),
+            Ok(WaitAction::Invoke { .. })
+        ));
+        assert_eq!(wait.callback_dispatch_failed(), Ok(WaitAction::ExitWorker));
+        assert_eq!(wait.state(), WaitState::Exiting);
+        assert_eq!(wait.worker_exited().unwrap(), CompletionPlan::default());
+        assert_eq!(wait.state(), WaitState::WorkerExited);
     }
 
     #[test]

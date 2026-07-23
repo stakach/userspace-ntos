@@ -5040,13 +5040,16 @@ pub unsafe fn rtl_create_user_thread(
 const RTL_TIMER_QUEUE_CAPACITY: usize = 4;
 const RTL_TIMERS_PER_QUEUE: usize = 16;
 const RTL_TIMER_HANDLE_CAPACITY: usize = RTL_TIMER_QUEUE_CAPACITY * RTL_TIMERS_PER_QUEUE;
+const RTL_REGISTERED_WAIT_CAPACITY: usize = 32;
 const RTL_ASYNC_HANDLE_MARKER: u64 = 0x0000_5250_0000_0000;
 const RTL_ASYNC_HANDLE_MASK: u64 = 0xFFFF_FFF0_0000_0000;
 const RTL_ASYNC_QUEUE_KIND: u64 = 1;
 const RTL_ASYNC_TIMER_KIND: u64 = 2;
+const RTL_ASYNC_WAIT_KIND: u64 = 3;
 const RTL_ASYNC_FREE: u8 = 0;
 const RTL_ASYNC_LIVE: u8 = 1;
 const RTL_ASYNC_RETIRED: u8 = 2;
+const RTL_ASYNC_RESERVED: u8 = 3;
 
 #[repr(C, align(8))]
 struct RtlAsyncCriticalSection {
@@ -5116,6 +5119,40 @@ struct RtlTimerHandleSlot {
     timer_generation: u32,
 }
 
+struct RtlRegisteredWaitSlot {
+    state: u8,
+    generation: u32,
+    model: Option<nt_rtl_timer_wait::registered_wait::RegisteredWait>,
+    deadline: Option<nt_rtl_timer_wait::registered_wait::WaitDeadline>,
+    cancel_requested: bool,
+    dispatch_pending: bool,
+    dispatch_timed_out: bool,
+    dispatch_failures: u8,
+    callback: u64,
+    context: u64,
+    queue_flags: u32,
+    captured_token: u64,
+}
+
+impl RtlRegisteredWaitSlot {
+    const fn new() -> Self {
+        Self {
+            state: RTL_ASYNC_FREE,
+            generation: 0,
+            model: None,
+            deadline: None,
+            cancel_requested: false,
+            dispatch_pending: false,
+            dispatch_timed_out: false,
+            dispatch_failures: 0,
+            callback: 0,
+            context: 0,
+            queue_flags: 0,
+            captured_token: 0,
+        }
+    }
+}
+
 impl RtlTimerHandleSlot {
     const fn new() -> Self {
         Self {
@@ -5132,6 +5169,8 @@ static mut RTL_TIMER_QUEUES: [RtlTimerQueueSlot; RTL_TIMER_QUEUE_CAPACITY] =
     [const { RtlTimerQueueSlot::new() }; RTL_TIMER_QUEUE_CAPACITY];
 static mut RTL_TIMER_HANDLES: [RtlTimerHandleSlot; RTL_TIMER_HANDLE_CAPACITY] =
     [const { RtlTimerHandleSlot::new() }; RTL_TIMER_HANDLE_CAPACITY];
+static mut RTL_REGISTERED_WAITS: [RtlRegisteredWaitSlot; RTL_REGISTERED_WAIT_CAPACITY] =
+    [const { RtlRegisteredWaitSlot::new() }; RTL_REGISTERED_WAIT_CAPACITY];
 static RTL_DEFAULT_TIMER_QUEUE: AtomicU64 = AtomicU64::new(0);
 
 const fn rtl_async_handle(kind: u64, index: usize, generation: u32) -> u64 {
@@ -5181,6 +5220,18 @@ unsafe fn rtl_timer_handle_slot_mut(
     (accepted && slot.generation == generation).then_some(slot)
 }
 
+unsafe fn rtl_registered_wait_slot_mut(
+    token: u64,
+    allow_retired: bool,
+) -> Option<&'static mut RtlRegisteredWaitSlot> {
+    let (index, generation) =
+        rtl_async_handle_parts(token, RTL_ASYNC_WAIT_KIND, RTL_REGISTERED_WAIT_CAPACITY)?;
+    let slot = unsafe { &mut (*core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS))[index] };
+    let accepted =
+        slot.state == RTL_ASYNC_LIVE || (allow_retired && slot.state == RTL_ASYNC_RETIRED);
+    (accepted && slot.generation == generation && slot.model.is_some()).then_some(slot)
+}
+
 fn rtl_timer_key(slot: &RtlTimerHandleSlot) -> Option<nt_rtl_timer_wait::timer::TimerKey> {
     nt_rtl_timer_wait::timer::TimerKey::from_parts(slot.timer_index, slot.timer_generation)
 }
@@ -5194,16 +5245,19 @@ const SSN_NT_RESUME_THREAD: u32 = 214;
 const SSN_NT_SET_EVENT: u32 = 228;
 const SSN_NT_SET_IO_COMPLETION: u32 = 241;
 const SSN_NT_TERMINATE_THREAD: u32 = 267;
+const SSN_NT_WAIT_FOR_MULTIPLE_OBJECTS: u32 = 280;
 const SSN_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 281;
 
 const IO_COMPLETION_ALL_ACCESS: u64 = 0x001F_0003;
 const EVENT_ALL_ACCESS: u64 = 0x001F_0003;
 const SYNCHRONIZATION_EVENT: u64 = 1;
+const WAIT_ANY: u64 = 1;
 const TOKEN_IMPERSONATE: u64 = 0x0004;
 const THREAD_IMPERSONATION_TOKEN: u64 = 5;
 const STATUS_SUCCESS_U32: u32 = 0;
 const STATUS_UNSUCCESSFUL_U32: u32 = 0xC000_0001;
 const STATUS_QUOTA_EXCEEDED_U32: u32 = 0xC000_0044;
+const STATUS_INSUFFICIENT_RESOURCES_U32: u32 = 0xC000_009A;
 const STATUS_CANT_WAIT_U32: u32 = 0xC000_00D8;
 const STATUS_TIMEOUT_U32: u32 = 0x0000_0102;
 
@@ -5235,7 +5289,11 @@ const WORK_ITEM_PROBE_CALLBACK: u32 = 2;
 #[cfg(feature = "rtl_work_item_probe")]
 static WORK_ITEM_PROBE_STATE: AtomicU32 = AtomicU32::new(WORK_ITEM_PROBE_IDLE);
 
-#[cfg(any(feature = "rtl_work_item_probe", feature = "rtl_timer_probe"))]
+#[cfg(any(
+    feature = "rtl_work_item_probe",
+    feature = "rtl_timer_probe",
+    feature = "rtl_wait_probe"
+))]
 unsafe fn current_process_is_smss() -> bool {
     let peb: u64;
     unsafe {
@@ -5391,6 +5449,96 @@ pub unsafe fn run_rtl_timer_probe_if_smss() {
     unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
 }
 
+#[cfg(feature = "rtl_wait_probe")]
+const WAIT_PROBE_IDLE: u32 = 0;
+#[cfg(feature = "rtl_wait_probe")]
+const WAIT_PROBE_REGISTERING: u32 = 1;
+#[cfg(feature = "rtl_wait_probe")]
+const WAIT_PROBE_CALLBACK: u32 = 2;
+#[cfg(feature = "rtl_wait_probe")]
+const WAIT_PROBE_BAD_TIMEOUT: u32 = 3;
+#[cfg(feature = "rtl_wait_probe")]
+static WAIT_PROBE_STATE: AtomicU32 = AtomicU32::new(WAIT_PROBE_IDLE);
+
+#[cfg(feature = "rtl_wait_probe")]
+unsafe extern "system" fn rtl_wait_probe_callback(context: *mut c_void, timed_out: u8) {
+    if context == core::ptr::addr_of!(WAIT_PROBE_STATE).cast_mut().cast() {
+        WAIT_PROBE_STATE.store(
+            if timed_out == 0 {
+                WAIT_PROBE_CALLBACK
+            } else {
+                WAIT_PROBE_BAD_TIMEOUT
+            },
+            Ordering::Release,
+        );
+        let marker = *b"[rtl-wait-probe] callback executed with timed_out=FALSE";
+        if timed_out == 0 {
+            unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+        }
+    }
+}
+
+#[cfg(feature = "rtl_wait_probe")]
+pub unsafe fn run_rtl_wait_probe_if_smss() {
+    if !unsafe { current_process_is_smss() }
+        || WAIT_PROBE_STATE
+            .compare_exchange(
+                WAIT_PROBE_IDLE,
+                WAIT_PROBE_REGISTERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return;
+    }
+    let event = match unsafe { rtl_async_create_event(SYNCHRONIZATION_EVENT) } {
+        Ok(event) => event,
+        Err(_) => {
+            let marker = *b"[rtl-wait-probe] FAIL event creation";
+            unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+            return;
+        }
+    };
+    let mut wait = 0u64;
+    let status = unsafe {
+        rtl_register_wait(
+            &mut wait,
+            event,
+            rtl_wait_probe_callback as usize as u64,
+            core::ptr::addr_of!(WAIT_PROBE_STATE) as u64,
+            u32::MAX,
+            nt_rtl_work_item::WorkItemFlags::EXECUTE_ONLY_ONCE.bits(),
+        )
+    };
+    if nt_rtl_work_item::nt_success(status) {
+        unsafe { rtl_async_set_event(event) };
+        for _ in 0..512 {
+            match WAIT_PROBE_STATE.load(Ordering::Acquire) {
+                WAIT_PROBE_CALLBACK => {
+                    let deregister = unsafe { rtl_deregister_wait(wait, u64::MAX) };
+                    unsafe { rtl_async_close(event) };
+                    if nt_rtl_work_item::nt_success(deregister) {
+                        let marker = *b"[rtl-wait-probe] PASS object -> scheduler multiwait -> completion callback -> only-once deregister";
+                        unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+                        return;
+                    }
+                    break;
+                }
+                WAIT_PROBE_BAD_TIMEOUT => break,
+                _ => {}
+            }
+            let _ = unsafe { work_pool_delay(-10_000) };
+        }
+    }
+    if wait != 0 {
+        let _ = unsafe { rtl_deregister_wait(wait, 0) };
+    }
+    unsafe { rtl_async_close(event) };
+    let marker = *b"[rtl-wait-probe] FAIL register, object wake, callback, or deregister";
+    unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+}
+
 #[inline]
 fn work_pool_lock_counters() {
     while WORK_POOL_COUNTER_LOCK
@@ -5416,6 +5564,14 @@ unsafe fn work_pool_delay(interval_100ns: i64) -> u32 {
             0,
             0,
         ) as u32
+    }
+}
+
+unsafe fn rtl_async_backoff() {
+    if !nt_rtl_work_item::nt_success(unsafe { work_pool_delay(-10_000) }) {
+        for _ in 0..4096 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -5466,6 +5622,29 @@ unsafe fn rtl_async_wait(handle: u64, timeout_ms: Option<u32>) -> u32 {
             SSN_NT_WAIT_FOR_SINGLE_OBJECT,
             handle,
             0,
+            relative
+                .as_ref()
+                .map_or(0, |timeout| timeout as *const i64 as u64),
+            0,
+        ) as u32
+    }
+}
+
+unsafe fn rtl_async_wait_many(handles: &[u64], alertable: bool, timeout_ms: Option<u32>) -> u32 {
+    let relative = timeout_ms.map(|milliseconds| {
+        if milliseconds == 0 {
+            0
+        } else {
+            -i64::from(milliseconds) * 10_000
+        }
+    });
+    unsafe {
+        syscall6(
+            SSN_NT_WAIT_FOR_MULTIPLE_OBJECTS,
+            handles.len() as u64,
+            handles.as_ptr() as u64,
+            WAIT_ANY,
+            alertable as u64,
             relative
                 .as_ref()
                 .map_or(0, |timeout| timeout as *const i64 as u64),
@@ -6043,9 +6222,9 @@ unsafe fn timer_completion_mode(
 }
 
 pub unsafe fn rtl_delete_timer(timer: u64, completion_event: u64) -> u32 {
-    // The hosted kernel provides one recognized RTL worker. Waiting on an in-flight callback from
-    // that same worker would self-deadlock; reject the wait without starting deletion so the caller
-    // can retry asynchronously. Idle synchronous deletion is completed by the control pump below.
+    // Waiting on an in-flight callback from either recognized RTL worker role would self-deadlock;
+    // reject the wait without starting deletion so the caller can retry asynchronously. Idle
+    // synchronous deletion is completed by the control pump below.
     if completion_event == u64::MAX && unsafe { rtl_async_on_worker() } {
         let callbacks_in_flight = {
             let _guard = unsafe { rtl_async_lock() };
@@ -6208,6 +6387,709 @@ pub unsafe fn rtl_delete_timer_queue(timer_queue: u64, completion_event: u64) ->
         }
     }
     plan.status
+}
+
+#[derive(Default)]
+struct RtlRegisteredWaitCleanup {
+    cancel_handle: u64,
+    captured_token: u64,
+    signal_event: u64,
+}
+
+struct RtlRegisteredWaitDispatch {
+    wait_token: u64,
+    callback: u64,
+    context: u64,
+    timed_out: bool,
+    queue_flags: u32,
+    captured_token: u64,
+}
+
+enum RtlRegisteredWaitControl {
+    Dispatch(RtlRegisteredWaitDispatch),
+    Cleanup(RtlRegisteredWaitCleanup),
+}
+
+struct RtlRegisteredWaitCallbackPacket {
+    wait_token: u64,
+    callback: u64,
+    context: u64,
+    timed_out: bool,
+    captured_token: u64,
+}
+
+unsafe fn release_registered_wait_locked(
+    slot: &mut RtlRegisteredWaitSlot,
+    cancel_handle: u64,
+    signal_event: u64,
+) -> RtlRegisteredWaitCleanup {
+    let captured_token = slot.captured_token;
+    slot.state = RTL_ASYNC_FREE;
+    slot.model = None;
+    slot.deadline = None;
+    slot.cancel_requested = false;
+    slot.dispatch_pending = false;
+    slot.dispatch_timed_out = false;
+    slot.dispatch_failures = 0;
+    slot.callback = 0;
+    slot.context = 0;
+    slot.queue_flags = 0;
+    slot.captured_token = 0;
+    RtlRegisteredWaitCleanup {
+        cancel_handle,
+        captured_token,
+        signal_event,
+    }
+}
+
+unsafe fn apply_registered_wait_cleanup(cleanup: RtlRegisteredWaitCleanup) {
+    let shared_wake = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
+    if cleanup.cancel_handle != shared_wake {
+        unsafe { rtl_async_close(cleanup.cancel_handle) };
+    }
+    unsafe { rtl_async_close(cleanup.captured_token) };
+    unsafe { rtl_async_set_event(cleanup.signal_event) };
+}
+
+unsafe fn capture_registered_wait_token(flags: nt_rtl_work_item::WorkItemFlags) -> Result<u64, u32> {
+    if !flags.transfers_impersonation() {
+        return Ok(0);
+    }
+    let mut token = 0u64;
+    let status = unsafe {
+        syscall4(
+            SSN_NT_OPEN_THREAD_TOKEN,
+            NT_CURRENT_THREAD,
+            TOKEN_IMPERSONATE,
+            1,
+            core::ptr::addr_of_mut!(token) as u64,
+        ) as u32
+    };
+    let capture = nt_rtl_work_item::normalize_token_capture(flags, status, token);
+    if nt_rtl_work_item::nt_success(capture.status()) {
+        Ok(capture.token_handle())
+    } else {
+        Err(capture.status())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rtl_register_wait(
+    new_wait: *mut u64,
+    object: u64,
+    callback: u64,
+    context: u64,
+    milliseconds: u32,
+    flags: u32,
+) -> u32 {
+    if new_wait.is_null() || object == 0 || callback == 0 {
+        return nt_rtl_timer_wait::STATUS_INVALID_PARAMETER;
+    }
+
+    let status = unsafe { ensure_rtl_async_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    let status = unsafe { start_completion_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+
+    let cancel_event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
+    if cancel_event == 0 {
+        return STATUS_UNSUCCESSFUL_U32;
+    }
+    let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
+    let captured_token = match unsafe { capture_registered_wait_token(work_flags) } {
+        Ok(token) => token,
+        Err(status) => return status,
+    };
+    let mut model = match nt_rtl_timer_wait::registered_wait::RegisteredWait::new(
+        object,
+        cancel_event,
+        callback,
+        context,
+        milliseconds,
+        work_flags,
+    ) {
+        Ok(model) => model,
+        Err(status) => {
+            unsafe { rtl_async_close(captured_token) };
+            return status;
+        }
+    };
+    if let Err(status) = model.worker_started() {
+        let _ = model.start_failed();
+        unsafe { rtl_async_close(captured_token) };
+        return status;
+    }
+    let queue_flags = model
+        .queue_flags()
+        .without(nt_rtl_work_item::WorkItemFlags::TRANSFER_IMPERSONATION)
+        .bits();
+    let token = {
+        let _guard = unsafe { rtl_async_lock() };
+        let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS)
+            .cast::<RtlRegisteredWaitSlot>();
+        let mut allocated = None;
+        for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
+            let slot = unsafe { &mut *slots.add(index) };
+            if slot.state != RTL_ASYNC_FREE {
+                continue;
+            }
+            slot.generation = next_rtl_generation(slot.generation);
+            slot.state = RTL_ASYNC_RESERVED;
+            slot.deadline = None;
+            slot.cancel_requested = false;
+            slot.dispatch_pending = false;
+            slot.dispatch_timed_out = false;
+            slot.dispatch_failures = 0;
+            slot.callback = callback;
+            slot.context = context;
+            slot.queue_flags = queue_flags;
+            slot.captured_token = captured_token;
+            slot.model = Some(model);
+            allocated = Some(rtl_async_handle(
+                RTL_ASYNC_WAIT_KIND,
+                index,
+                slot.generation,
+            ));
+            break;
+        }
+        allocated
+    };
+    let Some(token) = token else {
+        unsafe { rtl_async_close(captured_token) };
+        return nt_rtl_timer_wait::STATUS_NO_MEMORY;
+    };
+
+    // Validate only after every other fallible resource is reserved. A successful poll consumes a
+    // synchronization event/semaphore, and is therefore committed as this registration's first fire.
+    let preflight = unsafe { rtl_async_wait(object, Some(0)) };
+    let immediate_object = if preflight == STATUS_SUCCESS_U32 {
+        true
+    } else if preflight == STATUS_TIMEOUT_U32 {
+        false
+    } else {
+        let cleanup = {
+            let _guard = unsafe { rtl_async_lock() };
+            let Some((index, generation)) = rtl_async_handle_parts(
+                token,
+                RTL_ASYNC_WAIT_KIND,
+                RTL_REGISTERED_WAIT_CAPACITY,
+            ) else {
+                return STATUS_UNSUCCESSFUL_U32;
+            };
+            let slot = unsafe {
+                &mut *core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS)
+                    .cast::<RtlRegisteredWaitSlot>()
+                    .add(index)
+            };
+            if slot.state != RTL_ASYNC_RESERVED || slot.generation != generation {
+                return STATUS_UNSUCCESSFUL_U32;
+            }
+            unsafe { release_registered_wait_locked(slot, 0, 0) }
+        };
+        unsafe { apply_registered_wait_cleanup(cleanup) };
+        return preflight;
+    };
+    let deadline_now_ms = unsafe { rtl_async_now_ms() };
+    let published = {
+        let _guard = unsafe { rtl_async_lock() };
+        let Some((index, generation)) = rtl_async_handle_parts(
+            token,
+            RTL_ASYNC_WAIT_KIND,
+            RTL_REGISTERED_WAIT_CAPACITY,
+        ) else {
+            return STATUS_UNSUCCESSFUL_U32;
+        };
+        let slot = unsafe {
+            &mut *core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS)
+                .cast::<RtlRegisteredWaitSlot>()
+                .add(index)
+        };
+        if slot.state != RTL_ASYNC_RESERVED || slot.generation != generation {
+            false
+        } else {
+            slot.deadline = Some(nt_rtl_timer_wait::registered_wait::WaitDeadline::new(
+                deadline_now_ms,
+                milliseconds,
+            ));
+            if immediate_object {
+                if matches!(
+                    slot.model.as_mut().and_then(|model| {
+                        model
+                            .observe_wait(nt_rtl_timer_wait::registered_wait::WaitOutcome::Object)
+                            .ok()
+                    }),
+                    Some(nt_rtl_timer_wait::registered_wait::WaitAction::Invoke { .. })
+                ) {
+                    slot.dispatch_pending = true;
+                }
+            }
+            slot.state = RTL_ASYNC_LIVE;
+            true
+        }
+    };
+    if !published {
+        return STATUS_UNSUCCESSFUL_U32;
+    }
+    unsafe { core::ptr::write(new_wait, token) };
+    unsafe { rtl_async_wake() };
+    STATUS_SUCCESS_U32
+}
+
+unsafe fn registered_wait_completion_mode(
+    completion_event: u64,
+) -> Result<(nt_rtl_timer_wait::CompletionMode, Option<u64>), u32> {
+    if completion_event == 0 {
+        Ok((nt_rtl_timer_wait::CompletionMode::Async, None))
+    } else if completion_event == u64::MAX {
+        let event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
+        if event == 0 {
+            return Err(STATUS_UNSUCCESSFUL_U32);
+        }
+        Ok((
+            nt_rtl_timer_wait::CompletionMode::Synchronous(event),
+            Some(event),
+        ))
+    } else {
+        Ok((
+            nt_rtl_timer_wait::CompletionMode::Event(completion_event),
+            None,
+        ))
+    }
+}
+
+pub unsafe fn rtl_deregister_wait(wait_token: u64, completion_event: u64) -> u32 {
+    if completion_event == u64::MAX && unsafe { rtl_async_on_worker() } {
+        let state = {
+            let _guard = unsafe { rtl_async_lock() };
+            unsafe { rtl_registered_wait_slot_mut(wait_token, false) }
+                .and_then(|slot| slot.model.as_ref())
+                .map(|model| model.state())
+        };
+        let Some(state) = state else {
+            return nt_rtl_timer_wait::STATUS_INVALID_HANDLE;
+        };
+        if state != nt_rtl_timer_wait::registered_wait::WaitState::WorkerExited {
+            return STATUS_CANT_WAIT_U32;
+        }
+    }
+    let (mode, internal_event) = match unsafe { registered_wait_completion_mode(completion_event) } {
+        Ok(mode) => mode,
+        Err(status) => return status,
+    };
+    let result = {
+        let _guard = unsafe { rtl_async_lock() };
+        (|| {
+            let slot = unsafe { rtl_registered_wait_slot_mut(wait_token, false) }
+                .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?;
+            let plan = slot
+                .model
+                .as_mut()
+                .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?
+                .deregister(mode)?;
+            slot.state = RTL_ASYNC_RETIRED;
+            slot.cancel_requested = plan.set_cancel_event.is_some();
+            let cleanup = if plan.reclaim {
+                Some(unsafe {
+                    release_registered_wait_locked(
+                        slot,
+                        plan.close_handle.unwrap_or(0),
+                        plan.signal_event.unwrap_or(0),
+                    )
+                })
+            } else {
+                None
+            };
+            Ok::<_, u32>((plan, cleanup))
+        })()
+    };
+    let (plan, cleanup) = match result {
+        Ok(result) => result,
+        Err(status) => {
+            return status;
+        }
+    };
+    if let Some(event) = plan.set_cancel_event {
+        unsafe { rtl_async_set_event(event) };
+    }
+    if let Some(cleanup) = cleanup {
+        unsafe { apply_registered_wait_cleanup(cleanup) };
+    } else {
+        unsafe { rtl_async_wake() };
+    }
+    if internal_event.is_some() && plan.wait_event.is_some() {
+        loop {
+            let reclaimed = {
+                let _guard = unsafe { rtl_async_lock() };
+                unsafe { rtl_registered_wait_slot_mut(wait_token, true) }.is_none()
+            };
+            if reclaimed {
+                break;
+            }
+            let delay_status = unsafe { work_pool_delay(-10_000) };
+            if !nt_rtl_work_item::nt_success(delay_status) {
+                return delay_status;
+            }
+        }
+    }
+    plan.status
+}
+
+unsafe fn finish_registered_wait_callback(wait_token: u64) {
+    let now_ms = unsafe { rtl_async_now_ms() };
+    let cleanup = {
+        let _guard = unsafe { rtl_async_lock() };
+        let Some(slot) = (unsafe { rtl_registered_wait_slot_mut(wait_token, true) }) else {
+            return;
+        };
+        let Some(model) = slot.model.as_mut() else {
+            return;
+        };
+        match model.callback_finished() {
+            Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Retry) => {
+                slot.dispatch_failures = 0;
+                if let Some(deadline) = slot.deadline.as_mut() {
+                    deadline.rearm(now_ms);
+                }
+                None
+            }
+            Ok(nt_rtl_timer_wait::registered_wait::WaitAction::ExitWorker) => {
+                let completion = model.worker_exited().ok();
+                completion.and_then(|completion| {
+                    completion.reclaim.then(|| unsafe {
+                        release_registered_wait_locked(
+                            slot,
+                            completion.close_handle.unwrap_or(0),
+                            completion.signal_event.unwrap_or(0),
+                        )
+                    })
+                })
+            }
+            Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Invoke { .. }) | Err(_) => None,
+        }
+    };
+    if let Some(cleanup) = cleanup {
+        unsafe { apply_registered_wait_cleanup(cleanup) };
+    }
+    unsafe { rtl_async_wake() };
+}
+
+unsafe extern "system" fn rtl_registered_wait_callback_worker(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    let packet = unsafe { core::ptr::read(context.cast::<RtlRegisteredWaitCallbackPacket>()) };
+    let _ = unsafe { crate::process_heap_free(context.cast()) };
+    let impersonating = if packet.captured_token != 0 {
+        let token = packet.captured_token;
+        let status = unsafe {
+            syscall4(
+                SSN_NT_SET_INFORMATION_THREAD,
+                NT_CURRENT_THREAD,
+                THREAD_IMPERSONATION_TOKEN,
+                core::ptr::addr_of!(token) as u64,
+                core::mem::size_of::<u64>() as u64,
+            ) as u32
+        };
+        nt_rtl_work_item::nt_success(status)
+    } else {
+        false
+    };
+    let callback: unsafe extern "system" fn(*mut c_void, u8) =
+        unsafe { core::mem::transmute(packet.callback as usize) };
+    unsafe { callback(packet.context as *mut c_void, packet.timed_out as u8) };
+    if impersonating {
+        let token = 0u64;
+        let _ = unsafe {
+            syscall4(
+                SSN_NT_SET_INFORMATION_THREAD,
+                NT_CURRENT_THREAD,
+                THREAD_IMPERSONATION_TOKEN,
+                core::ptr::addr_of!(token) as u64,
+                core::mem::size_of::<u64>() as u64,
+            )
+        };
+    }
+    unsafe { finish_registered_wait_callback(packet.wait_token) };
+}
+
+unsafe fn next_registered_wait_control() -> Option<RtlRegisteredWaitControl> {
+    let _guard = unsafe { rtl_async_lock() };
+    let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
+    for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
+        let slot = unsafe { &mut *slots.add(index) };
+        if !matches!(slot.state, RTL_ASYNC_LIVE | RTL_ASYNC_RETIRED) {
+            continue;
+        }
+        let wait_token = rtl_async_handle(RTL_ASYNC_WAIT_KIND, index, slot.generation);
+        if slot.cancel_requested
+            && slot.model.as_ref().is_some_and(|model| {
+                model.state() == nt_rtl_timer_wait::registered_wait::WaitState::Waiting
+            })
+        {
+            if let Some(model) = slot.model.as_mut() {
+                let _ = model.observe_wait(nt_rtl_timer_wait::registered_wait::WaitOutcome::Cancel);
+            }
+        }
+        if slot.model.as_ref().is_some_and(|model| {
+            model.state() == nt_rtl_timer_wait::registered_wait::WaitState::Exiting
+        }) {
+            let completion = slot
+                .model
+                .as_mut()
+                .and_then(|model| model.worker_exited().ok());
+            if let Some(completion) = completion {
+                if completion.reclaim {
+                    let cleanup = unsafe {
+                        release_registered_wait_locked(
+                            slot,
+                            completion.close_handle.unwrap_or(0),
+                            completion.signal_event.unwrap_or(0),
+                        )
+                    };
+                    return Some(RtlRegisteredWaitControl::Cleanup(cleanup));
+                }
+            }
+        }
+        if slot.dispatch_pending
+            && slot.model.as_ref().is_some_and(|model| {
+                model.state() == nt_rtl_timer_wait::registered_wait::WaitState::Callback
+            })
+        {
+            slot.dispatch_pending = false;
+            return Some(RtlRegisteredWaitControl::Dispatch(
+                RtlRegisteredWaitDispatch {
+                    wait_token,
+                    callback: slot.callback,
+                    context: slot.context,
+                    timed_out: slot.dispatch_timed_out,
+                    queue_flags: slot.queue_flags,
+                    captured_token: slot.captured_token,
+                },
+            ));
+        }
+    }
+    None
+}
+
+unsafe fn observe_registered_wait(
+    wait_token: u64,
+    outcome: nt_rtl_timer_wait::registered_wait::WaitOutcome,
+    now_ms: u64,
+) -> bool {
+    let _guard = unsafe { rtl_async_lock() };
+    let Some(slot) = (unsafe { rtl_registered_wait_slot_mut(wait_token, true) }) else {
+        return false;
+    };
+    let Some(model) = slot.model.as_mut() else {
+        return false;
+    };
+    if model.state() != nt_rtl_timer_wait::registered_wait::WaitState::Waiting {
+        return false;
+    }
+    let effective_outcome = if slot.cancel_requested {
+        nt_rtl_timer_wait::registered_wait::WaitOutcome::Cancel
+    } else {
+        outcome
+    };
+    match model.observe_wait(effective_outcome) {
+        Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Invoke { timed_out, .. }) => {
+            slot.dispatch_pending = true;
+            slot.dispatch_timed_out = timed_out;
+            slot.dispatch_failures = 0;
+            true
+        }
+        Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Retry) => {
+            if let Some(deadline) = slot.deadline.as_mut() {
+                deadline.rearm(now_ms);
+            }
+            true
+        }
+        Ok(nt_rtl_timer_wait::registered_wait::WaitAction::ExitWorker) => true,
+        Err(_) => false,
+    }
+}
+
+unsafe fn observe_one_registered_timeout(now_ms: u64) -> bool {
+    let _guard = unsafe { rtl_async_lock() };
+    let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
+    for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
+        let slot = unsafe { &mut *slots.add(index) };
+        let waiting = slot.model.as_ref().is_some_and(|model| {
+            model.state() == nt_rtl_timer_wait::registered_wait::WaitState::Waiting
+        });
+        let expired = slot
+            .deadline
+            .and_then(|deadline| deadline.remaining(now_ms))
+            == Some(0);
+        if !matches!(slot.state, RTL_ASYNC_LIVE | RTL_ASYNC_RETIRED) || !waiting || !expired {
+            continue;
+        }
+        let outcome = if slot.cancel_requested {
+            nt_rtl_timer_wait::registered_wait::WaitOutcome::Cancel
+        } else {
+            nt_rtl_timer_wait::registered_wait::WaitOutcome::Timeout
+        };
+        if let Some(model) = slot.model.as_mut() {
+            match model.observe_wait(outcome) {
+                Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Invoke {
+                    timed_out,
+                    ..
+                }) => {
+                    slot.dispatch_pending = true;
+                    slot.dispatch_timed_out = timed_out;
+                    slot.dispatch_failures = 0;
+                }
+                Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Retry)
+                | Ok(nt_rtl_timer_wait::registered_wait::WaitAction::ExitWorker)
+                | Err(_) => {}
+            }
+        }
+        return true;
+    }
+    false
+}
+
+unsafe fn registered_wait_snapshot(
+    now_ms: u64,
+) -> (
+    nt_rtl_timer_wait::registered_wait::WaitSet<RTL_REGISTERED_WAIT_CAPACITY>,
+    Option<u32>,
+    bool,
+) {
+    let _guard = unsafe { rtl_async_lock() };
+    let mut set = nt_rtl_timer_wait::registered_wait::WaitSet::new();
+    let mut timeout = None;
+    let mut alertable = false;
+    let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
+    for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
+        let slot = unsafe { &mut *slots.add(index) };
+        if !matches!(slot.state, RTL_ASYNC_LIVE | RTL_ASYNC_RETIRED) || slot.cancel_requested {
+            continue;
+        }
+        let Some(request) = slot.model.as_ref().and_then(|model| model.wait_request()) else {
+            continue;
+        };
+        let token = rtl_async_handle(RTL_ASYNC_WAIT_KIND, index, slot.generation);
+        if set
+            .push(nt_rtl_timer_wait::registered_wait::WaitSetEntry {
+                token,
+                object: request.object,
+            })
+            .is_err()
+        {
+            break;
+        }
+        alertable |= request.alertable;
+        if let Some(remaining) = slot.deadline.and_then(|deadline| deadline.remaining(now_ms)) {
+            timeout = Some(timeout.map_or(remaining, |current: u32| current.min(remaining)));
+        }
+    }
+    (set, timeout, alertable)
+}
+
+unsafe fn execute_registered_wait_dispatch(dispatch: RtlRegisteredWaitDispatch) {
+    let packet_address = unsafe {
+        crate::process_heap_alloc(core::mem::size_of::<RtlRegisteredWaitCallbackPacket>())
+    };
+    if packet_address.is_null() {
+        if unsafe { registered_wait_dispatch_failed(dispatch.wait_token) } {
+            unsafe { rtl_async_backoff() };
+        }
+        return;
+    }
+    unsafe {
+        core::ptr::write(
+            packet_address.cast::<RtlRegisteredWaitCallbackPacket>(),
+            RtlRegisteredWaitCallbackPacket {
+                wait_token: dispatch.wait_token,
+                callback: dispatch.callback,
+                context: dispatch.context,
+                timed_out: dispatch.timed_out,
+                captured_token: dispatch.captured_token,
+            },
+        )
+    };
+    let status = unsafe {
+        rtl_queue_work_item(
+            rtl_registered_wait_callback_worker as usize as u64,
+            packet_address as u64,
+            dispatch.queue_flags,
+        )
+    };
+    if !nt_rtl_work_item::nt_success(status) {
+        let _ = unsafe { crate::process_heap_free(packet_address) };
+        if unsafe { registered_wait_dispatch_failed(dispatch.wait_token) } {
+            unsafe { rtl_async_backoff() };
+        }
+    }
+}
+
+unsafe fn registered_wait_dispatch_failed(wait_token: u64) -> bool {
+    let _guard = unsafe { rtl_async_lock() };
+    let Some(slot) = (unsafe { rtl_registered_wait_slot_mut(wait_token, true) }) else {
+        return false;
+    };
+    let callback_active = slot.model.as_ref().is_some_and(|model| {
+        model.state() == nt_rtl_timer_wait::registered_wait::WaitState::Callback
+    });
+    if !callback_active {
+        return false;
+    }
+    slot.dispatch_failures = slot.dispatch_failures.saturating_add(1);
+    if slot.dispatch_failures < 3 {
+        slot.dispatch_pending = true;
+        true
+    } else {
+        slot.dispatch_pending = false;
+        if let Some(model) = slot.model.as_mut() {
+            let _ = model.callback_dispatch_failed();
+        }
+        false
+    }
+}
+
+unsafe fn isolate_failed_registered_waits(now_ms: u64) -> bool {
+    let mut entries = [(0u64, 0u64); RTL_REGISTERED_WAIT_CAPACITY];
+    let len = {
+        let _guard = unsafe { rtl_async_lock() };
+        let slots =
+            core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
+        let mut len = 0usize;
+        for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
+            let slot = unsafe { &mut *slots.add(index) };
+            if !matches!(slot.state, RTL_ASYNC_LIVE | RTL_ASYNC_RETIRED) {
+                continue;
+            }
+            let Some(request) = slot.model.as_ref().and_then(|model| model.wait_request()) else {
+                continue;
+            };
+            entries[len] = (
+                rtl_async_handle(RTL_ASYNC_WAIT_KIND, index, slot.generation),
+                request.object,
+            );
+            len += 1;
+        }
+        len
+    };
+    let mut handled = false;
+    for &(token, object) in &entries[..len] {
+        let status = unsafe { rtl_async_wait(object, Some(0)) };
+        let outcome = if status == STATUS_SUCCESS_U32 {
+            Some(nt_rtl_timer_wait::registered_wait::WaitOutcome::Object)
+        } else if status == STATUS_TIMEOUT_U32 {
+            None
+        } else {
+            Some(nt_rtl_timer_wait::registered_wait::WaitOutcome::Failed(status))
+        };
+        if let Some(outcome) = outcome {
+            handled |= unsafe { observe_registered_wait(token, outcome, now_ms) };
+        }
+    }
+    handled
 }
 
 struct RtlTimerCallbackPacket {
@@ -6474,6 +7356,17 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
     RTL_SCHEDULER_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
 
     loop {
+        if let Some(control) = unsafe { next_registered_wait_control() } {
+            match control {
+                RtlRegisteredWaitControl::Dispatch(dispatch) => {
+                    unsafe { execute_registered_wait_dispatch(dispatch) }
+                }
+                RtlRegisteredWaitControl::Cleanup(cleanup) => {
+                    unsafe { apply_registered_wait_cleanup(cleanup) }
+                }
+            }
+            continue;
+        }
         let now_ms = unsafe { rtl_async_now_ms() };
         let (timer_action, timeout_ms) = unsafe { next_timer_worker_action(now_ms) };
         match timer_action {
@@ -6494,13 +7387,68 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
                         &RTL_SCHEDULER_WORKER_TID,
                     ) };
                 }
-                let wait_status = unsafe { rtl_async_wait(wake_event, timeout_ms) };
-                if !nt_rtl_work_item::nt_success(wait_status) && wait_status != STATUS_TIMEOUT_U32 {
-                    unsafe { exit_work_pool_thread(
-                        wait_status,
+                let snapshot_now = unsafe { rtl_async_now_ms() };
+                let (wait_set, wait_timeout, alertable) =
+                    unsafe { registered_wait_snapshot(snapshot_now) };
+                let combined_timeout = match (timeout_ms, wait_timeout) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+                    (None, None) => None,
+                };
+                let mut handles = [0u64; RTL_REGISTERED_WAIT_CAPACITY + 1];
+                let handle_count = match wait_set.write_handles(wake_event, &mut handles) {
+                    Ok(count) => count,
+                    Err(_) => unsafe { exit_work_pool_thread(
+                        STATUS_UNSUCCESSFUL_U32,
                         &RTL_SCHEDULER_WORKER_STATE,
                         &RTL_SCHEDULER_WORKER_TID,
-                    ) };
+                    ) },
+                };
+                let wait_status = unsafe {
+                    rtl_async_wait_many(
+                        &handles[..handle_count],
+                        alertable,
+                        combined_timeout,
+                    )
+                };
+                let observed_at = unsafe { rtl_async_now_ms() };
+                match wait_set.decode_status(wait_status) {
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Wake => {}
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Cancel(token) => {
+                        let _ = unsafe {
+                            observe_registered_wait(
+                                token,
+                                nt_rtl_timer_wait::registered_wait::WaitOutcome::Cancel,
+                                observed_at,
+                            )
+                        };
+                    }
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Object(token) => {
+                        let _ = unsafe {
+                            observe_registered_wait(
+                                token,
+                                nt_rtl_timer_wait::registered_wait::WaitOutcome::Object,
+                                observed_at,
+                            )
+                        };
+                    }
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Timeout => {
+                        let _ = unsafe { observe_one_registered_timeout(observed_at) };
+                    }
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::UserApc => {
+                        // The executive has no user-APC queue yet. Preserve absolute per-wait
+                        // deadlines so one future alertable registration cannot postpone others.
+                    }
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Failed(status)
+                        if status == STATUS_INSUFFICIENT_RESOURCES_U32 =>
+                    {
+                        unsafe { rtl_async_backoff() };
+                    }
+                    nt_rtl_timer_wait::registered_wait::WaitSetOutcome::Failed(_) => {
+                        if !unsafe { isolate_failed_registered_waits(observed_at) } {
+                            unsafe { rtl_async_backoff() };
+                        }
+                    }
                 }
             }
         }

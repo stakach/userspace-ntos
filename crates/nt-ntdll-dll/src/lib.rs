@@ -610,6 +610,11 @@ pub unsafe extern "C" fn LdrpInitialize(
                 // The timer probe uses the same hosted async worker but exercises deadline wakeup.
                 unsafe { on_target::run_rtl_timer_probe_if_smss() };
             }
+            #[cfg(feature = "rtl_wait_probe")]
+            {
+                // The wait probe verifies object wake, callback dispatch, and only-once teardown.
+                unsafe { on_target::run_rtl_wait_probe_if_smss() };
+            }
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).

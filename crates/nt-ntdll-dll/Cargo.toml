@@ -26,6 +26,9 @@ rtl_work_item_probe = []
 # Opt-in live timer deadline/callback/deletion probe. Like the work-item probe, this creates the
 # process async worker and is excluded from production images.
 rtl_timer_probe = []
+# Opt-in live registered-wait probe. Exercises object wake, completion callback, only-once exit,
+# and synchronous deregistration without changing production startup.
+rtl_wait_probe = []
 
 [dependencies]
 nt-alpc-abi = { path = "../nt-alpc-abi" }

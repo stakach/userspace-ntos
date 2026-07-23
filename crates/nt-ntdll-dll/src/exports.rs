@@ -16095,92 +16095,6 @@ pub unsafe extern "system" fn rtl_dump_resource(resource: *mut c_void) {
 // ---- timer queues / registered waits / thread-pool work -----------------------------------------
 
 const INVALID_HANDLE_VALUE_USIZE: usize = usize::MAX;
-const RTL_WAIT_SLOTS: usize = 32;
-
-#[repr(C)]
-struct WaitRecord {
-    live: AtomicU32,
-    object: AtomicUsize,
-    callback: AtomicUsize,
-    context: AtomicUsize,
-    milliseconds: AtomicU32,
-    flags: AtomicU32,
-}
-
-impl WaitRecord {
-    const fn new() -> Self {
-        Self {
-            live: AtomicU32::new(0),
-            object: AtomicUsize::new(0),
-            callback: AtomicUsize::new(0),
-            context: AtomicUsize::new(0),
-            milliseconds: AtomicU32::new(0),
-            flags: AtomicU32::new(0),
-        }
-    }
-}
-
-static RTL_WAITS: [WaitRecord; RTL_WAIT_SLOTS] = [const { WaitRecord::new() }; RTL_WAIT_SLOTS];
-
-#[inline]
-fn wait_handle(record: &'static WaitRecord) -> *mut c_void {
-    record as *const WaitRecord as *mut c_void
-}
-
-
-fn find_wait(handle: *mut c_void) -> Option<&'static WaitRecord> {
-    if handle.is_null() {
-        return None;
-    }
-    for record in &RTL_WAITS {
-        if wait_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
-            return Some(record);
-        }
-    }
-    None
-}
-
-fn alloc_wait_record(
-    object: *mut c_void,
-    callback: *mut c_void,
-    context: *mut c_void,
-    milliseconds: u32,
-    flags: u32,
-) -> Option<*mut c_void> {
-    for record in &RTL_WAITS {
-        if record
-            .live
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            record.object.store(object as usize, Ordering::Release);
-            record.callback.store(callback as usize, Ordering::Release);
-            record.context.store(context as usize, Ordering::Release);
-            record.milliseconds.store(milliseconds, Ordering::Release);
-            record.flags.store(flags, Ordering::Release);
-            return Some(wait_handle(record));
-        }
-    }
-    None
-}
-
-unsafe fn signal_completion_event(completion_event: *mut c_void) {
-    if completion_event.is_null() || completion_event as usize == INVALID_HANDLE_VALUE_USIZE {
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: forwards the same ABI as NtSetEvent(EventHandle, PreviousState=NULL).
-        let _ = unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(*mut c_void, *mut i32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_set_event)(
-                completion_event, core::ptr::null_mut()
-            )
-        };
-    }
-}
 
 /// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — allocate a generation-checked queue on
 /// the process-wide RTL async worker.
@@ -16425,8 +16339,8 @@ pub unsafe extern "system" fn rtl_queue_work_item(
 }
 
 /// `RtlRegisterWait(PHANDLE NewWaitObject, HANDLE Object, WAITORTIMERCALLBACK Callback,
-/// PVOID Context, ULONG Milliseconds, ULONG Flags) -> NTSTATUS`. Allocates a bounded wait record;
-/// the asynchronous wait-dispatch thread is still future work.
+/// PVOID Context, ULONG Milliseconds, ULONG Flags) -> NTSTATUS`. On target, the shared scheduler
+/// performs a real wait and queues serialized callbacks onto the completion lane.
 ///
 /// # Safety
 /// `new_wait_object` writable.
@@ -16440,15 +16354,24 @@ pub unsafe extern "system" fn rtl_register_wait(
     milliseconds: u32,
     flags: u32,
 ) -> NtStatus {
-    if new_wait_object.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::rtl_register_wait(
+                new_wait_object.cast(),
+                object as u64,
+                callback as u64,
+                context as u64,
+                milliseconds,
+                flags,
+            )
+        };
     }
-    let Some(handle) = alloc_wait_record(object, callback, context, milliseconds, flags) else {
-        return STATUS_NO_MEMORY;
-    };
-    // SAFETY: writable per the contract.
-    unsafe { *new_wait_object = handle };
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (new_wait_object, object, callback, context, milliseconds, flags);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlDeregisterWaitEx(HANDLE WaitHandle, HANDLE CompletionEvent) -> NTSTATUS`.
@@ -16460,16 +16383,20 @@ pub unsafe extern "system" fn rtl_deregister_wait_ex(
     wait_handle: *mut c_void,
     completion_event: *mut c_void,
 ) -> NtStatus {
-    let Some(wait_record) = find_wait(wait_handle) else {
-        return STATUS_INVALID_HANDLE;
-    };
-    wait_record.live.store(0, Ordering::Release);
-    // SAFETY: optional completion event supplied by the caller.
-    unsafe { signal_completion_event(completion_event) };
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            crate::on_target::rtl_deregister_wait(wait_handle as u64, completion_event as u64)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (wait_handle, completion_event);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `RtlDeregisterWait(HANDLE WaitHandle) -> NTSTATUS` — synchronous compatibility entry point over
+/// `RtlDeregisterWait(HANDLE WaitHandle) -> NTSTATUS` — asynchronous compatibility entry point over
 /// `RtlDeregisterWaitEx` with no completion event (`sdk/lib/rtl/wait.c:270`).
 ///
 /// # Safety
