@@ -605,7 +605,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex_u64(m0);
                 print_str(b"\n");
             }
-            delay_timer_interrupt(&mut delay_queue);
+            delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
             let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = received.0;
             mi = received.1;
@@ -2009,6 +2009,11 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_keyed_wait_key: u64 = u64::MAX;
             let mut park_keyed_wait_deadline: Option<u64> = None;
             let mut park_delay_deadline: Option<u64> = None;
+            let mut park_io_completion_port: i64 = -1;
+            let mut park_io_completion_key_out: u64 = 0;
+            let mut park_io_completion_apc_out: u64 = 0;
+            let mut park_io_completion_iosb_out: u64 = 0;
+            let mut park_io_completion_deadline: Option<u64> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
             let mut park_pipe_fid: u64 = 0;
@@ -2067,6 +2072,12 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.delay_requested = false;
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
+                nt_handler.io_completion_park_port = -1;
+                nt_handler.io_completion_key_out = 0;
+                nt_handler.io_completion_apc_out = 0;
+                nt_handler.io_completion_iosb_out = 0;
+                nt_handler.io_completion_deadline_100ns = u64::MAX;
+                nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
                 nt_handler.pipe_park_fid = 0;
                 nt_handler.pipe_park_buffer_va = 0;
@@ -2227,8 +2238,11 @@ pub(crate) unsafe fn service_sec_image(
                             SVC_LISTENER_TERMINATED.store(1, Ordering::Relaxed);
                         }
                         let reply_dropped = drop_current_syscall_reply();
-                        let mechanism_deleted =
-                            terminate_hosted_thread_mechanism(tid, &mut delay_queue);
+                        let mechanism_deleted = terminate_hosted_thread_mechanism(
+                            tid,
+                            &mut delay_queue,
+                            &mut nt_handler,
+                        );
                         if reply_dropped && mechanism_deleted {
                             PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2267,7 +2281,15 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                     ExecPostAction::TerminateRemoteThread { tid } => {
-                        let _ = terminate_hosted_thread_mechanism(tid, &mut delay_queue);
+                        let _ = terminate_hosted_thread_mechanism(
+                            tid,
+                            &mut delay_queue,
+                            &mut nt_handler,
+                        );
+                    }
+                    ExecPostAction::CleanupProcessWaiters { process_index } => {
+                        io_completion_cancel_process(&mut nt_handler, process_index);
+                        delay_timer_rearm(&delay_queue);
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
                         let reply_dropped = drop_current_syscall_reply();
@@ -2383,6 +2405,18 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
+                }
+                if nt_handler.io_completion_park_port >= 0 {
+                    park_io_completion_port = nt_handler.io_completion_park_port;
+                    park_io_completion_key_out = nt_handler.io_completion_key_out;
+                    park_io_completion_apc_out = nt_handler.io_completion_apc_out;
+                    park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
+                    if nt_handler.io_completion_deadline_100ns != u64::MAX {
+                        park_io_completion_deadline = Some(nt_handler.io_completion_deadline_100ns);
+                    }
+                }
+                if nt_handler.io_completion_wake.is_some() {
+                    let _ = unsafe { io_completion_deliver(&mut nt_handler) };
                 }
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
@@ -4565,6 +4599,41 @@ pub(crate) unsafe fn service_sec_image(
             set_reply_mr(17, flags);
             procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            if park_io_completion_port >= 0 && reply_main != 0 {
+                if park_io_completion_deadline.is_some() && !delay_timer_init() {
+                    result = 0xC000_009A;
+                } else if io_completion_park(
+                    &mut nt_handler,
+                    park_io_completion_port as u32,
+                    park_io_completion_key_out,
+                    park_io_completion_apc_out,
+                    park_io_completion_iosb_out,
+                    park_io_completion_deadline.unwrap_or(u64::MAX),
+                    resume_ip,
+                    sp,
+                    flags,
+                ) {
+                    delay_timer_rearm(&delay_queue);
+                    print_str(b"[io-completion] pi=");
+                    print_u64(pi as u64);
+                    print_str(b" port=");
+                    print_u64(park_io_completion_port as u64);
+                    print_str(b" -> PARK remover\n");
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                } else {
+                    print_str(
+                        b"[io-completion] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
+                    );
+                    result = 0xC000_009A;
+                }
+            }
             if let Some(deadline) = park_delay_deadline {
                 if delay_park(
                     &mut delay_queue,
@@ -5292,6 +5361,109 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
         _ => IMAGE_MIRROR_VA,
     };
     (stack_base, stack_frames * 0x1000, stack_mirror, heap_mirror, image_mirror)
+}
+
+unsafe fn io_completion_park(
+    nt_handler: &mut ExecNtHandler,
+    port_id: u32,
+    key_context_out: u64,
+    apc_context_out: u64,
+    io_status_block_out: u64,
+    deadline_100ns: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh)) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
+        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
+    }) else {
+        return false;
+    };
+    if nt_handler.io_completion_ports.retain(port_id).is_err() {
+        return false;
+    }
+    let mut waiter = nt_io_completion::CompletionWaiter::default();
+    waiter.port_id = port_id;
+    waiter.process_index = nt_handler.pi as u8;
+    waiter.reply_cap = stolen;
+    waiter.resume_ip = resume_ip;
+    waiter.resume_sp = sp;
+    waiter.resume_flags = flags;
+    waiter.thread_id = nt_handler.current_tid;
+    waiter.badge = nt_handler.current_badge;
+    waiter.key_context_out = key_context_out;
+    waiter.apc_context_out = apc_context_out;
+    waiter.io_status_block_out = io_status_block_out;
+    waiter.deadline_100ns = deadline_100ns;
+    if unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter) }.is_err() {
+        let _ = nt_handler.io_completion_ports.release(port_id);
+        return false;
+    }
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    IO_COMPLETION_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
+    let Some((waiter, packet)) = nt_handler.io_completion_wake.take() else {
+        return false;
+    };
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take();
+
+    let (stack_base, stack_size, stack_mirror, heap_mirror, image_mirror) =
+        mirror_ctx_for(waiter.badge, waiter.process_index as usize);
+    ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(image_mirror, Ordering::Relaxed);
+    nt_handler.pi = waiter.process_index as usize;
+
+    let copied = nt_handler
+        .xas_try_write_buf(waiter.apc_context_out, &packet.apc_context.to_le_bytes())
+        && nt_handler.xas_try_write_buf(waiter.key_context_out, &packet.key_context.to_le_bytes())
+        && nt_handler.xas_try_write_buf(waiter.io_status_block_out, &packet.status.to_le_bytes())
+        && nt_handler.xas_try_write_buf(
+            waiter.io_status_block_out + 8,
+            &packet.information.to_le_bytes(),
+        );
+
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.loop_ctx = saved_ctx;
+
+    set_reply_mr(15, waiter.resume_ip);
+    set_reply_mr(16, waiter.resume_sp);
+    set_reply_mr(17, waiter.resume_flags);
+    send_on_reply(
+        waiter.reply_cap,
+        18,
+        if copied { 0 } else { 0xC000_0005 },
+        0,
+        0,
+        0,
+    );
+    release_reply_pool_cap(waiter.reply_cap);
+    let _ = nt_handler.io_completion_ports.release(waiter.port_id);
+    IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// BATCH 33 — PARK a caller whose npfs pipe read returned STATUS_PENDING. Mirrors the event

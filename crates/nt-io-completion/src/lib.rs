@@ -75,7 +75,8 @@ pub struct CompletionWaiter {
     sequence: u64,
 }
 
-/// Allocation-free FIFO wait table shared by completion ports.
+/// Allocation-free wait table shared by completion ports. Per-port release is LIFO, matching NT
+/// KQUEUE scheduling; deadline and cancellation scans retain deterministic park order.
 pub struct CompletionWaiterTable<const WAITERS: usize> {
     slots: [Option<CompletionWaiter>; WAITERS],
     next_sequence: u64,
@@ -128,6 +129,11 @@ impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
     /// Remove the oldest waiter owned by a terminating thread.
     pub fn pop_thread(&mut self, thread_id: u64) -> Option<CompletionWaiter> {
         self.pop_oldest_matching(|waiter| waiter.thread_id == thread_id)
+    }
+
+    /// Remove the oldest waiter owned by a terminating process.
+    pub fn pop_process(&mut self, process_index: u8) -> Option<CompletionWaiter> {
+        self.pop_oldest_matching(|waiter| waiter.process_index == process_index)
     }
 
     /// Remove the earliest expired waiter. Equal deadlines retain park order.
@@ -678,5 +684,23 @@ mod tests {
         assert_eq!(waiters.pop_thread(101).unwrap().reply_cap, 2);
         assert_eq!(waiters.pop_thread(101), None);
         assert_eq!(waiters.pop_port(2).unwrap().reply_cap, 3);
+    }
+
+    #[test]
+    fn completion_waiters_cancel_by_process_without_disturbing_others() {
+        let mut waiters = CompletionWaiterTable::<4>::new();
+        let mut first = waiter(1, 1, INFINITE_DEADLINE);
+        first.process_index = 2;
+        waiters.insert(first).unwrap();
+        let mut second = waiter(2, 2, INFINITE_DEADLINE);
+        second.process_index = 3;
+        waiters.insert(second).unwrap();
+        let mut third = waiter(1, 3, INFINITE_DEADLINE);
+        third.process_index = 2;
+        waiters.insert(third).unwrap();
+        assert_eq!(waiters.pop_process(2).unwrap().reply_cap, 1);
+        assert_eq!(waiters.pop_process(2).unwrap().reply_cap, 3);
+        assert_eq!(waiters.pop_process(2), None);
+        assert_eq!(waiters.pop_port(2).unwrap().reply_cap, 2);
     }
 }

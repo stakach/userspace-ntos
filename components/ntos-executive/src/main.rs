@@ -1052,6 +1052,15 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Blocking `NtRemoveIoCompletion` calls. Seven waiters leave one of the eight reply objects active
+/// so the executive can continue receiving while every other reply cap is parked.
+const IO_COMPLETION_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
+static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable<IO_COMPLETION_WAITER_N> =
+    nt_io_completion::CompletionWaiterTable::new();
+static IO_COMPLETION_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static IO_COMPLETION_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static IO_COMPLETION_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Keyed-event waiters (`NtWaitForKeyedEvent`) use the same reply-cap parking model as object-event
 /// waits, but are keyed by an arbitrary user pointer instead of an object-namespace event index.
 /// ReactOS condition variables pass the address of each stack wait-entry's `WaitKey` field and wake
@@ -2790,11 +2799,14 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .map(|slot| KEYED_WAITER_DEADLINE[slot].load(Ordering::Relaxed))
         .filter(|deadline| *deadline != u64::MAX)
         .min();
+    let io_completion_deadline =
+        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
     let deadline = queue
         .next_deadline()
         .into_iter()
         .chain(event_deadline)
         .chain(keyed_deadline)
+        .chain(io_completion_deadline)
         .min();
     if let Some(deadline) = deadline {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
@@ -2880,11 +2892,40 @@ unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) 
     woken
 }
 
-unsafe fn delay_timer_interrupt(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) {
+unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
+    let now = monotonic_time_100ns();
+    let mut woken = 0;
+    while let Some(waiter) =
+        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
+    {
+        set_reply_mr(15, waiter.resume_ip);
+        set_reply_mr(16, waiter.resume_sp);
+        set_reply_mr(17, waiter.resume_flags);
+        send_on_reply(
+            waiter.reply_cap,
+            18,
+            nt_io_completion::STATUS_TIMEOUT as u64,
+            0,
+            0,
+            0,
+        );
+        release_reply_pool_cap(waiter.reply_cap);
+        let _ = handler.io_completion_ports.release(waiter.port_id);
+        IO_COMPLETION_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+        woken += 1;
+    }
+    woken
+}
+
+unsafe fn delay_timer_interrupt(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
+) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = delay_wake_due(queue);
     let _ = wait_wake_due();
     let _ = keyed_wait_wake_due();
+    let _ = io_completion_wake_due(handler);
     delay_timer_rearm(queue);
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
@@ -2896,7 +2937,12 @@ unsafe fn delay_timer_interrupt(queue: &mut nt_delay_execution::Queue<DELAY_WAIT
 }
 
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
-    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 || queue.len() != 0 {
+    let completion_deadline =
+        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
+        || queue.len() != 0
+        || completion_deadline.is_some()
+    {
         return;
     }
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
@@ -2939,6 +2985,42 @@ unsafe fn delay_cancel_thread(
         print_str(b"\n");
     }
     delay_timer_rearm(queue);
+}
+
+unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u64) {
+    while let Some(waiter) =
+        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_thread(thread_id) }
+    {
+        let cap = waiter.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        let _ = handler.io_completion_ports.release(waiter.port_id);
+    }
+}
+
+unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_index: u8) {
+    while let Some(waiter) =
+        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_process(process_index) }
+    {
+        let cap = waiter.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        let _ = handler.io_completion_ports.release(waiter.port_id);
+    }
 }
 
 /// ═══ Checkpoint B park/wake helpers (real reply-cap parking) ═══
@@ -3247,7 +3329,13 @@ fn runtime_thread_slot(tid: u64) -> Option<(usize, usize)> {
 unsafe fn terminate_hosted_thread_mechanism(
     tid: u64,
     delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
 ) -> bool {
+    delay_cancel_thread(delay_queue, tid);
+    io_completion_cancel_thread(handler, tid);
+    delay_timer_rearm(delay_queue);
+    wait_cancel_thread(tid);
+    keyed_wait_cancel_thread(tid);
     let cell = match hosted_thread_tcb_cell(tid) {
         Some(cell) => cell,
         None => return false,
@@ -3256,9 +3344,6 @@ unsafe fn terminate_hosted_thread_mechanism(
     if tcb <= 1 {
         return false;
     }
-    delay_cancel_thread(delay_queue, tid);
-    wait_cancel_thread(tid);
-    keyed_wait_cancel_thread(tid);
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_r(tcb)
@@ -4455,6 +4540,19 @@ struct ExecNtHandler {
     delay_requested: bool,
     delay_interval_100ns: i64,
     delay_alertable: bool,
+    /// Blocking completion remove side signal. `-1` means no park request; nonnegative is the
+    /// retained completion-port id to publish at the reply-cap park site.
+    io_completion_park_port: i64,
+    io_completion_key_out: u64,
+    io_completion_apc_out: u64,
+    io_completion_iosb_out: u64,
+    io_completion_deadline_100ns: u64,
+    /// Direct packet handoff selected by NtSetIoCompletion. The loop owns cross-process copyout and
+    /// reply-cap wake, so the syscall handler only transfers this allocation-free pair.
+    io_completion_wake: Option<(
+        nt_io_completion::CompletionWaiter,
+        nt_io_completion::CompletionPacket,
+    )>,
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
@@ -4557,6 +4655,7 @@ enum ExecPostAction {
     None,
     TerminateCurrentThread { tid: u64 },
     TerminateRemoteThread { tid: u64 },
+    CleanupProcessWaiters { process_index: u8 },
     CriticalTermination { code: u32, object: u64 },
 }
 

@@ -224,6 +224,12 @@ impl ExecNtHandler {
             delay_requested: false,
             delay_interval_100ns: 0,
             delay_alertable: false,
+            io_completion_park_port: -1,
+            io_completion_key_out: 0,
+            io_completion_apc_out: 0,
+            io_completion_iosb_out: 0,
+            io_completion_deadline_100ns: u64::MAX,
+            io_completion_wake: None,
             io_signal_event: -1,
             pipe_park_fid: 0,
             pipe_park_buffer_va: 0,
@@ -7063,16 +7069,42 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Ok(id) => id,
                     Err(status) => return status,
                 };
+                let packet = nt_io_completion::CompletionPacket {
+                    key_context: args[1],
+                    apc_context: args[2],
+                    status: args[3] as u32,
+                    information: args[4],
+                };
+                if let Some(waiter) = unsafe {
+                    (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id)
+                } {
+                    let wake_packet = match self
+                        .io_completion_ports
+                        .remove(object_id, nt_io_completion::RemoveMode::Poll)
+                    {
+                        Ok(nt_io_completion::RemoveResult::Packet(queued)) => {
+                            if let Err(status) = self.io_completion_ports.enqueue(object_id, packet) {
+                                let _ = unsafe {
+                                    (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+                                        .insert(waiter)
+                                };
+                                return status;
+                            }
+                            queued
+                        }
+                        Ok(nt_io_completion::RemoveResult::Empty(_)) => packet,
+                        Err(status) => {
+                            let _ = unsafe {
+                                (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
+                            };
+                            return status;
+                        }
+                    };
+                    self.io_completion_wake = Some((waiter, wake_packet));
+                    return nt_io_completion::STATUS_SUCCESS;
+                }
                 self.io_completion_ports
-                    .enqueue(
-                        object_id,
-                        nt_io_completion::CompletionPacket {
-                            key_context: args[1],
-                            apc_context: args[2],
-                            status: args[3] as u32,
-                            information: args[4],
-                        },
-                    )
+                    .enqueue(object_id, packet)
                     .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
             },
             NativeService::NtRemoveIoCompletion => unsafe {
@@ -7082,45 +7114,69 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Ok(id) => id,
                     Err(status) => return status,
                 };
-                let mut probe = [0u8; 16];
-                if args[1] == 0
-                    || args[2] == 0
-                    || args[3] == 0
-                    || !self.xas_read(args[1], &mut probe[..8])
-                    || !self.xas_read(args[2], &mut probe[..8])
-                    || !self.xas_read(args[3], &mut probe)
+                if !self.probe_user_output(args[1], 8)
+                    || !self.probe_user_output(args[2], 8)
+                    || !self.probe_user_output(args[3], 16)
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let mode = if args[4] == 0 {
-                    nt_io_completion::RemoveMode::Wait
+                let timeout_interval = if args[4] == 0 {
+                    None
                 } else {
                     let mut timeout = [0u8; 8];
                     if !self.xas_read(args[4], &mut timeout) {
                         return STATUS_ACCESS_VIOLATION;
                     }
-                    if i64::from_le_bytes(timeout) == 0 {
-                        nt_io_completion::RemoveMode::Poll
-                    } else {
-                        nt_io_completion::RemoveMode::Wait
-                    }
+                    Some(i64::from_le_bytes(timeout))
+                };
+                let mode = if timeout_interval == Some(0) {
+                    nt_io_completion::RemoveMode::Poll
+                } else {
+                    nt_io_completion::RemoveMode::Wait
                 };
                 match self.io_completion_ports.remove(object_id, mode) {
                     Ok(nt_io_completion::RemoveResult::Packet(packet)) => {
-                        self.xas_write_buf(args[1], &packet.key_context.to_le_bytes());
-                        self.xas_write_buf(args[2], &packet.apc_context.to_le_bytes());
-                        self.xas_write_buf(args[3], &packet.status.to_le_bytes());
-                        self.xas_write_buf(args[3] + 8, &packet.information.to_le_bytes());
-                        nt_io_completion::STATUS_SUCCESS
+                        let copied = self
+                            .xas_try_write_buf(args[2], &packet.apc_context.to_le_bytes())
+                            && self.xas_try_write_buf(args[1], &packet.key_context.to_le_bytes())
+                            && self.xas_try_write_buf(args[3], &packet.status.to_le_bytes())
+                            && self.xas_try_write_buf(
+                                args[3] + 8,
+                                &packet.information.to_le_bytes(),
+                            );
+                        if copied {
+                            nt_io_completion::STATUS_SUCCESS
+                        } else {
+                            STATUS_ACCESS_VIOLATION
+                        }
                     }
                     Ok(nt_io_completion::RemoveResult::Empty(status)) => {
-                        if status == nt_io_completion::STATUS_PENDING
-                            && !NT_REMOVE_IO_COMPLETION_WAIT_TRACED.swap(true, Ordering::Relaxed)
-                        {
-                            print_str(b"[nt-remove-io-completion] pi="); print_u64(self.pi as u64);
-                            print_str(b" empty blocking wait -> STATUS_PENDING (reply-cap wait not yet armed)\n");
+                        if status != nt_io_completion::STATUS_PENDING {
+                            return status;
                         }
-                        status
+                        let deadline = match timeout_interval {
+                            None => u64::MAX,
+                            Some(interval) => match nt_delay_execution::due_time(
+                                interval,
+                                monotonic_time_100ns(),
+                                nt_system_time_100ns(),
+                            ) {
+                                nt_delay_execution::Due::Immediate => {
+                                    return nt_io_completion::STATUS_TIMEOUT;
+                                }
+                                nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
+                            },
+                        };
+                        self.io_completion_park_port = object_id as i64;
+                        self.io_completion_key_out = args[1];
+                        self.io_completion_apc_out = args[2];
+                        self.io_completion_iosb_out = args[3];
+                        self.io_completion_deadline_100ns = deadline;
+                        if !NT_REMOVE_IO_COMPLETION_WAIT_TRACED.swap(true, Ordering::Relaxed) {
+                            print_str(b"[nt-remove-io-completion] pi="); print_u64(self.pi as u64);
+                            print_str(b" empty blocking wait -> reply-cap park armed\n");
+                        }
+                        nt_io_completion::STATUS_PENDING
                     }
                     Err(status) => status,
                 }
@@ -8503,7 +8559,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         };
                         return 0;
                     }
+                    let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
                     let _ = self.pm.terminate_process(pid, status);
+                    if let Some(process_index) = process_index {
+                        self.post_action = ExecPostAction::CleanupProcessWaiters { process_index };
+                    }
                 }
                 0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
             }
