@@ -16092,52 +16092,10 @@ pub unsafe extern "system" fn rtl_dump_resource(resource: *mut c_void) {
     let _ = unsafe { resource_load(resource) };
 }
 
-// ---- timer-queue / thread-pool / work-item — bounded ntdll records (no scheduler plane) -----------
+// ---- timer queues / registered waits / thread-pool work -----------------------------------------
 
 const INVALID_HANDLE_VALUE_USIZE: usize = usize::MAX;
-const RTL_TIMER_QUEUE_SLOTS: usize = 16;
-const RTL_TIMER_SLOTS: usize = 64;
 const RTL_WAIT_SLOTS: usize = 32;
-
-#[repr(C)]
-struct TimerQueueRecord {
-    live: AtomicU32,
-    deleting: AtomicU32,
-}
-
-impl TimerQueueRecord {
-    const fn new() -> Self {
-        Self {
-            live: AtomicU32::new(0),
-            deleting: AtomicU32::new(0),
-        }
-    }
-}
-
-#[repr(C)]
-struct TimerRecord {
-    live: AtomicU32,
-    queue: AtomicUsize,
-    callback: AtomicUsize,
-    parameter: AtomicUsize,
-    due_time: AtomicU32,
-    period: AtomicU32,
-    flags: AtomicU32,
-}
-
-impl TimerRecord {
-    const fn new() -> Self {
-        Self {
-            live: AtomicU32::new(0),
-            queue: AtomicUsize::new(0),
-            callback: AtomicUsize::new(0),
-            parameter: AtomicUsize::new(0),
-            due_time: AtomicU32::new(0),
-            period: AtomicU32::new(0),
-            flags: AtomicU32::new(0),
-        }
-    }
-}
 
 #[repr(C)]
 struct WaitRecord {
@@ -16162,152 +16120,13 @@ impl WaitRecord {
     }
 }
 
-static RTL_TIMER_QUEUES: [TimerQueueRecord; RTL_TIMER_QUEUE_SLOTS] =
-    [const { TimerQueueRecord::new() }; RTL_TIMER_QUEUE_SLOTS];
-static RTL_TIMERS: [TimerRecord; RTL_TIMER_SLOTS] = [const { TimerRecord::new() }; RTL_TIMER_SLOTS];
 static RTL_WAITS: [WaitRecord; RTL_WAIT_SLOTS] = [const { WaitRecord::new() }; RTL_WAIT_SLOTS];
-static RTL_DEFAULT_TIMER_QUEUE: AtomicUsize = AtomicUsize::new(0);
-
-#[inline]
-fn timer_queue_handle(record: &'static TimerQueueRecord) -> *mut c_void {
-    record as *const TimerQueueRecord as *mut c_void
-}
-
-#[inline]
-fn timer_handle(record: &'static TimerRecord) -> *mut c_void {
-    record as *const TimerRecord as *mut c_void
-}
 
 #[inline]
 fn wait_handle(record: &'static WaitRecord) -> *mut c_void {
     record as *const WaitRecord as *mut c_void
 }
 
-fn find_timer_queue(handle: *mut c_void) -> Option<&'static TimerQueueRecord> {
-    if handle.is_null() {
-        return None;
-    }
-    for record in &RTL_TIMER_QUEUES {
-        if timer_queue_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
-            return Some(record);
-        }
-    }
-    None
-}
-
-fn alloc_timer_queue_record() -> Option<*mut c_void> {
-    for record in &RTL_TIMER_QUEUES {
-        if record
-            .live
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            record.deleting.store(0, Ordering::Release);
-            return Some(timer_queue_handle(record));
-        }
-    }
-    None
-}
-
-fn release_timer_queue_record(handle: *mut c_void) -> bool {
-    let mut released = false;
-    for record in &RTL_TIMER_QUEUES {
-        if timer_queue_handle(record) == handle {
-            record.deleting.store(1, Ordering::Release);
-            released = record.live.swap(0, Ordering::AcqRel) != 0;
-            break;
-        }
-    }
-    if released && RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire) == handle as usize {
-        RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
-    }
-    released
-}
-
-fn default_timer_queue() -> Option<*mut c_void> {
-    let existing = RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire);
-    if existing != 0 {
-        let handle = existing as *mut c_void;
-        if find_timer_queue(handle).is_some() {
-            return Some(handle);
-        }
-        RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
-    }
-
-    let handle = alloc_timer_queue_record()?;
-    match RTL_DEFAULT_TIMER_QUEUE.compare_exchange(
-        0,
-        handle as usize,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => Some(handle),
-        Err(winner) => {
-            let _ = release_timer_queue_record(handle);
-            Some(winner as *mut c_void)
-        }
-    }
-}
-
-fn resolve_timer_queue(handle: *mut c_void) -> Option<*mut c_void> {
-    if handle.is_null() {
-        default_timer_queue()
-    } else if find_timer_queue(handle).is_some() {
-        Some(handle)
-    } else {
-        None
-    }
-}
-
-fn find_timer(handle: *mut c_void) -> Option<&'static TimerRecord> {
-    if handle.is_null() {
-        return None;
-    }
-    for record in &RTL_TIMERS {
-        if timer_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
-            return Some(record);
-        }
-    }
-    None
-}
-
-fn alloc_timer_record(
-    queue: *mut c_void,
-    callback: *mut c_void,
-    parameter: *mut c_void,
-    due_time: u32,
-    period: u32,
-    flags: u32,
-) -> Option<*mut c_void> {
-    for record in &RTL_TIMERS {
-        if record
-            .live
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            record.queue.store(queue as usize, Ordering::Release);
-            record.callback.store(callback as usize, Ordering::Release);
-            record
-                .parameter
-                .store(parameter as usize, Ordering::Release);
-            record.due_time.store(due_time, Ordering::Release);
-            record.period.store(period, Ordering::Release);
-            record.flags.store(flags, Ordering::Release);
-            return Some(timer_handle(record));
-        }
-    }
-    None
-}
-
-fn release_timers_for_queue(queue: *mut c_void) {
-    for record in &RTL_TIMERS {
-        if record.live.load(Ordering::Acquire) != 0
-            && record.queue.load(Ordering::Acquire) == queue as usize
-        {
-            record.live.store(0, Ordering::Release);
-        }
-    }
-}
 
 fn find_wait(handle: *mut c_void) -> Option<&'static WaitRecord> {
     if handle.is_null() {
@@ -16363,24 +16182,22 @@ unsafe fn signal_completion_event(completion_event: *mut c_void) {
     }
 }
 
-/// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — allocate an ntdll-owned timer-queue
-/// record. There is still no callback scheduler, so timers created on the queue do not fire yet, but
-/// handles are now distinct, validated, updateable, and deletable instead of all aliasing one
-/// sentinel.
+/// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — allocate a generation-checked queue on
+/// the process-wide RTL async worker.
 ///
 /// # Safety
 /// `timer_queue` writable.
 #[export_name = "RtlCreateTimerQueue"]
 pub unsafe extern "system" fn rtl_create_timer_queue(timer_queue: *mut *mut c_void) -> NtStatus {
-    if timer_queue.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { crate::on_target::rtl_create_timer_queue(timer_queue.cast()) };
     }
-    let Some(handle) = alloc_timer_queue_record() else {
-        return STATUS_NO_MEMORY;
-    };
-    // SAFETY: writable per the contract.
-    unsafe { *timer_queue = handle };
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = timer_queue;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 unsafe fn rtl_create_timer_impl(
@@ -16392,38 +16209,50 @@ unsafe fn rtl_create_timer_impl(
     period: u32,
     flags: u32,
 ) -> NtStatus {
-    if timer.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::rtl_create_timer(
+                timer_queue as u64,
+                timer.cast(),
+                callback as u64,
+                parameter as u64,
+                due_time,
+                period,
+                flags,
+            )
+        };
     }
-    let Some(queue) = resolve_timer_queue(timer_queue) else {
-        return STATUS_INVALID_HANDLE;
-    };
-    let Some(handle) = alloc_timer_record(queue, callback, parameter, due_time, period, flags)
-    else {
-        return STATUS_NO_MEMORY;
-    };
-    // SAFETY: writable per the contract.
-    unsafe { *timer = handle };
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (timer_queue, timer, callback, parameter, due_time, period, flags);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 unsafe fn rtl_delete_timer_queue_ex_impl(
     timer_queue: *mut c_void,
     completion_event: *mut c_void,
 ) -> NtStatus {
-    if find_timer_queue(timer_queue).is_none() {
-        return STATUS_INVALID_HANDLE;
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::rtl_delete_timer_queue(
+                timer_queue as u64,
+                completion_event as u64,
+            )
+        };
     }
-    release_timers_for_queue(timer_queue);
-    let _ = release_timer_queue_record(timer_queue);
-    // SAFETY: optional completion event supplied by the caller.
-    unsafe { signal_completion_event(completion_event) };
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (timer_queue, completion_event);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlCreateTimer(HANDLE TimerQueue, PHANDLE Timer, WAITORTIMERCALLBACKFUNC Callback,
 /// PVOID Parameter, DWORD DueTime, DWORD Period, ULONG Flags) -> NTSTATUS`. Allocates a bounded
-/// ntdll-owned timer record. Timer callbacks are still not scheduled yet.
+/// ntdll-owned timer record. The shared async worker performs real deadline waits and dispatch.
 ///
 /// # Safety
 /// `timer` writable.
@@ -16487,25 +16316,23 @@ pub unsafe extern "system" fn rtl_set_timer(
 /// Handles from Create*.
 #[export_name = "RtlUpdateTimer"]
 pub unsafe extern "system" fn rtl_update_timer(
-    timer_queue: *mut c_void,
+    _timer_queue: *mut c_void,
     timer: *mut c_void,
     due_time: u32,
     period: u32,
 ) -> NtStatus {
-    let Some(timer_record) = find_timer(timer) else {
-        return if timer.is_null() {
-            STATUS_INVALID_PARAMETER_1
-        } else {
-            STATUS_INVALID_HANDLE
-        };
-    };
-    if !timer_queue.is_null() && timer_record.queue.load(Ordering::Acquire) != timer_queue as usize
-    {
-        return STATUS_INVALID_HANDLE;
+    if timer.is_null() {
+        return STATUS_INVALID_PARAMETER_1;
     }
-    timer_record.due_time.store(due_time, Ordering::Release);
-    timer_record.period.store(period, Ordering::Release);
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::rtl_update_timer(timer as u64, due_time, period) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (timer, due_time, period);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlDeleteTimer(HANDLE TimerQueue, HANDLE Timer, HANDLE CompletionEvent) -> NTSTATUS`.
@@ -16514,25 +16341,22 @@ pub unsafe extern "system" fn rtl_update_timer(
 /// Handles from Create*.
 #[export_name = "RtlDeleteTimer"]
 pub unsafe extern "system" fn rtl_delete_timer(
-    timer_queue: *mut c_void,
+    _timer_queue: *mut c_void,
     timer: *mut c_void,
     completion_event: *mut c_void,
 ) -> NtStatus {
-    let Some(timer_record) = find_timer(timer) else {
-        return if timer.is_null() {
-            STATUS_INVALID_PARAMETER_1
-        } else {
-            STATUS_INVALID_HANDLE
-        };
-    };
-    if !timer_queue.is_null() && timer_record.queue.load(Ordering::Acquire) != timer_queue as usize
-    {
-        return STATUS_INVALID_HANDLE;
+    if timer.is_null() {
+        return STATUS_INVALID_PARAMETER_1;
     }
-    timer_record.live.store(0, Ordering::Release);
-    // SAFETY: optional completion event supplied by the caller.
-    unsafe { signal_completion_event(completion_event) };
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::rtl_delete_timer(timer as u64, completion_event as u64) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (timer, completion_event);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlCancelTimer(HANDLE TimerQueue, HANDLE Timer) -> NTSTATUS`.

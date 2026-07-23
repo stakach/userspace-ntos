@@ -605,6 +605,11 @@ pub unsafe extern "C" fn LdrpInitialize(
                 // The opt-in live probe runs only in smss and only after releasing its loader lock.
                 unsafe { on_target::run_rtl_queue_work_item_probe_if_smss() };
             }
+            #[cfg(feature = "rtl_timer_probe")]
+            {
+                // The timer probe uses the same hosted async worker but exercises deadline wakeup.
+                unsafe { on_target::run_rtl_timer_probe_if_smss() };
+            }
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).

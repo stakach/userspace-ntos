@@ -27,7 +27,7 @@ extern crate alloc;
 use core::{
     ffi::c_void,
     marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
 };
 
 use nt_ntdll::heap::{Backing, Heap};
@@ -5037,20 +5037,174 @@ pub unsafe fn rtl_create_user_thread(
 // ReactOS-compatible normal thread-pool lane.
 // ---------------------------------------------------------------------------------------------
 
+const RTL_TIMER_QUEUE_CAPACITY: usize = 4;
+const RTL_TIMERS_PER_QUEUE: usize = 16;
+const RTL_TIMER_HANDLE_CAPACITY: usize = RTL_TIMER_QUEUE_CAPACITY * RTL_TIMERS_PER_QUEUE;
+const RTL_ASYNC_HANDLE_MARKER: u64 = 0x0000_5250_0000_0000;
+const RTL_ASYNC_HANDLE_MASK: u64 = 0xFFFF_FFF0_0000_0000;
+const RTL_ASYNC_QUEUE_KIND: u64 = 1;
+const RTL_ASYNC_TIMER_KIND: u64 = 2;
+const RTL_ASYNC_FREE: u8 = 0;
+const RTL_ASYNC_LIVE: u8 = 1;
+const RTL_ASYNC_RETIRED: u8 = 2;
+
+#[repr(C, align(8))]
+struct RtlAsyncCriticalSection {
+    debug_info: u64,
+    lock_count: AtomicI32,
+    recursion_count: i32,
+    owning_thread: AtomicU64,
+    lock_semaphore: AtomicU64,
+    spin_count: usize,
+}
+
+static mut RTL_ASYNC_LOCK: RtlAsyncCriticalSection = RtlAsyncCriticalSection {
+    debug_info: u64::MAX,
+    lock_count: AtomicI32::new(-1),
+    recursion_count: 0,
+    owning_thread: AtomicU64::new(0),
+    lock_semaphore: AtomicU64::new(0),
+    spin_count: 0,
+};
+
+struct RtlAsyncGuard;
+
+impl Drop for RtlAsyncGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = crate::exports::rtl_leave_critical_section(
+                core::ptr::addr_of_mut!(RTL_ASYNC_LOCK).cast(),
+            );
+        }
+    }
+}
+
+unsafe fn rtl_async_lock() -> RtlAsyncGuard {
+    let status = unsafe {
+        crate::exports::rtl_enter_critical_section(core::ptr::addr_of_mut!(RTL_ASYNC_LOCK).cast())
+    };
+    if (status as i32) < 0 {
+        unsafe { crate::exports::rtl_raise_status(status) };
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    RtlAsyncGuard
+}
+
+struct RtlTimerQueueSlot {
+    state: u8,
+    generation: u32,
+    model: nt_rtl_timer_wait::timer::TimerQueue<RTL_TIMERS_PER_QUEUE>,
+}
+
+impl RtlTimerQueueSlot {
+    const fn new() -> Self {
+        Self {
+            state: RTL_ASYNC_FREE,
+            generation: 0,
+            model: nt_rtl_timer_wait::timer::TimerQueue::new(),
+        }
+    }
+}
+
+struct RtlTimerHandleSlot {
+    state: u8,
+    generation: u32,
+    queue_token: u64,
+    timer_index: u16,
+    timer_generation: u32,
+}
+
+impl RtlTimerHandleSlot {
+    const fn new() -> Self {
+        Self {
+            state: RTL_ASYNC_FREE,
+            generation: 0,
+            queue_token: 0,
+            timer_index: 0,
+            timer_generation: 0,
+        }
+    }
+}
+
+static mut RTL_TIMER_QUEUES: [RtlTimerQueueSlot; RTL_TIMER_QUEUE_CAPACITY] =
+    [const { RtlTimerQueueSlot::new() }; RTL_TIMER_QUEUE_CAPACITY];
+static mut RTL_TIMER_HANDLES: [RtlTimerHandleSlot; RTL_TIMER_HANDLE_CAPACITY] =
+    [const { RtlTimerHandleSlot::new() }; RTL_TIMER_HANDLE_CAPACITY];
+static RTL_DEFAULT_TIMER_QUEUE: AtomicU64 = AtomicU64::new(0);
+
+const fn rtl_async_handle(kind: u64, index: usize, generation: u32) -> u64 {
+    RTL_ASYNC_HANDLE_MARKER
+        | (kind << 32)
+        | ((generation as u64 & 0x00FF_FFFF) << 8)
+        | (index as u64 + 1)
+}
+
+fn rtl_async_handle_parts(handle: u64, kind: u64, capacity: usize) -> Option<(usize, u32)> {
+    if handle & RTL_ASYNC_HANDLE_MASK != RTL_ASYNC_HANDLE_MARKER || (handle >> 32) & 0xF != kind {
+        return None;
+    }
+    let encoded_index = (handle & 0xFF) as usize;
+    let generation = ((handle >> 8) & 0x00FF_FFFF) as u32;
+    if encoded_index == 0 || encoded_index > capacity || generation == 0 {
+        return None;
+    }
+    Some((encoded_index - 1, generation))
+}
+
+fn next_rtl_generation(generation: u32) -> u32 {
+    (generation.wrapping_add(1) & 0x00FF_FFFF).max(1)
+}
+
+unsafe fn rtl_timer_queue_slot_mut(
+    token: u64,
+    allow_retired: bool,
+) -> Option<&'static mut RtlTimerQueueSlot> {
+    let (index, generation) =
+        rtl_async_handle_parts(token, RTL_ASYNC_QUEUE_KIND, RTL_TIMER_QUEUE_CAPACITY)?;
+    let slot = unsafe { &mut (*core::ptr::addr_of_mut!(RTL_TIMER_QUEUES))[index] };
+    let accepted =
+        slot.state == RTL_ASYNC_LIVE || (allow_retired && slot.state == RTL_ASYNC_RETIRED);
+    (accepted && slot.generation == generation).then_some(slot)
+}
+
+unsafe fn rtl_timer_handle_slot_mut(
+    token: u64,
+    allow_retired: bool,
+) -> Option<&'static mut RtlTimerHandleSlot> {
+    let (index, generation) =
+        rtl_async_handle_parts(token, RTL_ASYNC_TIMER_KIND, RTL_TIMER_HANDLE_CAPACITY)?;
+    let slot = unsafe { &mut (*core::ptr::addr_of_mut!(RTL_TIMER_HANDLES))[index] };
+    let accepted =
+        slot.state == RTL_ASYNC_LIVE || (allow_retired && slot.state == RTL_ASYNC_RETIRED);
+    (accepted && slot.generation == generation).then_some(slot)
+}
+
+fn rtl_timer_key(slot: &RtlTimerHandleSlot) -> Option<nt_rtl_timer_wait::timer::TimerKey> {
+    nt_rtl_timer_wait::timer::TimerKey::from_parts(slot.timer_index, slot.timer_generation)
+}
+
 const SSN_NT_CREATE_IO_COMPLETION: u32 = 40;
+const SSN_NT_CREATE_EVENT: u32 = 37;
 const SSN_NT_DELAY_EXECUTION: u32 = 61;
+const SSN_NT_QUERY_SYSTEM_TIME: u32 = 182;
 const SSN_NT_REMOVE_IO_COMPLETION: u32 = 198;
 const SSN_NT_RESUME_THREAD: u32 = 214;
+const SSN_NT_SET_EVENT: u32 = 228;
 const SSN_NT_SET_IO_COMPLETION: u32 = 241;
 const SSN_NT_TERMINATE_THREAD: u32 = 267;
+const SSN_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 281;
 
 const IO_COMPLETION_ALL_ACCESS: u64 = 0x001F_0003;
+const EVENT_ALL_ACCESS: u64 = 0x001F_0003;
+const SYNCHRONIZATION_EVENT: u64 = 1;
 const TOKEN_IMPERSONATE: u64 = 0x0004;
 const THREAD_IMPERSONATION_TOKEN: u64 = 5;
 const STATUS_SUCCESS_U32: u32 = 0;
 const STATUS_UNSUCCESSFUL_U32: u32 = 0xC000_0001;
-const STATUS_NOT_SUPPORTED_U32: u32 = 0xC000_00BB;
 const STATUS_QUOTA_EXCEEDED_U32: u32 = 0xC000_0044;
+const STATUS_CANT_WAIT_U32: u32 = 0xC000_00D8;
 const STATUS_TIMEOUT_U32: u32 = 0x0000_0102;
 
 const POOL_UNINITIALIZED: u32 = 0;
@@ -5062,6 +5216,8 @@ const WORKER_ALIVE: u32 = 2;
 
 static WORK_POOL_INIT_STATE: AtomicU32 = AtomicU32::new(POOL_UNINITIALIZED);
 static WORK_POOL_PORT: AtomicU64 = AtomicU64::new(0);
+static RTL_ASYNC_WAKE_EVENT: AtomicU64 = AtomicU64::new(0);
+static RTL_ASYNC_WORKER_TID: AtomicU64 = AtomicU64::new(0);
 static WORK_POOL_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
 static WORK_POOL_COUNTER_LOCK: AtomicBool = AtomicBool::new(false);
 static mut WORK_POOL_COUNTERS: nt_rtl_work_item::PoolCounters =
@@ -5076,7 +5232,7 @@ const WORK_ITEM_PROBE_CALLBACK: u32 = 2;
 #[cfg(feature = "rtl_work_item_probe")]
 static WORK_ITEM_PROBE_STATE: AtomicU32 = AtomicU32::new(WORK_ITEM_PROBE_IDLE);
 
-#[cfg(feature = "rtl_work_item_probe")]
+#[cfg(any(feature = "rtl_work_item_probe", feature = "rtl_timer_probe"))]
 unsafe fn current_process_is_smss() -> bool {
     let peb: u64;
     unsafe {
@@ -5163,6 +5319,75 @@ pub unsafe fn run_rtl_queue_work_item_probe_if_smss() {
     unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
 }
 
+#[cfg(feature = "rtl_timer_probe")]
+const TIMER_PROBE_IDLE: u32 = 0;
+#[cfg(feature = "rtl_timer_probe")]
+const TIMER_PROBE_CALLBACK: u32 = 1;
+#[cfg(feature = "rtl_timer_probe")]
+static TIMER_PROBE_STATE: AtomicU32 = AtomicU32::new(TIMER_PROBE_IDLE);
+
+#[cfg(feature = "rtl_timer_probe")]
+unsafe extern "system" fn rtl_timer_probe_callback(context: *mut c_void, fired: u8) {
+    if context == core::ptr::addr_of!(TIMER_PROBE_STATE).cast_mut().cast() && fired != 0 {
+        TIMER_PROBE_STATE.store(TIMER_PROBE_CALLBACK, Ordering::Release);
+        let marker = *b"[rtl-timer-probe] callback executed with fired=TRUE";
+        unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+    }
+}
+
+#[cfg(feature = "rtl_timer_probe")]
+pub unsafe fn run_rtl_timer_probe_if_smss() {
+    if !unsafe { current_process_is_smss() }
+        || TIMER_PROBE_STATE.load(Ordering::Acquire) != TIMER_PROBE_IDLE
+    {
+        return;
+    }
+    let mut queue = 0u64;
+    let mut timer = 0u64;
+    let create_queue = unsafe { rtl_create_timer_queue(&mut queue) };
+    let create_timer = if nt_rtl_work_item::nt_success(create_queue) {
+        unsafe {
+            rtl_create_timer(
+                queue,
+                &mut timer,
+                rtl_timer_probe_callback as usize as u64,
+                core::ptr::addr_of!(TIMER_PROBE_STATE) as u64,
+                20,
+                0,
+                0,
+            )
+        }
+    } else {
+        create_queue
+    };
+    if nt_rtl_work_item::nt_success(create_timer) {
+        for _ in 0..512 {
+            if TIMER_PROBE_STATE.load(Ordering::Acquire) == TIMER_PROBE_CALLBACK {
+                let timer_delete = unsafe { rtl_delete_timer(timer, u64::MAX) };
+                let queue_delete = unsafe { rtl_delete_timer_queue(queue, u64::MAX) };
+                if nt_rtl_work_item::nt_success(timer_delete)
+                    && nt_rtl_work_item::nt_success(queue_delete)
+                {
+                    let marker =
+                        *b"[rtl-timer-probe] PASS deadline -> callback -> synchronous delete";
+                    unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+                    return;
+                }
+                break;
+            }
+            let _ = unsafe { work_pool_delay(-10_000) };
+        }
+    }
+    if timer != 0 {
+        let _ = unsafe { rtl_delete_timer(timer, 0) };
+    }
+    if queue != 0 {
+        let _ = unsafe { rtl_delete_timer_queue(queue, 0) };
+    }
+    let marker = *b"[rtl-timer-probe] FAIL create, callback, or delete";
+    unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+}
+
 #[inline]
 fn work_pool_lock_counters() {
     while WORK_POOL_COUNTER_LOCK
@@ -5189,6 +5414,101 @@ unsafe fn work_pool_delay(interval_100ns: i64) -> u32 {
             0,
         ) as u32
     }
+}
+
+unsafe fn rtl_async_create_event(event_type: u64) -> Result<u64, u32> {
+    let mut handle = 0u64;
+    let status = unsafe {
+        syscall6(
+            SSN_NT_CREATE_EVENT,
+            core::ptr::addr_of_mut!(handle) as u64,
+            EVENT_ALL_ACCESS,
+            0,
+            event_type,
+            0,
+            0,
+        ) as u32
+    };
+    if nt_rtl_work_item::nt_success(status) && handle != 0 {
+        Ok(handle)
+    } else if nt_rtl_work_item::nt_success(status) {
+        Err(STATUS_UNSUCCESSFUL_U32)
+    } else {
+        Err(status)
+    }
+}
+
+unsafe fn rtl_async_set_event(handle: u64) {
+    if handle != 0 {
+        let _ = unsafe { syscall4(SSN_NT_SET_EVENT, handle, 0, 0, 0) };
+    }
+}
+
+unsafe fn rtl_async_close(handle: u64) {
+    if handle != 0 {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+    }
+}
+
+unsafe fn rtl_async_wait(handle: u64, timeout_ms: Option<u32>) -> u32 {
+    let relative = timeout_ms.map(|milliseconds| {
+        if milliseconds == 0 {
+            0
+        } else {
+            -i64::from(milliseconds) * 10_000
+        }
+    });
+    unsafe {
+        syscall4(
+            SSN_NT_WAIT_FOR_SINGLE_OBJECT,
+            handle,
+            0,
+            relative
+                .as_ref()
+                .map_or(0, |timeout| timeout as *const i64 as u64),
+            0,
+        ) as u32
+    }
+}
+
+unsafe fn rtl_async_now_ms() -> u64 {
+    let mut time_100ns = 0i64;
+    let status = unsafe {
+        syscall4(
+            SSN_NT_QUERY_SYSTEM_TIME,
+            core::ptr::addr_of_mut!(time_100ns) as u64,
+            0,
+            0,
+            0,
+        ) as u32
+    };
+    if nt_rtl_work_item::nt_success(status) {
+        time_100ns.max(0) as u64 / 10_000
+    } else {
+        0
+    }
+}
+
+unsafe fn rtl_async_wake() {
+    let event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
+    unsafe { rtl_async_set_event(event) };
+}
+
+unsafe fn rtl_async_current_tid() -> u64 {
+    let tid: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x48]",
+            out(reg) tid,
+            options(nostack, preserves_flags, readonly)
+        )
+    };
+    tid
+}
+
+unsafe fn rtl_async_on_worker() -> bool {
+    let worker = RTL_ASYNC_WORKER_TID.load(Ordering::Acquire);
+    worker != 0 && worker == unsafe { rtl_async_current_tid() }
 }
 
 unsafe fn initialize_work_pool() -> u32 {
@@ -5221,9 +5541,19 @@ unsafe fn initialize_work_pool() -> u32 {
                     ) as u32
                 };
                 if nt_rtl_work_item::nt_success(status) && port != 0 {
-                    WORK_POOL_PORT.store(port, Ordering::Release);
-                    WORK_POOL_INIT_STATE.store(POOL_READY, Ordering::Release);
-                    return STATUS_SUCCESS_U32;
+                    match unsafe { rtl_async_create_event(SYNCHRONIZATION_EVENT) } {
+                        Ok(wake_event) => {
+                            WORK_POOL_PORT.store(port, Ordering::Release);
+                            RTL_ASYNC_WAKE_EVENT.store(wake_event, Ordering::Release);
+                            WORK_POOL_INIT_STATE.store(POOL_READY, Ordering::Release);
+                            return STATUS_SUCCESS_U32;
+                        }
+                        Err(event_status) => {
+                            unsafe { rtl_async_close(port) };
+                            WORK_POOL_INIT_STATE.store(POOL_UNINITIALIZED, Ordering::Release);
+                            return event_status;
+                        }
+                    }
                 }
                 WORK_POOL_INIT_STATE.store(POOL_UNINITIALIZED, Ordering::Release);
                 return if nt_rtl_work_item::nt_success(status) {
@@ -5473,7 +5803,619 @@ unsafe extern "system" fn rtlp_execute_work_item(
     }
 }
 
+unsafe fn ensure_rtl_async_worker() -> u32 {
+    let status = unsafe { initialize_work_pool() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    unsafe { start_work_pool_worker() }
+}
+
+unsafe fn allocate_timer_queue_locked() -> Option<u64> {
+    let queues = core::ptr::addr_of_mut!(RTL_TIMER_QUEUES).cast::<RtlTimerQueueSlot>();
+    for index in 0..RTL_TIMER_QUEUE_CAPACITY {
+        let slot = unsafe { &mut *queues.add(index) };
+        if slot.state != RTL_ASYNC_FREE {
+            continue;
+        }
+        slot.generation = next_rtl_generation(slot.generation);
+        slot.model = nt_rtl_timer_wait::timer::TimerQueue::new();
+        slot.state = RTL_ASYNC_LIVE;
+        return Some(rtl_async_handle(
+            RTL_ASYNC_QUEUE_KIND,
+            index,
+            slot.generation,
+        ));
+    }
+    None
+}
+
+unsafe fn resolve_timer_queue(token: u64) -> Result<u64, u32> {
+    if token != 0 {
+        let _guard = unsafe { rtl_async_lock() };
+        return unsafe { rtl_timer_queue_slot_mut(token, false) }
+            .map(|_| token)
+            .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE);
+    }
+
+    let _guard = unsafe { rtl_async_lock() };
+    let existing = RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire);
+    if existing != 0 && unsafe { rtl_timer_queue_slot_mut(existing, false) }.is_some() {
+        return Ok(existing);
+    }
+    let queue =
+        unsafe { allocate_timer_queue_locked() }.ok_or(nt_rtl_timer_wait::STATUS_NO_MEMORY)?;
+    RTL_DEFAULT_TIMER_QUEUE.store(queue, Ordering::Release);
+    Ok(queue)
+}
+
+unsafe fn allocate_timer_handle_locked(
+    queue_token: u64,
+    key: nt_rtl_timer_wait::timer::TimerKey,
+) -> Option<u64> {
+    let handles = core::ptr::addr_of_mut!(RTL_TIMER_HANDLES).cast::<RtlTimerHandleSlot>();
+    for index in 0..RTL_TIMER_HANDLE_CAPACITY {
+        let slot = unsafe { &mut *handles.add(index) };
+        if slot.state != RTL_ASYNC_FREE {
+            continue;
+        }
+        slot.generation = next_rtl_generation(slot.generation);
+        slot.queue_token = queue_token;
+        slot.timer_index = key.index() as u16;
+        slot.timer_generation = key.generation();
+        slot.state = RTL_ASYNC_LIVE;
+        return Some(rtl_async_handle(
+            RTL_ASYNC_TIMER_KIND,
+            index,
+            slot.generation,
+        ));
+    }
+    None
+}
+
+unsafe fn release_timer_handle_for_key_locked(
+    queue_token: u64,
+    key: nt_rtl_timer_wait::timer::TimerKey,
+) {
+    let handles = core::ptr::addr_of_mut!(RTL_TIMER_HANDLES).cast::<RtlTimerHandleSlot>();
+    for index in 0..RTL_TIMER_HANDLE_CAPACITY {
+        let slot = unsafe { &mut *handles.add(index) };
+        if slot.state != RTL_ASYNC_FREE
+            && slot.queue_token == queue_token
+            && slot.timer_index as usize == key.index()
+            && slot.timer_generation == key.generation()
+        {
+            slot.state = RTL_ASYNC_FREE;
+            slot.queue_token = 0;
+            return;
+        }
+    }
+}
+
+unsafe fn apply_timer_completion(plan: nt_rtl_timer_wait::CompletionPlan) {
+    if let Some(event) = plan.signal_event {
+        unsafe { rtl_async_set_event(event) };
+    }
+    if let Some(handle) = plan.close_handle {
+        unsafe { rtl_async_close(handle) };
+    }
+    if plan.wake_scheduler {
+        unsafe { rtl_async_wake() };
+    }
+}
+
+pub unsafe fn rtl_create_timer_queue(timer_queue: *mut u64) -> u32 {
+    if timer_queue.is_null() {
+        return nt_rtl_timer_wait::STATUS_INVALID_PARAMETER;
+    }
+    let status = unsafe { ensure_rtl_async_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    let token = {
+        let _guard = unsafe { rtl_async_lock() };
+        unsafe { allocate_timer_queue_locked() }
+    };
+    let Some(token) = token else {
+        return nt_rtl_timer_wait::STATUS_NO_MEMORY;
+    };
+    unsafe { core::ptr::write(timer_queue, token) };
+    unsafe { rtl_async_wake() };
+    STATUS_SUCCESS_U32
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rtl_create_timer(
+    timer_queue: u64,
+    timer: *mut u64,
+    callback: u64,
+    context: u64,
+    due_ms: u32,
+    period_ms: u32,
+    flags: u32,
+) -> u32 {
+    if timer.is_null() {
+        return nt_rtl_timer_wait::STATUS_INVALID_PARAMETER;
+    }
+    let status = unsafe { ensure_rtl_async_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    let queue_token = match unsafe { resolve_timer_queue(timer_queue) } {
+        Ok(token) => token,
+        Err(status) => return status,
+    };
+    let now_ms = unsafe { rtl_async_now_ms() };
+    let result = {
+        let _guard = unsafe { rtl_async_lock() };
+        let Some(queue) = (unsafe { rtl_timer_queue_slot_mut(queue_token, false) }) else {
+            return nt_rtl_timer_wait::STATUS_INVALID_HANDLE;
+        };
+        let spec = nt_rtl_timer_wait::timer::TimerSpec {
+            callback,
+            context,
+            due_ms,
+            period_ms,
+            flags: nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags),
+        };
+        match queue.model.create_timer(now_ms, spec) {
+            Ok((key, wake)) => match unsafe { allocate_timer_handle_locked(queue_token, key) } {
+                Some(handle) => Ok((handle, wake.0)),
+                None => {
+                    let _ = queue
+                        .model
+                        .delete_timer(key, nt_rtl_timer_wait::CompletionMode::Async);
+                    Err(nt_rtl_timer_wait::STATUS_NO_MEMORY)
+                }
+            },
+            Err(status) => Err(status),
+        }
+    };
+    let (handle, wake) = match result {
+        Ok(created) => created,
+        Err(status) => return status,
+    };
+    unsafe { core::ptr::write(timer, handle) };
+    if wake {
+        unsafe { rtl_async_wake() };
+    }
+    STATUS_SUCCESS_U32
+}
+
+pub unsafe fn rtl_update_timer(timer: u64, due_ms: u32, period_ms: u32) -> u32 {
+    let now_ms = unsafe { rtl_async_now_ms() };
+    let result = {
+        let _guard = unsafe { rtl_async_lock() };
+        let Some(handle) = (unsafe { rtl_timer_handle_slot_mut(timer, false) }) else {
+            return nt_rtl_timer_wait::STATUS_INVALID_HANDLE;
+        };
+        let queue_token = handle.queue_token;
+        let Some(key) = rtl_timer_key(handle) else {
+            return nt_rtl_timer_wait::STATUS_INVALID_HANDLE;
+        };
+        let Some(queue) = (unsafe { rtl_timer_queue_slot_mut(queue_token, false) }) else {
+            return nt_rtl_timer_wait::STATUS_INVALID_HANDLE;
+        };
+        queue.model.update_timer(key, now_ms, due_ms, period_ms)
+    };
+    match result {
+        Ok(wake) => {
+            if wake.0 {
+                unsafe { rtl_async_wake() };
+            }
+            STATUS_SUCCESS_U32
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn timer_completion_mode(
+    completion_event: u64,
+) -> Result<(nt_rtl_timer_wait::CompletionMode, Option<u64>), u32> {
+    if completion_event == 0 {
+        return Ok((nt_rtl_timer_wait::CompletionMode::Async, None));
+    }
+    if completion_event != u64::MAX {
+        return Ok((
+            nt_rtl_timer_wait::CompletionMode::Event(completion_event),
+            None,
+        ));
+    }
+    let event = unsafe { rtl_async_create_event(SYNCHRONIZATION_EVENT) }?;
+    Ok((
+        nt_rtl_timer_wait::CompletionMode::Synchronous(event),
+        Some(event),
+    ))
+}
+
+pub unsafe fn rtl_delete_timer(timer: u64, completion_event: u64) -> u32 {
+    // The hosted kernel provides one recognized RTL worker. Waiting on an in-flight callback from
+    // that same worker would self-deadlock; reject the wait without starting deletion so the caller
+    // can retry asynchronously. Idle synchronous deletion is completed by the control pump below.
+    if completion_event == u64::MAX && unsafe { rtl_async_on_worker() } {
+        let callbacks_in_flight = {
+            let _guard = unsafe { rtl_async_lock() };
+            unsafe { rtl_timer_handle_slot_mut(timer, false) }
+                .and_then(|handle| {
+                    let key = rtl_timer_key(handle)?;
+                    let queue = unsafe { rtl_timer_queue_slot_mut(handle.queue_token, true) }?;
+                    queue.model.callbacks_in_flight(key)
+                })
+                .unwrap_or(0)
+        };
+        if callbacks_in_flight != 0 {
+            return STATUS_CANT_WAIT_U32;
+        }
+    }
+    let mut event_error = None;
+    let (mode, internal_event) = match unsafe { timer_completion_mode(completion_event) } {
+        Ok(completion) => completion,
+        Err(status) => {
+            event_error = Some(status);
+            (nt_rtl_timer_wait::CompletionMode::Async, None)
+        }
+    };
+    let result = {
+        let _guard = unsafe { rtl_async_lock() };
+        (|| {
+            let handle = unsafe { rtl_timer_handle_slot_mut(timer, false) }
+                .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?;
+            let queue_token = handle.queue_token;
+            let key = rtl_timer_key(handle).ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?;
+            let queue = unsafe { rtl_timer_queue_slot_mut(queue_token, true) }
+                .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?;
+            handle.state = RTL_ASYNC_RETIRED;
+            let result = queue.model.delete_timer(key, mode);
+            if let Ok(plan) = &result {
+                if plan.reclaim {
+                    handle.state = RTL_ASYNC_FREE;
+                    handle.queue_token = 0;
+                }
+            } else {
+                handle.state = RTL_ASYNC_LIVE;
+            }
+            result
+        })()
+    };
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(status) => {
+            if let Some(event) = internal_event {
+                unsafe { rtl_async_close(event) };
+            }
+            return status;
+        }
+    };
+    if let Some(event) = plan.signal_event {
+        unsafe { rtl_async_set_event(event) };
+    }
+    if plan.wake_scheduler {
+        unsafe { rtl_async_wake() };
+    }
+    if let Some(event) = internal_event {
+        let mut wait_status = STATUS_SUCCESS_U32;
+        if plan.wait_event.is_some() {
+            wait_status = unsafe { rtl_async_wait_for_completion(event) };
+        }
+        unsafe { rtl_async_close(event) };
+        if !nt_rtl_work_item::nt_success(wait_status) {
+            return wait_status;
+        }
+    }
+    event_error.unwrap_or(plan.status)
+}
+
+pub unsafe fn rtl_delete_timer_queue(timer_queue: u64, completion_event: u64) -> u32 {
+    // Do not recursively execute arbitrary IOCP callbacks to emulate a second scheduler thread.
+    // An active callback makes synchronous worker-context queue deletion non-waitable; a drained queue
+    // can still perform its logical worker-exit transition re-entrantly.
+    let on_worker = unsafe { rtl_async_on_worker() };
+    if completion_event == u64::MAX && on_worker {
+        let callbacks_in_flight = {
+            let _guard = unsafe { rtl_async_lock() };
+            unsafe { rtl_timer_queue_slot_mut(timer_queue, false) }
+                .map(|queue| queue.model.total_callbacks_in_flight())
+                .unwrap_or(0)
+        };
+        if callbacks_in_flight != 0 {
+            return STATUS_CANT_WAIT_U32;
+        }
+    }
+    let (mode, internal_event) = match unsafe { timer_completion_mode(completion_event) } {
+        Ok(completion) => completion,
+        Err(status) => return status,
+    };
+    let result = {
+        let _guard = unsafe { rtl_async_lock() };
+        (|| {
+            let queue = unsafe { rtl_timer_queue_slot_mut(timer_queue, false) }
+                .ok_or(nt_rtl_timer_wait::STATUS_INVALID_HANDLE)?;
+            queue.state = RTL_ASYNC_RETIRED;
+            let result = queue.model.delete_queue(mode);
+            if result.is_ok() {
+                let handles =
+                    core::ptr::addr_of_mut!(RTL_TIMER_HANDLES).cast::<RtlTimerHandleSlot>();
+                for index in 0..RTL_TIMER_HANDLE_CAPACITY {
+                    let handle = unsafe { &mut *handles.add(index) };
+                    if handle.state != RTL_ASYNC_FREE && handle.queue_token == timer_queue {
+                        handle.state = RTL_ASYNC_RETIRED;
+                        let key = rtl_timer_key(handle);
+                        if key.is_none_or(|key| queue.model.callbacks_in_flight(key).is_none()) {
+                            handle.state = RTL_ASYNC_FREE;
+                            handle.queue_token = 0;
+                        }
+                    }
+                }
+            } else {
+                queue.state = RTL_ASYNC_LIVE;
+            }
+            let completion = if on_worker
+                && result.is_ok()
+                && queue.model.phase() == nt_rtl_timer_wait::timer::QueuePhase::AwaitingWorkerExit
+            {
+                queue.model.worker_exited().ok()
+            } else {
+                None
+            };
+            if completion.is_some() {
+                queue.state = RTL_ASYNC_FREE;
+                if RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire) == timer_queue {
+                    RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
+                }
+            }
+            result.map(|plan| (plan, completion))
+        })()
+    };
+    let (plan, completion) = match result {
+        Ok(result) => result,
+        Err(status) => {
+            if let Some(event) = internal_event {
+                unsafe { rtl_async_close(event) };
+            }
+            return status;
+        }
+    };
+    if plan.wake_scheduler {
+        unsafe { rtl_async_wake() };
+    }
+    if let Some(completion) = completion {
+        if let Some(event) = completion.signal_event {
+            unsafe { rtl_async_set_event(event) };
+        }
+    }
+    if let Some(event) = internal_event {
+        let mut wait_status = STATUS_SUCCESS_U32;
+        if plan.wait_event.is_some() {
+            wait_status = unsafe { rtl_async_wait_for_completion(event) };
+        }
+        unsafe { rtl_async_close(event) };
+        if !nt_rtl_work_item::nt_success(wait_status) {
+            return wait_status;
+        }
+    }
+    plan.status
+}
+
+struct RtlTimerCallbackPacket {
+    queue_token: u64,
+    callback: u64,
+    context: u64,
+    ticket: nt_rtl_timer_wait::timer::CallbackTicket,
+}
+
+unsafe fn finish_timer_callback(
+    queue_token: u64,
+    ticket: nt_rtl_timer_wait::timer::CallbackTicket,
+    failed: bool,
+) {
+    let key = ticket.key();
+    let plan = {
+        let _guard = unsafe { rtl_async_lock() };
+        let Some(queue) = (unsafe { rtl_timer_queue_slot_mut(queue_token, true) }) else {
+            return;
+        };
+        let plan = if failed {
+            queue.model.dispatch_failed(ticket)
+        } else {
+            queue.model.callback_finished(ticket)
+        };
+        if plan.as_ref().is_ok_and(|plan| plan.reclaim) {
+            unsafe { release_timer_handle_for_key_locked(queue_token, key) };
+        }
+        plan.ok()
+    };
+    if let Some(plan) = plan {
+        unsafe { apply_timer_completion(plan) };
+    }
+}
+
+unsafe extern "system" fn rtl_timer_callback_worker(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    let packet = unsafe { core::ptr::read(context.cast::<RtlTimerCallbackPacket>()) };
+    let _ = unsafe { crate::process_heap_free(context.cast()) };
+    let callback: unsafe extern "system" fn(*mut c_void, u8) =
+        unsafe { core::mem::transmute(packet.callback as usize) };
+    unsafe { callback(packet.context as *mut c_void, 1) };
+    unsafe { finish_timer_callback(packet.queue_token, packet.ticket, false) };
+}
+
+enum RtlTimerWorkerAction {
+    Dispatch {
+        queue_token: u64,
+        dispatch: nt_rtl_timer_wait::timer::Dispatch,
+    },
+    QueueExited {
+        queue_token: u64,
+        completion: nt_rtl_timer_wait::CompletionPlan,
+    },
+}
+
+unsafe fn next_timer_worker_action(now_ms: u64) -> (Option<RtlTimerWorkerAction>, Option<u32>) {
+    let _guard = unsafe { rtl_async_lock() };
+    let queues = core::ptr::addr_of_mut!(RTL_TIMER_QUEUES).cast::<RtlTimerQueueSlot>();
+    let mut timeout = None;
+    for index in 0..RTL_TIMER_QUEUE_CAPACITY {
+        let queue = unsafe { &mut *queues.add(index) };
+        if queue.state == RTL_ASYNC_FREE {
+            continue;
+        }
+        let queue_token = rtl_async_handle(RTL_ASYNC_QUEUE_KIND, index, queue.generation);
+        if queue.state == RTL_ASYNC_RETIRED
+            && queue.model.phase() == nt_rtl_timer_wait::timer::QueuePhase::AwaitingWorkerExit
+        {
+            if let Ok(completion) = queue.model.worker_exited() {
+                return (
+                    Some(RtlTimerWorkerAction::QueueExited {
+                        queue_token,
+                        completion,
+                    }),
+                    Some(0),
+                );
+            }
+        }
+        if queue.state != RTL_ASYNC_LIVE {
+            continue;
+        }
+        match queue.model.expire_one(now_ms) {
+            nt_rtl_timer_wait::timer::ExpireResult::Dispatch(dispatch) => {
+                return (
+                    Some(RtlTimerWorkerAction::Dispatch {
+                        queue_token,
+                        dispatch,
+                    }),
+                    Some(0),
+                );
+            }
+            nt_rtl_timer_wait::timer::ExpireResult::Idle
+            | nt_rtl_timer_wait::timer::ExpireResult::InlineBusy
+            | nt_rtl_timer_wait::timer::ExpireResult::NotDue
+            | nt_rtl_timer_wait::timer::ExpireResult::CallbackCapacity => {}
+        }
+        if let Some(next) = queue.model.next_dispatch_timeout(now_ms) {
+            timeout = Some(timeout.map_or(next, |current: u32| current.min(next)));
+        }
+    }
+    (None, timeout)
+}
+
+unsafe fn complete_timer_queue_exit(
+    queue_token: u64,
+    completion: nt_rtl_timer_wait::CompletionPlan,
+) {
+    {
+        let _guard = unsafe { rtl_async_lock() };
+        if let Some(queue) = unsafe { rtl_timer_queue_slot_mut(queue_token, true) } {
+            if queue.model.phase() == nt_rtl_timer_wait::timer::QueuePhase::Exited {
+                queue.state = RTL_ASYNC_FREE;
+                if RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire) == queue_token {
+                    RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
+                }
+            }
+        }
+    }
+    if let Some(event) = completion.signal_event {
+        unsafe { rtl_async_set_event(event) };
+    }
+}
+
+unsafe fn execute_timer_dispatch(queue_token: u64, dispatch: nt_rtl_timer_wait::timer::Dispatch) {
+    match dispatch.kind {
+        nt_rtl_timer_wait::timer::DispatchKind::Inline => {
+            let callback: unsafe extern "system" fn(*mut c_void, u8) =
+                unsafe { core::mem::transmute(dispatch.callback as usize) };
+            unsafe { callback(dispatch.context as *mut c_void, dispatch.timer_fired as u8) };
+            unsafe { finish_timer_callback(queue_token, dispatch.ticket, false) };
+        }
+        nt_rtl_timer_wait::timer::DispatchKind::QueueWork(flags) => {
+            let packet_address = unsafe {
+                crate::process_heap_alloc(core::mem::size_of::<RtlTimerCallbackPacket>())
+            };
+            if packet_address.is_null() {
+                unsafe { finish_timer_callback(queue_token, dispatch.ticket, true) };
+                return;
+            }
+            unsafe {
+                core::ptr::write(
+                    packet_address.cast::<RtlTimerCallbackPacket>(),
+                    RtlTimerCallbackPacket {
+                        queue_token,
+                        callback: dispatch.callback,
+                        context: dispatch.context,
+                        ticket: dispatch.ticket,
+                    },
+                )
+            };
+            let status = unsafe {
+                rtl_queue_work_item(
+                    rtl_timer_callback_worker as usize as u64,
+                    packet_address as u64,
+                    flags.bits(),
+                )
+            };
+            if !nt_rtl_work_item::nt_success(status) {
+                let packet =
+                    unsafe { core::ptr::read(packet_address.cast::<RtlTimerCallbackPacket>()) };
+                let _ = unsafe { crate::process_heap_free(packet_address) };
+                unsafe { finish_timer_callback(queue_token, packet.ticket, true) };
+            }
+        }
+    }
+}
+
+unsafe fn rtl_async_execute_one_completion() -> Result<bool, u32> {
+    let port = WORK_POOL_PORT.load(Ordering::Acquire);
+    if port == 0 {
+        return Err(STATUS_UNSUCCESSFUL_U32);
+    }
+    let mut key = 0u64;
+    let mut apc_context = 0u64;
+    let mut io_status = [0u64; 2];
+    let timeout = 0i64;
+    let status = unsafe {
+        syscall6(
+            SSN_NT_REMOVE_IO_COMPLETION,
+            port,
+            core::ptr::addr_of_mut!(key) as u64,
+            core::ptr::addr_of_mut!(apc_context) as u64,
+            io_status.as_mut_ptr() as u64,
+            core::ptr::addr_of!(timeout) as u64,
+            0,
+        ) as u32
+    };
+    if status == STATUS_TIMEOUT_U32 {
+        return Ok(false);
+    }
+    if !nt_rtl_work_item::nt_success(status) || key == 0 {
+        return Err(status);
+    }
+    let routine: CompletionRoutine = unsafe { core::mem::transmute(key as usize) };
+    unsafe {
+        routine(
+            core::ptr::null_mut(),
+            io_status[1] as *mut c_void,
+            apc_context as *mut c_void,
+        )
+    };
+    Ok(true)
+}
+
+unsafe fn rtl_async_wait_for_completion(event: u64) -> u32 {
+    if unsafe { rtl_async_on_worker() } {
+        let poll = unsafe { rtl_async_wait(event, Some(0)) };
+        if poll == STATUS_TIMEOUT_U32 {
+            STATUS_CANT_WAIT_U32
+        } else {
+            poll
+        }
+    } else {
+        unsafe { rtl_async_wait(event, None) }
+    }
+}
+
 unsafe fn exit_work_pool_thread(status: u32) -> ! {
+    RTL_ASYNC_WORKER_TID.store(0, Ordering::Release);
     let hook = crate::exports::rtl_exit_pool_thread_hook();
     if hook != 0 {
         let hook: ExitPoolThread = unsafe { core::mem::transmute(hook as usize) };
@@ -5502,43 +6444,44 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
         WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
         unsafe { exit_work_pool_thread(STATUS_INVALID_PARAMETER_U32) };
     }
+    RTL_ASYNC_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
 
     loop {
-        let port = WORK_POOL_PORT.load(Ordering::Acquire);
-        if port == 0 {
-            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-            unsafe { exit_work_pool_thread(STATUS_UNSUCCESSFUL_U32) };
-        }
-        let mut key = 0u64;
-        let mut apc_context = 0u64;
-        let mut io_status = [0u64; 2];
-        let timeout = -50_000_000i64;
-        let status = unsafe {
-            syscall6(
-                SSN_NT_REMOVE_IO_COMPLETION,
-                port,
-                core::ptr::addr_of_mut!(key) as u64,
-                core::ptr::addr_of_mut!(apc_context) as u64,
-                io_status.as_mut_ptr() as u64,
-                core::ptr::addr_of!(timeout) as u64,
-                0,
-            ) as u32
+        let completion_ran = match unsafe { rtl_async_execute_one_completion() } {
+            Ok(ran) => ran,
+            Err(status) => {
+                WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                unsafe { exit_work_pool_thread(status) };
+            }
         };
-        if status == STATUS_TIMEOUT_U32 {
-            continue;
+
+        let now_ms = unsafe { rtl_async_now_ms() };
+        let (timer_action, timeout_ms) = unsafe { next_timer_worker_action(now_ms) };
+        match timer_action {
+            Some(RtlTimerWorkerAction::Dispatch {
+                queue_token,
+                dispatch,
+            }) => unsafe { execute_timer_dispatch(queue_token, dispatch) },
+            Some(RtlTimerWorkerAction::QueueExited {
+                queue_token,
+                completion,
+            }) => unsafe { complete_timer_queue_exit(queue_token, completion) },
+            None => {
+                if completion_ran {
+                    continue;
+                }
+                let wake_event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
+                if wake_event == 0 {
+                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                    unsafe { exit_work_pool_thread(STATUS_UNSUCCESSFUL_U32) };
+                }
+                let wait_status = unsafe { rtl_async_wait(wake_event, timeout_ms) };
+                if !nt_rtl_work_item::nt_success(wait_status) && wait_status != STATUS_TIMEOUT_U32 {
+                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                    unsafe { exit_work_pool_thread(wait_status) };
+                }
+            }
         }
-        if !nt_rtl_work_item::nt_success(status) || key == 0 {
-            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-            unsafe { exit_work_pool_thread(status) };
-        }
-        let routine: CompletionRoutine = unsafe { core::mem::transmute(key as usize) };
-        unsafe {
-            routine(
-                core::ptr::null_mut(),
-                io_status[1] as *mut c_void,
-                apc_context as *mut c_void,
-            )
-        };
     }
 }
 
@@ -5547,12 +6490,6 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
         return STATUS_INVALID_PARAMETER_U32;
     }
     let work_flags = nt_rtl_work_item::WorkItemFlags::from_bits_retain(flags);
-    if !matches!(
-        work_flags.queue_class(),
-        nt_rtl_work_item::QueueClass::NormalCompletion
-    ) {
-        return STATUS_NOT_SUPPORTED_U32;
-    }
     let status = unsafe { initialize_work_pool() };
     if !nt_rtl_work_item::nt_success(status) {
         return status;
@@ -5623,6 +6560,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
     };
     if nt_rtl_work_item::nt_success(status) {
         let _queued = submission.commit_queue_success();
+        unsafe { rtl_async_wake() };
         STATUS_SUCCESS_U32
     } else {
         let _ = unsafe { cleanup_failed_submission(submission) };

@@ -105,6 +105,14 @@ pub mod timer {
     }
 
     impl TimerKey {
+        pub const fn from_parts(index: u16, generation: u32) -> Option<Self> {
+            if generation == 0 {
+                None
+            } else {
+                Some(Self { index, generation })
+            }
+        }
+
         pub const fn index(self) -> usize {
             self.index as usize
         }
@@ -253,6 +261,10 @@ pub mod timer {
 
         pub fn callbacks_in_flight(&self, key: TimerKey) -> Option<u32> {
             self.slot(key).map(|slot| slot.callbacks_in_flight)
+        }
+
+        pub fn total_callbacks_in_flight(&self) -> u32 {
+            self.slots.iter().map(|slot| slot.callbacks_in_flight).sum()
         }
 
         pub fn create_timer(
@@ -913,6 +925,7 @@ mod tests {
         let second = expire(&mut queue, 1);
         assert_ne!(first.ticket.firing_id(), second.ticket.firing_id());
         assert_eq!(queue.callbacks_in_flight(key), Some(2));
+        assert_eq!(queue.total_callbacks_in_flight(), 2);
         queue.callback_finished(first.ticket).unwrap();
         assert_eq!(queue.callbacks_in_flight(key), Some(1));
         assert_eq!(
@@ -1058,6 +1071,11 @@ mod tests {
             .unwrap();
         assert_ne!(old.generation(), new.generation());
         assert_eq!(queue.update_timer(old, 0, 1, 0), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(TimerKey::from_parts(0, 0), None);
+        assert_eq!(
+            TimerKey::from_parts(new.index() as u16, new.generation()),
+            Some(new)
+        );
     }
 
     fn wait(flags: WorkItemFlags) -> RegisteredWait {

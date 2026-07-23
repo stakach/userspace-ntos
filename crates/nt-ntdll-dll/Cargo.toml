@@ -23,6 +23,9 @@ native_transport = ["nt-ntdll/native_transport"]
 # Opt-in live integration probe. This creates an extra smss thread and runs DLL_THREAD_ATTACH, so it
 # is intentionally excluded from production/default images.
 rtl_work_item_probe = []
+# Opt-in live timer deadline/callback/deletion probe. Like the work-item probe, this creates the
+# process async worker and is excluded from production images.
+rtl_timer_probe = []
 
 [dependencies]
 nt-alpc-abi = { path = "../nt-alpc-abi" }
@@ -30,6 +33,7 @@ nt-kernel-exec = { path = "../nt-kernel-exec", default-features = false }
 nt-ntdll = { path = "../nt-ntdll", default-features = false }
 nt-ntdll-layout = { path = "../nt-ntdll-layout" }
 nt-rtl-work-item = { path = "../nt-rtl-work-item" }
+nt-rtl-timer-wait = { path = "../nt-rtl-timer-wait" }
 nt-thread-start = { path = "../nt-thread-start" }
 
 [lints.clippy]
