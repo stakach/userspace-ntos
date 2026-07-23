@@ -204,32 +204,80 @@ static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 // (or stale bytes). Capture the completed read's bytes here, keyed by the reader's fid, so the
 // executive's pipe re-drive delivers THESE bytes to the parked reader instead of re-reading. The read
 // result buffer npfs fills for a pending read is the IRP's user buffer (== our `data`, METHOD_NEITHER).
-const COMPLETED_READ_CAP: usize = 8;
-const COMPLETED_READ_BYTES: usize = 4096;
+const COMPLETED_READ_CAP: usize = PENDING_IRP_CAP;
 #[derive(Clone, Copy)]
 struct CompletedRead {
     fid: u64,
     status: u32,
     info: u64,
-    len: usize,
-    bytes: [u8; COMPLETED_READ_BYTES],
+    irp: u64,
+    iosl: u64,
+    file_object: u64,
+    data: u64,
+    system_buffer: u64,
 }
 static mut COMPLETED_READS: [CompletedRead; COMPLETED_READ_CAP] = [CompletedRead {
     fid: 0,
     status: 0,
     info: 0,
-    len: 0,
-    bytes: [0u8; COMPLETED_READ_BYTES],
+    irp: 0,
+    iosl: 0,
+    file_object: 0,
+    data: 0,
+    system_buffer: 0,
+}; COMPLETED_READ_CAP];
+
+#[derive(Clone, Copy)]
+struct CompletedWrite {
+    fid: u64,
+    status: u32,
+    info: u64,
+}
+
+static mut COMPLETED_WRITES: [CompletedWrite; COMPLETED_READ_CAP] = [CompletedWrite {
+    fid: 0,
+    status: 0,
+    info: 0,
 }; COMPLETED_READ_CAP];
 
 /// Take (consume) a stashed completed-pending-read for `fid`, if any. Returns `(status, info, bytes)`.
 pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
     let table = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
     let slot = table.iter_mut().find(|e| e.fid == fid && e.fid != 0)?;
-    let bytes = slot.bytes[..slot.len].to_vec();
+    let length = (slot.info as usize).min((FSD_ARG_FRAMES * 0x1000) as usize);
+    let source = if slot.system_buffer != 0 {
+        slot.system_buffer
+    } else {
+        slot.data
+    };
+    let mut bytes = alloc::vec![0u8; length];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_volatile((source + index as u64) as *const u8);
+    }
     let out = (slot.status, slot.info, bytes);
-    slot.fid = 0;
+    pool_free(slot.data);
+    pool_free(slot.iosl);
+    pool_free(slot.irp);
+    pool_free(slot.file_object);
+    *slot = CompletedRead {
+        fid: 0,
+        status: 0,
+        info: 0,
+        irp: 0,
+        iosl: 0,
+        file_object: 0,
+        data: 0,
+        system_buffer: 0,
+    };
     Some(out)
+}
+
+pub(crate) unsafe fn take_completed_write(fid: u64) -> Option<(u32, u64)> {
+    let table = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
+    let slot = table.iter_mut().find(|entry| entry.fid == fid && entry.fid != 0)?;
+    let result = (slot.status, slot.info);
+    slot.fid = 0;
+    Some(result)
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
@@ -440,24 +488,31 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
         // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
         // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
+        let mut completion_owns_graph = false;
         if slot.major as u64 == IRP_MJ_READ {
             let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
             // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
             // it). Fall back to our original buffer only if npfs left it in place.
             let sysbuf = read_unaligned((irp + 0x18) as *const u64);
-            let src = if sysbuf != 0 { sysbuf } else { slot.data };
-            let n = (information as usize).min(COMPLETED_READ_BYTES);
             let ctable = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
             if let Some(cslot) = ctable.iter_mut().find(|e| e.fid == 0) {
                 cslot.fid = fid;
                 cslot.status = status;
                 cslot.info = information;
-                cslot.len = n;
-                let mut i = 0usize;
-                while i < n {
-                    cslot.bytes[i] = read_volatile((src + i as u64) as *const u8);
-                    i += 1;
-                }
+                cslot.irp = slot.irp;
+                cslot.iosl = slot.iosl;
+                cslot.file_object = slot.file_object;
+                cslot.data = slot.data;
+                cslot.system_buffer = sysbuf;
+                completion_owns_graph = true;
+            }
+        } else if slot.major as u64 == IRP_MJ_WRITE {
+            let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
+            let completed = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
+            if let Some(completed) = completed.iter_mut().find(|entry| entry.fid == 0) {
+                completed.fid = fid;
+                completed.status = status;
+                completed.info = information;
             }
         }
         if PEER_COMPLETION_TRACE_COUNT < 8 {
@@ -470,10 +525,12 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             print_u64(information);
             print_str(b"\n");
         }
-        pool_free(slot.data);
-        pool_free(slot.iosl);
-        pool_free(slot.irp);
-        pool_free(slot.file_object);
+        if !completion_owns_graph {
+            pool_free(slot.data);
+            pool_free(slot.iosl);
+            pool_free(slot.irp);
+            pool_free(slot.file_object);
+        }
         *slot = PendingIrp { irp: 0, iosl: 0, file_object: 0, data: 0, major: 0 };
     }
 }

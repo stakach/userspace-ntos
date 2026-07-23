@@ -595,7 +595,12 @@ pub struct PipeWaiter {
     pub buffer_len: u32,
     /// User IO_STATUS_BLOCK VA (status + information written on completion).
     pub iosb_va: u64,
+    /// Caller APC/OVERLAPPED context copied into an associated completion-port packet.
+    pub apc_context: u64,
+    /// Executive event-object index to signal on completion (`u64::MAX` for no event).
+    pub event_obj_idx: u64,
     /// The stolen seL4 MCS reply cap that resumes the blocked thread.
+    /// Zero identifies asynchronous I/O whose initiating syscall already returned STATUS_PENDING.
     pub reply_cap: u64,
     /// Native-syscall resume context: RCX (return IP), RSP, RFLAGS.
     pub resume_ip: u64,
@@ -604,6 +609,8 @@ pub struct PipeWaiter {
     /// `true` if this waiter parked on FSCTL_PIPE_TRANSCEIVE (must re-read then
     /// return via the FSCTL output path), `false` for a plain NtReadFile.
     pub is_transceive: bool,
+    /// `true` for a pending NtWriteFile. Write completions carry no read buffer.
+    pub is_write: bool,
 }
 
 /// A fixed-capacity, heap-free, reset-safe table of parked pipe reads. Mirrors
@@ -652,6 +659,10 @@ impl<const N: usize> PipeWaiterTable<N> {
         self.slots.iter().all(|s| s.is_none())
     }
 
+    pub fn has_capacity(&self) -> bool {
+        self.slots.iter().any(|slot| slot.is_none())
+    }
+
     /// Whether `tid` currently owns any retained pending read/transceive IRP.
     pub fn has_thread(&self, tid: u64) -> bool {
         self.slots
@@ -694,6 +705,41 @@ impl<const N: usize> PipeWaiterTable<N> {
             }
         }
         n
+    }
+
+    /// Cancel only reply-cap-blocked operations. Asynchronous requests have already returned to
+    /// user mode and must remain owned until the driver produces their final completion.
+    pub fn cancel_blocked_thread(&mut self, tid: u64) -> usize {
+        let mut count = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|waiter| waiter.tid == tid && waiter.reply_cap != 0) {
+                *slot = None;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Detach reply-cap-blocked operations from a terminating thread while preserving the driver
+    /// completion owner. The finalizer will discard user copyout and release the file reference.
+    pub fn detach_blocked_thread(&mut self, tid: u64) -> usize {
+        let mut count = 0;
+        for waiter in self.slots.iter_mut().flatten() {
+            if waiter.tid == tid && waiter.reply_cap != 0 {
+                waiter.tid = 0;
+                waiter.buffer_va = 0;
+                waiter.buffer_len = 0;
+                waiter.iosb_va = 0;
+                waiter.apc_context = 0;
+                waiter.event_obj_idx = u64::MAX;
+                waiter.reply_cap = 0;
+                waiter.resume_ip = 0;
+                waiter.resume_sp = 0;
+                waiter.resume_flags = 0;
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Is there already a parked read on `file_id`? (Guards double-parking the
@@ -899,11 +945,14 @@ mod tests {
             buffer_va: 0x1000 + file_id,
             buffer_len: 256,
             iosb_va: 0x2000 + file_id,
+            apc_context: 0,
+            event_obj_idx: u64::MAX,
             reply_cap: 0x40 + file_id,
             resume_ip: 0x3000 + file_id,
             resume_sp: 0x4000 + file_id,
             resume_flags: 0x202,
             is_transceive: false,
+            is_write: false,
         }
     }
 
@@ -923,6 +972,35 @@ mod tests {
         assert_eq!(w.reply_cap, 0x40 + 0xAA);
         assert_eq!(w.buffer_va, 0x1000 + 0xAA);
         assert_eq!(w.iosb_va, 0x2000 + 0xAA);
+    }
+
+    #[test]
+    fn asynchronous_pipe_waiter_does_not_own_a_reply_cap() {
+        let mut t = PipeWaiterTable::<1>::new();
+        let mut waiter = wtr(0xAA, 3, 7);
+        waiter.reply_cap = 0;
+        waiter.apc_context = 0xDEAD;
+        waiter.event_obj_idx = 9;
+        let slot = t.park(waiter).unwrap();
+        let pending = t.get(slot).unwrap();
+        assert_eq!(pending.reply_cap, 0);
+        assert_eq!(pending.apc_context, 0xDEAD);
+        assert_eq!(pending.event_obj_idx, 9);
+        assert_eq!(t.cancel_blocked_thread(7), 0);
+        assert!(t.parked_on(0xAA));
+    }
+
+    #[test]
+    fn terminating_blocked_thread_detaches_without_dropping_completion_owner() {
+        let mut t = PipeWaiterTable::<1>::new();
+        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
+        assert_eq!(t.detach_blocked_thread(7), 1);
+        let waiter = t.get(slot).unwrap();
+        assert_eq!(waiter.file_id, 0xAA);
+        assert_eq!(waiter.tid, 0);
+        assert_eq!(waiter.reply_cap, 0);
+        assert_eq!(waiter.buffer_va, 0);
+        assert_eq!(waiter.iosb_va, 0);
     }
 
     #[test]

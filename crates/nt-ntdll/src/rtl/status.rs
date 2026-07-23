@@ -40,6 +40,16 @@ pub fn nt_status_to_dos_error(status: u32) -> u32 {
     }
 }
 
+/// Translate an I/O completion packet into the first two arguments documented for
+/// `LPOVERLAPPED_COMPLETION_ROUTINE`.
+pub fn io_completion_callback_arguments(status: u32, information: u64) -> (u32, u32) {
+    if status == 0 {
+        (0, information as u32)
+    } else {
+        (nt_status_to_dos_error(status), 0)
+    }
+}
+
 /// `RtlGetLastNtStatus`: read `TEB.LastStatusValue`.
 pub fn get_last_nt_status(teb: &Teb) -> u32 {
     teb.last_status_value
@@ -361,6 +371,19 @@ mod tests {
         assert_eq!(nt_status_to_dos_error(0x8000_0005), 234); // BUFFER_OVERFLOW -> MORE_DATA
         assert_eq!(nt_status_to_dos_error(0x8000_000D), 299); // PARTIAL_COPY
         assert_eq!(nt_status_to_dos_error(0xDEAD_BEEF), 317); // unmapped default
+    }
+
+    #[test]
+    fn io_completion_callback_uses_win32_error_and_dword_byte_count() {
+        assert_eq!(
+            io_completion_callback_arguments(0, 0x1_0000_0003),
+            (0, 3)
+        );
+        assert_eq!(io_completion_callback_arguments(0xC000_0022, 99), (5, 0));
+        assert_eq!(
+            io_completion_callback_arguments(0x8000_0005, 99),
+            (234, 0)
+        );
     }
 
     #[test]

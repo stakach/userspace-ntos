@@ -2144,7 +2144,10 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_buffer_va: u64 = 0;
             let mut park_pipe_buffer_len: u32 = 0;
             let mut park_pipe_iosb_va: u64 = 0;
+            let mut park_pipe_apc_context: u64 = 0;
+            let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
+            let mut park_pipe_is_write = false;
             // Every syscall path, including the still hand-wired ladder below, resolves process-local
             // handles through ExecNtHandler. Refresh caller identity before choosing table vs ladder;
             // doing this only inside table dispatch left a runtime worker using whichever process ran
@@ -2229,7 +2232,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_buffer_va = 0;
                 nt_handler.pipe_park_buffer_len = 0;
                 nt_handler.pipe_park_iosb_va = 0;
+                nt_handler.pipe_park_apc_context = 0;
+                nt_handler.pipe_park_event_obj_idx = u64::MAX;
                 nt_handler.pipe_park_transceive = false;
+                nt_handler.pipe_park_is_write = false;
                 nt_handler.pipe_write_redrive = false;
                 nt_handler.pipe_listen_fid = 0;
                 nt_handler.pipe_listen_event_handle = 0;
@@ -2579,7 +2585,10 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
                     park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
+                    park_pipe_apc_context = nt_handler.pipe_park_apc_context;
+                    park_pipe_event_obj_idx = nt_handler.pipe_park_event_obj_idx;
                     park_pipe_transceive = nt_handler.pipe_park_transceive;
+                    park_pipe_is_write = nt_handler.pipe_park_is_write;
                 }
                 // ★ BATCH 34: a client CONNECT to a pipe with a pending async server FSCTL_PIPE_LISTEN
                 // for the SAME pipe name completes that listen — signal its completion event so the
@@ -4931,7 +4940,10 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_va,
                     park_pipe_buffer_len,
                     park_pipe_iosb_va,
+                    park_pipe_apc_context,
+                    park_pipe_event_obj_idx,
                     park_pipe_transceive,
+                    park_pipe_is_write,
                     resume_ip,
                     sp,
                     flags,
@@ -5009,6 +5021,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 } else {
                     print_str(b"[pipe-park] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                    nt_handler.release_file_reference(park_pipe_fid);
                     result = 0xC000_009A;
                 }
             }
@@ -5699,7 +5712,10 @@ unsafe fn pipe_wait_park(
     buffer_va: u64,
     buffer_len: u32,
     iosb_va: u64,
+    apc_context: u64,
+    event_obj_idx: u64,
     is_transceive: bool,
+    is_write: bool,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -5734,11 +5750,14 @@ unsafe fn pipe_wait_park(
         buffer_va,
         buffer_len,
         iosb_va,
+        apc_context,
+        event_obj_idx,
         reply_cap: stolen,
         resume_ip,
         resume_sp: sp,
         resume_flags: flags,
         is_transceive,
+        is_write,
     });
     if parked.is_none() {
         return false; // table exhausted → caller returns PENDING directly
@@ -5780,13 +5799,16 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // (copying the payload into THAT IRP) — so a fresh re-drive read would find the queue drained
         // and return garbage/PENDING. `take_completed_read` hands back the exact bytes npfs delivered
         // to the pending read IRP (this is how the rpcrt4 worker gets winlogon's bind PDU).
-        let (status, completed) = if let Some((st, info, bytes)) =
-            driver_launch::take_completed_read(w.file_id)
-        {
+        let (status, completed) = if w.is_write {
+            match driver_launch::take_completed_write(w.file_id) {
+                Some(completion) => completion,
+                None => continue,
+            }
+        } else if let Some((st, info, bytes)) = driver_launch::take_completed_read(w.file_id) {
             let n = (bytes.len()).min(output.len());
             output[..n].copy_from_slice(&bytes[..n]);
             (st, info)
-        } else {
+        } else if w.is_transceive {
             match nt_handler.npfs_route_raw(
                 major::IRP_MJ_READ as u64,
                 0,
@@ -5797,6 +5819,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 Some((st, info, _)) => (st as u32, info),
                 None => continue,
             }
+        } else {
+            continue;
         };
         if status == 0x0000_0103 {
             continue; // still PENDING → stays parked (re-armable)
@@ -5816,12 +5840,24 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // the remainder). Gating the copyout on `status == 0` left the reader's buffer zeroed on
         // overflow, so rpcrt4's RPCRT4_ValidateCommonHeader saw an all-zero header and failed. Only a
         // hard error / PENDING leaves the buffer untouched.
-        if (status == 0 || status == 0x8000_0005) && copy_len != 0 && w.buffer_va != 0 {
+        if !w.is_write
+            && (status == 0 || status == 0x8000_0005)
+            && copy_len != 0
+            && w.buffer_va != 0
+        {
             nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
         }
         if w.iosb_va != 0 {
             nt_handler.xas_write_buf(w.iosb_va, &status.to_le_bytes());
             nt_handler.xas_write_buf(w.iosb_va + 8, &(completed as u64).to_le_bytes());
+        }
+        if w.event_obj_idx != u64::MAX {
+            let _ = nt_handler.events.set_existing(w.event_obj_idx);
+            let _ = wait_wake_dispatcher_set(nt_handler);
+        }
+        nt_handler.post_file_completion(w.file_id, w.apc_context, status, completed);
+        if nt_handler.io_completion_wake.is_some() {
+            let _ = io_completion_deliver(nt_handler);
         }
         // Wake the blocked thread on its stolen reply cap — restore RCX/RSP/RFLAGS (MR15/16/17) and
         // return `status` in MR0 (→ RAX/r10), exactly like the event wake.
@@ -5833,6 +5869,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             send_on_reply(cap, 18, status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
         }
+        nt_handler.release_file_reference(w.file_id);
         // Free the slot (re-armable for the next PDU).
         let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
         table_mut.complete(slot);

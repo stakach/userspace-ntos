@@ -17563,17 +17563,31 @@ pub unsafe extern "system" fn rtl_deregister_wait(wait_handle: *mut c_void) -> N
 }
 
 /// `RtlSetIoCompletionCallback(HANDLE FileHandle, PIO_APC_ROUTINE Callback, ULONG Flags) -> NTSTATUS`
-/// — bind an I/O completion callback (thread-pool). No plane → STATUS_SUCCESS no-op.
+/// — bind an asynchronous file to the process work pool's completion port.
 ///
 /// # Safety
 /// `file_handle` a valid handle.
 #[export_name = "RtlSetIoCompletionCallback"]
 pub unsafe extern "system" fn rtl_set_io_completion_callback(
-    _file_handle: *mut c_void,
-    _callback: *mut c_void,
-    _flags: u32,
+    file_handle: *mut c_void,
+    callback: *mut c_void,
+    flags: u32,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            crate::on_target::rtl_set_io_completion_callback(
+                file_handle as u64,
+                callback as u64,
+                flags,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (file_handle, callback, flags);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlSetThreadPoolStartFunc(PVOID StartFunc, PVOID ExitFunc) -> NTSTATUS` — install or clear the

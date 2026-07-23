@@ -224,6 +224,7 @@ impl ExecNtHandler {
             )
             .unwrap(),
             io_completion_ports: nt_io_completion::CompletionPortTable::new(),
+            file_completion: nt_io_completion::FileCompletionTable::new(),
             directory_opens: ExecDirectoryOpens::reset(),
             pi: 0,
             current_tid: 0,
@@ -265,7 +266,10 @@ impl ExecNtHandler {
             pipe_park_buffer_va: 0,
             pipe_park_buffer_len: 0,
             pipe_park_iosb_va: 0,
+            pipe_park_apc_context: 0,
+            pipe_park_event_obj_idx: u64::MAX,
             pipe_park_transceive: false,
+            pipe_park_is_write: false,
             pipe_write_redrive: false,
             pipe_listen_fid: 0,
             pipe_listen_event_handle: 0,
@@ -676,12 +680,26 @@ impl ExecNtHandler {
         h
     }
     /// Mint a process-local handle backed by a typed filesystem `FILE_OBJECT` identity.
-    pub(crate) fn mint_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
+    pub(crate) fn mint_file_handle(
+        &mut self,
+        file_id: u64,
+        access: u32,
+        synchronous: bool,
+    ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self
+        self.file_completion
+            .insert_file(file_id, synchronous)
+            .ok()?;
+        let handle = match self
             .pm
             .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
-            .ok()?;
+        {
+            Ok(handle) => handle,
+            Err(_) => {
+                self.release_file_reference(file_id);
+                return None;
+            }
+        };
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
@@ -1096,6 +1114,72 @@ impl ExecNtHandler {
             return Err(STATUS_ACCESS_DENIED);
         }
         Ok(object_id)
+    }
+
+    pub(crate) fn post_io_completion_packet(
+        &mut self,
+        object_id: u32,
+        packet: nt_io_completion::CompletionPacket,
+    ) -> u32 {
+        if let Some(waiter) = unsafe {
+            (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id)
+        } {
+            let wake_packet = match self
+                .io_completion_ports
+                .remove(object_id, nt_io_completion::RemoveMode::Poll)
+            {
+                Ok(nt_io_completion::RemoveResult::Packet(queued)) => {
+                    if let Err(status) = self.io_completion_ports.enqueue(object_id, packet) {
+                        let _ = unsafe {
+                            (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
+                        };
+                        return status;
+                    }
+                    queued
+                }
+                Ok(nt_io_completion::RemoveResult::Empty(_)) => packet,
+                Err(status) => {
+                    let _ = unsafe {
+                        (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
+                    };
+                    return status;
+                }
+            };
+            self.io_completion_wake = Some((waiter, wake_packet));
+            return nt_io_completion::STATUS_SUCCESS;
+        }
+        self.io_completion_ports
+            .enqueue(object_id, packet)
+            .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
+    }
+
+    pub(crate) fn post_file_completion(
+        &mut self,
+        file_id: u64,
+        apc_context: u64,
+        status: u32,
+        information: u64,
+    ) {
+        if apc_context == 0 {
+            return;
+        }
+        if let Some(binding) = self.file_completion.binding(file_id) {
+            let _ = self.post_io_completion_packet(
+                binding.port_id,
+                nt_io_completion::CompletionPacket {
+                    key_context: binding.key_context,
+                    apc_context,
+                    status,
+                    information,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn release_file_reference(&mut self, file_id: u64) {
+        if let Ok(Some(port_id)) = self.file_completion.release_file(file_id) {
+            let _ = self.io_completion_ports.release(port_id);
+        }
     }
     /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
     /// caller-supplied start routine + parameter (all alloc-free field writes, reset-safe),
@@ -2096,6 +2180,9 @@ impl ExecNtHandler {
             nt_process::HandleObject::IoCompletion(id) => {
                 let _ = self.io_completion_ports.release(id);
             }
+            nt_process::HandleObject::File(file_id) => {
+                self.release_file_reference(file_id);
+            }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
             }
@@ -2144,6 +2231,9 @@ impl ExecNtHandler {
                 .retain(token)
                 .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
             nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
+            nt_process::HandleObject::File(file_id) => {
+                self.file_completion.retain_file(file_id)
+            }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 self.directory_opens.retain(object_id)
             }
@@ -4805,8 +4895,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
                 let h = if routed_file_id != 0 {
-                    self.mint_file_handle(routed_file_id, args[1] as u32)
-                        .unwrap_or_else(|| self.mint_handle())
+                    let options = args[6] as u32;
+                    let synchronous = options
+                        & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                            | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                        != 0;
+                    let Some(handle) =
+                        self.mint_file_handle(routed_file_id, args[1] as u32, synchronous)
+                    else {
+                        self.queue_write(get_recv_mr(9), 0);
+                        if iosb != 0 {
+                            self.xas_write_buf(
+                                iosb,
+                                &nt_io_completion::STATUS_INSUFFICIENT_RESOURCES.to_le_bytes(),
+                            );
+                            self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                        }
+                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    };
+                    handle
                 } else {
                     self.mint_handle()
                 };
@@ -4870,6 +4977,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     status = 0x103; // STATUS_PENDING
                 }
                 let fid = self.npfs_file_id_for(args[0]);
+                let is_pipe_transceive = (fsctl as u32) == 0x0011_C017;
+                let mut transceive_file_retained = false;
                 if fid != 0 && !force_pending_listen {
                     let input_len = (args[7] as usize).min(0x4000);
                     let output_len = (args[9] as usize).min(0x4000);
@@ -4878,24 +4987,58 @@ impl NativeSyscallHandler for ExecNtHandler {
                     if (input_len == 0 || self.xas_read(args[6], &mut input))
                         && (output_len == 0 || args[8] != 0)
                     {
-                        if let Some((st, completed, _)) = self.npfs_route_raw(
-                            0xd, fsctl, fid, &input, &mut output,
-                        ) {
-                            status = st as u64;
-                            information = completed;
-                            if completed != 0 && args[8] != 0 {
-                                let copy_len = (completed as usize).min(output.len());
-                                self.xas_write_buf(args[8], &output[..copy_len]);
+                        let prepared = if is_pipe_transceive {
+                            let waiter_table = &*core::ptr::addr_of!(PIPE_WAITERS);
+                            let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+                            let reply_capacity = REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                && (0..WAIT_REPLY_POOL_N).any(|index| {
+                                    used & (1u64 << index) == 0
+                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+                                });
+                            if !waiter_table.has_capacity()
+                                || waiter_table.parked_on(fid)
+                                || !reply_capacity
+                            {
+                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                            } else {
+                                self.file_completion.retain_file(fid).map(|()| {
+                                    transceive_file_retained = true;
+                                })
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        match prepared {
+                            Err(preparation_status) => status = preparation_status as u64,
+                            Ok(()) => {
+                                if is_pipe_transceive && args[1] != 0 {
+                                    if let Ok(index) = self.event_index_for_handle(args[1], 0) {
+                                        let _ = self.events.reset_existing(index as u64);
+                                    }
+                                }
+                                if let Some((st, completed, _)) =
+                                    self.npfs_route_raw(0xd, fsctl, fid, &input, &mut output)
+                                {
+                                    status = st as u64;
+                                    information = completed;
+                                    if completed != 0 && args[8] != 0 {
+                                        let copy_len = (completed as usize).min(output.len());
+                                        self.xas_write_buf(args[8], &output[..copy_len]);
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                if transceive_file_retained && status as u32 != 0x0000_0103 {
+                    self.release_file_reference(fid);
                 }
                 // BATCH 33: an FSCTL_PIPE_TRANSCEIVE (write-then-read) on a real npfs pipe that returns
                 // PENDING has no response bytes yet → PARK this caller keyed by the reading end fid, and
                 // re-drive it when the peer writes the response (the loop steals the reply cap; the
                 // response is delivered to args[8]/IOSB at re-drive, so SUPPRESS the PENDING IOSB here).
                 if fid != 0
-                    && (fsctl as u32) == 0x0011_C017
+                    && is_pipe_transceive
                     && (status as u32) == 0x0000_0103
                     && args[8] != 0
                 {
@@ -4903,6 +5046,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     self.pipe_park_buffer_va = args[8];
                     self.pipe_park_buffer_len = args[9] as u32;
                     self.pipe_park_iosb_va = iosb;
+                    self.pipe_park_apc_context = args[3];
+                    self.pipe_park_event_obj_idx = if args[1] != 0 {
+                        self.event_index_for_handle(args[1], 0)
+                            .map_or(u64::MAX, |index| index as u64)
+                    } else {
+                        u64::MAX
+                    };
                     self.pipe_park_transceive = true;
                 }
                 // ★ BATCH 34 — the async ncacn_np SERVER completion edge. A server (pi 3/4) posting an
@@ -4959,7 +5109,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 // A TRANSCEIVE that COMPLETED synchronously (it wrote request bytes into npfs) may also
                 // satisfy the peer's parked read — ask the loop to re-drive.
-                if fid != 0 && (fsctl as u32) == 0x0011_C017 && (status as u32) != 0x0000_0103 {
+                if fid != 0 && is_pipe_transceive && (status as u32) != 0x0000_0103 {
                     self.pipe_write_redrive = true;
                 }
                 if self.pi == 2 && fsctl as u32 == 0x0011_0018
@@ -8484,37 +8634,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     status: args[3] as u32,
                     information: args[4],
                 };
-                if let Some(waiter) = unsafe {
-                    (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id)
-                } {
-                    let wake_packet = match self
-                        .io_completion_ports
-                        .remove(object_id, nt_io_completion::RemoveMode::Poll)
-                    {
-                        Ok(nt_io_completion::RemoveResult::Packet(queued)) => {
-                            if let Err(status) = self.io_completion_ports.enqueue(object_id, packet) {
-                                let _ = unsafe {
-                                    (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
-                                        .insert(waiter)
-                                };
-                                return status;
-                            }
-                            queued
-                        }
-                        Ok(nt_io_completion::RemoveResult::Empty(_)) => packet,
-                        Err(status) => {
-                            let _ = unsafe {
-                                (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
-                            };
-                            return status;
-                        }
-                    };
-                    self.io_completion_wake = Some((waiter, wake_packet));
-                    return nt_io_completion::STATUS_SUCCESS;
-                }
-                self.io_completion_ports
-                    .enqueue(object_id, packet)
-                    .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
+                self.post_io_completion_packet(object_id, packet)
             },
             NativeService::NtRemoveIoCompletion => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -8702,7 +8822,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                     ) {
                         status = st as u32;
                         if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
-                            if let Some(handle) = self.mint_file_handle(file_id, args[1] as u32) {
+                            let options = args[8] as u32;
+                            let synchronous = options
+                                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                    | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                                != 0;
+                            if let Some(handle) =
+                                self.mint_file_handle(file_id, args[1] as u32, synchronous)
+                            {
                                 self.queue_write(args[0], handle);
                                 info = nt_fs::FILE_OPENED as u64;
                                 // ★ BATCH 34: client CONNECT (winlogon's NtCreateFile on \pipe\ntsvcs)
@@ -8776,15 +8903,23 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let completion_event = self.validate_io_event(event);
                 let mut information = 0u64;
                 let mut routed = false;
-                let status = if !iosb_ok {
+                let mut completion_file_id = 0u64;
+                let mut pending_write_fid = 0u64;
+                let mut async_file_retained = false;
+                let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if len > transport_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if apc_routine != 0 {
-                    // No executive user-APC queue exists yet; do not pretend the callback ran.
-                    0xC000_00BB // STATUS_NOT_SUPPORTED
+                    let file_id = self.npfs_file_id_for(fh);
+                    if file_id != 0 && self.file_completion.binding(file_id).is_some() {
+                        0xC000_000D // STATUS_INVALID_PARAMETER
+                    } else {
+                        // No executive user-APC queue exists yet; do not pretend the callback ran.
+                        0xC000_00BB // STATUS_NOT_SUPPORTED
+                    }
                 } else if let Err(event_status) = completion_event {
                     event_status
                 } else if self.boot_status_handle_access(fh).is_ok() {
@@ -8799,31 +8934,123 @@ impl NativeSyscallHandler for ExecNtHandler {
                     match self.npfs_write_file_id_for(fh) {
                         Err(handle_status) => handle_status,
                         Ok(file_id) => {
-                            let mut output = [];
-                            match self.npfs_route_raw(
-                                major::IRP_MJ_WRITE as u64,
-                                0,
-                                file_id,
-                                &payload,
-                                &mut output,
-                            ) {
-                                Some((driver_status, completed, _)) => {
-                                    routed = true;
-                                    information = completed;
-                                    driver_status as u32
+                            completion_file_id = file_id;
+                            let synchronous =
+                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
+                            let waiter_table =
+                                unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
+                            let waiter_capacity =
+                                waiter_table.has_capacity() && !waiter_table.parked_on(file_id);
+                            let sync_reply_capacity = if synchronous {
+                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+                                (0..WAIT_REPLY_POOL_N).any(|index| {
+                                    used & (1u64 << index) == 0
+                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+                                })
+                            } else {
+                                true
+                            };
+                            let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                            } else {
+                                self.file_completion.retain_file(file_id).map(|()| {
+                                    async_file_retained = true;
+                                })
+                            };
+                            match prepared {
+                                Err(status) => status,
+                                Ok(()) => {
+                                    if let Ok(Some(index)) = completion_event {
+                                        let _ = self.events.reset_existing(index as u64);
+                                    }
+                                    let mut output = [];
+                                    match self.npfs_route_raw(
+                                        major::IRP_MJ_WRITE as u64,
+                                        0,
+                                        file_id,
+                                        &payload,
+                                        &mut output,
+                                    ) {
+                                        Some((driver_status, completed, _)) => {
+                                            routed = true;
+                                            information = completed;
+                                            if driver_status as u32 == 0x0000_0103 {
+                                                pending_write_fid = file_id;
+                                            }
+                                            driver_status as u32
+                                        }
+                                        None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                                    }
                                 }
-                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
                             }
                         }
                     }
                 };
-                if iosb_ok {
+                if async_file_retained && pending_write_fid == 0 {
+                    self.release_file_reference(completion_file_id);
+                }
+                if pending_write_fid != 0 {
+                    let synchronous = self
+                        .file_completion
+                        .is_synchronous(pending_write_fid)
+                        .unwrap_or(true);
+                    let event_obj_idx = completion_event
+                        .ok()
+                        .flatten()
+                        .map_or(u64::MAX, |index| index as u64);
+                    if synchronous {
+                        self.pipe_park_fid = pending_write_fid;
+                        self.pipe_park_buffer_va = 0;
+                        self.pipe_park_buffer_len = 0;
+                        self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_context = apc_context;
+                        self.pipe_park_event_obj_idx = event_obj_idx;
+                        self.pipe_park_transceive = false;
+                        self.pipe_park_is_write = true;
+                    } else {
+                        let waiter = nt_io_manager::PipeWaiter {
+                            file_id: pending_write_fid,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            buffer_va: 0,
+                            buffer_len: 0,
+                            iosb_va: iosb,
+                            apc_context,
+                            event_obj_idx,
+                            reply_cap: 0,
+                            resume_ip: 0,
+                            resume_sp: 0,
+                            resume_flags: 0,
+                            is_transceive: false,
+                            is_write: true,
+                        };
+                        if unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter) }
+                            .is_none()
+                        {
+                            if async_file_retained {
+                                self.release_file_reference(pending_write_fid);
+                            }
+                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                            pending_write_fid = 0;
+                        }
+                    }
+                }
+                if iosb_ok && pending_write_fid == 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 // A synchronous completion signals a valid real event. Legacy opaque events already
                 // have immediate-wait semantics; STATUS_PENDING must leave every event unsignalled.
                 if routed && status != 0x0000_0103 {
+                    if status & 0xC000_0000 != 0xC000_0000 {
+                        self.post_file_completion(
+                            completion_file_id,
+                            apc_context,
+                            status,
+                            information,
+                        );
+                    }
                     if let Ok(Some(index)) = completion_event {
                         if self.events.set_existing(index as u64).is_some() {
                             self.io_signal_event = index as i64;
@@ -8831,7 +9058,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     // BATCH 33: the bytes are now queued in npfs on the PEER end. Ask the loop to
                     // re-drive every parked pipe read — npfs's FCB pairing wakes the peer's reader.
-                    self.pipe_write_redrive = true;
+                    if status & 0xC000_0000 != 0xC000_0000 {
+                        self.pipe_write_redrive = true;
+                    }
                 }
                 if trace {
                     print_str(b"[nt-write-file] pi=");
@@ -8891,6 +9120,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let fh = args[0];
                 let event = args[1];
                 let apc_routine = args[2];
+                let apc_context = args[3];
                 let completion_event = self.validate_io_event(event);
                 let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
@@ -8905,14 +9135,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
-                let status = if !iosb_ok {
+                let mut completion_file_id = 0u64;
+                let mut async_file_retained = false;
+                let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !matches!(disk_file, Ok(Some(_))) && len > transport_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if apc_routine != 0 {
-                    0xC000_00BB // STATUS_NOT_SUPPORTED
+                    let file_id = self.npfs_file_id_for(fh);
+                    if file_id != 0 && self.file_completion.binding(file_id).is_some() {
+                        0xC000_000D // STATUS_INVALID_PARAMETER
+                    } else {
+                        0xC000_00BB // STATUS_NOT_SUPPORTED
+                    }
                 } else if let Err(event_status) = completion_event {
                     event_status
                 } else if let Err(handle_status) = disk_file {
@@ -8975,51 +9212,130 @@ impl NativeSyscallHandler for ExecNtHandler {
                     match self.npfs_read_file_id_for(fh) {
                         Err(handle_status) => handle_status,
                         Ok(file_id) => {
-                            match self.npfs_route_raw(
-                                major::IRP_MJ_READ as u64,
-                                0,
-                                file_id,
-                                &[],
-                                &mut output,
-                            ) {
-                                Some((driver_status, completed, _)) => {
-                                    routed = true;
-                                    information = completed;
-                                    let copy_len = (completed as usize).min(output.len());
-                                    if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
-                                        self.xas_write_buf(buffer, &output[..copy_len]);
+                            completion_file_id = file_id;
+                            let synchronous =
+                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
+                            let waiter_table =
+                                unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
+                            let waiter_capacity =
+                                waiter_table.has_capacity() && !waiter_table.parked_on(file_id);
+                            let sync_reply_capacity = if synchronous {
+                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+                                (0..WAIT_REPLY_POOL_N).any(|index| {
+                                    used & (1u64 << index) == 0
+                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+                                })
+                            } else {
+                                true
+                            };
+                            let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                            } else {
+                                self.file_completion.retain_file(file_id).map(|()| {
+                                    async_file_retained = true;
+                                })
+                            };
+                            match prepared {
+                                Err(status) => status,
+                                Ok(()) => {
+                                    if let Ok(Some(index)) = completion_event {
+                                        let _ = self.events.reset_existing(index as u64);
                                     }
-                                    if driver_status as u32 == 0x0000_0103 {
-                                        pending_read_fid = file_id;
+                                    match self.npfs_route_raw(
+                                        major::IRP_MJ_READ as u64,
+                                        0,
+                                        file_id,
+                                        &[],
+                                        &mut output,
+                                    ) {
+                                    Some((driver_status, completed, _)) => {
+                                        routed = true;
+                                        information = completed;
+                                        let copy_len = (completed as usize).min(output.len());
+                                        if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
+                                            self.xas_write_buf(buffer, &output[..copy_len]);
+                                        }
+                                        if driver_status as u32 == 0x0000_0103 {
+                                            pending_read_fid = file_id;
+                                        }
+                                        driver_status as u32
                                     }
-                                    driver_status as u32
+                                    None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                                    }
                                 }
-                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
                             }
                         }
                     }
                 };
-                // BATCH 33: a real npfs pipe read with no data yet → PARK this caller (withhold the
-                // reply, steal its reply cap keyed by this reading end's fid) and re-drive it when the
-                // peer writes. The loop performs the reply-cap steal (resume ctx is loop-resident); the
-                // IOSB / completion are written at re-drive, so SUPPRESS the PENDING IOSB write here.
+                if async_file_retained && pending_read_fid == 0 {
+                    self.release_file_reference(completion_file_id);
+                }
                 if pending_read_fid != 0 {
-                    self.pipe_park_fid = pending_read_fid;
-                    self.pipe_park_buffer_va = buffer;
-                    self.pipe_park_buffer_len = len as u32;
-                    self.pipe_park_iosb_va = iosb;
-                    self.pipe_park_transceive = false;
+                    let synchronous = self
+                        .file_completion
+                        .is_synchronous(pending_read_fid)
+                        .unwrap_or(true);
+                    let event_obj_idx = completion_event
+                        .ok()
+                        .flatten()
+                        .map_or(u64::MAX, |index| index as u64);
+                    if synchronous {
+                        self.pipe_park_fid = pending_read_fid;
+                        self.pipe_park_buffer_va = buffer;
+                        self.pipe_park_buffer_len = len as u32;
+                        self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_context = apc_context;
+                        self.pipe_park_event_obj_idx = event_obj_idx;
+                        self.pipe_park_transceive = false;
+                    } else {
+                        let waiter = nt_io_manager::PipeWaiter {
+                            file_id: pending_read_fid,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            buffer_va: buffer,
+                            buffer_len: len as u32,
+                            iosb_va: iosb,
+                            apc_context,
+                            event_obj_idx,
+                            reply_cap: 0,
+                            resume_ip: 0,
+                            resume_sp: 0,
+                            resume_flags: 0,
+                            is_transceive: false,
+                            is_write: false,
+                        };
+                        let parked = unsafe {
+                            (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter)
+                        };
+                        if parked.is_none() {
+                            if async_file_retained {
+                                self.release_file_reference(pending_read_fid);
+                            }
+                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                            pending_read_fid = 0;
+                        }
+                    }
                 }
                 if iosb_ok && pending_read_fid == 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 if routed && status != 0x0000_0103 {
+                    if status & 0xC000_0000 != 0xC000_0000 {
+                        self.post_file_completion(
+                            completion_file_id,
+                            apc_context,
+                            status,
+                            information,
+                        );
+                    }
                     if let Ok(Some(index)) = completion_event {
                         if self.events.set_existing(index as u64).is_some() {
                             self.io_signal_event = index as i64;
                         }
                     }
+                    self.pipe_write_redrive = true;
                 }
                 if NT_READ_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-read-file] pi=");
@@ -9069,35 +9385,91 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     print_str(b"\n");
                 }
-                if self.pi != 2 && self.pi != 4 {
-                    self.stop = true;
-                    return 0xC000_0002;
+                if iosb == 0 || !self.probe_user_output(iosb, 16) {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
                 let mut information = 0u64;
-                let file_id = self.npfs_file_id_for(args[0]);
-                let status = if information_class != 23 {
-                    0xC000_0003 // STATUS_INVALID_INFO_CLASS
-                } else if length < 8 {
-                    0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
-                } else if args[2] == 0 || !payload_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if file_id == 0 {
-                    0xC000_0008 // STATUS_INVALID_HANDLE
-                } else {
-                    let mut output = [];
-                    match self.npfs_route_raw(
-                        major::IRP_MJ_SET_INFORMATION as u64,
-                        information_class as u64,
-                        file_id,
-                        &payload[..8],
-                        &mut output,
-                    ) {
-                        Some((driver_status, completed, _)) => {
-                            information = completed;
-                            driver_status as u32
+                let status = match information_class {
+                    23 => {
+                        let file_id = self.npfs_file_id_for(args[0]);
+                        if self.pi != 2 && self.pi != 4 {
+                            0xC000_0002 // STATUS_NOT_IMPLEMENTED
+                        } else if length < 8 {
+                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+                        } else if args[2] == 0 || !payload_ok {
+                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                        } else if file_id == 0 {
+                            0xC000_0008 // STATUS_INVALID_HANDLE
+                        } else {
+                            let mut output = [];
+                            match self.npfs_route_raw(
+                                major::IRP_MJ_SET_INFORMATION as u64,
+                                information_class as u64,
+                                file_id,
+                                &payload[..8],
+                                &mut output,
+                            ) {
+                                Some((driver_status, completed, _)) => {
+                                    information = completed;
+                                    driver_status as u32
+                                }
+                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                            }
                         }
-                        None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
                     }
+                    30 => {
+                        const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
+                        if length < 16 {
+                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+                        } else if args[2] == 0 || !payload_ok {
+                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                        } else {
+                            let file_id = self.npfs_file_id_for(args[0]);
+                            if file_id == 0 {
+                                0xC000_0008 // STATUS_INVALID_HANDLE
+                            } else if let Err(status) =
+                                self.file_completion.can_associate(file_id)
+                            {
+                                status
+                            } else {
+                                let port_handle =
+                                    u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                                let key_context =
+                                    u64::from_le_bytes(payload[8..16].try_into().unwrap());
+                                match self.io_completion_id_for(
+                                    port_handle,
+                                    IO_COMPLETION_MODIFY_STATE,
+                                ) {
+                                    Err(status) => status,
+                                    Ok(port_id) => {
+                                        match self.io_completion_ports.retain(port_id) {
+                                            Err(status) => status,
+                                            Ok(()) => {
+                                                let binding =
+                                                    nt_io_completion::FileCompletionBinding {
+                                                        port_id,
+                                                        key_context,
+                                                    };
+                                                match self
+                                                    .file_completion
+                                                    .associate(file_id, binding)
+                                                {
+                                                    Ok(()) => nt_io_completion::STATUS_SUCCESS,
+                                                    Err(status) => {
+                                                        let _ = self
+                                                            .io_completion_ports
+                                                            .release(port_id);
+                                                        status
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => 0xC000_0003, // STATUS_INVALID_INFO_CLASS
                 };
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
@@ -9235,7 +9607,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                         if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
                             let mut status = st as u32;
                             let opened_handle = if status == 0 && fid != 0 {
-                                let handle = self.mint_file_handle(fid, args[1] as u32);
+                                let options = args[5] as u32;
+                                let synchronous = options
+                                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                        | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                                    != 0;
+                                let handle =
+                                    self.mint_file_handle(fid, args[1] as u32, synchronous);
                                 if handle.is_none() { status = 0xC000_009A; }
                                 handle
                             } else {

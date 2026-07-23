@@ -5356,6 +5356,7 @@ const SSN_NT_QUERY_SYSTEM_TIME: u32 = 182;
 const SSN_NT_REMOVE_IO_COMPLETION: u32 = 198;
 const SSN_NT_RESUME_THREAD: u32 = 214;
 const SSN_NT_SET_EVENT: u32 = 228;
+const SSN_NT_SET_INFORMATION_FILE: u32 = 233;
 const SSN_NT_SET_IO_COMPLETION: u32 = 241;
 const SSN_NT_TERMINATE_THREAD: u32 = 267;
 const SSN_NT_WAIT_FOR_MULTIPLE_OBJECTS: u32 = 280;
@@ -5808,7 +5809,7 @@ unsafe fn rtl_async_on_worker() -> bool {
             || current == RTL_COMPLETION_WORKER_TID.load(Ordering::Acquire))
 }
 
-unsafe fn initialize_work_pool() -> u32 {
+pub(crate) unsafe fn initialize_work_pool() -> u32 {
     loop {
         match WORK_POOL_INIT_STATE.load(Ordering::Acquire) {
             POOL_READY => return STATUS_SUCCESS_U32,
@@ -5867,7 +5868,7 @@ unsafe fn initialize_work_pool() -> u32 {
 type PoolThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
 type StartPoolThread = unsafe extern "system" fn(PoolThreadStart, *mut c_void, *mut u64) -> u32;
 type ExitPoolThread = unsafe extern "system" fn(u32) -> u32;
-type CompletionRoutine = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
+type CompletionRoutine = unsafe extern "system" fn(u32, u32, *mut c_void);
 
 unsafe fn default_start_pool_thread(
     routine: PoolThreadStart,
@@ -6003,8 +6004,43 @@ unsafe fn start_scheduler_worker() -> u32 {
     unsafe { start_pool_worker(&RTL_SCHEDULER_WORKER_STATE, rtlp_worker_thread) }
 }
 
-unsafe fn start_completion_worker() -> u32 {
+pub(crate) unsafe fn start_completion_worker() -> u32 {
     unsafe { start_pool_worker(&RTL_COMPLETION_WORKER_STATE, rtlp_completion_worker_thread) }
+}
+
+pub(crate) unsafe fn rtl_set_io_completion_callback(
+    file_handle: u64,
+    callback: u64,
+    _flags: u32,
+) -> u32 {
+    if callback == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let status = unsafe { initialize_work_pool() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    let status = unsafe { start_completion_worker() };
+    if !nt_rtl_work_item::nt_success(status) {
+        return status;
+    }
+    let port = WORK_POOL_PORT.load(Ordering::Acquire);
+    if port == 0 {
+        return STATUS_UNSUCCESSFUL_U32;
+    }
+    let mut io_status = [0u64; 2];
+    let information = [port, callback];
+    unsafe {
+        syscall6(
+            SSN_NT_SET_INFORMATION_FILE,
+            file_handle,
+            io_status.as_mut_ptr() as u64,
+            information.as_ptr() as u64,
+            core::mem::size_of_val(&information) as u64,
+            30,
+            0,
+        ) as u32
+    }
 }
 
 unsafe fn cleanup_failed_submission(submission: nt_rtl_work_item::Submission) -> u32 {
@@ -7404,13 +7440,21 @@ unsafe fn rtl_async_execute_one_completion(timeout: Option<i64>) -> Result<bool,
     if !nt_rtl_work_item::nt_success(status) || key == 0 {
         return Err(status);
     }
+    if key == rtlp_execute_work_item as usize as u64 {
+        unsafe {
+            rtlp_execute_work_item(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                apc_context as *mut c_void,
+            )
+        };
+        return Ok(true);
+    }
     let routine: CompletionRoutine = unsafe { core::mem::transmute(key as usize) };
+    let (error, transferred) =
+        nt_ntdll::rtl::status::io_completion_callback_arguments(io_status[0] as u32, io_status[1]);
     unsafe {
-        routine(
-            core::ptr::null_mut(),
-            io_status[1] as *mut c_void,
-            apc_context as *mut c_void,
-        )
+        routine(error, transferred, apc_context as *mut c_void)
     };
     Ok(true)
 }

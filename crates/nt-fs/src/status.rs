@@ -37,6 +37,7 @@ pub const FILE_DOES_NOT_EXIST: u32 = 5;
 
 // CreateOptions (spec §8.1)
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+pub const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x0000_0010;
 pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 

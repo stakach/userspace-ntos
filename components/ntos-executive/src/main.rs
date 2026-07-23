@@ -3858,13 +3858,18 @@ unsafe fn pipe_io_cancel_thread(tid: u64) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let mut reply_caps = [0u64; PIPE_WAITER_N];
     let mut count = 0usize;
-    for (_, waiter) in table.drain_all().filter(|(_, waiter)| waiter.tid == tid) {
+    for (_, waiter) in table
+        .drain_all()
+        .filter(|(_, waiter)| waiter.tid == tid && waiter.reply_cap != 0)
+    {
         reply_caps[count] = waiter.reply_cap;
         count += 1;
     }
-    let _ = table.cancel_thread(tid);
-    for cap in reply_caps.into_iter().take(count).filter(|cap| *cap != 0) {
-        release_reply_pool_cap(cap);
+    let _ = table.detach_blocked_thread(tid);
+    for index in 0..count {
+        if reply_caps[index] != 0 {
+            release_reply_pool_cap(reply_caps[index]);
+        }
     }
     let _ = (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).cancel_thread(tid);
 }
@@ -4987,6 +4992,9 @@ struct ExecNtHandler {
     /// Fixed executive completion-port objects and packet queues. SURT remains the cross-component
     /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
     io_completion_ports: nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>,
+    /// Shared FILE_OBJECT completion associations. Duplicate handles and pending operations retain
+    /// the same entry; the associated port reference is released with the final reference.
+    file_completion: nt_io_completion::FileCompletionTable<128>,
     /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
     /// The backing table lives in BSS to keep it off the bounded rootserver stack.
     directory_opens: ExecDirectoryOpens,
@@ -5124,7 +5132,10 @@ struct ExecNtHandler {
     pipe_park_buffer_va: u64,
     pipe_park_buffer_len: u32,
     pipe_park_iosb_va: u64,
+    pipe_park_apc_context: u64,
+    pipe_park_event_obj_idx: u64,
     pipe_park_transceive: bool,
+    pipe_park_is_write: bool,
     /// BATCH 33 — set by NtWriteFile when a write completes into npfs (non-PENDING): the LOOP must
     /// re-drive EVERY parked pipe read (re-issue each against npfs; npfs's own FCB pairing decides
     /// which reader now has bytes) and wake the satisfied ones. `false` = no re-drive requested.

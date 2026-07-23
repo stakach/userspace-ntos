@@ -13,6 +13,132 @@ pub const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
 pub const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileCompletionBinding {
+    pub port_id: u32,
+    pub key_context: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FileCompletionEntry {
+    file_id: u64,
+    references: u32,
+    synchronous: bool,
+    binding: Option<FileCompletionBinding>,
+}
+
+/// Fixed FILE_OBJECT-to-completion-port associations. Handles duplicated from the same file object
+/// share one entry and one immutable completion binding. Pending operations retain the same entry,
+/// so closing the last handle cannot tear down an association before its final completion packet.
+pub struct FileCompletionTable<const FILES: usize> {
+    entries: [FileCompletionEntry; FILES],
+}
+
+impl<const FILES: usize> FileCompletionTable<FILES> {
+    pub const fn new() -> Self {
+        assert!(FILES > 0);
+        Self {
+            entries: [FileCompletionEntry {
+                file_id: 0,
+                references: 0,
+                synchronous: false,
+                binding: None,
+            }; FILES],
+        }
+    }
+
+    pub fn insert_file(&mut self, file_id: u64, synchronous: bool) -> Result<(), u32> {
+        if file_id == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if let Some(entry) = self.entry_mut(file_id) {
+            if entry.synchronous != synchronous {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            entry.references = entry
+                .references
+                .checked_add(1)
+                .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            return Ok(());
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.references == 0)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *entry = FileCompletionEntry {
+            file_id,
+            references: 1,
+            synchronous,
+            binding: None,
+        };
+        Ok(())
+    }
+
+    pub fn retain_file(&mut self, file_id: u64) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.references = entry
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(())
+    }
+
+    /// Drop one handle reference. The returned port id is the binding reference the executive must
+    /// release when the last handle to the file object closes.
+    pub fn release_file(&mut self, file_id: u64) -> Result<Option<u32>, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.references -= 1;
+        if entry.references != 0 {
+            return Ok(None);
+        }
+        let port = entry.binding.map(|binding| binding.port_id);
+        *entry = FileCompletionEntry::default();
+        Ok(port)
+    }
+
+    pub fn associate(
+        &mut self,
+        file_id: u64,
+        binding: FileCompletionBinding,
+    ) -> Result<(), u32> {
+        self.can_associate(file_id)?;
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.binding = Some(binding);
+        Ok(())
+    }
+
+    pub fn can_associate(&self, file_id: u64) -> Result<(), u32> {
+        let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.synchronous || entry.binding.is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+
+    pub fn binding(&self, file_id: u64) -> Option<FileCompletionBinding> {
+        self.entry(file_id).and_then(|entry| entry.binding)
+    }
+
+    pub fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.synchronous)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    fn entry(&self, file_id: u64) -> Option<&FileCompletionEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.references != 0 && entry.file_id == file_id)
+    }
+
+    fn entry_mut(&mut self, file_id: u64) -> Option<&mut FileCompletionEntry> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.references != 0 && entry.file_id == file_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompletionPacket {
     pub key_context: u64,
     pub apc_context: u64,
@@ -621,6 +747,85 @@ mod tests {
                 information: 0x3333,
             }))
         );
+    }
+
+    #[test]
+    fn file_completion_binding_is_shared_until_the_last_handle_closes() {
+        let mut files = FileCompletionTable::<2>::new();
+        files.insert_file(10, false).unwrap();
+        files.retain_file(10).unwrap();
+        files
+            .associate(
+                10,
+                FileCompletionBinding {
+                    port_id: 3,
+                    key_context: 0x1234,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            files.binding(10),
+            Some(FileCompletionBinding {
+                port_id: 3,
+                key_context: 0x1234,
+            })
+        );
+        assert_eq!(files.release_file(10), Ok(None));
+        assert_eq!(files.binding(10).unwrap().key_context, 0x1234);
+        assert_eq!(files.release_file(10), Ok(Some(3)));
+        assert_eq!(files.binding(10), None);
+    }
+
+    #[test]
+    fn pending_operation_keeps_binding_alive_after_last_handle_closes() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, false).unwrap();
+        files
+            .associate(
+                10,
+                FileCompletionBinding {
+                    port_id: 3,
+                    key_context: 0x1234,
+                },
+            )
+            .unwrap();
+        files.retain_file(10).unwrap();
+        assert_eq!(files.release_file(10), Ok(None));
+        assert_eq!(files.is_synchronous(10), Ok(false));
+        assert_eq!(files.binding(10).unwrap().port_id, 3);
+        assert_eq!(files.release_file(10), Ok(Some(3)));
+        assert_eq!(files.binding(10), None);
+    }
+
+    #[test]
+    fn file_completion_binding_rejects_sync_rebind_and_capacity_overflow() {
+        let mut files = FileCompletionTable::<2>::new();
+        files.insert_file(10, true).unwrap();
+        assert_eq!(
+            files.associate(10, FileCompletionBinding::default()),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        files.insert_file(20, false).unwrap();
+        assert_eq!(
+            files.associate(
+                20,
+                FileCompletionBinding {
+                    port_id: 1,
+                    key_context: 2,
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            files.associate(20, FileCompletionBinding::default()),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(files.can_associate(20), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(
+            files.insert_file(30, false),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(files.retain_file(99), Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]
