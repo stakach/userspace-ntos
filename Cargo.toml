@@ -77,6 +77,7 @@ members = [
     "crates/nt-delay-execution",
     "crates/nt-thread-start",
     "crates/nt-rtl-work-item",
+    "crates/nt-rtl-timer-wait",
     "crates/nt-user-callback",
     "crates/nt-syscall-abi",
     "crates/nt-ntdll-layout",
@@ -171,6 +172,7 @@ nt-loader-trace = { path = "crates/nt-loader-trace" }
 nt-delay-execution = { path = "crates/nt-delay-execution" }
 nt-thread-start = { path = "crates/nt-thread-start" }
 nt-rtl-work-item = { path = "crates/nt-rtl-work-item" }
+nt-rtl-timer-wait = { path = "crates/nt-rtl-timer-wait" }
 nt-user-callback = { path = "crates/nt-user-callback" }
 nt-syscall-abi = { path = "crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "crates/nt-ntdll-layout" }

@@ -1,0 +1,17 @@
+[package]
+name = "nt-rtl-timer-wait"
+description = "Host-testable ReactOS-compatible RTL timer queue and registered wait state models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-rtl-work-item.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
