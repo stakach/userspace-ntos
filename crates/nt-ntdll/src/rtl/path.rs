@@ -741,6 +741,10 @@ mod tests {
             s(&dos_path_name_to_nt_path_name(&u("\\\\?\\C:\\x")).unwrap()),
             "\\??\\C:\\x"
         );
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name(&u("\\\\.\\pipe\\lsarpc")).unwrap()),
+            "\\??\\pipe\\lsarpc"
+        );
         // Relative can't be resolved without the CWD → None.
         assert!(dos_path_name_to_nt_path_name(&u("rel\\path")).is_none());
     }
@@ -787,16 +791,19 @@ mod tests {
     fn relative_nt_plan_uses_canonical_current_directory_subspan() {
         let plan = relative_nt_path_plan(&u("foo\\bar"), &u("C:\\Windows\\"), true).unwrap();
         assert_eq!(s(&plan.nt_path), "\\??\\C:\\Windows\\foo\\bar");
-        assert_eq!(s(&plan.nt_path[plan.relative_offset.unwrap()..]), "foo\\bar");
+        assert_eq!(
+            s(&plan.nt_path[plan.relative_offset.unwrap()..]),
+            "foo\\bar"
+        );
 
-        let plan = relative_nt_path_plan(
-            &u("sub\\..\\foo"),
-            &u("c:\\WINDOWS"),
-            true,
-        )
-        .unwrap();
+        let plan = relative_nt_path_plan(&u("sub\\..\\foo"), &u("c:\\WINDOWS"), true).unwrap();
         assert_eq!(s(&plan.nt_path), "\\??\\c:\\WINDOWS\\foo");
         assert_eq!(s(&plan.nt_path[plan.relative_offset.unwrap()..]), "foo");
+
+        let plan =
+            relative_nt_path_plan(&u("\\\\.\\pipe\\lsarpc"), &u("C:\\Windows"), true).unwrap();
+        assert_eq!(s(&plan.nt_path), "\\??\\pipe\\lsarpc");
+        assert_eq!(plan.relative_offset, None);
     }
 
     #[test]
@@ -805,7 +812,12 @@ mod tests {
         assert_eq!(escaped.relative_offset, None);
         let no_handle = relative_nt_path_plan(&u("foo"), &u("C:\\Windows"), false).unwrap();
         assert_eq!(no_handle.relative_offset, None);
-        for absolute in ["C:\\Windows2\\x", "D:\\x", "\\rooted", "\\\\server\\share\\x"] {
+        for absolute in [
+            "C:\\Windows2\\x",
+            "D:\\x",
+            "\\rooted",
+            "\\\\server\\share\\x",
+        ] {
             let plan = relative_nt_path_plan(&u(absolute), &u("C:\\Windows"), true).unwrap();
             assert_eq!(plan.relative_offset, None, "{absolute}");
         }

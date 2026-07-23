@@ -296,9 +296,13 @@ pub fn is_absolute(p: &str) -> bool {
 
 /// Collapse `.` and `..` components in a backslash path (the `RtlGetFullPathName_U` canonicalization).
 pub fn canonicalize(path: &str) -> String {
-    // Preserve a leading drive+root or UNC prefix.
+    // Preserve a leading drive+root, local-device, or UNC prefix. Local-device paths need their
+    // `\\.\` / `\\?\` discriminator intact: treating `\\.\pipe` as ordinary UNC collapses the
+    // `.` component and changes the native path from `\??\pipe` to `\??\UNC\pipe`.
     let (prefix, rest) = if path.len() >= 3 && path.as_bytes()[1] == b':' {
         (&path[..3], &path[3..])
+    } else if path.starts_with("\\\\.\\") || path.starts_with("\\\\?\\") {
+        (&path[..4], &path[4..])
     } else if let Some(r) = path.strip_prefix("\\\\") {
         // UNC: keep the "\\" prefix.
         return {
@@ -511,13 +515,14 @@ mod tests {
             s(&full_path_units(&u("c:system32"), &u("C:\\Windows"))),
             "C:\\Windows\\system32"
         );
+        assert_eq!(s(&full_path_units(&u("C:\\x"), &u("C:\\Windows"))), "C:\\x");
+        assert_eq!(s(&full_path_units(&u("C:\\"), &u("C:\\Windows"))), "C:\\");
         assert_eq!(
-            s(&full_path_units(&u("C:\\x"), &u("C:\\Windows"))),
-            "C:\\x"
-        );
-        assert_eq!(
-            s(&full_path_units(&u("C:\\"), &u("C:\\Windows"))),
-            "C:\\"
+            s(&full_path_units(
+                &u("\\\\.\\pipe\\lsarpc"),
+                &u("C:\\Windows")
+            )),
+            "\\\\.\\pipe\\lsarpc"
         );
     }
 
@@ -529,6 +534,11 @@ mod tests {
             canonicalize("\\\\server\\share\\a\\..\\b"),
             "\\\\server\\share\\b"
         );
+        assert_eq!(
+            canonicalize("\\\\.\\pipe\\.\\rpc\\..\\lsarpc"),
+            "\\\\.\\pipe\\lsarpc"
+        );
+        assert_eq!(canonicalize("\\\\?\\C:\\a\\..\\b"), "\\\\?\\C:\\b");
     }
 
     #[test]
