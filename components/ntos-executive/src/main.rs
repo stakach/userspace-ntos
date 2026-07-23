@@ -6859,7 +6859,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
-    IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
+    let image_frame_count = bi.user_image_elf_frame_count;
+    if image_frame_count == 0 || image_frame_count > img.end - img.start {
+        print_str(b"[boot] invalid ELF frame count\n");
+        park();
+    }
+    IMAGE_FRAMES_COUNT.store(image_frame_count, Ordering::Relaxed);
 
     let mut physical_pages = 0u64;
     let mut lowest_page = u64::MAX;
