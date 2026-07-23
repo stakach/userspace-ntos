@@ -105,6 +105,11 @@ static RTL_START_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static RTL_EXIT_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
 static LDR_TOP_LEVEL_CALLOUT_TEB: AtomicU64 = AtomicU64::new(0);
+static ETW_PROVIDER_LOCK: AtomicU32 = AtomicU32::new(0);
+static ETW_ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const ETW_PROVIDER_CAP: usize = 64;
+static mut ETW_PROVIDER_REGISTRY: nt_ntdll::etw::ProviderRegistry<ETW_PROVIDER_CAP> =
+    nt_ntdll::etw::ProviderRegistry::new();
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn rtl_start_pool_thread_hook() -> u64 {
@@ -22496,11 +22501,319 @@ pub unsafe extern "system" fn rtl_query_tag_heap(
 }
 
 // =================================================================================================
-// BATCH 4 — Etw* trace client. ETW is off in our environment (no trace session). Every Etw* API
-// returns ERROR_SUCCESS (0) / a null handle — the observable "tracing disabled" contract (a real
-// no-provider ETW client behaves the same: registration succeeds, events go nowhere). All take the
-// Win32 error-code convention (ULONG, 0 = success), NOT NTSTATUS.
+// BATCH 4 — Etw* trace client. Provider registration and activity IDs are real; providers remain
+// disabled until a trace-session kernel plane exists. Legacy session-control APIs below retain
+// their compatibility stubs. All return Win32 error codes (ULONG, 0 = success), not NTSTATUS.
 // =================================================================================================
+
+struct EtwProviderGuard;
+
+impl Drop for EtwProviderGuard {
+    fn drop(&mut self) {
+        ETW_PROVIDER_LOCK.store(0, Ordering::Release);
+    }
+}
+
+fn etw_provider_guard() -> EtwProviderGuard {
+    while ETW_PROVIDER_LOCK
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    EtwProviderGuard
+}
+
+fn etw_provider_registered(handle: u64) -> bool {
+    let _guard = etw_provider_guard();
+    unsafe { (&*core::ptr::addr_of!(ETW_PROVIDER_REGISTRY)).contains(handle) }
+}
+
+fn etw_validate_write(
+    handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    nt_ntdll::etw::validate_event_write(
+        etw_provider_registered(handle),
+        !descriptor.is_null(),
+        count,
+        !data.is_null(),
+    )
+}
+
+fn etw_generated_activity_id() -> nt_ntdll::etw::Guid {
+    let sequence = ETW_ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    nt_ntdll::etw::Guid {
+        data1: sequence as u32,
+        data2: (sequence >> 32) as u16,
+        data3: 0x4000 | ((sequence >> 48) as u16 & 0x0fff),
+        data4: sequence.rotate_left(29).to_le_bytes(),
+    }
+}
+
+/// Control the current thread's ETW activity identifier at `TEB+0x1710`.
+///
+/// # Safety
+/// `activity_id` is writable as one GUID.
+#[export_name = "EtwEventActivityIdControl"]
+pub unsafe extern "system" fn etw_event_activity_id_control(
+    control: u32,
+    activity_id: *mut nt_ntdll::etw::Guid,
+) -> u32 {
+    if activity_id.is_null() {
+        return nt_ntdll::etw::ERROR_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb = &mut *(current_teb() as *mut Teb);
+        let current = core::ptr::read_unaligned(
+            teb.activity_id.as_ptr().cast::<nt_ntdll::etw::Guid>(),
+        );
+        let mut state = nt_ntdll::etw::ActivityState { current };
+        let mut value = core::ptr::read_unaligned(activity_id);
+        let generated = if matches!(
+            control,
+            nt_ntdll::etw::EVENT_ACTIVITY_CTRL_CREATE_ID
+                | nt_ntdll::etw::EVENT_ACTIVITY_CTRL_CREATE_SET_ID
+        ) {
+            etw_generated_activity_id()
+        } else {
+            nt_ntdll::etw::Guid::default()
+        };
+        let status =
+            nt_ntdll::etw::control_activity_id(&mut state, control, &mut value, generated);
+        if status == nt_ntdll::etw::ERROR_SUCCESS {
+            core::ptr::write_unaligned(activity_id, value);
+            core::ptr::write_unaligned(
+                teb.activity_id.as_mut_ptr().cast::<nt_ntdll::etw::Guid>(),
+                state.current,
+            );
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = control;
+        nt_ntdll::etw::ERROR_INVALID_PARAMETER
+    }
+}
+
+/// Register a disabled-session ETW provider and return a generation-checked handle.
+///
+/// # Safety
+/// `provider_id` is readable and `registration_handle` is writable.
+#[export_name = "EtwEventRegister"]
+pub unsafe extern "system" fn etw_event_register(
+    provider_id: *const nt_ntdll::etw::Guid,
+    enable_callback: *const c_void,
+    callback_context: *mut c_void,
+    registration_handle: *mut u64,
+) -> u32 {
+    if provider_id.is_null() || registration_handle.is_null() {
+        return nt_ntdll::etw::ERROR_INVALID_PARAMETER;
+    }
+    let provider = unsafe { core::ptr::read_unaligned(provider_id) };
+    let _guard = etw_provider_guard();
+    match unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }.register(
+        provider,
+        enable_callback as usize,
+        callback_context as usize,
+    ) {
+        Ok(handle) => {
+            unsafe { core::ptr::write_unaligned(registration_handle, handle) };
+            nt_ntdll::etw::ERROR_SUCCESS
+        }
+        Err(error) => error,
+    }
+}
+
+/// # Safety
+/// `registration_handle` was returned by `EtwEventRegister`.
+#[export_name = "EtwEventUnregister"]
+pub unsafe extern "system" fn etw_event_unregister(registration_handle: u64) -> u32 {
+    let _guard = etw_provider_guard();
+    unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }
+        .unregister(registration_handle)
+}
+
+#[export_name = "EtwEventEnabled"]
+pub unsafe extern "system" fn etw_event_enabled(
+    registration_handle: u64,
+    _descriptor: *const nt_ntdll::etw::EventDescriptor,
+) -> u8 {
+    u8::from(etw_provider_registered(registration_handle) && false)
+}
+
+#[export_name = "EtwEventProviderEnabled"]
+pub unsafe extern "system" fn etw_event_provider_enabled(
+    registration_handle: u64,
+    _level: u8,
+    _keyword: u64,
+) -> u8 {
+    u8::from(etw_provider_registered(registration_handle) && false)
+}
+
+#[export_name = "EtwEventSetInformation"]
+pub unsafe extern "system" fn etw_event_set_information(
+    registration_handle: u64,
+    _information_class: u32,
+    information: *const c_void,
+    information_length: u32,
+) -> u32 {
+    if !etw_provider_registered(registration_handle) {
+        nt_ntdll::etw::ERROR_INVALID_HANDLE
+    } else if information_length != 0 && information.is_null() {
+        nt_ntdll::etw::ERROR_INVALID_PARAMETER
+    } else {
+        nt_ntdll::etw::ERROR_SUCCESS
+    }
+}
+
+#[export_name = "EtwEventWrite"]
+pub unsafe extern "system" fn etw_event_write(
+    registration_handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    etw_validate_write(registration_handle, descriptor, count, data)
+}
+
+#[export_name = "EtwEventWriteTransfer"]
+pub unsafe extern "system" fn etw_event_write_transfer(
+    registration_handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    _activity_id: *const nt_ntdll::etw::Guid,
+    _related_activity_id: *const nt_ntdll::etw::Guid,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    etw_validate_write(registration_handle, descriptor, count, data)
+}
+
+#[export_name = "EtwEventWriteEx"]
+pub unsafe extern "system" fn etw_event_write_ex(
+    registration_handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    _filter: u64,
+    _flags: u32,
+    _activity_id: *const nt_ntdll::etw::Guid,
+    _related_activity_id: *const nt_ntdll::etw::Guid,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    etw_validate_write(registration_handle, descriptor, count, data)
+}
+
+#[export_name = "EtwEventWriteFull"]
+pub unsafe extern "system" fn etw_event_write_full(
+    registration_handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    _event_property: u16,
+    _activity_id: *const nt_ntdll::etw::Guid,
+    _related_activity_id: *const nt_ntdll::etw::Guid,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    etw_validate_write(registration_handle, descriptor, count, data)
+}
+
+macro_rules! etw_scenario_write {
+    ($export:literal, $function:ident) => {
+        #[export_name = $export]
+        pub unsafe extern "system" fn $function(
+            registration_handle: u64,
+            descriptor: *const nt_ntdll::etw::EventDescriptor,
+            count: u32,
+            data: *const nt_ntdll::etw::EventDataDescriptor,
+        ) -> u32 {
+            etw_validate_write(registration_handle, descriptor, count, data)
+        }
+    };
+}
+etw_scenario_write!("EtwEventWriteStartScenario", etw_event_write_start_scenario);
+etw_scenario_write!("EtwEventWriteEndScenario", etw_event_write_end_scenario);
+
+#[export_name = "EtwEventWriteString"]
+pub unsafe extern "system" fn etw_event_write_string(
+    registration_handle: u64,
+    _level: u8,
+    _keyword: u64,
+    string: *const u16,
+) -> u32 {
+    if !etw_provider_registered(registration_handle) {
+        nt_ntdll::etw::ERROR_INVALID_HANDLE
+    } else if string.is_null() {
+        nt_ntdll::etw::ERROR_INVALID_PARAMETER
+    } else {
+        nt_ntdll::etw::ERROR_SUCCESS
+    }
+}
+
+#[export_name = "EtwEventWriteNoRegistration"]
+pub unsafe extern "system" fn etw_event_write_no_registration(
+    provider_id: *const nt_ntdll::etw::Guid,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    nt_ntdll::etw::validate_unregistered_event_write(
+        !provider_id.is_null(),
+        !descriptor.is_null(),
+        count,
+        !data.is_null(),
+    )
+}
+
+#[export_name = "EtwWriteUMSecurityEvent"]
+pub unsafe extern "system" fn etw_write_um_security_event(
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    _event_property: u16,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    nt_ntdll::etw::validate_unregistered_event_write(
+        true,
+        !descriptor.is_null(),
+        count,
+        !data.is_null(),
+    )
+}
+
+#[export_name = "EtwRegister"]
+pub unsafe extern "system" fn etw_register(
+    provider_id: *const nt_ntdll::etw::Guid,
+    enable_callback: *const c_void,
+    callback_context: *mut c_void,
+    registration_handle: *mut u64,
+) -> u32 {
+    unsafe {
+        etw_event_register(
+            provider_id,
+            enable_callback,
+            callback_context,
+            registration_handle,
+        )
+    }
+}
+
+#[export_name = "EtwUnregister"]
+pub unsafe extern "system" fn etw_unregister(registration_handle: u64) -> u32 {
+    unsafe { etw_event_unregister(registration_handle) }
+}
+
+#[export_name = "EtwWrite"]
+pub unsafe extern "system" fn etw_write(
+    registration_handle: u64,
+    descriptor: *const nt_ntdll::etw::EventDescriptor,
+    _activity_id: *const nt_ntdll::etw::Guid,
+    count: u32,
+    data: *const nt_ntdll::etw::EventDataDescriptor,
+) -> u32 {
+    etw_validate_write(registration_handle, descriptor, count, data)
+}
 
 macro_rules! etw_ok {
     ($export:literal, $fn:ident) => {
@@ -22524,18 +22837,6 @@ etw_ok!(
     etw_enumerate_process_reg_guids
 );
 etw_ok!("EtwEnumerateTraceGuids", etw_enumerate_trace_guids);
-etw_ok!("EtwEventActivityIdControl", etw_event_activity_id_control);
-etw_ok!("EtwEventEnabled", etw_event_enabled);
-etw_ok!("EtwEventProviderEnabled", etw_event_provider_enabled);
-etw_ok!("EtwEventRegister", etw_event_register);
-etw_ok!("EtwEventSetInformation", etw_event_set_information);
-etw_ok!("EtwEventUnregister", etw_event_unregister);
-etw_ok!("EtwEventWrite", etw_event_write);
-etw_ok!("EtwEventWriteEndScenario", etw_event_write_end_scenario);
-etw_ok!("EtwEventWriteFull", etw_event_write_full);
-etw_ok!("EtwEventWriteStartScenario", etw_event_write_start_scenario);
-etw_ok!("EtwEventWriteString", etw_event_write_string);
-etw_ok!("EtwEventWriteTransfer", etw_event_write_transfer);
 etw_ok!("EtwFlushTraceA", etw_flush_trace_a);
 etw_ok!("EtwFlushTraceW", etw_flush_trace_w);
 etw_ok!("EtwGetTraceEnableFlags", etw_get_trace_enable_flags);
@@ -22562,7 +22863,6 @@ etw_ok!("EtwQueryTraceA", etw_query_trace_a);
 etw_ok!("EtwQueryTraceW", etw_query_trace_w);
 etw_ok!("EtwReceiveNotificationsA", etw_receive_notifications_a);
 etw_ok!("EtwReceiveNotificationsW", etw_receive_notifications_w);
-etw_ok!("EtwRegister", etw_register);
 etw_ok!(
     "EtwRegisterSecurityProvider",
     etw_register_security_provider
@@ -22580,12 +22880,9 @@ etw_ok!("EtwTraceEvent", etw_trace_event);
 etw_ok!("EtwTraceEventInstance", etw_trace_event_instance);
 etw_ok!("EtwTraceMessage", etw_trace_message);
 etw_ok!("EtwTraceMessageVa", etw_trace_message_va);
-etw_ok!("EtwUnregister", etw_unregister);
 etw_ok!("EtwUnregisterTraceGuids", etw_unregister_trace_guids);
 etw_ok!("EtwUpdateTraceA", etw_update_trace_a);
 etw_ok!("EtwUpdateTraceW", etw_update_trace_w);
-etw_ok!("EtwWrite", etw_write);
-etw_ok!("EtwWriteUMSecurityEvent", etw_write_um_security_event);
 etw_ok!("EtwpCreateEtwThread", etwp_create_etw_thread);
 etw_ok!("EtwpGetCpuSpeed", etwp_get_cpu_speed);
 etw_ok!("EtwpGetTraceBuffer", etwp_get_trace_buffer);
@@ -28061,8 +28358,10 @@ pub unsafe extern "C" fn export_anchor() {
         etw_event_set_information as usize,
         etw_event_unregister as usize,
         etw_event_write as usize,
+        etw_event_write_ex as *const () as usize,
         etw_event_write_end_scenario as usize,
         etw_event_write_full as usize,
+        etw_event_write_no_registration as *const () as usize,
         etw_event_write_start_scenario as usize,
         etw_event_write_string as usize,
         etw_event_write_transfer as usize,

@@ -383,7 +383,10 @@ pub struct Teb {
     _rsvd_1698: [u8; 0x16B0 - 0x1698],
     /// `HardErrorMode` (offset 0x16B0).
     pub hard_error_mode: u32,
-    _rsvd_16b4: [u8; 0x1740 - 0x16B4],
+    _rsvd_16b4: [u8; 0x1710 - 0x16B4],
+    /// `ActivityId` (offset 0x1710).
+    pub activity_id: [u8; 16],
+    _rsvd_1720: [u8; 0x1740 - 0x1720],
     /// `GdiBatchCount` (offset 0x1740).
     pub gdi_batch_count: u32,
     _rsvd_1744: [u8; 1],
@@ -476,6 +479,7 @@ const _: () = assert!(offset_of!(Teb, deallocation_stack) == 0x1478);
 const _: () = assert!(offset_of!(Teb, tls_slots) == 0x1480);
 const _: () = assert!(offset_of!(Teb, vdm) == 0x1690); // C_ASSERT(... Vdm) == 0x1690
 const _: () = assert!(offset_of!(Teb, hard_error_mode) == 0x16B0); // C_ASSERT(... HardErrorMode) == 0x16B0
+const _: () = assert!(offset_of!(Teb, activity_id) == 0x1710);
 const _: () = assert!(offset_of!(Teb, gdi_batch_count) == 0x1740); // C_ASSERT(... GdiBatchCount) == 0x1740
 const _: () = assert!(offset_of!(Teb, free_stack_on_termination) == 0x1745);
 const _: () = assert!(offset_of!(Teb, has_fiber_data) == 0x1746);
