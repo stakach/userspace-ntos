@@ -14644,26 +14644,26 @@ pub unsafe extern "system" fn rtl_guid_from_string(
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: guid_string valid per the contract.
-    let (buf, units) = unsafe {
+    let (length, maximum_length, buffer) = unsafe {
         (
-            (*guid_string).buffer as *const u16,
-            (*guid_string).length as usize / 2,
+            core::ptr::read_unaligned(core::ptr::addr_of!((*guid_string).length)),
+            core::ptr::read_unaligned(core::ptr::addr_of!((*guid_string).maximum_length)),
+            core::ptr::read_unaligned(core::ptr::addr_of!((*guid_string).buffer)),
         )
     };
-    let s = unsafe { core::slice::from_raw_parts(buf, units) };
+    if length != 38 * 2 || maximum_length < length || buffer == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let s = unsafe { core::slice::from_raw_parts(buffer as *const u16, 38) };
     match nt_ntdll::rtl::guid::guid_from_string(s) {
         Some(g) => {
-            // GUID: Data1:u32, Data2:u16, Data3:u16, Data4:[u8;8].
             // SAFETY: guid writable for 16 bytes per the contract.
             unsafe {
-                *(guid as *mut u32) = g.data1;
-                *((guid as *mut u16).add(2)) = g.data2;
-                *((guid as *mut u16).add(3)) = g.data3;
-                core::ptr::copy_nonoverlapping(g.data4.as_ptr(), (guid as *mut u8).add(8), 8);
+                core::ptr::copy_nonoverlapping(g.to_windows_bytes().as_ptr(), guid.cast(), 16);
             }
             STATUS_SUCCESS
         }
-        None => 0xC000_0059, // STATUS_INVALID_PARAMETER-ish; RtlGUIDFromString uses STATUS_INVALID_PARAMETER
+        None => STATUS_INVALID_PARAMETER,
     }
 }
 
