@@ -138,6 +138,7 @@ const HEAP_LOCK_FREE: u8 = 0;
 const HEAP_LOCK_LIVE: u8 = 1;
 const HEAP_LOCK_RETIRED: u8 = 2;
 const HEAP_LOCK_CAPACITY: usize = PRIVATE_HEAP_CAPACITY + 1;
+const HEAP_NO_SERIALIZE: u32 = 0x0000_0001;
 
 #[repr(C, align(8))]
 struct HeapCriticalSection {
@@ -232,6 +233,12 @@ unsafe fn register_heap_lock_locked(
 ) -> bool {
     let records = core::ptr::addr_of_mut!(HEAP_LOCKS).cast::<HeapLockRecord>();
     for index in 0..HEAP_LOCK_CAPACITY {
+        let record = unsafe { &*records.add(index) };
+        if record.state != HEAP_LOCK_FREE && record.handle == handle as u64 {
+            return false;
+        }
+    }
+    for index in 0..HEAP_LOCK_CAPACITY {
         let record = unsafe { &mut *records.add(index) };
         if record.state != HEAP_LOCK_FREE {
             continue;
@@ -255,7 +262,9 @@ struct HeapOperationGuard {
 unsafe fn reclaim_heap_lock_record_locked(record: &mut HeapLockRecord, lock: *mut c_void) {
     if record.state == HEAP_LOCK_RETIRED
         && record.active_users == 0
-        && (!record.serialized || unsafe { critical_section_is_idle(lock) })
+        && (!record.serialized
+            || record.custom_lock != 0
+            || unsafe { critical_section_is_idle(lock) })
     {
         record.state = HEAP_LOCK_FREE;
         record.handle = 0;
@@ -279,12 +288,20 @@ impl Drop for HeapOperationGuard {
     }
 }
 
-fn lock_heap_operation(handle: *mut u8, allow_retired: bool) -> Option<HeapOperationGuard> {
+fn lock_heap_operation(
+    handle: *mut u8,
+    allow_retired: bool,
+    bypass_serialization: bool,
+) -> Option<HeapOperationGuard> {
     let (record, lock) = {
         let _registry_guard = lock_process_heap();
         let record = unsafe { heap_lock_record_locked(handle, allow_retired) }?;
         record.active_users = record.active_users.checked_add(1)?;
-        let lock = record.lock_pointer().unwrap_or(core::ptr::null_mut());
+        let lock = if bypass_serialization {
+            core::ptr::null_mut()
+        } else {
+            record.lock_pointer().unwrap_or(core::ptr::null_mut())
+        };
         (record as *mut HeapLockRecord, lock)
     };
     if !lock.is_null() {
@@ -346,8 +363,11 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
     unsafe {
         let registry = process_heaps_locked();
         if let Ok(handle) = registry.install_process(heap) {
-            debug_assert!(register_heap_lock_locked(handle, true, 0));
-            publish_process_heaps_locked(registry);
+            let registered = register_heap_lock_locked(handle, true, 0);
+            debug_assert!(registered);
+            if registered {
+                publish_process_heaps_locked(registry);
+            }
         }
     }
 }
@@ -382,7 +402,7 @@ pub(crate) fn install_private_heap(
 /// the registry lock has been dropped.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn remove_private_heap(handle: *mut u8) -> HeapRemoval<on_target::HeapBacking> {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+    let Some(_heap_guard) = lock_heap_operation(handle, false, false) else {
         return HeapRemoval::NotFound;
     };
     let _guard = lock_process_heap();
@@ -412,17 +432,10 @@ fn process_heap_handle() -> Option<*mut u8> {
     unsafe { process_heaps_locked().process_handle() }
 }
 
-/// Whether an exact handle names a registered heap.
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn heap_is_registered(handle: *mut u8) -> bool {
-    let _guard = lock_process_heap();
-    unsafe { process_heaps_locked().find(handle).is_some() }
-}
-
 /// Acquire the heap's recursive exclusion and retain it across subsequent heap API calls.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn lock_registered_heap(handle: *mut u8) -> bool {
-    let Some(guard) = lock_heap_operation(handle, false) else {
+    let Some(guard) = lock_heap_operation(handle, false, false) else {
         return false;
     };
     core::mem::forget(guard);
@@ -461,7 +474,7 @@ pub(crate) fn unlock_registered_heap(handle: *mut u8) -> bool {
 /// Read a heap's compatibility information.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_compatibility(handle: *mut u8) -> Option<u32> {
-    let _heap_guard = lock_heap_operation(handle, false)?;
+    let _heap_guard = lock_heap_operation(handle, false, false)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -473,7 +486,7 @@ pub(crate) fn heap_compatibility(handle: *mut u8) -> Option<u32> {
 /// Enable low-fragmentation compatibility mode on one registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+    let Some(_heap_guard) = lock_heap_operation(handle, false, false) else {
         return false;
     };
     let _guard = lock_process_heap();
@@ -488,7 +501,9 @@ pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
 /// Allocate from the heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: u32) -> *mut u8 {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return core::ptr::null_mut();
     };
     let _guard = lock_process_heap();
@@ -502,8 +517,10 @@ pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: 
 
 /// Free from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8) -> bool {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8, flags: u32) -> bool {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return false;
     };
     let _guard = lock_process_heap();
@@ -523,7 +540,9 @@ pub(crate) unsafe fn heap_realloc_with_flags(
     flags: u32,
     in_place_only: bool,
 ) -> *mut u8 {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return core::ptr::null_mut();
     };
     let _guard = lock_process_heap();
@@ -537,8 +556,9 @@ pub(crate) unsafe fn heap_realloc_with_flags(
 
 /// Size a live allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
-    let _heap_guard = lock_heap_operation(handle, false)?;
+pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8, flags: u32) -> Option<usize> {
+    let _heap_guard =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -547,10 +567,31 @@ pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
     }
 }
 
+/// Validate the complete physical chain or one exact live block on the named heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_validate(handle: *mut u8, ptr: Option<*const u8>, flags: u32) -> bool {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
+        return false;
+    };
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find(handle)
+            .is_some_and(|heap| heap.validate(ptr))
+    }
+}
+
 /// Read per-allocation user metadata from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_user_info(handle: *mut u8, ptr: *mut u8) -> Option<HeapUserInfo> {
-    let _heap_guard = lock_heap_operation(handle, false)?;
+pub(crate) unsafe fn heap_user_info(
+    handle: *mut u8,
+    ptr: *mut u8,
+    flags: u32,
+) -> Option<HeapUserInfo> {
+    let _heap_guard =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -561,8 +602,15 @@ pub(crate) unsafe fn heap_user_info(handle: *mut u8, ptr: *mut u8) -> Option<Hea
 
 /// Store a user value on an allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_set_user_value(handle: *mut u8, ptr: *mut u8, value: usize) -> bool {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+pub(crate) unsafe fn heap_set_user_value(
+    handle: *mut u8,
+    ptr: *mut u8,
+    value: usize,
+    flags: u32,
+) -> bool {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return false;
     };
     let _guard = lock_process_heap();
@@ -580,8 +628,11 @@ pub(crate) unsafe fn heap_set_user_flags(
     ptr: *mut u8,
     reset: u32,
     set: u32,
+    flags: u32,
 ) -> bool {
-    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+    let Some(_heap_guard) =
+        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return false;
     };
     let _guard = lock_process_heap();
@@ -624,7 +675,7 @@ pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *
 /// trusts the caller's pointer identically). Access is serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
-    process_heap_handle().is_some_and(|handle| unsafe { heap_free(handle, ptr) })
+    process_heap_handle().is_some_and(|handle| unsafe { heap_free(handle, ptr, 0) })
 }
 
 /// `RtlReAllocateHeap` core — grow/shrink `ptr` to `new_size` in the process heap (in-place when
@@ -663,7 +714,7 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
     let handle = process_heap_handle()?;
-    unsafe { heap_size(handle, ptr) }
+    unsafe { heap_size(handle, ptr, 0) }
 }
 
 /// Read per-allocation user metadata from a live process-heap block.
@@ -673,7 +724,7 @@ pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo> {
     let handle = process_heap_handle()?;
-    unsafe { heap_user_info(handle, ptr) }
+    unsafe { heap_user_info(handle, ptr, 0) }
 }
 
 /// Store a process-heap allocation's optional user value.
@@ -683,7 +734,7 @@ pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> bool {
     process_heap_handle()
-        .is_some_and(|handle| unsafe { heap_set_user_value(handle, ptr, value) })
+        .is_some_and(|handle| unsafe { heap_set_user_value(handle, ptr, value, 0) })
 }
 
 /// Update a process-heap allocation's three settable user flags.
@@ -693,7 +744,7 @@ pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> 
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_flags(ptr: *mut u8, reset: u32, set: u32) -> bool {
     process_heap_handle()
-        .is_some_and(|handle| unsafe { heap_set_user_flags(handle, ptr, reset, set) })
+        .is_some_and(|handle| unsafe { heap_set_user_flags(handle, ptr, reset, set, 0) })
 }
 
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/

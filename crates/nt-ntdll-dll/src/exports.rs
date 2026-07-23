@@ -1601,7 +1601,7 @@ pub unsafe extern "system" fn rtl_allocate_heap(
 #[export_name = "RtlFreeHeap"]
 pub unsafe extern "system" fn rtl_free_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     base: *mut c_void,
 ) -> u8 {
     // Step 4.C: free back to the in-process heap. A null pointer is a benign no-op success (the
@@ -1611,7 +1611,7 @@ pub unsafe extern "system" fn rtl_free_heap(
         if base.is_null() {
             return 1; // TRUE — RtlFreeHeap(_, _, NULL) is a no-op success.
         }
-        if unsafe { crate::heap_free(heap as *mut u8, base as *mut u8) } {
+        if unsafe { crate::heap_free(heap as *mut u8, base as *mut u8, flags) } {
             1
         } else {
             unsafe {
@@ -1622,7 +1622,7 @@ pub unsafe extern "system" fn rtl_free_heap(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = base;
+        let _ = (flags, base);
         0
     }
 }
@@ -1835,6 +1835,29 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 // =================================================================================================
 
 #[cfg(target_arch = "x86_64")]
+static CRITICAL_SECTION_EVENT_DIAGNOSTICS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_critical_section_event(cs: *mut c_void, handle: u64) {
+    if CRITICAL_SECTION_EVENT_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let mut message = [0u8; 64];
+    let mut length = 0usize;
+    for &byte in b"[cs-event] cs=0x" {
+        message[length] = byte;
+        length += 1;
+    }
+    length = crate::write_u64_hex(&mut message, length, cs as u64);
+    for &byte in b" handle=0x" {
+        message[length] = byte;
+        length += 1;
+    }
+    length = crate::write_u64_hex(&mut message, length, handle);
+    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn critical_section_create_event() -> Result<u64, NtStatus> {
     let mut handle = 0u64;
     let status = unsafe {
@@ -1873,6 +1896,7 @@ unsafe fn critical_section_wait_handle(cs: *mut c_void) -> u64 {
         return existing;
     }
     let candidate = unsafe { critical_section_create_event() }.unwrap_or(u64::MAX);
+    unsafe { report_critical_section_event(cs, candidate) };
     match slot.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => candidate,
         Err(installed) => {
@@ -2022,7 +2046,7 @@ pub unsafe extern "system" fn rtl_enter_critical_section(cs: *mut c_void) -> NtS
         }
     }
     unsafe {
-        *(cs.byte_add(0x10) as *mut u64) = tid;
+        (&*(cs.byte_add(0x10) as *const AtomicU64)).store(tid, Ordering::Release);
         *(cs.byte_add(0x0c) as *mut i32) = 1;
         #[cfg(target_arch = "x86_64")]
         critical_section_owned_count(1);
@@ -2050,7 +2074,7 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
         return STATUS_SUCCESS;
     }
     unsafe {
-        *(cs.byte_add(0x10) as *mut u64) = 0;
+        (&*(cs.byte_add(0x10) as *const AtomicU64)).store(0, Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         critical_section_owned_count(-1);
     }
@@ -20497,7 +20521,7 @@ pub unsafe extern "system" fn rtl_try_enter_critical_section(cs: *mut c_void) ->
         .is_ok()
     {
         unsafe {
-            *(cs.byte_add(0x10) as *mut u64) = tid;
+            (&*(cs.byte_add(0x10) as *const AtomicU64)).store(tid, Ordering::Release);
             *(cs.byte_add(0x0c) as *mut i32) = 1;
             #[cfg(target_arch = "x86_64")]
             critical_section_owned_count(1);
@@ -20575,7 +20599,7 @@ pub unsafe extern "system" fn rtl_is_critical_section_locked_by_thread(cs: *mut 
 #[export_name = "RtlSizeHeap"]
 pub unsafe extern "system" fn rtl_size_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     mem: *mut c_void,
 ) -> usize {
     if mem.is_null() {
@@ -20583,7 +20607,7 @@ pub unsafe extern "system" fn rtl_size_heap(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        match unsafe { crate::heap_size(heap as *mut u8, mem as *mut u8) } {
+        match unsafe { crate::heap_size(heap as *mut u8, mem as *mut u8, flags) } {
             Some(n) => n,
             None => {
                 unsafe {
@@ -20595,37 +20619,31 @@ pub unsafe extern "system" fn rtl_size_heap(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let _ = flags;
         usize::MAX
     }
 }
 
 /// `RtlValidateHeap(PVOID HeapHandle, ULONG Flags, PVOID MemoryPointer) -> BOOLEAN` — validate the
-/// heap (or a block). Ref `references/reactos/sdk/lib/rtl/heap.c:RtlValidateHeap`, which returns FALSE
-/// for a handle whose `Heap->Signature != HEAP_SIGNATURE`. Faithful-minimal: our first-fit process
-/// heap has no exposed `HEAP` header to signature-check, and it is internally consistent by
-/// construction — so a well-formed (non-NULL) handle validates TRUE, and a NULL handle (the "invalid
-/// heap" case) validates FALSE, matching the observable contract.
+/// heap (or a block). The whole-heap path checks every physical boundary tag and metadata invariant;
+/// the block path accepts only an exact live payload pointer reached through a valid prefix.
 ///
 /// # Safety
 /// `heap`/`mem` valid or NULL.
 #[export_name = "RtlValidateHeap"]
 pub unsafe extern "system" fn rtl_validate_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     mem: *mut c_void,
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        if mem.is_null() {
-            return u8::from(crate::heap_is_registered(heap as *mut u8));
-        }
-        return u8::from(unsafe {
-            crate::heap_size(heap as *mut u8, mem as *mut u8).is_some()
-        });
+        let block = (!mem.is_null()).then_some(mem as *const u8);
+        return u8::from(crate::heap_validate(heap as *mut u8, block, flags));
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (heap, mem);
+        let _ = (heap, flags, mem);
         0
     }
 }
@@ -20829,13 +20847,13 @@ pub unsafe extern "system" fn rtl_set_heap_information(
 #[export_name = "RtlGetUserInfoHeap"]
 pub unsafe extern "system" fn rtl_get_user_info_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     base: *mut c_void,
     user_value: *mut *mut c_void,
     user_flags: *mut u32,
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
-    if let Some(info) = unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8) } {
+    if let Some(info) = unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8, flags) } {
         if info.has_user_value && !user_value.is_null() {
             unsafe { *user_value = info.user_value as *mut c_void };
         }
@@ -20856,13 +20874,13 @@ pub unsafe extern "system" fn rtl_get_user_info_heap(
 #[export_name = "RtlSetUserValueHeap"]
 pub unsafe extern "system" fn rtl_set_user_value_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     base: *mut c_void,
     user_value: *mut c_void,
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        match unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8) } {
+        match unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8, flags) } {
             Some(info) if !info.has_user_value => return 0,
             Some(_) => {
                 return u8::from(unsafe {
@@ -20870,6 +20888,7 @@ pub unsafe extern "system" fn rtl_set_user_value_heap(
                         heap as *mut u8,
                         base as *mut u8,
                         user_value as usize,
+                        flags,
                     )
                 });
             }
@@ -20888,7 +20907,7 @@ pub unsafe extern "system" fn rtl_set_user_value_heap(
 #[export_name = "RtlSetUserFlagsHeap"]
 pub unsafe extern "system" fn rtl_set_user_flags_heap(
     heap: *mut c_void,
-    _flags: u32,
+    flags: u32,
     base: *mut c_void,
     user_flags_reset: u32,
     user_flags_set: u32,
@@ -20900,6 +20919,7 @@ pub unsafe extern "system" fn rtl_set_user_flags_heap(
             base as *mut u8,
             user_flags_reset,
             user_flags_set,
+            flags,
         )
     } {
         return 1;
