@@ -24,6 +24,7 @@ pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
@@ -677,6 +678,40 @@ impl ProcessManager {
         };
         self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
         Ok(pid)
+    }
+
+    /// Open a process selected by a captured native `CLIENT_ID` and place the new
+    /// typed handle in the caller's table.
+    ///
+    /// A nonzero thread id must belong to the requested process; native process
+    /// lookup distinguishes an invalid PID from an invalid PID/TID pair.
+    pub fn open_process_by_client_id(
+        &mut self,
+        caller_pid: ProcessId,
+        client_id: ClientId,
+        granted_access: u32,
+    ) -> Result<Handle, u32> {
+        if self.process(caller_pid).is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let target_pid = if client_id.unique_thread != 0 {
+            let thread = self
+                .thread(client_id.unique_thread)
+                .ok_or(STATUS_INVALID_CID)?;
+            if thread.process_id != client_id.unique_process {
+                return Err(STATUS_INVALID_CID);
+            }
+            thread.process_id
+        } else {
+            self.process(client_id.unique_process)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            client_id.unique_process
+        };
+        self.insert_handle(
+            caller_pid,
+            HandleObject::Process(target_pid),
+            granted_access,
+        )
     }
 
     pub fn process_break_on_termination(&self, pid: ProcessId) -> Option<bool> {

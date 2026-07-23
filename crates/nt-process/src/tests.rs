@@ -125,6 +125,112 @@ fn handle_table_operations() {
 }
 
 #[test]
+fn open_process_by_client_id_mints_local_access_checked_handles() {
+    const PROCESS_CREATE_THREAD: u32 = 0x0002;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let target_tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+
+    let pid_handle = pm
+        .open_process_by_client_id(
+            caller,
+            ClientId {
+                unique_process: target,
+                unique_thread: 0,
+            },
+            PROCESS_QUERY_INFORMATION,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.lookup_handle(caller, pid_handle),
+        Some(HandleObject::Process(target))
+    );
+    assert_eq!(
+        pm.handle_access(caller, pid_handle),
+        Some(PROCESS_QUERY_INFORMATION)
+    );
+    assert_eq!(
+        pm.resolve_process_handle(caller, pid_handle as u64, PROCESS_QUERY_INFORMATION),
+        Ok(target)
+    );
+    assert_eq!(
+        pm.resolve_process_handle(caller, pid_handle as u64, PROCESS_CREATE_THREAD),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(pm.lookup_handle(target, pid_handle), None);
+
+    let cid_handle = pm
+        .open_process_by_client_id(
+            caller,
+            ClientId {
+                unique_process: target,
+                unique_thread: target_tid,
+            },
+            PROCESS_CREATE_THREAD,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.handle_access(caller, cid_handle),
+        Some(PROCESS_CREATE_THREAD)
+    );
+    assert_eq!(pm.handle_count(caller), 2);
+}
+
+#[test]
+fn open_process_by_client_id_rejects_invalid_ids_without_minting() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let other = pm.create_process("other.exe", None, None);
+    let target_tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+
+    for (client_id, status) in [
+        (
+            ClientId {
+                unique_process: other,
+                unique_thread: target_tid,
+            },
+            STATUS_INVALID_CID,
+        ),
+        (
+            ClientId {
+                unique_process: target,
+                unique_thread: 0xDEAD,
+            },
+            STATUS_INVALID_CID,
+        ),
+        (
+            ClientId {
+                unique_process: 0xDEAD,
+                unique_thread: 0,
+            },
+            STATUS_INVALID_PARAMETER,
+        ),
+    ] {
+        assert_eq!(
+            pm.open_process_by_client_id(caller, client_id, 0x1F_FFFF),
+            Err(status)
+        );
+        assert_eq!(pm.handle_count(caller), 0);
+    }
+    assert_eq!(
+        pm.open_process_by_client_id(
+            0xDEAD,
+            ClientId {
+                unique_process: target,
+                unique_thread: 0,
+            },
+            0x1F_FFFF,
+        ),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.handle_count(caller), 0);
+}
+
+#[test]
 fn token_handles_preserve_owner_and_access() {
     let mut pm = ProcessManager::new();
     let caller = pm.create_process("caller.exe", None, None);
