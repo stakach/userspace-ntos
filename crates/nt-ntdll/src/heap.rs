@@ -522,6 +522,29 @@ impl<B: Backing> Heap<B> {
         self.formatted && offset == self.region_len
     }
 
+    /// Return the largest currently available free payload extent.
+    ///
+    /// Free neighbours are coalesced eagerly by [`Self::free`], so compaction itself requires no
+    /// mutation. `None` reports corrupt physical metadata; a full but valid heap returns `Some(0)`.
+    pub fn compact(&self) -> Option<usize> {
+        if !self.validate(None) {
+            return None;
+        }
+        let mut largest = 0usize;
+        let mut offset = 0usize;
+        let mut previous_size = 0usize;
+        while offset < self.region_len {
+            let header = self.header_at_offset(offset)?;
+            let next = self.validate_header(offset, previous_size, header)?;
+            if header.is_free() {
+                largest = largest.max(header.size - HDR);
+            }
+            previous_size = header.size;
+            offset = next;
+        }
+        Some(largest)
+    }
+
     fn segment_walk_entry(&self) -> RtlHeapWalkEntry {
         RtlHeapWalkEntry {
             data_address: self.backing.base(),
@@ -1561,6 +1584,43 @@ mod tests {
         // A single large alloc that only fits if coalescing worked.
         let big = h.allocate(600);
         assert!(big.is_some(), "coalescing failed to reclaim space");
+    }
+
+    #[test]
+    fn compact_reports_largest_coalesced_free_payload() {
+        let mut h = heap(1024);
+        assert_eq!(h.compact(), Some(h.region_len - HDR));
+        let first = h.allocate(100).unwrap();
+        let middle = h.allocate(200).unwrap();
+        let last = h.allocate(100).unwrap();
+        let after_allocations = h.compact().unwrap();
+        assert!(after_allocations < h.region_len - HDR);
+
+        // SAFETY: first/middle/last are exact live allocations from this heap.
+        unsafe {
+            assert!(h.free(middle));
+            let middle_extent = h.compact().unwrap();
+            assert!(middle_extent >= 200);
+            assert!(h.free(first));
+            assert!(h.compact().unwrap() >= middle_extent);
+            assert!(h.free(last));
+        }
+        assert_eq!(h.compact(), Some(h.region_len - HDR));
+    }
+
+    #[test]
+    fn compact_distinguishes_full_heap_from_corrupt_heap() {
+        let mut h = heap(256);
+        let mut allocations = Vec::new();
+        while let Some(pointer) = h.allocate(1) {
+            allocations.push(pointer);
+        }
+        assert_eq!(h.compact(), Some(0));
+
+        let corrupt = heap(256);
+        // SAFETY: deliberately corrupt a plain integer field in the first header.
+        unsafe { (*corrupt.hdr(corrupt.handle())).reserved = 1 };
+        assert_eq!(corrupt.compact(), None);
     }
 
     #[test]

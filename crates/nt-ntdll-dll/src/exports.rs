@@ -20949,14 +20949,30 @@ pub unsafe extern "system" fn rtl_unlock_heap(heap: *mut c_void) -> u8 {
     }
 }
 
-/// `RtlCompactHeap(PVOID HeapHandle, ULONG Flags) -> SIZE_T` — compact + return the largest free
-/// block. No compaction model; return 0 (the documented "size unavailable" value).
+/// `RtlCompactHeap(PVOID HeapHandle, ULONG Flags) -> SIZE_T` — coalesce and return the largest
+/// available free payload extent.
 ///
 /// # Safety
 /// `heap` a heap handle.
 #[export_name = "RtlCompactHeap"]
-pub unsafe extern "system" fn rtl_compact_heap(_heap: *mut c_void, _flags: u32) -> usize {
-    0
+pub unsafe extern "system" fn rtl_compact_heap(heap: *mut c_void, flags: u32) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return match crate::heap_compact(heap.cast(), flags) {
+            Some(size) => size,
+            None => {
+                unsafe {
+                    rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER)
+                };
+                0
+            }
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (heap, flags);
+        0
+    }
 }
 
 /// `RtlWalkHeap(PVOID HeapHandle, PRTL_HEAP_WALK_ENTRY Entry) -> NTSTATUS` — return the segment

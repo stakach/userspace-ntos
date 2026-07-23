@@ -592,6 +592,14 @@ pub(crate) fn heap_validate(handle: *mut u8, ptr: Option<*const u8>, flags: u32)
     }
 }
 
+/// Compact a registered heap and return its largest free payload extent.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_compact(handle: *mut u8, flags: u32) -> Option<usize> {
+    let _heap_guard = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
+    let _guard = lock_process_heap();
+    unsafe { process_heaps_locked().find(handle).and_then(Heap::compact) }
+}
+
 /// Advance a native heap-walk cursor on the exact registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_walk(
