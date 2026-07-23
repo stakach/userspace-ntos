@@ -1140,17 +1140,13 @@ impl ExecNtHandler {
                 .is_ok()
         } else {
             self.pm.set_thread_start_address(t, entry)
-                && self
-                    .pm
-                    .set_thread_state(
-                        t,
-                        if create_suspended {
-                            nt_process::ThreadState::Initialized
-                        } else {
-                            nt_process::ThreadState::Running
-                        },
-                    )
-                    .is_ok()
+                && if create_suspended {
+                    self.pm.suspend_thread(t).is_ok()
+                } else {
+                    self.pm
+                        .set_thread_state(t, nt_process::ThreadState::Running)
+                        .is_ok()
+                }
         };
         if !prepared {
             used.fetch_and(!(1 << slot), Ordering::Relaxed);
@@ -1163,6 +1159,9 @@ impl ExecNtHandler {
             {
                 Ok(handle) => handle,
                 Err(_) => {
+                    if create_suspended {
+                        let _ = self.pm.resume_thread(t);
+                    }
                     let _ = self
                         .pm
                         .set_thread_state(t, nt_process::ThreadState::Initialized);
@@ -1170,6 +1169,9 @@ impl ExecNtHandler {
                     return None;
                 }
             };
+        let _ = self
+            .pm
+            .set_thread_create_time(t, nt_system_time_100ns() as i64);
         if create_suspended {
             PM_POOL_SUSPENDED[self.pi].fetch_or(1 << slot, Ordering::Relaxed);
         } else {
@@ -1189,6 +1191,10 @@ impl ExecNtHandler {
                     .pm
                     .set_thread_start_address(tid as nt_process::ThreadId, entry)
             {
+                let _ = self.pm.set_thread_create_time(
+                    tid as nt_process::ThreadId,
+                    nt_system_time_100ns() as i64,
+                );
                 PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1378,6 +1384,129 @@ impl ExecNtHandler {
         }
         self.account_published_pm_handle(owner);
         0
+    }
+
+    pub(crate) fn thread_query_length(information_class: u32) -> Result<usize, u32> {
+        match information_class {
+            0 => Ok(0x30),
+            1 => Ok(0x20),
+            12 | 18 | 20 => Ok(4),
+            _ => Err(nt_process::STATUS_INVALID_INFO_CLASS),
+        }
+    }
+
+    pub(crate) fn query_thread_information_captured(
+        &self,
+        handle: u64,
+        information_class: u32,
+    ) -> Result<([u8; 0x30], usize), u32> {
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let current_tid = self.current_tid as nt_process::ThreadId;
+        let mut output = [0u8; 0x30];
+        let length = match information_class {
+            0 => {
+                let basic = self
+                    .pm
+                    .query_thread_basic(caller_pid, current_tid, handle)?;
+                let teb = if basic.teb_base_address != 0 {
+                    basic.teb_base_address
+                } else if self.pi == 0 {
+                    SMSS_TEB_VA
+                } else {
+                    TEB_VA
+                };
+                output[0..4].copy_from_slice(&basic.exit_status.to_le_bytes());
+                output[8..16].copy_from_slice(&teb.to_le_bytes());
+                output[0x10..0x18]
+                    .copy_from_slice(&(basic.client_id.unique_process as u64).to_le_bytes());
+                output[0x18..0x20]
+                    .copy_from_slice(&(basic.client_id.unique_thread as u64).to_le_bytes());
+                output[0x20..0x28].copy_from_slice(&basic.affinity_mask.to_le_bytes());
+                output[0x28..0x2C].copy_from_slice(&basic.priority.to_le_bytes());
+                output[0x2C..0x30].copy_from_slice(&basic.base_priority.to_le_bytes());
+                0x30
+            }
+            1 => {
+                let times = self
+                    .pm
+                    .query_thread_times(caller_pid, current_tid, handle)?;
+                for (index, value) in [
+                    times.create_time,
+                    times.exit_time,
+                    times.kernel_time,
+                    times.user_time,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    output[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                0x20
+            }
+            12 | 18 | 20 => {
+                let value = self.pm.query_thread_u32(
+                    caller_pid,
+                    current_tid,
+                    handle,
+                    information_class,
+                )?;
+                output[..4].copy_from_slice(&value.to_le_bytes());
+                4
+            }
+            _ => return Err(nt_process::STATUS_INVALID_INFO_CLASS),
+        };
+        Ok((output, length))
+    }
+
+    unsafe fn nt_query_information_thread(
+        &self,
+        handle: u64,
+        information_class: u32,
+        information: u64,
+        information_length: u32,
+        return_length: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        let expected = match Self::thread_query_length(information_class) {
+            Ok(length) => length,
+            Err(status) => return status,
+        };
+        if information_length as usize != expected {
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if information != 0 {
+            if information & 3 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            let mut probe = [0u8; 0x30];
+            if !self.xas_read(information, &mut probe[..expected]) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        if return_length != 0 && !self.probe_user_output(return_length, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut status = match self.query_thread_information_captured(handle, information_class) {
+            Ok((output, length)) => {
+                if self.xas_try_write_buf(information, &output[..length]) {
+                    if information_class == 0 {
+                        WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            }
+            Err(status) => status,
+        };
+        if return_length != 0 && !self.xas_write_u32(return_length, expected as u32) {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        status
     }
     /// Resolve a `NtTerminateProcess`/`NtOpenProcess`-style ProcessHandle to the target EPROCESS pid.
     /// `NtCurrentProcess()` (`-1`) → the caller (self-terminate). A real child ProcessHandle is now
@@ -3190,6 +3319,15 @@ impl NativeSyscallHandler for ExecNtHandler {
             },
             NativeService::NtOpenThread => unsafe {
                 self.nt_open_thread(args[0], args[1] as u32, args[2], args[3])
+            },
+            NativeService::NtQueryInformationThread => unsafe {
+                self.nt_query_information_thread(
+                    args[0],
+                    args[1] as u32,
+                    args[2],
+                    args[3] as u32,
+                    args[4],
+                )
             },
             // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
             // DesiredAccess, HandleAttributes, Options). Resolve both process handles in the
@@ -9086,7 +9224,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                         return 0;
                     }
                     let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
-                    let _ = self.pm.terminate_process(pid, status);
+                    let _ =
+                        self.pm
+                            .terminate_process_at(pid, status, nt_system_time_100ns() as i64);
                     self.release_process_handles(pid);
                     if let Some(process_index) = process_index {
                         self.post_action = ExecPostAction::CleanupProcessWaiters { process_index };
@@ -9152,10 +9292,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                     };
                     return 0;
                 }
+                let exit_time = nt_system_time_100ns() as i64;
                 let outcome = if self.pi == 1 && self.pm.main_thread(caller_pid) == Some(target) {
-                    self.pm.exit_thread(target, status)
+                    self.pm.exit_thread_at(target, status, exit_time)
                 } else {
-                    self.pm.terminate_thread(target, status)
+                    self.pm.terminate_thread_at(target, status, exit_time)
                 };
                 if let Err(status) = outcome {
                     return status;

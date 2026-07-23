@@ -2159,8 +2159,14 @@ pub(crate) unsafe fn service_sec_image(
                 argv[2] = get_recv_mr(7); // R8
                 argv[3] = get_recv_mr(8); // R9
                 let n = (entry.max_args as usize).min(16);
+                let mut stack_args_valid = true;
                 for i in 4..n {
-                    let argument_va = sp + 0x28 + (i as u64 - 4) * 8;
+                    let Some(argument_va) =
+                        sp.checked_add(0x28 + (i as u64 - 4) * 8)
+                    else {
+                        stack_args_valid = false;
+                        break;
+                    };
                     let mut bytes = [0u8; 8];
                     if client_copyin_mapped(
                         pi as u64,
@@ -2171,6 +2177,9 @@ pub(crate) unsafe fn service_sec_image(
                         scratch_base,
                     ) {
                         argv[i] = u64::from_le_bytes(bytes);
+                    } else {
+                        stack_args_valid = false;
+                        break;
                     }
                 }
                 // Refresh the handler's per-call executive context, then clear the stop side-signal
@@ -2275,7 +2284,9 @@ pub(crate) unsafe fn service_sec_image(
                 // never fire for the 3 live ReactOS processes → byte-identical boot. When active it
                 // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
                 // adapter (skipping the native ReactOS dispatch).
-                if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
+                if !stack_args_valid {
+                    result = 0xC000_0005;
+                } else if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
                     result = st;
                     handled = true;
                 } else {
@@ -3541,190 +3552,6 @@ pub(crate) unsafe fn service_sec_image(
                         result = 0; // no real event to park on → immediate WAIT_0 (documented)
                     }
                 }
-            } else if m0 == 162 {
-                // ★ NtQueryInformationThread(ThreadHandle=R10, ThreadInformationClass=RDX,
-                // ThreadInformation=R8, Length=R9, *ReturnLength=[sp+0x28]). GENERAL (all hosted
-                // clients): winlogon's RpcServerListen queries the RPC LISTENER thread's
-                // ThreadBasicInformation (kernel32 RVA 0x25f62 then derefs [Teb+0x2c8]); services'
-                // msvcrt/ntdll CRT init queries its OWN thread (NtCurrentThread==-2) during startup.
-                // Resolve the ThreadHandle VALUE → the ETHREAD and fill a real THREAD_BASIC_INFORMATION.
-                // Class 0 = ThreadBasicInformation. Per-pi handle table (nt_handler.pi = pi below).
-                nt_handler.pi = pi; // resolve the ThreadHandle in the CALLER's own handle table
-                let cls = m3; // RDX = ThreadInformationClass
-                let handle = get_recv_mr(9); // R10 = ThreadHandle
-                let buf = get_recv_mr(7); // R8 = ThreadInformation
-                let len = get_recv_mr(8); // R9 = ThreadInformationLength
-                let sp = get_recv_mr(16);
-                let return_length = client_read_u64_mapped(
-                    pi as u64,
-                    sp + 0x28,
-                    filled_pages,
-                    faults as usize,
-                    scratch_base,
-                )
-                .unwrap_or(0);
-                let trace = THREAD_QUERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                if trace < 8 {
-                    print_str(b"[thread-life] query caller_pi=");
-                    print_u64(pi as u64);
-                    print_str(b" badge=");
-                    print_u64(badge);
-                    print_str(b" handle=0x");
-                    print_hex(handle as u32);
-                    print_str(b" class=");
-                    print_u64(cls);
-                    print_str(b" length=");
-                    print_u64(len);
-                    print_str(b" output=0x");
-                    print_hex(buf as u32);
-                    print_str(b" return_length=0x");
-                    print_hex(return_length as u32);
-                    print_str(b"\n");
-                }
-                result = if cls == 18 {
-                    const THREAD_QUERY_INFORMATION: u32 = 0x0040;
-                    if len != 4 {
-                        if return_length != 0 {
-                            client_write_mapped(
-                                pi as u64,
-                                return_length,
-                                &4u32.to_le_bytes(),
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            );
-                        }
-                        nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
-                    } else if buf == 0 {
-                        0xC000_0005
-                    } else if let Some(caller_pid) = nt_handler.pm_pid_for_pi(pi) {
-                        match nt_handler.pm.resolve_thread_handle(
-                            caller_pid,
-                            nt_handler.current_tid as nt_process::ThreadId,
-                            handle,
-                            THREAD_QUERY_INFORMATION,
-                        ) {
-                            Ok(tid) => {
-                                let enabled = nt_handler
-                                    .pm
-                                    .thread_break_on_termination(tid)
-                                    .unwrap_or(false) as u32;
-                                let wrote = client_write_mapped(
-                                    pi as u64,
-                                    buf,
-                                    &enabled.to_le_bytes(),
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                ) && (return_length == 0
-                                    || client_write_mapped(
-                                        pi as u64,
-                                        return_length,
-                                        &4u32.to_le_bytes(),
-                                        filled_pages,
-                                        faults as usize,
-                                        scratch_base,
-                                    ));
-                                if wrote { 0 } else { 0xC000_0005 }
-                            }
-                            Err(status) => status as u64,
-                        }
-                    } else {
-                        nt_process::STATUS_INVALID_HANDLE as u64
-                    }
-                } else if cls != 0 {
-                    nt_process::STATUS_INVALID_INFO_CLASS as u64
-                } else if len != 0x30 {
-                    if return_length != 0 {
-                        client_write_u64_mapped(
-                            pi as u64,
-                            return_length,
-                            0x30,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                    }
-                    nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
-                } else if buf == 0 {
-                    0xC000_0005
-                } else if let Some(caller_pid) = nt_handler.pm_pid_for_pi(pi) {
-                    match nt_handler.pm.query_thread_basic(
-                        caller_pid,
-                        nt_handler.current_tid as nt_process::ThreadId,
-                        handle,
-                    ) {
-                        Ok(basic) => {
-                            let resolved_tid = basic.client_id.unique_thread as u64;
-                            // Main-thread TEBs predate the ETHREAD convergence and are bound by the
-                            // process spawn. Runtime threads always carry their distinct mapped TEB.
-                            let teb = if basic.teb_base_address != 0 {
-                                basic.teb_base_address
-                            } else if pi == 0 {
-                                SMSS_TEB_VA
-                            } else {
-                                TEB_VA
-                            };
-                            // THREAD_BASIC_INFORMATION (x64, 0x30 bytes): ExitStatus@0,
-                            // TebBaseAddress@8, ClientId@0x10, AffinityMask@0x20, priorities@0x28.
-                            let tbi: [(u64, u64); 6] = [
-                                (0x00, basic.exit_status as u64),
-                                (0x08, teb),
-                                (0x10, basic.client_id.unique_process as u64),
-                                (0x18, resolved_tid),
-                                (0x20, basic.affinity_mask),
-                                (0x28, 0),
-                            ];
-                            for (off, v) in tbi {
-                                client_write_u64_mapped(
-                                    pi as u64,
-                                    buf + off,
-                                    v,
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                );
-                            }
-                            if return_length != 0 {
-                                client_write_u64_mapped(
-                                    pi as u64,
-                                    return_length,
-                                    0x30,
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                );
-                            }
-                            WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
-                            print_str(b"[thread-life] query resolved ETHREAD tid=");
-                            print_u64(resolved_tid);
-                            print_str(b" written_teb=0x");
-                            print_hex((teb >> 32) as u32);
-                            print_hex(teb as u32);
-                            let readback_teb = client_read_u64_mapped(
-                                pi as u64,
-                                buf + 8,
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            )
-                            .unwrap_or(0);
-                            print_str(b" readback_teb=0x");
-                            print_hex((readback_teb >> 32) as u32);
-                            print_hex(readback_teb as u32);
-                            print_str(b"\n");
-                            0
-                        }
-                        Err(status) => {
-                            print_str(b"[thread-life] query unresolved handle status=0x");
-                            print_hex(status);
-                            print_str(b"\n");
-                            status as u64
-                        }
-                    }
-                } else {
-                    nt_process::STATUS_INVALID_HANDLE as u64
-                };
             } else if m0 == 98 && badge == WINLOGON_BADGE {
                 // NtIsProcessInJob(ProcessHandle=R10, JobHandle=RDX). kernel32's CreateProcessInternalW
                 // prologue (spawning services.exe) queries whether winlogon is in a job (JobHandle=NULL

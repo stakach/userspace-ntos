@@ -727,6 +727,7 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 pub const SSN_NT_OPEN_THREAD: u64 = 134;
+pub const SSN_NT_QUERY_INFORMATION_THREAD: u64 = 162;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
 pub const SSN_NT_OPEN_THREAD_TOKEN_EX: u64 = 136;
 pub const SSN_NT_OPEN_PROCESS: u64 = 128;
@@ -1482,7 +1483,6 @@ static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; TP_WORKER_PI_COUNT] =
     [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; TP_WORKER_PI_COUNT];
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// BATCH 25 — count of fixup-preserving re-maps (a re-faulted per-process image page re-mapped from
 /// its already-filled frame instead of re-filled from the raw PE, so reloc/IAT-snap fixups survive).
@@ -5139,6 +5139,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtRequestWaitReplyPort, SSN_NT_REQUEST_WAIT_REPLY_PORT as u32),
             (NativeService::NtOpenProcess, SSN_NT_OPEN_PROCESS as u32),
             (NativeService::NtOpenThread, SSN_NT_OPEN_THREAD as u32),
+            (
+                NativeService::NtQueryInformationThread,
+                SSN_NT_QUERY_INFORMATION_THREAD as u32,
+            ),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),

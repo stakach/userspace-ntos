@@ -1450,25 +1450,48 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
 }
 
 /// Write a u64 to the CSR thread's stack (via the executive's CSR_STACK_MIRROR alias).
-pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
-    if va >= CSR_STACK_BASE && va + 8 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u64, v);
+fn csr_stack_has_range(va: u64, len: usize) -> bool {
+    va >= CSR_STACK_BASE
+        && va
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000)
+}
+unsafe fn csr_stack_copyout(va: u64, bytes: &[u8]) -> bool {
+    if !csr_stack_has_range(va, bytes.len()) {
+        return false;
     }
+    core::ptr::copy_nonoverlapping(
+        bytes.as_ptr(),
+        (CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u8,
+        bytes.len(),
+    );
+    true
+}
+unsafe fn csr_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
+    if !csr_stack_has_range(va, bytes.len()) {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(
+        (CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *const u8,
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    true
+}
+unsafe fn csr_stack_read(va: u64) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    csr_stack_copyin(va, &mut bytes).then(|| u64::from_le_bytes(bytes))
+}
+pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
+    let _ = csr_stack_copyout(va, &v.to_le_bytes());
 }
 /// Write a u32 to the CSR thread's stack, returning false for an invalid output pointer.
 pub(crate) unsafe fn csr_stack_write32(va: u64, v: u32) -> bool {
-    if va >= CSR_STACK_BASE && va + 4 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u32, v);
-        true
-    } else {
-        false
-    }
+    csr_stack_copyout(va, &v.to_le_bytes())
 }
 /// Write a u16 to the CSR thread's stack (for PORT_MESSAGE.Type@0x04).
 pub(crate) unsafe fn csr_stack_write16(va: u64, v: u16) {
-    if va >= CSR_STACK_BASE && va + 2 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u16, v);
-    }
+    let _ = csr_stack_copyout(va, &v.to_le_bytes());
 }
 unsafe fn csr_sb_stack_write(va: u64, v: u64) {
     if va >= CSR_SB_STACK_BASE && va + 8 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
@@ -1495,18 +1518,25 @@ unsafe fn csr_sb_stack_write32(va: u64, v: u32) {
     }
 }
 unsafe fn csr_sb_stack_read(va: u64) -> u64 {
-    if va >= CSR_SB_STACK_BASE && va + 8 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
-        core::ptr::read_volatile(
-            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *const u64,
-        )
-    } else {
-        0
+    csr_sb_stack_read_checked(va).unwrap_or(0)
+}
+unsafe fn csr_sb_stack_read_checked(va: u64) -> Option<u64> {
+    let end = va.checked_add(8)?;
+    if va < CSR_SB_STACK_BASE || end > CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
+        return None;
     }
+    Some(core::ptr::read_volatile(
+        (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *const u64,
+    ))
+}
+fn csr_sb_stack_has_range(va: u64, len: usize) -> bool {
+    va >= CSR_SB_STACK_BASE
+        && va
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000)
 }
 unsafe fn csr_sb_stack_copyout(va: u64, bytes: &[u8]) -> bool {
-    if va < CSR_SB_STACK_BASE
-        || va + bytes.len() as u64 > CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000
-    {
+    if !csr_sb_stack_has_range(va, bytes.len()) {
         return false;
     }
     core::ptr::copy_nonoverlapping(
@@ -1517,9 +1547,7 @@ unsafe fn csr_sb_stack_copyout(va: u64, bytes: &[u8]) -> bool {
     true
 }
 unsafe fn csr_sb_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
-    if va < CSR_SB_STACK_BASE
-        || va + bytes.len() as u64 > CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000
-    {
+    if !csr_sb_stack_has_range(va, bytes.len()) {
         return false;
     }
     core::ptr::copy_nonoverlapping(
@@ -1528,6 +1556,118 @@ unsafe fn csr_sb_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
         bytes.len(),
     );
     true
+}
+
+unsafe fn csr_sb_query_thread_call(
+    nt_handler: &mut ExecNtHandler,
+    handle: u64,
+    information_class: u32,
+    information: u64,
+    information_length: u32,
+    return_length: u64,
+) -> u64 {
+    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
+    let expected = match ExecNtHandler::thread_query_length(information_class) {
+        Ok(length) => length,
+        Err(status) => return status as u64,
+    };
+    if information_length as usize != expected {
+        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
+    }
+    if information != 0 {
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut probe = [0u8; 0x30];
+        if !csr_sb_stack_copyin(information, &mut probe[..expected]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    if return_length != 0 && !csr_sb_stack_has_range(return_length, 4) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    nt_handler.pi = 1;
+    nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+    let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
+        Ok((output, length)) => {
+            if csr_sb_stack_copyout(information, &output[..length]) {
+                if information_class == 0 {
+                    WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
+                }
+                0
+            } else {
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+        Err(status) => status as u64,
+    };
+    if return_length != 0
+        && !csr_sb_stack_copyout(return_length, &(expected as u32).to_le_bytes())
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    status
+}
+
+unsafe fn csr_query_thread_call(
+    nt_handler: &mut ExecNtHandler,
+    handle: u64,
+    information_class: u32,
+    information: u64,
+    information_length: u32,
+    return_length: u64,
+) -> u64 {
+    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
+    let expected = match ExecNtHandler::thread_query_length(information_class) {
+        Ok(length) => length,
+        Err(status) => return status as u64,
+    };
+    if information_length as usize != expected {
+        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
+    }
+    if information != 0 {
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut probe = [0u8; 0x30];
+        if !csr_stack_copyin(information, &mut probe[..expected]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    if return_length != 0 && !csr_stack_has_range(return_length, 4) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    nt_handler.pi = 1;
+    nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+    let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
+        Ok((output, length)) => {
+            if csr_stack_copyout(information, &output[..length]) {
+                if information_class == 0 {
+                    WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
+                }
+                0
+            } else {
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+        Err(status) => status as u64,
+    };
+    if return_length != 0
+        && !csr_stack_copyout(return_length, &(expected as u32).to_le_bytes())
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    status
 }
 
 /// Demand-fill one code/data page for the CSR API thread during the rendezvous. The page is in
@@ -1742,7 +1882,6 @@ unsafe fn csr_sb_api_request_rendezvous(
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
     const SSN_SET_INFO_PROCESS: u64 = 237;
-    const SSN_QUERY_INFO_THREAD: u64 = 162;
     const SSN_QUERY_OBJECT: u64 = 170;
     const SSN_SET_INFO_OBJECT: u64 = 236;
     const SSN_RESUME_THREAD: u64 = 214;
@@ -1874,25 +2013,21 @@ unsafe fn csr_sb_api_request_rendezvous(
                 print_str(b"\n");
                 match ssn {
                     SSN_SET_INFO_PROCESS | SSN_SET_INFO_OBJECT => {}
-                    SSN_QUERY_INFO_THREAD => {
-                        let caller_pid = PM_PIDS[1].load(Ordering::Relaxed) as nt_process::ProcessId;
-                        if nt_handler
-                            .pm
-                            .resolve_thread_handle(
-                                caller_pid,
-                                CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
-                                get_recv_mr(9),
-                                0,
-                            )
-                            .is_err()
+                    SSN_NT_QUERY_INFORMATION_THREAD => {
+                        result = match sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_sb_stack_read_checked(address))
                         {
-                            result = nt_process::STATUS_INVALID_HANDLE as u64;
-                        } else if rdx == 1 {
-                            let buffer = get_recv_mr(7);
-                            for offset in (0..0x20).step_by(8) {
-                                csr_sb_stack_write(buffer + offset, 0);
-                            }
-                        }
+                            Some(return_length) => csr_sb_query_thread_call(
+                                nt_handler,
+                                get_recv_mr(9),
+                                rdx as u32,
+                                get_recv_mr(7),
+                                get_recv_mr(8) as u32,
+                                return_length,
+                            ),
+                            None => 0xC000_0005,
+                        };
                     }
                     SSN_QUERY_OBJECT => {
                         let buffer = get_recv_mr(7);
@@ -2202,6 +2337,22 @@ pub(crate) unsafe fn csr_rendezvous(
                         };
                         nt_handler.pi = saved_pi;
                     }
+                }
+                SSN_NT_QUERY_INFORMATION_THREAD => {
+                    result = match sp
+                        .checked_add(0x28)
+                        .and_then(|address| csr_stack_read(address))
+                    {
+                        Some(return_length) => csr_query_thread_call(
+                            nt_handler,
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(7),
+                            get_recv_mr(8) as u32,
+                            return_length,
+                        ),
+                        None => 0xC000_0005,
+                    };
                 }
                 SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
                 SSN_REPLY_WAIT_RECV => {

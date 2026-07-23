@@ -700,6 +700,7 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
     let unused_pool = pm.create_thread(pid, 0, 0, true).unwrap();
     pm.set_thread_state(unused_pool, ThreadState::Initialized)
         .unwrap();
+    assert_eq!(pm.suspend_thread(target), Ok(0));
     assert!(pm.set_thread_times(target, 100, 900, 30, 40));
     pm.set_thread_break_on_termination(target, true).unwrap();
     let handle = pm
@@ -821,11 +822,29 @@ fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
 
     let thread = pm.thread(worker).unwrap();
     assert_eq!(thread.start_address, 0x3000);
-    assert_eq!(thread.state, ThreadState::Initialized);
+    assert_eq!(thread.state, ThreadState::Suspended);
     assert_eq!(thread.exit_status, None);
-    assert_eq!(thread.suspend_count, 0);
+    assert_eq!(thread.suspend_count, 1);
     assert_eq!(thread.teb_base, 0);
     assert!(!pm.can_reclaim_thread(worker));
+}
+
+#[test]
+fn termination_timestamps_are_one_shot_and_cover_process_cascades() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+
+    pm.terminate_thread_at(worker, 0x1234, 100).unwrap();
+    pm.terminate_thread_at(worker, 0x5678, 200).unwrap();
+    assert_eq!(pm.thread(worker).unwrap().exit_status, Some(0x1234));
+    assert_eq!(pm.thread(worker).unwrap().exit_time_100ns, 100);
+
+    pm.terminate_thread_at(main, 0x9ABC, 300).unwrap();
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Terminated);
+    assert_eq!(pm.thread(main).unwrap().exit_time_100ns, 300);
+    assert_eq!(pm.thread(worker).unwrap().exit_time_100ns, 100);
 }
 
 #[test]

@@ -805,6 +805,14 @@ impl ProcessManager {
         true
     }
 
+    pub fn set_thread_create_time(&mut self, tid: ThreadId, create_time_100ns: i64) -> bool {
+        let Some(thread) = self.threads.get_mut(&tid) else {
+            return false;
+        };
+        thread.create_time_100ns = create_time_100ns;
+        true
+    }
+
     /// Resolve a caller-local thread handle for an operation requiring `required_access`.
     /// `NtCurrentThread` resolves to the supplied scheduling identity rather than assuming the
     /// process main thread, which is essential once multiple user threads share one process.
@@ -1055,7 +1063,7 @@ impl ProcessManager {
         thread.start_address = start_address;
         thread.parameter = 0;
         thread.state = if create_suspended {
-            ThreadState::Initialized
+            ThreadState::Suspended
         } else {
             ThreadState::Running
         };
@@ -1064,7 +1072,7 @@ impl ProcessManager {
         thread.exit_time_100ns = 0;
         thread.kernel_time_100ns = 0;
         thread.user_time_100ns = 0;
-        thread.suspend_count = 0;
+        thread.suspend_count = create_suspended as u32;
         thread.win32_thread = None;
         thread.teb_base = 0;
         thread.break_on_termination = false;
@@ -1158,12 +1166,31 @@ impl ProcessManager {
     /// `NtTerminateThread` (spec §21.1): set the exit status, mark terminated (signalled), and if
     /// this was the last non-system thread, initiate process exit.
     pub fn terminate_thread(&mut self, tid: ThreadId, exit_status: u32) -> Result<(), u32> {
-        let (pid, was_system) = {
+        self.terminate_thread_at(tid, exit_status, 0)
+    }
+
+    /// Terminate a thread and stamp every ETHREAD transitioned by the last-thread cascade.
+    pub fn terminate_thread_at(
+        &mut self,
+        tid: ThreadId,
+        exit_status: u32,
+        exit_time_100ns: i64,
+    ) -> Result<(), u32> {
+        let (pid, was_system, transitioned) = {
             let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-            t.state = ThreadState::Terminated;
-            t.exit_status = Some(exit_status);
-            (t.process_id, t.is_system_thread)
+            let transitioned = t.state != ThreadState::Terminated;
+            if transitioned {
+                t.state = ThreadState::Terminated;
+                t.exit_status = Some(exit_status);
+                if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
+                    t.exit_time_100ns = exit_time_100ns;
+                }
+            }
+            (t.process_id, t.is_system_thread, transitioned)
         };
+        if !transitioned {
+            return Ok(());
+        }
         if !was_system {
             let remaining = self
                 .threads
@@ -1175,7 +1202,7 @@ impl ProcessManager {
                 })
                 .count();
             if remaining == 0 {
-                self.terminate_process(pid, exit_status)?;
+                self.terminate_process_at(pid, exit_status, exit_time_100ns)?;
             }
         }
         Ok(())
@@ -1189,15 +1216,40 @@ impl ProcessManager {
     /// exit status; the EPROCESS stays whatever it was (Running). Alloc-free (in-place field writes
     /// on an already-allocated node) — safe to call under the executive's per-syscall heap reset.
     pub fn exit_thread(&mut self, tid: ThreadId, exit_status: u32) -> Result<(), u32> {
+        self.exit_thread_at(tid, exit_status, 0)
+    }
+
+    /// Terminate one thread without process-exit cascading and retain its first exit timestamp.
+    pub fn exit_thread_at(
+        &mut self,
+        tid: ThreadId,
+        exit_status: u32,
+        exit_time_100ns: i64,
+    ) -> Result<(), u32> {
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        t.state = ThreadState::Terminated;
-        t.exit_status = Some(exit_status);
+        if t.state != ThreadState::Terminated {
+            t.state = ThreadState::Terminated;
+            t.exit_status = Some(exit_status);
+            if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
+                t.exit_time_100ns = exit_time_100ns;
+            }
+        }
         Ok(())
     }
 
     /// `NtTerminateProcess` (spec §21.2): terminate all threads, set the exit status, and mark the
     /// process terminated (signalled). Releases the image-section map ref (spec §13.7).
     pub fn terminate_process(&mut self, pid: ProcessId, exit_status: u32) -> Result<(), u32> {
+        self.terminate_process_at(pid, exit_status, 0)
+    }
+
+    /// Terminate a process and stamp only threads that transition during this call.
+    pub fn terminate_process_at(
+        &mut self,
+        pid: ProcessId,
+        exit_status: u32,
+        exit_time_100ns: i64,
+    ) -> Result<(), u32> {
         let (tids, section) = {
             let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
@@ -1215,6 +1267,9 @@ impl ProcessManager {
                 if t.state != ThreadState::Terminated {
                     t.state = ThreadState::Terminated;
                     t.exit_status = Some(exit_status);
+                    if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
+                        t.exit_time_100ns = exit_time_100ns;
+                    }
                 }
             }
         }
