@@ -57,6 +57,42 @@ pub struct UnicodeString {
     pub buffer: u64,
 }
 
+/// `CURDIR` — the process current-directory path and cached directory handle.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CurDir {
+    pub dos_path: UnicodeString,
+    pub handle: u64,
+}
+
+/// `RTLP_CURDIR_REF` — an owned current-directory handle retained by a relative-name result.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RtlpCurDirRef {
+    pub ref_count: i32,
+    _pad: u32,
+    pub handle: u64,
+}
+
+impl RtlpCurDirRef {
+    pub const fn new(handle: u64) -> Self {
+        Self {
+            ref_count: 1,
+            _pad: 0,
+            handle,
+        }
+    }
+}
+
+/// `RTL_RELATIVE_NAME_U` — a relative subspan plus the directory handle that anchors it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RtlRelativeNameU {
+    pub relative_name: UnicodeString,
+    pub containing_directory: u64,
+    pub cur_dir_ref: u64,
+}
+
 /// `CLIENT_ID` — `(UniqueProcess, UniqueThread)` (`umtypes.h`). 16 bytes on x64.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -363,6 +399,13 @@ pub struct Teb {
 // Primitive sizes.
 const _: () = assert!(size_of::<ListEntry>() == 0x10);
 const _: () = assert!(size_of::<UnicodeString>() == 0x10); // 4B tail pad before the 8B buffer ptr
+const _: () = assert!(size_of::<CurDir>() == 0x18);
+const _: () = assert!(offset_of!(CurDir, handle) == 0x10);
+const _: () = assert!(size_of::<RtlpCurDirRef>() == 0x10);
+const _: () = assert!(offset_of!(RtlpCurDirRef, handle) == 0x08);
+const _: () = assert!(size_of::<RtlRelativeNameU>() == 0x20);
+const _: () = assert!(offset_of!(RtlRelativeNameU, containing_directory) == 0x10);
+const _: () = assert!(offset_of!(RtlRelativeNameU, cur_dir_ref) == 0x18);
 const _: () = assert!(size_of::<ClientId>() == 0x10);
 const _: () = assert!(size_of::<NtTib>() == 0x38);
 

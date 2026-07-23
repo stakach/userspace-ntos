@@ -29,7 +29,9 @@ use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
-use nt_ntdll_layout::{ListEntry, Peb, Teb, UnicodeString};
+use nt_ntdll_layout::{
+    ListEntry, Peb, RtlRelativeNameU, RtlpCurDirRef, Teb, UnicodeString,
+};
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
@@ -932,6 +934,23 @@ fn peb_current_directory() -> alloc::vec::Vec<u16> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn peb_current_directory_handle() -> u64 {
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb == 0 {
+            return 0;
+        }
+        let params = core::ptr::read((peb + 0x20) as *const u64);
+        if params == 0 {
+            0
+        } else {
+            core::ptr::read_unaligned((params + 0x48) as *const u64) & !0x3
+        }
+    }
+}
+
 /// Count bytes up to (not including) a terminating NUL.
 ///
 /// # Safety
@@ -1413,6 +1432,37 @@ unsafe fn boot_nt_close(file_handle: u64) -> NtStatus {
     unsafe {
         core::mem::transmute::<unsafe extern "C" fn(), NtClose>(nt_ntdll::trap_stubs::nt_close)(
             file_handle,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_duplicate_current_process_handle(
+    source_handle: u64,
+    target_handle: *mut u64,
+) -> NtStatus {
+    type NtDuplicateObject = unsafe extern "system" fn(
+        u64,
+        u64,
+        u64,
+        *mut u64,
+        u32,
+        u32,
+        u32,
+    ) -> NtStatus;
+    const CURRENT_PROCESS: u64 = u64::MAX;
+    const DUPLICATE_SAME_ACCESS: u32 = 0x2;
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtDuplicateObject>(
+            nt_ntdll::trap_stubs::nt_duplicate_object,
+        )(
+            CURRENT_PROCESS,
+            source_handle,
+            CURRENT_PROCESS,
+            target_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
         )
     }
 }
@@ -3832,11 +3882,8 @@ pub unsafe extern "system" fn rtl_query_environment_variable_u(
 /// `SmpKnownDllPath` (`C:\Windows\system32`, already env-expanded by `RtlQueryRegistryValues`); the
 /// KnownDlls directory open then targets `\??\C:\Windows\system32`.
 ///
-/// The pure prefix/classification is [`rtl::path::dos_path_name_to_nt_path_name`] (host-tested); here
-/// we materialize the `UNICODE_STRING` + heap buffer. `PartName`/`RelativeName` are the drive-relative
-/// helpers smss passes as `NULL` (it never uses them), so we leave them alone. A relative /
-/// drive-relative path (needs the live CWD, not yet threaded) or an alloc failure returns FALSE — the
-/// honest failure, never a fabricated NtName.
+/// The pure path planner canonicalizes against the live CWD. Relative-name callers receive a
+/// subspan of the full NT buffer plus an independently owned duplicate of the CWD handle.
 ///
 /// # Safety
 /// `dos_name` a NUL-terminated UTF-16 string (or NULL → FALSE); `nt_name` a valid writable
@@ -3846,7 +3893,7 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
     nt_name: PUnicodeString,
     part_name: *mut *mut u16,
     relative_name: *mut c_void,
-    _have_relative: bool,
+    have_relative: bool,
 ) -> NtStatus {
     if dos_name.is_null() || nt_name.is_null() {
         return STATUS_OBJECT_NAME_INVALID;
@@ -3859,21 +3906,78 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
     // SAFETY: [dos_name, dos_name+len) is the string body.
     let input = unsafe { core::slice::from_raw_parts(dos_name, len) };
     #[cfg(target_arch = "x86_64")]
-    let nt_opt = {
+    let (plan, containing_directory, cur_dir_ref, prepare_status) = {
+        let lock = !relative_name.is_null();
+        if lock {
+            unsafe { rtl_acquire_peb_lock() };
+        }
         let cwd = peb_current_directory();
-        rtl::path::dos_path_name_to_nt_path_name_rel(input, &cwd)
+        let current_handle = peb_current_directory_handle();
+        let plan = rtl::path::relative_nt_path_plan(input, &cwd, current_handle != 0);
+        let mut containing_directory = 0u64;
+        let mut cur_dir_ref = core::ptr::null_mut::<RtlpCurDirRef>();
+        let mut status = STATUS_SUCCESS;
+        if plan.as_ref().and_then(|plan| plan.relative_offset).is_some()
+            && !relative_name.is_null()
+        {
+            containing_directory = current_handle;
+            if have_relative {
+                cur_dir_ref = unsafe {
+                    crate::process_heap_alloc(core::mem::size_of::<RtlpCurDirRef>())
+                        as *mut RtlpCurDirRef
+                };
+                if cur_dir_ref.is_null() {
+                    status = STATUS_NO_MEMORY;
+                } else {
+                    let mut duplicate = 0u64;
+                    status = unsafe {
+                        boot_nt_duplicate_current_process_handle(current_handle, &mut duplicate)
+                    };
+                    if nt_success(status) {
+                        unsafe { core::ptr::write(cur_dir_ref, RtlpCurDirRef::new(duplicate)) };
+                        containing_directory = duplicate;
+                    } else {
+                        unsafe { crate::process_heap_free(cur_dir_ref.cast()) };
+                        cur_dir_ref = core::ptr::null_mut();
+                    }
+                }
+            }
+        }
+        if lock {
+            unsafe { rtl_release_peb_lock() };
+        }
+        (plan, containing_directory, cur_dir_ref, status)
     };
     #[cfg(not(target_arch = "x86_64"))]
-    let nt_opt = rtl::path::dos_path_name_to_nt_path_name(input);
-    let Some(nt) = nt_opt else {
+    let (plan, containing_directory, cur_dir_ref, prepare_status) = (
+        rtl::path::dos_path_name_to_nt_path_name(input).map(|nt_path| {
+            rtl::path::RelativeNtPathPlan {
+                nt_path,
+                relative_offset: None,
+            }
+        }),
+        0u64,
+        core::ptr::null_mut::<RtlpCurDirRef>(),
+        STATUS_SUCCESS,
+    );
+    if !nt_success(prepare_status) {
+        return prepare_status;
+    }
+    let Some(plan) = plan else {
         return STATUS_OBJECT_NAME_INVALID;
     };
+    let nt = plan.nt_path;
 
     let n_units = nt.len();
     let bytes = (n_units + 1) * 2;
     // SAFETY: process heap alloc (installed at LdrpInitialize). Null on failure.
     let buf = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
     if buf.is_null() {
+        #[cfg(target_arch = "x86_64")]
+        if !cur_dir_ref.is_null() {
+            let _ = unsafe { boot_nt_close((*cur_dir_ref).handle) };
+            unsafe { crate::process_heap_free(cur_dir_ref.cast()) };
+        }
         return STATUS_NO_MEMORY;
     }
 
@@ -3903,7 +4007,16 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
         }
 
         if !relative_name.is_null() {
-            core::ptr::write_bytes(relative_name as *mut u8, 0, 0x28);
+            let mut relative = RtlRelativeNameU::default();
+            if let Some(offset) = plan.relative_offset {
+                let relative_units = n_units - offset;
+                relative.relative_name.length = (relative_units * 2) as u16;
+                relative.relative_name.maximum_length = (relative_units * 2) as u16;
+                relative.relative_name.buffer = buf.add(offset) as u64;
+                relative.containing_directory = containing_directory;
+                relative.cur_dir_ref = cur_dir_ref as u64;
+            }
+            core::ptr::write_unaligned(relative_name as *mut RtlRelativeNameU, relative);
         }
     }
 
@@ -11720,9 +11833,8 @@ pub unsafe extern "system" fn rtlp_apply_length_function(
 }
 
 /// `RtlDosPathNameToRelativeNtPathName_U(PCWSTR DosName, PUNICODE_STRING NtName, PWSTR* PartName,
-/// PRTL_RELATIVE_NAME_U RelativeName) -> BOOLEAN` — convert a DOS path to an NT path (relative form).
-/// We build the absolute NT name via the host-tested `dos_path_name_to_nt_path_name` and leave the
-/// RelativeName cleared (absolute result — the common case).
+/// PRTL_RELATIVE_NAME_U RelativeName) -> BOOLEAN` — convert a DOS path to an NT path and return a
+/// handle-relative subspan when the canonical input remains beneath the live current directory.
 ///
 /// # Safety
 /// `dos_name` NUL-terminated; `nt_name` writable; `part_name`/`relative_name` null or writable.
@@ -11764,13 +11876,33 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u_with_
     }
 }
 
-/// `RtlReleaseRelativeName(PRTL_RELATIVE_NAME_U RelativeName)` — release the directory handle a
-/// relative-name conversion opened. We produce absolute names (no handle), so this is a no-op.
+/// `RtlReleaseRelativeName(PRTL_RELATIVE_NAME_U RelativeName)` — release the retained current-
+/// directory handle owned by a relative-name conversion.
 ///
 /// # Safety
 /// `relative_name` from `RtlDosPathNameToRelativeNtPathName_U`.
 #[export_name = "RtlReleaseRelativeName"]
-pub unsafe extern "system" fn rtl_release_relative_name(_relative_name: *mut c_void) {}
+pub unsafe extern "system" fn rtl_release_relative_name(relative_name: *mut c_void) {
+    if relative_name.is_null() {
+        return;
+    }
+    let relative = relative_name as *mut RtlRelativeNameU;
+    let reference = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*relative).cur_dir_ref)) };
+    if reference == 0 {
+        return;
+    }
+    unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!((*relative).cur_dir_ref), 0) };
+    let reference = reference as *mut RtlpCurDirRef;
+    let count = unsafe { &*(core::ptr::addr_of!((*reference).ref_count) as *const AtomicI32) };
+    if count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let handle = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*reference).handle)) };
+            let _ = unsafe { boot_nt_close(handle) };
+            unsafe { crate::process_heap_free(reference.cast()) };
+        }
+    }
+}
 
 /// `RtlDosSearchPath_Ustr` — search counted DOS paths through the real file-attribute syscall and
 /// return the selected full path through the caller's static/dynamic `UNICODE_STRING` buffers.

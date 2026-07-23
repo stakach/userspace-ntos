@@ -431,6 +431,63 @@ pub fn dos_path_name_to_nt_path_name_rel(name: &[u16], cwd: &[u16]) -> Option<Ve
     }
 }
 
+/// A canonical NT path and, when the original input was relative to the current directory, the
+/// UTF-16 offset of the handle-relative subspan within `nt_path`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelativeNtPathPlan {
+    pub nt_path: Vec<u16>,
+    pub relative_offset: Option<usize>,
+}
+
+/// Plan `RtlDosPathNameToRelativeNtPathName_U`. The relative result is valid only when a current
+/// directory handle exists and the canonical result remains under that directory on a component
+/// boundary. The full NT path is always returned for supported DOS path forms.
+pub fn relative_nt_path_plan(
+    name: &[u16],
+    cwd: &[u16],
+    has_current_directory_handle: bool,
+) -> Option<RelativeNtPathPlan> {
+    let input_type = determine_dos_path_name_type(name);
+    let full_dos = super::environment::full_path_units(name, cwd);
+    let nt_path = dos_path_name_to_nt_path_name(&full_dos)?;
+    let relative_offset = if input_type == DosPathType::Relative && has_current_directory_handle {
+        let canonical_cwd = super::environment::full_path_units(&[b'.' as u16], cwd);
+        let cwd_end = canonical_cwd
+            .iter()
+            .rposition(|unit| !is_sep(*unit))
+            .map_or(0, |index| index + 1);
+        let prefix_matches = full_dos.len() >= cwd_end
+            && full_dos[..cwd_end]
+                .iter()
+                .zip(&canonical_cwd[..cwd_end])
+                .all(|(&left, &right)| fold_ascii(left) == fold_ascii(right));
+        let dos_offset = if !prefix_matches {
+            None
+        } else if full_dos.len() == cwd_end {
+            Some(cwd_end)
+        } else if is_sep(full_dos[cwd_end]) {
+            Some(cwd_end + 1)
+        } else {
+            None
+        };
+        dos_offset.map(|offset| nt_path.len() - full_dos.len() + offset)
+    } else {
+        None
+    };
+    Some(RelativeNtPathPlan {
+        nt_path,
+        relative_offset,
+    })
+}
+
+fn fold_ascii(unit: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&unit) {
+        unit - 32
+    } else {
+        unit
+    }
+}
+
 /// `RtlIsDosDeviceName_U`: recognise a reserved DOS device name (case-insensitive, with an optional
 /// extension, e.g. `CON`, `NUL.txt`, `COM1`, `LPT3`). Returns `true` if the path names a device.
 pub fn is_dos_device_name(path: &[u16]) -> bool {
@@ -724,6 +781,34 @@ mod tests {
         assert!(
             dos_path_name_to_nt_path_name_rel(&u("C:services.exe"), &u("C:\\Windows")).is_none()
         );
+    }
+
+    #[test]
+    fn relative_nt_plan_uses_canonical_current_directory_subspan() {
+        let plan = relative_nt_path_plan(&u("foo\\bar"), &u("C:\\Windows\\"), true).unwrap();
+        assert_eq!(s(&plan.nt_path), "\\??\\C:\\Windows\\foo\\bar");
+        assert_eq!(s(&plan.nt_path[plan.relative_offset.unwrap()..]), "foo\\bar");
+
+        let plan = relative_nt_path_plan(
+            &u("sub\\..\\foo"),
+            &u("c:\\WINDOWS"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s(&plan.nt_path), "\\??\\c:\\WINDOWS\\foo");
+        assert_eq!(s(&plan.nt_path[plan.relative_offset.unwrap()..]), "foo");
+    }
+
+    #[test]
+    fn relative_nt_plan_rejects_unsafe_handle_relative_cases() {
+        let escaped = relative_nt_path_plan(&u("..\\outside"), &u("C:\\Windows"), true).unwrap();
+        assert_eq!(escaped.relative_offset, None);
+        let no_handle = relative_nt_path_plan(&u("foo"), &u("C:\\Windows"), false).unwrap();
+        assert_eq!(no_handle.relative_offset, None);
+        for absolute in ["C:\\Windows2\\x", "D:\\x", "\\rooted", "\\\\server\\share\\x"] {
+            let plan = relative_nt_path_plan(&u(absolute), &u("C:\\Windows"), true).unwrap();
+            assert_eq!(plan.relative_offset, None, "{absolute}");
+        }
     }
 
     #[test]
