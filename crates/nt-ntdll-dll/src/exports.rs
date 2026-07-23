@@ -12099,6 +12099,10 @@ pub unsafe extern "system" fn rtl_find_message(
 
 // ---- activation context stack --------------------------------------------------------------------
 
+const FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX: u32 = 0x01;
+const ACTCTX_SECTION_KEYED_DATA_MIN_SIZE: u32 = 64;
+const ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE: u32 = 68;
+
 #[cfg(target_arch = "x86_64")]
 fn activation_context_lock_ptr() -> *mut c_void {
     core::ptr::addr_of_mut!(RTL_ACTIVATION_CONTEXT_LOCK).cast()
@@ -12231,6 +12235,37 @@ unsafe fn publish_peb_process_activation_context(context: *mut c_void) {
             core::ptr::addr_of_mut!((*(peb as *mut nt_ntdll_layout::Peb)).activation_context_data)
         };
         unsafe { core::ptr::write_volatile(slot, context as u64) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_activation_section_keyed_data(
+    returned_data: *mut c_void,
+    output_size: u32,
+    section: &[u8],
+    data_offset: u32,
+    data_length: u32,
+    returned_context: *mut c_void,
+    roster_index: u32,
+) {
+    let output = returned_data as *mut u8;
+    let section_base = section.as_ptr();
+    debug_assert!((data_offset as usize) <= section.len());
+    unsafe {
+        core::ptr::write_unaligned(output.add(4) as *mut u32, 1);
+        core::ptr::write_unaligned(
+            output.add(8) as *mut *const u8,
+            section_base.add(data_offset as usize),
+        );
+        core::ptr::write_unaligned(output.add(16) as *mut u32, data_length);
+        core::ptr::write_unaligned(output.add(24) as *mut *const u8, core::ptr::null());
+        core::ptr::write_unaligned(output.add(32) as *mut u32, 0);
+        core::ptr::write_unaligned(output.add(40) as *mut *const u8, section_base);
+        core::ptr::write_unaligned(output.add(48) as *mut u32, section.len() as u32);
+        core::ptr::write_unaligned(output.add(56) as *mut *mut c_void, returned_context);
+        if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
+            core::ptr::write_unaligned(output.add(64) as *mut u32, roster_index);
+        }
     }
 }
 
@@ -13299,10 +13334,6 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
     string_to_find: *const c_void,
     returned_data: *mut c_void,
 ) -> NtStatus {
-    const FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX: u32 = 0x01;
-    const ACTCTX_SECTION_KEYED_DATA_MIN_SIZE: u32 = 64;
-    const ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE: u32 = 68;
-
     if flags & !FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0
         || string_to_find.is_null()
         || (flags != 0 && returned_data.is_null())
@@ -13397,44 +13428,20 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                     activation_context_release(context);
                     return STATUS_SUCCESS;
                 }
-                let section_base = section.as_ptr();
-                core::ptr::write_unaligned((returned_data as *mut u8).add(4) as *mut u32, 1);
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(8) as *mut *const u8,
-                    section_base.add(data_offset as usize),
-                );
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(16) as *mut u32,
-                    data_length,
-                );
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(24) as *mut *const u8,
-                    core::ptr::null(),
-                );
-                core::ptr::write_unaligned((returned_data as *mut u8).add(32) as *mut u32, 0);
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(40) as *mut *const u8,
-                    section_base,
-                );
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(48) as *mut u32,
-                    section.len() as u32,
-                );
                 let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(56) as *mut *mut c_void,
+                write_activation_section_keyed_data(
+                    returned_data,
+                    output_size,
+                    section,
+                    data_offset,
+                    data_length,
                     if return_context {
                         context
                     } else {
                         core::ptr::null_mut()
                     },
+                    roster_index,
                 );
-                if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
-                    core::ptr::write_unaligned(
-                        (returned_data as *mut u8).add(64) as *mut u32,
-                        roster_index,
-                    );
-                }
                 if !return_context {
                     activation_context_release(context);
                 }
