@@ -127,10 +127,15 @@ pub fn thread_client_id_from_native(
     unique_process: u64,
     unique_thread: u64,
 ) -> Result<ClientId, u32> {
+    let missing_status = if unique_process == 0 {
+        STATUS_INVALID_PARAMETER
+    } else {
+        STATUS_INVALID_CID
+    };
     let unique_process = u32::try_from(unique_process).map_err(|_| STATUS_INVALID_CID)?;
-    let unique_thread = u32::try_from(unique_thread).map_err(|_| STATUS_INVALID_CID)?;
+    let unique_thread = u32::try_from(unique_thread).map_err(|_| missing_status)?;
     if unique_thread == 0 {
-        return Err(STATUS_INVALID_CID);
+        return Err(missing_status);
     }
     Ok(ClientId {
         unique_process,
@@ -819,9 +824,12 @@ impl ProcessManager {
         if self.process(caller_pid).is_none() {
             return Err(STATUS_INVALID_HANDLE);
         }
-        let thread = self
-            .thread(client_id.unique_thread)
-            .ok_or(STATUS_INVALID_CID)?;
+        let missing_status = if client_id.unique_process == 0 {
+            STATUS_INVALID_PARAMETER
+        } else {
+            STATUS_INVALID_CID
+        };
+        let thread = self.thread(client_id.unique_thread).ok_or(missing_status)?;
         if client_id.unique_process != 0 && thread.process_id != client_id.unique_process {
             return Err(STATUS_INVALID_CID);
         }

@@ -337,23 +337,39 @@ fn open_thread_by_client_id_rejects_invalid_ids_without_minting() {
     let other = pm.create_process("other.exe", None, None);
     let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
 
-    for client_id in [
-        ClientId {
-            unique_process: other,
-            unique_thread: tid,
-        },
-        ClientId {
-            unique_process: target,
-            unique_thread: 0,
-        },
-        ClientId {
-            unique_process: target,
-            unique_thread: 0xDEAD,
-        },
+    for (client_id, status) in [
+        (
+            ClientId {
+                unique_process: other,
+                unique_thread: tid,
+            },
+            STATUS_INVALID_CID,
+        ),
+        (
+            ClientId {
+                unique_process: target,
+                unique_thread: 0,
+            },
+            STATUS_INVALID_CID,
+        ),
+        (
+            ClientId {
+                unique_process: target,
+                unique_thread: 0xDEAD,
+            },
+            STATUS_INVALID_CID,
+        ),
+        (
+            ClientId {
+                unique_process: 0,
+                unique_thread: 0xDEAD,
+            },
+            STATUS_INVALID_PARAMETER,
+        ),
     ] {
         assert_eq!(
             pm.open_thread_by_client_id(caller, client_id, THREAD_ALL_ACCESS),
-            Err(STATUS_INVALID_CID)
+            Err(status)
         );
         assert_eq!(pm.handle_count(caller), 0);
     }
@@ -390,10 +406,18 @@ fn thread_access_and_native_client_id_mapping_match_nt_policy() {
             unique_thread: 0x1234,
         })
     );
+    assert_eq!(
+        thread_client_id_from_native(0, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
     assert_eq!(thread_client_id_from_native(1, 0), Err(STATUS_INVALID_CID));
     assert_eq!(
         thread_client_id_from_native(u32::MAX as u64 + 1, 1),
         Err(STATUS_INVALID_CID)
+    );
+    assert_eq!(
+        thread_client_id_from_native(0, u32::MAX as u64 + 1),
+        Err(STATUS_INVALID_PARAMETER)
     );
     assert_eq!(
         thread_client_id_from_native(1, u32::MAX as u64 + 1),

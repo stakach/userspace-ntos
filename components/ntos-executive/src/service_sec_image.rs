@@ -5194,7 +5194,7 @@ pub(crate) unsafe fn service_sec_image(
                 Some(client_id),
                 0x0400, // PROCESS_QUERY_INFORMATION
             ) {
-                nt_handler.account_published_process_handle(owner);
+                nt_handler.account_published_pm_handle(owner);
                 open_ok |= 1;
             }
             if nt_handler

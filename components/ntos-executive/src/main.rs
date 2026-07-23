@@ -726,6 +726,7 @@ pub const SSN_NT_CLOSE: u64 = 27;
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
+pub const SSN_NT_OPEN_THREAD: u64 = 134;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
 pub const SSN_NT_OPEN_THREAD_TOKEN_EX: u64 = 136;
 pub const SSN_NT_OPEN_PROCESS: u64 = 128;
@@ -5137,6 +5138,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCompleteConnectPort, SSN_NT_COMPLETE_CONNECT_PORT as u32),
             (NativeService::NtRequestWaitReplyPort, SSN_NT_REQUEST_WAIT_REPLY_PORT as u32),
             (NativeService::NtOpenProcess, SSN_NT_OPEN_PROCESS as u32),
+            (NativeService::NtOpenThread, SSN_NT_OPEN_THREAD as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),

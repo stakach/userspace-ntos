@@ -162,7 +162,58 @@ unsafe fn sm_open_process_call(
     ) {
         Ok((owner, handle)) => {
             if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
-                nt_handler.account_published_process_handle(owner);
+                nt_handler.account_published_pm_handle(owner);
+                0
+            } else {
+                let _ = nt_handler.pm.take_handle(owner, handle);
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+        Err(status) => status as u64,
+    };
+    nt_handler.pi = saved_pi;
+    result
+}
+
+unsafe fn sm_open_thread_call(
+    nt_handler: &mut ExecNtHandler,
+    thread_handle: u64,
+    desired_access: u32,
+    object_attributes: u64,
+    client_id: u64,
+) -> u64 {
+    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
+    if !sm_stack_has_range(thread_handle, core::mem::size_of::<u64>()) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let client_id = if client_id == 0 {
+        None
+    } else {
+        if client_id & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let Some(client_id) = sm_capture_client_id(client_id) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+        Some(client_id)
+    };
+    if object_attributes & 3 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    let Some(object_attributes) = sm_capture_object_attributes(object_attributes) else {
+        return STATUS_ACCESS_VIOLATION;
+    };
+    let saved_pi = nt_handler.pi;
+    nt_handler.pi = 0;
+    let result = match nt_handler.open_thread_captured(
+        object_attributes,
+        client_id,
+        desired_access,
+    ) {
+        Ok((owner, handle)) => {
+            if sm_stack_copyout(thread_handle, &(handle as u64).to_le_bytes()) {
+                nt_handler.account_published_pm_handle(owner);
                 0
             } else {
                 let _ = nt_handler.pm.take_handle(owner, handle);
@@ -384,6 +435,15 @@ pub(crate) unsafe fn sm_rendezvous(
                     // Mint the handle in SMSS's real table; SmpSbCreateSession later uses the saved
                     // CSRSS process handle as NtDuplicateObject's target process.
                     result = sm_open_process_call(
+                        nt_handler,
+                        get_recv_mr(9),
+                        rdx as u32,
+                        get_recv_mr(7),
+                        get_recv_mr(8),
+                    );
+                }
+                SSN_NT_OPEN_THREAD => {
+                    result = sm_open_thread_call(
                         nt_handler,
                         get_recv_mr(9),
                         rdx as u32,
@@ -693,6 +753,15 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                     SSN_SET_INFO_THREAD => {}
                     SSN_NT_OPEN_PROCESS => {
                         result = sm_open_process_call(
+                            nt_handler,
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(7),
+                            get_recv_mr(8),
+                        );
+                    }
+                    SSN_NT_OPEN_THREAD => {
+                        result = sm_open_thread_call(
                             nt_handler,
                             get_recv_mr(9),
                             rdx as u32,
