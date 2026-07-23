@@ -2260,6 +2260,22 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     unsafe {
         EXE_BASE = smss_base;
     }
+    // RtlCreateUserProcess copies a de-normalized (self-relative) parameters block into the child.
+    // Real ntdll normalizes it before loader initialization exposes ImagePathName, CommandLine, and
+    // the other embedded strings to import resolution or DLL_PROCESS_ATTACH. Our trampoline enters
+    // this loader directly, so perform that startup step here. Boot-created processes already carry
+    // normalized parameters; RtlNormalizeProcessParams is idempotent for them.
+    // SAFETY: gs:[0x60] is the live PEB and the executive maps Peb->ProcessParameters before entry.
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb != 0 {
+            let parameters = core::ptr::read_unaligned((peb + 0x20) as *const u64);
+            if parameters != 0 {
+                crate::exports::rtl_normalize_process_params(parameters as *mut core::ffi::c_void);
+            }
+        }
+    }
     // (1) Process heap — install it so `alloc` works for any engine code that needs it, AND publish
     // its base into `Peb->ProcessHeap` (x64 PEB+0x30). Real ntdll's LdrpInitializeProcess sets
     // `Peb->ProcessHeap = RtlCreateHeap(...)`; kernel32's `GetProcessHeap()` returns exactly that

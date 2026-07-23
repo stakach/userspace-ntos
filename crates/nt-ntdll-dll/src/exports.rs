@@ -3526,9 +3526,10 @@ pub unsafe extern "system" fn rtl_adjust_privilege(
 // =================================================================================================
 
 /// `RtlNormalizeProcessParams(PRTL_USER_PROCESS_PARAMETERS) -> PRTL_USER_PROCESS_PARAMETERS`
-/// (ppb.c:280). BATCH 1: real — rebases each non-null `UNICODE_STRING.Buffer` + `Environment` OFFSET
-/// to `params + offset` and sets the `NORMALIZED` flag (no-op if already normalized). The block's own
-/// base is `params` (the block is self-relative). Returns `params`.
+/// (ppb.c:280). BATCH 1: real — rebases each non-null `UNICODE_STRING.Buffer` to `params + offset`
+/// and sets the `NORMALIZED` flag (no-op if already normalized). As in ReactOS, `Environment`
+/// remains a live VA rather than a self-relative field. The block's own base is `params`. Returns
+/// `params`.
 ///
 /// # Safety
 /// `params` a valid `RTL_USER_PROCESS_PARAMETERS` or null.
