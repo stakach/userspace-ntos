@@ -2007,6 +2007,14 @@ static mut PFILLED: [[u64; 512]; MAX_PI] = [[0u64; 512]; MAX_PI];
 /// change → sel4test byte-identical).
 static mut FILLED_WORK: [u64; 512] = [0u64; 512];
 
+/// Persistent directory FILE_OBJECT state. `ExecNtHandler` is a local in
+/// `service_sec_image`; embedding this table there adds roughly 34 KiB and makes the
+/// service function's frame exceed the bounded rootserver stack. The executive loop
+/// is serialized, so one fixed table can be reset and exclusively borrowed by each
+/// successive handler instance.
+static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> =
+    nt_fs::DirectoryOpenTable::new();
+
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
@@ -4716,7 +4724,8 @@ struct ExecNtHandler {
     /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
     io_completion_ports: nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>,
     /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
-    directory_opens: nt_fs::DirectoryOpenTable<64>,
+    /// The backing table lives in BSS to keep it off the bounded rootserver stack.
+    directory_opens: ExecDirectoryOpens,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -4929,6 +4938,49 @@ struct ExecNtHandler {
     /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
     /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
     dll_loaded_dirty: bool,
+}
+
+/// Exclusive pointer to the serialized executive's fixed directory-open table.
+///
+/// Keeping the forwarding API here makes it impossible for the large table value to
+/// become an `ExecNtHandler` field again by accident.
+struct ExecDirectoryOpens {
+    table: *mut nt_fs::DirectoryOpenTable<64>,
+}
+
+impl ExecDirectoryOpens {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(DIRECTORY_OPEN_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been
+        // dropped before a new one is constructed, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn create(&mut self, first_cluster: u32) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).create(first_cluster) }
+    }
+
+    fn get(&self, id: u32) -> Result<&nt_fs::DirectoryOpen, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get(id) }
+    }
+
+    fn get_mut(&mut self, id: u32) -> Result<&mut nt_fs::DirectoryOpen, u32> {
+        // SAFETY: mutable access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&mut *self.table).get_mut(id) }
+    }
+
+    fn retain(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain(id) }
+    }
+
+    fn release(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release(id) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

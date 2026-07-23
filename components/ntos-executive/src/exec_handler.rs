@@ -224,7 +224,7 @@ impl ExecNtHandler {
             )
             .unwrap(),
             io_completion_ports: nt_io_completion::CompletionPortTable::new(),
-            directory_opens: nt_fs::DirectoryOpenTable::new(),
+            directory_opens: ExecDirectoryOpens::reset(),
             pi: 0,
             current_tid: 0,
             current_badge: 0,

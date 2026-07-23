@@ -226,6 +226,16 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         }
         Ok(())
     }
+
+    /// Drop every open description without constructing another table-sized value.
+    ///
+    /// This is useful for fixed storage whose address must remain stable across an
+    /// executive service-loop restart.
+    pub fn clear(&mut self) {
+        for slot in &mut self.slots {
+            *slot = DirectoryOpenSlot::empty();
+        }
+    }
 }
 
 impl<const SLOTS: usize> Default for DirectoryOpenTable<SLOTS> {
@@ -586,5 +596,19 @@ mod tests {
         table.release(shared).unwrap();
         assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.create(99).unwrap(), shared);
+    }
+
+    #[test]
+    fn directory_open_table_clear_reuses_fixed_storage() {
+        let mut table = DirectoryOpenTable::<2>::new();
+        let first = table.create(41).unwrap();
+        table.retain(first).unwrap();
+        table.create(42).unwrap();
+
+        table.clear();
+
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.create(99).unwrap(), 0);
+        assert_eq!(table.create(100).unwrap(), 1);
     }
 }
