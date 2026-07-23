@@ -13115,6 +13115,15 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 Ok(section) => section,
                 Err(status) => return status,
             };
+        let clr_surrogate_section =
+            match nt_ntdll::rtl::activation_section::build_clr_surrogate_section(&[
+                nt_ntdll::rtl::activation_section::ClrSurrogateAssembly {
+                    surrogates: &details.clr_surrogates,
+                },
+            ]) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
         let parsed = details.root;
         let application_directory =
             if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
@@ -13161,6 +13170,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 parsed.dll_redirects,
                 dll_redirect_section,
                 window_class_redirect_section,
+                clr_surrogate_section,
                 encoded_assembly_identity,
             ),
         );
