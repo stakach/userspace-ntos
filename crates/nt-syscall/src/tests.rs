@@ -101,6 +101,15 @@ fn service_table_numbering() {
 }
 
 #[test]
+fn query_directory_file_keeps_native_eleven_argument_contract() {
+    assert_eq!(NativeService::NtQueryDirectoryFile.name(), "NtQueryDirectoryFile");
+    assert_eq!(NativeService::NtQueryDirectoryFile.arg_count(), (11, 11));
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtQueryDirectoryFile)
+        .is_some());
+}
+
+#[test]
 fn unknown_service_rejected() {
     let d = dispatcher();
     let mut ks = services();

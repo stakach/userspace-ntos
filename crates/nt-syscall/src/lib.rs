@@ -68,6 +68,7 @@ pub enum NativeService {
     NtDeviceIoControlFile,
     NtCreateNamedPipeFile,
     NtFsControlFile,
+    NtQueryDirectoryFile,
     NtQueryInformationFile,
     NtSetInformationFile,
     NtFlushBuffersFile,
@@ -212,6 +213,7 @@ impl NativeService {
             NtDeviceIoControlFile => "NtDeviceIoControlFile",
             NtCreateNamedPipeFile => "NtCreateNamedPipeFile",
             NtFsControlFile => "NtFsControlFile",
+            NtQueryDirectoryFile => "NtQueryDirectoryFile",
             NtQueryInformationFile => "NtQueryInformationFile",
             NtSetInformationFile => "NtSetInformationFile",
             NtFlushBuffersFile => "NtFlushBuffersFile",
@@ -374,6 +376,7 @@ impl NativeService {
             NtCreateEvent => (5, 5),
             // The filesystem-control handler forwards all native buffer arguments to the FSD.
             NtFsControlFile => (10, 10),
+            NtQueryDirectoryFile => (11, 11),
             _ => (0, 16), // permissive for the rest in v0.1
         }
     }
@@ -488,6 +491,7 @@ impl NativeService {
         NativeService::NtOpenProcessTokenEx,
         NativeService::NtDuplicateToken,
         NativeService::NtOpenThreadTokenEx,
+        NativeService::NtQueryDirectoryFile,
     ];
 }
 

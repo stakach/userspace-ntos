@@ -750,6 +750,9 @@ pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 /// NtQueryDirectoryObject SSN (sysfuncs.lst line 153 = SSN 152). ntdll's named-object path
 /// enumerates \BaseNamedObjects when services' SCM CreateEventW resolves a named event.
 pub const SSN_NT_QUERY_DIRECTORY_OBJECT: u64 = 152;
+/// NtQueryDirectoryFile SSN (sysfuncs.lst line 152 = SSN 151). Activation-context probing uses
+/// this to enumerate real FAT directories with FileBothDirectoryInformation.
+pub const SSN_NT_QUERY_DIRECTORY_FILE: u64 = 151;
 /// NtOpenEvent SSN (sysfuncs.lst line 121 = SSN 120). CreateEventW's ERROR_ALREADY_EXISTS
 /// fallback + OpenEventW open an existing named event in \BaseNamedObjects.
 pub const SSN_NT_OPEN_EVENT: u64 = 120;
@@ -5109,6 +5112,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenDirectoryObject, SSN_NT_OPEN_DIRECTORY_OBJECT as u32),
             (NativeService::NtCreateDirectoryObject, SSN_NT_CREATE_DIRECTORY_OBJECT as u32),
             (NativeService::NtQueryDirectoryObject, SSN_NT_QUERY_DIRECTORY_OBJECT as u32),
+            (NativeService::NtQueryDirectoryFile, SSN_NT_QUERY_DIRECTORY_FILE as u32),
             (NativeService::NtCreateSymbolicLinkObject, SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT as u32),
             (NativeService::NtOpenSymbolicLinkObject, SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32),
             // Workstream A batch 4 (group B2): out-writing query services (queued-write drain).

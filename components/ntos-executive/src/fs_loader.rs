@@ -25,6 +25,43 @@ pub(crate) unsafe fn fat_next(fs: &Fat32, cluster: u32) -> u32 {
     (core::ptr::read_unaligned(p.add(off as usize) as *const u32)) & 0x0FFF_FFFF
 }
 
+/// Visit native directory entries in stable FAT stream order. LFN fragments are decoded by the
+/// pure `nt-fs` parser after copying each DMA-backed slot to local storage.
+pub(crate) unsafe fn fat_visit_directory(
+    fs: &Fat32,
+    dir_cluster: u32,
+    mut visit: impl FnMut(nt_fs::DirectoryEntry) -> bool,
+) {
+    let mut decoder = nt_fs::FatDirectoryDecoder::new();
+    let cluster_bytes = fs.bps.saturating_mul(fs.spc);
+    let mut file_index = 0u32;
+    let mut cluster = dir_cluster;
+    while cluster >= 2 && cluster < 0x0fff_fff8 {
+        for sector in 0..fs.spc {
+            let data = fat_read_sector(fs, fat_cluster_sector(fs, cluster) + sector);
+            for index in 0..(fs.bps as usize / 32) {
+                let mut slot = [0u8; 32];
+                core::ptr::copy_nonoverlapping(data.add(index * 32), slot.as_mut_ptr(), slot.len());
+                match decoder.consume(&slot, file_index, cluster_bytes) {
+                    nt_fs::FatDirectorySlot::End => return,
+                    nt_fs::FatDirectorySlot::Skipped => {}
+                    nt_fs::FatDirectorySlot::Entry(record) => {
+                        if !visit(record.entry) {
+                            return;
+                        }
+                    }
+                }
+                file_index = file_index.saturating_add(32);
+            }
+        }
+        let next = fat_next(fs, cluster);
+        if next == cluster {
+            return;
+        }
+        cluster = next;
+    }
+}
+
 /// Scan directory `dir_cluster` (following its cluster chain) for the 8.3 name `name11`
 /// (11 bytes, space-padded). Returns (first_cluster, size_bytes, attr). LFN / deleted /
 /// volume-label / free entries are skipped. Extracts the entry before any further reads.

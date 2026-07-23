@@ -2212,6 +2212,42 @@ impl ExecNtHandler {
         }
         out
     }
+
+    unsafe fn read_directory_pattern(
+        &self,
+        ustr_va: u64,
+        output: &mut [u16; nt_fs::MAX_DIRECTORY_NAME],
+    ) -> Result<usize, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if ustr_va == 0 {
+            return Ok(0);
+        }
+        let mut header = [0u8; 16];
+        if !self.xas_read(ustr_va, &mut header) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let byte_len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let maximum_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let buffer = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if byte_len & 1 != 0 || byte_len > maximum_len || byte_len / 2 > output.len() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if byte_len == 0 {
+            return Ok(0);
+        }
+        if buffer == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut bytes = [0u8; nt_fs::MAX_DIRECTORY_NAME * 2];
+        if !self.xas_read(buffer, &mut bytes[..byte_len]) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        for index in 0..byte_len / 2 {
+            output[index] = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+        }
+        Ok(byte_len / 2)
+    }
     /// Cross-AS OBJECT_ATTRIBUTES.ObjectName read (OA+0x10 → PUNICODE_STRING) via [`read_ustr_pe`],
     /// so a name Buffer in a not-yet-faulted DLL `.rdata` page resolves from the PE. Used for services
     /// (pi 3) registry key opens (see `read_objattr_name`, whose scratch-alias fallback only reaches
@@ -6905,6 +6941,135 @@ impl NativeSyscallHandler for ExecNtHandler {
                 self.queue_write(iosb, 0); // Status = STATUS_SUCCESS
                 self.queue_write(iosb + 8, 8); // Information = bytes written
                 0
+            }
+            // NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+            // FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+            // RestartScan). Directory-open state is shared by duplicated handles.
+            NativeService::NtQueryDirectoryFile => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+                const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+                const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+                const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+                const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+                const GENERIC_READ: u32 = 0x8000_0000;
+                const GENERIC_ALL: u32 = 0x1000_0000;
+                const MAX_QUERY_BUFFER: usize = 1024 * 1024;
+
+                if args[2] != 0 {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                let event_index = if args[1] == 0 {
+                    None
+                } else {
+                    match self.event_index_for_handle(args[1], 0) {
+                        Ok(index) => Some(index),
+                        Err(status) => return status,
+                    }
+                };
+                let iosb = args[4];
+                let output = args[5];
+                let length = match usize::try_from(args[6]) {
+                    Ok(length) if length <= MAX_QUERY_BUFFER => length,
+                    _ => return STATUS_INSUFFICIENT_RESOURCES,
+                };
+                if iosb == 0 || output == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if iosb & 7 != 0 || output & 7 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if !self.probe_user_output(iosb, 16)
+                    || !self.probe_user_output(output, length)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                let pid = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let handle = args[0] as nt_process::Handle;
+                let (first_cluster, object_id) = match self.pm.lookup_handle(pid, handle) {
+                    Some(nt_process::HandleObject::Directory {
+                        first_cluster,
+                        object_id,
+                    }) => (first_cluster, object_id),
+                    Some(_) => return STATUS_OBJECT_TYPE_MISMATCH,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
+                if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
+                    return nt_fs::STATUS_ACCESS_DENIED;
+                }
+                let open = match self.directory_opens.get(object_id) {
+                    Ok(open) if open.first_cluster == first_cluster => *open,
+                    _ => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let fs = match exec_fs() {
+                    Some(fs) => fs,
+                    None => return 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                };
+
+                let mut pattern = [0u16; nt_fs::MAX_DIRECTORY_NAME];
+                let pattern_len = match self.read_directory_pattern(args[9], &mut pattern) {
+                    Ok(length) => length,
+                    Err(status) => return status,
+                };
+                let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
+
+                let mut entry_count = 0usize;
+                fat_visit_directory(&fs, first_cluster, |_| {
+                    entry_count = entry_count.saturating_add(1);
+                    true
+                });
+                let mut entries = alloc::vec::Vec::new();
+                if entries.try_reserve_exact(entry_count).is_err() {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                fat_visit_directory(&fs, first_cluster, |entry| {
+                    entries.push(entry);
+                    true
+                });
+
+                let mut encoded = alloc::vec::Vec::new();
+                if encoded.try_reserve_exact(length).is_err() {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                encoded.resize(length, 0);
+                let result = {
+                    let directory = match self.directory_opens.get_mut(object_id) {
+                        Ok(directory) => directory,
+                        Err(status) => return status,
+                    };
+                    nt_fs::query_directory(
+                        &mut directory.query,
+                        &entries,
+                        args[7] as u32,
+                        args[8] != 0,
+                        pattern,
+                        args[10] != 0,
+                        &mut encoded,
+                    )
+                };
+                let mut iosb_bytes = [0u8; 16];
+                iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
+                iosb_bytes[8..].copy_from_slice(&(result.information as u64).to_le_bytes());
+                if !self.xas_try_write_buf(output, &encoded[..result.information])
+                    || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                {
+                    if let Ok(directory) = self.directory_opens.get_mut(object_id) {
+                        directory.query = open.query;
+                    }
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if let Some(index) = event_index {
+                    if self.events.set_existing(index as u64).is_none() {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    }
+                    let _ = wait_wake_dispatcher(self, None);
+                }
+                result.status
             }
             // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
             // FileInformationClass). Resolve process-local ownership here; nt-fs owns the ABI layout.
