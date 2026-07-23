@@ -3914,17 +3914,22 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
     let input = unsafe { core::slice::from_raw_parts(dos_name, len) };
     #[cfg(target_arch = "x86_64")]
     let (plan, containing_directory, cur_dir_ref, prepare_status) = {
-        let lock = !relative_name.is_null();
-        if lock {
-            unsafe { rtl_acquire_peb_lock() };
-        }
+        unsafe { rtl_acquire_peb_lock() };
         let cwd = peb_current_directory();
         let current_handle = peb_current_directory_handle();
-        let plan = rtl::path::relative_nt_path_plan(input, &cwd, current_handle != 0);
+        let plan = rtl::path::try_relative_nt_path_plan(input, &cwd, current_handle != 0);
         let mut containing_directory = 0u64;
         let mut cur_dir_ref = core::ptr::null_mut::<RtlpCurDirRef>();
-        let mut status = STATUS_SUCCESS;
-        if plan.as_ref().and_then(|plan| plan.relative_offset).is_some()
+        let mut status = match &plan {
+            Ok(_) => STATUS_SUCCESS,
+            Err(rtl::path::NtPathPlanError::InvalidName) => STATUS_OBJECT_NAME_INVALID,
+            Err(rtl::path::NtPathPlanError::NameTooLong) => STATUS_NAME_TOO_LONG,
+        };
+        if plan
+            .as_ref()
+            .ok()
+            .and_then(|plan| plan.relative_offset)
+            .is_some()
             && !relative_name.is_null()
         {
             containing_directory = current_handle;
@@ -3950,23 +3955,24 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
                 }
             }
         }
-        if lock {
-            unsafe { rtl_release_peb_lock() };
-        }
-        (plan, containing_directory, cur_dir_ref, status)
+        unsafe { rtl_release_peb_lock() };
+        (plan.ok(), containing_directory, cur_dir_ref, status)
     };
     #[cfg(not(target_arch = "x86_64"))]
-    let (plan, containing_directory, cur_dir_ref, prepare_status) = (
-        rtl::path::dos_path_name_to_nt_path_name(input).map(|nt_path| {
-            rtl::path::RelativeNtPathPlan {
-                nt_path,
-                relative_offset: None,
-            }
-        }),
-        0u64,
-        core::ptr::null_mut::<RtlpCurDirRef>(),
-        STATUS_SUCCESS,
-    );
+    let (plan, containing_directory, cur_dir_ref, prepare_status) = {
+        let plan = rtl::path::try_relative_nt_path_plan(input, &[], false);
+        let status = match &plan {
+            Ok(_) => STATUS_SUCCESS,
+            Err(rtl::path::NtPathPlanError::InvalidName) => STATUS_OBJECT_NAME_INVALID,
+            Err(rtl::path::NtPathPlanError::NameTooLong) => STATUS_NAME_TOO_LONG,
+        };
+        (
+            plan.ok(),
+            0u64,
+            core::ptr::null_mut::<RtlpCurDirRef>(),
+            status,
+        )
+    };
     if !nt_success(prepare_status) {
         return prepare_status;
     }
@@ -4004,11 +4010,8 @@ unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
         core::ptr::write(core::ptr::addr_of_mut!((*nt_name).buffer), buf as u64);
 
         if !part_name.is_null() {
-            let last_sep = nt
-                .iter()
-                .rposition(|&c| c == b'\\' as u16 || c == b'/' as u16);
-            match last_sep {
-                Some(i) if i + 1 < n_units => core::ptr::write(part_name, buf.add(i + 1)),
+            match plan.part_offset {
+                Some(offset) => core::ptr::write(part_name, buf.add(offset)),
                 _ => core::ptr::write(part_name, core::ptr::null_mut()),
             }
         }
@@ -4038,17 +4041,15 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
     relative_name: *mut c_void,
 ) -> u8 {
     // SAFETY: forwards the same descriptor/pointer contract.
-    u8::from(
-        unsafe {
-            rtl_dos_path_name_to_nt_path_name_u_impl(
-                dos_name,
-                nt_name,
-                part_name as *mut *mut u16,
-                relative_name,
-                false,
-            )
-        } == STATUS_SUCCESS,
-    )
+    u8::from(nt_success(unsafe {
+        rtl_dos_path_name_to_nt_path_name_u_impl(
+            dos_name,
+            nt_name,
+            part_name as *mut *mut u16,
+            relative_name,
+            false,
+        )
+    }))
 }
 
 /// `RtlDosPathNameToNtPathName_U_WithStatus(...) -> NTSTATUS`.
@@ -11973,17 +11974,15 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u(
     relative_name: *mut c_void,
 ) -> u8 {
     // SAFETY: forwards the same descriptor/pointer contract.
-    u8::from(
-        unsafe {
-            rtl_dos_path_name_to_nt_path_name_u_impl(
-                dos_name,
-                nt_name,
-                part_name,
-                relative_name,
-                true,
-            )
-        } == STATUS_SUCCESS,
-    )
+    u8::from(nt_success(unsafe {
+        rtl_dos_path_name_to_nt_path_name_u_impl(
+            dos_name,
+            nt_name,
+            part_name,
+            relative_name,
+            true,
+        )
+    }))
 }
 
 /// `RtlDosPathNameToRelativeNtPathName_U_WithStatus(...) -> NTSTATUS`.

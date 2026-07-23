@@ -437,19 +437,70 @@ pub fn dos_path_name_to_nt_path_name_rel(name: &[u16], cwd: &[u16]) -> Option<Ve
 pub struct RelativeNtPathPlan {
     pub nt_path: Vec<u16>,
     pub relative_offset: Option<usize>,
+    pub part_offset: Option<usize>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NtPathPlanError {
+    InvalidName,
+    NameTooLong,
 }
 
 /// Plan `RtlDosPathNameToRelativeNtPathName_U`. The relative result is valid only when a current
 /// directory handle exists and the canonical result remains under that directory on a component
 /// boundary. The full NT path is always returned for supported DOS path forms.
-pub fn relative_nt_path_plan(
+pub fn try_relative_nt_path_plan(
     name: &[u16],
     cwd: &[u16],
     has_current_directory_handle: bool,
-) -> Option<RelativeNtPathPlan> {
+) -> Result<RelativeNtPathPlan, NtPathPlanError> {
+    if name.is_empty() {
+        return Err(NtPathPlanError::InvalidName);
+    }
+    let input_bytes = name
+        .len()
+        .checked_add(1)
+        .and_then(|units| units.checked_mul(core::mem::size_of::<u16>()))
+        .ok_or(NtPathPlanError::NameTooLong)?;
+    if input_bytes > MAX_UNICODE_STRING_BUFFER_BYTES {
+        return Err(NtPathPlanError::NameTooLong);
+    }
+
+    let finish = |nt_path: Vec<u16>, relative_offset: Option<usize>, part_offset: Option<usize>| {
+        let bytes = nt_path
+            .len()
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(core::mem::size_of::<u16>()))
+            .ok_or(NtPathPlanError::NameTooLong)?;
+        if bytes > MAX_UNICODE_STRING_BUFFER_BYTES {
+            return Err(NtPathPlanError::NameTooLong);
+        }
+        Ok(RelativeNtPathPlan {
+            nt_path,
+            relative_offset,
+            part_offset,
+        })
+    };
+
+    // ReactOS fast-paths the exact Win32 NT prefix and copies everything after it byte-for-byte.
+    // Forward slashes, dot components, duplicate separators, and trailing spaces/dots are data here.
+    if name.len() > 4 && name[..4] == [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16] {
+        let mut nt_path = Vec::with_capacity(name.len());
+        nt_path.extend("\\??\\".encode_utf16());
+        nt_path.extend_from_slice(&name[4..]);
+        let part_offset = nt_path
+            .iter()
+            .rposition(|unit| *unit == b'\\' as u16)
+            .and_then(|position| (position + 1 < nt_path.len()).then_some(position + 1));
+        return finish(nt_path, None, part_offset);
+    }
+
     let input_type = determine_dos_path_name_type(name);
+    if input_type == DosPathType::RootLocalDevice {
+        return finish("\\??\\".encode_utf16().collect(), None, None);
+    }
     let full_dos = super::environment::full_path_units(name, cwd);
-    let nt_path = dos_path_name_to_nt_path_name(&full_dos)?;
+    let nt_path = dos_path_name_to_nt_path_name(&full_dos).ok_or(NtPathPlanError::InvalidName)?;
     let relative_offset = if input_type == DosPathType::Relative && has_current_directory_handle {
         let canonical_cwd = super::environment::full_path_units(&[b'.' as u16], cwd);
         let cwd_end = canonical_cwd
@@ -474,10 +525,39 @@ pub fn relative_nt_path_plan(
     } else {
         None
     };
-    Some(RelativeNtPathPlan {
-        nt_path,
-        relative_offset,
-    })
+    let part_offset =
+        ordinary_part_offset(&full_dos).map(|offset| nt_path.len() - full_dos.len() + offset);
+    finish(nt_path, relative_offset, part_offset)
+}
+
+/// Compatibility wrapper for callers that only distinguish a valid plan from failure.
+pub fn relative_nt_path_plan(
+    name: &[u16],
+    cwd: &[u16],
+    has_current_directory_handle: bool,
+) -> Option<RelativeNtPathPlan> {
+    try_relative_nt_path_plan(name, cwd, has_current_directory_handle).ok()
+}
+
+fn ordinary_part_offset(full_dos: &[u16]) -> Option<usize> {
+    if full_dos.last().map_or(true, |unit| is_sep(*unit)) {
+        return None;
+    }
+    let last_separator = full_dos.iter().rposition(|unit| is_sep(*unit))?;
+    if determine_dos_path_name_type(full_dos) == DosPathType::UncAbsolute {
+        let server_end = full_dos[2..]
+            .iter()
+            .position(|unit| is_sep(*unit))
+            .map(|offset| offset + 2)?;
+        let share_end = full_dos[server_end + 1..]
+            .iter()
+            .position(|unit| is_sep(*unit))
+            .map(|offset| offset + server_end + 1)?;
+        if last_separator < share_end {
+            return None;
+        }
+    }
+    Some(last_separator + 1)
 }
 
 fn fold_ascii(unit: u16) -> u16 {
@@ -804,6 +884,67 @@ mod tests {
             relative_nt_path_plan(&u("\\\\.\\pipe\\lsarpc"), &u("C:\\Windows"), true).unwrap();
         assert_eq!(s(&plan.nt_path), "\\??\\pipe\\lsarpc");
         assert_eq!(plan.relative_offset, None);
+    }
+
+    #[test]
+    fn relative_nt_plan_preserves_win32_nt_prefix_verbatim() {
+        for (input, expected, part) in [
+            ("\\\\?\\foo/bar", "\\??\\foo/bar", Some("foo/bar")),
+            ("\\\\?\\foo\\.", "\\??\\foo\\.", Some(".")),
+            ("\\\\?\\foo\\..", "\\??\\foo\\..", Some("..")),
+            ("\\\\?\\foo\\\\bar ", "\\??\\foo\\\\bar ", Some("bar ")),
+            ("\\\\?\\foo\\", "\\??\\foo\\", None),
+        ] {
+            let plan = try_relative_nt_path_plan(&u(input), &u("C:\\Windows"), true).unwrap();
+            assert_eq!(s(&plan.nt_path), expected);
+            let actual_part = plan.part_offset.map(|offset| s(&plan.nt_path[offset..]));
+            assert_eq!(actual_part.as_deref(), part);
+            assert_eq!(plan.relative_offset, None);
+        }
+    }
+
+    #[test]
+    fn relative_nt_plan_handles_local_device_roots_and_unc_parts() {
+        for input in ["\\\\.", "\\\\?", "\\\\.\\", "\\\\?\\"] {
+            let plan = try_relative_nt_path_plan(&u(input), &u("C:\\Windows"), true).unwrap();
+            assert_eq!(s(&plan.nt_path), "\\??\\");
+            assert_eq!(plan.part_offset, None);
+            assert_eq!(plan.relative_offset, None);
+        }
+
+        for (input, part) in [
+            ("\\\\server", None),
+            ("\\\\server\\share", None),
+            ("\\\\server\\share\\file", Some("file")),
+            ("\\\\server\\share\\dir\\file", Some("file")),
+        ] {
+            let plan = try_relative_nt_path_plan(&u(input), &u("C:\\Windows"), true).unwrap();
+            let actual_part = plan.part_offset.map(|offset| s(&plan.nt_path[offset..]));
+            assert_eq!(actual_part.as_deref(), part);
+        }
+    }
+
+    #[test]
+    fn relative_nt_plan_enforces_native_unicode_string_length() {
+        let mut maximum = u("\\\\?\\");
+        maximum.resize(32_766, b'x' as u16);
+        assert_eq!(
+            try_relative_nt_path_plan(&maximum, &u("C:\\Windows"), false)
+                .unwrap()
+                .nt_path
+                .len(),
+            32_766
+        );
+
+        maximum.push(b'x' as u16);
+        assert_eq!(
+            try_relative_nt_path_plan(&maximum, &u("C:\\Windows"), false),
+            Err(NtPathPlanError::NameTooLong)
+        );
+        assert_eq!(
+            try_relative_nt_path_plan(&[], &u("C:\\Windows"), false),
+            Err(NtPathPlanError::InvalidName)
+        );
     }
 
     #[test]
