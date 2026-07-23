@@ -4,9 +4,15 @@ use alloc::vec::Vec;
 
 use crate::NtStatus;
 
-use super::{activation::DllRedirect, activation_manifest::ManifestWindowClass, strings};
+use super::{
+    activation::DllRedirect,
+    activation_manifest::{ManifestClrSurrogate, ManifestWindowClass},
+    guid::Guid,
+    strings,
+};
 
 pub const STRSECTION_MAGIC: u32 = 0x6448_7353;
+pub const GUIDSECTION_MAGIC: u32 = 0x6448_7347;
 pub const DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME: u32 = 0x01;
 pub const DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT: u32 = 0x02;
 pub const DLL_REDIRECTION_PATH_EXPAND: u32 = 0x04;
@@ -21,6 +27,9 @@ const REDIRECTION_SIZE: usize = 20;
 const PATH_SEGMENT_SIZE: usize = 8;
 const WINDOW_CLASS_REDIRECTION_SIZE: usize = 24;
 const HASH_ALGORITHM_X65599: u32 = 1;
+const GUID_HEADER_SIZE: usize = 40;
+const GUID_INDEX_SIZE: usize = 28;
+const CLR_SURROGATE_SIZE: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DllRedirectionSection {
@@ -73,6 +82,19 @@ pub struct WindowClassRedirectionMatch {
     pub versioned_name_length: u32,
     pub module_offset: u32,
     pub module_length: u32,
+    pub assembly_roster_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClrSurrogateAssembly<'a> {
+    pub surrogates: &'a [ManifestClrSurrogate],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClrSurrogateMatch {
+    pub data_offset: u32,
+    /// Unpadded payload length returned through `ACTCTX_SECTION_KEYED_DATA`.
+    pub data_length: u32,
     pub assembly_roster_index: u32,
 }
 
@@ -742,6 +764,281 @@ pub fn find_window_class_redirection(
     Ok(None)
 }
 
+/// Build a GUID-keyed CLR-surrogate activation-context section in assembly/entity order.
+pub fn build_clr_surrogate_section(
+    assemblies: &[ClrSurrogateAssembly<'_>],
+) -> Result<Vec<u8>, NtStatus> {
+    let count = assemblies.iter().try_fold(0usize, |count, assembly| {
+        count
+            .checked_add(assembly.surrogates.len())
+            .ok_or(STATUS_NO_MEMORY)
+    })?;
+    let index_bytes = count.checked_mul(GUID_INDEX_SIZE).ok_or(STATUS_NO_MEMORY)?;
+    let mut total = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .ok_or(STATUS_NO_MEMORY)?;
+    for assembly in assemblies {
+        for surrogate in assembly.surrogates {
+            validate_clr_surrogate(surrogate)?;
+            total = total
+                .checked_add(clr_surrogate_storage_size(surrogate)?)
+                .ok_or(STATUS_NO_MEMORY)?;
+        }
+    }
+    let _total_u32 = checked_section_size(total)?;
+    let count_u32 = u32::try_from(count).map_err(|_| STATUS_NO_MEMORY)?;
+
+    let mut section = Vec::new();
+    section
+        .try_reserve_exact(total)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    section.resize(total, 0);
+    write_u32(&mut section, 0, GUIDSECTION_MAGIC)?;
+    write_u32(&mut section, 4, GUID_HEADER_SIZE as u32)?;
+    write_u32(&mut section, 20, count_u32)?;
+    write_u32(&mut section, 24, GUID_HEADER_SIZE as u32)?;
+
+    let mut cursor = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .ok_or(STATUS_NO_MEMORY)?;
+    let mut position = 0usize;
+    for (assembly_index, assembly) in assemblies.iter().enumerate() {
+        let roster_index = u32::try_from(assembly_index.checked_add(1).ok_or(STATUS_NO_MEMORY)?)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        for surrogate in assembly.surrogates {
+            let index_offset = GUID_HEADER_SIZE
+                .checked_add(
+                    position
+                        .checked_mul(GUID_INDEX_SIZE)
+                        .ok_or(STATUS_NO_MEMORY)?,
+                )
+                .ok_or(STATUS_NO_MEMORY)?;
+            let storage_size = clr_surrogate_storage_size(surrogate)?;
+            let data_length = clr_surrogate_data_length(surrogate)?;
+            let version_bytes = surrogate
+                .runtime_version
+                .as_ref()
+                .map(|version| utf16_bytes_len(version.len()))
+                .transpose()?
+                .unwrap_or(0);
+            let name_bytes = utf16_bytes_len(surrogate.name.len())?;
+            let version_offset = if version_bytes == 0 {
+                0
+            } else {
+                CLR_SURROGATE_SIZE
+            };
+            let name_offset = CLR_SURROGATE_SIZE
+                .checked_add(if version_bytes == 0 {
+                    0
+                } else {
+                    version_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?
+                })
+                .ok_or(STATUS_NO_MEMORY)?;
+
+            write_guid(&mut section, index_offset, surrogate.clsid)?;
+            write_u32(&mut section, index_offset + 16, to_u32(cursor)?)?;
+            write_u32(&mut section, index_offset + 20, to_u32(storage_size)?)?;
+            write_u32(&mut section, index_offset + 24, roster_index)?;
+
+            write_u32(&mut section, cursor, CLR_SURROGATE_SIZE as u32)?;
+            write_guid(&mut section, cursor + 8, surrogate.clsid)?;
+            write_u32(&mut section, cursor + 24, to_u32(version_offset)?)?;
+            write_u32(&mut section, cursor + 28, to_u32(version_bytes)?)?;
+            write_u32(&mut section, cursor + 32, to_u32(name_offset)?)?;
+            write_u32(&mut section, cursor + 36, to_u32(name_bytes)?)?;
+            if version_bytes != 0 {
+                write_utf16(
+                    &mut section,
+                    cursor + version_offset,
+                    surrogate.runtime_version.as_ref().unwrap(),
+                )?;
+            }
+            write_utf16(&mut section, cursor + name_offset, &surrogate.name)?;
+
+            debug_assert!(data_length <= storage_size);
+            cursor = cursor.checked_add(storage_size).ok_or(STATUS_NO_MEMORY)?;
+            position += 1;
+        }
+    }
+    if position != count || cursor != section.len() {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    Ok(section)
+}
+
+/// Find an exact GUID in a structurally validated CLR-surrogate section.
+pub fn find_clr_surrogate(
+    section: &[u8],
+    clsid: &Guid,
+) -> Result<Option<ClrSurrogateMatch>, NtStatus> {
+    if section.len() < GUID_HEADER_SIZE
+        || read_u32(section, 0)? != GUIDSECTION_MAGIC
+        || read_u32(section, 4)? != GUID_HEADER_SIZE as u32
+        || read_u32(section, 8)? != 0
+        || read_u32(section, 12)? != 0
+        || read_u32(section, 16)? != 0
+        || read_u32(section, 28)? != 0
+        || read_u32(section, 32)? != 0
+        || read_u32(section, 36)? != 0
+        || read_u32(section, 24)? != GUID_HEADER_SIZE as u32
+    {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    let count = read_offset(section, 20)?;
+    let index_bytes = count
+        .checked_mul(GUID_INDEX_SIZE)
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let mut expected = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .filter(|end| *end <= section.len())
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let mut found = None;
+
+    for position in 0..count {
+        let index = GUID_HEADER_SIZE
+            .checked_add(
+                position
+                    .checked_mul(GUID_INDEX_SIZE)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+            )
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        let index_guid = read_guid(section, index)?;
+        let data_offset = read_offset(section, index + 16)?;
+        let stored_data_length = read_offset(section, index + 20)?;
+        let roster_index = read_u32(section, index + 24)?;
+        if data_offset != expected
+            || stored_data_length < CLR_SURROGATE_SIZE
+            || stored_data_length % 4 != 0
+            || roster_index == 0
+            || data_offset
+                .checked_add(stored_data_length)
+                .filter(|end| *end <= section.len())
+                .is_none()
+            || read_u32(section, data_offset)? != CLR_SURROGATE_SIZE as u32
+            || read_u32(section, data_offset + 4)? != 0
+            || read_guid(section, data_offset + 8)? != index_guid
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let version_offset = read_offset(section, data_offset + 24)?;
+        let version_length = read_offset(section, data_offset + 28)?;
+        let name_offset = read_offset(section, data_offset + 32)?;
+        let name_length = read_offset(section, data_offset + 36)?;
+        let version_storage = if version_length == 0 {
+            if version_offset != 0 {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            0
+        } else {
+            if version_offset != CLR_SURROGATE_SIZE
+                || version_length % 2 != 0
+                || section_contains_unit(section, data_offset + version_offset, version_length, 0)?
+                || read_u16(
+                    section,
+                    data_offset
+                        .checked_add(version_offset)
+                        .and_then(|value| value.checked_add(version_length))
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                )? != 0
+            {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            version_length
+                .checked_add(2)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
+        };
+        if name_offset
+            != CLR_SURROGATE_SIZE
+                .checked_add(version_storage)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
+            || name_length == 0
+            || name_length % 2 != 0
+            || section_contains_unit(section, data_offset + name_offset, name_length, 0)?
+            || read_u16(
+                section,
+                data_offset
+                    .checked_add(name_offset)
+                    .and_then(|value| value.checked_add(name_length))
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+            )? != 0
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let data_length = name_offset
+            .checked_add(name_length)
+            .and_then(|value| value.checked_add(2))
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        let canonical_storage = align4(data_length).ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        let explicit_empty_version_storage =
+            align4(data_length + 2).ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        if stored_data_length != canonical_storage
+            && !(version_length == 0 && stored_data_length == explicit_empty_version_storage)
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        if found.is_none() && index_guid == *clsid {
+            found = Some(ClrSurrogateMatch {
+                data_offset: invalid_to_u32(data_offset)?,
+                data_length: invalid_to_u32(data_length)?,
+                assembly_roster_index: roster_index,
+            });
+        }
+        expected = data_offset
+            .checked_add(stored_data_length)
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    }
+    if expected != section.len() {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    Ok(found)
+}
+
+fn validate_clr_surrogate(surrogate: &ManifestClrSurrogate) -> Result<(), NtStatus> {
+    if surrogate.name.is_empty()
+        || surrogate.name.contains(&0)
+        || surrogate
+            .runtime_version
+            .as_ref()
+            .is_some_and(|version| version.contains(&0))
+    {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    Ok(())
+}
+
+fn clr_surrogate_data_length(surrogate: &ManifestClrSurrogate) -> Result<usize, NtStatus> {
+    let version_bytes = surrogate
+        .runtime_version
+        .as_ref()
+        .map(|version| utf16_bytes_len(version.len()))
+        .transpose()?
+        .unwrap_or(0);
+    let name_bytes = utf16_bytes_len(surrogate.name.len())?;
+    CLR_SURROGATE_SIZE
+        .checked_add(if version_bytes == 0 {
+            0
+        } else {
+            version_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?
+        })
+        .and_then(|value| value.checked_add(name_bytes))
+        .and_then(|value| value.checked_add(2))
+        .ok_or(STATUS_NO_MEMORY)
+}
+
+fn clr_surrogate_storage_size(surrogate: &ManifestClrSurrogate) -> Result<usize, NtStatus> {
+    let data_length = clr_surrogate_data_length(surrogate)?;
+    let explicit_empty_version = surrogate
+        .runtime_version
+        .as_ref()
+        .is_some_and(Vec::is_empty);
+    align4(
+        data_length
+            .checked_add(if explicit_empty_version { 2 } else { 0 })
+            .ok_or(STATUS_NO_MEMORY)?,
+    )
+    .ok_or(STATUS_NO_MEMORY)
+}
+
 fn validate_window_class_entry(entry: &WindowClassSectionEntry<'_>) -> Result<(), NtStatus> {
     if entry.name.is_empty()
         || entry.name.contains(&0)
@@ -951,6 +1248,13 @@ fn write_u32(section: &mut [u8], offset: usize, value: u32) -> Result<(), NtStat
     Ok(())
 }
 
+fn write_guid(section: &mut [u8], offset: usize, value: Guid) -> Result<(), NtStatus> {
+    let end = offset.checked_add(16).ok_or(STATUS_NO_MEMORY)?;
+    let destination = section.get_mut(offset..end).ok_or(STATUS_NO_MEMORY)?;
+    destination.copy_from_slice(&value.to_windows_bytes());
+    Ok(())
+}
+
 fn write_utf16(section: &mut [u8], offset: usize, value: &[u16]) -> Result<(), NtStatus> {
     let byte_length = utf16_bytes_len(value.len())?;
     let end = offset.checked_add(byte_length).ok_or(STATUS_NO_MEMORY)?;
@@ -969,6 +1273,18 @@ fn read_u32(section: &[u8], offset: usize) -> Result<u32, NtStatus> {
         .get(offset..end)
         .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_guid(section: &[u8], offset: usize) -> Result<Guid, NtStatus> {
+    let end = offset
+        .checked_add(16)
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let bytes = section
+        .get(offset..end)
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let mut encoded = [0u8; 16];
+    encoded.copy_from_slice(bytes);
+    Ok(Guid::from_windows_bytes(encoded))
 }
 
 fn read_offset(section: &[u8], offset: usize) -> Result<usize, NtStatus> {
@@ -1058,6 +1374,150 @@ mod tests {
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().collect()
+    }
+
+    fn surrogate_guid(last: u8) -> Guid {
+        Guid {
+            data1: 0x9666_6666,
+            data2: 0x8888,
+            data3: 0x7777,
+            data4: [0x66, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55, last],
+        }
+    }
+
+    #[test]
+    fn builds_exact_clr_surrogate_guid_section() {
+        let surrogates = [ManifestClrSurrogate {
+            clsid: surrogate_guid(0x55),
+            name: wide("testsurrogate"),
+            runtime_version: Some(wide("v2.0.50727")),
+        }];
+        let section = build_clr_surrogate_section(&[ClrSurrogateAssembly {
+            surrogates: &surrogates,
+        }])
+        .unwrap();
+        assert_eq!(section.len(), 160);
+        assert_eq!(read_u32(&section, 0), Ok(GUIDSECTION_MAGIC));
+        assert_eq!(read_u32(&section, 4), Ok(40));
+        assert_eq!(read_u32(&section, 20), Ok(1));
+        assert_eq!(read_u32(&section, 24), Ok(40));
+        assert_eq!(read_guid(&section, 40), Ok(surrogate_guid(0x55)));
+        assert_eq!(read_u32(&section, 56), Ok(68));
+        assert_eq!(read_u32(&section, 60), Ok(92));
+        assert_eq!(read_u32(&section, 64), Ok(1));
+        assert_eq!(read_u32(&section, 68), Ok(40));
+        assert_eq!(read_guid(&section, 76), Ok(surrogate_guid(0x55)));
+        assert_eq!(read_u32(&section, 92), Ok(40));
+        assert_eq!(read_u32(&section, 96), Ok(20));
+        assert_eq!(read_u32(&section, 100), Ok(62));
+        assert_eq!(read_u32(&section, 104), Ok(26));
+        assert_eq!(read_wide(&section, 108, 20), wide("v2.0.50727"));
+        assert_eq!(read_wide(&section, 130, 26), wide("testsurrogate"));
+        assert_eq!(
+            find_clr_surrogate(&section, &surrogate_guid(0x55)),
+            Ok(Some(ClrSurrogateMatch {
+                data_offset: 68,
+                data_length: 90,
+                assembly_roster_index: 1,
+            }))
+        );
+        assert_eq!(
+            find_clr_surrogate(&section, &surrogate_guid(0x54)),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn clr_surrogate_sections_preserve_rosters_and_empty_version_storage() {
+        let absent = [ManifestClrSurrogate {
+            clsid: surrogate_guid(0x55),
+            name: wide("plain"),
+            runtime_version: None,
+        }];
+        let empty = [ManifestClrSurrogate {
+            clsid: surrogate_guid(0x56),
+            name: wide("empty"),
+            runtime_version: Some(Vec::new()),
+        }];
+        let section = build_clr_surrogate_section(&[
+            ClrSurrogateAssembly { surrogates: &[] },
+            ClrSurrogateAssembly {
+                surrogates: &absent,
+            },
+            ClrSurrogateAssembly { surrogates: &empty },
+        ])
+        .unwrap();
+        let absent_match = find_clr_surrogate(&section, &surrogate_guid(0x55))
+            .unwrap()
+            .unwrap();
+        let empty_match = find_clr_surrogate(&section, &surrogate_guid(0x56))
+            .unwrap()
+            .unwrap();
+        assert_eq!(absent_match.assembly_roster_index, 2);
+        assert_eq!(empty_match.assembly_roster_index, 3);
+        assert_eq!(absent_match.data_length, 52);
+        assert_eq!(empty_match.data_length, 52);
+        let first_storage = read_u32(&section, GUID_HEADER_SIZE + 20).unwrap();
+        let second_storage = read_u32(&section, GUID_HEADER_SIZE + GUID_INDEX_SIZE + 20).unwrap();
+        assert_eq!(first_storage, 52);
+        assert_eq!(second_storage, 56);
+    }
+
+    #[test]
+    fn clr_surrogate_builder_and_finder_reject_invalid_data() {
+        let invalid = [ManifestClrSurrogate {
+            clsid: Guid::default(),
+            name: Vec::new(),
+            runtime_version: None,
+        }];
+        assert_eq!(
+            build_clr_surrogate_section(&[ClrSurrogateAssembly {
+                surrogates: &invalid,
+            }]),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+
+        let valid = [ManifestClrSurrogate {
+            clsid: surrogate_guid(0x55),
+            name: wide("testsurrogate"),
+            runtime_version: Some(wide("v2.0.50727")),
+        }];
+        let original =
+            build_clr_surrogate_section(&[ClrSurrogateAssembly { surrogates: &valid }]).unwrap();
+        for (offset, value) in [
+            (0, 0),
+            (8, 1),
+            (24, 0),
+            (56, 0),
+            (60, 88),
+            (64, 0),
+            (68, 0),
+            (72, 1),
+            (92, 0),
+            (96, 21),
+            (100, 40),
+            (104, 0),
+        ] {
+            let mut section = original.clone();
+            write_u32(&mut section, offset, value).unwrap();
+            assert_eq!(
+                find_clr_surrogate(&section, &surrogate_guid(0x55)),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT),
+                "offset {offset}"
+            );
+        }
+        let mut truncated = original.clone();
+        truncated.pop();
+        assert_eq!(
+            find_clr_surrogate(&truncated, &surrogate_guid(0x55)),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+        let mut trailing = original;
+        trailing.push(0);
+        assert_eq!(
+            find_clr_surrogate(&trailing, &surrogate_guid(0x55)),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
     }
 
     #[test]
