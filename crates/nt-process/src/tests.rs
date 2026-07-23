@@ -275,6 +275,133 @@ fn native_process_client_id_capture_never_truncates_handles() {
 }
 
 #[test]
+fn open_thread_by_client_id_mints_local_access_checked_handles() {
+    const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+
+    let handle = pm
+        .open_thread_by_client_id(
+            caller,
+            ClientId {
+                unique_process: target,
+                unique_thread: tid,
+            },
+            THREAD_QUERY_INFORMATION,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.lookup_handle(caller, handle),
+        Some(HandleObject::Thread(tid))
+    );
+    assert_eq!(pm.lookup_handle(target, handle), None);
+    assert_eq!(
+        pm.handle_access(caller, handle),
+        Some(THREAD_QUERY_INFORMATION)
+    );
+    assert_eq!(
+        pm.resolve_thread_handle(caller, 0, handle as u64, THREAD_QUERY_INFORMATION),
+        Ok(tid)
+    );
+    assert_eq!(
+        pm.resolve_thread_handle(caller, 0, handle as u64, THREAD_SUSPEND_RESUME),
+        Err(STATUS_ACCESS_DENIED)
+    );
+
+    let process_agnostic = pm
+        .open_thread_by_client_id(
+            caller,
+            ClientId {
+                unique_process: 0,
+                unique_thread: tid,
+            },
+            THREAD_SUSPEND_RESUME,
+        )
+        .unwrap();
+    assert_eq!(pm.handle_count(caller), 2);
+    assert_eq!(
+        pm.handle_access(caller, process_agnostic),
+        Some(THREAD_SUSPEND_RESUME)
+    );
+}
+
+#[test]
+fn open_thread_by_client_id_rejects_invalid_ids_without_minting() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let other = pm.create_process("other.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+
+    for client_id in [
+        ClientId {
+            unique_process: other,
+            unique_thread: tid,
+        },
+        ClientId {
+            unique_process: target,
+            unique_thread: 0,
+        },
+        ClientId {
+            unique_process: target,
+            unique_thread: 0xDEAD,
+        },
+    ] {
+        assert_eq!(
+            pm.open_thread_by_client_id(caller, client_id, THREAD_ALL_ACCESS),
+            Err(STATUS_INVALID_CID)
+        );
+        assert_eq!(pm.handle_count(caller), 0);
+    }
+    assert_eq!(
+        pm.open_thread_by_client_id(
+            0xDEAD,
+            ClientId {
+                unique_process: target,
+                unique_thread: tid,
+            },
+            THREAD_ALL_ACCESS,
+        ),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
+fn thread_access_and_native_client_id_mapping_match_nt_policy() {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+    assert_eq!(map_thread_access(GENERIC_READ), THREAD_GENERIC_READ);
+    assert_eq!(map_thread_access(GENERIC_WRITE), THREAD_GENERIC_WRITE);
+    assert_eq!(map_thread_access(GENERIC_EXECUTE), THREAD_GENERIC_EXECUTE);
+    assert_eq!(map_thread_access(GENERIC_ALL), THREAD_ALL_ACCESS);
+    assert_eq!(map_thread_access(MAXIMUM_ALLOWED), THREAD_ALL_ACCESS);
+    assert_eq!(
+        thread_client_id_from_native(0, 0x1234),
+        Ok(ClientId {
+            unique_process: 0,
+            unique_thread: 0x1234,
+        })
+    );
+    assert_eq!(thread_client_id_from_native(1, 0), Err(STATUS_INVALID_CID));
+    assert_eq!(
+        thread_client_id_from_native(u32::MAX as u64 + 1, 1),
+        Err(STATUS_INVALID_CID)
+    );
+    assert_eq!(
+        thread_client_id_from_native(1, u32::MAX as u64 + 1),
+        Err(STATUS_INVALID_CID)
+    );
+}
+
+#[test]
 fn token_handles_preserve_owner_and_access() {
     let mut pm = ProcessManager::new();
     let caller = pm.create_process("caller.exe", None, None);

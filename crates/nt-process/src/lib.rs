@@ -35,6 +35,10 @@ pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
 pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
 pub const PROCESS_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const THREAD_GENERIC_READ: u32 = 0x0002_0048;
+pub const THREAD_GENERIC_WRITE: u32 = 0x0002_0037;
+pub const THREAD_GENERIC_EXECUTE: u32 = 0x0012_0000;
+pub const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
 
 /// Expand generic process access bits using the NT process-object generic mapping. Until process
 /// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full process mask.
@@ -58,6 +62,32 @@ pub fn map_process_access(desired: u32) -> u32 {
     }
     if desired & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
         mapped |= PROCESS_ALL_ACCESS;
+    }
+    mapped
+}
+
+/// Expand generic thread access bits using the NT thread-object generic mapping. Until thread
+/// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full thread mask.
+pub fn map_thread_access(desired: u32) -> u32 {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+    let mut mapped =
+        desired & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL | MAXIMUM_ALLOWED);
+    if desired & GENERIC_READ != 0 {
+        mapped |= THREAD_GENERIC_READ;
+    }
+    if desired & GENERIC_WRITE != 0 {
+        mapped |= THREAD_GENERIC_WRITE;
+    }
+    if desired & GENERIC_EXECUTE != 0 {
+        mapped |= THREAD_GENERIC_EXECUTE;
+    }
+    if desired & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+        mapped |= THREAD_ALL_ACCESS;
     }
     mapped
 }
@@ -86,6 +116,22 @@ pub fn process_client_id_from_native(
         Err(_) => return Err(STATUS_INVALID_PARAMETER),
     };
     let unique_thread = u32::try_from(unique_thread).map_err(|_| STATUS_INVALID_CID)?;
+    Ok(ClientId {
+        unique_process,
+        unique_thread,
+    })
+}
+
+/// Capture the handle-width native `CLIENT_ID` values for `NtOpenThread` without truncation.
+pub fn thread_client_id_from_native(
+    unique_process: u64,
+    unique_thread: u64,
+) -> Result<ClientId, u32> {
+    let unique_process = u32::try_from(unique_process).map_err(|_| STATUS_INVALID_CID)?;
+    let unique_thread = u32::try_from(unique_thread).map_err(|_| STATUS_INVALID_CID)?;
+    if unique_thread == 0 {
+        return Err(STATUS_INVALID_CID);
+    }
     Ok(ClientId {
         unique_process,
         unique_thread,
@@ -758,6 +804,30 @@ impl ProcessManager {
         self.insert_handle(
             caller_pid,
             HandleObject::Process(target_pid),
+            granted_access,
+        )
+    }
+
+    /// Open a thread selected by a captured native `CLIENT_ID` and place the typed handle in the
+    /// caller's table. A zero process id is permitted; otherwise it must own the selected thread.
+    pub fn open_thread_by_client_id(
+        &mut self,
+        caller_pid: ProcessId,
+        client_id: ClientId,
+        granted_access: u32,
+    ) -> Result<Handle, u32> {
+        if self.process(caller_pid).is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let thread = self
+            .thread(client_id.unique_thread)
+            .ok_or(STATUS_INVALID_CID)?;
+        if client_id.unique_process != 0 && thread.process_id != client_id.unique_process {
+            return Err(STATUS_INVALID_CID);
+        }
+        self.insert_handle(
+            caller_pid,
+            HandleObject::Thread(client_id.unique_thread),
             granted_access,
         )
     }
