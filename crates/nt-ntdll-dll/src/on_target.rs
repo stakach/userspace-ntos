@@ -382,17 +382,14 @@ unsafe fn call_tls_initializers(base: u64, reason: u32) {
     if tls_rva == 0 || tls_size < 0x28 {
         return;
     }
-    let callbacks = unsafe {
-        core::ptr::read_unaligned((base + tls_rva as u64 + 0x18) as *const u64)
-    };
+    let callbacks =
+        unsafe { core::ptr::read_unaligned((base + tls_rva as u64 + 0x18) as *const u64) };
     if callbacks == 0 {
         return;
     }
     let mut index = 0u64;
     loop {
-        let callback = unsafe {
-            core::ptr::read_unaligned((callbacks + index * 8) as *const u64)
-        };
+        let callback = unsafe { core::ptr::read_unaligned((callbacks + index * 8) as *const u64) };
         if callback == 0 {
             break;
         }
@@ -839,8 +836,7 @@ pub unsafe fn ldr_initialize_thread() -> u32 {
             };
         }
     }
-    if failure == 0
-        && unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).commit(teb) }.is_ok()
+    if failure == 0 && unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).commit(teb) }.is_ok()
     {
         return 0;
     }
@@ -880,9 +876,8 @@ pub unsafe fn ldr_initialize_thread() -> u32 {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_shutdown_thread(teb: u64, process_shutdown: bool) -> u32 {
     const DLL_THREAD_DETACH: u32 = 3;
-    let committed = unsafe {
-        (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).take_committed_for_shutdown(teb)
-    };
+    let committed =
+        unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).take_committed_for_shutdown(teb) };
     let table = unsafe { &*core::ptr::addr_of!(MODULE_TABLE) };
     let mut modules = [nt_ntdll::loader::thread::ThreadModuleState::default(); MODULE_TABLE_CAP];
     let mut count = 0usize;
@@ -948,10 +943,7 @@ pub unsafe fn ldr_shutdown_thread(teb: u64, process_shutdown: bool) -> u32 {
     if plan.executable_tls_base() != 0 {
         let mut activation_frame = [0u64; 7];
         if let Ok(_activation_context) = unsafe {
-            ModuleActivationContextGuard::enter(
-                plan.executable_tls_base(),
-                &mut activation_frame,
-            )
+            ModuleActivationContextGuard::enter(plan.executable_tls_base(), &mut activation_frame)
         } {
             unsafe { call_tls_initializers(plan.executable_tls_base(), DLL_THREAD_DETACH) };
         };
@@ -1288,21 +1280,15 @@ unsafe fn image_tls_directory(base: u64) -> Option<nt_ntdll::loader::tls::ImageT
     }
     let directory = base + rva as u64;
     Some(nt_ntdll::loader::tls::ImageTlsDirectory {
-        start_address_of_raw_data: unsafe {
-            core::ptr::read_unaligned(directory as *const u64)
-        },
+        start_address_of_raw_data: unsafe { core::ptr::read_unaligned(directory as *const u64) },
         end_address_of_raw_data: unsafe {
             core::ptr::read_unaligned((directory + 0x08) as *const u64)
         },
-        address_of_index: unsafe {
-            core::ptr::read_unaligned((directory + 0x10) as *const u64)
-        },
+        address_of_index: unsafe { core::ptr::read_unaligned((directory + 0x10) as *const u64) },
         address_of_callbacks: unsafe {
             core::ptr::read_unaligned((directory + 0x18) as *const u64)
         },
-        size_of_zero_fill: unsafe {
-            core::ptr::read_unaligned((directory + 0x20) as *const u32)
-        },
+        size_of_zero_fill: unsafe { core::ptr::read_unaligned((directory + 0x20) as *const u32) },
     })
 }
 
@@ -1363,11 +1349,7 @@ unsafe fn allocate_current_thread_static_tls() -> u32 {
         }
         if entry.zero_fill_size != 0 {
             unsafe {
-                core::ptr::write_bytes(
-                    block.add(entry.raw_data_size),
-                    0,
-                    entry.zero_fill_size,
-                )
+                core::ptr::write_bytes(block.add(entry.raw_data_size), 0, entry.zero_fill_size)
             };
         }
         unsafe { core::ptr::write(vector.add(entry.index as usize), block as u64) };
@@ -2070,7 +2052,11 @@ unsafe fn load_and_snap_dependency(
         return 0;
     }
     unsafe { snap_module(base, ntdll_base, table, out, depth) };
-    if out.status == 0 { base } else { 0 }
+    if out.status == 0 {
+        base
+    } else {
+        0
+    }
 }
 
 /// `NtMapViewOfSection` — a dedicated 10-arg caller (its arity exceeds syscall8's 8). Uses the same
@@ -2233,8 +2219,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     // NULL → GetModuleFileNameW(NULL)'s `[Peb->Ldr]+0x10` InLoadOrder walk derefs NULL+0x10 (the
     // kernel32+0xff13 wall). `image_base` (the EXE) is recorded as list entry 0.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
-    let ldr_status =
-        unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), smss_base) };
+    let ldr_status = unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), smss_base) };
     if ldr_status != 0 {
         drop(_loader_lock);
         unsafe {
@@ -2242,9 +2227,8 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
             core::hint::unreachable_unchecked()
         }
     }
-    let tls_status = unsafe {
-        initialize_process_static_tls(smss_base, core::ptr::addr_of!(MODULE_TABLE))
-    };
+    let tls_status =
+        unsafe { initialize_process_static_tls(smss_base, core::ptr::addr_of!(MODULE_TABLE)) };
     if tls_status != 0 {
         drop(_loader_lock);
         unsafe {
@@ -2268,10 +2252,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     // CRT startup does strdup(GetCommandLineA()), which strlen(NULL)-faults without this.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped, snapped DLL images.
     unsafe {
-        let status = run_process_attach(
-            core::ptr::addr_of_mut!(MODULE_TABLE),
-            startup_reserved,
-        );
+        let status = run_process_attach(core::ptr::addr_of_mut!(MODULE_TABLE), startup_reserved);
         if status != 0 {
             drop(_loader_lock);
             crate::exports::rtl_raise_status(status);
@@ -2367,13 +2348,8 @@ unsafe fn snap_module(
                 let dep_name = &base[..bn];
                 let mut dep_base = (&*table).find(dep_name);
                 if dep_base == 0 {
-                    dep_base = load_and_snap_dependency(
-                        dep_name,
-                        ntdll_base,
-                        table,
-                        out,
-                        depth + 1,
-                    );
+                    dep_base =
+                        load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
                     if out.status != 0 {
                         core::ptr::write_unaligned(
                             (image_base + ft as u64) as *mut u64,
@@ -2431,13 +2407,8 @@ unsafe fn snap_module(
                     let dep_name = &base[..bn];
                     let mut dep_base = (&*table).find(dep_name);
                     if dep_base == 0 {
-                        dep_base = load_and_snap_dependency(
-                            dep_name,
-                            ntdll_base,
-                            table,
-                            out,
-                            depth + 1,
-                        );
+                        dep_base =
+                            load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
                         if out.status != 0 {
                             core::ptr::write_unaligned(
                                 (image_base + iat_rva as u64) as *mut u64,
@@ -2698,8 +2669,7 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
                 let parameters = core::ptr::read_unaligned((peb + 0x20) as *const u64);
                 if parameters != 0 {
                     let length = core::ptr::read_unaligned((parameters + 0x60) as *const u16);
-                    let maximum =
-                        core::ptr::read_unaligned((parameters + 0x62) as *const u16);
+                    let maximum = core::ptr::read_unaligned((parameters + 0x62) as *const u16);
                     let buffer = core::ptr::read_unaligned((parameters + 0x68) as *const u64);
                     if length & 1 == 0
                         && length != 0
@@ -2895,8 +2865,7 @@ pub unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
                 }
             }
             if count != 0 {
-                let status =
-                    crate::exports::ldr_initialize_process_activation_context(entries[0]);
+                let status = crate::exports::ldr_initialize_process_activation_context(entries[0]);
                 if status != 0 {
                     return status;
                 }
@@ -3249,13 +3218,7 @@ pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
     let mut visited = [0u64; MODULE_TABLE_CAP];
     let mut visited_count = 0usize;
     let collect_status = unsafe {
-        collect_reference_releases(
-            table,
-            base,
-            &mut ledger,
-            &mut visited,
-            &mut visited_count,
-        )
+        collect_reference_releases(table, base, &mut ledger, &mut visited, &mut visited_count)
     };
     if collect_status != 0 {
         return collect_status;
@@ -3374,9 +3337,8 @@ unsafe fn collect_reference_modules_dfs(
         let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
         let dependency = unsafe { (&*table).find(&name[..length]) };
         if dependency >= 0x1_0000 {
-            let status = unsafe {
-                collect_reference_modules_dfs(table, dependency, visited, visited_count)
-            };
+            let status =
+                unsafe { collect_reference_modules_dfs(table, dependency, visited, visited_count) };
             if status != 0 {
                 return status;
             }
@@ -3442,15 +3404,7 @@ pub unsafe fn ldr_get_procedure_address(
         let table = core::ptr::addr_of_mut!(MODULE_TABLE);
         if name.is_null() {
             let mut load_status = 0;
-            let address = resolve_export_addr(
-                base,
-                true,
-                &[],
-                ordinal,
-                table,
-                &mut load_status,
-                0,
-            );
+            let address = resolve_export_addr(base, true, &[], ordinal, table, &mut load_status, 0);
             if load_status != 0 {
                 return load_status;
             }
@@ -3468,15 +3422,8 @@ pub unsafe fn ldr_get_procedure_address(
                     nb[i] = core::ptr::read_unaligned((buffer as *const u8).add(i));
                 }
                 let mut load_status = 0;
-                let address = resolve_export_addr(
-                    base,
-                    false,
-                    &nb[..l],
-                    0,
-                    table,
-                    &mut load_status,
-                    0,
-                );
+                let address =
+                    resolve_export_addr(base, false, &nb[..l], 0, table, &mut load_status, 0);
                 if load_status != 0 {
                     return load_status;
                 }
@@ -4800,17 +4747,6 @@ pub unsafe fn rtl_set_thread_is_critical(new: u8, old: *mut u8, check_flag: u8) 
 const SSN_NT_CREATE_THREAD: u32 = 55;
 /// `THREAD_ALL_ACCESS`.
 const THREAD_ALL_ACCESS: u64 = 0x001F_FFFF;
-/// The thread stack reserve (default when the caller passes 0).
-const DEFAULT_THREAD_STACK: usize = 0x10_0000; // 1 MiB
-/// CONTEXT.Rcx / .Rsp / .Rip byte offsets (amd64), and INITIAL_TEB stack fields — mirror
-/// `nt_thread_start`'s constants (the executive reads the same offsets).
-const CTX_RCX: usize = 0x80;
-const CTX_RSP: usize = 0x98;
-const CTX_RIP: usize = 0xF8;
-/// The amd64 CONTEXT record size (enough to hold through RIP@0xF8 + the extended area the kernel may
-/// touch); 0x4D0 is the real `sizeof(CONTEXT)` on x64.
-const CONTEXT_SIZE: usize = 0x4D0;
-
 /// Best-effort current-image stack defaults from `PEB->ImageBaseAddress` optional header.
 ///
 /// # Safety
@@ -5018,61 +4954,83 @@ unsafe fn syscall8(
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn rtl_create_user_thread(
     process: u64,
-    _thread_sd: u64,
+    thread_sd: u64,
     create_suspended: u8,
-    _stack_zero_bits: u32,
+    stack_zero_bits: u32,
     stack_reserve: usize,
-    _stack_commit: usize,
+    stack_commit: usize,
     start_address: u64,
     parameter: u64,
     thread_handle: *mut u64,
     client_id: *mut u64,
 ) -> u64 {
-    // Allocate the thread stack.
-    let stack_size = if stack_reserve != 0 {
-        stack_reserve
-    } else {
-        DEFAULT_THREAD_STACK
+    let mut initial_teb = [0u64; 5];
+    let stack_status = unsafe {
+        rtl_create_user_stack(
+            stack_commit,
+            stack_reserve,
+            stack_zero_bits,
+            nt_ntdll::rtl::user_stack::DEFAULT_PAGE_SIZE,
+            nt_ntdll::rtl::user_stack::DEFAULT_RESERVE_ALIGNMENT,
+            initial_teb.as_mut_ptr(),
+        )
     };
-    // SAFETY: on-target VM syscall.
-    let stack_base = unsafe { nt_allocate_virtual_memory(stack_size) };
-    if stack_base == 0 {
-        return STATUS_NO_MEMORY;
+    if (stack_status as i32) < 0 {
+        return stack_status as u64;
     }
-    // stack grows down: top = base + size (16-aligned, minus a shadow).
-    let stack_top = (stack_base + stack_size as u64) & !0xF;
-
     // Build the CONTEXT record on the current stack (zeroed, then Rip/Rcx/Rsp set). It must live long
     // enough for the executive's stack-mirror read during the syscall — a stack local of this fn.
-    let mut context = [0u8; CONTEXT_SIZE];
-    // SAFETY: writing within the fixed-size context buffer at the known amd64 offsets.
-    unsafe {
-        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RCX) as *mut u64, parameter);
-        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RSP) as *mut u64, stack_top);
-        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RIP) as *mut u64, start_address);
-    }
-    // INITIAL_TEB: { _, StackBase(0x10), StackLimit(0x18), AllocatedStackBase(0x20), _ }.
-    let mut initial_teb = [0u64; 8];
-    initial_teb[2] = stack_base + stack_size as u64; // StackBase @0x10
-    initial_teb[3] = stack_base; // StackLimit @0x18
-    initial_teb[4] = stack_base; // AllocatedStackBase @0x20
-
+    let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+    let initialized = nt_thread_start::initialize_amd64_user_context(
+        &mut context,
+        start_address,
+        parameter,
+        initial_teb[2],
+    );
+    debug_assert!(initialized);
     // NtCreateThread(&ThreadHandle, THREAD_ALL_ACCESS, ObjectAttributes=NULL, ProcessHandle,
     //                &ClientId, &Context, &InitialTeb, CreateSuspended).
     // SAFETY: on-target; all pointers are valid stack locals / the caller's out-params.
-    unsafe {
+    let mut created_handle = 0u64;
+    let mut created_client_id = [0u64; 2];
+    let object_attributes = ObjectAttributes {
+        length: core::mem::size_of::<ObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: 0,
+        attributes: 0,
+        _p1: 0,
+        security_descriptor: thread_sd,
+        security_qos: 0,
+    };
+    let status = unsafe {
         syscall8(
             SSN_NT_CREATE_THREAD,
-            thread_handle as u64,
+            core::ptr::addr_of_mut!(created_handle) as u64,
             THREAD_ALL_ACCESS,
-            0, // ObjectAttributes = NULL
+            core::ptr::addr_of!(object_attributes) as u64,
             process,
-            client_id as u64,
+            created_client_id.as_mut_ptr() as u64,
             context.as_ptr() as u64,
             initial_teb.as_ptr() as u64,
             (create_suspended != 0) as u64,
         )
+    };
+    if (status as u32 as i32) < 0 {
+        unsafe { rtl_free_user_stack(initial_teb[4]) };
+        return status;
     }
+    if thread_handle.is_null() {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, created_handle, 0, 0, 0) };
+    } else {
+        unsafe { core::ptr::write(thread_handle, created_handle) };
+    }
+    if !client_id.is_null() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(created_client_id.as_ptr(), client_id, 2);
+        }
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5108,6 +5066,102 @@ static WORK_POOL_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
 static WORK_POOL_COUNTER_LOCK: AtomicBool = AtomicBool::new(false);
 static mut WORK_POOL_COUNTERS: nt_rtl_work_item::PoolCounters =
     nt_rtl_work_item::PoolCounters::new();
+
+#[cfg(feature = "rtl_work_item_probe")]
+const WORK_ITEM_PROBE_IDLE: u32 = 0;
+#[cfg(feature = "rtl_work_item_probe")]
+const WORK_ITEM_PROBE_QUEUING: u32 = 1;
+#[cfg(feature = "rtl_work_item_probe")]
+const WORK_ITEM_PROBE_CALLBACK: u32 = 2;
+#[cfg(feature = "rtl_work_item_probe")]
+static WORK_ITEM_PROBE_STATE: AtomicU32 = AtomicU32::new(WORK_ITEM_PROBE_IDLE);
+
+#[cfg(feature = "rtl_work_item_probe")]
+unsafe fn current_process_is_smss() -> bool {
+    let peb: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x60]",
+            out(reg) peb,
+            options(nostack, preserves_flags, readonly)
+        )
+    };
+    if peb == 0 {
+        return false;
+    }
+    let params = unsafe { core::ptr::read_unaligned((peb + 0x20) as *const u64) };
+    if params == 0 {
+        return false;
+    }
+    let image_name = params + 0x60;
+    let length = unsafe { core::ptr::read_unaligned(image_name as *const u16) } as usize;
+    let buffer = unsafe { core::ptr::read_unaligned((image_name + 8) as *const u64) };
+    const SUFFIX: &[u8; 8] = b"smss.exe";
+    if buffer == 0 || length / 2 < SUFFIX.len() {
+        return false;
+    }
+    let suffix_start = length / 2 - SUFFIX.len();
+    SUFFIX.iter().enumerate().all(|(index, expected)| {
+        let unit = unsafe {
+            core::ptr::read_volatile((buffer + ((suffix_start + index) * 2) as u64) as *const u16)
+        };
+        let folded = if unit <= 0x7f {
+            (unit as u8).to_ascii_lowercase()
+        } else {
+            0
+        };
+        folded == *expected
+    })
+}
+
+#[cfg(feature = "rtl_work_item_probe")]
+unsafe extern "system" fn rtl_queue_work_item_probe_callback(context: *mut c_void) {
+    if context == core::ptr::addr_of!(WORK_ITEM_PROBE_STATE).cast_mut().cast() {
+        WORK_ITEM_PROBE_STATE.store(WORK_ITEM_PROBE_CALLBACK, Ordering::Release);
+        let marker = *b"[rtl-work-item-probe] callback executed with expected context";
+        unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+    }
+}
+
+/// A bounded live probe for the first hosted process. It uses the exported queue entry, then waits
+/// for the completion-port worker to run the callback. The executive's existing worker and IOCP
+/// park logs provide the transport-side proof around these two user-side markers.
+#[cfg(feature = "rtl_work_item_probe")]
+pub unsafe fn run_rtl_queue_work_item_probe_if_smss() {
+    if !unsafe { current_process_is_smss() }
+        || WORK_ITEM_PROBE_STATE
+            .compare_exchange(
+                WORK_ITEM_PROBE_IDLE,
+                WORK_ITEM_PROBE_QUEUING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return;
+    }
+
+    let status = unsafe {
+        crate::exports::rtl_queue_work_item(
+            rtl_queue_work_item_probe_callback as *mut c_void,
+            core::ptr::addr_of!(WORK_ITEM_PROBE_STATE).cast_mut().cast(),
+            0,
+        ) as u32
+    };
+    if nt_rtl_work_item::nt_success(status) {
+        for _ in 0..256 {
+            if WORK_ITEM_PROBE_STATE.load(Ordering::Acquire) == WORK_ITEM_PROBE_CALLBACK {
+                let marker =
+                    *b"[rtl-work-item-probe] PASS queue -> worker -> IOCP wake -> callback";
+                unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+                return;
+            }
+            let _ = unsafe { work_pool_delay(nt_rtl_work_item::WORKER_START_POLL_INTERVAL_100NS) };
+        }
+    }
+    let marker = *b"[rtl-work-item-probe] FAIL queue or callback timeout";
+    unsafe { crate::dbg_print_bytes(marker.as_ptr(), marker.len()) };
+}
 
 #[inline]
 fn work_pool_lock_counters() {
@@ -5184,14 +5238,9 @@ unsafe fn initialize_work_pool() -> u32 {
 }
 
 type PoolThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
-type StartPoolThread = unsafe extern "system" fn(
-    PoolThreadStart,
-    *mut c_void,
-    *mut u64,
-) -> u32;
+type StartPoolThread = unsafe extern "system" fn(PoolThreadStart, *mut c_void, *mut u64) -> u32;
 type ExitPoolThread = unsafe extern "system" fn(u32) -> u32;
-type CompletionRoutine =
-    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
+type CompletionRoutine = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
 
 unsafe fn default_start_pool_thread(
     routine: PoolThreadStart,
@@ -5271,9 +5320,8 @@ unsafe fn start_work_pool_worker() -> u32 {
                 let routine: PoolThreadStart =
                     unsafe { core::mem::transmute(worker_routine as usize) };
                 let mut thread_handle = 0u64;
-                let status = unsafe {
-                    call_start_pool_thread(routine, parameter, &mut thread_handle)
-                };
+                let status =
+                    unsafe { call_start_pool_thread(routine, parameter, &mut thread_handle) };
                 start.advance(nt_rtl_work_item::WorkerStartEvent::StartReturned {
                     status,
                     thread_handle,
@@ -5325,9 +5373,8 @@ unsafe fn start_work_pool_worker() -> u32 {
 
 unsafe fn cleanup_failed_submission(submission: nt_rtl_work_item::Submission) -> u32 {
     work_pool_lock_counters();
-    let plan = unsafe {
-        submission.queue_failed(&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS))
-    };
+    let plan =
+        unsafe { submission.queue_failed(&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS)) };
     work_pool_unlock_counters();
     let Ok(plan) = plan else {
         return STATUS_UNSUCCESSFUL_U32;
@@ -5411,9 +5458,7 @@ unsafe extern "system" fn rtlp_execute_work_item(
             nt_rtl_work_item::ExecutionAction::CompleteAccounting { .. } => {
                 work_pool_lock_counters();
                 let result = unsafe {
-                    execution.complete_accounting(
-                        &mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS),
-                    )
+                    execution.complete_accounting(&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS))
                 };
                 work_pool_unlock_counters();
                 if result.is_err() {
@@ -5530,11 +5575,8 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
                 core::ptr::addr_of_mut!(token_handle) as u64,
             ) as u32
         };
-        let capture = nt_rtl_work_item::normalize_token_capture(
-            work_flags,
-            token_status,
-            token_handle,
-        );
+        let capture =
+            nt_rtl_work_item::normalize_token_capture(work_flags, token_status, token_handle);
         if !nt_rtl_work_item::nt_success(capture.status()) {
             let _ = unsafe { crate::process_heap_free(packet_address) };
             return capture.status();
@@ -5542,12 +5584,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
         token_handle = capture.token_handle();
     }
 
-    let packet = nt_rtl_work_item::WorkItemPacket::new(
-        function,
-        context,
-        work_flags,
-        token_handle,
-    );
+    let packet = nt_rtl_work_item::WorkItemPacket::new(function, context, work_flags, token_handle);
     unsafe {
         core::ptr::write_volatile(
             packet_address.cast::<nt_rtl_work_item::WorkItemPacket>(),
@@ -5556,8 +5593,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
     };
     work_pool_lock_counters();
     let submission = unsafe {
-        (&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS))
-            .reserve(packet_address as u64, packet)
+        (&mut *core::ptr::addr_of_mut!(WORK_POOL_COUNTERS)).reserve(packet_address as u64, packet)
     };
     work_pool_unlock_counters();
     let Ok(submission) = submission else {

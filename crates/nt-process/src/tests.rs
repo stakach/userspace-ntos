@@ -151,7 +151,10 @@ fn stable_token_handles_return_identity_on_close() {
         .insert_handle(caller, HandleObject::TokenObject(token), 0x2c)
         .unwrap();
 
-    assert_eq!(pm.take_handle(caller, handle), Ok(HandleObject::TokenObject(token)));
+    assert_eq!(
+        pm.take_handle(caller, handle),
+        Ok(HandleObject::TokenObject(token))
+    );
     assert_eq!(pm.lookup_handle(caller, handle), None);
     assert_eq!(pm.take_handle(caller, handle), Err(STATUS_INVALID_HANDLE));
 }
@@ -164,7 +167,8 @@ fn thread_impersonation_replaces_reverts_and_falls_back_to_primary() {
     let second = pm.create_thread(pid, 0x2000, 0, false).unwrap();
     let primary = nt_security::TokenId::from_raw(1).unwrap();
     let impersonation = nt_security::TokenId::from_raw(2).unwrap();
-    pm.replace_process_primary_token(pid, Some(primary)).unwrap();
+    pm.replace_process_primary_token(pid, Some(primary))
+        .unwrap();
 
     assert_eq!(pm.effective_token(first), Some(primary));
     assert_eq!(pm.effective_token(second), Some(primary));
@@ -174,7 +178,10 @@ fn thread_impersonation_replaces_reverts_and_falls_back_to_primary() {
         effective_only: false,
         level: nt_security::SecurityImpersonationLevel::Impersonation,
     };
-    assert_eq!(pm.replace_thread_impersonation(first, Some(context)), Ok(None));
+    assert_eq!(
+        pm.replace_thread_impersonation(first, Some(context)),
+        Ok(None)
+    );
     assert_eq!(pm.thread_impersonation(first), Some(context));
     assert_eq!(pm.effective_token(first), Some(impersonation));
     assert_eq!(pm.effective_token(second), Some(primary));
@@ -427,6 +434,33 @@ fn terminated_thread_is_reclaimable_only_after_handles_close() {
     assert!(pm.can_reclaim_thread(worker));
     assert!(!pm.can_reclaim_thread(main));
     assert!(!pm.can_reclaim_thread(0xDEAD));
+}
+
+#[test]
+fn reclaimed_runtime_thread_can_be_reused_only_after_handle_close() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let _main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Thread(worker), 0x1f_ffff)
+        .unwrap();
+
+    pm.terminate_thread(worker, 0x1234).unwrap();
+    assert_eq!(
+        pm.reuse_reclaimed_thread(worker, 0x3000, true),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    pm.close_handle(pid, handle).unwrap();
+    pm.reuse_reclaimed_thread(worker, 0x3000, true).unwrap();
+
+    let thread = pm.thread(worker).unwrap();
+    assert_eq!(thread.start_address, 0x3000);
+    assert_eq!(thread.state, ThreadState::Initialized);
+    assert_eq!(thread.exit_status, None);
+    assert_eq!(thread.suspend_count, 0);
+    assert_eq!(thread.teb_base, 0);
+    assert!(!pm.can_reclaim_thread(worker));
 }
 
 #[test]

@@ -679,7 +679,8 @@ impl ProcessManager {
     }
 
     pub fn process_break_on_termination(&self, pid: ProcessId) -> Option<bool> {
-        self.process(pid).map(|process| process.break_on_termination)
+        self.process(pid)
+            .map(|process| process.break_on_termination)
     }
 
     pub fn set_process_break_on_termination(
@@ -768,6 +769,53 @@ impl ProcessManager {
                         .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
                 })
             })
+    }
+
+    /// Reset a preallocated runtime-thread identity after its terminated object is no longer
+    /// reachable through any handle. This is intentionally narrower than creating a new NT thread:
+    /// hosts use it to recycle bounded, allocation-free worker slots after deleting the old backing
+    /// mechanism.
+    pub fn reuse_reclaimed_thread(
+        &mut self,
+        tid: ThreadId,
+        start_address: u64,
+        create_suspended: bool,
+    ) -> Result<(), u32> {
+        if !self.can_reclaim_thread(tid) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let process_id = self
+            .threads
+            .get(&tid)
+            .map(|thread| thread.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let process = self
+            .processes
+            .get(&process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if matches!(
+            process.state,
+            ProcessState::Exiting | ProcessState::Terminated
+        ) {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.impersonation.is_some() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        thread.start_address = start_address;
+        thread.parameter = 0;
+        thread.state = if create_suspended {
+            ThreadState::Initialized
+        } else {
+            ThreadState::Running
+        };
+        thread.exit_status = None;
+        thread.suspend_count = 0;
+        thread.win32_thread = None;
+        thread.teb_base = 0;
+        thread.break_on_termination = false;
+        Ok(())
     }
 
     /// Bind a thread's start address (spec §10) — a host that pre-creates the main thread as an

@@ -218,11 +218,7 @@ pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
 
 /// Allocate from the heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_alloc_with_flags(
-    handle: *mut u8,
-    size: usize,
-    flags: u32,
-) -> *mut u8 {
+pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: u32) -> *mut u8 {
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -256,9 +252,7 @@ pub(crate) unsafe fn heap_realloc_with_flags(
     unsafe {
         process_heaps_locked()
             .find_mut(handle)
-            .and_then(|heap| {
-                heap.reallocate_with_flags(ptr, new_size, flags, in_place_only)
-            })
+            .and_then(|heap| heap.reallocate_with_flags(ptr, new_size, flags, in_place_only))
             .unwrap_or(core::ptr::null_mut())
     }
 }
@@ -276,10 +270,7 @@ pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
 
 /// Read per-allocation user metadata from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_user_info(
-    handle: *mut u8,
-    ptr: *mut u8,
-) -> Option<HeapUserInfo> {
+pub(crate) unsafe fn heap_user_info(handle: *mut u8, ptr: *mut u8) -> Option<HeapUserInfo> {
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -290,11 +281,7 @@ pub(crate) unsafe fn heap_user_info(
 
 /// Store a user value on an allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn heap_set_user_value(
-    handle: *mut u8,
-    ptr: *mut u8,
-    value: usize,
-) -> bool {
+pub(crate) unsafe fn heap_set_user_value(handle: *mut u8, ptr: *mut u8, value: usize) -> bool {
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -612,6 +599,12 @@ pub unsafe extern "C" fn LdrpInitialize(
             // (2)+(3) Real heap + in-process import snap against OUR export table.
             // SAFETY: on-target; both are mapped PE images in this VSpace.
             let res = unsafe { on_target::ldrp_drive(smss, ntdll, context as u64) };
+
+            #[cfg(feature = "rtl_work_item_probe")]
+            {
+                // The opt-in live probe runs only in smss and only after releasing its loader lock.
+                unsafe { on_target::run_rtl_queue_work_item_probe_if_smss() };
+            }
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).

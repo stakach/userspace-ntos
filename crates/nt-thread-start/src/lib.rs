@@ -4,6 +4,24 @@ pub const CONTEXT_RCX_OFFSET: u64 = 0x80;
 pub const CONTEXT_RDX_OFFSET: u64 = 0x88;
 pub const CONTEXT_RSP_OFFSET: u64 = 0x98;
 pub const CONTEXT_RIP_OFFSET: u64 = 0xf8;
+pub const AMD64_CONTEXT_SIZE: usize = 0x4d0;
+
+const CONTEXT_FLAGS_OFFSET: usize = 0x30;
+const CONTEXT_MXCSR_OFFSET: usize = 0x34;
+const CONTEXT_SEG_CS_OFFSET: usize = 0x38;
+const CONTEXT_SEG_DS_OFFSET: usize = 0x3a;
+const CONTEXT_SEG_ES_OFFSET: usize = 0x3c;
+const CONTEXT_SEG_FS_OFFSET: usize = 0x3e;
+const CONTEXT_SEG_GS_OFFSET: usize = 0x40;
+const CONTEXT_SEG_SS_OFFSET: usize = 0x42;
+const CONTEXT_EFLAGS_OFFSET: usize = 0x44;
+
+const CONTEXT_AMD64_FULL_WITH_SEGMENTS: u32 = 0x0010_000f;
+const INITIAL_MXCSR: u32 = 0x1f80;
+const EFLAGS_INTERRUPT_MASK: u32 = 0x200;
+const USER_CODE_SELECTOR: u16 = 0x33;
+const USER_DATA_SELECTOR: u16 = 0x2b;
+const USER_CMTEB_SELECTOR: u16 = 0x53;
 
 pub const INITIAL_TEB_STACK_BASE_OFFSET: u64 = 0x10;
 pub const INITIAL_TEB_STACK_LIMIT_OFFSET: u64 = 0x18;
@@ -84,6 +102,52 @@ impl Amd64ThreadContext {
     }
 }
 
+/// Build the initialized portion of an AMD64 user thread `CONTEXT` using the same stack and
+/// selector contract as ReactOS `RtlInitializeContext`.
+pub fn initialize_amd64_user_context(
+    context: &mut [u8],
+    start_address: u64,
+    parameter: u64,
+    stack_base: u64,
+) -> bool {
+    if context.len() < AMD64_CONTEXT_SIZE {
+        return false;
+    }
+    context[..AMD64_CONTEXT_SIZE].fill(0);
+    let rsp = stack_base.wrapping_sub(6 * 8) & !15;
+    let rsp = rsp.wrapping_sub(8);
+
+    put_u32(
+        context,
+        CONTEXT_FLAGS_OFFSET,
+        CONTEXT_AMD64_FULL_WITH_SEGMENTS,
+    );
+    put_u32(context, CONTEXT_MXCSR_OFFSET, INITIAL_MXCSR);
+    put_u16(context, CONTEXT_SEG_CS_OFFSET, USER_CODE_SELECTOR);
+    put_u16(context, CONTEXT_SEG_DS_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_ES_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_FS_OFFSET, USER_CMTEB_SELECTOR);
+    put_u16(context, CONTEXT_SEG_GS_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_SS_OFFSET, USER_DATA_SELECTOR);
+    put_u32(context, CONTEXT_EFLAGS_OFFSET, EFLAGS_INTERRUPT_MASK);
+    put_u64(context, CONTEXT_RCX_OFFSET as usize, parameter);
+    put_u64(context, CONTEXT_RSP_OFFSET as usize, rsp);
+    put_u64(context, CONTEXT_RIP_OFFSET as usize, start_address);
+    true
+}
+
+fn put_u16(buffer: &mut [u8], offset: usize, value: u16) {
+    buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(buffer: &mut [u8], offset: usize, value: u64) {
+    buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InitialTeb64 {
     pub stack_base: u64,
@@ -131,6 +195,58 @@ mod tests {
     }
 
     #[test]
+    fn initializes_reactos_amd64_user_context_contract() {
+        let mut bytes = [0xa5; AMD64_CONTEXT_SIZE];
+        assert!(initialize_amd64_user_context(
+            &mut bytes,
+            0x1234_5678,
+            0xfeed_beef,
+            0x7001_0000,
+        ));
+        assert_eq!(
+            u32::from_le_bytes(bytes[0x30..0x34].try_into().unwrap()),
+            0x0010_000f
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[0x34..0x38].try_into().unwrap()),
+            0x1f80
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap()),
+            0x33
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[0x3a..0x3c].try_into().unwrap()),
+            0x2b
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[0x3e..0x40].try_into().unwrap()),
+            0x53
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()),
+            0x200
+        );
+        let decoded = Amd64ThreadContext::read(
+            |address| {
+                let at = address as usize;
+                u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+            },
+            0,
+        );
+        assert_eq!(decoded.rip, 0x1234_5678);
+        assert_eq!(decoded.rcx, 0xfeed_beef);
+        assert_eq!(decoded.rsp, 0x7000_ffc8);
+        assert!(bytes[0x100..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn context_initializer_rejects_short_storage() {
+        let mut bytes = [0u8; AMD64_CONTEXT_SIZE - 1];
+        assert!(!initialize_amd64_user_context(&mut bytes, 1, 2, 3));
+    }
+
+    #[test]
     fn trampoline_restores_both_windows_argument_registers() {
         let code = Amd64ThreadContext {
             rip: 0x8877_6655_4433_2211,
@@ -170,12 +286,18 @@ mod tests {
         assert_eq!(u64::from_le_bytes(code[12..20].try_into().unwrap()), ntdll);
         assert_eq!(&code[20..23], &[0x45, 0x31, 0xc0]);
         assert_eq!(&code[23..25], &[0x49, 0xb9]);
-        assert_eq!(u64::from_le_bytes(code[25..33].try_into().unwrap()), context);
+        assert_eq!(
+            u64::from_le_bytes(code[25..33].try_into().unwrap()),
+            context
+        );
         assert_eq!(&code[33..35], &[0x48, 0xb8]);
         assert_eq!(u64::from_le_bytes(code[35..43].try_into().unwrap()), loader);
         assert_eq!(&code[43..45], &[0xff, 0xd0]);
         assert_eq!(&code[45..47], &[0x48, 0xb8]);
-        assert_eq!(u64::from_le_bytes(code[47..55].try_into().unwrap()), context);
+        assert_eq!(
+            u64::from_le_bytes(code[47..55].try_into().unwrap()),
+            context
+        );
         assert_eq!(&code[55..62], &[0x48, 0x8b, 0x88, 0x80, 0, 0, 0]);
         assert_eq!(&code[62..69], &[0x48, 0x8b, 0x90, 0x88, 0, 0, 0]);
         assert_eq!(&code[69..76], &[0x48, 0x8b, 0xa0, 0x98, 0, 0, 0]);

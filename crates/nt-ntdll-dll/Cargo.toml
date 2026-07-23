@@ -20,6 +20,9 @@ crate-type = ["cdylib"]
 # trap). Forwards to nt-ntdll's `native_transport` (which flips the Nt* stub bodies + on_target).
 default = ["native_transport"]
 native_transport = ["nt-ntdll/native_transport"]
+# Opt-in live integration probe. This creates an extra smss thread and runs DLL_THREAD_ATTACH, so it
+# is intentionally excluded from production/default images.
+rtl_work_item_probe = []
 
 [dependencies]
 nt-alpc-abi = { path = "../nt-alpc-abi" }
@@ -27,6 +30,7 @@ nt-kernel-exec = { path = "../nt-kernel-exec", default-features = false }
 nt-ntdll = { path = "../nt-ntdll", default-features = false }
 nt-ntdll-layout = { path = "../nt-ntdll-layout" }
 nt-rtl-work-item = { path = "../nt-rtl-work-item" }
+nt-thread-start = { path = "../nt-thread-start" }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

@@ -32,6 +32,10 @@ TARGET_JSON="x86_64-pc-windows-gnullvm-nostd.json"
 TARGET_DIRNAME="x86_64-pc-windows-gnullvm-nostd"
 OUT_DIR="$ROOT/.tmp"
 OUT_DLL="$OUT_DIR/nt-ntdll.dll"
+FEATURE_ARGS=()
+if [ -n "${NTDLL_FEATURES:-}" ]; then
+  FEATURE_ARGS=(--features "$NTDLL_FEATURES")
+fi
 
 echo "==> building nt-ntdll-dll (PE32+ ntdll.dll) for $TARGET_DIRNAME"
 
@@ -40,6 +44,7 @@ echo "==> building nt-ntdll-dll (PE32+ ntdll.dll) for $TARGET_DIRNAME"
     cargo +nightly build \
       --release \
       --target "$TARGET_JSON" \
+      "${FEATURE_ARGS[@]}" \
       -Z build-std=core,alloc,panic_abort \
       -Z build-std-features=compiler-builtins-mem \
       -Z json-target-spec )

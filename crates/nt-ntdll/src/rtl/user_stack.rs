@@ -87,7 +87,11 @@ pub fn create_user_stack_layout(
     };
 
     let commit = round_up(requested_commit, commit_alignment).ok_or(STATUS_INVALID_PARAMETER)?;
-    let reserve_floor = requested_reserve.max(default_reserve).max(commit);
+    let reserve_floor = if commit >= requested_reserve {
+        round_up(commit, DEFAULT_STACK_RESERVE).ok_or(STATUS_INVALID_PARAMETER)?
+    } else {
+        requested_reserve
+    };
     let reserve = round_up(reserve_floor, reserve_alignment).ok_or(STATUS_INVALID_PARAMETER)?;
     let guard = if reserve >= commit.saturating_add(DEFAULT_PAGE_SIZE) {
         DEFAULT_PAGE_SIZE
@@ -143,12 +147,18 @@ mod tests {
     }
 
     #[test]
-    fn reserve_never_drops_below_default() {
+    fn explicit_reserve_is_preserved_when_larger_than_commit() {
         assert_eq!(
             create_user_stack_layout(0x20_000, 0x20_000, 0, 1, 1, DCOMMIT, DRESERVE)
                 .unwrap()
                 .reserve,
             DRESERVE
+        );
+        assert_eq!(
+            create_user_stack_layout(0x20_000, 0x40_000, 0, 0x1000, 0x1_0000, DCOMMIT, DRESERVE)
+                .unwrap()
+                .reserve,
+            0x40_000
         );
     }
 

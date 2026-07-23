@@ -1095,15 +1095,32 @@ impl ExecNtHandler {
             return None;
         }
         let t = tid as nt_process::ThreadId;
-        self.pm.set_thread_start_address(t, entry);
-        let _ = self.pm.set_thread_state(
-            t,
-            if create_suspended {
-                nt_process::ThreadState::Initialized
-            } else {
-                nt_process::ThreadState::Running
-            },
-        );
+        let prepared = if self
+            .pm
+            .thread(t)
+            .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
+        {
+            self.pm
+                .reuse_reclaimed_thread(t, entry, create_suspended)
+                .is_ok()
+        } else {
+            self.pm.set_thread_start_address(t, entry)
+                && self
+                    .pm
+                    .set_thread_state(
+                        t,
+                        if create_suspended {
+                            nt_process::ThreadState::Initialized
+                        } else {
+                            nt_process::ThreadState::Running
+                        },
+                    )
+                    .is_ok()
+        };
+        if !prepared {
+            used.fetch_and(!(1 << slot), Ordering::Relaxed);
+            return None;
+        }
         let h =
             match self
                 .pm

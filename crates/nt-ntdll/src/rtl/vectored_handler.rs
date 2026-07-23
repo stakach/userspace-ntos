@@ -490,13 +490,13 @@ mod tests {
         assert_eq!(
             handlers.as_ref().encoded_handler_for_test(head),
             Some(crate::rtl::encode::encode_pointer(
-                handler_two as usize as u64,
+                handler_two as *const () as usize as u64,
                 0x1234_5678,
             ))
         );
         assert_ne!(
             handlers.as_ref().encoded_handler_for_test(head),
-            Some(handler_two as usize as u64)
+            Some(handler_two as *const () as usize as u64)
         );
         let mut state = call_state(handlers.as_ref());
 
