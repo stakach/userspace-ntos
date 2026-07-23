@@ -10,6 +10,7 @@ use super::activation::{
     COMPATIBILITY_ELEMENT_TYPE_OS, RUN_LEVEL_AS_INVOKER, RUN_LEVEL_HIGHEST_AVAILABLE,
     RUN_LEVEL_REQUIRE_ADMIN, RUN_LEVEL_UNSPECIFIED, STATUS_SXS_CANT_GEN_ACTCTX,
 };
+use super::guid::Guid;
 
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_SXS_INVALID_ACTCTXDATA_FORMAT: NtStatus = 0xC015_0003;
@@ -29,6 +30,7 @@ pub struct ParsedManifestDetails {
     pub root_language: Option<Vec<u16>>,
     pub dependencies: Vec<ManifestDependency>,
     pub window_classes: Vec<ManifestWindowClass>,
+    pub clr_surrogates: Vec<ManifestClrSurrogate>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +47,14 @@ pub struct ManifestWindowClass {
     pub file_index: usize,
     pub name: Vec<u16>,
     pub versioned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestClrSurrogate {
+    pub clsid: Guid,
+    pub name: Vec<u16>,
+    /// `Some(empty)` preserves an explicitly empty `runtimeVersion` attribute.
+    pub runtime_version: Option<Vec<u16>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -304,6 +314,7 @@ struct Parser<'a> {
     root_language: Option<Vec<u16>>,
     dependencies: Vec<ManifestDependency>,
     window_classes: Vec<ManifestWindowClass>,
+    clr_surrogates: Vec<ManifestClrSurrogate>,
     compatibility: Vec<CompatibilityElement>,
     run_level: u32,
     ui_access: u32,
@@ -345,6 +356,7 @@ impl<'a> Parser<'a> {
             root_language: None,
             dependencies: Vec::new(),
             window_classes: Vec::new(),
+            clr_surrogates: Vec::new(),
             compatibility: Vec::new(),
             run_level: RUN_LEVEL_UNSPECIFIED,
             ui_access: 0,
@@ -459,6 +471,10 @@ impl<'a> Parser<'a> {
                     {
                         self.set_assembly_identity(tag)?;
                         FrameKind::Other
+                    } else if parent_is_assembly && local_eq(self.input, tag.name(), "clrSurrogate")
+                    {
+                        self.add_clr_surrogate(tag)?;
+                        FrameKind::Other
                     } else if parent_dependency_optional.is_some()
                         && local_eq(self.input, tag.name(), "dependentAssembly")
                     {
@@ -539,6 +555,7 @@ impl<'a> Parser<'a> {
             root_language: self.root_language,
             dependencies: self.dependencies,
             window_classes: self.window_classes,
+            clr_surrogates: self.clr_surrogates,
         })
     }
 
@@ -690,6 +707,46 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(versioned)
+    }
+
+    fn add_clr_surrogate(&mut self, tag: Tag) -> Result<(), NtStatus> {
+        let mut clsid = None;
+        let mut name = None;
+        let mut runtime_version = None;
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            let value = || decode_attribute_value(&self.input[attribute.value()]);
+            if attribute_eq(self.input, attribute, "clsid") {
+                clsid = super::guid::guid_from_string(&value()?);
+                if clsid.is_none() {
+                    return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                }
+            } else if attribute_eq(self.input, attribute, "name") {
+                name = Some(value()?);
+            } else if attribute_eq(self.input, attribute, "runtimeVersion") {
+                runtime_version = Some(value()?);
+            }
+        }
+        let (Some(clsid), Some(name)) = (clsid, name) else {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        };
+        if name.is_empty()
+            || name.contains(&0)
+            || runtime_version
+                .as_ref()
+                .is_some_and(|version| version.contains(&0))
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        self.clr_surrogates
+            .try_reserve(1)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        self.clr_surrogates.push(ManifestClrSurrogate {
+            clsid,
+            name,
+            runtime_version,
+        });
+        Ok(())
     }
 
     fn finish_frame(&mut self, kind: FrameKind) -> Result<(), NtStatus> {
@@ -1474,6 +1531,78 @@ mod tests {
             parsed.root.dll_redirects[parsed.window_classes[2].file_index].name,
             wide("second.dll")
         );
+    }
+
+    #[test]
+    fn parses_root_clr_surrogates_and_preserves_optional_versions() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <clrSurrogate clsid="{96666666-8888-7777-6666-555555555555}"
+                name="test&amp;surrogate" runtimeVersion="v2.0.50727"/>
+              <asm:clrSurrogate clsid="{96666666-8888-7777-6666-555555555556}"
+                name="unversioned"></asm:clrSurrogate>
+              <clrSurrogate clsid="{96666666-8888-7777-6666-555555555557}"
+                name="empty-version" runtimeVersion=""/>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.clr_surrogates.len(), 3);
+        assert_eq!(
+            parsed.clr_surrogates[0].clsid,
+            Guid {
+                data1: 0x9666_6666,
+                data2: 0x8888,
+                data3: 0x7777,
+                data4: [0x66, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55],
+            }
+        );
+        assert_eq!(parsed.clr_surrogates[0].name, wide("test&surrogate"));
+        assert_eq!(
+            parsed.clr_surrogates[0].runtime_version,
+            Some(wide("v2.0.50727"))
+        );
+        assert_eq!(parsed.clr_surrogates[1].name, wide("unversioned"));
+        assert_eq!(parsed.clr_surrogates[1].runtime_version, None);
+        assert_eq!(parsed.clr_surrogates[2].runtime_version, Some(Vec::new()));
+    }
+
+    #[test]
+    fn clr_surrogates_require_root_level_valid_clsid_and_name() {
+        let nested = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0"><wrapper>
+              <clrSurrogate clsid="{96666666-8888-7777-6666-555555555555}" name="ignored"/>
+            </wrapper></assembly>"#,
+        )
+        .unwrap();
+        assert!(nested.clr_surrogates.is_empty());
+
+        for manifest in [
+            br#"<assembly manifestVersion="1.0"><clrSurrogate name="missing-clsid"/></assembly>"#
+                .as_slice(),
+            br#"<assembly manifestVersion="1.0"><clrSurrogate clsid="{96666666-8888-7777-6666-555555555555}"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><clrSurrogate clsid="96666666-8888-7777-6666-555555555555" name="bad-guid"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><clrSurrogate clsid="{96666666-8888-7777-6666-555555555555}" name=""/></assembly>"#,
+        ] {
+            assert_eq!(
+                parse_manifest_details(manifest),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+            );
+        }
+    }
+
+    #[test]
+    fn clr_surrogate_attributes_use_exact_namespace_matching() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <clrSurrogate clsid="{96666666-8888-7777-6666-555555555555}"
+                name="real" runtimeVersion="v4"
+                xmlns:clsid="ignored" xmlns:name="ignored" xmlns:runtimeVersion="ignored"/>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.clr_surrogates.len(), 1);
+        assert_eq!(parsed.clr_surrogates[0].name, wide("real"));
+        assert_eq!(parsed.clr_surrogates[0].runtime_version, Some(wide("v4")));
     }
 
     #[test]
