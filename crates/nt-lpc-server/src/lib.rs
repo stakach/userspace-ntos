@@ -221,11 +221,12 @@ impl Server {
             Ok(Some(m)) => {
                 let n = m.bytes.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&m.bytes[..n]);
-                // detail0 is the connection's accepted PortContext for listen-port receives.
+                // Listen-port receives expose the accepted PortContext for reply routing. Comm-port
+                // receives remain classic LPC and do not surface ALPC message attributes.
                 Ok(reply(
                     NtStatus::SUCCESS,
                     n as u32,
-                    m.attrs.context.unwrap_or(0),
+                    if is_listen_port { m.port_context } else { 0 },
                     msg_type_of(&m.bytes) as u64,
                 ))
             }

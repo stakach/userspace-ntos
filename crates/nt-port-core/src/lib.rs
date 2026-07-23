@@ -155,6 +155,8 @@ pub struct DataView {
 pub struct QueuedMessage {
     pub bytes: Vec<u8>,
     pub attrs: MessageAttrs,
+    /// Accepted connection PortContext used only for classic LPC listen-port routing.
+    pub port_context: u64,
 }
 
 /// Base for allocated port / comm-port handles (a distinct, recognizable range —
@@ -459,15 +461,14 @@ impl PortCore {
         let mut msg = QueuedMessage {
             bytes: bytes.to_vec(),
             attrs,
+            port_context: 0,
         };
         for conn in self.connections.iter_mut() {
             if conn.state != ConnState::Connected {
                 continue;
             }
             if from_handle != 0 && conn.client_handle == from_handle {
-                if msg.attrs.context.is_none() {
-                    msg.attrs.context = Some(conn.port_context);
-                }
+                msg.port_context = conn.port_context;
                 conn.server_inbox.push(msg);
                 return Ok(());
             }
@@ -720,7 +721,8 @@ mod tests {
             .unwrap();
         let request = core.receive_message(ph).unwrap().unwrap();
         assert_eq!(request.bytes, b"second");
-        assert_eq!(request.attrs.context, Some(0x2222));
+        assert_eq!(request.attrs.context, None);
+        assert_eq!(request.port_context, 0x2222);
         core.send_message(ph, b"reply", MessageAttrs::default()).unwrap();
 
         assert!(core.receive_message(clients[0]).unwrap().is_none());

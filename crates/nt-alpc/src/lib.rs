@@ -237,7 +237,7 @@ impl AlpcServer {
         // A valid listen port with nothing pending must park, not error.
         let is_listen_port = conn_try.is_ok();
         match core.receive_message(req.port_handle) {
-            Ok(Some(QueuedMessage { bytes, attrs })) => {
+            Ok(Some(QueuedMessage { bytes, attrs, .. })) => {
                 let msg_type = read_msg_type(&bytes);
                 // Project the neutral attrs into the ALPC valid-attributes view.
                 // Non-bridging attrs from an ALPC peer are surfaced; an LPC peer
@@ -505,6 +505,7 @@ impl PeerDirect {
         let msg = QueuedMessage {
             bytes: bytes.to_vec(),
             attrs,
+            port_context: 0,
         };
         for c in self.conns.iter_mut() {
             if from_handle == c.client_handle {
