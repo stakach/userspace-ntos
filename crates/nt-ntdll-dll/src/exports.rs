@@ -18433,6 +18433,186 @@ unsafe fn debug_buffer_commit(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_buffer_reset_query(
+    buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
+) -> NtStatus {
+    let offset_free = unsafe { (*buffer).offset_free };
+    let commit_size = unsafe { (*buffer).commit_size };
+    let view_size = unsafe { (*buffer).view_size };
+    let base = unsafe { (*buffer).view_base_client };
+    if base.is_null()
+        || offset_free < nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE
+        || offset_free > commit_size
+        || commit_size > view_size
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let payload_size = offset_free - nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE;
+    if payload_size != 0 {
+        unsafe {
+            core::ptr::write_bytes(
+                base.byte_add(nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE)
+                    .cast::<u8>(),
+                0,
+                payload_size,
+            )
+        };
+    }
+    unsafe {
+        (*buffer).offset_free = nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE;
+        (*buffer).modules = core::ptr::null_mut();
+        (*buffer).back_traces = core::ptr::null_mut();
+        (*buffer).heaps = core::ptr::null_mut();
+        (*buffer).locks = core::ptr::null_mut();
+    }
+    STATUS_SUCCESS
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_query_process_heap_information_impl(
+    buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
+) -> NtStatus {
+    use nt_ntdll::heap::{HeapWalkOutcome, RtlHeapWalkEntry};
+    use nt_ntdll::rtl::debug_buffer::{
+        heap_entry_from_walk, plan_heap_snapshot, RtlHeapInformation, RtlProcessHeaps,
+        QUERY_HEAP_BLOCKS, QUERY_HEAP_TAGS,
+    };
+
+    unsafe { (*buffer).heaps = core::ptr::null_mut() };
+    if unsafe { (*buffer).flags } & QUERY_HEAP_TAGS != 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    const MAX_PROCESS_HEAPS: usize = 16;
+    let start_offset = unsafe { (*buffer).offset_free };
+    let include_entries = unsafe { (*buffer).flags } & QUERY_HEAP_BLOCKS != 0;
+    let specific_heap = unsafe { (*buffer).specific_heap };
+
+    let status = crate::with_process_heap_debug_snapshot(|snapshot| {
+        let mut handles = [core::ptr::null_mut(); MAX_PROCESS_HEAPS];
+        let number_of_heaps = snapshot.copy_handles(&mut handles);
+        if number_of_heaps > handles.len() {
+            return STATUS_NO_MEMORY;
+        }
+
+        let mut summaries = [None; MAX_PROCESS_HEAPS];
+        let mut number_of_entries = 0usize;
+        for index in 0..number_of_heaps {
+            let Some(summary) = snapshot.summary(handles[index]) else {
+                return STATUS_UNSUCCESSFUL;
+            };
+            if include_entries
+                && (specific_heap.is_null() || specific_heap.cast::<u8>() == handles[index])
+            {
+                let Some(total) =
+                    number_of_entries.checked_add(summary.number_of_entries as usize)
+                else {
+                    return STATUS_NO_MEMORY;
+                };
+                number_of_entries = total;
+            }
+            summaries[index] = Some(summary);
+        }
+
+        let Some(plan) = plan_heap_snapshot(number_of_heaps, number_of_entries) else {
+            return STATUS_NO_MEMORY;
+        };
+        let payload = unsafe { debug_buffer_commit(buffer, plan.total_size) };
+        if payload.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        unsafe { core::ptr::write_bytes(payload.cast::<u8>(), 0, plan.total_size) };
+
+        let heaps = payload.cast::<RtlProcessHeaps>();
+        let heap_information = unsafe {
+            payload
+                .byte_add(plan.heap_information_offset)
+                .cast::<RtlHeapInformation>()
+        };
+        let mut entries = unsafe {
+            payload
+                .byte_add(plan.entries_offset)
+                .cast::<nt_ntdll::rtl::debug_buffer::RtlHeapEntry>()
+        };
+        unsafe {
+            (*heaps).number_of_heaps = number_of_heaps as u32;
+            (*heaps)._padding = 0;
+        }
+
+        for index in 0..number_of_heaps {
+            let summary = summaries[index].expect("summary populated during preflight");
+            let selected = include_entries
+                && (specific_heap.is_null() || specific_heap.cast::<u8>() == handles[index]);
+            let entry_count = if selected {
+                summary.number_of_entries
+            } else {
+                0
+            };
+            let flags = match snapshot.flags(handles[index]) {
+                Some(flags) => flags,
+                None => return STATUS_UNSUCCESSFUL,
+            };
+            unsafe {
+                heap_information.add(index).write(RtlHeapInformation {
+                    base_address: summary.base_address.cast(),
+                    flags,
+                    entry_overhead: summary.entry_overhead,
+                    creator_back_trace_index: 0,
+                    bytes_allocated: summary.bytes_allocated,
+                    bytes_committed: summary.bytes_committed,
+                    number_of_tags: 0,
+                    number_of_entries: entry_count,
+                    number_of_pseudo_tags: 0,
+                    pseudo_tag_granularity: 0,
+                    reserved: [0; 5],
+                    _padding: 0,
+                    tags: core::ptr::null_mut(),
+                    entries: if entry_count == 0 {
+                        core::ptr::null_mut()
+                    } else {
+                        entries
+                    },
+                })
+            };
+
+            if selected {
+                let mut walk = RtlHeapWalkEntry::restart();
+                let mut written = 0u32;
+                loop {
+                    match snapshot.walk(handles[index], &mut walk) {
+                        Ok(HeapWalkOutcome::Entry) => {
+                            let Some(entry) = heap_entry_from_walk(&walk) else {
+                                return STATUS_UNSUCCESSFUL;
+                            };
+                            unsafe { entries.write(entry) };
+                            entries = unsafe { entries.add(1) };
+                            written += 1;
+                        }
+                        Ok(HeapWalkOutcome::NoMoreEntries) => break,
+                        Err(_) => return STATUS_UNSUCCESSFUL,
+                    }
+                }
+                if written != entry_count {
+                    return STATUS_UNSUCCESSFUL;
+                }
+            }
+        }
+
+        unsafe { (*buffer).heaps = heaps.cast() };
+        STATUS_SUCCESS
+    });
+
+    if !nt_success(status) {
+        unsafe {
+            (*buffer).offset_free = start_offset;
+            (*buffer).heaps = core::ptr::null_mut();
+        }
+    }
+    status
+}
+
 /// `RtlCreateQueryDebugBuffer(ULONG Size, BOOLEAN EventPair) -> PRTL_DEBUG_INFORMATION`.
 ///
 /// Reserves the complete query view, commits its first page, and installs the native x64 ownership
@@ -18518,11 +18698,40 @@ pub unsafe extern "system" fn rtl_destroy_query_debug_buffer(buffer: *mut c_void
     }
 }
 
+/// `RtlQueryProcessHeapInformation(PRTL_DEBUG_INFORMATION Buffer) -> NTSTATUS`.
+///
+/// Captures all registered heap summaries and, when requested, their physical segment/block walk
+/// into the buffer's committed VM view. Heap tags remain unsupported because this allocator does
+/// not maintain native allocation-tag accounting.
+///
+/// # Safety
+/// `buffer` must come from `RtlCreateQueryDebugBuffer`.
+#[export_name = "RtlQueryProcessHeapInformation"]
+pub unsafe extern "system" fn rtl_query_process_heap_information(
+    buffer: *mut c_void,
+) -> NtStatus {
+    if buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            rtl_query_process_heap_information_impl(
+                buffer.cast::<nt_ntdll::rtl::debug_buffer::DebugInformation>(),
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `RtlQueryProcessDebugInformation(ULONG ProcessId, ULONG Flags, PRTL_DEBUG_INFORMATION Buffer)`.
 ///
-/// Current-process module queries are captured from the live loader list into the buffer's VM view.
-/// Heap, backtrace, lock, and remote-process snapshots return STATUS_NOT_IMPLEMENTED until those
-/// process planes can provide non-synthetic records.
+/// Current-process module and heap queries are captured from the live loader and process-heap
+/// registries into the buffer's VM view. Backtrace, heap-tag, lock, and remote-process snapshots
+/// return an honest unsupported status.
 ///
 /// # Safety
 /// `buffer` from `RtlCreateQueryDebugBuffer`.
@@ -18538,10 +18747,11 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
     #[cfg(target_arch = "x86_64")]
     {
         let buffer = buffer.cast::<nt_ntdll::rtl::debug_buffer::DebugInformation>();
-        unsafe {
-            (*buffer).flags = flags;
-            (*buffer).offset_free = nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE;
+        let status = unsafe { debug_buffer_reset_query(buffer) };
+        if !nt_success(status) {
+            return status;
         }
+        unsafe { (*buffer).flags = flags };
         if process_id <= 1 {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -18578,6 +18788,16 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
                 return status;
             }
             unsafe { (*buffer).modules = modules };
+        }
+        if flags
+            & (nt_ntdll::rtl::debug_buffer::QUERY_HEAPS
+                | nt_ntdll::rtl::debug_buffer::QUERY_HEAP_BLOCKS)
+            != 0
+        {
+            let status = unsafe { rtl_query_process_heap_information_impl(buffer) };
+            if !nt_success(status) {
+                return status;
+            }
         }
         STATUS_SUCCESS
     }
@@ -29678,6 +29898,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_time_zone_information as usize,
         rtl_create_query_debug_buffer as usize,
         rtl_destroy_query_debug_buffer as usize,
+        rtl_query_process_heap_information as usize,
         rtl_query_process_debug_information as usize,
         rtl_get_unload_event_trace as usize,
         rtl_get_unload_event_trace_ex as usize,

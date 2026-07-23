@@ -428,6 +428,61 @@ pub(crate) unsafe fn copy_process_heap_handles(output: &mut [*mut u8]) -> usize 
     unsafe { process_heaps_locked().copy_handles(output) }
 }
 
+/// Read-only process-heap view held under the registry lock.
+///
+/// Every heap mutation also takes `PROCESS_HEAP_LOCK`, after its optional native heap lock, so this
+/// guard provides a stable allocation-free snapshot without recursively entering every heap lock.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct ProcessHeapDebugSnapshot<'a> {
+    registry: &'a ProcessHeapRegistry,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ProcessHeapDebugSnapshot<'_> {
+    pub(crate) fn copy_handles(&self, output: &mut [*mut u8]) -> usize {
+        self.registry.copy_handles(output)
+    }
+
+    pub(crate) fn summary(
+        &self,
+        handle: *mut u8,
+    ) -> Option<nt_ntdll::heap::HeapDebugSummary> {
+        self.registry.find(handle)?.debug_summary()
+    }
+
+    pub(crate) fn flags(&self, handle: *mut u8) -> Option<u32> {
+        // SAFETY: the outer registry guard stabilizes the parallel lock-record table.
+        let record = unsafe { heap_lock_record_locked(handle, false) }?;
+        Some(if record.serialized {
+            0
+        } else {
+            HEAP_NO_SERIALIZE
+        })
+    }
+
+    pub(crate) fn walk(
+        &self,
+        handle: *mut u8,
+        entry: &mut RtlHeapWalkEntry,
+    ) -> Result<HeapWalkOutcome, HeapWalkError> {
+        self.registry
+            .find(handle)
+            .ok_or(HeapWalkError::InvalidParameter)?
+            .walk_next(entry)
+    }
+}
+
+/// Execute one allocation-free query while all registered process heaps remain stable.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn with_process_heap_debug_snapshot<R>(
+    query: impl FnOnce(ProcessHeapDebugSnapshot<'_>) -> R,
+) -> R {
+    let _guard = lock_process_heap();
+    // SAFETY: the registry lock excludes all installation, removal, and heap mutation.
+    let registry = unsafe { process_heaps_locked() };
+    query(ProcessHeapDebugSnapshot { registry })
+}
+
 /// Validate the complete physical chain of every registered process heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn validate_process_heaps() -> bool {

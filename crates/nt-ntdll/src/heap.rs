@@ -265,6 +265,17 @@ pub enum HeapWalkError {
     InvalidParameter,
 }
 
+/// Allocation-free summary used by `RtlQueryProcessHeapInformation`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeapDebugSummary {
+    pub base_address: *mut u8,
+    pub entry_overhead: u16,
+    pub bytes_committed: usize,
+    pub bytes_allocated: usize,
+    /// Segment descriptors plus physical busy/free block records.
+    pub number_of_entries: u32,
+}
+
 /// User metadata associated with one live heap allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HeapUserInfo {
@@ -520,6 +531,47 @@ impl<B: Backing> Heap<B> {
             offset = next;
         }
         self.formatted && offset == self.region_len
+    }
+
+    /// Capture the native heap-debug summary from a validated physical block chain.
+    ///
+    /// The committed backing is one segment. Native `BytesAllocated` counts committed bytes not
+    /// represented by free physical blocks, so it includes busy-block headers and alignment
+    /// overhead. The caller must provide the same exclusion required by [`Self::walk_next`] when
+    /// concurrent heap operations are possible.
+    pub fn debug_summary(&self) -> Option<HeapDebugSummary> {
+        let entry_overhead = u16::try_from(HDR).ok()?;
+        let mut offset = 0usize;
+        let mut previous_size = 0usize;
+        let mut previous_was_free = false;
+        let mut free_bytes = 0usize;
+        let mut number_of_entries = 1u32;
+
+        while offset < self.region_len {
+            let header = self.header_at_offset(offset)?;
+            let next = self.validate_header(offset, previous_size, header)?;
+            if previous_was_free && header.is_free() {
+                return None;
+            }
+            if header.is_free() {
+                free_bytes = free_bytes.checked_add(header.size)?;
+            }
+            number_of_entries = number_of_entries.checked_add(1)?;
+            previous_was_free = header.is_free();
+            previous_size = header.size;
+            offset = next;
+        }
+        if !self.formatted || offset != self.region_len {
+            return None;
+        }
+
+        Some(HeapDebugSummary {
+            base_address: self.handle(),
+            entry_overhead,
+            bytes_committed: self.region_len,
+            bytes_allocated: self.region_len.checked_sub(free_bytes)?,
+            number_of_entries,
+        })
     }
 
     /// Return the largest currently available free payload extent.
@@ -1269,6 +1321,58 @@ mod tests {
         assert_eq!(entry.data_address, block.data_address);
         assert_eq!(entry.data_size, block.data_size);
         assert_eq!(entry.flags, block.flags);
+    }
+
+    #[test]
+    fn debug_summary_counts_segment_and_physical_blocks() {
+        let mut heap = heap(2048);
+        let first = heap.allocate(17).unwrap();
+        let middle = heap.allocate(33).unwrap();
+        let _last = heap.allocate(49).unwrap();
+        // SAFETY: middle is an exact live allocation from this heap.
+        assert!(unsafe { heap.free(middle) });
+
+        let summary = heap.debug_summary().unwrap();
+        assert_eq!(summary.base_address, heap.handle());
+        assert_eq!(summary.entry_overhead, HDR as u16);
+        assert_eq!(summary.bytes_committed, heap.region_len);
+
+        let mut cursor = RtlHeapWalkEntry::restart();
+        let mut expected_entries = 0u32;
+        let mut expected_allocated = 0usize;
+        loop {
+            match heap.walk_next(&mut cursor).unwrap() {
+                HeapWalkOutcome::Entry => {
+                    expected_entries += 1;
+                    if cursor.flags & RTL_HEAP_BUSY != 0 {
+                        expected_allocated += cursor.data_size + usize::from(cursor.overhead_bytes);
+                    }
+                }
+                HeapWalkOutcome::NoMoreEntries => break,
+            }
+        }
+        assert_eq!(summary.number_of_entries, expected_entries);
+        assert_eq!(summary.bytes_allocated, expected_allocated);
+        assert!(heap.validate(Some(first)));
+    }
+
+    #[test]
+    fn debug_summary_reports_empty_heap_and_rejects_corruption() {
+        let heap = heap(1024);
+        assert_eq!(
+            heap.debug_summary(),
+            Some(HeapDebugSummary {
+                base_address: heap.handle(),
+                entry_overhead: HDR as u16,
+                bytes_committed: heap.region_len,
+                bytes_allocated: 0,
+                number_of_entries: 2,
+            })
+        );
+
+        // SAFETY: corrupt the first in-band header without forming an invalid Rust value.
+        unsafe { (*heap.hdr(heap.handle())).reserved = 1 };
+        assert_eq!(heap.debug_summary(), None);
     }
 
     #[test]
