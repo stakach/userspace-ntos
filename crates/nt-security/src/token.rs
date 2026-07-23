@@ -3,6 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::native_acl::NativeAcl;
 use crate::sid::{Luid, Sid};
 
 /// Token type (spec §7.2).
@@ -38,8 +39,10 @@ impl TryFrom<u32> for SecurityImpersonationLevel {
 }
 
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
 pub const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
 pub const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
+pub const STATUS_ALLOTTED_SPACE_EXCEEDED: u32 = 0xC000_0099;
 
 /// A group in a token (spec §7.3). v0.1 attributes: enabled / deny-only / owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +68,15 @@ impl TokenGroup {
             enabled: false,
             deny_only: true,
             owner: false,
+        }
+    }
+
+    pub fn enabled_owner(sid: Sid) -> Self {
+        TokenGroup {
+            sid,
+            enabled: true,
+            deny_only: false,
+            owner: true,
         }
     }
 }
@@ -133,6 +145,8 @@ pub struct AccessToken {
     pub privileges: Vec<TokenPrivilege>,
     pub owner: Sid,
     pub primary_group: Sid,
+    /// Lossless native default ACL. `None` is the distinct null-default-DACL state.
+    pub default_dacl: Option<NativeAcl>,
     pub session_id: u32,
     pub authentication_id: Luid,
 }
@@ -164,9 +178,7 @@ impl AccessToken {
         };
         if effective_only {
             duplicate.groups.retain(|group| group.enabled);
-            duplicate
-                .privileges
-                .retain(|privilege| privilege.enabled);
+            duplicate.privileges.retain(|privilege| privilege.enabled);
         }
         Ok(duplicate)
     }
@@ -304,7 +316,7 @@ impl AccessToken {
             impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_system(),
             groups: vec![
-                TokenGroup::enabled(Sid::administrators()),
+                TokenGroup::enabled_owner(Sid::administrators()),
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
@@ -336,6 +348,7 @@ impl AccessToken {
             ],
             owner: Sid::administrators(),
             primary_group: Sid::local_system(),
+            default_dacl: Some(NativeAcl::system_default()),
             session_id: 0,
             authentication_id: Luid::new(0x3e7), // SYSTEM_LUID
         }
@@ -361,6 +374,7 @@ impl AccessToken {
             ],
             owner: Sid::local_account(machine, 1001),
             primary_group: Sid::users(),
+            default_dacl: None,
             session_id: 1,
             authentication_id: Luid::new(0x1_0000),
         }
@@ -380,6 +394,7 @@ impl AccessToken {
             privileges: vec![Self::priv_enabled(SE_CHANGE_NOTIFY, 23)],
             owner: Sid::local_account(machine, 1000),
             primary_group: Sid::users(),
+            default_dacl: None,
             session_id: 1,
             authentication_id: Luid::new(0x2_0000),
         }
@@ -392,7 +407,11 @@ pub struct TokenId(u32);
 
 impl TokenId {
     pub const fn from_raw(raw: u32) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
+        if raw == 0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
     }
 
     pub const fn raw(self) -> u32 {
@@ -408,14 +427,43 @@ impl TokenId {
 struct TokenObject {
     token: AccessToken,
     references: u32,
+    token_luid: Luid,
+    modified_luid: Luid,
+    expiration_time: i64,
+    dynamic_charged: u32,
+}
+
+/// The fixed native fields returned for `TokenStatistics`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TokenStatistics {
+    pub token_id: Luid,
+    pub authentication_id: Luid,
+    pub expiration_time: i64,
+    pub token_type: TokenType,
+    pub impersonation_level: SecurityImpersonationLevel,
+    pub dynamic_charged: u32,
+    pub dynamic_available: u32,
+    pub group_count: u32,
+    pub privilege_count: u32,
+    pub modified_id: Luid,
 }
 
 /// Monotonic token-object arena. Process fields, thread impersonation contexts, and handles each
 /// hold an explicit reference, so closing the handle used to assign a thread token cannot destroy
 /// the thread's effective security context.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TokenStore {
     objects: Vec<Option<TokenObject>>,
+    next_luid: u64,
+}
+
+impl Default for TokenStore {
+    fn default() -> Self {
+        Self {
+            objects: Vec::new(),
+            next_luid: 1,
+        }
+    }
 }
 
 impl TokenStore {
@@ -426,27 +474,31 @@ impl TokenStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             objects: Vec::with_capacity(capacity),
+            next_luid: 1,
         }
     }
 
     /// Insert a token with one owning reference.
     pub fn insert(&mut self, token: AccessToken) -> TokenId {
+        let token_luid = self.allocate_luid();
+        let modified_luid = self.allocate_luid();
+        let dynamic_charged = dynamic_usage(&token).max(500) as u32;
         self.objects.push(Some(TokenObject {
             token,
             references: 1,
+            token_luid,
+            modified_luid,
+            expiration_time: -1,
+            dynamic_charged,
         }));
         TokenId(self.objects.len() as u32)
     }
 
     pub fn get(&self, id: TokenId) -> Option<&AccessToken> {
-        self.objects.get(id.slot())?.as_ref().map(|entry| &entry.token)
-    }
-
-    pub fn get_mut(&mut self, id: TokenId) -> Option<&mut AccessToken> {
         self.objects
-            .get_mut(id.slot())?
-            .as_mut()
-            .map(|entry| &mut entry.token)
+            .get(id.slot())?
+            .as_ref()
+            .map(|entry| &entry.token)
     }
 
     pub fn reference_count(&self, id: TokenId) -> Option<u32> {
@@ -462,7 +514,10 @@ impl TokenStore {
             .get_mut(id.slot())
             .and_then(Option::as_mut)
             .ok_or(STATUS_INVALID_HANDLE)?;
-        entry.references = entry.references.checked_add(1).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.references = entry
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_INVALID_HANDLE)?;
         Ok(())
     }
 
@@ -490,10 +545,160 @@ impl TokenStore {
         impersonation_level: SecurityImpersonationLevel,
         effective_only: bool,
     ) -> Result<TokenId, u32> {
-        let duplicate = self
-            .get(source)
-            .ok_or(STATUS_INVALID_HANDLE)?
-            .duplicate(token_type, impersonation_level, effective_only)?;
-        Ok(self.insert(duplicate))
+        let (duplicate, modified_luid, expiration_time, dynamic_charged) = {
+            let source = self
+                .objects
+                .get(source.slot())
+                .and_then(Option::as_ref)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            (
+                source
+                    .token
+                    .duplicate(token_type, impersonation_level, effective_only)?,
+                source.modified_luid,
+                source.expiration_time,
+                source.dynamic_charged,
+            )
+        };
+        let token_luid = self.allocate_luid();
+        self.objects.push(Some(TokenObject {
+            token: duplicate,
+            references: 1,
+            token_luid,
+            modified_luid,
+            expiration_time,
+            dynamic_charged,
+        }));
+        Ok(TokenId(self.objects.len() as u32))
     }
+
+    /// Apply privilege changes and advance `ModifiedId` only when token state changed.
+    pub fn adjust_privileges(
+        &mut self,
+        id: TokenId,
+        disable_all: bool,
+        requested: &[PrivilegeAdjustment],
+        previous: &mut [PrivilegeAdjustment],
+    ) -> Result<PrivilegeAdjustmentSummary, u32> {
+        let slot = id.slot();
+        let result = self
+            .objects
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .token
+            .adjust_privileges(disable_all, requested, previous);
+        if result.changed != 0 {
+            let modified_luid = self.allocate_luid();
+            self.objects[slot]
+                .as_mut()
+                .expect("validated token object disappeared")
+                .modified_luid = modified_luid;
+        }
+        Ok(result)
+    }
+
+    /// Set the token owner to the user or a group carrying `SE_GROUP_OWNER`.
+    pub fn set_owner(&mut self, id: TokenId, owner: Sid) -> Result<(), u32> {
+        let slot = id.slot();
+        {
+            let token = &self
+                .objects
+                .get(slot)
+                .and_then(Option::as_ref)
+                .ok_or(STATUS_INVALID_HANDLE)?
+                .token;
+            let valid = token.user == owner
+                || token
+                    .groups
+                    .iter()
+                    .any(|group| group.owner && group.sid == owner);
+            if !valid {
+                return Err(STATUS_INVALID_OWNER);
+            }
+        }
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.owner = owner;
+        object.modified_luid = modified_luid;
+        Ok(())
+    }
+
+    /// Replace the token default DACL within its fixed dynamic-space charge.
+    pub fn set_default_dacl(
+        &mut self,
+        id: TokenId,
+        default_dacl: Option<NativeAcl>,
+    ) -> Result<(), u32> {
+        let slot = id.slot();
+        let object = self
+            .objects
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let usage = object
+            .token
+            .primary_group
+            .native_len()
+            .unwrap_or(0)
+            .saturating_add(
+                default_dacl
+                    .as_ref()
+                    .map_or(0, |acl| acl.acl_size() as usize),
+            );
+        if usage > object.dynamic_charged as usize {
+            return Err(STATUS_ALLOTTED_SPACE_EXCEEDED);
+        }
+        if default_dacl.is_none() && object.token.default_dacl.is_none() {
+            return Ok(());
+        }
+
+        let modified_luid = self.allocate_luid();
+        let object = self.objects[slot]
+            .as_mut()
+            .expect("validated token object disappeared");
+        object.token.default_dacl = default_dacl;
+        object.modified_luid = modified_luid;
+        Ok(())
+    }
+
+    /// Return the query-visible metadata and dynamic-space accounting for a token.
+    pub fn statistics(&self, id: TokenId) -> Option<TokenStatistics> {
+        let object = self.objects.get(id.slot())?.as_ref()?;
+        let usage = dynamic_usage(&object.token) as u32;
+        Some(TokenStatistics {
+            token_id: object.token_luid,
+            authentication_id: object.token.authentication_id,
+            expiration_time: object.expiration_time,
+            token_type: object.token.token_type,
+            impersonation_level: object.token.impersonation_level,
+            dynamic_charged: object.dynamic_charged,
+            dynamic_available: object.dynamic_charged.saturating_sub(usage),
+            group_count: object.token.groups.len() as u32,
+            privilege_count: object.token.privileges.len() as u32,
+            modified_id: object.modified_luid,
+        })
+    }
+
+    fn allocate_luid(&mut self) -> Luid {
+        let value = self.next_luid;
+        self.next_luid = self.next_luid.wrapping_add(1);
+        if self.next_luid == 0 {
+            self.next_luid = 1;
+        }
+        Luid {
+            low: value as u32,
+            high: (value >> 32) as i32,
+        }
+    }
+}
+
+fn dynamic_usage(token: &AccessToken) -> usize {
+    token.primary_group.native_len().unwrap_or(0)
+        + token
+            .default_dacl
+            .as_ref()
+            .map_or(0, |acl| acl.acl_size() as usize)
 }

@@ -70,6 +70,31 @@ impl Sid {
         }
         s
     }
+
+    /// Return the byte length of this SID in the native in-memory representation.
+    pub fn native_len(&self) -> Option<usize> {
+        if self.revision != 1 || self.sub_authorities.len() > 15 {
+            return None;
+        }
+        self.sub_authorities
+            .len()
+            .checked_mul(4)
+            .and_then(|length| length.checked_add(8))
+    }
+
+    /// Write this SID in the native in-memory representation.
+    pub fn write_native(&self, output: &mut [u8]) -> Option<usize> {
+        let length = self.native_len()?;
+        let output = output.get_mut(..length)?;
+        output[0] = self.revision;
+        output[1] = self.sub_authorities.len() as u8;
+        output[2..8].copy_from_slice(&self.identifier_authority);
+        for (index, sub_authority) in self.sub_authorities.iter().enumerate() {
+            let offset = 8 + index * 4;
+            output[offset..offset + 4].copy_from_slice(&sub_authority.to_le_bytes());
+        }
+        Some(length)
+    }
 }
 
 /// A LUID (locally-unique identifier, spec §7.4).

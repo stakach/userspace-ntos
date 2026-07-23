@@ -2638,13 +2638,14 @@ impl ExecNtHandler {
         // The exact ReactOS SYSTEM token has 24 privileges, so this is sufficient even for
         // DisableAllPrivileges and remains allocation-free across the executive heap reset.
         let mut previous = [nt_security::PrivilegeAdjustment::default(); 24];
-        let result = match self.token_store.get_mut(token_id) {
-            Some(token) => token.adjust_privileges(
-                disable_all,
-                &requested,
-                &mut previous[..plan.changed],
-            ),
-            None => return nt_process::STATUS_INVALID_HANDLE,
+        let result = match self.token_store.adjust_privileges(
+            token_id,
+            disable_all,
+            &requested,
+            &mut previous[..plan.changed],
+        ) {
+            Ok(result) => result,
+            Err(status) => return status,
         };
         if previous_state != 0 {
             let mut output = [0u8; 4 + 24 * 12];
