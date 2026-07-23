@@ -20,6 +20,7 @@ pub mod avl_table;
 pub mod bitmap;
 pub mod compression;
 pub mod convert;
+pub mod debug_buffer;
 pub mod dos8dot3;
 pub mod dynamic_function_table;
 pub mod encode;
