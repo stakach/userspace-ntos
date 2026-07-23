@@ -720,6 +720,66 @@ pub unsafe fn ldr_shutdown_process() -> u32 {
 /// # Safety
 /// The process loader data is initialized and this is the current thread's one loader entry pass.
 #[cfg(target_arch = "x86_64")]
+unsafe fn report_invalid_thread_attach_base(index: usize, base: u64) {
+    let mut message = [0u8; 64];
+    let mut length = 0usize;
+    for &byte in b"[ldr-thread] invalid ledger index=" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u32_dec(&mut message, length, index as u32);
+    for &byte in b" base=0x" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u64_hex(&mut message, length, base);
+    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_recovered_thread_attach_base(index: usize, base: u64) {
+    let mut message = [0u8; 64];
+    let mut length = 0usize;
+    for &byte in b"[ldr-thread] repaired ledger index=" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u32_dec(&mut message, length, index as u32);
+    for &byte in b" base=0x" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u64_hex(&mut message, length, base);
+    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
+}
+
+#[cfg(target_arch = "x86_64")]
+fn recover_missing_attached_base(table: &ModuleTable) -> Option<u64> {
+    let mut candidate = None;
+    for module in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+        if !module.attached
+            || module.base == 0
+            || table.attach_order.as_slice().contains(&module.base)
+        {
+            continue;
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(module.base);
+    }
+    candidate
+}
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_initialize_thread() -> u32 {
     const DLL_THREAD_ATTACH: u32 = 2;
     const DLL_THREAD_DETACH: u32 = 3;
@@ -745,14 +805,35 @@ pub unsafe fn ldr_initialize_thread() -> u32 {
         return tls_status;
     }
 
-    let table = unsafe { &*core::ptr::addr_of!(MODULE_TABLE) };
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(MODULE_TABLE) };
     let mut modules = [nt_ntdll::loader::thread::ThreadModuleState::default(); MODULE_TABLE_CAP];
     let mut count = 0usize;
-    for &base in table.attach_order.as_slice() {
+    let ledger_len = table.attach_order.as_slice().len();
+    for ledger_index in 0..ledger_len {
         if count == modules.len() {
             unsafe { free_current_thread_static_tls() };
             unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
             return STATUS_NO_MEMORY as u32;
+        }
+        let observed = table.attach_order.as_slice()[ledger_index];
+        let mut base = observed;
+        let valid_module = base >= 0x1_0000
+            && table
+                .index_by_base(base)
+                .is_some_and(|index| table.mods[index].attached);
+        if !valid_module {
+            unsafe { report_invalid_thread_attach_base(ledger_index, base) };
+            let Some(recovered) = recover_missing_attached_base(table) else {
+                continue;
+            };
+            if !table
+                .attach_order
+                .replace_if(ledger_index, observed, recovered)
+            {
+                continue;
+            }
+            base = recovered;
+            unsafe { report_recovered_thread_attach_base(ledger_index, base) };
         }
         let entry = unsafe { ldr_entry_for_base(base) };
         let flags = if entry != 0 {
@@ -882,9 +963,17 @@ pub unsafe fn ldr_shutdown_thread(teb: u64, process_shutdown: bool) -> u32 {
     let mut modules = [nt_ntdll::loader::thread::ThreadModuleState::default(); MODULE_TABLE_CAP];
     let mut count = 0usize;
     if committed {
-        for &base in table.attach_order.as_slice() {
+        for (ledger_index, &base) in table.attach_order.as_slice().iter().enumerate() {
             if count == modules.len() {
                 return STATUS_NO_MEMORY as u32;
+            }
+            let valid_module = base >= 0x1_0000
+                && table
+                    .index_by_base(base)
+                    .is_some_and(|index| table.mods[index].attached);
+            if !valid_module {
+                unsafe { report_invalid_thread_attach_base(ledger_index, base) };
+                continue;
             }
             let entry = unsafe { ldr_entry_for_base(base) };
             let flags = if entry != 0 {

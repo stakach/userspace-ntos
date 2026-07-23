@@ -144,6 +144,19 @@ impl<const N: usize> AttachLedger<N> {
         true
     }
 
+    /// Replace one observed corrupt entry without changing order or length.
+    pub fn replace_if(&mut self, index: usize, observed: u64, replacement: u64) -> bool {
+        if replacement == 0
+            || index >= self.len
+            || self.entries[index] != observed
+            || self.as_slice().contains(&replacement)
+        {
+            return false;
+        }
+        self.entries[index] = replacement;
+        true
+    }
+
     pub fn as_slice(&self) -> &[u64] {
         &self.entries[..self.len]
     }
@@ -466,5 +479,18 @@ mod tests {
         assert!(ledger.remove(20));
         assert_eq!(ledger.as_slice(), &[10, 30]);
         assert!(!ledger.remove(40));
+    }
+
+    #[test]
+    fn attach_ledger_repairs_only_the_observed_unique_slot() {
+        let mut ledger = AttachLedger::<4>::new();
+        ledger.record(10);
+        ledger.record(20);
+        ledger.record(30);
+        assert!(ledger.replace_if(1, 20, 40));
+        assert_eq!(ledger.as_slice(), &[10, 40, 30]);
+        assert!(!ledger.replace_if(1, 20, 50));
+        assert!(!ledger.replace_if(1, 40, 30));
+        assert!(!ledger.replace_if(3, 0, 50));
     }
 }

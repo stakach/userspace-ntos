@@ -292,8 +292,11 @@ pub const CSR_SB_ENV_SCRATCH_VA: u64 = 0x0000_0100_107F_0000;
 // pml4 (isolated from smss/csrss's threads at the same VAs) — they fall in the STACK_BASE 2 MiB PT
 // that every spawn_sec_image already created. The EXECUTIVE-side env scratch must be DISTINCT from
 // SM (0x1070) / CSR (0x1071) / smss-spawn (0x1074) / csrss-spawn (0x1078) / winlogon-spawn (0x107C).
-pub const WL_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // target VSpace (4 frames)
-pub const WL_LISTENER_STACK_FRAMES: u64 = 4;
+pub const WL_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // target VSpace
+// LdrInitializeThread builds the bounded module/attach plan on this bootstrap stack before it
+// restores the caller's INITIAL_TEB stack. Four pages let __chkstk probe below the mapping once a
+// process has the full winlogon dependency set; match the later worker slots' eight-page floor.
+pub const WL_LISTENER_STACK_FRAMES: u64 = 8;
 pub const WL_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA; // target VSpace
 pub const WL_LISTENER_TEB_VA: u64 = SM_TEB_VA; // target VSpace (2 pages)
 pub const WL_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA; // target VSpace
@@ -509,6 +512,7 @@ const fn hosted_thread_layout_is_disjoint(
 }
 
 const _: () = {
+    assert!(WL_LISTENER_STACK_FRAMES >= 8);
     assert!(nt_syscall_abi::native_ipc_buffer_va(SMSS_TEB_VA) == IPCBUF_VADDR);
     assert!(nt_syscall_abi::native_ipc_buffer_va(TEB_VA) == IPCBUF_VADDR);
     assert!(nt_syscall_abi::native_ipc_buffer_va(SM_TEB_VA) == SM_IPCBUF_VA);

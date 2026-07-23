@@ -53,6 +53,33 @@ pub(crate) fn native_processor_information(
     )
 }
 
+fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
+    let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
+    let affinity = if processors >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << processors) - 1
+    };
+    nt_syscall::system_information::SystemBasicInformation {
+        timer_resolution_100ns: 10_000,
+        page_size: 0x1000,
+        number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32,
+        lowest_physical_page_number: SYSTEM_LOWEST_PHYSICAL_PAGE
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32,
+        highest_physical_page_number: SYSTEM_HIGHEST_PHYSICAL_PAGE
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32,
+        allocation_granularity: 0x1_0000,
+        minimum_user_mode_address: 0x1_0000,
+        maximum_user_mode_address: 0x0000_07ff_fffe_ffff,
+        active_processors_affinity_mask: affinity,
+        number_of_processors: processors,
+    }
+}
+
 #[inline]
 fn boot_status_data_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(EXEC_BOOT_STATUS_DATA) as *mut u8
@@ -2530,6 +2557,15 @@ impl ExecNtHandler {
                         (bssd + 0x28) as *mut u64,
                         WINLOGON_CSR_STATIC_VA + 0x3060,
                     );
+                    // BASE_STATIC_SERVER_DATA.SysInfo starts at +0x140 on x64. ReactOS kernel32
+                    // consumes PageSize and AllocationGranularity here when creating every thread
+                    // stack, so publish the same record as NtQuerySystemInformation class 0.
+                    let sysinfo = native_basic_system_information().encode();
+                    core::ptr::copy_nonoverlapping(
+                        sysinfo.as_ptr(),
+                        (bssd + 0x140) as *mut u8,
+                        sysinfo.len(),
+                    );
                 } else if i == 3 {
                     write_wstr(sc + 0x000, "C:\\Windows");
                     write_wstr(sc + 0x020, "C:\\Windows\\System32");
@@ -4093,8 +4129,8 @@ impl NativeSyscallHandler for ExecNtHandler {
             // layer supplies the live machine/time facts and performs user-buffer probing/copyout.
             NativeService::NtQuerySystemInformation => unsafe {
                 use nt_syscall::system_information::{
-                    query_plan, SystemBasicInformation, SystemInformationKind,
-                    SystemTimeOfDayInformation, SYSTEM_BASIC_INFORMATION_CLASS,
+                    query_plan, SystemInformationKind, SystemTimeOfDayInformation,
+                    SYSTEM_BASIC_INFORMATION_CLASS,
                     SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
                     SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
                 };
@@ -4150,31 +4186,7 @@ impl NativeSyscallHandler for ExecNtHandler {
 
                 let wrote = match plan.kind {
                     SystemInformationKind::Basic => {
-                        let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
-                        let affinity = if processors >= 64 {
-                            u64::MAX
-                        } else {
-                            (1u64 << processors) - 1
-                        };
-                        let output = SystemBasicInformation {
-                            timer_resolution_100ns: 10_000,
-                            page_size: 0x1000,
-                            number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
-                                .load(Ordering::Relaxed)
-                                .min(u32::MAX as u64) as u32,
-                            lowest_physical_page_number: SYSTEM_LOWEST_PHYSICAL_PAGE
-                                .load(Ordering::Relaxed)
-                                .min(u32::MAX as u64) as u32,
-                            highest_physical_page_number: SYSTEM_HIGHEST_PHYSICAL_PAGE
-                                .load(Ordering::Relaxed)
-                                .min(u32::MAX as u64) as u32,
-                            allocation_granularity: 0x1_0000,
-                            minimum_user_mode_address: 0x1_0000,
-                            maximum_user_mode_address: 0x0000_07ff_fffe_ffff,
-                            active_processors_affinity_mask: affinity,
-                            number_of_processors: processors,
-                        }
-                        .encode();
+                        let output = native_basic_system_information().encode();
                         self.xas_try_write_buf(buf, &output)
                     }
                     SystemInformationKind::Processor => {
