@@ -462,6 +462,15 @@ pub(crate) unsafe fn service_sec_image(
             *e = 0;
         }
     }
+    let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
+    for index in 0..MAX_PI {
+        core::ptr::write(
+            vm_maps.add(index),
+            nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
+        );
+    }
+    VM_FREE_FRAME_N = 0;
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -2237,6 +2246,8 @@ pub(crate) unsafe fn service_sec_image(
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
                     pml4,
+                    procs: &mut procs,
+                    pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
                     csrss_file_handle: &mut csrss_file_handle as *mut u64,
@@ -3334,28 +3345,6 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0; // STATUS_SUCCESS (winlogon's connect always succeeds)
                     routed_csr = true;
                 }
-            } else if m0 == 287 {
-                // NtWriteVirtualMemory(ProcessHandle=R10, BaseAddress=RDX, Buffer=R8, Size=R9,
-                // *NumberOfBytesWritten=[sp+0x28]). smss's RtlCreateUserProcess(csrss) reaches here to
-                // inject the child's RTL_USER_PROCESS_PARAMETERS. In our hosted model spawn_sec_image
-                // already built csrss's REAL PEB/params AND csrss has long since run its loader + SM
-                // connect, so this late write is moot (its BaseAddress is garbage — the child-side
-                // NtAllocateVirtualMemory that would have reserved the target is faked). Model it as a
-                // successful write: set *NumberOfBytesWritten = Size and return SUCCESS so
-                // RtlCreateUserProcess completes. TODO(migrate): a real cross-AS NtWriteVirtualMemory
-                // belongs in nt-memory-manager once a genuinely-new child needs live param injection.
-                let size = get_recv_mr(8); // R9 = NumberOfBytesToWrite
-                let sp = get_recv_mr(16);
-                let written_ptr = smss_stack_read(sp + 0x28); // arg5 = *NumberOfBytesWritten (optional)
-                if written_ptr != 0 {
-                    if badge == CSRSS_BADGE {
-                        csrss_out_write(written_ptr, size, &mut *filled_pages, &mut faults,
-                            scratch_base, &reg, &dll_pes, pml4);
-                    } else {
-                        smss_stack_write(written_ptr, size);
-                    }
-                }
-                result = 0; // STATUS_SUCCESS
             } else if m0 == 223 {
                 // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
                 // its API port as the hard-error port right after SmConnectToSm succeeds

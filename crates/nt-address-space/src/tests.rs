@@ -380,16 +380,14 @@ fn fixed_vm_map_null_commit_reserves_and_commit_updates_protection() {
     let reserved = map
         .allocate(None, 0x2000, MEM_RESERVE, PAGE_NOACCESS)
         .unwrap();
-    map.allocate(
-        Some(reserved.base),
-        0x1000,
-        MEM_COMMIT,
-        PAGE_READWRITE | PAGE_GUARD,
-    )
-    .unwrap();
     assert_eq!(
-        map.extent_at(reserved.base).unwrap().protection,
-        PAGE_READWRITE | PAGE_GUARD
+        map.allocate(
+            Some(reserved.base),
+            0x1000,
+            MEM_COMMIT,
+            PAGE_READWRITE | PAGE_GUARD,
+        ),
+        Err(STATUS_INVALID_PAGE_PROTECTION)
     );
     assert_eq!(
         map.allocate(None, 0x1000, MEM_COMMIT, 0x8000),

@@ -1779,6 +1779,234 @@ impl ExecNtHandler {
             .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
     }
 
+    fn resolve_process_for_access(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<(nt_process::ProcessId, usize), u32> {
+        let caller = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let pid = self
+            .pm
+            .resolve_process_handle(caller, handle, required_access)?;
+        let pi = self
+            .pi_for_pid(pid)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        Ok((pid, pi))
+    }
+
+    unsafe fn nt_copy_virtual_memory(&mut self, args: &[u64], read: bool) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
+        const PROCESS_VM_READ: u32 = 0x0010;
+        const PROCESS_VM_WRITE: u32 = 0x0020;
+
+        let remote = args[1];
+        let local = args[2];
+        let length = args[3];
+        let count_ptr = args[4];
+        let valid_range = |base: u64| {
+            base.checked_add(length)
+                .is_some_and(|end| end <= USER_ADDRESS_LIMIT)
+        };
+        if !valid_range(remote) || !valid_range(local) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if count_ptr != 0 {
+            if count_ptr & 7 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if !self.probe_user_output(count_ptr, 8) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        if length == 0 {
+            if count_ptr != 0 {
+                let _ = self.xas_write_u64(count_ptr, 0);
+            }
+            return 0;
+        }
+
+        let required_access = if read {
+            PROCESS_VM_READ
+        } else {
+            PROCESS_VM_WRITE
+        };
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[0], required_access) {
+                Ok(target) => target,
+                Err(status) => {
+                    if count_ptr != 0 {
+                        let _ = self.xas_write_u64(count_ptr, 0);
+                    }
+                    return status;
+                }
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            if count_ptr != 0 {
+                let _ = self.xas_write_u64(count_ptr, 0);
+            }
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+
+        let ctx = match self.loop_ctx {
+            Some(ctx) => ctx,
+            None => {
+                if count_ptr != 0 {
+                    let _ = self.xas_write_u64(count_ptr, 0);
+                }
+                return STATUS_PARTIAL_COPY;
+            }
+        };
+        let procs = &mut *ctx.procs;
+        let target = procs[target_pi];
+        if target.pml4 == 0 || target.scratch_base == 0 {
+            if count_ptr != 0 {
+                let _ = self.xas_write_u64(count_ptr, 0);
+            }
+            return nt_process::STATUS_INVALID_HANDLE;
+        }
+        let (target_filled, target_faults) = if target_pi == self.pi {
+            (&*ctx.filled_pages, *ctx.faults as usize)
+        } else {
+            (&(*ctx.pfilled)[target_pi], procs[target_pi].faults as usize)
+        };
+
+        let mut transferred = 0u64;
+        let mut buffer = [0u8; 256];
+        while transferred < length {
+            let remote_address = remote + transferred;
+            let local_address = local + transferred;
+            let remote_page = 0x1000 - (remote_address as usize & 0xfff);
+            let local_page = 0x1000 - (local_address as usize & 0xfff);
+            let chunk = (length - transferred)
+                .min(buffer.len() as u64)
+                .min(remote_page as u64)
+                .min(local_page as u64) as usize;
+            let copied = if read {
+                client_copyin_process_mapped(
+                    target_pi as u64,
+                    remote_address,
+                    &mut buffer[..chunk],
+                    target_filled,
+                    target_faults,
+                    target.scratch_base,
+                    target_pi == self.pi,
+                ) && self.xas_try_write_buf(local_address, &buffer[..chunk])
+            } else {
+                self.xas_read(local_address, &mut buffer[..chunk])
+                    && if target_pi == self.pi {
+                        self.xas_try_write_buf(remote_address, &buffer[..chunk])
+                    } else {
+                        client_copyout_mapped(
+                            target_pi as u64,
+                            remote_address,
+                            &buffer[..chunk],
+                            target_filled,
+                            target_faults,
+                            target.scratch_base,
+                        )
+                    }
+            };
+            if !copied {
+                break;
+            }
+            transferred += chunk as u64;
+        }
+        if count_ptr != 0 {
+            let _ = self.xas_write_u64(count_ptr, transferred);
+        }
+        if transferred == length {
+            0
+        } else {
+            STATUS_PARTIAL_COPY
+        }
+    }
+
+    unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+
+        let free_type = args[3] as u32;
+        if free_type != nt_address_space::MEM_RELEASE && free_type != nt_address_space::MEM_DECOMMIT
+        {
+            return nt_address_space::STATUS_INVALID_PARAMETER_4;
+        }
+        let base_ptr = args[1];
+        let size_ptr = args[2];
+        if base_ptr & 7 != 0 || size_ptr & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut word = [0u8; 8];
+        if !self.xas_read(base_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let base = u64::from_le_bytes(word);
+        if !self.xas_read(size_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let size = u64::from_le_bytes(word);
+        if base >= HIGHEST_USER_ADDRESS {
+            return nt_address_space::STATUS_INVALID_PARAMETER_2;
+        }
+        if HIGHEST_USER_ADDRESS - base < size {
+            return STATUS_INVALID_PARAMETER_3;
+        }
+
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        let ctx = self.loop_ctx.unwrap();
+        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+            .add(target_pi);
+        let before = core::ptr::read(vm_map);
+        let mut after = before;
+        let plan = match after.free(base, size, free_type) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        let mut page = plan.base;
+        while page < plan.base + plan.size {
+            let old = before.extent_at(page);
+            let new = after.extent_at(page);
+            if old.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
+                && new
+                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
+            {
+                vm_unmap_private_page(target_pi, page);
+            }
+            page += 0x1000;
+        }
+        core::ptr::write(vm_map, after);
+        let _ = self.xas_write_u64(size_ptr, plan.size);
+        let _ = self.xas_write_u64(base_ptr, plan.base);
+        0
+    }
+
     fn token_id_for_handle(
         &self,
         handle: u64,
@@ -6868,8 +7096,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                 unsafe { publish_time_zone(information, nt_system_time_100ns()) };
                 0
             },
-            NativeService::NtFreeVirtualMemory
-            | NativeService::NtTestAlert
+            NativeService::NtFreeVirtualMemory => unsafe { self.nt_free_virtual_memory(args) },
+            NativeService::NtReadVirtualMemory => unsafe {
+                self.nt_copy_virtual_memory(args, true)
+            },
+            NativeService::NtWriteVirtualMemory => unsafe {
+                self.nt_copy_virtual_memory(args, false)
+            },
+            NativeService::NtTestAlert
             | NativeService::NtCreateKeyedEvent
             | NativeService::NtInitializeRegistry
             | NativeService::NtUnmapViewOfSection
@@ -7748,39 +7982,53 @@ impl NativeSyscallHandler for ExecNtHandler {
                 nt_fs::STATUS_SUCCESS
             }
             // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress[RDX]=args[1], ZeroBits,
-            // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). RESERVE (base in==0) picks a
-            // per-process bump base; COMMIT maps frames + mirrors the first heap window (group C:
-            // page_map target pml4 comes from the loop ctx).
+            // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). The fixed VAD policy selects
+            // the target process's range; newly committed pages are mapped into that target PML4.
             NativeService::NtAllocateVirtualMemory => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+                const PROCESS_VM_OPERATION: u32 = 0x0008;
                 let ctx = self.loop_ctx.unwrap();
                 let base_ptr = args[1]; // RDX
                 let size_ptr = args[3]; // R9
-                let alloc_type = args[4]; // arg5 = Type
+                if base_ptr & 7 != 0 || size_ptr & 7 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 8) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 let mut word = [0u8; 8];
-                let base_in = if self.xas_read(base_ptr, &mut word) {
-                    u64::from_le_bytes(word)
-                } else {
-                    0
-                };
-                word = [0; 8];
-                let want = if self.xas_read(size_ptr, &mut word) {
-                    u64::from_le_bytes(word)
-                } else {
-                    0
-                };
-                let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
-                let base = if base_in != 0 {
-                    base_in
-                } else if self.pi == 1 {
-                    NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                } else if self.pi == 2 {
-                    NEXT_WINLOGON_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                } else if self.pi == 3 {
-                    NEXT_SERVICES_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                } else if self.pi == 4 {
-                    NEXT_LSASS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                } else {
-                    NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                if !self.xas_read(base_ptr, &mut word) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let base_in = u64::from_le_bytes(word);
+                if !self.xas_read(size_ptr, &mut word) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let want = u64::from_le_bytes(word);
+                let (_, target_pi) =
+                    match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                        Ok(target) => target,
+                        Err(status) => return status,
+                    };
+                let procs = &mut *ctx.procs;
+                let target = procs[target_pi];
+                if target.pml4 == 0 || target.scratch_base == 0 {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+                    as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+                    .add(target_pi);
+                let before = core::ptr::read(vm_map);
+                let mut after = before;
+                let plan = match after.allocate(
+                    (base_in != 0).then_some(base_in),
+                    want,
+                    args[4] as u32,
+                    args[5] as u32,
+                ) {
+                    Ok(plan) => plan,
+                    Err(status) => return status,
                 };
                 if self.pi == 2
                     && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
@@ -7798,37 +8046,86 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_hex((want >> 32) as u32);
                     print_hex(want as u32);
                     print_str(b" type=0x");
-                    print_hex(alloc_type as u32);
+                    print_hex(args[4] as u32);
                     print_str(b" selected=0x");
-                    print_hex((base >> 32) as u32);
-                    print_hex(base as u32);
+                    print_hex((plan.base >> 32) as u32);
+                    print_hex(plan.base as u32);
                     print_str(b"\n");
                 }
-                if alloc_type & 0x1000 != 0 {
-                    // MEM_COMMIT — back it with real frames.
-                    let mut p = 0u64;
-                    while p < rounded {
-                        let f = alloc_frame();
-                        let _ = page_map(f, base + p, RW_NX, ctx.pml4);
-                        // Mirror the first heap window into the executive so smss_copyin can read
-                        // heap-resident pointer args, into the ACTIVE process's heap mirror.
-                        let va = base + p;
-                        if self.pi == 1 || self.pi == 2 {
-                            // win32k runs attached to the calling GUI process and dereferences
-                            // user heap pointers directly. Register the committed frame so a
-                            // win32k-side fault maps this same live page, not a fresh zero page.
-                            csrss_frame_put(self.pi as u64, va, f);
+
+                let mut page = plan.base;
+                let mut changed_end = plan.base;
+                let mut map_status = 0u32;
+                while page < plan.base + plan.size {
+                    let old = before.extent_at(page);
+                    let new = after.extent_at(page);
+                    if new.is_some_and(|extent| {
+                        extent.state == nt_address_space::VmExtentState::Committed
+                    }) {
+                        if old.is_none_or(|extent| {
+                            extent.state != nt_address_space::VmExtentState::Committed
+                        }) {
+                            if let Err(status) = vm_map_private_page(
+                                target_pi,
+                                page,
+                                new.unwrap().protection,
+                                target.pml4,
+                                target.scratch_base,
+                            ) {
+                                map_status = status;
+                                break;
+                            }
+                        } else if old.unwrap().protection != new.unwrap().protection {
+                            if let Err(status) = vm_reprotect_private_page(
+                                target_pi,
+                                page,
+                                old.unwrap().protection,
+                                new.unwrap().protection,
+                                target.pml4,
+                            ) {
+                                map_status = status;
+                                break;
+                            }
                         }
-                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-                            let mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-                            let _ = page_map(copy_cap(f),
-                                mirror + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
-                        }
-                        p += 0x1000;
                     }
+                    page += 0x1000;
+                    changed_end = page;
                 }
-                self.xas_write_buf(base_ptr, &base.to_le_bytes());
-                self.xas_write_buf(size_ptr, &rounded.to_le_bytes());
+                if map_status != 0 {
+                    page = plan.base;
+                    while page < changed_end {
+                        let old = before.extent_at(page);
+                        let new = after.extent_at(page);
+                        if old.is_none_or(|extent| {
+                            extent.state != nt_address_space::VmExtentState::Committed
+                        }) && new.is_some_and(|extent| {
+                            extent.state == nt_address_space::VmExtentState::Committed
+                        }) {
+                            vm_unmap_private_page(target_pi, page);
+                        } else if let (Some(old), Some(new)) = (old, new) {
+                            if old.state == nt_address_space::VmExtentState::Committed
+                                && new.state == nt_address_space::VmExtentState::Committed
+                                && old.protection != new.protection
+                            {
+                                let _ = vm_reprotect_private_page(
+                                    target_pi,
+                                    page,
+                                    new.protection,
+                                    old.protection,
+                                    target.pml4,
+                                );
+                            }
+                        }
+                        page += 0x1000;
+                    }
+                    return map_status;
+                }
+                core::ptr::write(vm_map, after);
+                if !self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes())
+                    || !self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes())
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
                 0
             },

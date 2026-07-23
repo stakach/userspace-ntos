@@ -426,10 +426,6 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
     }
     if setup_env {
-        // Reserve a page table for the region the executive backs NtAllocateVirtualMemory in.
-        let apt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
-        let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, SMSS_ALLOC_VA, pml4);
         // Reserve a PT in the EXECUTIVE's own VSpace for the heap copyin mirror window.
         let hpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
@@ -1013,6 +1009,20 @@ pub(crate) unsafe fn client_copyin_mapped(
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
+    client_copyin_process_mapped(pi, va, dst, filled_pages, nfilled, scratch_base, true)
+}
+
+/// Explicit-process variant used by `NtRead/WriteVirtualMemory`. `allow_active_mirrors` must be
+/// false for a remote process because hosted processes reuse identical stack/heap/image VAs.
+pub(crate) unsafe fn client_copyin_process_mapped(
+    pi: u64,
+    va: u64,
+    dst: &mut [u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+    allow_active_mirrors: bool,
+) -> bool {
     if dst.is_empty() {
         return true;
     }
@@ -1025,7 +1035,9 @@ pub(crate) unsafe fn client_copyin_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
         let mut temporary_cap = 0;
-        let mirrored = if pi == 2 && wl_listener_stack_contains(current, chunk) {
+        let mirrored = if !allow_active_mirrors
+            || pi == 2 && wl_listener_stack_contains(current, chunk)
+        {
             None
         } else {
             smss_mirror(current, chunk as u64)

@@ -183,8 +183,10 @@ pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
 /// Adjacent to smss's mirror, in the same FILEBUF page table. ACTIVE_STACK_MIRROR selects between
 /// them by the current fault badge.
 pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1069_0000;
-/// Where the executive backs NtAllocateVirtualMemory for the process (its own PT).
-pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
+/// Dedicated private-memory arena. It occupies the empty tail of the hosted image page directory,
+/// clear of the fixed NLS/CSR/stack mappings below it. Leaf page tables are installed on demand.
+pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_3000_0000;
+pub const PRIVATE_VM_LIMIT: u64 = 0x0000_0100_4000_0000;
 /// The executive's mirror of the first window of smss's heap (SMSS_ALLOC_VA). A userspace broker
 /// can't walk smss's page tables, so `smss_copyin` reads syscall pointer args (e.g. a loader-built
 /// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
@@ -658,9 +660,10 @@ pub const SSN_NT_QUERY_DEBUG_FILTER_STATE: u64 = 148;
 /// ntdll's NtSetDebugFilterState SSN. The executive has no SeDebugPrivilege plane yet, so the
 /// handler returns STATUS_ACCESS_DENIED just like a real kernel would for an unprivileged caller.
 pub const SSN_NT_SET_DEBUG_FILTER_STATE: u64 = 222;
-/// No-op-success syscalls: NtFreeVirtualMemory (bump allocator never frees),
-/// NtSetInformationThread/Process (attributes we don't model).
+/// Remaining no-op-success thread/process information setters.
 pub const SSN_NT_FREE_VM: u64 = 87;
+pub const SSN_NT_READ_VM: u64 = 194;
+pub const SSN_NT_WRITE_VM: u64 = 287;
 pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
@@ -928,6 +931,16 @@ pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDO
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
+const VM_REGION_CAPACITY: usize = 64;
+const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
+static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
+    [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
+const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
+static mut PROCESS_VM_PT_CAPS: [[u64; PRIVATE_VM_PT_COUNT]; MAX_PI] =
+    [[0; PRIVATE_VM_PT_COUNT]; MAX_PI];
+const VM_FREE_FRAME_CAPACITY: usize = 4096;
+static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
+static mut VM_FREE_FRAME_N: usize = 0;
 static mut KUSER_PAGE_ALIAS: [u64; MAX_PI] = [0; MAX_PI];
 
 unsafe fn kuser_page_alias_put(pi: u64, alias: u64) {
@@ -2117,27 +2130,41 @@ static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_ALIAS: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_ALIAS_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
 static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
-    csrss_frame_put_at(pi, page, fr, 0);
+    let _ = csrss_frame_put_at_cap(pi, page, fr, 0, 0);
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
 unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
+    let _ = csrss_frame_put_at_cap(pi, page, fr, alias, 0);
+}
+unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
+    let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
     for i in 0..n {
         if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
+            if core::ptr::read(frs.add(i)) != fr {
+                return false;
+            }
             if alias != 0 {
                 let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
                 if core::ptr::read(aliases.add(i)) == 0 {
                     core::ptr::write(aliases.add(i), alias);
                 }
             }
-            return;
+            if alias_cap != 0 {
+                let alias_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64;
+                if core::ptr::read(alias_caps.add(i)) == 0 {
+                    core::ptr::write(alias_caps.add(i), alias_cap);
+                }
+            }
+            return true;
         }
     }
     if n < CSRSS_FRAME_CAP {
@@ -2145,8 +2172,45 @@ unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64).add(n), page);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64).add(n), fr);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64).add(n), alias);
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64).add(n),
+            alias_cap,
+        );
         core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
+        true
+    } else {
+        false
     }
+}
+unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64)> {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
+    let vas = core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64;
+    let pis = core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8;
+    let frs = core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64;
+    let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
+    let alias_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64;
+    for index in 0..n {
+        if core::ptr::read(vas.add(index)) == page && core::ptr::read(pis.add(index)) as u64 == pi {
+            let frame = core::ptr::read(frs.add(index));
+            let alias_cap = core::ptr::read(alias_caps.add(index));
+            let last = n - 1;
+            if index != last {
+                core::ptr::write(vas.add(index), core::ptr::read(vas.add(last)));
+                core::ptr::write(pis.add(index), core::ptr::read(pis.add(last)));
+                core::ptr::write(frs.add(index), core::ptr::read(frs.add(last)));
+                core::ptr::write(aliases.add(index), core::ptr::read(aliases.add(last)));
+                core::ptr::write(alias_caps.add(index), core::ptr::read(alias_caps.add(last)));
+            }
+            core::ptr::write(vas.add(last), 0);
+            core::ptr::write(pis.add(last), 0);
+            core::ptr::write(frs.add(last), 0);
+            core::ptr::write(aliases.add(last), 0);
+            core::ptr::write(alias_caps.add(last), 0);
+            core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), last);
+            return Some((frame, alias_cap));
+        }
+    }
+    None
 }
 /// Exact per-process frame lookup. Unlike `csrss_frame_get`, this never falls back to the shared
 /// executable-page cache, which is important when deciding whether a writable client page has a
@@ -2276,6 +2340,165 @@ unsafe fn alloc_frame() -> u64 {
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
     s
 }
+
+unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
+    let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
+    if count == 0 {
+        let (frame, error) = alloc_frame_r();
+        return if error == 0 {
+            Ok(frame)
+        } else {
+            let _ = cnode_delete_r(frame);
+            Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+        };
+    }
+    let index = count - 1;
+    let frames = core::ptr::addr_of_mut!(VM_FREE_FRAMES) as *mut u64;
+    let frame = core::ptr::read(frames.add(index));
+    core::ptr::write(frames.add(index), 0);
+    core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), index);
+    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x2000;
+    if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        core::ptr::write(frames.add(index), frame);
+        core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    core::ptr::write_bytes(scratch as *mut u8, 0, 0x1000);
+    let _ = page_unmap(frame);
+    Ok(frame)
+}
+
+unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
+    let _ = page_unmap(frame);
+    if alias_cap != 0 {
+        let _ = page_unmap(alias_cap);
+        let _ = cnode_delete_r(alias_cap);
+    }
+    let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
+    if count < VM_FREE_FRAME_CAPACITY {
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(VM_FREE_FRAMES) as *mut u64).add(count),
+            frame,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count + 1);
+    } else {
+        let _ = cnode_delete_r(frame);
+    }
+}
+
+fn heap_mirror_for_pi(pi: usize) -> u64 {
+    match pi {
+        1 => CSRSS_HEAP_MIRROR_VA,
+        2 => WINLOGON_HEAP_MIRROR_VA,
+        3 => SERVICES_HEAP_MIRROR_VA,
+        4 => LSASS_HEAP_MIRROR_VA,
+        _ => SMSS_HEAP_MIRROR_VA,
+    }
+}
+
+fn vm_page_rights(protection: u32) -> u64 {
+    let base = protection & 0xff;
+    let writable = matches!(
+        base,
+        nt_address_space::PAGE_READWRITE | nt_address_space::PAGE_EXECUTE_READWRITE
+    );
+    let executable = matches!(
+        base,
+        nt_address_space::PAGE_EXECUTE
+            | nt_address_space::PAGE_EXECUTE_READ
+            | nt_address_space::PAGE_EXECUTE_READWRITE
+    );
+    (if base == nt_address_space::PAGE_NOACCESS {
+        0
+    } else if writable {
+        3
+    } else {
+        2
+    }) | if executable { 0 } else { PAGE_EXECUTE_NEVER }
+}
+
+unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u32> {
+    let offset = page
+        .checked_sub(SMSS_ALLOC_VA)
+        .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
+        .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
+    let index = (offset / 0x20_0000) as usize;
+    let caps = core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS) as *mut [u64; PRIVATE_VM_PT_COUNT];
+    let slot = (*caps.add(pi)).as_mut_ptr().add(index);
+    if core::ptr::read(slot) != 0 {
+        return Ok(());
+    }
+    let pt = alloc_slot();
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt) != 0 {
+        let _ = cnode_delete_r(pt);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, page & !0x1f_ffff, pml4) != 0 {
+        let _ = cnode_delete_r(pt);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    core::ptr::write(slot, pt);
+    Ok(())
+}
+
+unsafe fn vm_map_private_page(
+    pi: usize,
+    page: u64,
+    protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    vm_ensure_private_pt(pi, page, pml4)?;
+    let frame = vm_frame_acquire(scratch_base)?;
+    if page_map_r(frame, page, vm_page_rights(protection), pml4) != 0 {
+        vm_frame_release(frame, 0);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let mut alias = 0;
+    let mut alias_cap = 0;
+    if page >= SMSS_ALLOC_VA && page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        alias = heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA);
+        let (copied, copy_error) = copy_cap_r(frame);
+        if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            let _ = cnode_delete_r(copied);
+            vm_frame_release(frame, 0);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        alias_cap = copied;
+    }
+    if !csrss_frame_put_at_cap(pi as u64, page, frame, alias, alias_cap) {
+        vm_frame_release(frame, alias_cap);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    Ok(())
+}
+
+unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
+    if let Some((frame, alias_cap)) = csrss_frame_take(pi as u64, page) {
+        vm_frame_release(frame, alias_cap);
+    }
+}
+
+unsafe fn vm_reprotect_private_page(
+    pi: usize,
+    page: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+) -> Result<(), u32> {
+    let frame = csrss_frame_get_exact(pi as u64, page).0;
+    if frame == 0 {
+        return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+    }
+    let _ = page_unmap(frame);
+    if page_map_r(frame, page, vm_page_rights(new_protection), pml4) == 0 {
+        Ok(())
+    } else {
+        let _ = page_map_r(frame, page, vm_page_rights(old_protection), pml4);
+        Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
 unsafe fn copy_cap(src: u64) -> u64 {
     let d = alloc_slot();
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, d, src, 0);
@@ -2352,6 +2575,21 @@ unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
         inout("r10") vaddr => _,
         inout("r8") rights => _,
         inout("r9") vspace => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+unsafe fn paging_struct_map_r(paging: u64, label: u64, vaddr: u64, vspace: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") paging => _,
+        inout("rsi") label << 12 => reply,
+        inout("r10") vaddr => _,
+        inout("r8") vspace => _,
+        inout("r9") 0u64 => _,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -4648,6 +4886,10 @@ fn build_key_value_info(class: u64, name: &str, ty: u32, data: &[u8]) -> alloc::
 struct ExecLoopCtx {
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
     pml4: u64,
+    /// Every hosted process's trusted mechanism state. Cross-process VM services select the target
+    /// PML4/scratch through the access-checked target pid rather than the caller's active context.
+    procs: *mut [ProcExec; MAX_PI],
+    pfilled: *mut [[u64; 512]; MAX_PI],
     /// The named NLS section handle (\Nls\NlsSectionCP20127) NtOpenSection records so
     /// NtMapViewOfSection can back it. Points at the loop-local `nls_section_handle`.
     nls_section_handle: *mut u64,
@@ -5169,6 +5411,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
+            (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),
+            (NativeService::NtWriteVirtualMemory, SSN_NT_WRITE_VM as u32),
             (NativeService::NtSetInformationThread, SSN_NT_SET_INFO_THREAD as u32),
             (NativeService::NtSetInformationProcess, SSN_NT_SET_INFO_PROCESS as u32),
             (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
@@ -5706,22 +5950,6 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
 static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
 /// How many VMFaults (page faults) the service loop demand-paged in for the user thread.
 static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// Bump allocator for NtAllocateVirtualMemory backing a SEC_IMAGE process.
-static NEXT_SMSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
-/// csrss's OWN NtAllocateVirtualMemory bump — a SEPARATE counter from smss's so smss's allocations
-/// don't push csrss's heap base past the single alloc page table spawn_sec_image maps. Both start at
-/// SMSS_ALLOC_VA: the two processes have independent VSpaces, so the same VA (with each's own PT) is
-/// fine, and csrss's heap then lands low, within its mapped PT.
-static NEXT_CSRSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
-/// winlogon's OWN NtAllocateVirtualMemory bump (3rd hosted process) — a SEPARATE counter so smss's
-/// (or csrss's) allocations don't push winlogon's heap base past the single alloc PT spawn_sec_image
-/// maps. Starts at SMSS_ALLOC_VA: independent VSpaces make the same VA (own PT) fine.
-static NEXT_WINLOGON_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
-/// services.exe's OWN NtAllocateVirtualMemory bump (4th hosted process) — a SEPARATE counter (same
-/// rationale as csrss/winlogon: independent VSpaces make the same start VA (own PT) fine).
-static NEXT_SERVICES_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
-/// lsass.exe's OWN NtAllocateVirtualMemory bump (5th hosted process).
-static NEXT_LSASS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 /// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can

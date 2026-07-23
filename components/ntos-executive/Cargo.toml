@@ -41,6 +41,7 @@ nt-alpc-abi = { path = "../../crates/nt-alpc-abi" }
 nt-alpc = { path = "../../crates/nt-alpc" }
 bytemuck = { version = "1", default-features = false }
 nt-syscall = { path = "../../crates/nt-syscall" }
+nt-address-space = { path = "../../crates/nt-address-space" }
 # ntdll_plan Step 6.A — the shared ntdll↔executive SSN/transport ABI (NT_NATIVE_SYSCALL_LABEL).
 nt-syscall-abi = { path = "../../crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "../../crates/nt-ntdll-layout" }

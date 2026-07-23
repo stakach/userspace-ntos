@@ -68,7 +68,9 @@ fn valid_prot(p: u32) -> bool {
 
 fn valid_private_vm_protection(protection: u32) -> bool {
     const BASE_MASK: u32 = 0xff;
-    const MODIFIER_MASK: u32 = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+    // Guard pages require a one-shot fault transition that this eager seL4 mapper cannot yet
+    // provide. Reject them instead of silently granting ordinary access.
+    const MODIFIER_MASK: u32 = PAGE_NOCACHE | PAGE_WRITECOMBINE;
     let base = protection & BASE_MASK;
     let valid_base = matches!(
         base,
