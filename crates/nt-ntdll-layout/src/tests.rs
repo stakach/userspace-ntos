@@ -99,10 +99,24 @@ fn primitive_sizes_and_alignment() {
     assert_eq!(size_of::<ListEntry>(), 0x10);
     assert_eq!(size_of::<UnicodeString>(), 0x10);
     assert_eq!(size_of::<ClientId>(), 0x10);
+    assert_eq!(size_of::<ObjectAttributes>(), 0x30);
     assert_eq!(size_of::<NtTib>(), 0x38);
     // Everything is 8-byte aligned on x64.
     assert_eq!(align_of::<Peb>(), 8);
     assert_eq!(align_of::<Teb>(), 8);
+}
+
+#[test]
+fn object_attributes_layout() {
+    assert_eq!(offset_of!(ObjectAttributes, length), 0x00);
+    assert_eq!(offset_of!(ObjectAttributes, root_directory), 0x08);
+    assert_eq!(offset_of!(ObjectAttributes, object_name), 0x10);
+    assert_eq!(offset_of!(ObjectAttributes, attributes), 0x18);
+    assert_eq!(offset_of!(ObjectAttributes, security_descriptor), 0x20);
+    assert_eq!(
+        offset_of!(ObjectAttributes, security_quality_of_service),
+        0x28
+    );
 }
 
 #[test]

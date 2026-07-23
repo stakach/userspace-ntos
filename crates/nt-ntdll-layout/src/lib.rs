@@ -103,6 +103,26 @@ pub struct ClientId {
     pub unique_thread: u64,
 }
 
+/// `OBJECT_ATTRIBUTES` - object-manager call metadata (`ntdef.h`). 0x30 bytes on x64.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ObjectAttributes {
+    /// Structure size supplied by the caller.
+    pub length: u32,
+    _pad0: u32,
+    /// Optional root-directory handle.
+    pub root_directory: u64,
+    /// Optional pointer to a [`UnicodeString`] object name.
+    pub object_name: u64,
+    /// `OBJ_*` flags.
+    pub attributes: u32,
+    _pad1: u32,
+    /// Optional security descriptor.
+    pub security_descriptor: u64,
+    /// Optional security quality-of-service structure.
+    pub security_quality_of_service: u64,
+}
+
 /// `NT_TIB` — the head of the TEB (`ketypes.h`). 0x38 bytes on x64.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -407,6 +427,13 @@ const _: () = assert!(size_of::<RtlRelativeNameU>() == 0x20);
 const _: () = assert!(offset_of!(RtlRelativeNameU, containing_directory) == 0x10);
 const _: () = assert!(offset_of!(RtlRelativeNameU, cur_dir_ref) == 0x18);
 const _: () = assert!(size_of::<ClientId>() == 0x10);
+const _: () = assert!(size_of::<ObjectAttributes>() == 0x30);
+const _: () = assert!(offset_of!(ObjectAttributes, length) == 0x00);
+const _: () = assert!(offset_of!(ObjectAttributes, root_directory) == 0x08);
+const _: () = assert!(offset_of!(ObjectAttributes, object_name) == 0x10);
+const _: () = assert!(offset_of!(ObjectAttributes, attributes) == 0x18);
+const _: () = assert!(offset_of!(ObjectAttributes, security_descriptor) == 0x20);
+const _: () = assert!(offset_of!(ObjectAttributes, security_quality_of_service) == 0x28);
 const _: () = assert!(size_of::<NtTib>() == 0x38);
 
 // PEB — NDK peb_teb.h `_STRUCT64` C_ASSERT block + live-RE NLS/Ldr offsets.
