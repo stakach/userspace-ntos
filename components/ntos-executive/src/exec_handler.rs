@@ -2864,6 +2864,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(nt_process::HandleObject::TokenObject(token)) => Some(token),
                     _ => None,
                 };
+                let source_completion = match self
+                    .pm
+                    .lookup_handle(source_pid, args[1] as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::IoCompletion(id)) => Some(id),
+                    _ => None,
+                };
                 let options = args[6] as u32;
                 let mut target_pid_for_peak = None;
                 let mut native_duplicate = false;
@@ -2893,8 +2900,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                                     return STATUS_INVALID_HANDLE;
                                 }
                             }
-                            native_duplicate = true;
-                            Ok(Some(handle as u64))
+                            if let Some(id) = source_completion {
+                                match self.io_completion_ports.retain(id) {
+                                    Ok(()) => {
+                                        native_duplicate = true;
+                                        Ok(Some(handle as u64))
+                                    }
+                                    Err(status) => {
+                                        // The process-table copy does not own a completion-port
+                                        // reference until retain succeeds. Remove that copy without
+                                        // releasing the source's sole backing-object reference.
+                                        let _ = self.pm.take_handle(target_pid, handle);
+                                        Err(status)
+                                    }
+                                }
+                            } else {
+                                native_duplicate = true;
+                                Ok(Some(handle as u64))
+                            }
                         }
                         Err(status)
                             if status == STATUS_INVALID_HANDLE
@@ -4965,8 +4988,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                             ctx_va,
                         );
                         let worker_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
+                        let worker_entry = NTDLL_BASE.wrapping_add(worker_rva);
+                        // Native ntdll starts directly at RtlpWorkerThread. Kernel32's installed
+                        // hook starts at BaseThreadStartup and carries RtlpWorkerThread in RCX.
                         let is_tp_worker = worker_rva != 0
-                            && start.rip == NTDLL_BASE.wrapping_add(worker_rva);
+                            && (start.rip == worker_entry || start.rcx == worker_entry);
                         if is_tp_worker {
                             if TP_WORKER_TID[self.pi].load(Ordering::Relaxed) != 0 {
                                 return 0xC000_009A;
