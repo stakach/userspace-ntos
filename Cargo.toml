@@ -76,6 +76,7 @@ members = [
     "crates/nt-loader-trace",
     "crates/nt-delay-execution",
     "crates/nt-thread-start",
+    "crates/nt-rtl-work-item",
     "crates/nt-user-callback",
     "crates/nt-syscall-abi",
     "crates/nt-ntdll-layout",
@@ -169,6 +170,7 @@ nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
 nt-loader-trace = { path = "crates/nt-loader-trace" }
 nt-delay-execution = { path = "crates/nt-delay-execution" }
 nt-thread-start = { path = "crates/nt-thread-start" }
+nt-rtl-work-item = { path = "crates/nt-rtl-work-item" }
 nt-user-callback = { path = "crates/nt-user-callback" }
 nt-syscall-abi = { path = "crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "crates/nt-ntdll-layout" }
