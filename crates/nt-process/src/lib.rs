@@ -694,16 +694,12 @@ impl ProcessManager {
     pub fn query_thread_basic(
         &self,
         caller_pid: ProcessId,
+        current_tid: ThreadId,
         handle: u64,
     ) -> Result<ThreadBasicInformation, u32> {
-        let tid = if handle == u64::MAX - 1 {
-            self.main_thread(caller_pid).ok_or(STATUS_INVALID_HANDLE)?
-        } else {
-            match self.lookup_handle(caller_pid, handle as Handle) {
-                Some(HandleObject::Thread(tid)) => tid,
-                _ => return Err(STATUS_INVALID_HANDLE),
-            }
-        };
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
         let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
         Ok(ThreadBasicInformation {
             exit_status: thread.exit_status.unwrap_or(STATUS_SUCCESS),

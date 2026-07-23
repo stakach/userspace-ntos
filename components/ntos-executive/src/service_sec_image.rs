@@ -3649,7 +3649,11 @@ pub(crate) unsafe fn service_sec_image(
                 } else if buf == 0 {
                     0xC000_0005
                 } else if let Some(caller_pid) = nt_handler.pm_pid_for_pi(pi) {
-                    match nt_handler.pm.query_thread_basic(caller_pid, handle) {
+                    match nt_handler.pm.query_thread_basic(
+                        caller_pid,
+                        nt_handler.current_tid as nt_process::ThreadId,
+                        handle,
+                    ) {
                         Ok(basic) => {
                             let resolved_tid = basic.client_id.unique_thread as u64;
                             // Main-thread TEBs predate the ETHREAD convergence and are bound by the

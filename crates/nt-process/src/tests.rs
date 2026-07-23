@@ -651,8 +651,10 @@ fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
         let teb = 0x0000_0100_1049_0000 + index * 0x60000;
         assert!(pm.set_thread_start_address(tid, 0x7ff0_1000 + index * 0x100));
         assert!(pm.set_thread_teb(tid, teb));
-        let handle = pm.insert_handle(pid, HandleObject::Thread(tid), 0).unwrap();
-        let basic = pm.query_thread_basic(pid, handle as u64).unwrap();
+        let handle = pm
+            .insert_handle(pid, HandleObject::Thread(tid), 0x0040)
+            .unwrap();
+        let basic = pm.query_thread_basic(pid, main, handle as u64).unwrap();
         assert_eq!(basic.teb_base_address, teb);
         assert_eq!(
             basic.client_id,
@@ -668,9 +670,24 @@ fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
     assert_ne!(seen[1].0, seen[2].0);
     assert_ne!(seen[0].1, seen[2].1);
     assert_ne!(seen[0].2, seen[2].2);
-    let current = pm.query_thread_basic(pid, u64::MAX - 1).unwrap();
-    assert_eq!(current.client_id.unique_thread, main);
-    assert_eq!(pm.query_thread_basic(pid, 0), Err(STATUS_INVALID_HANDLE));
+    let worker = seen[1].1;
+    let current = pm.query_thread_basic(pid, worker, u64::MAX - 1).unwrap();
+    assert_eq!(current.client_id.unique_thread, worker);
+    pm.terminate_thread(worker, 0x1234).unwrap();
+    let terminated = pm.query_thread_basic(pid, main, seen[1].0 as u64).unwrap();
+    assert_eq!(terminated.exit_status, 0x1234);
+    assert_eq!(
+        pm.query_thread_basic(pid, main, 0),
+        Err(STATUS_INVALID_HANDLE)
+    );
+
+    let denied = pm
+        .insert_handle(pid, HandleObject::Thread(worker), 0)
+        .unwrap();
+    assert_eq!(
+        pm.query_thread_basic(pid, main, denied as u64),
+        Err(STATUS_ACCESS_DENIED)
+    );
 }
 
 #[test]
