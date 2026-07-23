@@ -121,6 +121,45 @@ pub struct ResolvedManifestSource {
     pub nt_path: Vec<u16>,
 }
 
+/// Append one enumerated filename to an already-resolved directory without resolving the parent
+/// path again. This keeps the DOS metadata path and the native open path rooted at the same
+/// directory handle that produced the filename.
+pub fn resolved_manifest_child(
+    directory: &ResolvedManifestSource,
+    filename: &[u16],
+) -> Option<ResolvedManifestSource> {
+    fn append(directory: &[u16], filename: &[u16]) -> Option<Vec<u16>> {
+        if directory.is_empty()
+            || filename.is_empty()
+            || filename
+                .iter()
+                .any(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+        {
+            return None;
+        }
+        let separator = !directory
+            .last()
+            .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16);
+        let capacity = directory
+            .len()
+            .checked_add(usize::from(separator))?
+            .checked_add(filename.len())?;
+        let mut path = Vec::new();
+        path.try_reserve_exact(capacity).ok()?;
+        path.extend_from_slice(directory);
+        if separator {
+            path.push(b'\\' as u16);
+        }
+        path.extend_from_slice(filename);
+        Some(path)
+    }
+
+    Some(ResolvedManifestSource {
+        dos_path: append(&directory.dos_path, filename)?,
+        nt_path: append(&directory.nt_path, filename)?,
+    })
+}
+
 /// Construct the sidecar path for an external PE source. Only an originally numeric selector
 /// contributes its decimal id; pointer-form selectors, including `#123`, use `.manifest`.
 pub fn associated_manifest_source(
@@ -831,6 +870,30 @@ mod tests {
             assert_eq!(String::from_utf16_lossy(&sidecar.dos_path), expected);
             assert!(String::from_utf16_lossy(&sidecar.nt_path).ends_with(&expected[3..]));
         }
+    }
+
+    #[test]
+    fn enumerated_winsxs_child_keeps_the_resolved_parent_paths() {
+        let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+        let directory = ResolvedManifestSource {
+            dos_path: wide("C:\\Windows\\winsxs\\manifests"),
+            nt_path: wide("\\??\\C:\\Windows\\winsxs\\manifests"),
+        };
+        let filename = wide(
+            "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest",
+        );
+        assert_eq!(filename.len(), 93);
+
+        let child = resolved_manifest_child(&directory, &filename).unwrap();
+        assert_eq!(
+            String::from_utf16_lossy(&child.dos_path),
+            "C:\\Windows\\winsxs\\manifests\\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest"
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&child.nt_path),
+            "\\??\\C:\\Windows\\winsxs\\manifests\\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest"
+        );
+        assert!(resolved_manifest_child(&directory, &wide("nested\\bad.manifest")).is_none());
     }
 
     #[test]

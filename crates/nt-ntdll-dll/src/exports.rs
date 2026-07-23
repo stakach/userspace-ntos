@@ -13575,13 +13575,9 @@ impl TargetActivationManifestCatalog {
         let Some((_, filename)) = best else {
             return Ok(None);
         };
-        let manifest_path = append_activation_path(&manifests_directory, &filename)?;
-        let resolved = nt_ntdll::rtl::activation::resolve_manifest_source(
-            &manifest_path,
-            None,
-            &[],
-        )
-        .ok_or(STATUS_NO_SUCH_FILE)?;
+        let resolved =
+            nt_ntdll::rtl::activation::resolved_manifest_child(&resolved_directory, &filename)
+                .ok_or(STATUS_NO_MEMORY)?;
         let manifest = match unsafe { read_activation_manifest_file(&resolved.nt_path) } {
             Ok(manifest) => manifest,
             Err(status) if activation_path_missing(status) => return Ok(None),
@@ -13589,6 +13585,7 @@ impl TargetActivationManifestCatalog {
         };
         let extension_length = ".manifest".len();
         let assembly_directory = filename[..filename.len() - extension_length].to_vec();
+        let manifest_path = resolved.dos_path;
         Ok(Some(
             nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
                 source: manifest_path.clone(),
