@@ -6301,6 +6301,21 @@ pub unsafe extern "system" fn rtl_unhandled_exception_filter(ptrs: *mut c_void) 
     nt_ntdll::rtl::exception::unhandled_exception_filter(code)
 }
 
+/// `RtlUnhandledExceptionFilter2(PEXCEPTION_POINTERS, PCSTR Function) -> LONG`.
+///
+/// ReactOS uses the optional function name only in its diagnostic stack print. The filter decision
+/// is identical to `RtlUnhandledExceptionFilter`.
+///
+/// # Safety
+/// `ptrs` follows the `EXCEPTION_POINTERS` contract; `function` is diagnostic-only.
+#[export_name = "RtlUnhandledExceptionFilter2"]
+pub unsafe extern "system" fn rtl_unhandled_exception_filter2(
+    ptrs: *mut c_void,
+    _function: *const u8,
+) -> i32 {
+    unsafe { rtl_unhandled_exception_filter(ptrs) }
+}
+
 /// `RtlSetUnhandledExceptionFilter(PRTLP_UNHANDLED_EXCEPTION_FILTER Filter)`.
 ///
 /// # Safety
@@ -27108,6 +27123,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_char_to_integer as usize,
         rtl_create_heap as usize,
         rtl_unhandled_exception_filter as usize,
+        rtl_unhandled_exception_filter2 as *const () as usize,
         rtl_set_unhandled_exception_filter as usize,
         memmove as usize,
         rtl_copy_memory as usize,
