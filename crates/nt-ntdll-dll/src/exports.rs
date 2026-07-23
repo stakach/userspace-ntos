@@ -13265,6 +13265,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 Ok(section) => section,
                 Err(status) => return status,
             };
+        let application_settings = details.application_settings;
         let parsed = details.root;
         let application_directory =
             if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
@@ -13312,6 +13313,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 dll_redirect_section,
                 window_class_redirect_section,
                 clr_surrogate_section,
+                application_settings,
                 encoded_assembly_identity,
             ),
         );
@@ -14139,6 +14141,106 @@ pub unsafe extern "system" fn rtl_query_information_active_activation_context(
             buffer_size,
             return_length,
         )
+    }
+}
+
+/// `RtlQueryActivationContextApplicationSettings(ULONG Flags, HANDLE ActCtx, PCWSTR Namespace,
+/// PCWSTR SettingName, PWSTR Buffer, SIZE_T Size, PSIZE_T Written) -> NTSTATUS`.
+///
+/// Query the manifest settings retained by `RtlCreateActivationContext`. A NULL context selects the
+/// process activation context; a NULL namespace selects the 2005 WindowsSettings schema.
+///
+/// # Safety
+/// Input strings are NUL-terminated. On success `buffer` is writable for the value and terminator;
+/// `written`, when non-NULL, is writable.
+#[export_name = "RtlQueryActivationContextApplicationSettings"]
+pub unsafe extern "system" fn rtl_query_activation_context_application_settings(
+    flags: u32,
+    activation_context: *mut c_void,
+    namespace: *const u16,
+    setting_name: *const u16,
+    buffer: *mut u16,
+    size: usize,
+    written: *mut usize,
+) -> NtStatus {
+    if flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let namespace = if namespace.is_null() {
+            None
+        } else {
+            match copy_utf16_z_bounded(namespace, 32 * 1024) {
+                Ok(namespace) => Some(namespace),
+                Err(status) => return status,
+            }
+        };
+        if namespace.as_deref().is_some_and(|namespace| {
+            !nt_ntdll::rtl::activation_settings::is_valid_namespace(namespace)
+        }) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let selected = if activation_context.is_null() {
+            process_activation_context_no_addref()
+        } else {
+            activation_context
+        };
+        let Some(object_ptr) = activation_context_acquire_registered(selected) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if setting_name.is_null() {
+            activation_context_release(selected);
+            return STATUS_INVALID_PARAMETER;
+        }
+        let name = match copy_utf16_z_bounded(setting_name, 32 * 1024) {
+            Ok(name) => name,
+            Err(status) => {
+                activation_context_release(selected);
+                return status;
+            }
+        };
+        let object = &*object_ptr;
+        let query = nt_ntdll::rtl::activation_settings::query_application_setting(
+            &object.application_settings,
+            namespace.as_deref(),
+            &name,
+            size,
+        );
+        let query = match query {
+            Ok(query) => query,
+            Err(status) => {
+                activation_context_release(selected);
+                return status;
+            }
+        };
+        if !written.is_null() {
+            core::ptr::write_unaligned(written, query.required_chars);
+        }
+        if query.status != STATUS_SUCCESS {
+            activation_context_release(selected);
+            return query.status;
+        }
+        if buffer.is_null() {
+            activation_context_release(selected);
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(query.value.as_ptr(), buffer, query.value.len());
+        core::ptr::write_unaligned(buffer.add(query.value.len()), 0);
+        activation_context_release(selected);
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            activation_context,
+            namespace,
+            setting_name,
+            buffer,
+            size,
+            written,
+        );
+        STATUS_NOT_IMPLEMENTED
     }
 }
 
@@ -28015,6 +28117,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_free_thread_activation_context_stack as usize,
         rtl_is_activation_context_active as usize,
         rtl_query_information_active_activation_context as usize,
+        rtl_query_activation_context_application_settings as *const () as usize,
         rtl_is_thread_within_loader_callout as usize,
     ];
     core::hint::black_box(anchors_sxs);

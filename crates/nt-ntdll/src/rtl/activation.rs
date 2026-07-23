@@ -289,6 +289,7 @@ pub struct ActivationContextObject {
     pub dll_redirect_section: Vec<u8>,
     pub window_class_redirect_section: Vec<u8>,
     pub clr_surrogate_section: Vec<u8>,
+    pub application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
 }
 
 const _: () = assert!(core::mem::align_of::<ActivationContextObject>() <= 16);
@@ -351,6 +352,7 @@ impl ActivationContextObject {
         dll_redirect_section: Vec<u8>,
         window_class_redirect_section: Vec<u8>,
         clr_surrogate_section: Vec<u8>,
+        application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
         encoded_assembly_identity: Vec<u16>,
     ) -> Self {
         let file_count = u32::try_from(dll_redirects.len()).unwrap_or(u32::MAX);
@@ -371,6 +373,7 @@ impl ActivationContextObject {
             dll_redirect_section,
             window_class_redirect_section,
             clr_surrogate_section,
+            application_settings,
         }
     }
 
@@ -847,6 +850,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(object.is_valid());
         assert_eq!(object.reference_count(), 1);
@@ -865,6 +869,7 @@ mod tests {
         let object = ActivationContextObject::new(
             Vec::new(),
             b"<assembly/>".to_vec(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

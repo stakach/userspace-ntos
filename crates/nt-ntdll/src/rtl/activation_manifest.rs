@@ -31,6 +31,7 @@ pub struct ParsedManifestDetails {
     pub dependencies: Vec<ManifestDependency>,
     pub window_classes: Vec<ManifestWindowClass>,
     pub clr_surrogates: Vec<ManifestClrSurrogate>,
+    pub application_settings: Vec<ManifestApplicationSetting>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -55,6 +56,13 @@ pub struct ManifestClrSurrogate {
     pub name: Vec<u16>,
     /// `Some(empty)` preserves an explicitly empty `runtimeVersion` attribute.
     pub runtime_version: Option<Vec<u16>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestApplicationSetting {
+    pub namespace: Vec<u16>,
+    pub name: Vec<u16>,
+    pub value: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -315,13 +323,16 @@ struct Parser<'a> {
     dependencies: Vec<ManifestDependency>,
     window_classes: Vec<ManifestWindowClass>,
     clr_surrogates: Vec<ManifestClrSurrogate>,
+    application_settings: Vec<ManifestApplicationSetting>,
+    selected_settings_application: Option<usize>,
+    next_application_id: usize,
     compatibility: Vec<CompatibilityElement>,
     run_level: u32,
     ui_access: u32,
 }
 
 struct Frame {
-    name: Range<usize>,
+    tag: Tag,
     kind: FrameKind,
 }
 
@@ -343,6 +354,17 @@ enum FrameKind {
         versioned: bool,
         text: Vec<u16>,
     },
+    Application {
+        application_id: usize,
+    },
+    WindowsSettings {
+        application_id: usize,
+    },
+    ApplicationSetting {
+        namespace: Vec<u16>,
+        name: Vec<u16>,
+        value: Vec<u16>,
+    },
     Other,
 }
 
@@ -357,6 +379,9 @@ impl<'a> Parser<'a> {
             dependencies: Vec::new(),
             window_classes: Vec::new(),
             clr_surrogates: Vec::new(),
+            application_settings: Vec::new(),
+            selected_settings_application: None,
+            next_application_id: 0,
             compatibility: Vec::new(),
             run_level: RUN_LEVEL_UNSPECIFIED,
             ui_access: 0,
@@ -374,7 +399,7 @@ impl<'a> Parser<'a> {
             let mut stack = Vec::new();
             stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
             stack.push(Frame {
-                name: root.name(),
+                tag: root,
                 kind: FrameKind::Assembly,
             });
 
@@ -385,16 +410,19 @@ impl<'a> Parser<'a> {
                 }
                 let text = &self.input[text_start..self.position];
                 validate_escaped_text(text)?;
-                if let Some(Frame {
-                    kind: FrameKind::WindowClass { text: output, .. },
-                    ..
-                }) = stack.last_mut()
-                {
-                    let decoded = decode_attribute_value(text)?;
-                    output
-                        .try_reserve(decoded.len())
-                        .map_err(|_| STATUS_NO_MEMORY)?;
-                    output.extend_from_slice(&decoded);
+                if let Some(frame) = stack.last_mut() {
+                    let output = match &mut frame.kind {
+                        FrameKind::WindowClass { text, .. }
+                        | FrameKind::ApplicationSetting { value: text, .. } => Some(text),
+                        _ => None,
+                    };
+                    if let Some(output) = output {
+                        let decoded = decode_attribute_value(text)?;
+                        output
+                            .try_reserve(decoded.len())
+                            .map_err(|_| STATUS_NO_MEMORY)?;
+                        output.extend_from_slice(&decoded);
+                    }
                 }
                 if self.position == self.input.len() {
                     return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
@@ -406,14 +434,18 @@ impl<'a> Parser<'a> {
                     let content_start = self.position + 9;
                     let content_end = find_ascii(self.input, content_start, "]]>")
                         .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-                    if let Some(Frame {
-                        kind: FrameKind::WindowClass { text, .. },
-                        ..
-                    }) = stack.last_mut()
-                    {
-                        text.try_reserve(content_end - content_start)
-                            .map_err(|_| STATUS_NO_MEMORY)?;
-                        text.extend_from_slice(&self.input[content_start..content_end]);
+                    if let Some(frame) = stack.last_mut() {
+                        let output = match &mut frame.kind {
+                            FrameKind::WindowClass { text, .. }
+                            | FrameKind::ApplicationSetting { value: text, .. } => Some(text),
+                            _ => None,
+                        };
+                        if let Some(output) = output {
+                            output
+                                .try_reserve(content_end - content_start)
+                                .map_err(|_| STATUS_NO_MEMORY)?;
+                            output.extend_from_slice(&self.input[content_start..content_end]);
+                        }
                     }
                     self.position = content_end + 3;
                 } else if self.starts_with("<?") {
@@ -423,7 +455,7 @@ impl<'a> Parser<'a> {
                     let Some(frame) = stack.pop() else {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     };
-                    if self.input[frame.name.clone()] != self.input[closing] {
+                    if self.input[frame.tag.name()] != self.input[closing] {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     }
                     self.finish_frame(frame.kind)?;
@@ -431,12 +463,15 @@ impl<'a> Parser<'a> {
                     return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                 } else {
                     let tag = self.parse_start_tag()?;
-                    if stack
-                        .last()
-                        .is_some_and(|frame| matches!(&frame.kind, FrameKind::WindowClass { .. }))
-                    {
+                    if stack.last().is_some_and(|frame| {
+                        matches!(
+                            &frame.kind,
+                            FrameKind::WindowClass { .. } | FrameKind::ApplicationSetting { .. }
+                        )
+                    }) {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     }
+                    let namespace = resolve_element_namespace(self.input, tag, &stack)?;
                     let parent_is_assembly = stack
                         .last()
                         .is_some_and(|frame| matches!(&frame.kind, FrameKind::Assembly));
@@ -457,6 +492,15 @@ impl<'a> Parser<'a> {
                         FrameKind::File { file_index } => Some(*file_index),
                         _ => None,
                     });
+                    let parent_application_id = stack.last().and_then(|frame| match &frame.kind {
+                        FrameKind::Application { application_id } => Some(*application_id),
+                        _ => None,
+                    });
+                    let parent_settings_application_id =
+                        stack.last().and_then(|frame| match &frame.kind {
+                            FrameKind::WindowsSettings { application_id } => Some(*application_id),
+                            _ => None,
+                        });
 
                     let kind = if parent_is_assembly && local_eq(self.input, tag.name(), "file") {
                         FrameKind::File {
@@ -507,6 +551,40 @@ impl<'a> Parser<'a> {
                             versioned: self.window_class_is_versioned(tag)?,
                             text: Vec::new(),
                         }
+                    } else if parent_is_assembly
+                        && local_eq(self.input, tag.name(), "application")
+                        && is_assembly_namespace(&namespace)
+                    {
+                        let application_id = self.next_application_id;
+                        self.next_application_id = self
+                            .next_application_id
+                            .checked_add(1)
+                            .ok_or(STATUS_NO_MEMORY)?;
+                        FrameKind::Application { application_id }
+                    } else if parent_application_id.is_some()
+                        && local_eq(self.input, tag.name(), "windowsSettings")
+                        && is_assembly_namespace(&namespace)
+                    {
+                        FrameKind::WindowsSettings {
+                            application_id: parent_application_id.unwrap(),
+                        }
+                    } else if let Some(application_id) = parent_settings_application_id {
+                        let name = local_name(self.input, tag.name());
+                        if !tag.self_closing
+                            && is_application_setting(&namespace, name)
+                            && self
+                                .selected_settings_application
+                                .is_none_or(|selected| selected == application_id)
+                        {
+                            self.selected_settings_application = Some(application_id);
+                            FrameKind::ApplicationSetting {
+                                namespace,
+                                name: name.to_vec(),
+                                value: Vec::new(),
+                            }
+                        } else {
+                            FrameKind::Other
+                        }
                     } else {
                         FrameKind::Other
                     };
@@ -531,10 +609,7 @@ impl<'a> Parser<'a> {
                     }
                     if !tag.self_closing {
                         stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
-                        stack.push(Frame {
-                            name: tag.name(),
-                            kind,
-                        });
+                        stack.push(Frame { tag, kind });
                     }
                 }
             }
@@ -556,6 +631,7 @@ impl<'a> Parser<'a> {
             dependencies: self.dependencies,
             window_classes: self.window_classes,
             clr_surrogates: self.clr_surrogates,
+            application_settings: self.application_settings,
         })
     }
 
@@ -750,23 +826,42 @@ impl<'a> Parser<'a> {
     }
 
     fn finish_frame(&mut self, kind: FrameKind) -> Result<(), NtStatus> {
-        if let FrameKind::WindowClass {
-            file_index,
-            versioned,
-            text,
-        } = kind
-        {
-            if text.is_empty() || text.contains(&0) {
-                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
-            }
-            self.window_classes
-                .try_reserve(1)
-                .map_err(|_| STATUS_NO_MEMORY)?;
-            self.window_classes.push(ManifestWindowClass {
+        match kind {
+            FrameKind::WindowClass {
                 file_index,
-                name: text,
                 versioned,
-            });
+                text,
+            } => {
+                if text.is_empty() || text.contains(&0) {
+                    return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                }
+                self.window_classes
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_NO_MEMORY)?;
+                self.window_classes.push(ManifestWindowClass {
+                    file_index,
+                    name: text,
+                    versioned,
+                });
+            }
+            FrameKind::ApplicationSetting {
+                namespace,
+                name,
+                value,
+            } => {
+                if value.contains(&0) {
+                    return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                }
+                self.application_settings
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_NO_MEMORY)?;
+                self.application_settings.push(ManifestApplicationSetting {
+                    namespace,
+                    name,
+                    value,
+                });
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1045,6 +1140,108 @@ fn ensure_unique_attributes(input: &[u16], start: usize, end: usize) -> Result<(
     Ok(())
 }
 
+fn resolve_element_namespace(
+    input: &[u16],
+    tag: Tag,
+    stack: &[Frame],
+) -> Result<Vec<u16>, NtStatus> {
+    let qualified = &input[tag.name()];
+    let prefix_end = qualified
+        .iter()
+        .rposition(|unit| *unit == b':' as u16)
+        .unwrap_or(0);
+    let prefix = if prefix_end == 0 {
+        &[][..]
+    } else {
+        &qualified[..prefix_end]
+    };
+    if let Some(namespace) = namespace_declared_on_tag(input, tag, prefix)? {
+        return Ok(namespace);
+    }
+    for frame in stack.iter().rev() {
+        if let Some(namespace) = namespace_declared_on_tag(input, frame.tag, prefix)? {
+            return Ok(namespace);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn namespace_declared_on_tag(
+    input: &[u16],
+    tag: Tag,
+    prefix: &[u16],
+) -> Result<Option<Vec<u16>>, NtStatus> {
+    let mut position = tag.attrs_start;
+    while let Some(attribute) = next_attribute(input, &mut position, tag.attrs_end)? {
+        let name = &input[attribute.name()];
+        let matches = if prefix.is_empty() {
+            ascii_slice_eq(name, "xmlns")
+        } else {
+            name.len() == 6 + prefix.len()
+                && ascii_slice_eq(&name[..6], "xmlns:")
+                && name[6..] == *prefix
+        };
+        if matches {
+            return decode_attribute_value(&input[attribute.value()]).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn local_name(input: &[u16], name: Range<usize>) -> &[u16] {
+    let qualified = &input[name];
+    let local_start = qualified
+        .iter()
+        .rposition(|unit| *unit == b':' as u16)
+        .map_or(0, |position| position + 1);
+    &qualified[local_start..]
+}
+
+fn is_assembly_namespace(namespace: &[u16]) -> bool {
+    ascii_slice_eq(namespace, "urn:schemas-microsoft-com:asm.v1")
+        || ascii_slice_eq(namespace, "urn:schemas-microsoft-com:asm.v2")
+        || ascii_slice_eq(namespace, "urn:schemas-microsoft-com:asm.v3")
+}
+
+fn is_application_setting(namespace: &[u16], name: &[u16]) -> bool {
+    (ascii_slice_eq(
+        namespace,
+        "http://schemas.microsoft.com/SMI/2005/WindowsSettings",
+    ) && matches_ascii(name, &["autoElevate", "disableTheming", "dpiAware"]))
+        || (ascii_slice_eq(
+            namespace,
+            "http://schemas.microsoft.com/SMI/2011/WindowsSettings",
+        ) && matches_ascii(name, &["disableWindowFiltering", "printerDriverIsolation"]))
+        || (ascii_slice_eq(
+            namespace,
+            "http://schemas.microsoft.com/SMI/2016/WindowsSettings",
+        ) && matches_ascii(name, &["dpiAwareness", "longPathAware"]))
+        || (ascii_slice_eq(
+            namespace,
+            "http://schemas.microsoft.com/SMI/2017/WindowsSettings",
+        ) && matches_ascii(
+            name,
+            &[
+                "gdiScaling",
+                "highResolutionScrollingAware",
+                "magicFutureSetting",
+                "ultraHighResolutionScrollingAware",
+            ],
+        ))
+        || (ascii_slice_eq(
+            namespace,
+            "http://schemas.microsoft.com/SMI/2019/WindowsSettings",
+        ) && ascii_slice_eq(name, "activeCodePage"))
+        || (ascii_slice_eq(
+            namespace,
+            "http://schemas.microsoft.com/SMI/2020/WindowsSettings",
+        ) && ascii_slice_eq(name, "heapType"))
+}
+
+fn matches_ascii(input: &[u16], choices: &[&str]) -> bool {
+    choices.iter().any(|choice| ascii_slice_eq(input, choice))
+}
+
 fn parse_name_bounded(input: &[u16], position: &mut usize, end: usize) -> Result<(), NtStatus> {
     if *position >= end || !is_name_start(input[*position]) {
         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
@@ -1196,11 +1393,11 @@ fn attribute_eq(input: &[u16], attribute: Attribute, expected: &str) -> bool {
 
 fn local_frame_suffix(input: &[u16], stack: &[Frame], expected: &[&str]) -> bool {
     stack.len() == expected.len() + 1
-        && local_eq(input, stack[0].name.clone(), "assembly")
+        && local_eq(input, stack[0].tag.name(), "assembly")
         && stack[1..]
             .iter()
             .zip(expected)
-            .all(|(frame, expected)| local_eq(input, frame.name.clone(), expected))
+            .all(|(frame, expected)| local_eq(input, frame.tag.name(), expected))
 }
 
 fn ascii_slice_eq(input: &[u16], expected: &str) -> bool {
@@ -1682,5 +1879,99 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.dependencies.is_empty());
+    }
+
+    #[test]
+    fn parses_application_settings_with_scoped_namespaces() {
+        let parsed = parse_manifest_details(
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1"
+                xmlns:asm="urn:schemas-microsoft-com:asm.v3" manifestVersion="1.0">
+              <asm:application xmlns:ws="http://schemas.microsoft.com/SMI/2005/WindowsSettings">
+                <asm:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">
+                  <ws:dpiAware>true&amp;yes</ws:dpiAware>
+                  <ws:dpiAwareness xmlns:ws="http://schemas.microsoft.com/SMI/2016/WindowsSettings"><![CDATA[per monitor]]></ws:dpiAwareness>
+                  <ws:dpiAware>sibling</ws:dpiAware>
+                  <dpiAware xmlns="">ignored</dpiAware>
+                  <dpiAware>default-again</dpiAware>
+                </asm:windowsSettings>
+              </asm:application>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.application_settings,
+            vec![
+                ManifestApplicationSetting {
+                    namespace: wide("http://schemas.microsoft.com/SMI/2005/WindowsSettings"),
+                    name: wide("dpiAware"),
+                    value: wide("true&yes"),
+                },
+                ManifestApplicationSetting {
+                    namespace: wide("http://schemas.microsoft.com/SMI/2016/WindowsSettings"),
+                    name: wide("dpiAwareness"),
+                    value: wide("per monitor"),
+                },
+                ManifestApplicationSetting {
+                    namespace: wide("http://schemas.microsoft.com/SMI/2005/WindowsSettings"),
+                    name: wide("dpiAware"),
+                    value: wide("sibling"),
+                },
+                ManifestApplicationSetting {
+                    namespace: wide("http://schemas.microsoft.com/SMI/2005/WindowsSettings"),
+                    name: wide("dpiAware"),
+                    value: wide("default-again"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn application_settings_use_first_nonempty_application() {
+        let parsed = parse_manifest_details(
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <application/>
+              <application xmlns="urn:schemas-microsoft-com:asm.v3">
+                <windowsSettings>
+                  <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings"></dpiAware>
+                  <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings"/>
+                </windowsSettings>
+              </application>
+              <application xmlns="urn:schemas-microsoft-com:asm.v3">
+                <windowsSettings>
+                  <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">late</dpiAwareness>
+                </windowsSettings>
+              </application>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.application_settings,
+            vec![ManifestApplicationSetting {
+                namespace: wide("http://schemas.microsoft.com/SMI/2005/WindowsSettings"),
+                name: wide("dpiAware"),
+                value: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_unbound_or_wrong_application_setting_namespaces() {
+        let parsed = parse_manifest_details(
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <asmv3:application>
+                <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">
+                  <dpiAware>true</dpiAware>
+                </asmv3:windowsSettings>
+              </asmv3:application>
+              <application xmlns="urn:schemas-microsoft-com:asm.v3">
+                <windowsSettings>
+                  <dpiAware xmlns="urn:not-windows-settings">true</dpiAware>
+                  <DpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</DpiAware>
+                </windowsSettings>
+              </application>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert!(parsed.application_settings.is_empty());
     }
 }
