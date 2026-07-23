@@ -1733,10 +1733,11 @@ pub unsafe extern "system" fn rtl_multiple_free_heap(
     index
 }
 
-/// `RtlCreateTagHeap(...)` — heap tagging helper. Honest seam.
+/// `RtlCreateTagHeap(...)` — heap tagging helper.
 ///
 /// # Safety
-/// Standard contract; no live effect until the heap plane is wired.
+/// Tagging is disabled because the process `NtGlobalFlag` does not request it, so native RTL
+/// returns zero without inspecting the supplied tag strings.
 #[export_name = "RtlCreateTagHeap"]
 pub unsafe extern "system" fn rtl_create_tag_heap(
     _heap: *mut c_void,
@@ -1744,7 +1745,7 @@ pub unsafe extern "system" fn rtl_create_tag_heap(
     _tag_prefix: *mut c_void,
     _tag_names: *mut c_void,
 ) -> u32 {
-    0 // No tag allocated (no live heap yet).
+    0
 }
 
 /// `RtlFreeUnicodeString(PUNICODE_STRING)` — free a heap-allocated `UNICODE_STRING` buffer and zero
@@ -19333,10 +19334,17 @@ pub unsafe extern "system" fn rtl_set_thread_error_mode(
     STATUS_SUCCESS
 }
 
-/// `RtlValidateProcessHeaps() -> BOOLEAN`.
+/// `RtlValidateProcessHeaps() -> BOOLEAN` — validate every registered process/private heap.
 #[export_name = "RtlValidateProcessHeaps"]
 pub extern "system" fn rtl_validate_process_heaps() -> u8 {
-    1
+    #[cfg(target_arch = "x86_64")]
+    {
+        return u8::from(crate::validate_process_heaps());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
 
 /// `RtlGetNtProductType(PNT_PRODUCT_TYPE ProductType) -> BOOLEAN` — 1 = NtProductWinNt.
@@ -21149,10 +21157,11 @@ pub unsafe extern "system" fn rtl_set_user_flags_heap(
     0
 }
 
-/// `RtlQueryTagHeap(...)` — heap tag introspection (debug). No tag store; return NULL.
+/// `RtlQueryTagHeap(...)` — heap tag introspection.
 ///
 /// # Safety
-/// Args are the RtlQueryTagHeap ABI; reads no memory here.
+/// Tagging is disabled because the process `NtGlobalFlag` does not request it, so native RTL
+/// returns NULL without inspecting the query fields.
 #[export_name = "RtlQueryTagHeap"]
 pub unsafe extern "system" fn rtl_query_tag_heap(
     _heap: *mut c_void,

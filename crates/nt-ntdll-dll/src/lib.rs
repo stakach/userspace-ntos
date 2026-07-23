@@ -428,6 +428,13 @@ pub(crate) unsafe fn copy_process_heap_handles(output: &mut [*mut u8]) -> usize 
     unsafe { process_heaps_locked().copy_handles(output) }
 }
 
+/// Validate the complete physical chain of every registered process heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn validate_process_heaps() -> bool {
+    let _guard = lock_process_heap();
+    unsafe { process_heaps_locked().validate_all() }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn process_heap_handle() -> Option<*mut u8> {
     let _guard = lock_process_heap();

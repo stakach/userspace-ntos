@@ -1103,6 +1103,18 @@ impl<B: Backing, const N: usize> HeapRegistry<B, N> {
         }
         written
     }
+
+    /// Validate every registered heap's complete physical block chain.
+    pub fn validate_all(&self) -> bool {
+        self.process
+            .iter()
+            .chain(
+                self.private[..self.private_len]
+                    .iter()
+                    .filter_map(Option::as_ref),
+            )
+            .all(|heap| heap.validate(None))
+    }
 }
 
 #[cfg(test)]
@@ -1784,6 +1796,30 @@ mod tests {
         let mut all = [core::ptr::null_mut(); 3];
         assert_eq!(registry.copy_handles(&mut all), 3);
         assert_eq!(all, [process, first, second]);
+    }
+
+    #[test]
+    fn registry_validates_every_process_heap() {
+        let mut registry = HeapRegistry::<VecBacking, 3>::new();
+        assert!(registry.validate_all());
+        let process = registry.install_process(heap(512)).ok().unwrap();
+        let first = registry.insert_private(heap(512)).ok().unwrap();
+        let second = registry.insert_private(heap(512)).ok().unwrap();
+        assert!(registry.validate_all());
+
+        // SAFETY: deliberately corrupt one private heap's integer header metadata.
+        unsafe { (*registry.find_mut(first).unwrap().hdr(first)).reserved = 1 };
+        assert!(!registry.validate_all());
+        assert!(matches!(
+            registry.remove_private(first),
+            HeapRemoval::Removed(_)
+        ));
+        assert!(registry.validate_all());
+
+        // SAFETY: deliberately corrupt the distinguished process heap.
+        unsafe { (*registry.find_mut(process).unwrap().hdr(process)).size = 0 };
+        assert!(!registry.validate_all());
+        assert!(registry.find(second).is_some());
     }
 
     #[test]
