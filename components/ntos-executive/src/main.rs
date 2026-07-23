@@ -1178,6 +1178,7 @@ const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
 const REG_KEY: &str = r"\Registry\Machine\System\CurrentControlSet\Services\FromSyscall";
 
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -2030,8 +2031,33 @@ static mut FILLED_WORK: [u64; 512] = [0u64; 512];
 static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> =
     nt_fs::DirectoryOpenTable::new();
 
+fn try_alloc_slot() -> Option<u64> {
+    let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
+    let mut current = NEXT_SLOT.load(Ordering::Relaxed);
+    loop {
+        if current >= end {
+            return None;
+        }
+        match NEXT_SLOT.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn alloc_slot() -> u64 {
-    NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
+    match try_alloc_slot() {
+        Some(slot) => slot,
+        None => {
+            print_str(b"[cap] root CSpace exhausted\n");
+            park()
+        }
+    }
 }
 
 // --- Shared executable-page cache (generic DLL loader) --------------------------------------------
@@ -2070,46 +2096,7 @@ unsafe fn dll_cache_put(va: u64, fr: u64) {
     }
 }
 
-// --- EAGER IMAGE-MAP completion tracking ---------------------------------------------------------
-// (A) EAGER IMAGE-MAPPING. Under QEMU TCG each demand-fault is a full fault-EP round-trip (~6/s), so
-// paging a big DLL image in one-page-at-a-time (or in small BATCH runs) dominates the boot budget
-// (the full 5-process load exceeds the 500s TCG window). The fix: the FIRST time a process faults
-// into a given image, fill+map the WHOLE image extent in that ONE round-trip (same total frames —
-// each page gets a frame either way — just UPFRONT, so the process never demand-faults that image's
-// code pages again). To keep this O(pages) (not O(pages^2) via the linear `filled_pages` scan) and
-// to run exactly ONCE per (process, image), we record the (pi, image_base) pairs already eagerly
-// filled. A tiny fixed set — there are only ~165 distinct DLLs across the whole boot, and each is
-// eager-filled at most once per process that maps it. Keyed by (pi as u8, image_base). Accessed via
-// raw pointers (static_mut_refs lint) — single-threaded executive, no races.
-const EAGER_DONE_CAP: usize = 4096;
-static mut EAGER_DONE_PI: [u8; EAGER_DONE_CAP] = [0; EAGER_DONE_CAP];
-static mut EAGER_DONE_BASE: [u64; EAGER_DONE_CAP] = [0; EAGER_DONE_CAP];
-static mut EAGER_DONE_N: usize = 0;
-/// True if this (pi, image_base) has already been eagerly whole-image filled (so the fault path
-/// should NOT re-eager it — just service the single faulting page, e.g. a runtime re-fault whose
-/// frame the fixup-remap path preserves).
-pub(crate) unsafe fn eager_done(pi: u64, base: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(EAGER_DONE_N));
-    let pis = core::ptr::addr_of!(EAGER_DONE_PI) as *const u8;
-    let bases = core::ptr::addr_of!(EAGER_DONE_BASE) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(bases.add(i)) == base && core::ptr::read(pis.add(i)) as u64 == pi {
-            return true;
-        }
-    }
-    false
-}
-/// Record that (pi, image_base) has been eagerly whole-image filled.
-pub(crate) unsafe fn eager_mark(pi: u64, base: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(EAGER_DONE_N));
-    if n < EAGER_DONE_CAP {
-        core::ptr::write((core::ptr::addr_of_mut!(EAGER_DONE_PI) as *mut u8).add(n), pi as u8);
-        core::ptr::write((core::ptr::addr_of_mut!(EAGER_DONE_BASE) as *mut u64).add(n), base);
-        core::ptr::write(core::ptr::addr_of_mut!(EAGER_DONE_N), n + 1);
-    }
-}
-
-// --- csrss client-page frame tracking (win32k cross-AS client-memory sharing) --------------------
+// --- per-process private-page frame tracking ------------------------------------------------------
 // win32k runs in its own component VSpace, but its NtUser/NtGdi handlers dereference the CALLING
 // process's (the GUI client's) user pointers DIRECTLY — the authentic Windows model where win32k
 // shares the caller's user address space. To emulate that we map the CURRENT dispatch client's OWN
@@ -2122,9 +2109,11 @@ pub(crate) unsafe fn eager_mark(pi: u64, base: u64) {
 // the fault-fill path allocated for each PER-PROCESS client page ((pi,page) -> frame cptr); the
 // shared-DLL-text cache (`dll_cache`) covers RX pages (byte-identical across clients). The
 // executive's scratch alias already shares these frames, so the client's runtime writes are visible.
-// Two interactive clients retain private writable pages for their full DLL graphs. Winlogon's
-// runtime worker stacks are created late, after the former 8192-entry table could already be full;
-// silently dropping those entries made win32k attach an unrelated page at the same user VA.
+// Every hosted process is recorded because bounded forward prefetch must also detect already-mapped
+// private neighbours in services and LSASS. GUI attach consumes only the entries for its selected
+// pi. Winlogon's runtime worker stacks are created late, after the former 8192-entry table could
+// already be full; silently dropping those entries made win32k attach an unrelated page at the same
+// user VA.
 const CSRSS_FRAME_CAP: usize = 16384;
 static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
@@ -2537,7 +2526,9 @@ unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u6
     reply >> 12
 }
 unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
-    let d = alloc_slot();
+    let Some(d) = try_alloc_slot() else {
+        return (0, 4);
+    };
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -2650,7 +2641,9 @@ unsafe fn tcb_write_registers_r(target: u64, rip: u64, rsp: u64, arg0: u64) -> u
 }
 /// Allocate a fresh 4 KiB frame, returning (slot, retype-error-label).
 unsafe fn alloc_frame_r() -> (u64, u64) {
-    let s = alloc_slot();
+    let Some(s) = try_alloc_slot() else {
+        return (0, 4);
+    };
     let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
     (s, e)
 }
@@ -6856,6 +6849,7 @@ struct Fat32 {
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
+    ROOT_CSPACE_END.store(bi.empty.end, Ordering::Relaxed);
     IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);

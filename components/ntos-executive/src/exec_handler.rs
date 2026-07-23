@@ -10171,7 +10171,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                         );
                         0
                     } else {
-                        self.stop = true;
                         loader_trace_record(
                             self.pi,
                             LoaderOp::MapViewOfSection,
@@ -10256,7 +10255,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                     );
                     0
                 } else {
-                    self.stop = true; // other sections not modeled
+                    print_str(b"[ntos-exec] NtMapViewOfSection unsupported pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" section=0x");
+                    print_hex(sect as u32);
+                    print_str(b"\n");
                     loader_trace_record(
                         self.pi,
                         LoaderOp::MapViewOfSection,

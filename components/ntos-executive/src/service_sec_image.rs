@@ -1722,24 +1722,15 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 base
             };
-            // ★ (A) EAGER IMAGE-MAP. The FIRST time this process faults into an image (`base`), fill+map
-            // the WHOLE image extent `[base, img_hi)` in this ONE round-trip instead of a small forward
-            // RUN — same total frames, just UPFRONT, so the process never demand-faults that image's code
-            // pages again (the dominant TCG cost: each per-page fault is a full fault-EP round-trip). On a
-            // LATER fault into an already-eager image (a runtime re-touch / a fixup re-fault), fall back to
-            // the small forward BATCH from the faulting page (the fixup-remap path preserves its frame).
-            // The per-page body below is IDENTICAL for both — it just walks a wider window. `eager_mark`
-            // makes this run exactly ONCE per (pi, image), so the whole-image pass is O(pages), not
-            // O(pages^2): we start from `base`, and each page's mapped-state is checked via the scalable
-            // (pi,page) frame map / shared cache — not the bounded `filled_pages` linear scan.
-            let do_eager = img_hi > base && !eager_done(pi as u64, base);
-            let (batch_start, batch_pages) = if do_eager {
-                eager_mark(pi as u64, base);
-                (base, (img_hi - base) / 0x1000)
-            } else {
-                const FORWARD_RUN: u64 = 4;
-                (page, FORWARD_RUN)
-            };
+            // Prefetch a bounded forward window from the page the process actually touched. Whole-image
+            // eager mapping made every untouched section resident and retained one root-CNode cap for
+            // each scratch mapping plus one for each process mapping. A broad LSASS dependency scan
+            // therefore exhausted the finite root CSpace before those pages were ever referenced.
+            // Thirty-two pages amortize the QEMU fault round-trip while preserving genuine demand
+            // paging and a fixed per-fault capability bound.
+            const FORWARD_RUN: u64 = 32;
+            let (batch_start, batch_pages) = (page, FORWARD_RUN);
+            let mut allocation_failed = false;
             let mut bi: u64 = 0;
             while bi < batch_pages {
                 let bpage = batch_start + bi * 0x1000;
@@ -1817,13 +1808,10 @@ pub(crate) unsafe fn service_sec_image(
                 //  - In the small FORWARD-RUN (non-eager) path, THIS process may already have the
                 //    cached shared page mapped (it's a re-entry) → skip pre-mapping to avoid a
                 //    double-map; let it fault normally if unmapped.
-                //  - In the EAGER whole-image path (`do_eager` = the FIRST time this pi maps this
-                //    image), the page is NOT yet mapped in this pi, so MAP the cached shared frame into
-                //    THIS process here (cheap: a copy_cap + page_map, no fill, no fresh frame). This is
-                //    the key eager win for a SECOND+ process mapping a DLL a prior process already
-                //    filled: it gets every RX text page mapped in ONE round-trip, never demand-faulting
-                //    that DLL's code. (The map falls through to the `cached != 0` arm below.)
-                if !is_fault_page && shareable && cached != 0 && !do_eager {
+                // A cached shared neighbour may already be mapped by an overlapping prior window.
+                // Without a mapping query, leave it for its own cheap cache-hit fault rather than
+                // risking DeleteFirst and consuming another destination cap.
+                if !is_fault_page && shareable && cached != 0 {
                     bi += 1;
                     continue;
                 }
@@ -1885,7 +1873,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(se);
                         print_str(b" faults=");
                         print_u64(faults);
-                        print_str(b" (alloc/map FAILED - skip fill, likely frame-pool pressure)\n");
+                        print_str(b" (alloc/map FAILED - skip fill, resource pressure)\n");
+                        allocation_failed = true;
                         break;
                     }
                     let r = fill_image_page(tpe, rva, scratch);
@@ -1913,12 +1902,11 @@ pub(crate) unsafe fn service_sec_image(
                         if (faults as usize) < filled_pages.len() {
                             filled_pages[faults as usize] = bpage;
                         }
-                        if pi == 1 || pi == 2 {
-                            // Record this GUI client's (csrss pi 1 / winlogon pi 2) frame so win32k can
-                            // identity-map + read/write it per-client (a client pointer into user32/gdi32
-                            // .data — e.g. the PFNCLIENT arrays — the client's stack-built OBJECT_ATTRIBUTES,
-                            // or its own image). The frame is shared with the executive's scratch, so it
-                            // holds the client's LIVE runtime data, not the (zeroed) PE static content.
+                        if pi >= 1 {
+                            // Record every process's private image page so a later overlapping forward
+                            // prefetch can reuse it instead of allocating and attempting a second map.
+                            // For GUI clients the same record also lets win32k identity-map live client
+                            // data such as PFNCLIENT arrays and stack-built OBJECT_ATTRIBUTES.
                             csrss_frame_put_at(pi as u64, bpage, f, scratch);
                         }
                         if base == PE_LOAD_BASE {
@@ -1946,8 +1934,15 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" shared=");
                     print_u64(shareable as u64);
                     print_str(b"\n");
+                    if ce != 0 || me != 8 || is_fault_page {
+                        allocation_failed = true;
+                        break;
+                    }
                 }
                 bi += 1;
+            }
+            if allocation_failed {
+                park_and_log!(pi, b"image-map-resource", m0, addr);
             }
             procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
