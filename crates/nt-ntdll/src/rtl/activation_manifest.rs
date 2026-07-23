@@ -6,8 +6,8 @@ use core::ops::Range;
 use crate::NtStatus;
 
 use super::activation::{
-    COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED, COMPATIBILITY_ELEMENT_TYPE_OS,
-    CompatibilityElement, DllRedirect, RUN_LEVEL_AS_INVOKER, RUN_LEVEL_HIGHEST_AVAILABLE,
+    CompatibilityElement, DllRedirect, COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED,
+    COMPATIBILITY_ELEMENT_TYPE_OS, RUN_LEVEL_AS_INVOKER, RUN_LEVEL_HIGHEST_AVAILABLE,
     RUN_LEVEL_REQUIRE_ADMIN, RUN_LEVEL_UNSPECIFIED, STATUS_SXS_CANT_GEN_ACTCTX,
 };
 
@@ -21,6 +21,30 @@ pub struct ParsedManifest {
     pub compatibility: Vec<CompatibilityElement>,
     pub run_level: u32,
     pub ui_access: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedManifestDetails {
+    pub root: ParsedManifest,
+    pub root_language: Option<Vec<u16>>,
+    pub dependencies: Vec<ManifestDependency>,
+    pub window_classes: Vec<ManifestWindowClass>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestDependency {
+    pub identity: AssemblyIdentity,
+    pub language: Option<Vec<u16>>,
+    pub optional: bool,
+    pub delayed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestWindowClass {
+    /// Index of the owning file in `ParsedManifest::dll_redirects`.
+    pub file_index: usize,
+    pub name: Vec<u16>,
+    pub versioned: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +97,14 @@ impl Attribute {
 }
 
 pub fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest, NtStatus> {
+    let details = parse_manifest_details(bytes)?;
+    if !details.dependencies.is_empty() {
+        return Err(STATUS_SXS_CANT_GEN_ACTCTX);
+    }
+    Ok(details.root)
+}
+
+pub fn parse_manifest_details(bytes: &[u8]) -> Result<ParsedManifestDetails, NtStatus> {
     let input = decode_manifest(bytes)?;
     Parser::new(&input).parse()
 }
@@ -267,12 +299,40 @@ fn is_xml_character(value: u32) -> bool {
 struct Parser<'a> {
     input: &'a [u16],
     position: usize,
-    unsupported: bool,
     redirects: Vec<DllRedirect>,
     identity: Option<AssemblyIdentity>,
+    root_language: Option<Vec<u16>>,
+    dependencies: Vec<ManifestDependency>,
+    window_classes: Vec<ManifestWindowClass>,
     compatibility: Vec<CompatibilityElement>,
     run_level: u32,
     ui_access: u32,
+}
+
+struct Frame {
+    name: Range<usize>,
+    kind: FrameKind,
+}
+
+enum FrameKind {
+    Assembly,
+    File {
+        file_index: usize,
+    },
+    Dependency {
+        optional: bool,
+    },
+    DependentAssembly {
+        optional: bool,
+        delayed: bool,
+        saw_identity: bool,
+    },
+    WindowClass {
+        file_index: usize,
+        versioned: bool,
+        text: Vec<u16>,
+    },
+    Other,
 }
 
 impl<'a> Parser<'a> {
@@ -280,16 +340,18 @@ impl<'a> Parser<'a> {
         Self {
             input,
             position: 0,
-            unsupported: false,
             redirects: Vec::new(),
             identity: None,
+            root_language: None,
+            dependencies: Vec::new(),
+            window_classes: Vec::new(),
             compatibility: Vec::new(),
             run_level: RUN_LEVEL_UNSPECIFIED,
             ui_access: 0,
         }
     }
 
-    fn parse(mut self) -> Result<ParsedManifest, NtStatus> {
+    fn parse(mut self) -> Result<ParsedManifestDetails, NtStatus> {
         self.skip_document_misc()?;
         let root = self.parse_start_tag()?;
         if !local_eq(self.input, root.name(), "assembly") || !self.root_has_version(root)? {
@@ -299,14 +361,29 @@ impl<'a> Parser<'a> {
         if !root.self_closing {
             let mut stack = Vec::new();
             stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
-            stack.push(root.name());
+            stack.push(Frame {
+                name: root.name(),
+                kind: FrameKind::Assembly,
+            });
 
             while !stack.is_empty() {
                 let text_start = self.position;
                 while self.position < self.input.len() && self.input[self.position] != b'<' as u16 {
                     self.position += 1;
                 }
-                validate_escaped_text(&self.input[text_start..self.position])?;
+                let text = &self.input[text_start..self.position];
+                validate_escaped_text(text)?;
+                if let Some(Frame {
+                    kind: FrameKind::WindowClass { text: output, .. },
+                    ..
+                }) = stack.last_mut()
+                {
+                    let decoded = decode_attribute_value(text)?;
+                    output
+                        .try_reserve(decoded.len())
+                        .map_err(|_| STATUS_NO_MEMORY)?;
+                    output.extend_from_slice(&decoded);
+                }
                 if self.position == self.input.len() {
                     return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                 }
@@ -314,46 +391,121 @@ impl<'a> Parser<'a> {
                 if self.starts_with("<!--") {
                     self.skip_comment()?;
                 } else if self.starts_with("<![CDATA[") {
-                    self.skip_cdata()?;
+                    let content_start = self.position + 9;
+                    let content_end = find_ascii(self.input, content_start, "]]>")
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+                    if let Some(Frame {
+                        kind: FrameKind::WindowClass { text, .. },
+                        ..
+                    }) = stack.last_mut()
+                    {
+                        text.try_reserve(content_end - content_start)
+                            .map_err(|_| STATUS_NO_MEMORY)?;
+                        text.extend_from_slice(&self.input[content_start..content_end]);
+                    }
+                    self.position = content_end + 3;
                 } else if self.starts_with("<?") {
                     self.skip_processing_instruction()?;
                 } else if self.starts_with("</") {
                     let closing = self.parse_end_tag()?;
-                    let Some(opening) = stack.pop() else {
+                    let Some(frame) = stack.pop() else {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     };
-                    if self.input[opening] != self.input[closing] {
+                    if self.input[frame.name.clone()] != self.input[closing] {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     }
+                    self.finish_frame(frame.kind)?;
                 } else if self.starts_with("<!") {
                     return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                 } else {
                     let tag = self.parse_start_tag()?;
-                    let direct_child = stack.len() == 1;
-                    if local_eq(self.input, tag.name(), "dependency")
-                        || local_eq(self.input, tag.name(), "dependentAssembly")
-                        || local_eq(self.input, tag.name(), "assemblyBinding")
+                    if stack
+                        .last()
+                        .is_some_and(|frame| matches!(&frame.kind, FrameKind::WindowClass { .. }))
                     {
-                        self.unsupported = true;
+                        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                     }
-                    if direct_child && local_eq(self.input, tag.name(), "file") {
-                        self.add_file_redirect(tag)?;
-                    }
-                    if direct_child && local_eq(self.input, tag.name(), "assemblyIdentity") {
+                    let parent_is_assembly = stack
+                        .last()
+                        .is_some_and(|frame| matches!(&frame.kind, FrameKind::Assembly));
+                    let parent_dependency_optional =
+                        stack.last().and_then(|frame| match &frame.kind {
+                            FrameKind::Dependency { optional } => Some(*optional),
+                            _ => None,
+                        });
+                    let parent_dependent = stack.last().and_then(|frame| match &frame.kind {
+                        FrameKind::DependentAssembly {
+                            optional,
+                            delayed,
+                            saw_identity,
+                        } => Some((*optional, *delayed, *saw_identity)),
+                        _ => None,
+                    });
+                    let parent_file_index = stack.last().and_then(|frame| match &frame.kind {
+                        FrameKind::File { file_index } => Some(*file_index),
+                        _ => None,
+                    });
+
+                    let kind = if parent_is_assembly && local_eq(self.input, tag.name(), "file") {
+                        FrameKind::File {
+                            file_index: self.add_file_redirect(tag)?,
+                        }
+                    } else if parent_is_assembly && local_eq(self.input, tag.name(), "dependency") {
+                        FrameKind::Dependency {
+                            optional: self.dependency_is_optional(tag)?,
+                        }
+                    } else if parent_is_assembly
+                        && local_eq(self.input, tag.name(), "assemblyIdentity")
+                    {
                         self.set_assembly_identity(tag)?;
-                    }
+                        FrameKind::Other
+                    } else if parent_dependency_optional.is_some()
+                        && local_eq(self.input, tag.name(), "dependentAssembly")
+                    {
+                        FrameKind::DependentAssembly {
+                            optional: parent_dependency_optional.unwrap(),
+                            delayed: self.dependent_is_delayed(tag)?,
+                            saw_identity: false,
+                        }
+                    } else if parent_dependent.is_some()
+                        && local_eq(self.input, tag.name(), "assemblyIdentity")
+                    {
+                        let (optional, delayed, saw_identity) = parent_dependent.unwrap();
+                        if saw_identity {
+                            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                        }
+                        self.add_dependency_identity(tag, optional, delayed)?;
+                        if let Some(Frame {
+                            kind: FrameKind::DependentAssembly { saw_identity, .. },
+                            ..
+                        }) = stack.last_mut()
+                        {
+                            *saw_identity = true;
+                        }
+                        FrameKind::Other
+                    } else if parent_file_index.is_some()
+                        && local_eq(self.input, tag.name(), "windowClass")
+                    {
+                        FrameKind::WindowClass {
+                            file_index: parent_file_index.unwrap(),
+                            versioned: self.window_class_is_versioned(tag)?,
+                            text: Vec::new(),
+                        }
+                    } else {
+                        FrameKind::Other
+                    };
                     if local_eq(self.input, tag.name(), "supportedOS")
-                        && local_stack_suffix(self.input, &stack, &["compatibility", "application"])
+                        && local_frame_suffix(self.input, &stack, &["compatibility", "application"])
                     {
                         self.add_supported_os(tag)?;
                     }
                     if local_eq(self.input, tag.name(), "maxversiontested")
-                        && local_stack_suffix(self.input, &stack, &["compatibility", "application"])
+                        && local_frame_suffix(self.input, &stack, &["compatibility", "application"])
                     {
                         self.add_max_version_tested(tag)?;
                     }
                     if local_eq(self.input, tag.name(), "requestedExecutionLevel")
-                        && local_stack_suffix(
+                        && local_frame_suffix(
                             self.input,
                             &stack,
                             &["trustInfo", "security", "requestedPrivileges"],
@@ -363,7 +515,10 @@ impl<'a> Parser<'a> {
                     }
                     if !tag.self_closing {
                         stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
-                        stack.push(tag.name());
+                        stack.push(Frame {
+                            name: tag.name(),
+                            kind,
+                        });
                     }
                 }
             }
@@ -373,15 +528,17 @@ impl<'a> Parser<'a> {
         if self.position != self.input.len() {
             return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
         }
-        if self.unsupported {
-            return Err(STATUS_SXS_CANT_GEN_ACTCTX);
-        }
-        Ok(ParsedManifest {
-            dll_redirects: self.redirects,
-            assembly_identity: self.identity.unwrap_or_default(),
-            compatibility: self.compatibility,
-            run_level: self.run_level,
-            ui_access: self.ui_access,
+        Ok(ParsedManifestDetails {
+            root: ParsedManifest {
+                dll_redirects: self.redirects,
+                assembly_identity: self.identity.unwrap_or_default(),
+                compatibility: self.compatibility,
+                run_level: self.run_level,
+                ui_access: self.ui_access,
+            },
+            root_language: self.root_language,
+            dependencies: self.dependencies,
+            window_classes: self.window_classes,
         })
     }
 
@@ -403,7 +560,7 @@ impl<'a> Parser<'a> {
         Ok(found)
     }
 
-    fn add_file_redirect(&mut self, tag: Tag) -> Result<(), NtStatus> {
+    fn add_file_redirect(&mut self, tag: Tag) -> Result<usize, NtStatus> {
         let mut position = tag.attrs_start;
         let mut name = None;
         let mut load_from = None;
@@ -429,31 +586,131 @@ impl<'a> Parser<'a> {
         self.redirects
             .try_reserve(1)
             .map_err(|_| STATUS_NO_MEMORY)?;
+        let file_index = self.redirects.len();
         self.redirects.push(DllRedirect { name, load_from });
-        Ok(())
+        Ok(file_index)
     }
 
     fn set_assembly_identity(&mut self, tag: Tag) -> Result<(), NtStatus> {
         if self.identity.is_some() {
             return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
         }
+        let (identity, language) = self.parse_assembly_identity(tag)?;
+        self.identity = Some(identity);
+        self.root_language = language;
+        Ok(())
+    }
+
+    fn add_dependency_identity(
+        &mut self,
+        tag: Tag,
+        optional: bool,
+        delayed: bool,
+    ) -> Result<(), NtStatus> {
+        let (identity, language) = self.parse_assembly_identity(tag)?;
+        self.dependencies
+            .try_reserve(1)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        self.dependencies.push(ManifestDependency {
+            identity,
+            language,
+            optional,
+            delayed,
+        });
+        Ok(())
+    }
+
+    fn parse_assembly_identity(
+        &self,
+        tag: Tag,
+    ) -> Result<(AssemblyIdentity, Option<Vec<u16>>), NtStatus> {
         let mut identity = AssemblyIdentity::default();
+        let mut language = None;
         let mut position = tag.attrs_start;
         while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
             let value = || decode_attribute_value(&self.input[attribute.value()]);
-            if local_eq(self.input, attribute.name(), "name") {
+            if attribute_eq(self.input, attribute, "name") {
                 identity.name = Some(value()?);
-            } else if local_eq(self.input, attribute.name(), "processorArchitecture") {
+            } else if attribute_eq(self.input, attribute, "processorArchitecture") {
                 identity.processor_architecture = Some(value()?);
-            } else if local_eq(self.input, attribute.name(), "publicKeyToken") {
+            } else if attribute_eq(self.input, attribute, "publicKeyToken") {
                 identity.public_key_token = Some(value()?);
-            } else if local_eq(self.input, attribute.name(), "type") {
+            } else if attribute_eq(self.input, attribute, "type") {
                 identity.kind = Some(value()?);
-            } else if local_eq(self.input, attribute.name(), "version") {
+            } else if attribute_eq(self.input, attribute, "version") {
                 identity.version = parse_assembly_version(&value()?)?;
+            } else if attribute_eq(self.input, attribute, "language") {
+                language = Some(value()?);
             }
         }
-        self.identity = Some(identity);
+        Ok((identity, language))
+    }
+
+    fn dependency_is_optional(&self, tag: Tag) -> Result<bool, NtStatus> {
+        let mut optional = false;
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            if attribute_eq(self.input, attribute, "optional") {
+                optional = ascii_slice_eq_ci(
+                    &decode_attribute_value(&self.input[attribute.value()])?,
+                    "yes",
+                );
+            }
+        }
+        Ok(optional)
+    }
+
+    fn dependent_is_delayed(&self, tag: Tag) -> Result<bool, NtStatus> {
+        let mut delayed = false;
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            if attribute_eq(self.input, attribute, "allowDelayedBinding") {
+                delayed = ascii_slice_eq(
+                    &decode_attribute_value(&self.input[attribute.value()])?,
+                    "true",
+                );
+            }
+        }
+        Ok(delayed)
+    }
+
+    fn window_class_is_versioned(&self, tag: Tag) -> Result<bool, NtStatus> {
+        let mut versioned = true;
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            if attribute_eq(self.input, attribute, "versioned") {
+                let value = decode_attribute_value(&self.input[attribute.value()])?;
+                if ascii_slice_eq_ci(&value, "yes") {
+                    versioned = true;
+                } else if ascii_slice_eq_ci(&value, "no") {
+                    versioned = false;
+                } else {
+                    return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                }
+            }
+        }
+        Ok(versioned)
+    }
+
+    fn finish_frame(&mut self, kind: FrameKind) -> Result<(), NtStatus> {
+        if let FrameKind::WindowClass {
+            file_index,
+            versioned,
+            text,
+        } = kind
+        {
+            if text.is_empty() || text.contains(&0) {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            self.window_classes
+                .try_reserve(1)
+                .map_err(|_| STATUS_NO_MEMORY)?;
+            self.window_classes.push(ManifestWindowClass {
+                file_index,
+                name: text,
+                versioned,
+            });
+        }
         Ok(())
     }
 
@@ -659,13 +916,6 @@ impl<'a> Parser<'a> {
         if find_ascii(self.input, content_start, "--").is_some_and(|bad| bad < end) {
             return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
         }
-        self.position = end + 3;
-        Ok(())
-    }
-
-    fn skip_cdata(&mut self) -> Result<(), NtStatus> {
-        let end = find_ascii(self.input, self.position + 9, "]]>")
-            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
         self.position = end + 3;
         Ok(())
     }
@@ -883,13 +1133,17 @@ fn local_eq(input: &[u16], name: Range<usize>, expected: &str) -> bool {
     ascii_slice_eq(&qualified[local_start..], expected)
 }
 
-fn local_stack_suffix(input: &[u16], stack: &[Range<usize>], expected: &[&str]) -> bool {
+fn attribute_eq(input: &[u16], attribute: Attribute, expected: &str) -> bool {
+    ascii_slice_eq(&input[attribute.name()], expected)
+}
+
+fn local_frame_suffix(input: &[u16], stack: &[Frame], expected: &[&str]) -> bool {
     stack.len() == expected.len() + 1
-        && local_eq(input, stack[0].clone(), "assembly")
+        && local_eq(input, stack[0].name.clone(), "assembly")
         && stack[1..]
             .iter()
             .zip(expected)
-            .all(|(name, expected)| local_eq(input, name.clone(), expected))
+            .all(|(frame, expected)| local_eq(input, frame.name.clone(), expected))
 }
 
 fn ascii_slice_eq(input: &[u16], expected: &str) -> bool {
@@ -1136,10 +1390,168 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dependency_manifests_as_unsupported() {
+    fn parses_dependency_identity_and_binding_flags() {
         let manifest = br#"<assembly manifestVersion="1.0">
-            <dependency><dependentAssembly><assemblyIdentity name="shared"/></dependentAssembly></dependency>
+            <dependency optional="YeS"><dependentAssembly allowDelayedBinding="true">
+              <assemblyIdentity name="shared" type="win32" version="6.0.1.2"
+                processorArchitecture="*" publicKeyToken="6595b64144ccf1df"
+                language="neutral"/>
+              <bindingRedirect oldVersion="1.0.0.0-6.0.1.2" newVersion="6.0.1.2"/>
+            </dependentAssembly></dependency>
             </assembly>"#;
+        let parsed = parse_manifest_details(manifest).unwrap();
+        assert_eq!(parsed.dependencies.len(), 1);
+        let dependency = &parsed.dependencies[0];
+        assert_eq!(dependency.identity.name, Some(wide("shared")));
+        assert_eq!(dependency.identity.kind, Some(wide("win32")));
+        assert_eq!(dependency.identity.version, [6, 0, 1, 2]);
+        assert_eq!(dependency.identity.processor_architecture, Some(wide("*")));
+        assert_eq!(
+            dependency.identity.public_key_token,
+            Some(wide("6595b64144ccf1df"))
+        );
+        assert_eq!(dependency.language, Some(wide("neutral")));
+        assert!(dependency.optional);
+        assert!(dependency.delayed);
         assert_eq!(parse_manifest(manifest), Err(STATUS_SXS_CANT_GEN_ACTCTX));
+    }
+
+    #[test]
+    fn accepts_empty_dependencies_and_ignores_unrelated_binding_elements() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <assemblyIdentity name="root" language="en-US"/>
+              <dependency/>
+              <assemblyBinding><bindingRedirect oldVersion="1" newVersion="2"/></assemblyBinding>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert!(parsed.dependencies.is_empty());
+        assert_eq!(parsed.root.assembly_identity.name, Some(wide("root")));
+        assert_eq!(parsed.root_language, Some(wide("en-US")));
+        assert_eq!(
+            encode_assembly_identity(&parsed.root.assembly_identity).unwrap(),
+            wide("root,version=\"0.0.0.0\"")
+        );
+    }
+
+    #[test]
+    fn window_classes_remain_associated_with_their_files() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <file name="first.dll">
+                <windowClass versioned="YES">First&amp;Class</windowClass>
+                <windowClass>DefaultClass</windowClass>
+              </file>
+              <file name="second.dll">
+                <windowClass versioned="no"><![CDATA[Second<Class]]></windowClass>
+              </file>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.root.dll_redirects.len(), 2);
+        assert_eq!(
+            parsed.window_classes,
+            vec![
+                ManifestWindowClass {
+                    file_index: 0,
+                    name: wide("First&Class"),
+                    versioned: true,
+                },
+                ManifestWindowClass {
+                    file_index: 0,
+                    name: wide("DefaultClass"),
+                    versioned: true,
+                },
+                ManifestWindowClass {
+                    file_index: 1,
+                    name: wide("Second<Class"),
+                    versioned: false,
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.root.dll_redirects[parsed.window_classes[2].file_index].name,
+            wide("second.dll")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_window_classes_and_duplicate_dependency_identity() {
+        for manifest in [
+            br#"<assembly manifestVersion="1.0"><file name="x.dll"><windowClass versioned="maybe">X</windowClass></file></assembly>"#.as_slice(),
+            br#"<assembly manifestVersion="1.0"><file name="x.dll"><windowClass></windowClass></file></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><file name="x.dll"><windowClass>Foo<b>Bar</b>Baz</windowClass></file></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity name="a"/><assemblyIdentity name="b"/></dependentAssembly></dependency></assembly>"#,
+        ] {
+            assert_eq!(
+                parse_manifest_details(manifest),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mismatched_same_leading_element_names() {
+        assert_eq!(
+            parse_manifest_details(
+                br#"<assembly manifestVersion="1.0"><dependency></dependentAnything></assembly>"#
+            ),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+    }
+
+    #[test]
+    fn dependency_defaults_and_attributes_follow_native_matching() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <assemblyIdentity name="root"/>
+              <dependency optional="yes" xmlns:optional="urn:ignored">
+                <dependentAssembly allowDelayedBinding="TRUE" xmlns:allowDelayedBinding="true">
+                  <assemblyIdentity name="first" xmlns:name="urn:ignored"
+                    version="1.2.3.4" xmlns:version="not-a-version"/>
+                </dependentAssembly>
+              </dependency>
+              <dependency><dependentAssembly><assemblyIdentity name="second"/></dependentAssembly></dependency>
+              <wrapper><assemblyIdentity name="not-root"/></wrapper>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.root.assembly_identity.name, Some(wide("root")));
+        assert_eq!(parsed.dependencies.len(), 2);
+        assert_eq!(parsed.dependencies[0].identity.name, Some(wide("first")));
+        assert_eq!(parsed.dependencies[0].identity.version, [1, 2, 3, 4]);
+        assert!(parsed.dependencies[0].optional);
+        assert!(!parsed.dependencies[0].delayed);
+        assert!(!parsed.dependencies[1].optional);
+        assert!(!parsed.dependencies[1].delayed);
+    }
+
+    #[test]
+    fn window_class_namespace_attributes_and_self_closing_form_are_ignored() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0"><file name="x.dll">
+              <windowClass versioned="no" xmlns:versioned="yes">PlainClass</windowClass>
+              <windowClass/>
+            </file></assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.window_classes,
+            vec![ManifestWindowClass {
+                file_index: 0,
+                name: wide("PlainClass"),
+                versioned: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_non_self_closing_empty_dependency() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0"><dependency></dependency></assembly>"#,
+        )
+        .unwrap();
+        assert!(parsed.dependencies.is_empty());
     }
 }
