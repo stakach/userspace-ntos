@@ -412,6 +412,33 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
+fn virtual_memory_copy_services_use_exact_native_contracts() {
+    let pairs = [
+        (NativeService::NtFreeVirtualMemory, 87u32, 4u8),
+        (NativeService::NtReadVirtualMemory, 194, 5),
+        (NativeService::NtWriteVirtualMemory, 287, 5),
+    ];
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &pairs.map(|(service, number, _)| (service, number)),
+    );
+    for (service, number, arguments) in pairs {
+        let entry = table.lookup(number).unwrap();
+        assert_eq!(entry.service, service);
+        assert_eq!((entry.min_args, entry.max_args), (arguments, arguments));
+        assert_eq!(table.number_of(service), Some(number));
+    }
+    assert_eq!(
+        NativeService::NtReadVirtualMemory.name(),
+        "NtReadVirtualMemory"
+    );
+    assert_eq!(
+        NativeService::NtWriteVirtualMemory.name(),
+        "NtWriteVirtualMemory"
+    );
+}
+
+#[test]
 fn event_family_uses_native_numbers_and_argument_contracts() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

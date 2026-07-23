@@ -4787,6 +4787,9 @@ struct ExecNtHandler {
     /// (SSN 50, `StartLsass`) recognised the lsass.exe SEC_IMAGE section, so the loop spawns lsass
     /// (badge LSASS_BADGE) after dispatch.
     lsass_spawn_request: bool,
+    /// Access requested by the `NtCreateProcess` call that raised one of the spawn signals above.
+    /// The loop maps generic bits and publishes the typed child handle with this grant.
+    process_spawn_desired_access: u32,
     /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
     /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
     /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.

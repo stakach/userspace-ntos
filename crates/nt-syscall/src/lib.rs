@@ -88,6 +88,8 @@ pub enum NativeService {
     // Memory / section (§16.4)
     NtAllocateVirtualMemory,
     NtFreeVirtualMemory,
+    NtReadVirtualMemory,
+    NtWriteVirtualMemory,
     NtCreateSection,
     NtMapViewOfSection,
     NtUnmapViewOfSection,
@@ -234,6 +236,8 @@ impl NativeService {
             NtQueryKey => "NtQueryKey",
             NtAllocateVirtualMemory => "NtAllocateVirtualMemory",
             NtFreeVirtualMemory => "NtFreeVirtualMemory",
+            NtReadVirtualMemory => "NtReadVirtualMemory",
+            NtWriteVirtualMemory => "NtWriteVirtualMemory",
             NtCreateSection => "NtCreateSection",
             NtMapViewOfSection => "NtMapViewOfSection",
             NtUnmapViewOfSection => "NtUnmapViewOfSection",
@@ -327,12 +331,13 @@ impl NativeService {
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
             | NtSetDebugFilterState | NtOpenEventPair | NtPlugPlayControl
             | NtSetSystemPowerState | NtOpenEvent | NtOpenSemaphore | NtReleaseSemaphore => (3, 3),
-            NtGetPlugPlayEvent | NtOpenProcess | NtOpenThread => (4, 4),
+            NtGetPlugPlayEvent | NtOpenProcess | NtOpenThread | NtFreeVirtualMemory => (4, 4),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtOpenProcessTokenEx | NtSetInformationThread
             | NtCreateIoCompletion => (4, 4),
             NtOpenThreadTokenEx => (5, 5),
-            NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
+            NtReadVirtualMemory | NtWriteVirtualMemory | NtProtectVirtualMemory
+            | NtQueryInformationProcess | NtQueryInformationToken
             | NtQueryInformationThread
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
             | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent
@@ -365,7 +370,7 @@ impl NativeService {
             // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
             // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
             NtCreatePort | NtCreateThread
-            | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
+            | NtMakeTemporaryObject | NtOpenProcessToken | NtSetValueKey
             | NtSetInformationProcess | NtTestAlert
             | NtFlushInstructionCache
             | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
@@ -502,6 +507,8 @@ impl NativeService {
         NativeService::NtOpenProcess,
         NativeService::NtOpenThread,
         NativeService::NtQueryInformationThread,
+        NativeService::NtReadVirtualMemory,
+        NativeService::NtWriteVirtualMemory,
     ];
 }
 

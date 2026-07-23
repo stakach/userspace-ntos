@@ -238,6 +238,7 @@ impl ExecNtHandler {
             winlogon_spawn_request: false,
             services_spawn_request: false,
             lsass_spawn_request: false,
+            process_spawn_desired_access: 0,
             sm_spawn_request: false,
             wl_spawn_request: 0,
             svc_listener_spawn: false,
@@ -9465,6 +9466,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && sect == *ctx.csrss_section_handle
                     && (*ctx.csrss_pe).is_some()
                 {
+                    self.process_spawn_desired_access = args[1] as u32;
                     self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
                     0
                 } else if self.pi == 0
@@ -9472,6 +9474,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && sect == *ctx.winlogon_section_handle
                     && (*ctx.winlogon_pe).is_some()
                 {
+                    self.process_spawn_desired_access = args[1] as u32;
                     self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
                     0
                 } else if self.pi == 2
@@ -9482,6 +9485,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     // winlogon's Win32 NtCreateProcessEx(50) StartServicesManager — loop spawns
                     // services.exe (4th process). SSN 50 routes here (registered in the native table),
                     // so the spawn body lives in the loop's flag-consumption block (mirrors winlogon).
+                    self.process_spawn_desired_access = args[1] as u32;
                     self.services_spawn_request = true;
                     0
                 } else if self.pi == 2
@@ -9490,6 +9494,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && (*ctx.lsass_pe).is_some()
                 {
                     // winlogon's Win32 NtCreateProcessEx(50) StartLsass — loop spawns lsass.exe (5th).
+                    self.process_spawn_desired_access = args[1] as u32;
                     self.lsass_spawn_request = true;
                     0
                 } else {

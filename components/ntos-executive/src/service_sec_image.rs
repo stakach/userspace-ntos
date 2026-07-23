@@ -2194,6 +2194,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.winlogon_spawn_request = false;
                 nt_handler.services_spawn_request = false;
                 nt_handler.lsass_spawn_request = false;
+                nt_handler.process_spawn_desired_access = 0;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = 0;
                 nt_handler.svc_listener_spawn = false;
@@ -2662,7 +2663,9 @@ pub(crate) unsafe fn service_sec_image(
                             let h = nt_handler.pm.insert_handle(
                                 smss_pid,
                                 nt_process::HandleObject::Process(csrss_pid),
-                                0,
+                                nt_process::map_process_access(
+                                    nt_handler.process_spawn_desired_access,
+                                ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                             h.map(|v| v as u64).unwrap_or_else(|_| {
@@ -2715,7 +2718,9 @@ pub(crate) unsafe fn service_sec_image(
                             let h = nt_handler.pm.insert_handle(
                                 smss_pid,
                                 nt_process::HandleObject::Process(winlogon_pid),
-                                0,
+                                nt_process::map_process_access(
+                                    nt_handler.process_spawn_desired_access,
+                                ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                             h.map(|v| v as u64).unwrap_or_else(|_| {
@@ -2766,7 +2771,9 @@ pub(crate) unsafe fn service_sec_image(
                             let h = nt_handler.pm.insert_handle(
                                 wl_pid,
                                 nt_process::HandleObject::Process(sv_pid),
-                                0,
+                                nt_process::map_process_access(
+                                    nt_handler.process_spawn_desired_access,
+                                ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                             h.map(|v| v as u64).unwrap_or_else(|_| {
@@ -2813,7 +2820,11 @@ pub(crate) unsafe fn service_sec_image(
                     lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
                         (Some(wl_pid), Some(ls_pid)) => {
                             let h = nt_handler.pm.insert_handle(
-                                wl_pid, nt_process::HandleObject::Process(ls_pid), 0,
+                                wl_pid,
+                                nt_process::HandleObject::Process(ls_pid),
+                                nt_process::map_process_access(
+                                    nt_handler.process_spawn_desired_access,
+                                ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                             h.map(|v| v as u64).unwrap_or_else(|_| {
