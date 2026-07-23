@@ -17137,11 +17137,53 @@ pub unsafe extern "system" fn rtl_set_time_zone_information(
     write(daylight_start.as_ptr(), REG_BINARY, 0x98, 16)
 }
 
-// ---- debug buffer / stack backtrace / WOW64 fs-redirection (honest no-ops) ------------------------
+// ---- debug buffer / stack backtrace / WOW64 fs-redirection ----------------------------------------
 
-/// `RtlCreateQueryDebugBuffer(ULONG Size, BOOLEAN EventPair) -> PRTL_DEBUG_INFORMATION` — allocate a
-/// debug-query buffer. Allocate a zeroed block from the process heap (the caller fills it via
-/// RtlQueryProcessDebugInformation, which we no-op).
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_buffer_commit(
+    buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
+    size: usize,
+) -> *mut c_void {
+    let Some(plan) = nt_ntdll::rtl::debug_buffer::plan_commit(
+        unsafe { (*buffer).offset_free },
+        unsafe { (*buffer).commit_size },
+        unsafe { (*buffer).view_size },
+        size,
+    ) else {
+        return core::ptr::null_mut();
+    };
+    if plan.commit_size != 0 {
+        const MEM_COMMIT: u32 = 0x1000;
+        const PAGE_READWRITE: u32 = 0x04;
+        let base = unsafe { (*buffer).view_base_client as u64 + plan.commit_offset as u64 };
+        let Ok((committed_base, committed_size)) = (unsafe {
+            crate::on_target::nt_allocate_virtual_memory_raw(
+                base,
+                plan.commit_size,
+                0,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }) else {
+            return core::ptr::null_mut();
+        };
+        if committed_base != base {
+            return core::ptr::null_mut();
+        }
+        unsafe { (*buffer).commit_size = plan.commit_offset.saturating_add(committed_size) };
+    }
+    unsafe {
+        (*buffer).offset_free = plan.new_offset_free;
+        (*buffer)
+            .view_base_client
+            .byte_add(plan.result_offset)
+    }
+}
+
+/// `RtlCreateQueryDebugBuffer(ULONG Size, BOOLEAN EventPair) -> PRTL_DEBUG_INFORMATION`.
+///
+/// Reserves the complete query view, commits its first page, and installs the native x64 ownership
+/// metadata used by later query payload commits.
 ///
 /// # Safety
 /// Reads no memory.
@@ -17152,14 +17194,50 @@ pub unsafe extern "system" fn rtl_create_query_debug_buffer(
 ) -> *mut c_void {
     #[cfg(target_arch = "x86_64")]
     {
-        let n = (size as usize).max(0x1000);
-        // SAFETY: on-target heap.
-        let p = unsafe { crate::process_heap_alloc(n) };
-        if !p.is_null() {
-            // SAFETY: p valid for n bytes.
-            unsafe { core::ptr::write_bytes(p, 0, n) };
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const PAGE_READWRITE: u32 = 0x04;
+
+        let Some(view_size) = nt_ntdll::rtl::debug_buffer::reservation_size(size) else {
+            return core::ptr::null_mut();
+        };
+        let Ok((base, actual_view_size)) = (unsafe {
+            crate::on_target::nt_allocate_virtual_memory_raw(
+                0,
+                view_size,
+                0,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        }) else {
+            return core::ptr::null_mut();
+        };
+        let committed = unsafe {
+            crate::on_target::nt_allocate_virtual_memory_raw(
+                base,
+                nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE,
+                0,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        let Ok((committed_base, commit_size)) = committed else {
+            let _ = unsafe { crate::on_target::nt_release_virtual_memory(base) };
+            return core::ptr::null_mut();
+        };
+        if committed_base != base {
+            let _ = unsafe { crate::on_target::nt_release_virtual_memory(base) };
+            return core::ptr::null_mut();
         }
-        p as *mut c_void
+        let buffer = base as *mut nt_ntdll::rtl::debug_buffer::DebugInformation;
+        unsafe {
+            core::ptr::write_bytes(base as *mut u8, 0, commit_size);
+            let mut information =
+                nt_ntdll::rtl::debug_buffer::initial_information(buffer.cast(), actual_view_size);
+            information.commit_size = commit_size;
+            core::ptr::write(buffer, information);
+        }
+        buffer.cast()
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -17174,28 +17252,87 @@ pub unsafe extern "system" fn rtl_create_query_debug_buffer(
 /// `buffer` from `RtlCreateQueryDebugBuffer`.
 #[export_name = "RtlDestroyQueryDebugBuffer"]
 pub unsafe extern "system" fn rtl_destroy_query_debug_buffer(buffer: *mut c_void) -> NtStatus {
-    if !buffer.is_null() {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: buffer from the process heap.
-        unsafe {
-            crate::process_heap_free(buffer as *mut u8);
-        }
+    if buffer.is_null() {
+        return STATUS_SUCCESS;
     }
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::nt_release_virtual_memory(buffer as u64) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `RtlQueryProcessDebugInformation(HANDLE UniqueProcessId, ULONG Flags, PRTL_DEBUG_INFORMATION Buf)
-/// -> NTSTATUS` — no debug-info plane; STATUS_SUCCESS leaving the buffer zeroed (empty info).
+/// `RtlQueryProcessDebugInformation(ULONG ProcessId, ULONG Flags, PRTL_DEBUG_INFORMATION Buffer)`.
+///
+/// Current-process module queries are captured from the live loader list into the buffer's VM view.
+/// Heap, backtrace, lock, and remote-process snapshots return STATUS_NOT_IMPLEMENTED until those
+/// process planes can provide non-synthetic records.
 ///
 /// # Safety
 /// `buffer` from `RtlCreateQueryDebugBuffer`.
 #[export_name = "RtlQueryProcessDebugInformation"]
 pub unsafe extern "system" fn rtl_query_process_debug_information(
-    _unique_process_id: *mut c_void,
-    _flags: u32,
-    _buffer: *mut c_void,
+    process_id: u32,
+    flags: u32,
+    buffer: *mut c_void,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let buffer = buffer.cast::<nt_ntdll::rtl::debug_buffer::DebugInformation>();
+        unsafe {
+            (*buffer).flags = flags;
+            (*buffer).offset_free = nt_ntdll::rtl::debug_buffer::DEBUG_INFORMATION_SIZE;
+        }
+        if process_id <= 1 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let teb = unsafe { current_teb() };
+        let current_process_id = if teb == 0 {
+            0
+        } else {
+            unsafe { core::ptr::read_unaligned((teb + 0x40) as *const u64) as u32 }
+        };
+        if process_id != current_process_id
+            || flags & !nt_ntdll::rtl::debug_buffer::SUPPORTED_QUERY_MASK != 0
+        {
+            return STATUS_NOT_IMPLEMENTED;
+        }
+        if flags & nt_ntdll::rtl::debug_buffer::QUERY_MODULES != 0 {
+            let mut required = 0u32;
+            let status = unsafe {
+                ldr_query_process_module_information(
+                    core::ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            };
+            if status != STATUS_INFO_LENGTH_MISMATCH && !nt_success(status) {
+                return status;
+            }
+            let modules = unsafe { debug_buffer_commit(buffer, required as usize) };
+            if modules.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            let status =
+                unsafe { ldr_query_process_module_information(modules, required, &mut required) };
+            if !nt_success(status) {
+                return status;
+            }
+            unsafe { (*buffer).modules = modules };
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (process_id, flags);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlGetUnloadEventTrace() -> PRTL_UNLOAD_EVENT_TRACE`.

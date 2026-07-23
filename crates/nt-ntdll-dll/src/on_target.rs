@@ -146,7 +146,7 @@ pub(crate) unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
 /// # Safety
 /// On-target hosted-process syscall; the requested address range must be valid for the process.
 #[cfg(target_arch = "x86_64")]
-unsafe fn nt_allocate_virtual_memory_raw(
+pub(crate) unsafe fn nt_allocate_virtual_memory_raw(
     base_in: u64,
     size_in: usize,
     zero_bits: u32,
