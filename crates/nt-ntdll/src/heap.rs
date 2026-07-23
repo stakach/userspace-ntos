@@ -19,6 +19,161 @@
 
 use core::mem::{align_of, size_of};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapLockAcquire {
+    Acquired,
+    Recursed,
+    Contended,
+    Bypassed,
+    InvalidHandle,
+    InvalidThread,
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapLockRelease {
+    Released,
+    StillHeld,
+    NotOwner,
+}
+
+/// Allocation-free policy model for the process heap registry's recursive exclusion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeapLockState {
+    owner: u64,
+    depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapLockPolicy {
+    Internal,
+    NoSerialize,
+    Custom(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeapLockEntry {
+    handle: u64,
+    policy: HeapLockPolicy,
+    state: HeapLockState,
+}
+
+/// Bounded per-heap lock policy used to verify handle-specific recursive ownership.
+pub struct HeapLockTable<const N: usize> {
+    entries: [Option<HeapLockEntry>; N],
+}
+
+impl<const N: usize> Default for HeapLockTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> HeapLockTable<N> {
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    pub fn register(&mut self, handle: u64, policy: HeapLockPolicy) -> bool {
+        if handle == 0
+            || self
+                .entries
+                .iter()
+                .flatten()
+                .any(|entry| entry.handle == handle)
+        {
+            return false;
+        }
+        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+            return false;
+        };
+        *slot = Some(HeapLockEntry {
+            handle,
+            policy,
+            state: HeapLockState::new(),
+        });
+        true
+    }
+
+    pub fn acquire(&mut self, handle: u64, thread_id: u64) -> HeapLockAcquire {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.handle == handle)
+        else {
+            return HeapLockAcquire::InvalidHandle;
+        };
+        if entry.policy == HeapLockPolicy::NoSerialize {
+            HeapLockAcquire::Bypassed
+        } else {
+            entry.state.try_acquire(thread_id)
+        }
+    }
+
+    pub fn release(&mut self, handle: u64, thread_id: u64) -> HeapLockRelease {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.handle == handle)
+        else {
+            return HeapLockRelease::NotOwner;
+        };
+        if entry.policy == HeapLockPolicy::NoSerialize {
+            HeapLockRelease::Released
+        } else {
+            entry.state.release(thread_id)
+        }
+    }
+}
+
+impl HeapLockState {
+    pub const fn new() -> Self {
+        Self { owner: 0, depth: 0 }
+    }
+
+    pub const fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    pub fn try_acquire(&mut self, thread_id: u64) -> HeapLockAcquire {
+        if thread_id == 0 {
+            return HeapLockAcquire::InvalidThread;
+        }
+        if self.owner == thread_id {
+            if self.depth == u32::MAX {
+                return HeapLockAcquire::Overflow;
+            }
+            self.depth += 1;
+            return HeapLockAcquire::Recursed;
+        }
+        if self.owner != 0 {
+            return HeapLockAcquire::Contended;
+        }
+        self.owner = thread_id;
+        self.depth = 1;
+        HeapLockAcquire::Acquired
+    }
+
+    pub fn release(&mut self, thread_id: u64) -> HeapLockRelease {
+        if thread_id == 0 || self.owner != thread_id || self.depth == 0 {
+            return HeapLockRelease::NotOwner;
+        }
+        self.depth -= 1;
+        if self.depth != 0 {
+            HeapLockRelease::StillHeld
+        } else {
+            self.owner = 0;
+            HeapLockRelease::Released
+        }
+    }
+}
+
 /// Every allocation is rounded up to this alignment (the Windows heap guarantees 16-byte alignment
 /// on x64, matching `MEMORY_ALLOCATION_ALIGNMENT`).
 pub const HEAP_ALIGN: usize = 16;
@@ -634,6 +789,45 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn heap_lock_is_recursive_and_releases_at_final_depth() {
+        let mut lock = HeapLockState::new();
+        assert_eq!(lock.try_acquire(7), HeapLockAcquire::Acquired);
+        assert_eq!(lock.try_acquire(7), HeapLockAcquire::Recursed);
+        assert_eq!(lock.owner(), 7);
+        assert_eq!(lock.depth(), 2);
+        assert_eq!(lock.release(7), HeapLockRelease::StillHeld);
+        assert_eq!(lock.release(7), HeapLockRelease::Released);
+        assert_eq!(lock, HeapLockState::new());
+    }
+
+    #[test]
+    fn heap_lock_rejects_contention_wrong_owner_and_zero_tid() {
+        let mut lock = HeapLockState::new();
+        assert_eq!(lock.try_acquire(0), HeapLockAcquire::InvalidThread);
+        assert_eq!(lock.try_acquire(7), HeapLockAcquire::Acquired);
+        assert_eq!(lock.try_acquire(8), HeapLockAcquire::Contended);
+        assert_eq!(lock.release(8), HeapLockRelease::NotOwner);
+        assert_eq!(lock.owner(), 7);
+        assert_eq!(lock.depth(), 1);
+    }
+
+    #[test]
+    fn heap_lock_table_keeps_handles_independent_and_honors_no_serialize() {
+        let mut locks = HeapLockTable::<3>::new();
+        assert!(locks.register(0x1000, HeapLockPolicy::Internal));
+        assert!(locks.register(0x2000, HeapLockPolicy::Internal));
+        assert!(locks.register(0x3000, HeapLockPolicy::NoSerialize));
+        assert_eq!(locks.acquire(0x1000, 7), HeapLockAcquire::Acquired);
+        assert_eq!(locks.release(0x2000, 7), HeapLockRelease::NotOwner);
+        assert_eq!(locks.acquire(0x2000, 8), HeapLockAcquire::Acquired);
+        assert_eq!(locks.release(0x1000, 7), HeapLockRelease::Released);
+        assert_eq!(locks.release(0x2000, 8), HeapLockRelease::Released);
+        assert_eq!(locks.acquire(0x3000, 0), HeapLockAcquire::Bypassed);
+        assert_eq!(locks.release(0x3000, 0), HeapLockRelease::Released);
+        assert_eq!(locks.acquire(0x4000, 7), HeapLockAcquire::InvalidHandle);
+    }
 
     /// A host-test backing region: an owned `Vec<u8>`.
     struct VecBacking {

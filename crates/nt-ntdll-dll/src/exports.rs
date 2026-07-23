@@ -6014,7 +6014,7 @@ pub unsafe extern "system" fn rtl_create_heap(
             }
             return core::ptr::null_mut();
         };
-        match crate::install_private_heap(heap) {
+        match crate::install_private_heap(heap, flags & HEAP_NO_SERIALIZE == 0, lock as u64) {
             Ok(handle) => handle as *mut c_void,
             Err(heap) => {
                 let backing = heap.destroy();
@@ -20685,20 +20685,41 @@ pub unsafe extern "system" fn rtl_get_process_heaps(count: u32, heaps: *mut *mut
     }
 }
 
-macro_rules! heap_noop_bool {
-    ($export:literal, $fn:ident) => {
-        /// A single-threaded single-heap no-op heap op returning TRUE (success).
-        ///
-        /// # Safety
-        /// `heap` a heap handle.
-        #[export_name = $export]
-        pub unsafe extern "system" fn $fn(_heap: *mut c_void) -> u8 {
-            1
-        }
-    };
+/// `RtlLockHeap(PVOID HeapHandle) -> BOOLEAN` — retain recursive exclusive access across a caller's
+/// compound heap operation.
+///
+/// # Safety
+/// `heap` must name a registered process heap.
+#[export_name = "RtlLockHeap"]
+pub unsafe extern "system" fn rtl_lock_heap(heap: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return u8::from(crate::lock_registered_heap(heap.cast()));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = heap;
+        0
+    }
 }
-heap_noop_bool!("RtlLockHeap", rtl_lock_heap);
-heap_noop_bool!("RtlUnlockHeap", rtl_unlock_heap);
+
+/// `RtlUnlockHeap(PVOID HeapHandle) -> BOOLEAN` — release one recursive lock depth. Invalid heaps
+/// and wrong-thread releases fail without changing ownership.
+///
+/// # Safety
+/// `heap` must name a registered process heap locked by the current thread.
+#[export_name = "RtlUnlockHeap"]
+pub unsafe extern "system" fn rtl_unlock_heap(heap: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return u8::from(crate::unlock_registered_heap(heap.cast()));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = heap;
+        0
+    }
+}
 
 /// `RtlCompactHeap(PVOID HeapHandle, ULONG Flags) -> SIZE_T` — compact + return the largest free
 /// block. No compaction model; return 0 (the documented "size unavailable" value).

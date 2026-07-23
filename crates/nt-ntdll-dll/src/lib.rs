@@ -30,7 +30,7 @@ use core::ffi::c_void;
 #[cfg(target_arch = "x86_64")]
 use core::mem::MaybeUninit;
 #[cfg(target_arch = "x86_64")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use nt_ntdll::heap::{Heap, HeapRegistry, HeapRemoval, HeapUserInfo};
 
@@ -99,6 +99,207 @@ fn lock_process_heap() -> ProcessHeapLockGuard {
     ProcessHeapLockGuard
 }
 
+#[cfg(target_arch = "x86_64")]
+fn current_thread_id() -> u64 {
+    let thread_id: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x48]",
+            out(reg) thread_id,
+            options(nostack, preserves_flags, readonly)
+        )
+    };
+    thread_id
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_owned_by(lock: *mut c_void, thread_id: u64) -> bool {
+    if lock.is_null() || thread_id == 0 {
+        return false;
+    }
+    let owner = unsafe { &*(lock.byte_add(0x10) as *const AtomicU64) };
+    owner.load(Ordering::Acquire) == thread_id
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_is_idle(lock: *mut c_void) -> bool {
+    if lock.is_null() {
+        return true;
+    }
+    let lock_count = unsafe { &*(lock.byte_add(0x08) as *const AtomicI32) };
+    let recursion = unsafe { core::ptr::read_volatile(lock.byte_add(0x0c) as *const i32) };
+    let owner = unsafe { &*(lock.byte_add(0x10) as *const AtomicU64) };
+    lock_count.load(Ordering::Acquire) == -1
+        && recursion == 0
+        && owner.load(Ordering::Acquire) == 0
+}
+
+const HEAP_LOCK_FREE: u8 = 0;
+const HEAP_LOCK_LIVE: u8 = 1;
+const HEAP_LOCK_RETIRED: u8 = 2;
+const HEAP_LOCK_CAPACITY: usize = PRIVATE_HEAP_CAPACITY + 1;
+
+#[repr(C, align(8))]
+struct HeapCriticalSection {
+    debug_info: u64,
+    lock_count: AtomicI32,
+    recursion_count: i32,
+    owning_thread: AtomicU64,
+    lock_semaphore: AtomicU64,
+    spin_count: usize,
+}
+
+impl HeapCriticalSection {
+    const fn new() -> Self {
+        Self {
+            debug_info: u64::MAX,
+            lock_count: AtomicI32::new(-1),
+            recursion_count: 0,
+            owning_thread: AtomicU64::new(0),
+            lock_semaphore: AtomicU64::new(0),
+            spin_count: 0,
+        }
+    }
+
+    fn reset_preserving_wait_handle(&mut self) {
+        self.debug_info = u64::MAX;
+        self.lock_count.store(-1, Ordering::Release);
+        self.recursion_count = 0;
+        self.owning_thread.store(0, Ordering::Release);
+        self.spin_count = 0;
+    }
+}
+
+struct HeapLockRecord {
+    state: u8,
+    handle: u64,
+    serialized: bool,
+    custom_lock: u64,
+    active_users: u32,
+    critical_section: HeapCriticalSection,
+}
+
+impl HeapLockRecord {
+    const fn new() -> Self {
+        Self {
+            state: HEAP_LOCK_FREE,
+            handle: 0,
+            serialized: true,
+            custom_lock: 0,
+            active_users: 0,
+            critical_section: HeapCriticalSection::new(),
+        }
+    }
+
+    fn lock_pointer(&mut self) -> Option<*mut c_void> {
+        if !self.serialized {
+            None
+        } else if self.custom_lock != 0 {
+            Some(self.custom_lock as *mut c_void)
+        } else {
+            Some(core::ptr::addr_of_mut!(self.critical_section).cast())
+        }
+    }
+}
+
+static mut HEAP_LOCKS: [HeapLockRecord; HEAP_LOCK_CAPACITY] =
+    [const { HeapLockRecord::new() }; HEAP_LOCK_CAPACITY];
+
+unsafe fn heap_lock_record_locked(
+    handle: *mut u8,
+    allow_retired: bool,
+) -> Option<&'static mut HeapLockRecord> {
+    if handle.is_null() {
+        return None;
+    }
+    let records = core::ptr::addr_of_mut!(HEAP_LOCKS).cast::<HeapLockRecord>();
+    for index in 0..HEAP_LOCK_CAPACITY {
+        let record = unsafe { &mut *records.add(index) };
+        if record.handle == handle as u64
+            && (record.state == HEAP_LOCK_LIVE
+                || (allow_retired && record.state == HEAP_LOCK_RETIRED))
+        {
+            return Some(record);
+        }
+    }
+    None
+}
+
+unsafe fn register_heap_lock_locked(
+    handle: *mut u8,
+    serialized: bool,
+    custom_lock: u64,
+) -> bool {
+    let records = core::ptr::addr_of_mut!(HEAP_LOCKS).cast::<HeapLockRecord>();
+    for index in 0..HEAP_LOCK_CAPACITY {
+        let record = unsafe { &mut *records.add(index) };
+        if record.state != HEAP_LOCK_FREE {
+            continue;
+        }
+        record.critical_section.reset_preserving_wait_handle();
+        record.handle = handle as u64;
+        record.serialized = serialized;
+        record.custom_lock = custom_lock;
+        record.active_users = 0;
+        record.state = HEAP_LOCK_LIVE;
+        return true;
+    }
+    false
+}
+
+struct HeapOperationGuard {
+    record: *mut HeapLockRecord,
+    lock: *mut c_void,
+}
+
+unsafe fn reclaim_heap_lock_record_locked(record: &mut HeapLockRecord, lock: *mut c_void) {
+    if record.state == HEAP_LOCK_RETIRED
+        && record.active_users == 0
+        && (!record.serialized || unsafe { critical_section_is_idle(lock) })
+    {
+        record.state = HEAP_LOCK_FREE;
+        record.handle = 0;
+        record.custom_lock = 0;
+    }
+}
+
+impl Drop for HeapOperationGuard {
+    fn drop(&mut self) {
+        if !self.lock.is_null() {
+            let _ = unsafe { exports::rtl_leave_critical_section(self.lock) };
+        }
+        if self.record.is_null() {
+            return;
+        }
+        let _registry_guard = lock_process_heap();
+        let record = unsafe { &mut *self.record };
+        debug_assert!(record.active_users != 0);
+        record.active_users = record.active_users.saturating_sub(1);
+        unsafe { reclaim_heap_lock_record_locked(record, self.lock) };
+    }
+}
+
+fn lock_heap_operation(handle: *mut u8, allow_retired: bool) -> Option<HeapOperationGuard> {
+    let (record, lock) = {
+        let _registry_guard = lock_process_heap();
+        let record = unsafe { heap_lock_record_locked(handle, allow_retired) }?;
+        record.active_users = record.active_users.checked_add(1)?;
+        let lock = record.lock_pointer().unwrap_or(core::ptr::null_mut());
+        (record as *mut HeapLockRecord, lock)
+    };
+    if !lock.is_null() {
+        let status = unsafe { exports::rtl_enter_critical_section(lock) };
+        if (status as i32) < 0 {
+            let _registry_guard = lock_process_heap();
+            let record = unsafe { &mut *record };
+            record.active_users = record.active_users.saturating_sub(1);
+            unsafe { reclaim_heap_lock_record_locked(record, lock) };
+            return None;
+        }
+    }
+    Some(HeapOperationGuard { record, lock })
+}
+
 /// Access the registry while [`PROCESS_HEAP_LOCK`] is held, initializing its allocation-free
 /// storage on first use.
 #[cfg(target_arch = "x86_64")]
@@ -144,7 +345,8 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
     // SAFETY: the process-heap guard excludes every reader and writer.
     unsafe {
         let registry = process_heaps_locked();
-        if registry.install_process(heap).is_ok() {
+        if let Ok(handle) = registry.install_process(heap) {
+            debug_assert!(register_heap_lock_locked(handle, true, 0));
             publish_process_heaps_locked(registry);
         }
     }
@@ -152,15 +354,27 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
 
 /// Register a newly formatted private heap and return its stable backing-base handle.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn install_private_heap(heap: ProcessHeap) -> Result<*mut u8, ProcessHeap> {
+pub(crate) fn install_private_heap(
+    heap: ProcessHeap,
+    serialized: bool,
+    custom_lock: u64,
+) -> Result<*mut u8, ProcessHeap> {
     let _guard = lock_process_heap();
     unsafe {
         let registry = process_heaps_locked();
-        let result = registry.insert_private(heap);
-        if result.is_ok() {
-            publish_process_heaps_locked(registry);
+        match registry.insert_private(heap) {
+            Ok(handle) => {
+                if register_heap_lock_locked(handle, serialized, custom_lock) {
+                    publish_process_heaps_locked(registry);
+                    return Ok(handle);
+                }
+                if let HeapRemoval::Removed(heap) = registry.remove_private(handle) {
+                    return Err(heap);
+                }
+                unreachable!();
+            }
+            Err(heap) => Err(heap),
         }
-        result
     }
 }
 
@@ -168,11 +382,17 @@ pub(crate) fn install_private_heap(heap: ProcessHeap) -> Result<*mut u8, Process
 /// the registry lock has been dropped.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn remove_private_heap(handle: *mut u8) -> HeapRemoval<on_target::HeapBacking> {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return HeapRemoval::NotFound;
+    };
     let _guard = lock_process_heap();
     unsafe {
         let registry = process_heaps_locked();
         let result = registry.remove_private(handle);
         if matches!(&result, HeapRemoval::Removed(_)) {
+            if let Some(record) = heap_lock_record_locked(handle, false) {
+                record.state = HEAP_LOCK_RETIRED;
+            }
             publish_process_heaps_locked(registry);
         }
         result
@@ -186,6 +406,12 @@ pub(crate) unsafe fn copy_process_heap_handles(output: &mut [*mut u8]) -> usize 
     unsafe { process_heaps_locked().copy_handles(output) }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn process_heap_handle() -> Option<*mut u8> {
+    let _guard = lock_process_heap();
+    unsafe { process_heaps_locked().process_handle() }
+}
+
 /// Whether an exact handle names a registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_is_registered(handle: *mut u8) -> bool {
@@ -193,9 +419,49 @@ pub(crate) fn heap_is_registered(handle: *mut u8) -> bool {
     unsafe { process_heaps_locked().find(handle).is_some() }
 }
 
+/// Acquire the heap's recursive exclusion and retain it across subsequent heap API calls.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn lock_registered_heap(handle: *mut u8) -> bool {
+    let Some(guard) = lock_heap_operation(handle, false) else {
+        return false;
+    };
+    core::mem::forget(guard);
+    true
+}
+
+/// Release one explicit `RtlLockHeap` depth without disturbing another thread's ownership.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn unlock_registered_heap(handle: *mut u8) -> bool {
+    let (record, lock, serialized) = {
+        let _registry_guard = lock_process_heap();
+        let Some(record) = (unsafe { heap_lock_record_locked(handle, true) }) else {
+            return false;
+        };
+        let serialized = record.serialized;
+        let lock = record.lock_pointer().unwrap_or(core::ptr::null_mut());
+        (record as *mut HeapLockRecord, lock, serialized)
+    };
+    if serialized {
+        if !unsafe { critical_section_owned_by(lock, current_thread_id()) } {
+            return false;
+        }
+        let status = unsafe { exports::rtl_leave_critical_section(lock) };
+        if (status as i32) < 0 {
+            return false;
+        }
+    }
+    let _registry_guard = lock_process_heap();
+    let record = unsafe { &mut *record };
+    debug_assert!(record.active_users != 0);
+    record.active_users = record.active_users.saturating_sub(1);
+    unsafe { reclaim_heap_lock_record_locked(record, lock) };
+    true
+}
+
 /// Read a heap's compatibility information.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_compatibility(handle: *mut u8) -> Option<u32> {
+    let _heap_guard = lock_heap_operation(handle, false)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -207,6 +473,9 @@ pub(crate) fn heap_compatibility(handle: *mut u8) -> Option<u32> {
 /// Enable low-fragmentation compatibility mode on one registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return false;
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -219,6 +488,9 @@ pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
 /// Allocate from the heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: u32) -> *mut u8 {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return core::ptr::null_mut();
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -231,6 +503,9 @@ pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: 
 /// Free from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8) -> bool {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return false;
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -248,6 +523,9 @@ pub(crate) unsafe fn heap_realloc_with_flags(
     flags: u32,
     in_place_only: bool,
 ) -> *mut u8 {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return core::ptr::null_mut();
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -260,6 +538,7 @@ pub(crate) unsafe fn heap_realloc_with_flags(
 /// Size a live allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
+    let _heap_guard = lock_heap_operation(handle, false)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -271,6 +550,7 @@ pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
 /// Read per-allocation user metadata from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_user_info(handle: *mut u8, ptr: *mut u8) -> Option<HeapUserInfo> {
+    let _heap_guard = lock_heap_operation(handle, false)?;
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -282,6 +562,9 @@ pub(crate) unsafe fn heap_user_info(handle: *mut u8, ptr: *mut u8) -> Option<Hea
 /// Store a user value on an allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_set_user_value(handle: *mut u8, ptr: *mut u8, value: usize) -> bool {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return false;
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -298,6 +581,9 @@ pub(crate) unsafe fn heap_set_user_flags(
     reset: u32,
     set: u32,
 ) -> bool {
+    let Some(_heap_guard) = lock_heap_operation(handle, false) else {
+        return false;
+    };
     let _guard = lock_process_heap();
     unsafe {
         process_heaps_locked()
@@ -324,17 +610,10 @@ pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
 /// Serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *mut u8 {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        let Some(handle) = registry.process_handle() else {
-            return core::ptr::null_mut();
-        };
-        registry
-            .find_mut(handle)
-            .and_then(|heap| heap.allocate_with_flags(size, flags))
-            .unwrap_or(core::ptr::null_mut())
-    }
+    let Some(handle) = process_heap_handle() else {
+        return core::ptr::null_mut();
+    };
+    unsafe { heap_alloc_with_flags(handle, size, flags) }
 }
 
 /// `RtlFreeHeap` core — free `ptr` (returned by [`process_heap_alloc`]) back to the process heap.
@@ -345,14 +624,7 @@ pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *
 /// trusts the caller's pointer identically). Access is serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find_mut(handle))
-            .is_some_and(|heap| heap.free(ptr))
-    }
+    process_heap_handle().is_some_and(|handle| unsafe { heap_free(handle, ptr) })
 }
 
 /// `RtlReAllocateHeap` core — grow/shrink `ptr` to `new_size` in the process heap (in-place when
@@ -377,15 +649,10 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
     flags: u32,
     in_place_only: bool,
 ) -> *mut u8 {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find_mut(handle))
-            .and_then(|heap| heap.reallocate_with_flags(ptr, new_size, flags, in_place_only))
-            .unwrap_or(core::ptr::null_mut())
-    }
+    let Some(handle) = process_heap_handle() else {
+        return core::ptr::null_mut();
+    };
+    unsafe { heap_realloc_with_flags(handle, ptr, new_size, flags, in_place_only) }
 }
 
 /// `RtlSizeHeap` core — the payload size of a live block (from [`process_heap_alloc`]). Returns
@@ -395,14 +662,8 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
 /// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`].
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find(handle))
-            .and_then(|heap| heap.size_of(ptr))
-    }
+    let handle = process_heap_handle()?;
+    unsafe { heap_size(handle, ptr) }
 }
 
 /// Read per-allocation user metadata from a live process-heap block.
@@ -411,14 +672,8 @@ pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo> {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find(handle))
-            .and_then(|heap| heap.user_info(ptr))
-    }
+    let handle = process_heap_handle()?;
+    unsafe { heap_user_info(handle, ptr) }
 }
 
 /// Store a process-heap allocation's optional user value.
@@ -427,14 +682,8 @@ pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> bool {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find_mut(handle))
-            .is_some_and(|heap| heap.set_user_value(ptr, value))
-    }
+    process_heap_handle()
+        .is_some_and(|handle| unsafe { heap_set_user_value(handle, ptr, value) })
 }
 
 /// Update a process-heap allocation's three settable user flags.
@@ -443,14 +692,8 @@ pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> 
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_flags(ptr: *mut u8, reset: u32, set: u32) -> bool {
-    let _guard = lock_process_heap();
-    unsafe {
-        let registry = process_heaps_locked();
-        registry
-            .process_handle()
-            .and_then(|handle| registry.find_mut(handle))
-            .is_some_and(|heap| heap.set_user_flags(ptr, reset, set))
-    }
+    process_heap_handle()
+        .is_some_and(|handle| unsafe { heap_set_user_flags(handle, ptr, reset, set) })
 }
 
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
