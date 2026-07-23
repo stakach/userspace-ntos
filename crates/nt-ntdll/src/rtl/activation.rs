@@ -285,6 +285,7 @@ pub struct ActivationContextObject {
     pub manifest: Vec<u8>,
     pub dll_redirects: Vec<DllRedirect>,
     pub dll_redirect_section: Vec<u8>,
+    pub window_class_redirect_section: Vec<u8>,
 }
 
 const _: () = assert!(core::mem::align_of::<ActivationContextObject>() <= 16);
@@ -345,6 +346,7 @@ impl ActivationContextObject {
         manifest: Vec<u8>,
         dll_redirects: Vec<DllRedirect>,
         dll_redirect_section: Vec<u8>,
+        window_class_redirect_section: Vec<u8>,
         encoded_assembly_identity: Vec<u16>,
     ) -> Self {
         let file_count = u32::try_from(dll_redirects.len()).unwrap_or(u32::MAX);
@@ -362,6 +364,7 @@ impl ActivationContextObject {
             manifest,
             dll_redirects,
             dll_redirect_section,
+            window_class_redirect_section,
         }
     }
 
@@ -823,6 +826,7 @@ mod tests {
         let object = ActivationContextObject::new(
             Vec::new(),
             b"<assembly/>".to_vec(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -13048,8 +13048,16 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 }
             }
         };
-        let parsed = match nt_ntdll::rtl::activation_manifest::parse_manifest(&manifest) {
-            Ok(parsed) => parsed,
+        let parse_details = |bytes: &[u8]| {
+            let details = nt_ntdll::rtl::activation_manifest::parse_manifest_details(bytes)?;
+            if details.dependencies.is_empty() {
+                Ok(details)
+            } else {
+                Err(nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX)
+            }
+        };
+        let details = match parse_details(&manifest) {
+            Ok(details) => details,
             Err(status)
                 if status != nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX
                     && associated_manifest.is_some() =>
@@ -13059,8 +13067,8 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(manifest) => manifest,
                     Err(status) => return status,
                 };
-                match nt_ntdll::rtl::activation_manifest::parse_manifest(&manifest) {
-                    Ok(parsed) => parsed,
+                match parse_details(&manifest) {
+                    Ok(details) => details,
                     Err(status) => return status,
                 }
             }
@@ -13068,18 +13076,30 @@ pub unsafe extern "system" fn rtl_create_activation_context(
         };
         let encoded_assembly_identity =
             match nt_ntdll::rtl::activation_manifest::encode_assembly_identity(
-                &parsed.assembly_identity,
+                &details.root.assembly_identity,
             ) {
                 Ok(identity) => identity,
                 Err(status) => return status,
             };
         let dll_redirect_section =
             match nt_ntdll::rtl::activation_section::build_dll_redirection_section(
-                &parsed.dll_redirects,
+                &details.root.dll_redirects,
             ) {
                 Ok(section) => section,
                 Err(status) => return status,
             };
+        let window_class_redirect_section =
+            match nt_ntdll::rtl::activation_section::build_window_class_redirection_section(&[
+                nt_ntdll::rtl::activation_section::WindowClassAssembly {
+                    version: details.root.assembly_identity.version,
+                    files: &details.root.dll_redirects,
+                    classes: &details.window_classes,
+                },
+            ]) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
+        let parsed = details.root;
         let application_directory =
             if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
             {
@@ -13124,6 +13144,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 manifest,
                 parsed.dll_redirects,
                 dll_redirect_section,
+                window_class_redirect_section,
                 encoded_assembly_identity,
             ),
         );
@@ -13228,7 +13249,6 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
     returned_data: *mut c_void,
 ) -> NtStatus {
     const FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX: u32 = 0x01;
-    const ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION: u32 = 2;
     const ACTCTX_SECTION_KEYED_DATA_MIN_SIZE: u32 = 64;
     const ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE: u32 = 68;
 
@@ -13254,7 +13274,11 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
         if !returned_data.is_null() && output_size < ACTCTX_SECTION_KEYED_DATA_MIN_SIZE {
             return STATUS_INVALID_PARAMETER;
         }
-        if section_id != ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION {
+        if section_id
+            != nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION
+            && section_id
+                != nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION
+        {
             return STATUS_SXS_SECTION_NOT_FOUND;
         }
 
@@ -13271,34 +13295,66 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                     continue;
                 };
                 let object = &*object_ptr;
-                let found = match nt_ntdll::rtl::activation_section::find_dll_redirection(
-                    &object.dll_redirect_section,
-                    key_name,
-                ) {
-                    Ok(Some(found)) => found,
-                    Ok(None) => {
-                        activation_context_release(context);
-                        continue;
+                let (section, data_offset, data_length, roster_index) = match section_id {
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION => {
+                        match nt_ntdll::rtl::activation_section::find_dll_redirection(
+                            &object.dll_redirect_section,
+                            key_name,
+                        ) {
+                            Ok(Some(found)) => (
+                                &object.dll_redirect_section,
+                                found.data_offset,
+                                found.data_length,
+                                found.assembly_roster_index,
+                            ),
+                            Ok(None) => {
+                                activation_context_release(context);
+                                continue;
+                            }
+                            Err(status) => {
+                                activation_context_release(context);
+                                return status;
+                            }
+                        }
                     }
-                    Err(status) => {
-                        activation_context_release(context);
-                        return status;
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION => {
+                        match nt_ntdll::rtl::activation_section::find_window_class_redirection(
+                            &object.window_class_redirect_section,
+                            1,
+                            key_name,
+                        ) {
+                            Ok(Some(found)) => (
+                                &object.window_class_redirect_section,
+                                found.data_offset,
+                                found.data_length,
+                                found.assembly_roster_index,
+                            ),
+                            Ok(None) => {
+                                activation_context_release(context);
+                                continue;
+                            }
+                            Err(status) => {
+                                activation_context_release(context);
+                                return status;
+                            }
+                        }
                     }
+                    _ => unreachable!(),
                 };
 
                 if returned_data.is_null() {
                     activation_context_release(context);
                     return STATUS_SUCCESS;
                 }
-                let section_base = object.dll_redirect_section.as_ptr();
+                let section_base = section.as_ptr();
                 core::ptr::write_unaligned((returned_data as *mut u8).add(4) as *mut u32, 1);
                 core::ptr::write_unaligned(
                     (returned_data as *mut u8).add(8) as *mut *const u8,
-                    section_base.add(found.data_offset as usize),
+                    section_base.add(data_offset as usize),
                 );
                 core::ptr::write_unaligned(
                     (returned_data as *mut u8).add(16) as *mut u32,
-                    found.data_length,
+                    data_length,
                 );
                 core::ptr::write_unaligned(
                     (returned_data as *mut u8).add(24) as *mut *const u8,
@@ -13311,7 +13367,7 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                 );
                 core::ptr::write_unaligned(
                     (returned_data as *mut u8).add(48) as *mut u32,
-                    object.dll_redirect_section.len() as u32,
+                    section.len() as u32,
                 );
                 let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
                 core::ptr::write_unaligned(
@@ -13325,7 +13381,7 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                 if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
                     core::ptr::write_unaligned(
                         (returned_data as *mut u8).add(64) as *mut u32,
-                        found.assembly_roster_index,
+                        roster_index,
                     );
                 }
                 if !return_context {
