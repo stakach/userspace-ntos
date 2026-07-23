@@ -704,6 +704,8 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
     assert!(pm.set_thread_times(target, 100, 900, 30, 40));
     pm.set_thread_disable_boost(target, true).unwrap();
     pm.set_thread_hide_from_debugger(target).unwrap();
+    pm.set_thread_name(target, &[b'r' as u16, b'p' as u16, b'c' as u16])
+        .unwrap();
     pm.set_thread_break_on_termination(target, true).unwrap();
     let handle = pm
         .insert_handle(pid, HandleObject::Thread(target), THREAD_QUERY_INFORMATION)
@@ -739,6 +741,21 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 17), Ok(1));
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 18), Ok(1));
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 20), Ok(0));
+    let mut name = [0u16; THREAD_NAME_MAX_UNITS];
+    assert_eq!(
+        pm.query_thread_name(pid, current, handle as u64, &mut name),
+        Ok(3)
+    );
+    assert_eq!(&name[..3], &[b'r' as u16, b'p' as u16, b'c' as u16]);
+    assert_eq!(
+        pm.set_thread_name(target, &[0x41; THREAD_NAME_MAX_UNITS + 1]),
+        Err(0xC000_009A)
+    );
+    pm.set_thread_name(target, &[]).unwrap();
+    assert_eq!(
+        pm.query_thread_name(pid, current, handle as u64, &mut name),
+        Ok(0)
+    );
 
     pm.terminate_thread(current, 0).unwrap();
     assert_eq!(pm.query_thread_u32(pid, target, handle as u64, 12), Ok(1));

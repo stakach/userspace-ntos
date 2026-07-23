@@ -1402,6 +1402,7 @@ impl ExecNtHandler {
             9 | 14 => Ok(8),
             17 => Ok(0),
             18 => Ok(4),
+            38 => Ok(0x10),
             _ => Err(nt_process::STATUS_INVALID_INFO_CLASS),
         }
     }
@@ -1437,6 +1438,93 @@ impl ExecNtHandler {
             _ => return nt_process::STATUS_INVALID_INFO_CLASS,
         };
         update.map_or_else(|status| status, |()| 0)
+    }
+
+    pub(crate) fn resolve_thread_for_set(
+        &self,
+        handle: u64,
+    ) -> Result<nt_process::ThreadId, u32> {
+        const THREAD_SET_INFORMATION: u32 = 0x0020;
+        let caller = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.pm.resolve_thread_handle(
+            caller,
+            self.current_tid as nt_process::ThreadId,
+            handle,
+            THREAD_SET_INFORMATION,
+        )
+    }
+
+    pub(crate) fn set_thread_name_resolved(
+        &mut self,
+        tid: nt_process::ThreadId,
+        name: &[u16],
+    ) -> u32 {
+        self.pm
+            .set_thread_name(tid, name)
+            .map_or_else(|status| status, |()| 0)
+    }
+
+    unsafe fn nt_set_thread_name(
+        &mut self,
+        handle: u64,
+        information: u64,
+        information_length: u32,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        if information_length != 0x10 {
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if information & 7 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut descriptor = [0u8; 0x10];
+        if information == 0 || !self.xas_read(information, &mut descriptor) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let raw_byte_length =
+            u16::from_le_bytes(descriptor[0..2].try_into().unwrap()) as usize;
+        let byte_length = raw_byte_length & !1;
+        let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
+
+        let tid = match self.resolve_thread_for_set(handle) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        if buffer == 0 {
+            return self
+                .pm
+                .set_thread_name(tid, &[])
+                .map_or_else(|status| status, |()| 0);
+        }
+        if raw_byte_length != 0 && buffer & 1 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_input(buffer, raw_byte_length) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if byte_length == 0 {
+            return self
+                .pm
+                .set_thread_name(tid, &[])
+                .map_or_else(|status| status, |()| 0);
+        }
+        if byte_length > nt_process::THREAD_NAME_MAX_UNITS * 2 {
+            return 0xC000_009A;
+        }
+        let mut bytes = [0u8; nt_process::THREAD_NAME_MAX_UNITS * 2];
+        if !self.xas_read(buffer, &mut bytes[..byte_length]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
+        for (index, chunk) in bytes[..byte_length].chunks_exact(2).enumerate() {
+            name[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+        self.pm
+            .set_thread_name(tid, &name[..byte_length / 2])
+            .map_or_else(|status| status, |()| 0)
     }
 
     pub(crate) fn query_thread_information_captured(
@@ -1538,6 +1626,79 @@ impl ExecNtHandler {
         Ok((output, length))
     }
 
+    pub(crate) fn query_thread_name_captured(
+        &self,
+        handle: u64,
+        name: &mut [u16; nt_process::THREAD_NAME_MAX_UNITS],
+    ) -> Result<usize, u32> {
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.pm.query_thread_name(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            handle,
+            name,
+        )
+    }
+
+    unsafe fn nt_query_thread_name(
+        &self,
+        handle: u64,
+        information: u64,
+        information_length: u32,
+        return_length: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+        if information != 0 {
+            if information & 7 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if !self.probe_user_output(information, information_length as usize) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        if return_length != 0 && !self.probe_user_output(return_length, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
+        let mut required = 0u32;
+        let mut status = match self.query_thread_name_captured(handle, &mut name) {
+            Ok(units) => {
+                required = (0x10 + units * 2) as u32;
+                if information_length < required {
+                    STATUS_BUFFER_TOO_SMALL
+                } else {
+                    let mut output = [0u8; 0x10 + nt_process::THREAD_NAME_MAX_UNITS * 2];
+                    if units != 0 {
+                        let byte_length = (units * 2) as u16;
+                        output[0..2].copy_from_slice(&byte_length.to_le_bytes());
+                        output[2..4].copy_from_slice(&byte_length.to_le_bytes());
+                        output[8..16]
+                            .copy_from_slice(&information.wrapping_add(0x10).to_le_bytes());
+                        for (index, unit) in name[..units].iter().enumerate() {
+                            output[0x10 + index * 2..0x12 + index * 2]
+                                .copy_from_slice(&unit.to_le_bytes());
+                        }
+                    }
+                    if self.xas_try_write_buf(information, &output[..required as usize]) {
+                        0
+                    } else {
+                        STATUS_ACCESS_VIOLATION
+                    }
+                }
+            }
+            Err(status) => status,
+        };
+        if return_length != 0 && !self.xas_write_u32(return_length, required) {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
+
     unsafe fn nt_query_information_thread(
         &self,
         handle: u64,
@@ -1546,6 +1707,14 @@ impl ExecNtHandler {
         information_length: u32,
         return_length: u64,
     ) -> u32 {
+        if information_class == 38 {
+            return self.nt_query_thread_name(
+                handle,
+                information,
+                information_length,
+                return_length,
+            );
+        }
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
         let expected = match Self::thread_query_length(information_class) {
@@ -2336,6 +2505,29 @@ impl ExecNtHandler {
     /// Probe a small writable event output before changing dispatcher state.
     pub(crate) unsafe fn probe_event_output(&self, va: u64, len: usize) -> bool {
         len <= 8 && self.probe_user_output(va, len)
+    }
+
+    /// Probe an arbitrary readable user range, including image and DLL `.rdata` that has not faulted
+    /// into the process yet.
+    pub(crate) unsafe fn probe_user_input(&self, va: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if va == 0 || va.checked_add(len as u64).is_none() {
+            return false;
+        }
+        let mut address = va;
+        let mut remaining = len;
+        let mut bytes = [0u8; 8];
+        while remaining != 0 {
+            let chunk = remaining.min(bytes.len());
+            if !self.xas_read(address, &mut bytes[..chunk]) {
+                return false;
+            }
+            address += chunk as u64;
+            remaining -= chunk;
+        }
+        true
     }
 
     /// Probe an arbitrary user output range without changing its contents.
@@ -6604,6 +6796,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let information_class = args[1] as u32;
                 if information_class == 5 {
                     return self.nt_set_thread_impersonation_token(args);
+                }
+                if information_class == 38 {
+                    return self.nt_set_thread_name(args[0], args[2], args[3] as u32);
                 }
                 let expected = match Self::thread_set_length(information_class) {
                     Ok(length) => length,

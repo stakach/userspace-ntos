@@ -22,6 +22,7 @@ use nt_security::TokenId;
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
+pub const THREAD_NAME_MAX_UNITS: usize = 256;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -344,6 +345,8 @@ pub struct NtThread {
     disable_boost: bool,
     /// `ThreadHideFromDebugger`, set-only-to-true through the native API.
     hide_from_debugger: bool,
+    thread_name_len: u16,
+    thread_name: [u16; THREAD_NAME_MAX_UNITS],
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -631,6 +634,8 @@ impl ProcessManager {
                 break_on_termination: false,
                 disable_boost: false,
                 hide_from_debugger: false,
+                thread_name_len: 0,
+                thread_name: [0; THREAD_NAME_MAX_UNITS],
             },
         );
         Ok(tid)
@@ -847,6 +852,33 @@ impl ProcessManager {
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         thread.hide_from_debugger = true;
         Ok(())
+    }
+
+    pub fn set_thread_name(&mut self, tid: ThreadId, name: &[u16]) -> Result<(), u32> {
+        if name.len() > THREAD_NAME_MAX_UNITS {
+            return Err(0xC000_009A);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.thread_name[..name.len()].copy_from_slice(name);
+        thread.thread_name[name.len()..].fill(0);
+        thread.thread_name_len = name.len() as u16;
+        Ok(())
+    }
+
+    pub fn query_thread_name(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        output: &mut [u16; THREAD_NAME_MAX_UNITS],
+    ) -> Result<usize, u32> {
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
+        let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        let length = thread.thread_name_len as usize;
+        output[..length].copy_from_slice(&thread.thread_name[..length]);
+        Ok(length)
     }
 
     /// Resolve a caller-local thread handle for an operation requiring `required_access`.
@@ -1115,6 +1147,8 @@ impl ProcessManager {
         thread.break_on_termination = false;
         thread.disable_boost = false;
         thread.hide_from_debugger = false;
+        thread.thread_name_len = 0;
+        thread.thread_name.fill(0);
         Ok(())
     }
 
