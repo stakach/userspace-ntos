@@ -691,6 +691,53 @@ fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
 }
 
 #[test]
+fn thread_query_classes_use_access_checked_state_and_real_times() {
+    const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("query.exe", None, None);
+    let current = pm.create_thread(pid, 0x1000, 0, true).unwrap();
+    let target = pm.create_thread(pid, 0x2000, 0, true).unwrap();
+    let unused_pool = pm.create_thread(pid, 0, 0, true).unwrap();
+    pm.set_thread_state(unused_pool, ThreadState::Initialized)
+        .unwrap();
+    assert!(pm.set_thread_times(target, 100, 900, 30, 40));
+    pm.set_thread_break_on_termination(target, true).unwrap();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Thread(target), THREAD_QUERY_INFORMATION)
+        .unwrap();
+
+    assert_eq!(
+        pm.query_thread_basic(pid, current, handle as u64)
+            .unwrap()
+            .exit_status,
+        STATUS_PENDING
+    );
+    assert_eq!(
+        pm.query_thread_times(pid, current, handle as u64).unwrap(),
+        ThreadTimes {
+            create_time: 100,
+            exit_time: 0,
+            kernel_time: 30,
+            user_time: 40,
+        }
+    );
+    assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 12), Ok(0));
+    assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 18), Ok(1));
+    assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 20), Ok(0));
+
+    pm.terminate_thread(current, 0).unwrap();
+    assert_eq!(pm.query_thread_u32(pid, target, handle as u64, 12), Ok(1));
+    pm.terminate_thread(target, 0x1234).unwrap();
+    assert_eq!(pm.query_thread_u32(pid, target, handle as u64, 20), Ok(1));
+    assert_eq!(
+        pm.query_thread_times(pid, target, handle as u64)
+            .unwrap()
+            .exit_time,
+        900
+    );
+}
+
+#[test]
 fn terminate_thread_handle_resolution_checks_identity_type_and_access() {
     const THREAD_TERMINATE: u32 = 0x0001;
     let mut pm = ProcessManager::new();

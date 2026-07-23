@@ -21,6 +21,7 @@ use nt_security::TokenId;
 
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_PENDING: u32 = 0x0000_0103;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -152,6 +153,15 @@ pub struct ThreadBasicInformation {
     pub affinity_mask: u64,
     pub priority: i32,
     pub base_priority: i32,
+}
+
+/// Architecture-neutral fields returned for `ThreadTimes` (`KERNEL_USER_TIMES`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadTimes {
+    pub create_time: i64,
+    pub exit_time: i64,
+    pub kernel_time: i64,
+    pub user_time: i64,
 }
 
 /// Process states (spec §7.1).
@@ -312,6 +322,10 @@ pub struct NtThread {
     pub state: ThreadState,
     pub is_system_thread: bool,
     pub exit_status: Option<u32>,
+    pub create_time_100ns: i64,
+    pub exit_time_100ns: i64,
+    pub kernel_time_100ns: i64,
+    pub user_time_100ns: i64,
     /// Active impersonation context. The thread owns a token reference independently of the user
     /// handle that assigned it.
     impersonation: Option<ImpersonationContext>,
@@ -600,6 +614,10 @@ impl ProcessManager {
                 state: ThreadState::Ready,
                 is_system_thread,
                 exit_status: None,
+                create_time_100ns: 0,
+                exit_time_100ns: 0,
+                kernel_time_100ns: 0,
+                user_time_100ns: 0,
                 impersonation: None,
                 suspend_count: 0,
                 win32_thread: None,
@@ -702,7 +720,7 @@ impl ProcessManager {
             self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
         let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
         Ok(ThreadBasicInformation {
-            exit_status: thread.exit_status.unwrap_or(STATUS_SUCCESS),
+            exit_status: thread.exit_status.unwrap_or(STATUS_PENDING),
             teb_base_address: thread.teb_base,
             client_id: ClientId {
                 unique_process: thread.process_id,
@@ -712,6 +730,79 @@ impl ProcessManager {
             priority: 0,
             base_priority: 0,
         })
+    }
+
+    /// Return real thread accounting fields after enforcing `THREAD_QUERY_INFORMATION`.
+    pub fn query_thread_times(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+    ) -> Result<ThreadTimes, u32> {
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
+        let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(ThreadTimes {
+            create_time: thread.create_time_100ns,
+            exit_time: if thread.state == ThreadState::Terminated {
+                thread.exit_time_100ns
+            } else {
+                0
+            },
+            kernel_time: thread.kernel_time_100ns,
+            user_time: thread.user_time_100ns,
+        })
+    }
+
+    /// Query one of the ULONG thread state classes supported by the native API.
+    pub fn query_thread_u32(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        information_class: u32,
+    ) -> Result<u32, u32> {
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
+        let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        match information_class {
+            12 => Ok((self
+                .threads
+                .values()
+                .filter(|candidate| {
+                    candidate.process_id == thread.process_id
+                        && !matches!(
+                            candidate.state,
+                            ThreadState::Initialized | ThreadState::Terminated
+                        )
+                })
+                .count()
+                == 1) as u32),
+            18 => Ok(thread.break_on_termination as u32),
+            20 => Ok((thread.state == ThreadState::Terminated) as u32),
+            _ => Err(STATUS_INVALID_INFO_CLASS),
+        }
+    }
+
+    /// Publish host clock/accounting values used by `ThreadTimes`.
+    pub fn set_thread_times(
+        &mut self,
+        tid: ThreadId,
+        create_time_100ns: i64,
+        exit_time_100ns: i64,
+        kernel_time_100ns: i64,
+        user_time_100ns: i64,
+    ) -> bool {
+        let Some(thread) = self.threads.get_mut(&tid) else {
+            return false;
+        };
+        thread.create_time_100ns = create_time_100ns;
+        thread.exit_time_100ns = exit_time_100ns;
+        thread.kernel_time_100ns = kernel_time_100ns;
+        thread.user_time_100ns = user_time_100ns;
+        true
     }
 
     /// Resolve a caller-local thread handle for an operation requiring `required_access`.
@@ -969,6 +1060,10 @@ impl ProcessManager {
             ThreadState::Running
         };
         thread.exit_status = None;
+        thread.create_time_100ns = 0;
+        thread.exit_time_100ns = 0;
+        thread.kernel_time_100ns = 0;
+        thread.user_time_100ns = 0;
         thread.suspend_count = 0;
         thread.win32_thread = None;
         thread.teb_base = 0;
