@@ -37,6 +37,7 @@ impl CompletionMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompletionPlan {
     pub signal_event: Option<u64>,
+    pub close_handle: Option<u64>,
     pub wake_scheduler: bool,
     pub reclaim: bool,
     pub queue_exited: bool,
@@ -198,8 +199,18 @@ pub mod timer {
     pub struct Dispatch {
         pub callback: u64,
         pub context: u64,
+        pub timer_fired: bool,
         pub kind: DispatchKind,
         pub ticket: CallbackTicket,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum ExpireResult {
+        Idle,
+        NotDue,
+        CallbackCapacity,
+        InlineBusy,
+        Dispatch(Dispatch),
     }
 
     pub struct TimerQueue<const N: usize> {
@@ -207,6 +218,7 @@ pub mod timer {
         phase: QueuePhase,
         next_sequence: u64,
         next_callback_id: u64,
+        inline_callback_id: u64,
         queue_completion_event: u64,
     }
 
@@ -223,6 +235,7 @@ pub mod timer {
                 phase: QueuePhase::Running,
                 next_sequence: 0,
                 next_callback_id: 1,
+                inline_callback_id: 0,
                 queue_completion_event: 0,
             }
         }
@@ -305,45 +318,60 @@ pub mod timer {
             Some(deadline.saturating_sub(now_ms).min(u32::MAX as u64) as u32)
         }
 
-        pub fn expire_one(&mut self, now_ms: u64) -> Option<Dispatch> {
-            let (index, deadline, _) = self.head_identity()?;
-            if deadline > now_ms {
-                return None;
+        pub fn expire_one(&mut self, now_ms: u64) -> ExpireResult {
+            if self.inline_callback_id != 0 {
+                return ExpireResult::InlineBusy;
             }
-            let callback_index = self.slots[index]
+            let Some((index, deadline, _)) = self.head_identity() else {
+                return ExpireResult::Idle;
+            };
+            if deadline > now_ms {
+                return ExpireResult::NotDue;
+            }
+            let Some(callback_index) = self.slots[index]
                 .active_callbacks
                 .iter()
-                .position(|id| *id == 0)?;
+                .position(|id| *id == 0)
+            else {
+                return ExpireResult::CallbackCapacity;
+            };
             let firing_id = self.take_callback_id();
             let sequence = self.take_sequence();
-            let slot = &mut self.slots[index];
-            slot.active_callbacks[callback_index] = firing_id;
-            slot.callbacks_in_flight = slot.callbacks_in_flight.saturating_add(1);
-            if slot.period_ms == 0 {
-                slot.phase = TimerPhase::Dormant;
-            } else {
-                let cadence = deadline.saturating_add(slot.period_ms as u64);
-                slot.deadline_ms = if cadence < now_ms {
-                    now_ms.saturating_add(slot.period_ms as u64)
+            let (callback, context, generation, kind) = {
+                let slot = &mut self.slots[index];
+                slot.active_callbacks[callback_index] = firing_id;
+                slot.callbacks_in_flight = slot.callbacks_in_flight.saturating_add(1);
+                if slot.period_ms == 0 {
+                    slot.phase = TimerPhase::Dormant;
                 } else {
-                    cadence
+                    let cadence = deadline.saturating_add(slot.period_ms as u64);
+                    slot.deadline_ms = if cadence < now_ms {
+                        now_ms.saturating_add(slot.period_ms as u64)
+                    } else {
+                        cadence
+                    };
+                    slot.sequence = sequence;
+                }
+                let flags = WorkItemFlags::from_bits_retain(slot.flags.bits() & TIMER_WORK_FLAGS);
+                let kind = if slot.flags.contains(WorkItemFlags::EXECUTE_IN_TIMER_THREAD) {
+                    DispatchKind::Inline
+                } else {
+                    DispatchKind::QueueWork(flags)
                 };
-                slot.sequence = sequence;
-            }
-            let flags = WorkItemFlags::from_bits_retain(slot.flags.bits() & TIMER_WORK_FLAGS);
-            let kind = if slot.flags.contains(WorkItemFlags::EXECUTE_IN_TIMER_THREAD) {
-                DispatchKind::Inline
-            } else {
-                DispatchKind::QueueWork(flags)
+                (slot.callback, slot.context, slot.generation, kind)
             };
-            Some(Dispatch {
-                callback: slot.callback,
-                context: slot.context,
+            if kind == DispatchKind::Inline {
+                self.inline_callback_id = firing_id;
+            }
+            ExpireResult::Dispatch(Dispatch {
+                callback,
+                context,
+                timer_fired: true,
                 kind,
                 ticket: CallbackTicket {
                     key: TimerKey {
                         index: index as u16,
-                        generation: slot.generation,
+                        generation,
                     },
                     firing_id,
                 },
@@ -355,7 +383,7 @@ pub mod timer {
         }
 
         pub fn callback_finished(&mut self, ticket: CallbackTicket) -> Result<CompletionPlan, u32> {
-            let slot = self.slot_mut(ticket.key).ok_or(STATUS_INVALID_HANDLE)?;
+            let slot = self.slot(ticket.key).ok_or(STATUS_INVALID_HANDLE)?;
             let callback_index = slot
                 .active_callbacks
                 .iter()
@@ -364,9 +392,20 @@ pub mod timer {
             if ticket.firing_id == 0 || slot.callbacks_in_flight == 0 {
                 return Err(STATUS_INVALID_PARAMETER);
             }
+            let capacity_was_full = !slot.active_callbacks.contains(&0);
+            let inline_finished = self.inline_callback_id == ticket.firing_id;
+            if inline_finished {
+                self.inline_callback_id = 0;
+            }
+            let slot = self
+                .slot_mut(ticket.key)
+                .expect("validated callback ticket");
             slot.active_callbacks[callback_index] = 0;
             slot.callbacks_in_flight -= 1;
             let mut plan = CompletionPlan::default();
+            if capacity_was_full || inline_finished {
+                plan.wake_scheduler = true;
+            }
             if slot.phase == TimerPhase::Destroying && slot.callbacks_in_flight == 0 {
                 plan.signal_event = (slot.completion_event != 0).then_some(slot.completion_event);
                 plan.reclaim = true;
@@ -538,6 +577,7 @@ pub mod registered_wait {
         pub status: u32,
         pub set_cancel_event: Option<u64>,
         pub signal_event: Option<u64>,
+        pub close_handle: Option<u64>,
         pub wait_event: Option<u64>,
         pub reclaim: bool,
     }
@@ -672,6 +712,7 @@ pub mod registered_wait {
                     .worker_exited
                     .then_some(self.completion_event)
                     .filter(|e| *e != 0),
+                close_handle: self.worker_exited.then_some(self.cancel_event),
                 wait_event: match mode {
                     CompletionMode::Synchronous(event) if !self.worker_exited => Some(event),
                     CompletionMode::Async
@@ -694,6 +735,7 @@ pub mod registered_wait {
             self.state = WaitState::Reclaimable;
             Ok(CompletionPlan {
                 signal_event: (self.completion_event != 0).then_some(self.completion_event),
+                close_handle: Some(self.cancel_event),
                 reclaim: true,
                 queue_exited: false,
                 ..CompletionPlan::default()
@@ -724,6 +766,13 @@ mod tests {
         }
     }
 
+    fn expire<const N: usize>(queue: &mut TimerQueue<N>, now_ms: u64) -> Dispatch {
+        match queue.expire_one(now_ms) {
+            ExpireResult::Dispatch(dispatch) => dispatch,
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn timers_are_stable_at_equal_deadlines_and_wake_for_new_head() {
         let mut queue = TimerQueue::<3>::new();
@@ -736,8 +785,8 @@ mod tests {
             .unwrap();
         assert_eq!(wake, WakeScheduler(false));
         assert_eq!(queue.next_timeout(119), Some(1));
-        assert_eq!(queue.expire_one(120).unwrap().ticket.key(), first);
-        assert_eq!(queue.expire_one(120).unwrap().ticket.key(), second);
+        assert_eq!(expire(&mut queue, 120).ticket.key(), first);
+        assert_eq!(expire(&mut queue, 120).ticket.key(), second);
     }
 
     #[test]
@@ -746,13 +795,13 @@ mod tests {
         let (key, _) = queue
             .create_timer(100, spec(10, 20, WorkItemFlags::default()))
             .unwrap();
-        let first = queue.expire_one(110).unwrap();
+        let first = expire(&mut queue, 110);
         assert_eq!(queue.next_timeout(110), Some(20));
         queue.callback_finished(first.ticket).unwrap();
-        let on_cadence = queue.expire_one(130).unwrap();
+        let on_cadence = expire(&mut queue, 130);
         assert_eq!(queue.next_timeout(130), Some(20));
         queue.callback_finished(on_cadence.ticket).unwrap();
-        let second = queue.expire_one(150).unwrap();
+        let second = expire(&mut queue, 150);
         assert_eq!(second.ticket.key(), key);
         assert_eq!(queue.next_timeout(150), Some(20));
     }
@@ -764,14 +813,17 @@ mod tests {
             .with(WorkItemFlags::EXECUTE_LONG_FUNCTION)
             .with(WorkItemFlags::EXECUTE_ONLY_ONCE);
         queue.create_timer(0, spec(0, 0, flags)).unwrap();
-        assert_eq!(queue.expire_one(0).unwrap().kind, DispatchKind::Inline);
+        let inline = expire(&mut queue, 0);
+        assert_eq!(inline.kind, DispatchKind::Inline);
+        assert_eq!(queue.expire_one(0), ExpireResult::InlineBusy);
+        queue.callback_finished(inline.ticket).unwrap();
 
         let flags = WorkItemFlags::EXECUTE_IN_IO_THREAD
             .with(WorkItemFlags::TRANSFER_IMPERSONATION)
             .with(WorkItemFlags::EXECUTE_ONLY_ONCE);
         queue.create_timer(0, spec(0, 0, flags)).unwrap();
         assert_eq!(
-            queue.expire_one(0).unwrap().kind,
+            expire(&mut queue, 0).kind,
             DispatchKind::QueueWork(
                 WorkItemFlags::EXECUTE_IN_IO_THREAD.with(WorkItemFlags::TRANSFER_IMPERSONATION)
             )
@@ -784,7 +836,7 @@ mod tests {
         let (key, _) = queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.next_timeout(0), None);
         queue.callback_finished(dispatch.ticket).unwrap();
@@ -804,7 +856,7 @@ mod tests {
         let (key, _) = queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         let duplicate = dispatch.ticket.clone();
         let delete = queue
             .delete_timer(key, CompletionMode::Event(0x44))
@@ -826,9 +878,9 @@ mod tests {
         let (key, _) = queue
             .create_timer(0, spec(0, 1, WorkItemFlags::default()))
             .unwrap();
-        let first = queue.expire_one(0).unwrap();
+        let first = expire(&mut queue, 0);
         let duplicate = first.ticket.clone();
-        let second = queue.expire_one(1).unwrap();
+        let second = expire(&mut queue, 1);
         assert_ne!(first.ticket.firing_id(), second.ticket.firing_id());
         assert_eq!(queue.callbacks_in_flight(key), Some(2));
         queue.callback_finished(first.ticket).unwrap();
@@ -843,6 +895,30 @@ mod tests {
     }
 
     #[test]
+    fn callback_capacity_backpressures_and_wakes_scheduler() {
+        let mut queue = TimerQueue::<1>::new();
+        queue
+            .create_timer(0, spec(0, 1, WorkItemFlags::default()))
+            .unwrap();
+        let mut tickets: [Option<CallbackTicket>; 8] = core::array::from_fn(|_| None);
+        for (now, ticket) in tickets.iter_mut().enumerate() {
+            let dispatch = expire(&mut queue, now as u64);
+            assert!(dispatch.timer_fired);
+            *ticket = Some(dispatch.ticket);
+        }
+        assert_eq!(queue.expire_one(8), ExpireResult::CallbackCapacity);
+        let completion = queue.callback_finished(tickets[0].take().unwrap()).unwrap();
+        assert!(completion.wake_scheduler);
+        assert!(matches!(
+            queue.expire_one(8),
+            ExpireResult::Dispatch(Dispatch {
+                timer_fired: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn queue_delete_waits_for_callbacks_and_worker_exit() {
         let mut queue = TimerQueue::<2>::new();
         queue
@@ -851,7 +927,7 @@ mod tests {
         queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         let delete = queue
             .delete_queue(CompletionMode::Synchronous(0x55))
             .unwrap();
@@ -898,7 +974,7 @@ mod tests {
         let (key, _) = queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         queue
             .delete_timer(key, CompletionMode::Event(0x44))
             .unwrap();
@@ -917,7 +993,7 @@ mod tests {
         let (dormant, _) = queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         assert_eq!(
             queue.update_timer(dormant, 10, 20, 30),
             Ok(WakeScheduler(false))
@@ -927,7 +1003,7 @@ mod tests {
         let (destroying, _) = queue
             .create_timer(0, spec(0, 0, WorkItemFlags::default()))
             .unwrap();
-        let dispatch = queue.expire_one(0).unwrap();
+        let dispatch = expire(&mut queue, 0);
         queue
             .delete_timer(destroying, CompletionMode::Async)
             .unwrap();
@@ -1008,6 +1084,7 @@ mod tests {
         assert_eq!(wait.callback_finished(), Ok(WaitAction::ExitWorker));
         let completion = wait.worker_exited().unwrap();
         assert_eq!(completion.signal_event, Some(0x88));
+        assert_eq!(completion.close_handle, Some(0x20));
         assert!(completion.reclaim);
     }
 
@@ -1094,6 +1171,7 @@ mod tests {
         let plan = wait.deregister(CompletionMode::Event(0x77)).unwrap();
         assert_eq!(plan.status, STATUS_SUCCESS);
         assert_eq!(plan.signal_event, Some(0x77));
+        assert_eq!(plan.close_handle, Some(0x20));
         assert!(plan.reclaim);
     }
 
