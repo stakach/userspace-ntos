@@ -5349,7 +5349,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     {
                         return STATUS_ACCESS_VIOLATION;
                     }
-                    let (pid, _) =
+                    let (pid, target_pi) =
                         match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
                             Ok(target) => target,
                             Err(status) => return status,
@@ -5361,7 +5361,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     let mut information = [0u8; 48];
                     information[0..4]
                         .copy_from_slice(&process.exit_status.unwrap_or(0).to_le_bytes());
-                    let peb = if self.loop_ctx.is_some() {
+                    let peb = if target_pi == 0 {
                         SMSS_PEB_VA
                     } else {
                         PEB_VA

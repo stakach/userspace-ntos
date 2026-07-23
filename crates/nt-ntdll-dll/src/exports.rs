@@ -18468,6 +18468,157 @@ unsafe fn debug_buffer_reset_query(
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn debug_open_process(process_id: u32) -> Result<u64, NtStatus> {
+    type NtOpenProcess = unsafe extern "system" fn(
+        *mut u64,
+        u32,
+        *const BootObjectAttributes,
+        *const [u64; 2],
+    ) -> NtStatus;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+
+    let object_attributes = BootObjectAttributes {
+        length: core::mem::size_of::<BootObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: 0,
+        attributes: 0,
+        _p1: 0,
+        security_descriptor: 0,
+        security_qos: 0,
+    };
+    let client_id = [process_id as u64, 0];
+    let mut handle = 0u64;
+    let status = unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtOpenProcess>(
+            nt_ntdll::trap_stubs::nt_open_process,
+        )(
+            &mut handle,
+            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+            &object_attributes,
+            &client_id,
+        )
+    };
+    if nt_success(status) {
+        Ok(handle)
+    } else {
+        Err(status)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_query_process_peb(process_handle: u64) -> Result<u64, NtStatus> {
+    type NtQueryInformationProcess =
+        unsafe extern "system" fn(u64, u32, *mut u8, u32, *mut u32) -> NtStatus;
+
+    let mut information = [0u8; 48];
+    let mut returned = 0u32;
+    let status = unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtQueryInformationProcess>(
+            nt_ntdll::trap_stubs::nt_query_information_process,
+        )(
+            process_handle,
+            0,
+            information.as_mut_ptr(),
+            information.len() as u32,
+            &mut returned,
+        )
+    };
+    if !nt_success(status) {
+        return Err(status);
+    }
+    if returned != information.len() as u32 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(u64::from_le_bytes(information[8..16].try_into().unwrap()))
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_read_process_memory(
+    process_handle: u64,
+    address: u64,
+    output: &mut [u8],
+) -> Result<(), NtStatus> {
+    type NtReadVirtualMemory =
+        unsafe extern "system" fn(u64, u64, *mut u8, usize, *mut usize) -> NtStatus;
+
+    let mut read = 0usize;
+    let status = unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtReadVirtualMemory>(
+            nt_ntdll::trap_stubs::nt_read_virtual_memory,
+        )(
+            process_handle,
+            address,
+            output.as_mut_ptr(),
+            output.len(),
+            &mut read,
+        )
+    };
+    if !nt_success(status) {
+        return Err(status);
+    }
+    if read != output.len() {
+        return Err(STATUS_UNSUCCESSFUL);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_query_remote_process_modules(
+    process_id: u32,
+    buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
+) -> NtStatus {
+    use nt_ntdll::rtl::debug_buffer::{
+        query_remote_process_modules, RemoteModuleSnapshotError,
+    };
+
+    let process_handle = match unsafe { debug_open_process(process_id) } {
+        Ok(handle) => handle,
+        Err(status) => return status,
+    };
+    let start_offset = unsafe { (*buffer).offset_free };
+    let status = (|| {
+        let peb = unsafe { debug_query_process_peb(process_handle) }?;
+        let planned = query_remote_process_modules(peb, None, |address, output| unsafe {
+            debug_read_process_memory(process_handle, address, output)
+        })
+        .map_err(|error| match error {
+            RemoteModuleSnapshotError::Read(status) => status,
+            RemoteModuleSnapshotError::Malformed(_) => STATUS_UNSUCCESSFUL,
+            RemoteModuleSnapshotError::BufferTooSmall { .. } => STATUS_INFO_LENGTH_MISMATCH,
+        })?;
+
+        let modules = unsafe { debug_buffer_commit(buffer, planned.required_size) };
+        if modules.is_null() {
+            return Err(STATUS_NO_MEMORY);
+        }
+        let output =
+            unsafe { core::slice::from_raw_parts_mut(modules.cast::<u8>(), planned.required_size) };
+        query_remote_process_modules(peb, Some(output), |address, output| unsafe {
+            debug_read_process_memory(process_handle, address, output)
+        })
+        .map_err(|error| match error {
+            RemoteModuleSnapshotError::Read(status) => status,
+            RemoteModuleSnapshotError::Malformed(_) => STATUS_UNSUCCESSFUL,
+            RemoteModuleSnapshotError::BufferTooSmall { .. } => STATUS_INFO_LENGTH_MISMATCH,
+        })?;
+        unsafe { (*buffer).modules = modules };
+        Ok(STATUS_SUCCESS)
+    })()
+    .unwrap_or_else(|status| status);
+
+    let _ = unsafe { boot_nt_close(process_handle) };
+    if !nt_success(status) {
+        unsafe {
+            (*buffer).offset_free = start_offset;
+            (*buffer).modules = core::ptr::null_mut();
+        }
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn rtl_query_process_heap_information_impl(
     buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
 ) -> NtStatus {
@@ -18727,8 +18878,8 @@ pub unsafe extern "system" fn rtl_query_process_heap_information(
 /// `RtlQueryProcessDebugInformation(ULONG ProcessId, ULONG Flags, PRTL_DEBUG_INFORMATION Buffer)`.
 ///
 /// Current-process module and heap queries are captured from the live loader and process-heap
-/// registries into the buffer's VM view. Backtrace, heap-tag, lock, and remote-process snapshots
-/// return an honest unsupported status.
+/// registries into the buffer's VM view. Remote module queries walk the target PEB through
+/// `NtReadVirtualMemory`. Backtrace, heap-tag, lock, and remote-heap snapshots remain unsupported.
 ///
 /// # Safety
 /// `buffer` from `RtlCreateQueryDebugBuffer`.
@@ -18752,16 +18903,29 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
         if process_id <= 1 {
             return STATUS_ACCESS_VIOLATION;
         }
+        if flags & !nt_ntdll::rtl::debug_buffer::SUPPORTED_QUERY_MASK != 0 {
+            return STATUS_NOT_IMPLEMENTED;
+        }
         let teb = unsafe { current_teb() };
         let current_process_id = if teb == 0 {
             0
         } else {
             unsafe { core::ptr::read_unaligned((teb + 0x40) as *const u64) as u32 }
         };
-        if process_id != current_process_id
-            || flags & !nt_ntdll::rtl::debug_buffer::SUPPORTED_QUERY_MASK != 0
-        {
-            return STATUS_NOT_IMPLEMENTED;
+        if process_id != current_process_id {
+            if flags
+                & (nt_ntdll::rtl::debug_buffer::QUERY_HEAPS
+                    | nt_ntdll::rtl::debug_buffer::QUERY_HEAP_BLOCKS)
+                != 0
+            {
+                return STATUS_NOT_IMPLEMENTED;
+            }
+            unsafe { (*buffer).target_process_id = process_id as usize as *mut c_void };
+            return if flags & nt_ntdll::rtl::debug_buffer::QUERY_MODULES != 0 {
+                unsafe { rtl_query_remote_process_modules(process_id, buffer) }
+            } else {
+                STATUS_SUCCESS
+            };
         }
         if flags & nt_ntdll::rtl::debug_buffer::QUERY_MODULES != 0 {
             let mut required = 0u32;
