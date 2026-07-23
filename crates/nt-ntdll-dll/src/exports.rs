@@ -17134,62 +17134,715 @@ pub unsafe extern "system" fn rtl_get_unload_event_trace_ex(
     }
 }
 
-/// `RtlTraceDatabaseCreate(...) -> PRTL_TRACE_DATABASE`.
-///
-/// ReactOS marks the trace-database family unimplemented and returns NULL/FALSE. Export the ABI so
-/// callers resolve the symbol, but do not fabricate a trace database.
-#[export_name = "RtlTraceDatabaseCreate"]
-pub unsafe extern "system" fn rtl_trace_database_create(
-    _buckets: u32,
-    _maximum_size: usize,
-    _flags: u32,
-    _tag: u32,
-    _hash_function: *mut c_void,
-) -> *mut c_void {
+#[cfg(target_arch = "x86_64")]
+unsafe extern "system" fn rtl_trace_standard_hash(
+    count: u32,
+    trace: *mut *mut c_void,
+) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    if trace.is_null() {
+        return 0;
+    }
+    let values = unsafe { core::slice::from_raw_parts(trace.cast::<usize>(), count as usize) };
+    nt_ntdll::rtl::trace_database::standard_hash(values)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_database_header_valid(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+) -> bool {
+    !database.is_null()
+        && unsafe {
+            (*database).magic == nt_ntdll::rtl::trace_database::TRACE_DATABASE_MAGIC
+                && (*database).number_of_buckets != 0
+                && !(*database).buckets.is_null()
+                && (*database).hash_function.is_some()
+        }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_database_acquire(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+) -> bool {
+    if !unsafe { trace_database_header_valid(database) } {
+        return false;
+    }
+    let lock = unsafe { core::ptr::addr_of_mut!((*database).lock).cast::<c_void>() };
+    if !nt_success(unsafe { rtl_enter_critical_section(lock) }) {
+        return false;
+    }
+    unsafe { (*database).owner = core::ptr::null_mut() };
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_database_release(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+) {
+    unsafe {
+        (*database).owner = core::ptr::null_mut();
+        let lock = core::ptr::addr_of_mut!((*database).lock).cast::<c_void>();
+        let _ = rtl_leave_critical_section(lock);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_hash_and_bucket(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+    count: u32,
+    trace: *mut *mut c_void,
+    record_probe: bool,
+) -> Option<(u32, usize)> {
+    let hash = unsafe { ((*database).hash_function?)(count, trace) };
+    let bucket =
+        nt_ntdll::rtl::trace_database::bucket_index(hash, unsafe { (*database).number_of_buckets })?;
+    if record_probe {
+        let counter = nt_ntdll::rtl::trace_database::hash_counter_index(
+            bucket,
+            unsafe { (*database).number_of_buckets },
+        )?;
+        unsafe {
+            (*database).hash_counter[counter] =
+                (*database).hash_counter[counter].saturating_add(1);
+        }
+    }
+    Some((hash, bucket))
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_find_in_bucket(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+    bucket: usize,
+    count: u32,
+    trace: *mut *mut c_void,
+) -> *mut nt_ntdll::rtl::trace_database::TraceBlock {
+    let mut current = unsafe { *(*database).buckets.add(bucket) };
+    let maximum_blocks = unsafe {
+        (*database)
+            .current_size
+            .checked_div(core::mem::size_of::<
+                nt_ntdll::rtl::trace_database::TraceBlock,
+            >())
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    for _ in 0..maximum_blocks {
+        if current.is_null() {
+            return core::ptr::null_mut();
+        }
+        if unsafe {
+            (*current).magic != nt_ntdll::rtl::trace_database::TRACE_BLOCK_MAGIC
+                || (*current).size != count
+        } {
+            current = unsafe { (*current).next };
+            continue;
+        }
+        let stored = unsafe { (*current).trace };
+        let mut matches = !stored.is_null() || count == 0;
+        for index in 0..count as usize {
+            if unsafe { *stored.add(index) != *trace.add(index) } {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return current;
+        }
+        current = unsafe { (*current).next };
+    }
     core::ptr::null_mut()
 }
 
-macro_rules! rtl_trace_database_false {
-    ($export:literal, $fn:ident, ($($arg:ident : $ty:ty),* $(,)?)) => {
-        #[export_name = $export]
-        pub unsafe extern "system" fn $fn($($arg: $ty),*) -> u8 {
-            let _ = ($($arg,)*);
-            0
-        }
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_block_is_in_bucket(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+    bucket: usize,
+    target: *mut nt_ntdll::rtl::trace_database::TraceBlock,
+) -> bool {
+    let mut current = unsafe { *(*database).buckets.add(bucket) };
+    let maximum_blocks = unsafe {
+        (*database)
+            .current_size
+            .checked_div(core::mem::size_of::<
+                nt_ntdll::rtl::trace_database::TraceBlock,
+            >())
+            .unwrap_or(0)
+            .saturating_add(1)
     };
+    for _ in 0..maximum_blocks {
+        if current.is_null() {
+            return false;
+        }
+        if current == target {
+            return true;
+        }
+        current = unsafe { (*current).next };
+    }
+    false
 }
 
-rtl_trace_database_false!(
-    "RtlTraceDatabaseAdd",
-    rtl_trace_database_add,
-    (database: *mut c_void, count: u32, trace: *mut *mut c_void, trace_block: *mut *mut c_void)
-);
-rtl_trace_database_false!(
-    "RtlTraceDatabaseDestroy",
-    rtl_trace_database_destroy,
-    (database: *mut c_void)
-);
-rtl_trace_database_false!(
-    "RtlTraceDatabaseEnumerate",
-    rtl_trace_database_enumerate,
-    (database: *mut c_void, trace_enumerate: *mut c_void, trace_block: *mut *mut c_void)
-);
-rtl_trace_database_false!(
-    "RtlTraceDatabaseFind",
-    rtl_trace_database_find,
-    (database: *mut c_void, count: u32, trace: *mut *mut c_void, trace_block: *mut *mut c_void)
-);
-rtl_trace_database_false!("RtlTraceDatabaseLock", rtl_trace_database_lock, (database: *mut c_void));
-rtl_trace_database_false!(
-    "RtlTraceDatabaseUnlock",
-    rtl_trace_database_unlock,
-    (database: *mut c_void)
-);
-rtl_trace_database_false!(
-    "RtlTraceDatabaseValidate",
-    rtl_trace_database_validate,
-    (database: *mut c_void)
-);
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_block_fits_segment(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+    block: *mut nt_ntdll::rtl::trace_database::TraceBlock,
+) -> bool {
+    let block_start = block as usize;
+    let Some(block_size) =
+        nt_ntdll::rtl::trace_database::trace_block_allocation_size(unsafe { (*block).size })
+    else {
+        return false;
+    };
+    let Some(block_end) = block_start.checked_add(block_size) else {
+        return false;
+    };
+    let mut segment = unsafe { (*database).segment_list };
+    let maximum_segments = unsafe {
+        (*database)
+            .current_size
+            .checked_div(nt_ntdll::rtl::trace_database::SEGMENT_SIZE)
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    for _ in 0..maximum_segments {
+        if segment.is_null() {
+            return false;
+        }
+        let allocation_start = unsafe { (*segment).segment_start as usize };
+        let allocation_free = unsafe { (*segment).segment_free as usize };
+        if block_start >= allocation_start && block_end <= allocation_free {
+            return true;
+        }
+        segment = unsafe { (*segment).next_segment };
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn trace_database_validate_locked(
+    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
+) -> bool {
+    use nt_ntdll::rtl::trace_database::{
+        TraceBlock, TraceSegment, SEGMENT_SIZE, TRACE_BLOCK_MAGIC, TRACE_SEGMENT_MAGIC,
+    };
+
+    let maximum_segments = unsafe {
+        (*database)
+            .current_size
+            .checked_div(SEGMENT_SIZE)
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    let mut segment = unsafe { (*database).segment_list };
+    let mut tail = core::ptr::null_mut();
+    let mut total_size = 0usize;
+    let mut segment_count = 0usize;
+    while !segment.is_null() && segment_count < maximum_segments {
+        if unsafe {
+            (*segment).magic != TRACE_SEGMENT_MAGIC
+                || (*segment).database != database
+                || (*segment).segment_start.is_null()
+                || (*segment).segment_end.is_null()
+                || (*segment).segment_free.is_null()
+        } {
+            return false;
+        }
+        let start = unsafe { (*segment).segment_start as usize };
+        let end = unsafe { (*segment).segment_end as usize };
+        let free = unsafe { (*segment).segment_free as usize };
+        let Some(expected_end) = start.checked_add(unsafe { (*segment).total_size }) else {
+            return false;
+        };
+        if expected_end != end || free < start || free > end {
+            return false;
+        }
+        let Some(next_total) = total_size.checked_add(unsafe { (*segment).total_size }) else {
+            return false;
+        };
+        total_size = next_total;
+        tail = segment;
+        segment = unsafe { (*segment).next_segment };
+        segment_count += 1;
+    }
+    if !segment.is_null()
+        || tail.is_null()
+        || total_size != unsafe { (*database).current_size }
+        || tail != unsafe { database.add(1).cast::<TraceSegment>() }
+        || unsafe { (*tail).segment_start != database.cast::<u8>() }
+    {
+        return false;
+    }
+    let expected_buckets = unsafe { tail.add(1).cast::<*mut TraceBlock>() };
+    if unsafe { (*database).buckets != expected_buckets } {
+        return false;
+    }
+    let Some(bucket_bytes) = (unsafe { (*database).number_of_buckets } as usize)
+        .checked_mul(core::mem::size_of::<*mut TraceBlock>())
+    else {
+        return false;
+    };
+    let Some(bucket_end) = (expected_buckets as usize).checked_add(bucket_bytes) else {
+        return false;
+    };
+    if bucket_end > unsafe { (*tail).segment_free as usize } {
+        return false;
+    }
+
+    let maximum_blocks = unsafe {
+        (*database)
+            .current_size
+            .checked_div(core::mem::size_of::<TraceBlock>())
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    let mut observed = 0usize;
+    for bucket in 0..unsafe { (*database).number_of_buckets as usize } {
+        let mut block = unsafe { *(*database).buckets.add(bucket) };
+        let mut chain_count = 0usize;
+        while !block.is_null() && chain_count < maximum_blocks {
+            if block as usize % core::mem::align_of::<TraceBlock>() != 0
+                || unsafe { (*block).magic != TRACE_BLOCK_MAGIC }
+                || unsafe { (*block).trace != block.add(1).cast::<*mut c_void>() }
+                || !unsafe { trace_block_fits_segment(database, block) }
+            {
+                return false;
+            }
+            let Some((_, expected_bucket)) = (unsafe {
+                trace_hash_and_bucket(database, (*block).size, (*block).trace, false)
+            }) else {
+                return false;
+            };
+            if expected_bucket != bucket {
+                return false;
+            }
+            observed = observed.saturating_add(1);
+            chain_count += 1;
+            block = unsafe { (*block).next };
+        }
+        if !block.is_null() {
+            return false;
+        }
+    }
+    observed == unsafe { (*database).number_of_traces }
+}
+
+/// `RtlTraceDatabaseCreate(...) -> PRTL_TRACE_DATABASE`.
+///
+/// Creates an in-process hash table whose trace blocks live in stable, 64-KiB VM segments.
+#[export_name = "RtlTraceDatabaseCreate"]
+pub unsafe extern "system" fn rtl_trace_database_create(
+    buckets: u32,
+    maximum_size: usize,
+    flags: u32,
+    tag: u32,
+    hash_function: *mut c_void,
+) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use nt_ntdll::rtl::trace_database::{
+            TraceDatabase, TraceHashFunction, TraceSegment, TRACE_DATABASE_MAGIC,
+            TRACE_IN_USER_MODE, TRACE_SEGMENT_MAGIC,
+        };
+
+        let Some(allocation_size) =
+            nt_ntdll::rtl::trace_database::initial_allocation_size(buckets)
+        else {
+            return core::ptr::null_mut();
+        };
+        let allocation = unsafe { crate::on_target::nt_allocate_virtual_memory(allocation_size) };
+        if allocation == 0 {
+            return core::ptr::null_mut();
+        }
+        let raw = allocation as *mut u8;
+        unsafe { core::ptr::write_bytes(raw, 0, allocation_size) };
+        let database = raw.cast::<TraceDatabase>();
+        let segment = unsafe { database.add(1).cast::<TraceSegment>() };
+        let bucket_table = unsafe { segment.add(1).cast::<*mut nt_ntdll::rtl::trace_database::TraceBlock>() };
+        let function = if hash_function.is_null() {
+            rtl_trace_standard_hash
+        } else {
+            unsafe { core::mem::transmute::<*mut c_void, TraceHashFunction>(hash_function) }
+        };
+        unsafe {
+            core::ptr::write(
+                database,
+                TraceDatabase {
+                    magic: TRACE_DATABASE_MAGIC,
+                    flags: flags | TRACE_IN_USER_MODE,
+                    tag,
+                    _padding0: 0,
+                    segment_list: segment,
+                    maximum_size,
+                    current_size: allocation_size,
+                    owner: core::ptr::null_mut(),
+                    lock: [0; 40],
+                    number_of_buckets: buckets,
+                    _padding1: 0,
+                    buckets: bucket_table,
+                    hash_function: Some(function),
+                    number_of_traces: 0,
+                    number_of_hits: 0,
+                    hash_counter: [0; 16],
+                },
+            );
+        }
+        let lock = unsafe { core::ptr::addr_of_mut!((*database).lock).cast::<c_void>() };
+        if !nt_success(unsafe { rtl_initialize_critical_section(lock) }) {
+            let _ = unsafe { crate::on_target::nt_release_virtual_memory(allocation) };
+            return core::ptr::null_mut();
+        }
+        let free = unsafe { bucket_table.add(buckets as usize).cast::<u8>() };
+        unsafe {
+            core::ptr::write(
+                segment,
+                TraceSegment {
+                    magic: TRACE_SEGMENT_MAGIC,
+                    _padding: 0,
+                    database,
+                    next_segment: core::ptr::null_mut(),
+                    total_size: allocation_size,
+                    segment_start: raw,
+                    segment_end: raw.add(allocation_size),
+                    segment_free: free,
+                },
+            );
+        }
+        database.cast()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (buckets, maximum_size, flags, tag, hash_function);
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlTraceDatabaseAdd(...) -> BOOLEAN`.
+#[export_name = "RtlTraceDatabaseAdd"]
+pub unsafe extern "system" fn rtl_trace_database_add(
+    database: *mut c_void,
+    count: u32,
+    trace: *mut *mut c_void,
+    trace_block: *mut *mut c_void,
+) -> u8 {
+    if !trace_block.is_null() {
+        unsafe { *trace_block = core::ptr::null_mut() };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use nt_ntdll::rtl::trace_database::{
+            TraceBlock, TraceDatabase, TraceSegment, SEGMENT_SIZE, TRACE_BLOCK_MAGIC,
+            TRACE_SEGMENT_MAGIC,
+        };
+
+        if count != 0 && trace.is_null() {
+            return 0;
+        }
+        let database = database.cast::<TraceDatabase>();
+        if !unsafe { trace_database_acquire(database) } {
+            return 0;
+        }
+        let result = (|| {
+            let (_, bucket) = unsafe { trace_hash_and_bucket(database, count, trace, true) }?;
+            let existing =
+                unsafe { trace_find_in_bucket(database, bucket, count, trace) };
+            if !existing.is_null() {
+                unsafe {
+                    (*existing).count = (*existing).count.saturating_add(1);
+                    (*database).number_of_hits = (*database).number_of_hits.saturating_add(1);
+                }
+                return Some(existing);
+            }
+
+            let request =
+                nt_ntdll::rtl::trace_database::trace_block_allocation_size(count)?;
+            let mut segment = unsafe { (*database).segment_list };
+            let remaining = unsafe {
+                ((*segment).segment_end as usize).checked_sub((*segment).segment_free as usize)
+            }?;
+            if request > remaining {
+                if request > SEGMENT_SIZE - core::mem::size_of::<TraceSegment>()
+                    || !nt_ntdll::rtl::trace_database::can_grow(
+                        unsafe { (*database).current_size },
+                        unsafe { (*database).maximum_size },
+                    )
+                {
+                    return None;
+                }
+                let allocation =
+                    unsafe { crate::on_target::nt_allocate_virtual_memory(SEGMENT_SIZE) };
+                if allocation == 0 {
+                    return None;
+                }
+                let raw = allocation as *mut u8;
+                unsafe { core::ptr::write_bytes(raw, 0, SEGMENT_SIZE) };
+                let new_segment = raw.cast::<TraceSegment>();
+                unsafe {
+                    core::ptr::write(
+                        new_segment,
+                        TraceSegment {
+                            magic: TRACE_SEGMENT_MAGIC,
+                            _padding: 0,
+                            database,
+                            next_segment: segment,
+                            total_size: SEGMENT_SIZE,
+                            segment_start: raw,
+                            segment_end: raw.add(SEGMENT_SIZE),
+                            segment_free: new_segment.add(1).cast::<u8>(),
+                        },
+                    );
+                    (*database).segment_list = new_segment;
+                    (*database).current_size += SEGMENT_SIZE;
+                }
+                segment = new_segment;
+            }
+
+            let block = unsafe { (*segment).segment_free.cast::<TraceBlock>() };
+            let trace_copy = unsafe { block.add(1).cast::<*mut c_void>() };
+            unsafe {
+                (*segment).segment_free = (*segment).segment_free.add(request);
+                core::ptr::write(
+                    block,
+                    TraceBlock {
+                        magic: TRACE_BLOCK_MAGIC,
+                        count: 1,
+                        size: count,
+                        user_count: 0,
+                        user_size: 0,
+                        _padding: 0,
+                        user_context: core::ptr::null_mut(),
+                        next: *(*database).buckets.add(bucket),
+                        trace: trace_copy,
+                    },
+                );
+                if count != 0 {
+                    core::ptr::copy_nonoverlapping(trace, trace_copy, count as usize);
+                }
+                *(*database).buckets.add(bucket) = block;
+                (*database).number_of_traces =
+                    (*database).number_of_traces.saturating_add(1);
+            }
+            Some(block)
+        })();
+        unsafe { trace_database_release(database) };
+        if let Some(block) = result {
+            if !trace_block.is_null() {
+                unsafe { *trace_block = block.cast() };
+            }
+            return 1;
+        }
+        return 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (database, count, trace);
+        0
+    }
+}
+
+/// `RtlTraceDatabaseFind(...) -> BOOLEAN`.
+#[export_name = "RtlTraceDatabaseFind"]
+pub unsafe extern "system" fn rtl_trace_database_find(
+    database: *mut c_void,
+    count: u32,
+    trace: *mut *mut c_void,
+    trace_block: *mut *mut c_void,
+) -> u8 {
+    if !trace_block.is_null() {
+        unsafe { *trace_block = core::ptr::null_mut() };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if count != 0 && trace.is_null() {
+            return 0;
+        }
+        let database = database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>();
+        if !unsafe { trace_database_acquire(database) } {
+            return 0;
+        }
+        let found = if let Some((_, bucket)) =
+            unsafe { trace_hash_and_bucket(database, count, trace, true) }
+        {
+            unsafe { trace_find_in_bucket(database, bucket, count, trace) }
+        } else {
+            core::ptr::null_mut()
+        };
+        if !found.is_null() {
+            unsafe {
+                (*database).number_of_hits = (*database).number_of_hits.saturating_add(1);
+            }
+        }
+        unsafe { trace_database_release(database) };
+        if found.is_null() {
+            return 0;
+        }
+        if !trace_block.is_null() {
+            unsafe { *trace_block = found.cast() };
+        }
+        return 1;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (database, count, trace);
+        0
+    }
+}
+
+/// `RtlTraceDatabaseEnumerate(...) -> BOOLEAN`.
+#[export_name = "RtlTraceDatabaseEnumerate"]
+pub unsafe extern "system" fn rtl_trace_database_enumerate(
+    database: *mut c_void,
+    trace_enumerate: *mut c_void,
+    trace_block: *mut *mut c_void,
+) -> u8 {
+    if !trace_block.is_null() {
+        unsafe { *trace_block = core::ptr::null_mut() };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use nt_ntdll::rtl::trace_database::{TraceDatabase, TraceEnumerate};
+        if trace_enumerate.is_null() || trace_block.is_null() {
+            return 0;
+        }
+        let database = database.cast::<TraceDatabase>();
+        if !unsafe { trace_database_acquire(database) } {
+            return 0;
+        }
+        let enumerate = trace_enumerate.cast::<TraceEnumerate>();
+        let result = (|| {
+            if unsafe { (*enumerate).database.is_null() } {
+                unsafe {
+                    (*enumerate).database = database;
+                    (*enumerate).index = 0;
+                    (*enumerate).block = *(*database).buckets;
+                }
+            } else if unsafe {
+                (*enumerate).database != database
+                    || (*enumerate).index >= (*database).number_of_buckets
+            } {
+                return None;
+            }
+            while unsafe { (*enumerate).block.is_null() } {
+                unsafe { (*enumerate).index = (*enumerate).index.saturating_add(1) };
+                if unsafe { (*enumerate).index >= (*database).number_of_buckets } {
+                    return None;
+                }
+                unsafe {
+                    (*enumerate).block =
+                        *(*database).buckets.add((*enumerate).index as usize);
+                }
+            }
+            let current = unsafe { (*enumerate).block };
+            if !unsafe {
+                trace_block_is_in_bucket(database, (*enumerate).index as usize, current)
+            } {
+                return None;
+            }
+            unsafe { (*enumerate).block = (*current).next };
+            Some(current)
+        })();
+        unsafe { trace_database_release(database) };
+        if let Some(block) = result {
+            unsafe { *trace_block = block.cast() };
+            return 1;
+        }
+        return 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (database, trace_enumerate);
+        0
+    }
+}
+
+/// `RtlTraceDatabaseValidate(...) -> BOOLEAN`.
+#[export_name = "RtlTraceDatabaseValidate"]
+pub unsafe extern "system" fn rtl_trace_database_validate(database: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let database = database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>();
+        if !unsafe { trace_database_acquire(database) } {
+            return 0;
+        }
+        let valid = unsafe { trace_database_validate_locked(database) };
+        unsafe { trace_database_release(database) };
+        return u8::from(valid);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = database;
+        0
+    }
+}
+
+/// `RtlTraceDatabaseDestroy(...) -> BOOLEAN`.
+#[export_name = "RtlTraceDatabaseDestroy"]
+pub unsafe extern "system" fn rtl_trace_database_destroy(database: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use nt_ntdll::rtl::trace_database::TraceDatabase;
+        let database = database.cast::<TraceDatabase>();
+        if unsafe { rtl_trace_database_validate(database.cast()) } == 0 {
+            return 0;
+        }
+        let lock = unsafe { core::ptr::addr_of_mut!((*database).lock).cast::<c_void>() };
+        if !nt_success(unsafe { rtl_delete_critical_section(lock) }) {
+            return 0;
+        }
+        let mut segment = unsafe { (*database).segment_list };
+        unsafe { (*database).magic = 0 };
+        let mut success = true;
+        while !segment.is_null() {
+            let next = unsafe { (*segment).next_segment };
+            let allocation = if next.is_null() {
+                database as u64
+            } else {
+                segment as u64
+            };
+            if !nt_success(unsafe {
+                crate::on_target::nt_release_virtual_memory(allocation)
+            }) {
+                success = false;
+            }
+            segment = next;
+        }
+        return u8::from(success);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = database;
+        0
+    }
+}
+
+/// `RtlTraceDatabaseLock(...) -> VOID`.
+#[export_name = "RtlTraceDatabaseLock"]
+pub unsafe extern "system" fn rtl_trace_database_lock(database: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = unsafe {
+            trace_database_acquire(
+                database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>(),
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = database;
+}
+
+/// `RtlTraceDatabaseUnlock(...) -> VOID`.
+#[export_name = "RtlTraceDatabaseUnlock"]
+pub unsafe extern "system" fn rtl_trace_database_unlock(database: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let database = database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>();
+        if unsafe { trace_database_header_valid(database) } {
+            unsafe { trace_database_release(database) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = database;
+}
 
 // `RtlCaptureStackBackTrace` is provided by the security_exports module (part of that family).
 
