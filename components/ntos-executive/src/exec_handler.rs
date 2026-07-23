@@ -224,6 +224,7 @@ impl ExecNtHandler {
             )
             .unwrap(),
             io_completion_ports: nt_io_completion::CompletionPortTable::new(),
+            directory_opens: nt_fs::DirectoryOpenTable::new(),
             pi: 0,
             current_tid: 0,
             current_badge: 0,
@@ -722,14 +723,21 @@ impl ExecNtHandler {
         access: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self
-            .pm
-            .insert_handle(
-                pid,
-                nt_process::HandleObject::Directory { first_cluster },
-                access,
-            )
-            .ok()?;
+        let object_id = self.directory_opens.create(first_cluster).ok()?;
+        let handle = match self.pm.insert_handle(
+            pid,
+            nt_process::HandleObject::Directory {
+                first_cluster,
+                object_id,
+            },
+            access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = self.directory_opens.release(object_id);
+                return None;
+            }
+        };
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
@@ -1273,11 +1281,14 @@ impl ExecNtHandler {
             nt_process::HandleObject::IoCompletion(id) => {
                 let _ = self.io_completion_ports.release(id);
             }
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                let _ = self.directory_opens.release(object_id);
+            }
             _ => {}
         }
     }
 
-    fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
+    pub(crate) fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
         match self.pm.take_handle(pid, handle as nt_process::Handle) {
             Ok(object) => {
                 self.release_handle_object(object);
@@ -1286,6 +1297,49 @@ impl ExecNtHandler {
             }
             Err(_) => false,
         }
+    }
+
+    fn release_process_handles(&mut self, pid: nt_process::ProcessId) {
+        while let Some(object) = self.pm.take_any_handle(pid) {
+            self.release_handle_object(object);
+            PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn duplicate_process_handle_with_access(
+        &mut self,
+        source_pid: nt_process::ProcessId,
+        source_handle: nt_process::Handle,
+        target_pid: nt_process::ProcessId,
+        desired_access: Option<u32>,
+    ) -> Result<nt_process::Handle, u32> {
+        let object = self
+            .pm
+            .lookup_handle(source_pid, source_handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let handle = self.pm.duplicate_handle_with_access(
+            source_pid,
+            source_handle,
+            target_pid,
+            desired_access,
+        )?;
+        let retained = match object {
+            nt_process::HandleObject::TokenObject(token) => self
+                .token_store
+                .retain(token)
+                .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
+            nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
+            nt_process::HandleObject::Directory { object_id, .. } => {
+                self.directory_opens.retain(object_id)
+            }
+            _ => Ok(()),
+        };
+        if let Err(status) = retained {
+            // The table copy does not own the backing object until retain succeeds.
+            let _ = self.pm.take_handle(target_pid, handle);
+            return Err(status);
+        }
+        Ok(handle)
     }
 
     /// Transfer one existing token reference into a new caller-local handle. Every failure path
@@ -1719,7 +1773,7 @@ impl ExecNtHandler {
 
     pub(crate) fn close_current_handle(&mut self, handle: u64) {
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            let _ = self.pm.close_handle(pid, handle as nt_process::Handle);
+            let _ = self.close_process_handle(pid, handle);
         }
     }
     /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
@@ -2966,26 +3020,13 @@ impl NativeSyscallHandler for ExecNtHandler {
             // preserves shared identities such as msgina's worker-completion event instead of
             // copying an unowned scalar handle value.
             NativeService::NtDuplicateObject => {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
                 const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
                 const DUPLICATE_SAME_ACCESS: u32 = 0x2;
 
                 let Some(source_pid) = self.resolve_process_handle(args[0]) else {
                     return STATUS_INVALID_HANDLE;
-                };
-                let source_token = match self
-                    .pm
-                    .lookup_handle(source_pid, args[1] as nt_process::Handle)
-                {
-                    Some(nt_process::HandleObject::TokenObject(token)) => Some(token),
-                    _ => None,
-                };
-                let source_completion = match self
-                    .pm
-                    .lookup_handle(source_pid, args[1] as nt_process::Handle)
-                {
-                    Some(nt_process::HandleObject::IoCompletion(id)) => Some(id),
-                    _ => None,
                 };
                 let options = args[6] as u32;
                 let mut target_pid_for_peak = None;
@@ -3003,37 +3044,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     target_pid_for_peak = Some(target_pid);
                     let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
                         .then_some(args[4] as u32);
-                    match self.pm.duplicate_handle_with_access(
+                    match self.duplicate_process_handle_with_access(
                             source_pid,
                             args[1] as nt_process::Handle,
                             target_pid,
                             desired_access,
                         ) {
                         Ok(handle) => {
-                            if let Some(token) = source_token {
-                                if self.token_store.retain(token).is_err() {
-                                    let _ = self.pm.take_handle(target_pid, handle);
-                                    return STATUS_INVALID_HANDLE;
-                                }
-                            }
-                            if let Some(id) = source_completion {
-                                match self.io_completion_ports.retain(id) {
-                                    Ok(()) => {
-                                        native_duplicate = true;
-                                        Ok(Some(handle as u64))
-                                    }
-                                    Err(status) => {
-                                        // The process-table copy does not own a completion-port
-                                        // reference until retain succeeds. Remove that copy without
-                                        // releasing the source's sole backing-object reference.
-                                        let _ = self.pm.take_handle(target_pid, handle);
-                                        Err(status)
-                                    }
-                                }
-                            } else {
-                                native_duplicate = true;
-                                Ok(Some(handle as u64))
-                            }
+                            native_duplicate = true;
+                            Ok(Some(handle as u64))
                         }
                         Err(status)
                             if status == STATUS_INVALID_HANDLE
@@ -3085,7 +3104,19 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 match result {
                     Ok(Some(handle)) => {
-                        self.queue_write(args[3], handle);
+                        if !unsafe { self.xas_write_u64(args[3], handle) } {
+                            if native_duplicate {
+                                let _ = self.close_process_handle(
+                                    target_pid_for_peak.unwrap(),
+                                    handle,
+                                );
+                            } else {
+                                let _ = unsafe {
+                                    crate::win32k_subsystem::close_user_object_handle(handle)
+                                };
+                            }
+                            return STATUS_ACCESS_VIOLATION;
+                        }
                         if native_duplicate {
                             let count = self.pm.handle_count(target_pid_for_peak.unwrap()) as u64;
                             if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
@@ -8750,6 +8781,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
                     let _ = self.pm.terminate_process(pid, status);
+                    self.release_process_handles(pid);
                     if let Some(process_index) = process_index {
                         self.post_action = ExecPostAction::CleanupProcessWaiters { process_index };
                     }
@@ -8801,6 +8833,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 };
                 let prior_state = self.pm.thread(target).map(|thread| thread.state);
+                let target_pid = self
+                    .pm
+                    .thread(target)
+                    .map(|thread| thread.process_id)
+                    .unwrap_or(caller_pid);
                 let is_current = target == current_tid;
                 if let Some(code) = self.pm.critical_thread_termination_code(target) {
                     self.post_action = ExecPostAction::CriticalTermination {
@@ -8816,6 +8853,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 if let Err(status) = outcome {
                     return status;
+                }
+                if self.pm.is_process_signaled(target_pid) {
+                    self.release_process_handles(target_pid);
                 }
                 self.post_action = if is_current {
                     ExecPostAction::TerminateCurrentThread { tid: target as u64 }

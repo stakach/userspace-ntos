@@ -656,7 +656,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                             (Some(source_pid), Some(target_pid)) => {
                                 let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
                                     .then_some(sm_stack_read(sp + 0x28) as u32);
-                                match nt_handler.pm.duplicate_handle_with_access(
+                                match nt_handler.duplicate_process_handle_with_access(
                                     source_pid,
                                     source_handle as nt_process::Handle,
                                     target_pid,
@@ -674,9 +674,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         };
                         if options & DUPLICATE_CLOSE_SOURCE != 0 {
                             if let Some(source_pid) = source_pid {
-                                let _ = nt_handler
-                                    .pm
-                                    .close_handle(source_pid, source_handle as nt_process::Handle);
+                                let _ = nt_handler.close_process_handle(source_pid, source_handle);
                             }
                         }
                         nt_handler.pi = saved_pi;

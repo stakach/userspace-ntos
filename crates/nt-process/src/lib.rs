@@ -163,6 +163,7 @@ pub enum HandleObject {
     /// A directory on the executive's mounted FAT volume.
     Directory {
         first_cluster: u32,
+        object_id: u32,
     },
     /// The executive-reserved `\SystemRoot\bootstat.dat` file used by RTL boot-status APIs.
     BootStatusFile,
@@ -1055,6 +1056,14 @@ impl ProcessManager {
     /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
     pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
         self.take_handle(pid, handle).map(|_| ())
+    }
+    /// Remove one arbitrary handle from `pid`. Hosts use this during process teardown to release
+    /// backing-object references owned outside the process manager.
+    pub fn take_any_handle(&mut self, pid: ProcessId) -> Option<HandleObject> {
+        let proc = self.processes.get_mut(&pid)?;
+        proc.handles
+            .iter_mut()
+            .find_map(|entry| entry.take().map(|entry| entry.object))
     }
     /// Close the first handle in `pid`'s table whose entry refers to `object` (spec §8.1), freeing
     /// the slot; returns whether one was found. A host that assigns its own handle VALUES (outside

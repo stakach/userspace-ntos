@@ -4712,6 +4712,8 @@ struct ExecNtHandler {
     /// Fixed executive completion-port objects and packet queues. SURT remains the cross-component
     /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
     io_completion_ports: nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>,
+    /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
+    directory_opens: nt_fs::DirectoryOpenTable<64>,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
