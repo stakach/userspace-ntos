@@ -217,6 +217,7 @@ impl ExecNtHandler {
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
+            tp_worker_spawn_request: 0,
             wait_park_event: -1,
             wait_deadline_100ns: u64::MAX,
             keyed_wait_key: u64::MAX,
@@ -4491,11 +4492,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // CSRSS creates two suspended server workers during initialization. Back both with
                 // real ETHREADs and typed handles so ReactOS's NtResumeThread calls control their
                 // actual TCBs. Slot 0 is CsrApiRequestThread; slot 1 is CsrSbApiRequestThread.
-                if matches!(ctx.service, NativeService::NtCreateThread) && self.pi == 1 {
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 1
+                    && args[3] == u64::MAX
+                    && CSR_SB_TID.load(Ordering::Relaxed) == 0
+                {
                     unsafe {
-                        if args[3] != u64::MAX || CSR_SB_TID.load(Ordering::Relaxed) != 0 {
-                            return 0xC000_009A;
-                        }
                         let sp = get_recv_mr(16);
                         let ctx_va = smss_stack_read(sp + 0x30);
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
@@ -4607,7 +4609,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         return 0;
                     }
                 }
-                if matches!(ctx.service, NativeService::NtCreateThread) && self.pi == 2 {
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 2
+                    && args[3] == u64::MAX
+                    && WL_WORKER3_TID.load(Ordering::Relaxed) == 0
+                {
                     unsafe {
                         let sp = get_recv_mr(16);
                         let cid_ptr = smss_stack_read(sp + 0x28);
@@ -4696,6 +4702,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // the main multiplex). Its faults sub-select to (pi 3, listener) by SVC_LISTENER_BADGE.
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 3
+                    && self.current_badge == SERVICES_BADGE
                     && SVC_LISTENER_TCB.load(Ordering::Relaxed) == 0
                     && SVC_LISTENER_TID.load(Ordering::Relaxed) == 0
                 {
@@ -4909,6 +4916,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 3
+                    && self.current_badge == SVC_LISTENER_BADGE
                     && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0
                     && SCM_WORKER_TCB.load(Ordering::Relaxed) == 0
                     && SCM_WORKER_TID.load(Ordering::Relaxed) == 0
@@ -4945,10 +4953,58 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && (2..=4).contains(&self.pi)
-                {
-                    return 0xC000_009A;
+                // Bounded generic fallback. Identify it by ntdll's exact private worker entrypoint,
+                // never by creation order: smss and the RPC servers legitimately create additional
+                // native threads after their known listeners and must retain their own routes.
+                if args[3] == u64::MAX && self.pi < TP_WORKER_PI_COUNT {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let worker_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
+                        let is_tp_worker = worker_rva != 0
+                            && start.rip == NTDLL_BASE.wrapping_add(worker_rva);
+                        if is_tp_worker {
+                            if TP_WORKER_TID[self.pi].load(Ordering::Relaxed) != 0 {
+                                return 0xC000_009A;
+                            }
+                            let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                            if let Some((_slot, tid, handle)) = self.nt_create_thread_handle(
+                                start.rip,
+                                create_suspended,
+                                args[1] as u32,
+                            ) {
+                                self.pm
+                                    .set_thread_teb(tid as nt_process::ThreadId, TP_WORKER_TEB_VA);
+                                let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
+                                self.queue_write(args[0], handle);
+                                let cid_ptr = smss_stack_read(sp + 0x28);
+                                if cid_ptr != 0 {
+                                    self.queue_write(cid_ptr, pid as u64);
+                                    self.queue_write(cid_ptr + 8, tid);
+                                }
+                                TP_WORKER_TID[self.pi].store(tid, Ordering::Relaxed);
+                                self.tp_worker_spawn_request = self.pi as u8 + 1;
+                                print_str(b"[tp-worker] claimed pi=");
+                                print_u64(self.pi as u64);
+                                print_str(b" badge=");
+                                print_u64(tp_worker_badge(self.pi));
+                                print_str(b" tid=");
+                                print_u64(tid);
+                                print_str(b" entry=0x");
+                                print_hex((start.rip >> 32) as u32);
+                                print_hex(start.rip as u32);
+                                print_str(b" suspended=");
+                                print_u64(create_suspended as u64);
+                                print_str(b"\n");
+                                return 0;
+                            }
+                            return 0xC000_009A;
+                        }
+                    }
                 }
                 let h = self.mint_handle();
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)

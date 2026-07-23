@@ -14,6 +14,9 @@ pub(crate) static OUR_LDRP_RVA: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OUR_LDR_INITIALIZE_THUNK_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of the callback entry in the same loaded Rust ntdll, resolved from its export table at boot.
 pub(crate) static OUR_KI_USER_CALLBACK_DISPATCHER_RVA: AtomicU64 = AtomicU64::new(0);
+/// RVA of ntdll's normal completion-port worker. An exact entrypoint match distinguishes the
+/// generic thread-pool worker from process-specific native threads that also use NtCreateThread.
+pub(crate) static OUR_TP_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE

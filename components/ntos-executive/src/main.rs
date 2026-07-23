@@ -413,6 +413,48 @@ pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1075_0000;
 /// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
 pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
 
+// --- Bounded generic ntdll thread-pool worker -----------------------------------------------
+// The established SM/CSR/RPC roles retain their specialized layouts. An NtCreateThread whose
+// entrypoint exactly matches ntdll's exported worker gets this generic layout at the same target VAs
+// in each process (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
+pub const TP_WORKER_PI_COUNT: usize = 5;
+pub const TP_WORKER_BADGE_BASE: u64 = 16;
+pub const TP_WORKER_STACK_BASE: u64 = 0x0000_0100_1058_0000;
+pub const TP_WORKER_STACK_FRAMES: u64 = 16;
+pub const TP_WORKER_STACK_TOP: u64 = TP_WORKER_STACK_BASE + TP_WORKER_STACK_FRAMES * 0x1000;
+pub const TP_WORKER_CONTEXT_RSP: u64 = ((TP_WORKER_STACK_TOP - 6 * 8) & !15) - 8;
+pub const TP_WORKER_IPCBUF_VA: u64 = 0x0000_0100_1059_0000;
+pub const TP_WORKER_TEB_VA: u64 = 0x0000_0100_105A_0000;
+pub const TP_WORKER_TRAMP_VA: u64 = 0x0000_0100_105B_0000;
+pub const TP_WORKER_EXEC_BASE: u64 = 0x0000_0100_13A0_0000;
+pub const TP_WORKER_EXEC_STRIDE: u64 = 0x0004_0000;
+pub const TP_WORKER_ENV_SCRATCH_OFFSET: u64 = 0x0002_0000;
+
+#[inline]
+pub const fn tp_worker_badge(pi: usize) -> u64 {
+    TP_WORKER_BADGE_BASE + pi as u64
+}
+
+#[inline]
+pub const fn tp_worker_pi_from_badge(badge: u64) -> Option<usize> {
+    let offset = badge.wrapping_sub(TP_WORKER_BADGE_BASE);
+    if offset < TP_WORKER_PI_COUNT as u64 {
+        Some(offset as usize)
+    } else {
+        None
+    }
+}
+
+#[inline]
+pub const fn tp_worker_stack_mirror_va(pi: usize) -> u64 {
+    TP_WORKER_EXEC_BASE + pi as u64 * TP_WORKER_EXEC_STRIDE
+}
+
+#[inline]
+pub const fn tp_worker_env_scratch_va(pi: usize) -> u64 {
+    tp_worker_stack_mirror_va(pi) + TP_WORKER_ENV_SCRATCH_OFFSET
+}
+
 const fn hosted_thread_layout_is_disjoint(
     stack_base: u64,
     stack_frames: u64,
@@ -445,6 +487,7 @@ const _: () = {
     assert!(
         nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER3_TEB_VA) == LSASS_LISTENER3_IPCBUF_VA
     );
+    assert!(nt_syscall_abi::native_ipc_buffer_va(TP_WORKER_TEB_VA) == TP_WORKER_IPCBUF_VA);
     assert!(SM_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
     assert!(SM_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
@@ -476,6 +519,25 @@ const _: () = {
         WL_WORKER3_TEB_VA,
         WL_WORKER3_TRAMP_VA,
     ));
+    assert!(hosted_thread_layout_is_disjoint(
+        TP_WORKER_STACK_BASE,
+        TP_WORKER_STACK_FRAMES,
+        TP_WORKER_IPCBUF_VA,
+        TP_WORKER_TEB_VA,
+        TP_WORKER_TRAMP_VA,
+    ));
+    assert!(TP_WORKER_STACK_BASE >= WORK_CLUSTER_BASE);
+    assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
+    assert!(tp_worker_badge(0) == 16);
+    assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1) == 20);
+    assert!(TP_WORKER_CONTEXT_RSP >= TP_WORKER_STACK_BASE);
+    assert!(TP_WORKER_CONTEXT_RSP < TP_WORKER_STACK_TOP);
+    assert!(TP_WORKER_CONTEXT_RSP & 15 == 8);
+    assert!(TP_WORKER_EXEC_STRIDE >= TP_WORKER_ENV_SCRATCH_OFFSET + 0x4000);
+    assert!(
+        tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1) + 0x4000
+            <= TP_WORKER_EXEC_BASE + 0x20_0000
+    );
 };
 
 /// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
@@ -1067,7 +1129,7 @@ static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 /// subsequent recvs. On `NtSetEvent(that event)` the loop does `send_on_reply(stolen_cap, WAIT_0)` to
 /// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
-const WAIT_REPLY_POOL_N: usize = 8;
+const WAIT_REPLY_POOL_N: usize = 16;
 /// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
 /// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
 /// (into a waiter slot) and installs a free spare as the new active.
@@ -1118,7 +1180,7 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Blocking `NtRemoveIoCompletion` calls. Seven waiters leave one of the eight reply objects active
+/// Blocking `NtRemoveIoCompletion` calls. Fifteen waiters leave one of the sixteen reply objects active
 /// so the executive can continue receiving while every other reply cap is parked.
 const IO_COMPLETION_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable<IO_COMPLETION_WAITER_N> =
@@ -1332,6 +1394,13 @@ static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER2_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
+/// One bounded generic ntdll thread-pool worker per boot process (pi 0..4). These identities remain
+/// separate from the listener-specific state so badge routing cannot accidentally inherit a server
+/// listener's park/drop policy.
+static TP_WORKER_TID: [AtomicU64; TP_WORKER_PI_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_PI_COUNT];
+static TP_WORKER_TCB: [AtomicU64; TP_WORKER_PI_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_PI_COUNT];
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -3354,7 +3423,11 @@ unsafe fn drop_current_syscall_reply() -> bool {
 }
 
 fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
-    if tid == CSR_API_TID.load(Ordering::Relaxed) {
+    if let Some(index) = (0..TP_WORKER_PI_COUNT)
+        .find(|&index| tid != 0 && tid == TP_WORKER_TID[index].load(Ordering::Relaxed))
+    {
+        Some(&TP_WORKER_TCB[index])
+    } else if tid == CSR_API_TID.load(Ordering::Relaxed) {
         Some(&CSR_LOOP_TCB)
     } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
         Some(&CSR_SB_LOOP_TCB)
@@ -4504,7 +4577,7 @@ struct ExecNtHandler {
     global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
     /// Fixed executive completion-port objects and packet queues. SURT remains the cross-component
     /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
-    io_completion_ports: nt_io_completion::CompletionPortTable<2, 16, 64>,
+    io_completion_ports: nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -4588,6 +4661,9 @@ struct ExecNtHandler {
     /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
     lsass_listener2_spawn: bool,
     lsass_listener3_spawn: bool,
+    /// One-based process index for a bounded generic ntdll thread-pool worker awaiting mechanism
+    /// construction in the loop. Zero means no request; values 1..=5 map to pi 0..=4.
+    tp_worker_spawn_request: u8,
     /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
     /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
     /// event index) instead of replying, and wake it on the matching NtSetEvent. -1 = no park (either
@@ -5534,8 +5610,9 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
-/// creation remains allocation-free. Three slots cover the live lsass worker fan-out.
-const PM_RUNTIME_THREAD_SLOTS: usize = 3;
+/// creation remains allocation-free. Three slots cover the existing specialized fan-out and the
+/// fourth admits one generic ntdll thread-pool worker without reallocating under the loop reset.
+const PM_RUNTIME_THREAD_SLOTS: usize = 4;
 static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
     [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
 static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
@@ -8830,6 +8907,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let tp_worker_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "RtlpWorkerThread")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
@@ -8837,6 +8923,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA
                         .store(ldr_initialize_thunk_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.store(callback_dispatcher_rva, Ordering::Relaxed);
+                    img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
                     print_str(b"\n");

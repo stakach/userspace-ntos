@@ -1034,6 +1034,64 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     })
 }
 
+/// Spawn the one bounded generic ntdll thread-pool worker assigned to `pi`. The caller-supplied
+/// stack allocation is not mapped into this userspace kernel, so normalize both INITIAL_TEB and
+/// CONTEXT.Rsp to the fixed 16-page worker stack before entering LdrInitializeThunk. The original
+/// RIP/RCX/RDX remain intact and are restored by the loader trampoline.
+pub(crate) unsafe fn spawn_tp_worker_thread(
+    pi: usize,
+    pml4: u64,
+    mut start: nt_thread_start::Amd64ThreadContext,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+    resume: bool,
+) -> u64 {
+    if pi >= TP_WORKER_PI_COUNT {
+        return 0;
+    }
+    let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
+    if loader_rva == 0 {
+        return 0;
+    }
+
+    // ReactOS amd64 RtlInitializeContext: (StackBase - 6 pointers), align down to 16, then -8.
+    start.rsp = TP_WORKER_CONTEXT_RSP;
+    let initial_teb = nt_thread_start::InitialTeb64 {
+        stack_base: TP_WORKER_STACK_TOP,
+        stack_limit: TP_WORKER_STACK_BASE,
+        allocated_stack_base: TP_WORKER_STACK_BASE,
+    };
+    let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi));
+    spawn_hosted_thread(&HostedThread {
+        pml4,
+        client_pi: pi as u64,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: Some(LoaderThreadContext {
+            loader_va: NTDLL_BASE + loader_rva,
+            start,
+            initial_teb,
+        }),
+        scr: tp_worker_env_scratch_va(pi),
+        teb_va: TP_WORKER_TEB_VA,
+        stack_base: TP_WORKER_STACK_BASE,
+        stack_frames: TP_WORKER_STACK_FRAMES,
+        ipcbuf_va: TP_WORKER_IPCBUF_VA,
+        tramp_va: TP_WORKER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: tp_worker_stack_mirror_va(pi),
+        fault_ep: worker_ep,
+        cid_proc,
+        cid_thread,
+        resume,
+        prio: 106,
+        native: true,
+        diag: false,
+    })
+}
+
 /// Spawn services' REAL RPC listener thread (ScmStartRpcServer's rpcrt4 io_thread) in services'
 /// VSpace (pi 3) and RESUME it into the main service-loop multiplex. Unlike `spawn_wl_listener_thread`
 /// (suspended, no-receiver EP), this one faults to a cap minted at [`SVC_LISTENER_BADGE`] off the MAIN
