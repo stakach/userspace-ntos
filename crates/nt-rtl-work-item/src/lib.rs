@@ -509,6 +509,15 @@ impl PoolCounters {
         }
     }
 
+    pub const fn total_requests(&self) -> u32 {
+        self.normal_requests.saturating_add(self.io_requests)
+    }
+
+    pub const fn total_long_requests(&self) -> u32 {
+        self.normal_long_requests
+            .saturating_add(self.io_long_requests)
+    }
+
     /// Reserves counters and couples that reservation to the effective packet being queued.
     pub fn reserve(
         &mut self,
@@ -677,6 +686,342 @@ impl WorkerStartLatch {
 }
 
 impl Default for WorkerStartLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub const MAX_COMPLETION_WORKERS: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerRole {
+    Scheduler,
+    Completion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerId {
+    role: WorkerRole,
+    slot: u8,
+    generation: u32,
+}
+
+impl WorkerId {
+    pub const fn role(self) -> WorkerRole {
+        self.role
+    }
+
+    pub const fn slot(self) -> u8 {
+        self.slot
+    }
+
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerState {
+    Free,
+    Starting,
+    Running,
+    Stopping,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrowthReason {
+    Bootstrap,
+    Backlog,
+    LongIsolation,
+    PersistentFloor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartReservation {
+    pub id: WorkerId,
+    pub reason: GrowthReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsureWorker {
+    Ready,
+    Start(StartReservation),
+    WaitForStart,
+    CapacityReached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartResult {
+    Running(WorkerId),
+    Failed { status: u32, usable_workers: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FleetError {
+    StaleWorker,
+    InvalidTransition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopDecision {
+    Stop,
+    KeepMinimum,
+    Busy,
+    Persistent,
+    AlreadyStopping,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerSlot {
+    state: WorkerState,
+    generation: u32,
+}
+
+impl WorkerSlot {
+    const fn new() -> Self {
+        Self {
+            state: WorkerState::Free,
+            generation: 0,
+        }
+    }
+
+    fn reserve(&mut self, role: WorkerRole, slot: usize, reason: GrowthReason) -> StartReservation {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        self.state = WorkerState::Starting;
+        StartReservation {
+            id: WorkerId {
+                role,
+                slot: slot as u8,
+                generation: self.generation,
+            },
+            reason,
+        }
+    }
+}
+
+/// Bounded policy for a dedicated timer/wait scheduler and a shared completion-worker fleet.
+/// Native thread creation remains the responsibility of the target adapter.
+#[derive(Debug, Eq, PartialEq)]
+pub struct WorkerFleet {
+    scheduler: WorkerSlot,
+    completion: [WorkerSlot; MAX_COMPLETION_WORKERS],
+    persistent_floor: bool,
+}
+
+impl WorkerFleet {
+    pub const fn new() -> Self {
+        Self {
+            scheduler: WorkerSlot::new(),
+            completion: [WorkerSlot::new(); MAX_COMPLETION_WORKERS],
+            persistent_floor: false,
+        }
+    }
+
+    pub fn ensure_scheduler(&mut self) -> EnsureWorker {
+        match self.scheduler.state {
+            WorkerState::Free => EnsureWorker::Start(self.scheduler.reserve(
+                WorkerRole::Scheduler,
+                0,
+                GrowthReason::Bootstrap,
+            )),
+            WorkerState::Starting | WorkerState::Stopping => EnsureWorker::WaitForStart,
+            WorkerState::Running => EnsureWorker::Ready,
+        }
+    }
+
+    pub fn ensure_completion(
+        &mut self,
+        flags: WorkItemFlags,
+        counters: &PoolCounters,
+    ) -> EnsureWorker {
+        let persistent = flags.intersects(
+            WorkItemFlags::EXECUTE_IN_PERSISTENT_THREAD
+                .with(WorkItemFlags::EXECUTE_IN_PERSISTENT_IO_THREAD),
+        );
+        let running = self.completion_running();
+        let starting = self.completion_starting();
+        if running == 0 {
+            if starting != 0 || self.completion_stopping() != 0 {
+                return EnsureWorker::WaitForStart;
+            }
+            let reason = if persistent {
+                GrowthReason::PersistentFloor
+            } else {
+                GrowthReason::Bootstrap
+            };
+            return self.reserve_completion(reason);
+        }
+
+        let provisioned = running.saturating_add(starting);
+        let requests = counters.total_requests();
+        let long_requests = counters.total_long_requests();
+        let reason = if requests > long_requests && long_requests >= u32::from(provisioned) {
+            Some(GrowthReason::LongIsolation)
+        } else if requests > u32::from(provisioned) {
+            Some(GrowthReason::Backlog)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) if usize::from(provisioned) < MAX_COMPLETION_WORKERS => {
+                self.reserve_completion(reason)
+            }
+            Some(_) => EnsureWorker::CapacityReached,
+            None => EnsureWorker::Ready,
+        }
+    }
+
+    pub fn finish_start(
+        &mut self,
+        reservation: StartReservation,
+        status: u32,
+    ) -> Result<StartResult, FleetError> {
+        // `status` must be the terminal result of the complete WorkerStart handshake, not an
+        // intermediate status such as STATUS_PENDING.
+        {
+            let slot = self.slot_mut(reservation.id)?;
+            if slot.state != WorkerState::Starting {
+                return Err(FleetError::InvalidTransition);
+            }
+            if nt_success(status) {
+                slot.state = WorkerState::Running;
+                return Ok(StartResult::Running(reservation.id));
+            }
+            slot.state = WorkerState::Free;
+        }
+        let usable_workers = match reservation.id.role {
+            WorkerRole::Scheduler => u8::from(self.scheduler.state == WorkerState::Running),
+            WorkerRole::Completion => self.completion_running(),
+        };
+        Ok(StartResult::Failed {
+            status,
+            usable_workers,
+        })
+    }
+
+    /// Commits the sticky minimum required by an accepted persistent work item. Callers must only
+    /// invoke this after the corresponding packet has been successfully queued.
+    pub fn commit_persistent_floor(&mut self) {
+        self.persistent_floor = true;
+    }
+
+    /// Applies idle-retirement policy. The scheduler is process-lifetime infrastructure and is
+    /// never retired through this completion-worker policy.
+    pub fn request_stop(
+        &mut self,
+        id: WorkerId,
+        counters: &PoolCounters,
+    ) -> Result<StopDecision, FleetError> {
+        let state = self.slot(id)?.state;
+        if state == WorkerState::Stopping {
+            return Ok(StopDecision::AlreadyStopping);
+        }
+        if state != WorkerState::Running {
+            return Err(FleetError::InvalidTransition);
+        }
+        if id.role == WorkerRole::Scheduler {
+            return Ok(StopDecision::Persistent);
+        }
+        if counters.total_requests() != 0 {
+            return Ok(StopDecision::Busy);
+        }
+        let provisioned = self
+            .completion_running()
+            .saturating_add(self.completion_starting());
+        if provisioned <= 1 {
+            return Ok(if self.persistent_floor {
+                StopDecision::Persistent
+            } else {
+                StopDecision::KeepMinimum
+            });
+        }
+        self.slot_mut(id)?.state = WorkerState::Stopping;
+        Ok(StopDecision::Stop)
+    }
+
+    pub fn finish_stop(&mut self, id: WorkerId) -> Result<(), FleetError> {
+        let slot = self.slot_mut(id)?;
+        if slot.state != WorkerState::Stopping {
+            return Err(FleetError::InvalidTransition);
+        }
+        slot.state = WorkerState::Free;
+        Ok(())
+    }
+
+    pub const fn scheduler_state(&self) -> WorkerState {
+        self.scheduler.state
+    }
+
+    pub fn completion_running(&self) -> u8 {
+        self.completion
+            .iter()
+            .filter(|slot| slot.state == WorkerState::Running)
+            .count() as u8
+    }
+
+    pub fn completion_starting(&self) -> u8 {
+        self.completion
+            .iter()
+            .filter(|slot| slot.state == WorkerState::Starting)
+            .count() as u8
+    }
+
+    pub fn state(&self, id: WorkerId) -> Result<WorkerState, FleetError> {
+        Ok(self.slot(id)?.state)
+    }
+
+    fn completion_stopping(&self) -> u8 {
+        self.completion
+            .iter()
+            .filter(|slot| slot.state == WorkerState::Stopping)
+            .count() as u8
+    }
+
+    fn reserve_completion(&mut self, reason: GrowthReason) -> EnsureWorker {
+        let Some((slot_index, slot)) = self
+            .completion
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.state == WorkerState::Free)
+        else {
+            return EnsureWorker::CapacityReached;
+        };
+        EnsureWorker::Start(slot.reserve(WorkerRole::Completion, slot_index, reason))
+    }
+
+    fn slot(&self, id: WorkerId) -> Result<&WorkerSlot, FleetError> {
+        let slot = match id.role {
+            WorkerRole::Scheduler if id.slot == 0 => &self.scheduler,
+            WorkerRole::Scheduler => return Err(FleetError::StaleWorker),
+            WorkerRole::Completion => self
+                .completion
+                .get(usize::from(id.slot))
+                .ok_or(FleetError::StaleWorker)?,
+        };
+        (slot.generation == id.generation)
+            .then_some(slot)
+            .ok_or(FleetError::StaleWorker)
+    }
+
+    fn slot_mut(&mut self, id: WorkerId) -> Result<&mut WorkerSlot, FleetError> {
+        let slot = match id.role {
+            WorkerRole::Scheduler if id.slot == 0 => &mut self.scheduler,
+            WorkerRole::Scheduler => return Err(FleetError::StaleWorker),
+            WorkerRole::Completion => self
+                .completion
+                .get_mut(usize::from(id.slot))
+                .ok_or(FleetError::StaleWorker)?,
+        };
+        (slot.generation == id.generation)
+            .then_some(slot)
+            .ok_or(FleetError::StaleWorker)
+    }
+}
+
+impl Default for WorkerFleet {
     fn default() -> Self {
         Self::new()
     }
@@ -1289,5 +1634,298 @@ mod tests {
             ]
         );
         assert_eq!(counters, PoolCounters::default());
+    }
+
+    fn reservation(result: EnsureWorker) -> StartReservation {
+        let EnsureWorker::Start(reservation) = result else {
+            panic!("expected a worker start reservation, got {result:?}");
+        };
+        reservation
+    }
+
+    fn finish_worker(fleet: &mut WorkerFleet, reservation: StartReservation) -> WorkerId {
+        let StartResult::Running(id) = fleet
+            .finish_start(reservation, STATUS_SUCCESS)
+            .expect("valid start reservation")
+        else {
+            panic!("successful status did not start the worker");
+        };
+        id
+    }
+
+    #[test]
+    fn scheduler_and_completion_use_independent_slot_zero() {
+        let mut fleet = WorkerFleet::new();
+        let scheduler = reservation(fleet.ensure_scheduler());
+        assert_eq!(scheduler.id.role(), WorkerRole::Scheduler);
+        assert_eq!(scheduler.id.slot(), 0);
+        assert_eq!(fleet.ensure_scheduler(), EnsureWorker::WaitForStart);
+        finish_worker(&mut fleet, scheduler);
+        assert_eq!(fleet.ensure_scheduler(), EnsureWorker::Ready);
+
+        let completion = reservation(
+            fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &PoolCounters::new()),
+        );
+        assert_eq!(completion.id.role(), WorkerRole::Completion);
+        assert_eq!(completion.id.slot(), 0);
+        assert_eq!(fleet.scheduler_state(), WorkerState::Running);
+    }
+
+    #[test]
+    fn starting_without_running_blocks_another_submission() {
+        let mut fleet = WorkerFleet::new();
+        let counters = PoolCounters::new();
+        let _first =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+
+        assert_eq!(
+            fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters),
+            EnsureWorker::WaitForStart
+        );
+    }
+
+    #[test]
+    fn short_work_reuses_running_worker_but_backlog_grows_to_capacity() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let _one = counters
+            .reserve(
+                1,
+                WorkItemPacket::new(1, 1, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let first = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(first.reason, GrowthReason::Bootstrap);
+        assert_eq!(finish_worker(&mut fleet, first).slot(), 0);
+        assert_eq!(
+            fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters),
+            EnsureWorker::Ready
+        );
+
+        let _two = counters
+            .reserve(
+                2,
+                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let second =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(second.reason, GrowthReason::Backlog);
+        assert_eq!(finish_worker(&mut fleet, second).slot(), 1);
+
+        let _three = counters
+            .reserve(
+                3,
+                WorkItemPacket::new(1, 3, WorkItemFlags::EXECUTE_IN_IO_THREAD, 0),
+            )
+            .unwrap();
+        let third =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_IN_IO_THREAD, &counters));
+        assert_eq!(finish_worker(&mut fleet, third).slot(), 2);
+
+        let _four = counters
+            .reserve(
+                4,
+                WorkItemPacket::new(1, 4, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters),
+            EnsureWorker::CapacityReached
+        );
+    }
+
+    #[test]
+    fn short_work_behind_long_callback_grows_for_isolation() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let long_flags = WorkItemFlags::EXECUTE_LONG_FUNCTION;
+        let _long = counters
+            .reserve(1, WorkItemPacket::new(1, 1, long_flags, 0))
+            .unwrap();
+        let first = reservation(fleet.ensure_completion(long_flags, &counters));
+        finish_worker(&mut fleet, first);
+
+        let _short = counters
+            .reserve(
+                2,
+                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let second =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(second.reason, GrowthReason::LongIsolation);
+    }
+
+    #[test]
+    fn persistent_work_protects_the_last_completion_worker() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let persistent = WorkItemFlags::EXECUTE_IN_PERSISTENT_THREAD;
+        let one = counters
+            .reserve(1, WorkItemPacket::new(1, 1, persistent, 0))
+            .unwrap();
+        let first = reservation(fleet.ensure_completion(persistent, &counters));
+        assert_eq!(first.reason, GrowthReason::PersistentFloor);
+        let first_id = finish_worker(&mut fleet, first);
+        assert_eq!(
+            fleet.request_stop(first_id, &counters),
+            Ok(StopDecision::Busy)
+        );
+        drive_execution(
+            one.commit_queue_success().dequeue().begin_execution(),
+            STATUS_SUCCESS,
+            &mut counters,
+        );
+        fleet.commit_persistent_floor();
+        assert_eq!(
+            fleet.request_stop(first_id, &counters),
+            Ok(StopDecision::Persistent)
+        );
+
+        let two = counters
+            .reserve(
+                2,
+                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let three = counters
+            .reserve(
+                3,
+                WorkItemPacket::new(1, 3, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let second =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        let second_id = finish_worker(&mut fleet, second);
+        two.queue_failed(&mut counters).unwrap();
+        three.queue_failed(&mut counters).unwrap();
+        assert_eq!(
+            fleet.request_stop(second_id, &counters),
+            Ok(StopDecision::Stop)
+        );
+    }
+
+    #[test]
+    fn failed_start_releases_slot_and_rejects_stale_generation() {
+        let mut fleet = WorkerFleet::new();
+        let counters = PoolCounters::new();
+        let old = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(
+            fleet.finish_start(old, 0xC000_009A),
+            Ok(StartResult::Failed {
+                status: 0xC000_009A,
+                usable_workers: 0
+            })
+        );
+        let replacement =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(replacement.id.slot(), old.id.slot());
+        assert_ne!(replacement.id.generation(), old.id.generation());
+        assert_eq!(
+            fleet.finish_start(old, STATUS_SUCCESS),
+            Err(FleetError::StaleWorker)
+        );
+        finish_worker(&mut fleet, replacement);
+    }
+
+    #[test]
+    fn failed_persistent_start_does_not_commit_retirement_floor() {
+        let mut fleet = WorkerFleet::new();
+        let counters = PoolCounters::new();
+        let failed = reservation(
+            fleet.ensure_completion(WorkItemFlags::EXECUTE_IN_PERSISTENT_THREAD, &counters),
+        );
+        fleet.finish_start(failed, 0xC000_009A).unwrap();
+
+        let replacement =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        let replacement_id = finish_worker(&mut fleet, replacement);
+        assert_eq!(
+            fleet.request_stop(replacement_id, &counters),
+            Ok(StopDecision::KeepMinimum)
+        );
+    }
+
+    #[test]
+    fn failed_growth_preserves_an_existing_usable_worker() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let _one = counters
+            .reserve(
+                1,
+                WorkItemPacket::new(1, 1, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let first = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        finish_worker(&mut fleet, first);
+        let _two = counters
+            .reserve(
+                2,
+                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let growth =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(
+            fleet.finish_start(growth, 0xC000_009A),
+            Ok(StartResult::Failed {
+                status: 0xC000_009A,
+                usable_workers: 1
+            })
+        );
+    }
+
+    #[test]
+    fn stopped_slot_is_reused_only_after_two_phase_exit() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let one = counters
+            .reserve(
+                1,
+                WorkItemPacket::new(1, 1, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let initial =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        finish_worker(&mut fleet, initial);
+        let two = counters
+            .reserve(
+                2,
+                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let retiring =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        let old_id = finish_worker(&mut fleet, retiring);
+        one.queue_failed(&mut counters).unwrap();
+        two.queue_failed(&mut counters).unwrap();
+        assert_eq!(
+            fleet.request_stop(old_id, &counters),
+            Ok(StopDecision::Stop)
+        );
+        assert_eq!(
+            fleet.request_stop(old_id, &counters),
+            Ok(StopDecision::AlreadyStopping)
+        );
+        assert_eq!(fleet.state(old_id), Ok(WorkerState::Stopping));
+        fleet.finish_stop(old_id).unwrap();
+        let _next_one = counters
+            .reserve(
+                3,
+                WorkItemPacket::new(1, 3, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let _next_two = counters
+            .reserve(
+                4,
+                WorkItemPacket::new(1, 4, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let replacement =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(replacement.id.slot(), old_id.slot());
+        assert_ne!(replacement.id.generation(), old_id.generation());
+        assert_eq!(fleet.finish_stop(old_id), Err(FleetError::StaleWorker));
     }
 }
