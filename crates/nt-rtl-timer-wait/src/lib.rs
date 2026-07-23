@@ -571,6 +571,10 @@ pub mod timer {
 pub mod registered_wait {
     use super::*;
 
+    pub const STATUS_WAIT_0: u32 = 0;
+    pub const STATUS_USER_APC: u32 = 0x0000_00C0;
+    pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
+
     const WAIT_WORK_FLAGS: u32 = WorkItemFlags::EXECUTE_IN_IO_THREAD.bits()
         | WorkItemFlags::EXECUTE_LONG_FUNCTION.bits()
         | WorkItemFlags::EXECUTE_IN_PERSISTENT_THREAD.bits()
@@ -601,6 +605,136 @@ pub mod registered_wait {
         Timeout,
         UserApc,
         Failed(u32),
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct WaitSetEntry {
+        pub token: u64,
+        pub object: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum WaitSetOutcome {
+        Wake,
+        Cancel(u64),
+        Object(u64),
+        Timeout,
+        UserApc,
+        Failed(u32),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum WaitSetError {
+        Capacity,
+        OutputTooSmall,
+    }
+
+    /// Stable WaitAny layout for one scheduler wake event followed by registered objects.
+    pub struct WaitSet<const N: usize> {
+        entries: [WaitSetEntry; N],
+        len: usize,
+    }
+
+    impl<const N: usize> WaitSet<N> {
+        pub const fn new() -> Self {
+            Self {
+                entries: [WaitSetEntry {
+                    token: 0,
+                    object: 0,
+                }; N],
+                len: 0,
+            }
+        }
+
+        pub const fn len(&self) -> usize {
+            self.len
+        }
+
+        pub const fn handle_count(&self) -> usize {
+            1 + self.len
+        }
+
+        pub fn push(&mut self, entry: WaitSetEntry) -> Result<(), WaitSetError> {
+            if self.len == N {
+                return Err(WaitSetError::Capacity);
+            }
+            self.entries[self.len] = entry;
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn write_handles(
+            &self,
+            wake_event: u64,
+            output: &mut [u64],
+        ) -> Result<usize, WaitSetError> {
+            let count = self.handle_count();
+            if output.len() < count {
+                return Err(WaitSetError::OutputTooSmall);
+            }
+            output[0] = wake_event;
+            for (index, entry) in self.entries[..self.len].iter().enumerate() {
+                output[1 + index] = entry.object;
+            }
+            Ok(count)
+        }
+
+        pub const fn decode_status(&self, status: u32) -> WaitSetOutcome {
+            if status == STATUS_TIMEOUT {
+                return WaitSetOutcome::Timeout;
+            }
+            if status == STATUS_USER_APC {
+                return WaitSetOutcome::UserApc;
+            }
+            let index = status.wrapping_sub(STATUS_WAIT_0) as usize;
+            if index == 0 {
+                return WaitSetOutcome::Wake;
+            }
+            let entry_index = index - 1;
+            if entry_index < self.len {
+                WaitSetOutcome::Object(self.entries[entry_index].token)
+            } else {
+                WaitSetOutcome::Failed(status)
+            }
+        }
+    }
+
+    impl<const N: usize> Default for WaitSet<N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct WaitDeadline {
+        timeout_ms: u32,
+        deadline_ms: u64,
+    }
+
+    impl WaitDeadline {
+        pub const fn new(now_ms: u64, timeout_ms: u32) -> Self {
+            Self {
+                timeout_ms,
+                deadline_ms: now_ms.saturating_add(timeout_ms as u64),
+            }
+        }
+
+        pub const fn remaining(self, now_ms: u64) -> Option<u32> {
+            if self.timeout_ms == u32::MAX {
+                None
+            } else {
+                let remaining = self.deadline_ms.saturating_sub(now_ms);
+                Some(if remaining > u32::MAX as u64 {
+                    u32::MAX
+                } else {
+                    remaining as u32
+                })
+            }
+        }
+
+        pub fn rearm(&mut self, now_ms: u64) {
+            self.deadline_ms = now_ms.saturating_add(self.timeout_ms as u64);
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1176,6 +1310,74 @@ mod tests {
         let mut io = wait(WorkItemFlags::EXECUTE_IN_IO_THREAD);
         io.worker_started().unwrap();
         assert!(io.wait_request().unwrap().alertable);
+    }
+
+    #[test]
+    fn multiplexed_wait_set_preserves_object_tokens_and_bounds_output() {
+        let mut set = WaitSet::<2>::new();
+        set.push(WaitSetEntry {
+            token: 0x101,
+            object: 0x20,
+        })
+        .unwrap();
+        set.push(WaitSetEntry {
+            token: 0x202,
+            object: 0x30,
+        })
+        .unwrap();
+        assert_eq!(
+            set.push(WaitSetEntry {
+                token: 0x303,
+                object: 0x40,
+            }),
+            Err(WaitSetError::Capacity)
+        );
+
+        let mut handles = [0u64; 3];
+        assert_eq!(set.write_handles(0x10, &mut handles), Ok(3));
+        assert_eq!(handles, [0x10, 0x20, 0x30]);
+        assert_eq!(set.decode_status(STATUS_WAIT_0), WaitSetOutcome::Wake);
+        assert_eq!(
+            set.decode_status(STATUS_WAIT_0 + 1),
+            WaitSetOutcome::Object(0x101)
+        );
+        assert_eq!(
+            set.decode_status(STATUS_WAIT_0 + 2),
+            WaitSetOutcome::Object(0x202)
+        );
+        assert_eq!(
+            set.decode_status(STATUS_WAIT_0 + 3),
+            WaitSetOutcome::Failed(3)
+        );
+        assert_eq!(
+            WaitSet::<1>::new().write_handles(0x10, &mut []),
+            Err(WaitSetError::OutputTooSmall)
+        );
+    }
+
+    #[test]
+    fn multiplexed_wait_set_decodes_timeout_apc_and_failure() {
+        let set = WaitSet::<1>::new();
+        assert_eq!(set.decode_status(STATUS_TIMEOUT), WaitSetOutcome::Timeout);
+        assert_eq!(set.decode_status(STATUS_USER_APC), WaitSetOutcome::UserApc);
+        assert_eq!(
+            set.decode_status(STATUS_INVALID_PARAMETER),
+            WaitSetOutcome::Failed(STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn registered_wait_deadline_rearms_relative_timeout_and_keeps_infinite() {
+        let mut finite = WaitDeadline::new(100, 25);
+        assert_eq!(finite.remaining(100), Some(25));
+        assert_eq!(finite.remaining(130), Some(0));
+        finite.rearm(200);
+        assert_eq!(finite.remaining(210), Some(15));
+
+        let mut infinite = WaitDeadline::new(100, u32::MAX);
+        assert_eq!(infinite.remaining(100), None);
+        infinite.rearm(u64::MAX - 10);
+        assert_eq!(infinite.remaining(u64::MAX), None);
     }
 
     #[test]
