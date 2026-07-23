@@ -2283,20 +2283,6 @@ impl ExecNtHandler {
         0
     }
 
-    fn serialize_sid(sid: &nt_security::Sid, output: &mut [u8]) -> Option<usize> {
-        let count = u8::try_from(sid.sub_authorities.len()).ok()?;
-        let length = 8usize.checked_add(sid.sub_authorities.len().checked_mul(4)?)?;
-        let output = output.get_mut(..length)?;
-        output[0] = sid.revision;
-        output[1] = count;
-        output[2..8].copy_from_slice(&sid.identifier_authority);
-        for (index, authority) in sid.sub_authorities.iter().enumerate() {
-            let offset = 8 + index * 4;
-            output[offset..offset + 4].copy_from_slice(&authority.to_le_bytes());
-        }
-        Some(length)
-    }
-
     pub(crate) unsafe fn nt_open_process_token(
         &mut self,
         process_handle: u64,
@@ -7480,12 +7466,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(token) => token,
                     None => return 0xC000_0008,
                 };
-                let mut output = [0u8; 4 + 24 * 12];
+                // The modeled tokens have a 500-byte dynamic charge, which bounds a replacement
+                // default ACL query to 500 bytes including its pointer.
+                let mut output = [0u8; 512];
                 let needed = match class {
                     1 => {
                         // TOKEN_USER: aligned SID_AND_ATTRIBUTES followed by the user SID.
-                        let sid_length = Self::serialize_sid(&token.user, &mut output[16..])
-                            .unwrap_or(0);
+                        let sid_length = token.user.write_native(&mut output[16..]).unwrap_or(0);
                         output[..8].copy_from_slice(&buf.wrapping_add(16).to_le_bytes());
                         16 + sid_length
                     }
@@ -7506,12 +7493,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                         4 + token.privileges.len() * 12
                     }
+                    4 => {
+                        // TOKEN_OWNER: pointer followed immediately by the current owner SID.
+                        match nt_security::encode_token_owner(token, buf, &mut output) {
+                            Ok(encoded) => encoded.required_length,
+                            Err(_) => return 0xC000_0078, // STATUS_INVALID_SID
+                        }
+                    }
                     5 => {
                         // TOKEN_PRIMARY_GROUP: pointer followed immediately by the SID.
                         let sid_length =
-                            Self::serialize_sid(&token.primary_group, &mut output[8..]).unwrap_or(0);
+                            token.primary_group.write_native(&mut output[8..]).unwrap_or(0);
                         output[..8].copy_from_slice(&buf.wrapping_add(8).to_le_bytes());
                         8 + sid_length
+                    }
+                    6 => {
+                        // TOKEN_DEFAULT_DACL: null pointer or in-buffer lossless native ACL.
+                        nt_security::encode_token_default_dacl(token, buf, &mut output)
+                            .required_length
                     }
                     8 => {
                         output[..4].copy_from_slice(&(token.token_type as u32).to_le_bytes());
@@ -7524,6 +7523,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                         output[..4]
                             .copy_from_slice(&(token.impersonation_level as u32).to_le_bytes());
                         4
+                    }
+                    10 => {
+                        let statistics = match self.token_store.statistics(token_id) {
+                            Some(statistics) => statistics,
+                            None => return 0xC000_0008,
+                        };
+                        nt_security::encode_token_statistics(statistics, &mut output)
+                            .required_length
                     }
                     _ => return STATUS_INVALID_INFO_CLASS,
                 };
