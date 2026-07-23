@@ -1798,7 +1798,6 @@ impl ExecNtHandler {
 
     unsafe fn nt_copy_virtual_memory(&mut self, args: &[u64], read: bool) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
         const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
         const PROCESS_VM_READ: u32 = 0x0010;
         const PROCESS_VM_WRITE: u32 = 0x0020;
@@ -1815,9 +1814,6 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
         if count_ptr != 0 {
-            if count_ptr & 7 != 0 {
-                return STATUS_DATATYPE_MISALIGNMENT;
-            }
             if !self.probe_user_output(count_ptr, 8) {
                 return STATUS_ACCESS_VIOLATION;
             }
@@ -1878,6 +1874,11 @@ impl ExecNtHandler {
         } else {
             (&(*ctx.pfilled)[target_pi], procs[target_pi].faults as usize)
         };
+        let target_vm = core::ptr::read(
+            (core::ptr::addr_of!(PROCESS_VM_REGIONS)
+                as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+                .add(target_pi),
+        );
 
         let mut transferred = 0u64;
         let mut buffer = [0u8; 256];
@@ -1890,7 +1891,15 @@ impl ExecNtHandler {
                 .min(buffer.len() as u64)
                 .min(remote_page as u64)
                 .min(local_page as u64) as usize;
-            let copied = if read {
+            let private_extent = target_vm.extent_at(remote_address);
+            let protection_allows = private_extent.is_none()
+                || if read {
+                    target_vm.permits_read(remote_address)
+                } else {
+                    target_vm.permits_write(remote_address)
+                };
+            let copied = protection_allows
+                && if read {
                 client_copyin_process_mapped(
                     target_pi as u64,
                     remote_address,
@@ -1914,7 +1923,7 @@ impl ExecNtHandler {
                             target.scratch_base,
                         )
                     }
-            };
+                };
             if !copied {
                 break;
             }
@@ -1932,7 +1941,6 @@ impl ExecNtHandler {
 
     unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
         const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
@@ -1944,9 +1952,6 @@ impl ExecNtHandler {
         }
         let base_ptr = args[1];
         let size_ptr = args[2];
-        if base_ptr & 7 != 0 || size_ptr & 3 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
         if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 4) {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -1979,7 +1984,6 @@ impl ExecNtHandler {
         }) {
             return nt_process::STATUS_PROCESS_IS_TERMINATING;
         }
-        let ctx = self.loop_ctx.unwrap();
         let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
             as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
             .add(target_pi);
@@ -5134,17 +5138,46 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let class = args[1]; // ProcessInformationClass
                 let buf = args[2]; // R8 = ProcessInformation buffer (a stack local)
                 if class == 0 {
-                    // ProcessBasicInformation — PROCESS_BASIC_INFORMATION (x64, 48 bytes). Both
-                    // processes' PEB is at PEB_VA (own VSpace).
-                    smss_stack_write(buf + 0x00, 0); // ExitStatus (running)
-                    smss_stack_write(buf + 0x08, PEB_VA); // PebBaseAddress
-                    smss_stack_write(buf + 0x10, 1); // AffinityMask
-                    smss_stack_write(buf + 0x18, 13); // BasePriority
-                    smss_stack_write(buf + 0x20, (self.pi as u64 + 1) * 0x100); // UniqueProcessId (fake)
-                    smss_stack_write(buf + 0x28, 0); // InheritedFromUniqueProcessId
+                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+                    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                    if args[3] != 48 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
                     let retlen = args[4]; // *ReturnLength
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 48);
+                    if buf == 0
+                        || !self.probe_user_output(buf, 48)
+                        || retlen != 0 && !self.probe_user_output(retlen, 4)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    let (pid, _) =
+                        match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
+                            Ok(target) => target,
+                            Err(status) => return status,
+                        };
+                    let process = match self.pm.process(pid) {
+                        Some(process) => process,
+                        None => return nt_process::STATUS_INVALID_HANDLE,
+                    };
+                    let mut information = [0u8; 48];
+                    information[0..4]
+                        .copy_from_slice(&process.exit_status.unwrap_or(0).to_le_bytes());
+                    let peb = if self.loop_ctx.is_some() {
+                        SMSS_PEB_VA
+                    } else {
+                        PEB_VA
+                    };
+                    information[8..16].copy_from_slice(&peb.to_le_bytes());
+                    information[16..24].copy_from_slice(&1u64.to_le_bytes()); // AffinityMask
+                    information[24..28].copy_from_slice(&13i32.to_le_bytes()); // BasePriority
+                    information[32..40].copy_from_slice(&(pid as u64).to_le_bytes());
+                    information[40..48]
+                        .copy_from_slice(&(process.parent.unwrap_or(0) as u64).to_le_bytes());
+                    if !self.xas_try_write_buf(buf, &information) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if retlen != 0 && !self.xas_write_u32(retlen, 48) {
+                        return STATUS_ACCESS_VIOLATION;
                     }
                     0
                 } else if class == 29 {
@@ -7986,13 +8019,22 @@ impl NativeSyscallHandler for ExecNtHandler {
             // the target process's range; newly committed pages are mapped into that target PML4.
             NativeService::NtAllocateVirtualMemory => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+                const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
                 const PROCESS_VM_OPERATION: u32 = 0x0008;
+                const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
                 let ctx = self.loop_ctx.unwrap();
                 let base_ptr = args[1]; // RDX
                 let size_ptr = args[3]; // R9
-                if base_ptr & 7 != 0 || size_ptr & 7 != 0 {
-                    return STATUS_DATATYPE_MISALIGNMENT;
+                let zero_bits = args[2];
+                let allocation_type = args[4] as u32;
+                let protection = args[5] as u32;
+                if let Err(status) = nt_address_space::validate_allocate_parameters(
+                    zero_bits,
+                    allocation_type,
+                    protection,
+                ) {
+                    return status;
                 }
                 if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 8) {
                     return STATUS_ACCESS_VIOLATION;
@@ -8006,11 +8048,57 @@ impl NativeSyscallHandler for ExecNtHandler {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let want = u64::from_le_bytes(word);
-                let (_, target_pi) =
+                if base_in > HIGHEST_VAD_ADDRESS {
+                    return nt_address_space::STATUS_INVALID_PARAMETER_2;
+                }
+                if HIGHEST_VAD_ADDRESS + 1 - base_in < want || want == 0 {
+                    return nt_address_space::STATUS_INVALID_PARAMETER_4;
+                }
+                let (target_pid, target_pi) =
                     match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
                         Ok(target) => target,
                         Err(status) => return status,
                     };
+                if self.pm.process(target_pid).is_some_and(|process| {
+                    matches!(
+                        process.state,
+                        nt_process::ProcessState::Exiting
+                            | nt_process::ProcessState::Terminated
+                    )
+                }) {
+                    return nt_process::STATUS_PROCESS_IS_TERMINATING;
+                }
+                if allocation_type & nt_address_space::MEM_LARGE_PAGES != 0 {
+                    if !self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY) {
+                        return STATUS_PRIVILEGE_NOT_HELD;
+                    }
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if allocation_type
+                    & (nt_address_space::MEM_PHYSICAL | nt_address_space::MEM_WRITE_WATCH)
+                    != 0
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let copy_on_write = matches!(
+                    protection & 0xff,
+                    nt_address_space::PAGE_WRITECOPY
+                        | nt_address_space::PAGE_EXECUTE_WRITECOPY
+                );
+                let created_vad =
+                    base_in == 0 || allocation_type & nt_address_space::MEM_RESERVE != 0;
+                if created_vad && copy_on_write {
+                    return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+                }
+                let placement_limit = if base_in == 0 && zero_bits != 0 {
+                    let highest = u64::MAX >> zero_bits;
+                    if highest > HIGHEST_VAD_ADDRESS {
+                        return nt_address_space::STATUS_INVALID_PARAMETER_3;
+                    }
+                    PRIVATE_VM_LIMIT.min(highest + 1)
+                } else {
+                    PRIVATE_VM_LIMIT
+                };
                 let procs = &mut *ctx.procs;
                 let target = procs[target_pi];
                 if target.pml4 == 0 || target.scratch_base == 0 {
@@ -8021,15 +8109,22 @@ impl NativeSyscallHandler for ExecNtHandler {
                     .add(target_pi);
                 let before = core::ptr::read(vm_map);
                 let mut after = before;
-                let plan = match after.allocate(
+                let plan = match after.allocate_below(
                     (base_in != 0).then_some(base_in),
                     want,
-                    args[4] as u32,
-                    args[5] as u32,
+                    allocation_type,
+                    protection,
+                    placement_limit,
                 ) {
                     Ok(plan) => plan,
                     Err(status) => return status,
                 };
+                if !created_vad
+                    && allocation_type != nt_address_space::MEM_RESET
+                    && copy_on_write
+                {
+                    return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+                }
                 if self.pi == 2
                     && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
                 {
@@ -8121,9 +8216,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     return map_status;
                 }
                 core::ptr::write(vm_map, after);
-                if !self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes())
-                    || !self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes())
-                {
+                let size_written = self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes());
+                let base_written = self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes());
+                if !created_vad && (!size_written || !base_written) {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);

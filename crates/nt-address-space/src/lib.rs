@@ -38,13 +38,20 @@ pub const STATUS_FREE_VM_NOT_AT_BASE: u32 = 0xC000_009F;
 pub const STATUS_MEMORY_NOT_ALLOCATED: u32 = 0xC000_00A0;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+pub const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 pub const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 pub const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
+pub const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_DECOMMIT: u32 = 0x4000;
 pub const MEM_RELEASE: u32 = 0x8000;
+pub const MEM_RESET: u32 = 0x0008_0000;
+pub const MEM_TOP_DOWN: u32 = 0x0010_0000;
+pub const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+pub const MEM_PHYSICAL: u32 = 0x0040_0000;
+pub const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 
 // Page protection
 pub const PAGE_NOACCESS: u32 = 0x01;
@@ -66,25 +73,79 @@ fn valid_prot(p: u32) -> bool {
     matches!(p, PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE)
 }
 
-fn valid_private_vm_protection(protection: u32) -> bool {
+fn valid_allocate_protection(protection: u32) -> bool {
     const BASE_MASK: u32 = 0xff;
-    // Guard pages require a one-shot fault transition that this eager seL4 mapper cannot yet
-    // provide. Reject them instead of silently granting ordinary access.
-    const MODIFIER_MASK: u32 = PAGE_NOCACHE | PAGE_WRITECOMBINE;
+    const MODIFIER_MASK: u32 = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
     let base = protection & BASE_MASK;
     let valid_base = matches!(
         base,
         PAGE_NOACCESS
             | PAGE_READONLY
             | PAGE_READWRITE
+            | PAGE_WRITECOPY
             | PAGE_EXECUTE
             | PAGE_EXECUTE_READ
             | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
     );
     valid_base
         && protection & !(BASE_MASK | MODIFIER_MASK) == 0
         && !(base == PAGE_NOACCESS && protection & MODIFIER_MASK != 0)
-        && protection & (PAGE_NOCACHE | PAGE_WRITECOMBINE) != PAGE_NOCACHE | PAGE_WRITECOMBINE
+        && !(protection & PAGE_NOCACHE != 0
+            && protection & (PAGE_NOACCESS | PAGE_WRITECOMBINE) != 0)
+        && !(protection & PAGE_WRITECOMBINE != 0 && base == PAGE_NOACCESS)
+}
+
+/// Validate the argument-only part of ReactOS `NtAllocateVirtualMemory`, before user-pointer
+/// probing or process-handle lookup. Mechanism-dependent unsupported flags are rejected later,
+/// after the handle check, at the same point ReactOS rejects them.
+pub fn validate_allocate_parameters(
+    zero_bits: u64,
+    allocation_type: u32,
+    protection: u32,
+) -> Result<(), u32> {
+    const MI_MAX_ZERO_BITS: u64 = 53;
+    const ALLOWED: u32 = MEM_COMMIT
+        | MEM_RESERVE
+        | MEM_RESET
+        | MEM_PHYSICAL
+        | MEM_TOP_DOWN
+        | MEM_WRITE_WATCH
+        | MEM_LARGE_PAGES;
+
+    if zero_bits > MI_MAX_ZERO_BITS {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    if allocation_type & !ALLOWED != 0
+        || allocation_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET) == 0
+        || allocation_type & MEM_RESET != 0 && allocation_type != MEM_RESET
+    {
+        return Err(STATUS_INVALID_PARAMETER_5);
+    }
+    if allocation_type & MEM_LARGE_PAGES != 0 {
+        if allocation_type & MEM_COMMIT == 0
+            || allocation_type & (MEM_PHYSICAL | MEM_RESET | MEM_WRITE_WATCH) != 0
+        {
+            return Err(STATUS_INVALID_PARAMETER_5);
+        }
+    }
+    if allocation_type & MEM_WRITE_WATCH != 0 && allocation_type & MEM_RESERVE == 0 {
+        return Err(STATUS_INVALID_PARAMETER_5);
+    }
+    if allocation_type & MEM_PHYSICAL != 0 {
+        if allocation_type & MEM_RESERVE == 0
+            || allocation_type & !(MEM_RESERVE | MEM_TOP_DOWN | MEM_PHYSICAL) != 0
+        {
+            return Err(STATUS_INVALID_PARAMETER_5);
+        }
+        if protection != PAGE_READWRITE {
+            return Err(STATUS_INVALID_PARAMETER_6);
+        }
+    }
+    if !valid_allocate_protection(protection) {
+        return Err(STATUS_INVALID_PAGE_PROTECTION);
+    }
+    Ok(())
 }
 
 /// Reservation state for one private-memory extent.
@@ -162,6 +223,25 @@ impl<const N: usize> VmRegionMap<N> {
     pub fn is_committed(&self, address: u64) -> bool {
         self.extent_at(address)
             .is_some_and(|extent| extent.state == VmExtentState::Committed)
+    }
+
+    pub fn permits_read(&self, address: u64) -> bool {
+        self.extent_at(address).is_some_and(|extent| {
+            extent.state == VmExtentState::Committed
+                && extent.protection & PAGE_GUARD == 0
+                && extent.protection & 0xff != PAGE_NOACCESS
+        })
+    }
+
+    pub fn permits_write(&self, address: u64) -> bool {
+        self.extent_at(address).is_some_and(|extent| {
+            extent.state == VmExtentState::Committed
+                && extent.protection & PAGE_GUARD == 0
+                && matches!(
+                    extent.protection & 0xff,
+                    PAGE_READWRITE | PAGE_EXECUTE_READWRITE
+                )
+        })
     }
 
     fn align_up(value: u64, alignment: u64) -> Option<u64> {
@@ -251,11 +331,34 @@ impl<const N: usize> VmRegionMap<N> {
         self.extents[write..].fill(None);
     }
 
-    fn find_free(&self, size: u64) -> Option<u64> {
+    fn find_free_below(&self, size: u64, upper_bound: u64, top_down: bool) -> Option<u64> {
+        let upper_bound = upper_bound.min(self.upper_bound);
+        if top_down {
+            let mut candidate = upper_bound.checked_sub(size)? & !(ALLOCATION_GRANULARITY - 1);
+            loop {
+                if candidate < self.lower_bound {
+                    return None;
+                }
+                let end = candidate.checked_add(size)?;
+                let conflict = self
+                    .extents
+                    .iter()
+                    .flatten()
+                    .filter(|extent| candidate < extent.end() && extent.base < end)
+                    .map(|extent| extent.base)
+                    .min();
+                match conflict {
+                    Some(base) => {
+                        candidate = base.checked_sub(size)? & !(ALLOCATION_GRANULARITY - 1);
+                    }
+                    None => return Some(candidate),
+                }
+            }
+        }
         let mut candidate = Self::align_up(self.lower_bound, ALLOCATION_GRANULARITY)?;
         loop {
             let end = candidate.checked_add(size)?;
-            if end > self.upper_bound {
+            if end > upper_bound {
                 return None;
             }
             let mut next = None;
@@ -344,23 +447,61 @@ impl<const N: usize> VmRegionMap<N> {
         allocation_type: u32,
         protection: u32,
     ) -> Result<VmAllocatePlan, u32> {
-        if allocation_type & !(MEM_RESERVE | MEM_COMMIT) != 0
-            || allocation_type & (MEM_RESERVE | MEM_COMMIT) == 0
+        self.allocate_below(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            self.upper_bound,
+        )
+    }
+
+    /// Allocate beneath an optional `ZeroBits` ceiling. The syscall layer performs the ordered
+    /// argument validation first; this method owns range normalization and VAD mutation.
+    pub fn allocate_below(
+        &mut self,
+        requested_base: Option<u64>,
+        requested_size: u64,
+        allocation_type: u32,
+        protection: u32,
+        upper_bound: u64,
+    ) -> Result<VmAllocatePlan, u32> {
+        validate_allocate_parameters(0, allocation_type, protection)?;
+        let upper_bound = upper_bound.min(self.upper_bound);
+        if requested_base
+            .is_some_and(|address| address < self.lower_bound || address >= upper_bound)
         {
-            return Err(STATUS_INVALID_PARAMETER_5);
-        }
-        if !valid_private_vm_protection(protection) {
-            return Err(STATUS_INVALID_PAGE_PROTECTION);
-        }
-        if requested_base.is_some_and(|address| address >= self.upper_bound) {
-            return Err(STATUS_INVALID_PARAMETER_2);
+            return Err(STATUS_CONFLICTING_ADDRESSES);
         }
         let available = match requested_base {
-            Some(address) => self.upper_bound - address,
-            None => self.upper_bound,
+            Some(address) => upper_bound - address,
+            None => upper_bound,
         };
         if requested_size > available || requested_size == 0 {
             return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        if allocation_type == MEM_RESET && requested_base.is_some() {
+            let address = requested_base.unwrap();
+            let base = address & !(PAGE_SIZE - 1);
+            let end = Self::align_up(
+                address
+                    .checked_add(requested_size)
+                    .ok_or(STATUS_INVALID_PARAMETER_4)?,
+                PAGE_SIZE,
+            )
+            .ok_or(STATUS_INVALID_PARAMETER_4)?;
+            if !self
+                .extents
+                .iter()
+                .flatten()
+                .any(|extent| base < extent.end() && extent.base < end)
+            {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            return Ok(VmAllocatePlan {
+                base,
+                size: end - base,
+            });
         }
         if allocation_type & MEM_RESERVE != 0 || requested_base.is_none() {
             let (base, end) = match requested_base {
@@ -378,12 +519,14 @@ impl<const N: usize> VmRegionMap<N> {
                 None => {
                     let size = Self::align_up(requested_size, PAGE_SIZE)
                         .ok_or(STATUS_INVALID_PARAMETER_4)?;
-                    let base = self.find_free(size).ok_or(STATUS_NO_MEMORY)?;
+                    let base = self
+                        .find_free_below(size, upper_bound, allocation_type & MEM_TOP_DOWN != 0)
+                        .ok_or(STATUS_NO_MEMORY)?;
                     (base, base + size)
                 }
             };
-            if end > self.upper_bound || end <= base {
-                return Err(STATUS_INVALID_PARAMETER_4);
+            if end > upper_bound || end <= base {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
             }
             if base < self.lower_bound || self.overlaps(base, end) {
                 return Err(STATUS_CONFLICTING_ADDRESSES);
@@ -414,8 +557,8 @@ impl<const N: usize> VmRegionMap<N> {
                 PAGE_SIZE,
             )
             .ok_or(STATUS_INVALID_PARAMETER_4)?;
-            if end > self.upper_bound || end <= base {
-                return Err(STATUS_INVALID_PARAMETER_4);
+            if end > upper_bound || end <= base {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
             }
             if self.allocation_for_range(base, end).is_err() {
                 return Err(STATUS_CONFLICTING_ADDRESSES);

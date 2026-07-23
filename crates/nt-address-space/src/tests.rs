@@ -380,37 +380,35 @@ fn fixed_vm_map_null_commit_reserves_and_commit_updates_protection() {
     let reserved = map
         .allocate(None, 0x2000, MEM_RESERVE, PAGE_NOACCESS)
         .unwrap();
+    map.allocate(
+        Some(reserved.base),
+        0x1000,
+        MEM_COMMIT,
+        PAGE_READWRITE | PAGE_GUARD,
+    )
+    .unwrap();
     assert_eq!(
-        map.allocate(
-            Some(reserved.base),
-            0x1000,
-            MEM_COMMIT,
-            PAGE_READWRITE | PAGE_GUARD,
-        ),
-        Err(STATUS_INVALID_PAGE_PROTECTION)
+        map.extent_at(reserved.base).unwrap().protection,
+        PAGE_READWRITE | PAGE_GUARD
     );
     assert_eq!(
         map.allocate(None, 0x1000, MEM_COMMIT, 0x8000),
         Err(STATUS_INVALID_PAGE_PROTECTION)
     );
-    assert_eq!(
-        map.allocate(
-            Some(reserved.base + 0x1000),
-            0x1000,
-            MEM_COMMIT,
-            PAGE_WRITECOPY
-        ),
-        Err(STATUS_INVALID_PAGE_PROTECTION)
-    );
-    assert_eq!(
-        map.allocate(
-            None,
-            0x1000,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_EXECUTE_WRITECOPY
-        ),
-        Err(STATUS_INVALID_PAGE_PROTECTION)
-    );
+    map.allocate(
+        Some(reserved.base + 0x1000),
+        0x1000,
+        MEM_COMMIT,
+        PAGE_WRITECOPY,
+    )
+    .unwrap();
+    map.allocate(
+        None,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_WRITECOPY,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -478,7 +476,7 @@ fn fixed_vm_map_allocate_validation_matches_native_precedence() {
     );
     assert_eq!(
         map.allocate(Some(0x10_0000), 0, MEM_COMMIT, PAGE_READWRITE),
-        Err(STATUS_INVALID_PARAMETER_2)
+        Err(STATUS_CONFLICTING_ADDRESSES)
     );
     assert_eq!(
         map.allocate(None, 0x10_0000, MEM_COMMIT, PAGE_READWRITE),
@@ -488,4 +486,148 @@ fn fixed_vm_map_allocate_validation_matches_native_precedence() {
         map.allocate(None, 0x10_0001, MEM_COMMIT, PAGE_READWRITE),
         Err(STATUS_INVALID_PARAMETER_4)
     );
+}
+
+#[test]
+fn fixed_vm_allocate_argument_validation_matches_reactos_order() {
+    assert_eq!(
+        validate_allocate_parameters(54, 0, 0),
+        Err(STATUS_INVALID_PARAMETER_3)
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, 0, 0),
+        Err(STATUS_INVALID_PARAMETER_5)
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, MEM_RESET | MEM_COMMIT, PAGE_READWRITE),
+        Err(STATUS_INVALID_PARAMETER_5)
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, MEM_WRITE_WATCH | MEM_COMMIT, PAGE_READWRITE),
+        Err(STATUS_INVALID_PARAMETER_5)
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, MEM_PHYSICAL | MEM_RESERVE, PAGE_READONLY),
+        Err(STATUS_INVALID_PARAMETER_6)
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, MEM_COMMIT, PAGE_WRITECOPY),
+        Ok(())
+    );
+    assert_eq!(
+        validate_allocate_parameters(0, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE,),
+        Ok(())
+    );
+}
+
+#[test]
+fn fixed_vm_map_places_top_down_and_honors_zero_bits_ceiling() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let first = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(first.base, 0xF_0000);
+    let second = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(second.base, 0xE_0000);
+    assert_eq!(
+        map.allocate_below(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            0x10000,
+        ),
+        Err(STATUS_NO_MEMORY)
+    );
+}
+
+#[test]
+fn fixed_vm_map_reset_preserves_existing_commit() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    let reset = map
+        .allocate(
+            Some(allocation.base + 0x800),
+            0x800,
+            MEM_RESET,
+            PAGE_READONLY,
+        )
+        .unwrap();
+    assert_eq!(reset.base, allocation.base);
+    assert_eq!(reset.size, 0x1000);
+    assert_eq!(
+        map.extent_at(allocation.base).unwrap().protection,
+        PAGE_READWRITE
+    );
+}
+
+#[test]
+fn fixed_vm_map_reset_matches_reactos_overlap_hack() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x30_0000);
+    let allocation = map
+        .allocate(None, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    assert_eq!(
+        map.allocate(
+            Some(allocation.base + 0x1000),
+            0x20_0000,
+            MEM_RESET,
+            PAGE_WRITECOPY,
+        ),
+        Ok(VmAllocatePlan {
+            base: allocation.base + 0x1000,
+            size: 0x20_0000,
+        })
+    );
+    assert_eq!(
+        map.allocate(Some(0x280000), 0x1000, MEM_RESET, PAGE_READWRITE),
+        Err(STATUS_CONFLICTING_ADDRESSES)
+    );
+    let new_reset = map
+        .allocate(None, 0x1000, MEM_RESET, PAGE_READWRITE)
+        .unwrap();
+    assert_eq!(
+        map.extent_at(new_reset.base).unwrap().state,
+        VmExtentState::Reserved
+    );
+}
+
+#[test]
+fn fixed_vm_map_reports_committed_access_permissions() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let no_access = map
+        .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS)
+        .unwrap();
+    let executable = map
+        .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ)
+        .unwrap();
+    let writable = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_EXECUTE_READWRITE,
+        )
+        .unwrap();
+    assert!(!map.permits_read(no_access.base));
+    assert!(!map.permits_write(no_access.base));
+    assert!(map.permits_read(executable.base));
+    assert!(!map.permits_write(executable.base));
+    assert!(map.permits_read(writable.base));
+    assert!(map.permits_write(writable.base));
+    assert!(!map.permits_read(0xF_0000));
 }

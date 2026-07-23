@@ -2757,9 +2757,17 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
             if peb != 0 {
                 let parameters = core::ptr::read_unaligned((peb + 0x20) as *const u64);
                 if parameters != 0 {
+                    const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 0x0000_0001;
+                    let flags = core::ptr::read_unaligned((parameters + 0x08) as *const u32);
                     let length = core::ptr::read_unaligned((parameters + 0x60) as *const u16);
                     let maximum = core::ptr::read_unaligned((parameters + 0x62) as *const u16);
-                    let buffer = core::ptr::read_unaligned((parameters + 0x68) as *const u64);
+                    let raw_buffer =
+                        core::ptr::read_unaligned((parameters + 0x68) as *const u64);
+                    let buffer = if flags & RTL_USER_PROCESS_PARAMETERS_NORMALIZED != 0 {
+                        raw_buffer
+                    } else {
+                        parameters.checked_add(raw_buffer).unwrap_or(0)
+                    };
                     if length & 1 == 0
                         && length != 0
                         && length <= maximum

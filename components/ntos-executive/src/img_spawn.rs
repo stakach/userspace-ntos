@@ -651,6 +651,11 @@ pub(crate) unsafe fn spawn_sec_image(
             );
         }
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
+        // Cross-process process creation finishes by writing Peb->ProcessParameters through
+        // NtWriteVirtualMemory. Register the live PEB frame and its persistent executive alias so
+        // the generic remote-copy path updates the child rather than requiring an SSN-specific
+        // synthetic success.
+        csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000);
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
         let nls_pt = alloc_slot();
