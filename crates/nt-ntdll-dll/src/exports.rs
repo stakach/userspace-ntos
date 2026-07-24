@@ -8862,24 +8862,16 @@ pub extern "C" fn toupper(c: i32) -> i32 {
     nt_ntdll::crt::ascii_toupper(c)
 }
 
-/// `towlower(wint_t) -> wint_t` (Latin-1 subset).
+/// `towlower(wint_t) -> wint_t`.
 #[export_name = "towlower"]
 pub extern "C" fn towlower(c: u32) -> u32 {
-    if (0x41..=0x5A).contains(&c) {
-        c + 0x20
-    } else {
-        c
-    }
+    u16::try_from(c).map_or(c, |unit| u32::from(nls_downcase_unit(unit)))
 }
 
-/// `towupper(wint_t) -> wint_t` (Latin-1 subset).
+/// `towupper(wint_t) -> wint_t`.
 #[export_name = "towupper"]
 pub extern "C" fn towupper(c: u32) -> u32 {
-    if (0x61..=0x7A).contains(&c) {
-        c - 0x20
-    } else {
-        c
-    }
+    u16::try_from(c).map_or(c, |unit| u32::from(nls_upcase_unit(unit)))
 }
 
 /// `isalpha(int) -> int` (ASCII).
@@ -8948,68 +8940,40 @@ pub extern "C" fn islower(c: i32) -> i32 {
     i32::from(nt_ntdll::crt::ascii_is_lower(c))
 }
 
-/// `iswalpha(wint_t) -> int` (ASCII subset).
+/// `iswalpha(wint_t) -> int`.
 #[export_name = "iswalpha"]
 pub extern "C" fn iswalpha(c: i32) -> i32 {
-    i32::from(nt_ntdll::crt::wide_ascii_is_alpha(c))
+    i32::from(nt_ntdll::crt::wide_is_alpha(c as u32))
 }
 
-/// `iswdigit(wint_t) -> int` (ASCII subset).
+/// `iswdigit(wint_t) -> int`.
 #[export_name = "iswdigit"]
 pub extern "C" fn iswdigit(c: i32) -> i32 {
-    i32::from(nt_ntdll::crt::wide_ascii_is_digit(c))
+    i32::from(nt_ntdll::crt::wide_is_digit(c as u32))
 }
 
-/// `iswlower(wint_t) -> int` (ASCII subset).
+/// `iswlower(wint_t) -> int`.
 #[export_name = "iswlower"]
 pub extern "C" fn iswlower(c: i32) -> i32 {
-    i32::from(nt_ntdll::crt::wide_ascii_is_lower(c))
+    i32::from(nt_ntdll::crt::wide_is_lower(c as u32))
 }
 
-/// `iswspace(wint_t) -> int` (ASCII subset).
+/// `iswspace(wint_t) -> int`.
 #[export_name = "iswspace"]
 pub extern "C" fn iswspace(c: i32) -> i32 {
-    i32::from(nt_ntdll::crt::wide_ascii_is_space(c))
+    i32::from(nt_ntdll::crt::wide_is_space(c as u32))
 }
 
-/// `iswxdigit(wint_t) -> int` (ASCII subset).
+/// `iswxdigit(wint_t) -> int`.
 #[export_name = "iswxdigit"]
 pub extern "C" fn iswxdigit(c: i32) -> i32 {
-    i32::from(nt_ntdll::crt::wide_ascii_is_xdigit(c))
+    i32::from(nt_ntdll::crt::wide_is_xdigit(c as u32))
 }
 
-/// `iswctype(wint_t c, wctype_t type) -> int` — the wide ctype predicate. We serve the classes the
-/// Win32 stack actually queries (alpha/digit/space/upper/lower/alnum) over ASCII/Latin-1; the mask
-/// bits follow the MSVCRT `_ISxxx` values.
+/// `iswctype(wint_t c, wctype_t type) -> int`.
 #[export_name = "iswctype"]
 pub extern "C" fn iswctype(c: u32, mask: u16) -> i32 {
-    const IS_UPPER: u16 = 0x0001;
-    const IS_LOWER: u16 = 0x0002;
-    const IS_DIGIT: u16 = 0x0004;
-    const IS_SPACE: u16 = 0x0008;
-    const IS_ALPHA: u16 = 0x0100;
-    let c = c as i32;
-    let upper = nt_ntdll::crt::ascii_is_upper(c);
-    let lower = nt_ntdll::crt::ascii_is_lower(c);
-    let digit = nt_ntdll::crt::ascii_is_digit(c);
-    let space = nt_ntdll::crt::ascii_is_space(c);
-    let mut hit = false;
-    if mask & IS_UPPER != 0 && upper {
-        hit = true;
-    }
-    if mask & IS_LOWER != 0 && lower {
-        hit = true;
-    }
-    if mask & IS_DIGIT != 0 && digit {
-        hit = true;
-    }
-    if mask & IS_SPACE != 0 && space {
-        hit = true;
-    }
-    if mask & IS_ALPHA != 0 && (upper || lower) {
-        hit = true;
-    }
-    i32::from(hit)
+    i32::from(nt_ntdll::crt::wide_ctype(c, mask))
 }
 
 /// `sin(double) -> double`. Minimal Taylor/CORDIC-free reduction — the Win32 boot path uses these

@@ -124,6 +124,108 @@ pub fn wide_ascii_is_xdigit(c: i32) -> bool {
     ascii_is_xdigit(c)
 }
 
+// Microsoft CRT `_wctype` bits. ReactOS's ntdll CRT exports use the fixed 257-entry
+// EOF-plus-Latin-1 table from sdk/lib/crt/string/ctype.c.
+pub const WCTYPE_UPPER: u16 = 0x0001;
+pub const WCTYPE_LOWER: u16 = 0x0002;
+pub const WCTYPE_DIGIT: u16 = 0x0004;
+pub const WCTYPE_SPACE: u16 = 0x0008;
+pub const WCTYPE_PUNCT: u16 = 0x0010;
+pub const WCTYPE_CONTROL: u16 = 0x0020;
+pub const WCTYPE_BLANK: u16 = 0x0040;
+pub const WCTYPE_HEX: u16 = 0x0080;
+pub const WCTYPE_ALPHA: u16 = 0x0100;
+pub const WCTYPE_ALPHA_MASK: u16 = WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_LOWER;
+
+/// Return the exact ReactOS `_wctype[c + 1]` bits for a `wint_t`.
+///
+/// ReactOS's ntdll build deliberately classifies only `0x00..=0xff`; every larger value returns
+/// zero. The Latin-1 portion includes the native quirks such as superscript digits also carrying
+/// `_PUNCT`.
+pub const fn wide_ctype_bits(c: u32) -> u16 {
+    match c {
+        0x00..=0x08 | 0x0e..=0x1f | 0x7f..=0x9f => WCTYPE_CONTROL,
+        0x09 => WCTYPE_BLANK | WCTYPE_CONTROL | WCTYPE_SPACE,
+        0x0a..=0x0d => WCTYPE_CONTROL | WCTYPE_SPACE,
+        0x20 | 0xa0 => WCTYPE_SPACE | WCTYPE_BLANK,
+        0x21..=0x2f
+        | 0x3a..=0x40
+        | 0x5b..=0x60
+        | 0x7b..=0x7e
+        | 0xa1..=0xb1
+        | 0xb4..=0xb8
+        | 0xba..=0xbf
+        | 0xd7
+        | 0xf7 => WCTYPE_PUNCT,
+        0x30..=0x39 => WCTYPE_DIGIT | WCTYPE_HEX,
+        0x41..=0x46 => WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_HEX,
+        0x47..=0x5a | 0xc0..=0xd6 | 0xd8..=0xde => WCTYPE_ALPHA | WCTYPE_UPPER,
+        0x61..=0x66 => WCTYPE_ALPHA | WCTYPE_LOWER | WCTYPE_HEX,
+        0x67..=0x7a | 0xdf..=0xf6 | 0xf8..=0xff => WCTYPE_ALPHA | WCTYPE_LOWER,
+        0xb2 | 0xb3 | 0xb9 => WCTYPE_PUNCT | WCTYPE_DIGIT,
+        _ => 0,
+    }
+}
+
+/// ReactOS `iswctype`: return the matching mask bits, not a Boolean normalization.
+pub const fn wide_ctype(c: u32, mask: u16) -> u16 {
+    wide_ctype_bits(c) & mask
+}
+
+pub const fn wide_is_alpha(c: u32) -> u16 {
+    wide_ctype(c, WCTYPE_ALPHA_MASK)
+}
+
+pub const fn wide_is_digit(c: u32) -> u16 {
+    wide_ctype(c, WCTYPE_DIGIT)
+}
+
+pub const fn wide_is_lower(c: u32) -> u16 {
+    wide_ctype(c, WCTYPE_LOWER)
+}
+
+pub const fn wide_is_space(c: u32) -> u16 {
+    wide_ctype(c, WCTYPE_SPACE)
+}
+
+pub const fn wide_is_xdigit(c: u32) -> u16 {
+    wide_ctype(c, WCTYPE_HEX)
+}
+
+/// Decode one ReactOS three-level Unicode case table entry.
+///
+/// Each level contains `u16` offsets into the same table; the leaf is a signed delta from the
+/// original UTF-16 unit. A malformed or truncated table returns `None` instead of reading beyond
+/// the mapped NLS image.
+pub fn nls_case_map(table: &[u16], unit: u16) -> Option<u16> {
+    let high = *table.get((unit >> 8) as usize)? as usize;
+    let middle = *table.get(high.checked_add(((unit >> 4) & 0x0f) as usize)?)? as usize;
+    let delta = *table.get(middle.checked_add((unit & 0x0f) as usize)?)? as i16;
+    Some((unit as i32 + delta as i32) as u16)
+}
+
+/// Apply the ReactOS `RtlpUpcaseUnicodeChar` ASCII fast path and NLS-table lookup.
+pub fn wide_upcase_with_table(unit: u16, table: &[u16]) -> u16 {
+    if unit < b'a' as u16 {
+        unit
+    } else if unit <= b'z' as u16 {
+        unit - (b'a' - b'A') as u16
+    } else {
+        nls_case_map(table, unit).unwrap_or(unit)
+    }
+}
+
+/// Apply the ReactOS `RtlpDowncaseUnicodeChar` ASCII fast path and NLS-table lookup.
+pub fn wide_downcase_with_table(unit: u16, table: &[u16]) -> u16 {
+    if unit < b'A' as u16 {
+        unit
+    } else if unit <= b'Z' as u16 {
+        unit + (b'a' - b'A') as u16
+    } else {
+        nls_case_map(table, unit).unwrap_or(unit)
+    }
+}
+
 fn ascii_fold_byte(c: u8) -> u8 {
     ascii_tolower(c as i32) as u8
 }
@@ -753,6 +855,73 @@ mod tests {
         assert!(wide_ascii_is_lower(b'x' as i32));
         assert!(wide_ascii_is_space(b'\t' as i32));
         assert!(wide_ascii_is_xdigit(b'B' as i32));
+    }
+
+    #[test]
+    fn wide_ctype_preserves_reactos_latin1_masks() {
+        assert_eq!(
+            wide_ctype_bits(b'\t' as u32),
+            WCTYPE_BLANK | WCTYPE_CONTROL | WCTYPE_SPACE
+        );
+        assert_eq!(
+            wide_ctype_bits(b'A' as u32),
+            WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_HEX
+        );
+        assert_eq!(
+            wide_ctype_bits(b'z' as u32),
+            WCTYPE_ALPHA | WCTYPE_LOWER
+        );
+        assert_eq!(wide_ctype_bits(0xa0), WCTYPE_SPACE | WCTYPE_BLANK);
+        assert_eq!(wide_ctype_bits(0xb2), WCTYPE_PUNCT | WCTYPE_DIGIT);
+        assert_eq!(wide_ctype_bits(0xc9), WCTYPE_ALPHA | WCTYPE_UPPER);
+        assert_eq!(wide_ctype_bits(0xdf), WCTYPE_ALPHA | WCTYPE_LOWER);
+        assert_eq!(wide_ctype_bits(0xd7), WCTYPE_PUNCT);
+        assert_eq!(wide_ctype_bits(0x100), 0);
+        assert_eq!(wide_ctype_bits(u32::MAX), 0);
+    }
+
+    #[test]
+    fn wide_ctype_returns_intersecting_bits_not_boolean() {
+        assert_eq!(
+            wide_ctype(b'A' as u32, WCTYPE_ALPHA_MASK | WCTYPE_HEX),
+            WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_HEX
+        );
+        assert_eq!(
+            wide_is_alpha(0xc9),
+            WCTYPE_ALPHA | WCTYPE_UPPER
+        );
+        assert_eq!(wide_is_digit(0xb2), WCTYPE_DIGIT);
+        assert_eq!(wide_is_lower(0xdf), WCTYPE_LOWER);
+        assert_eq!(wide_is_space(0xa0), WCTYPE_SPACE);
+        assert_eq!(wide_is_xdigit(b'f' as u32), WCTYPE_HEX);
+        assert_eq!(wide_ctype(b'Q' as u32, WCTYPE_DIGIT), 0);
+    }
+
+    #[test]
+    fn nls_case_map_decodes_signed_three_level_delta() {
+        let mut upper = vec![0u16; 282];
+        upper[0] = 256;
+        upper[256 + 0x0e] = 272;
+        upper[272 + 0x09] = (-32i16) as u16;
+        assert_eq!(nls_case_map(&upper, 0x00e9), Some(0x00c9));
+        assert_eq!(wide_upcase_with_table(0x00e9, &upper), 0x00c9);
+        assert_eq!(wide_upcase_with_table(b'q' as u16, &[]), b'Q' as u16);
+
+        let mut lower = vec![0u16; 282];
+        lower[0] = 256;
+        lower[256 + 0x0c] = 272;
+        lower[272 + 0x09] = 32;
+        assert_eq!(nls_case_map(&lower, 0x00c9), Some(0x00e9));
+        assert_eq!(wide_downcase_with_table(0x00c9, &lower), 0x00e9);
+        assert_eq!(wide_downcase_with_table(b'Q' as u16, &[]), b'q' as u16);
+    }
+
+    #[test]
+    fn malformed_nls_case_table_is_an_identity_fallback() {
+        let truncated = [4u16, 0, 0, 0];
+        assert_eq!(nls_case_map(&truncated, 0x0100), None);
+        assert_eq!(wide_upcase_with_table(0x0100, &truncated), 0x0100);
+        assert_eq!(wide_downcase_with_table(0x0100, &truncated), 0x0100);
     }
 
     #[test]
