@@ -834,6 +834,7 @@ unsafe fn rtl_unicode_string_to_multibyte_string_impl(
             (*dst).buffer = 0;
             return STATUS_SUCCESS;
         }
+        (*dst).length = body_bytes as u16;
 
         let dbuf = if allocate != 0 {
             let p = crate::process_heap_alloc(total_bytes) as *mut u8;
@@ -15935,25 +15936,40 @@ pub unsafe extern "system" fn rtl_is_dos_device_name_ustr(path: PCUnicodeString)
 #[export_name = "RtlIsNameLegalDOS8Dot3"]
 pub unsafe extern "system" fn rtl_is_name_legal_dos_8dot3(
     name: PCUnicodeString,
-    _oem_name: *mut c_void,
+    oem_name: *mut c_void,
     spaces_present: *mut u8,
 ) -> u8 {
     if name.is_null() {
         return 0;
     }
-    // SAFETY: name valid per the contract.
-    let (buf, units) = unsafe { ((*name).buffer as *const u16, (*name).length as usize / 2) };
-    let s = if buf.is_null() {
-        &[][..]
+    let mut local_buffer = [0u8; 12];
+    let mut local_oem = UnicodeString::default();
+    local_oem.length = local_buffer.len() as u16;
+    local_oem.maximum_length = local_buffer.len() as u16;
+    local_oem.buffer = local_buffer.as_mut_ptr() as u64;
+    let destination = if oem_name.is_null() {
+        core::ptr::addr_of_mut!(local_oem)
     } else {
-        // SAFETY: valid region.
-        unsafe { core::slice::from_raw_parts(buf, units) }
+        oem_name as PUnicodeString
+    };
+    let status =
+        unsafe { rtl_unicode_string_to_counted_oem_string_impl(destination, name, 0, true) };
+    if !nt_success(status) {
+        return 0;
+    }
+    let length = unsafe { (*destination).length as usize };
+    let buffer = unsafe { (*destination).buffer as *const u8 };
+    if length > 12 || buffer.is_null() {
+        return 0;
+    }
+    let converted = unsafe { core::slice::from_raw_parts(buffer, length) };
+    let Some(spaces) = rtl::dos8dot3::legal_dos_8dot3_oem(converted) else {
+        return 0;
     };
     if !spaces_present.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *spaces_present = u8::from(s.contains(&0x20)) };
+        unsafe { core::ptr::write(spaces_present, u8::from(spaces)) };
     }
-    u8::from(nt_ntdll::rtl::strings::is_name_legal_dos_8dot3(s))
+    1
 }
 
 /// `RtlGenerate8dot3Name(PCUNICODE_STRING, BOOLEAN, PGENERATE_NAME_CONTEXT,

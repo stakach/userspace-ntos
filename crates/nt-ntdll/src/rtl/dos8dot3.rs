@@ -37,6 +37,51 @@ fn is_short_illegal(unit: u16) -> bool {
     unit < 128 && SHORT_ILLEGALS[unit as usize / 32] & (1u32 << (unit as usize % 32)) != 0
 }
 
+/// Validate an already-upcased counted OEM name using `RtlIsNameLegalDOS8Dot3` rules.
+///
+/// `Some(spaces)` is a legal name and reports whether it contains an interior space. `None` is
+/// illegal; native callers must leave their `NameContainsSpaces` output untouched in that case.
+pub fn legal_dos_8dot3_oem(name: &[u8]) -> Option<bool> {
+    const ILLEGAL: &[u8] = b"*?<>|\"+=,;[]:/\\\xe5\0";
+
+    if name.is_empty() || name.len() > 12 {
+        return None;
+    }
+    if name[0] == b'.' {
+        return matches!(name, b"." | b"..").then_some(false);
+    }
+
+    let mut dot = None;
+    let mut spaces = false;
+    for (index, &byte) in name.iter().enumerate() {
+        match byte {
+            b' ' => {
+                if index == 0 || index + 1 == name.len() || name[index + 1] == b'.' {
+                    return None;
+                }
+                spaces = true;
+            }
+            b'.' => {
+                if dot.replace(index).is_some() {
+                    return None;
+                }
+            }
+            _ if ILLEGAL.contains(&byte) => return None,
+            _ => {}
+        }
+    }
+
+    match dot {
+        None if name.len() > 8 => None,
+        Some(position)
+            if position > 8 || name.len() - position > 4 || position + 1 == name.len() =>
+        {
+            None
+        }
+        _ => Some(spaces),
+    }
+}
+
 fn checksum(name: &[u16]) -> u16 {
     match name {
         [] => 0,
@@ -290,5 +335,42 @@ mod tests {
             })
         });
         assert_eq!(s(&output), "MENUD\u{c9}~1");
+    }
+
+    #[test]
+    fn legal_oem_names_match_reactos_vectors() {
+        let cases: &[(&[u8], Option<bool>)] = &[
+            (b"12345678", Some(false)),
+            (b"123 5678", Some(true)),
+            (b"12345678.", None),
+            (b"1234 678.", None),
+            (b"12345678.A", Some(false)),
+            (b"12345678.A ", None),
+            (b"12345678.A C", Some(true)),
+            (b" 2345678.A ", None),
+            (b"1 345678.ABC", Some(true)),
+            (b"1      8.A C", Some(true)),
+            (b"1 3 5 7 .ABC", None),
+            (b"12345678.  C", Some(true)),
+            (b"123456789.A", None),
+            (b"12345.ABCD", None),
+            (b"12345.AB D", None),
+            (b".ABC", None),
+            (b"12.ABC.D", None),
+            (b".", Some(false)),
+            (b"..", Some(false)),
+            (b"...", None),
+            (b"", None),
+        ];
+        for &(name, expected) in cases {
+            assert_eq!(legal_dos_8dot3_oem(name), expected, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn legal_oem_names_reject_native_illegal_bytes() {
+        for byte in b"*?<>|\"+=,;[]:/\\".iter().copied().chain([0xe5, 0]) {
+            assert_eq!(legal_dos_8dot3_oem(&[b'A', byte]), None, "{byte:#x}");
+        }
     }
 }

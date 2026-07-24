@@ -355,28 +355,21 @@ pub fn validate_unicode_string(s: &UnicodeString) -> bool {
     s.length <= s.maximum_length && s.length.is_multiple_of(2)
 }
 
-/// `RtlIsTextUnicode`/`RtlIsNameLegalDOS8Dot3`-adjacent helper: whether a name fits the classic
-/// 8.3 form (`name` up to 8 chars, optional `.ext` up to 3), ASCII-only, no reserved chars.
+/// Host convenience for ASCII `RtlIsNameLegalDOS8Dot3` inputs. The target export performs real OEM
+/// conversion before calling the byte-level validator.
 pub fn is_name_legal_dos_8dot3(name: &[u16]) -> bool {
-    // Reject empty / over-long overall.
-    if name.is_empty() {
+    let mut oem = Vec::new();
+    if oem.try_reserve_exact(name.len()).is_err() {
         return false;
     }
-    const RESERVED: &[u8] = b"\"+,;=[]|<>/?*:\\. ";
-    let dot = name.iter().position(|&c| c == b'.' as u16);
-    let (stem, ext): (&[u16], &[u16]) = match dot {
-        Some(i) => (&name[..i], &name[i + 1..]),
-        None => (name, &[]),
-    };
-    if stem.is_empty() || stem.len() > 8 || ext.len() > 3 {
-        return false;
+    for &unit in name {
+        let upcase = upcase_char(unit);
+        let Ok(byte) = u8::try_from(upcase) else {
+            return false;
+        };
+        oem.push(byte);
     }
-    // A second dot is illegal.
-    if ext.contains(&(b'.' as u16)) {
-        return false;
-    }
-    let ok_char = |&c: &u16| c < 0x80 && c != 0 && !RESERVED.contains(&(c as u8));
-    stem.iter().all(ok_char) && ext.iter().all(ok_char)
+    super::dos8dot3::legal_dos_8dot3_oem(&oem).is_some()
 }
 
 // --- Rust-string helpers (host convenience, used by tests + the CRT layer) ---------------------
@@ -671,7 +664,10 @@ mod tests {
         assert!(is_name_legal_dos_8dot3(&u("README")));
         assert!(!is_name_legal_dos_8dot3(&u("TOOLONGNAME.TXT")));
         assert!(!is_name_legal_dos_8dot3(&u("bad.name.ext")));
+        assert!(is_name_legal_dos_8dot3(&u("123 5678")));
         assert!(!is_name_legal_dos_8dot3(&u("has space")));
+        assert!(is_name_legal_dos_8dot3(&u(".")));
+        assert!(is_name_legal_dos_8dot3(&u("..")));
         assert!(!is_name_legal_dos_8dot3(&u("")));
     }
 
