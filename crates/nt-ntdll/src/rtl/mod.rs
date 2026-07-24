@@ -55,6 +55,7 @@ pub mod security;
 pub mod splay;
 pub mod status;
 pub mod strings;
+pub mod text_unicode;
 pub mod time;
 pub mod timezone;
 pub mod trace_database;

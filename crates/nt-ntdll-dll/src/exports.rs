@@ -27181,9 +27181,8 @@ pub unsafe extern "system" fn rtl_dns_host_name_to_computer_name(
     }
 }
 
-/// `RtlIsTextUnicode(PVOID Buffer, INT Size, INT* Result) -> BOOLEAN` — heuristic UTF-16 detection.
-/// We apply the standard IS_TEXT_UNICODE_STATISTICS heuristic: even byte count + a majority of
-/// zero high-bytes ⇒ likely UTF-16LE.
+/// `RtlIsTextUnicode(PVOID Buffer, INT Size, INT* Result) -> BOOLEAN` — mask-sensitive UTF-16
+/// detection with the native statistical, signature, control, invalid, and DBCS tests.
 ///
 /// # Safety
 /// `buffer` valid for `size` bytes; `result` null or writable.
@@ -27200,24 +27199,37 @@ pub unsafe extern "system" fn rtl_is_text_unicode(
         }
         return 0;
     }
-    let n = size as usize;
-    // SAFETY: buffer valid for n bytes.
-    let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, n) };
-    let even = n % 2 == 0;
-    let units = n / 2;
-    let mut zero_hi = 0usize;
-    for i in 0..units {
-        if bytes[i * 2 + 1] == 0 {
-            zero_hi += 1;
-        }
-    }
-    let likely = even && units > 0 && zero_hi * 2 >= units;
+    // SAFETY: buffer valid for size bytes and result, when present, is readable/writable.
+    let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, size as usize) };
+    let requested = if result.is_null() {
+        None
+    } else {
+        Some(unsafe { core::ptr::read_unaligned(result) } as u32)
+    };
+    let detected = rtl::text_unicode::is_text_unicode(
+        bytes,
+        requested,
+        nls_is_ansi_dbcs(),
+        |unit| {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let lead_info = NLS_ANSI_LEAD_BYTE_INFO;
+                return unit <= u8::MAX as u16
+                    && !lead_info.is_null()
+                    && core::ptr::read_unaligned(lead_info.add(unit as usize)) != 0;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = unit;
+                false
+            }
+        },
+    );
     if !result.is_null() {
-        // IS_TEXT_UNICODE_STATISTICS = 0x2.
         // SAFETY: result writable.
-        unsafe { *result = if likely { 0x2 } else { 0 } };
+        unsafe { core::ptr::write_unaligned(result, detected.flags as i32) };
     }
-    u8::from(likely)
+    u8::from(detected.is_unicode)
 }
 
 /// `RtlxUnicodeStringToAnsiSize(PCUNICODE_STRING src) -> ULONG` — ANSI byte length incl. NUL.
