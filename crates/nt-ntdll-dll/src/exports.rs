@@ -22057,23 +22057,12 @@ pub unsafe extern "system" fn rtl_restore_last_win32_error(error: u32) {
 
 /// `RtlGetTickCount() -> ULONG`.
 ///
-/// Uses the kernel's `NtQuerySystemTime` backing and converts 100ns units to milliseconds. This is a
-/// live monotonic clock in the current executive; the exact Windows uptime shared-data path is still
-/// a future KUSER_SHARED_DATA update.
+/// Reads the live KUSER tick counter and applies its native fixed-point multiplier.
 #[export_name = "RtlGetTickCount"]
 pub unsafe extern "system" fn rtl_get_tick_count() -> u32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let mut time_100ns = 0i64;
-        let status = core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut i64) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_query_system_time)(&mut time_100ns);
-        if status == STATUS_SUCCESS {
-            (time_100ns / 10_000) as u32
-        } else {
-            0
-        }
+        nt_ntdll_layout::kuser::read_tick_count(KUSER_SHARED_DATA_VA as *const u8)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

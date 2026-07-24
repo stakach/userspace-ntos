@@ -113,6 +113,77 @@ pub unsafe fn publish_time_zone(page: *mut u8, bias_100ns: i64, time_zone_id: u3
     }
 }
 
+/// Convert a native KUSER tick counter with its fixed-point multiplier to milliseconds.
+pub fn tick_count_to_milliseconds(tick_count: u64, multiplier: u32) -> u32 {
+    (tick_count.wrapping_mul(u64::from(multiplier)) >> 24) as u32
+}
+
+/// Read one concurrently published `KSYSTEM_TIME` value.
+///
+/// # Safety
+/// `page.add(offset)` identifies a readable native `KSYSTEM_TIME`.
+pub unsafe fn read_ksystem_time(page: *const u8, offset: usize) -> u64 {
+    loop {
+        let high1 = unsafe { core::ptr::read_volatile(page.add(offset + 4) as *const u32) };
+        let low = unsafe { core::ptr::read_volatile(page.add(offset) as *const u32) };
+        let high2 = unsafe { core::ptr::read_volatile(page.add(offset + 8) as *const u32) };
+        if high1 == high2 {
+            return (u64::from(high1) << 32) | u64::from(low);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Read the shared tick counter and apply the page's fixed-point multiplier.
+///
+/// # Safety
+/// `page` identifies a readable native `KUSER_SHARED_DATA` page.
+pub unsafe fn read_tick_count(page: *const u8) -> u32 {
+    let ticks = unsafe { read_ksystem_time(page, TICK_COUNT) };
+    let multiplier =
+        unsafe { core::ptr::read_volatile(page.add(TICK_COUNT_MULTIPLIER) as *const u32) };
+    tick_count_to_milliseconds(ticks, multiplier)
+}
+
+/// Publish the dynamic clocks consumed directly through `KUSER_SHARED_DATA`.
+///
+/// # Safety
+/// `page` is an 8-byte-aligned, writable `KUSER_SHARED_DATA` page mapping.
+pub unsafe fn publish_clocks(page: *mut u8, interrupt_time_100ns: u64, system_time_100ns: u64) {
+    let tick_count = interrupt_time_100ns / 10_000;
+    debug_assert_eq!(page as usize & 7, 0);
+    unsafe {
+        publish_ksystem_time(page, INTERRUPT_TIME, interrupt_time_100ns);
+        publish_ksystem_time(page, SYSTEM_TIME, system_time_100ns);
+        publish_ksystem_time(page, TICK_COUNT, tick_count);
+        core::ptr::write_volatile(
+            page.add(TICK_COUNT_LOW_DEPRECATED) as *mut u32,
+            tick_count as u32,
+        );
+    }
+}
+
+unsafe fn publish_ksystem_time(page: *mut u8, offset: usize, value: u64) {
+    let high = (value >> 32) as u32;
+    unsafe {
+        // High2 marks the update first. Windows then uses one qword store even for the deliberately
+        // unaligned SystemTime field; x86-64 keeps this cache-line-contained store coherent.
+        core::ptr::write_volatile(page.add(offset + 8) as *mut u32, high);
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            "mov qword ptr [{address}], {value}",
+            address = in(reg) page.add(offset),
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            core::ptr::write_volatile(page.add(offset) as *mut u32, value as u32);
+            core::ptr::write_volatile(page.add(offset + 4) as *mut u32, high);
+        }
+    }
+}
+
 pub fn processor_features(feature_bits: u32) -> [u8; PROCESSOR_FEATURE_COUNT] {
     let mut features = [0u8; PROCESSOR_FEATURE_COUNT];
     features[PF_COMPARE_EXCHANGE_DOUBLE] = 1;
@@ -209,5 +280,59 @@ mod tests {
         assert_eq!(read_u32(&page.0, TIME_ZONE_BIAS + 4), 0xffff_fff7);
         assert_eq!(read_u32(&page.0, TIME_ZONE_BIAS + 8), 0xffff_fff7);
         assert_eq!(read_u32(&page.0, TIME_ZONE_ID), 2);
+    }
+
+    #[test]
+    fn publishes_and_reads_live_clocks_with_native_tick_math() {
+        #[repr(align(8))]
+        struct AlignedPage([u8; PAGE_SIZE]);
+
+        let mut page = AlignedPage([0u8; PAGE_SIZE]);
+        let interrupt = 0x0000_0003_ffff_ffff;
+        let system = 0x01da_0003_ffff_ffff;
+        put_u32(
+            &mut page.0,
+            TICK_COUNT_MULTIPLIER,
+            TICK_COUNT_MULTIPLIER_ONE_MS,
+        );
+        unsafe { publish_clocks(page.0.as_mut_ptr(), interrupt, system) };
+
+        assert_eq!(
+            unsafe { read_ksystem_time(page.0.as_ptr(), INTERRUPT_TIME) },
+            interrupt
+        );
+        assert_eq!(
+            unsafe { read_ksystem_time(page.0.as_ptr(), SYSTEM_TIME) },
+            system
+        );
+        assert_eq!(
+            read_u32(&page.0, TICK_COUNT_LOW_DEPRECATED),
+            (interrupt / 10_000) as u32
+        );
+        assert_eq!(
+            unsafe { read_tick_count(page.0.as_ptr()) },
+            (interrupt / 10_000) as u32
+        );
+        for offset in [INTERRUPT_TIME, SYSTEM_TIME, TICK_COUNT] {
+            assert_eq!(
+                read_u32(&page.0, offset + 4),
+                read_u32(&page.0, offset + 8)
+            );
+        }
+    }
+
+    #[test]
+    fn tick_multiplier_conversion_wraps_to_the_native_ulong() {
+        assert_eq!(
+            tick_count_to_milliseconds(1234, TICK_COUNT_MULTIPLIER_ONE_MS),
+            1234
+        );
+        assert_eq!(
+            tick_count_to_milliseconds(
+                u64::from(u32::MAX) + 2,
+                TICK_COUNT_MULTIPLIER_ONE_MS
+            ),
+            1
+        );
     }
 }

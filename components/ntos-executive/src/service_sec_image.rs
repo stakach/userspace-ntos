@@ -416,6 +416,17 @@ pub(crate) unsafe fn service_sec_image(
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = ExecNtHandler::new();
     let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
+    if ntdll.is_some() {
+        publish_kuser_clocks();
+        let alias = kuser_page_alias_get(0);
+        if alias != 0 {
+            KUSER_CLOCK_INITIAL_TICK.store(
+                u64::from(nt_ntdll_layout::kuser::read_tick_count(alias as *const u8)),
+                Ordering::Release,
+            );
+        }
+        KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved process handle tables) is allocated. Each smss syscall we service allocates
     // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
@@ -583,6 +594,9 @@ pub(crate) unsafe fn service_sec_image(
     let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
     let mut last_progress_t = monotonic_time_100ns();
     loop {
+        if ntdll.is_some() {
+            publish_kuser_clocks();
+        }
         // Progress-stall accounting: reset the wall-clock window on any epoch bump (real forward
         // progress); quiesce if no progress for STALL_BUDGET_100NS.
         {

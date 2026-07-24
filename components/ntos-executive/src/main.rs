@@ -941,20 +941,18 @@ static mut PROCESS_VM_PT_CAPS: [[u64; PRIVATE_VM_PT_COUNT]; MAX_PI] =
 const VM_FREE_FRAME_CAPACITY: usize = 4096;
 static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
 static mut VM_FREE_FRAME_N: usize = 0;
-static mut KUSER_PAGE_ALIAS: [u64; MAX_PI] = [0; MAX_PI];
+static KUSER_PAGE_ALIAS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 
 unsafe fn kuser_page_alias_put(pi: u64, alias: u64) {
     let index = pi as usize;
     if index < MAX_PI {
-        let aliases = core::ptr::addr_of_mut!(KUSER_PAGE_ALIAS) as *mut u64;
-        core::ptr::write(aliases.add(index), alias);
+        KUSER_PAGE_ALIAS[index].store(alias, Ordering::Release);
     }
 }
 
 unsafe fn kuser_page_alias_get(pi: usize) -> u64 {
     if pi < MAX_PI {
-        let aliases = core::ptr::addr_of!(KUSER_PAGE_ALIAS) as *const u64;
-        core::ptr::read(aliases.add(pi))
+        KUSER_PAGE_ALIAS[pi].load(Ordering::Acquire)
     } else {
         0
     }
@@ -1393,6 +1391,9 @@ const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
+static KUSER_CLOCK_INIT_OK: AtomicBool = AtomicBool::new(false);
+static KUSER_CLOCK_INITIAL_TICK: AtomicU64 = AtomicU64::new(0);
+static KUSER_CLOCK_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3215,6 +3216,22 @@ fn monotonic_time_100ns() -> u64 {
 
 fn nt_system_time_100ns() -> u64 {
     NT_SYSTEM_TIME_BOOT_100NS.saturating_add(monotonic_time_100ns())
+}
+
+unsafe fn publish_kuser_clocks() {
+    let interrupt_time = monotonic_time_100ns();
+    let system_time = NT_SYSTEM_TIME_BOOT_100NS.saturating_add(interrupt_time);
+    for pi in 0..MAX_PI {
+        let alias = kuser_page_alias_get(pi);
+        if alias != 0 {
+            nt_ntdll_layout::kuser::publish_clocks(
+                alias as *mut u8,
+                interrupt_time,
+                system_time,
+            );
+        }
+    }
+    KUSER_CLOCK_PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn print_hex_u64(value: u64) {
@@ -9439,6 +9456,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(heap_verdict as u32);
                     print_str(b"\n");
                     let _ = (sfirst, sssn, heap_verdict);
+                    let kuser_alias = kuser_page_alias_get(0);
+                    let kuser_initial_tick =
+                        KUSER_CLOCK_INITIAL_TICK.load(Ordering::Acquire) as u32;
+                    let kuser_tick = if kuser_alias != 0 {
+                        nt_ntdll_layout::kuser::read_tick_count(kuser_alias as *const u8)
+                    } else {
+                        0
+                    };
+                    let kuser_publications =
+                        KUSER_CLOCK_PUBLISH_COUNT.load(Ordering::Acquire);
+                    print_str(b"[ntos-exec] KUSER live clock: initial_ms=");
+                    print_u64(u64::from(kuser_initial_tick));
+                    print_str(b" current_ms=");
+                    print_u64(u64::from(kuser_tick));
+                    print_str(b" publications=");
+                    print_u64(kuser_publications);
+                    print_str(b"\n");
+                    check(
+                        b"exec_kuser_live_clock",
+                        kuser_alias != 0
+                            && KUSER_CLOCK_INIT_OK.load(Ordering::Acquire)
+                            && kuser_publications >= 3
+                            && kuser_tick.wrapping_sub(kuser_initial_tick) >= 30,
+                        &mut passed,
+                    );
                     // The trampoline now enters ntdll's REAL loader init, LdrpInitialize
                     // (ntdll+0x8e70). It runs deep into process bring-up — reads TEB/PEB/KUSER,
                     // NtQueryVirtualMemory, NtQueryInformationProcess(ProcessCookie), NtOpenKey +
