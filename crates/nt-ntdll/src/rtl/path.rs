@@ -568,20 +568,82 @@ fn fold_ascii(unit: u16) -> u16 {
     }
 }
 
-/// `RtlIsDosDeviceName_U`: recognise a reserved DOS device name (case-insensitive, with an optional
-/// extension, e.g. `CON`, `NUL.txt`, `COM1`, `LPT3`). Returns `true` if the path names a device.
-pub fn is_dos_device_name(path: &[u16]) -> bool {
+/// The canonical device-token span returned by `RtlIsDosDeviceName_Ustr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DosDeviceNameSpan {
+    /// Byte offset of the token within the original UTF-16 path.
+    pub offset_bytes: u16,
+    /// Canonical token length in bytes: 6 for `CON`/`PRN`/`AUX`/`NUL`, 8 for `COMn`/`LPTn`.
+    pub length_bytes: u16,
+}
+
+impl DosDeviceNameSpan {
+    /// Pack the span as `MAKELONG(length, offset)`, matching the native ABI.
+    pub const fn packed(self) -> u32 {
+        ((self.offset_bytes as u32) << 16) | self.length_bytes as u32
+    }
+}
+
+fn is_unicode_decimal_digit(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x0030..=0x0039
+            | 0x0660..=0x0669
+            | 0x06F0..=0x06F9
+            | 0x07C0..=0x07C9
+            | 0x0966..=0x096F
+            | 0x09E6..=0x09EF
+            | 0x0A66..=0x0A6F
+            | 0x0AE6..=0x0AEF
+            | 0x0B66..=0x0B6F
+            | 0x0BE6..=0x0BEF
+            | 0x0C66..=0x0C6F
+            | 0x0CE6..=0x0CEF
+            | 0x0D66..=0x0D6F
+            | 0x0DE6..=0x0DEF
+            | 0x0E50..=0x0E59
+            | 0x0ED0..=0x0ED9
+            | 0x0F20..=0x0F29
+            | 0x1040..=0x1049
+            | 0x1090..=0x1099
+            | 0x17E0..=0x17E9
+            | 0x1810..=0x1819
+            | 0x1946..=0x194F
+            | 0x19D0..=0x19D9
+            | 0x1A80..=0x1A89
+            | 0x1A90..=0x1A99
+            | 0x1B50..=0x1B59
+            | 0x1BB0..=0x1BB9
+            | 0x1C40..=0x1C49
+            | 0x1C50..=0x1C59
+            | 0xA620..=0xA629
+            | 0xA8D0..=0xA8D9
+            | 0xA900..=0xA909
+            | 0xA9D0..=0xA9D9
+            | 0xA9F0..=0xA9F9
+            | 0xAA50..=0xAA59
+            | 0xABF0..=0xABF9
+            | 0xFF10..=0xFF19
+    )
+}
+
+/// Locate the canonical DOS device token within a counted UTF-16 path.
+pub fn dos_device_name(path: &[u16]) -> Option<DosDeviceNameSpan> {
     let path_type = determine_dos_path_name_type(path);
     if matches!(path_type, DosPathType::Unknown | DosPathType::UncAbsolute) {
-        return false;
+        return None;
     }
     if path_type == DosPathType::LocalDevice {
-        return path.len() == 7
+        return (path.len() == 7
             && path[0] == b'\\' as u16
             && path[1] == b'\\' as u16
             && path[2] == b'.' as u16
             && path[3] == b'\\' as u16
-            && eq_ascii_ci(&path[4..], b"CON");
+            && eq_ascii_ci(&path[4..], b"CON"))
+        .then_some(DosDeviceNameSpan {
+            offset_bytes: 8,
+            length_bytes: 6,
+        });
     }
 
     let mut end = path.len();
@@ -592,17 +654,21 @@ pub fn is_dos_device_name(path: &[u16]) -> bool {
         end -= 1;
     }
     if end == 0 {
-        return false;
+        return None;
     }
     let start = path[..end]
         .iter()
-        .rposition(|&c| is_sep(c))
-        .map_or(0, |position| position + 1)
-        .max(if end >= 2 && path[1] == b':' as u16 {
-            2
-        } else {
-            0
-        });
+        .rposition(|&unit| is_sep(unit))
+        .map_or_else(
+            || {
+                if end >= 2 && path[1] == b':' as u16 {
+                    2
+                } else {
+                    0
+                }
+            },
+            |position| position + 1,
+        );
     let component = &path[start..end];
     let stem_end = component
         .iter()
@@ -612,14 +678,31 @@ pub fn is_dos_device_name(path: &[u16]) -> bool {
     while stem.last() == Some(&(b' ' as u16)) {
         stem = &stem[..stem.len() - 1];
     }
-    matches!(stem.len(), 3 | 4)
+    let length_bytes = if stem.len() == 3
         && (eq_ascii_ci(stem, b"CON")
             || eq_ascii_ci(stem, b"PRN")
             || eq_ascii_ci(stem, b"AUX")
-            || eq_ascii_ci(stem, b"NUL")
-            || (stem.len() == 4
-                && (eq_ascii_ci(&stem[..3], b"COM") || eq_ascii_ci(&stem[..3], b"LPT"))
-                && matches!(stem[3], 0x31..=0x39)))
+            || eq_ascii_ci(stem, b"NUL"))
+    {
+        6
+    } else if stem.len() == 4
+        && (eq_ascii_ci(&stem[..3], b"COM") || eq_ascii_ci(&stem[..3], b"LPT"))
+        && is_unicode_decimal_digit(stem[3])
+        && stem[3] != b'0' as u16
+    {
+        8
+    } else {
+        return None;
+    };
+    Some(DosDeviceNameSpan {
+        offset_bytes: u16::try_from(start.checked_mul(2)?).ok()?,
+        length_bytes,
+    })
+}
+
+/// `RtlIsDosDeviceName_U`: recognise a reserved DOS device name.
+pub fn is_dos_device_name(path: &[u16]) -> bool {
+    dos_device_name(path).is_some()
 }
 
 fn eq_ascii_ci(value: &[u16], expected: &[u8]) -> bool {
@@ -966,20 +1049,40 @@ mod tests {
 
     #[test]
     fn dos_devices() {
-        assert!(is_dos_device_name(&u("CON")));
-        assert!(is_dos_device_name(&u("nul.txt")));
-        assert!(is_dos_device_name(&u("NUL. ")));
-        assert!(is_dos_device_name(&u("C:\\path\\CON:")));
-        assert!(is_dos_device_name(&u("C:\\path\\COM1")));
-        assert!(is_dos_device_name(&u("LPT3")));
-        assert!(is_dos_device_name(&u("\\\\.\\CON")));
-        assert!(!is_dos_device_name(&u("COM0")));
-        assert!(!is_dos_device_name(&u("README")));
-        assert!(!is_dos_device_name(&u("CONSOLE")));
-        assert!(!is_dos_device_name(&u("\\\\server\\share\\NUL")));
-        assert!(!is_dos_device_name(&u("\\\\.\\NUL")));
-        assert!(!is_dos_device_name(&u("//./CON")));
-        assert!(!is_dos_device_name(&[0x014e, b'U' as u16, b'L' as u16]));
+        let span = |path: &str| dos_device_name(&u(path)).map(DosDeviceNameSpan::packed);
+        assert_eq!(span("CON"), Some(0x0000_0006));
+        assert_eq!(span("con:"), Some(0x0000_0006));
+        assert_eq!(span("NUL.txt"), Some(0x0000_0006));
+        assert_eq!(span("NUL .txt"), Some(0x0000_0006));
+        assert_eq!(span("LPT1:"), Some(0x0000_0008));
+        assert_eq!(span("CoM4:"), Some(0x0000_0008));
+        assert_eq!(span("c:\\nul:"), Some(0x0006_0006));
+        assert_eq!(span("c:prn     "), Some(0x0004_0006));
+        assert_eq!(span("c:nul. . . :"), Some(0x0004_0006));
+        assert_eq!(span("C:\\path\\COM1.foo"), Some(0x0010_0008));
+        assert_eq!(span("\\\\.\\CON"), Some(0x0008_0006));
+        assert_eq!(span("\\??\\CON"), Some(0x0008_0006));
+        for path in [
+            "", "COM0", "COM10", "CONSOLE", "README", "c:\\nul\\", "c:\\nul\\foo",
+            "\\\\server\\share\\NUL", "\\\\.\\NUL", "\\\\?\\CON", "//./CON",
+        ] {
+            assert_eq!(span(path), None, "{path}");
+        }
+        assert_eq!(
+            dos_device_name(&[b'C' as u16, b'O' as u16, b'M' as u16, 0xFF16])
+                .map(DosDeviceNameSpan::packed),
+            Some(0x0000_0008)
+        );
+        assert_eq!(
+            dos_device_name(&[b'C' as u16, b'O' as u16, b'M' as u16, 0xFF10])
+                .map(DosDeviceNameSpan::packed),
+            Some(0x0000_0008)
+        );
+        assert!(!is_dos_device_name(&[
+            0x014e,
+            b'U' as u16,
+            b'L' as u16
+        ]));
     }
 
     #[test]

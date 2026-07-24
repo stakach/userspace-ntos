@@ -15906,13 +15906,25 @@ pub unsafe extern "system" fn rtl_determine_dos_path_name_type_u(path: *const u1
 pub unsafe extern "system" fn rtl_is_dos_device_name_u(path: *const u16) -> u32 {
     // SAFETY: path NUL-terminated per the contract.
     let n = unsafe { wcslen_raw(path) };
-    let s = unsafe { core::slice::from_raw_parts(path, n) };
-    if nt_ntdll::rtl::path::is_dos_device_name(s) {
-        // Offset 0, length = whole name in bytes (a conservative but valid packed result).
-        (n * 2) as u32
-    } else {
-        0
+    if n > 32_766 {
+        return 0;
     }
+    let s = if n == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(path, n) }
+    };
+    nt_ntdll::rtl::path::dos_device_name(s).map_or(0, |span| span.packed())
+}
+
+/// `RtlIsDosDeviceName_Ustr(PCUNICODE_STRING Path) -> ULONG`.
+///
+/// # Safety
+/// `path` is null or points to a valid counted UTF-16 string.
+#[export_name = "RtlIsDosDeviceName_Ustr"]
+pub unsafe extern "system" fn rtl_is_dos_device_name_ustr(path: PCUnicodeString) -> u32 {
+    let s = unsafe { us_slice(path) };
+    nt_ntdll::rtl::path::dos_device_name(s).map_or(0, |span| span.packed())
 }
 
 /// `RtlIsNameLegalDOS8Dot3(PCUNICODE_STRING Name, POEM_STRING OemName, PBOOLEAN SpacesPresent)
@@ -29983,6 +29995,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_get_length_without_last_full_dos_or_nt_path_element as usize,
         rtlp_apply_length_function as usize,
         rtl_is_dos_device_name_u as usize,
+        rtl_is_dos_device_name_ustr as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
         rtl_generate_8dot3_name as usize,
         rtl_compute_privatized_dll_name_u as usize,
