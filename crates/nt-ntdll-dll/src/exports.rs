@@ -3243,6 +3243,13 @@ pub unsafe extern "system" fn rtl_get_nt_global_flags() -> u32 {
 /// `RtlNtStatusToDosError(NTSTATUS) -> ULONG` — map an NTSTATUS to a Win32 error (`nt-ntdll` logic).
 #[export_name = "RtlNtStatusToDosError"]
 pub extern "system" fn rtl_nt_status_to_dos_error(status: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb = current_teb();
+        if teb != 0 {
+            (*(teb as *mut Teb)).last_status_value = status;
+        }
+    }
     rtl::status::nt_status_to_dos_error(status)
 }
 

@@ -9194,40 +9194,37 @@ pub unsafe fn rtl_dos_search_path_u(
     buffer: *mut u16,
     part_name: *mut *mut u16,
 ) -> u32 {
-    use alloc::string::String;
     use alloc::vec::Vec;
-    // SAFETY: NUL-terminated inputs.
-    let path_s = unsafe { utf16_to_string(path) };
-    let file_s = unsafe { utf16_to_string(file_name) };
-    let ext_s = if extension.is_null() {
-        String::new()
-    } else {
-        // SAFETY: NUL-terminated.
-        unsafe { utf16_to_string(extension) }
-    };
-    if file_s.is_empty() {
+    if file_name.is_null() {
         return 0;
     }
-    // Append the extension only if FileName has no '.'.
-    let has_dot = file_s.contains('.');
-    let leaf = if has_dot || ext_s.is_empty() {
-        file_s.clone()
+
+    // SAFETY: non-null inputs are NUL-terminated by the caller.
+    let path_units = if path.is_null() {
+        &[][..]
     } else {
-        let mut l = file_s.clone();
-        l.push_str(&ext_s);
-        l
+        unsafe { core::slice::from_raw_parts(path, wlen(path)) }
     };
-    // Try each ';'-separated directory.
-    for dir in path_s.split(';') {
-        if dir.is_empty() {
-            continue;
-        }
-        // Build the candidate DOS path: dir (strip trailing '\') + '\' + leaf.
-        let mut cand = String::from(dir.trim_end_matches('\\'));
-        cand.push('\\');
-        cand.push_str(&leaf);
+    let file_units = unsafe { core::slice::from_raw_parts(file_name, wlen(file_name)) };
+    if file_units.is_empty() {
+        return 0;
+    }
+    let extension_units = if extension.is_null() {
+        None
+    } else {
+        Some(unsafe { core::slice::from_raw_parts(extension, wlen(extension)) })
+    };
+    let Ok(candidates) = nt_ntdll::rtl::path::dos_search_path_candidates(
+        0,
+        path_units,
+        file_units,
+        extension_units,
+    ) else {
+        return 0;
+    };
+
+    for cand_units in candidates {
         // Convert to an NT path (\??\...) for NtQueryAttributesFile.
-        let cand_units: Vec<u16> = cand.encode_utf16().collect();
         let Some(nt) = nt_ntdll::rtl::path::dos_path_name_to_nt_path_name(&cand_units) else {
             continue;
         };
@@ -9263,7 +9260,7 @@ pub unsafe fn rtl_dos_search_path_u(
                     // *PartName points at the leaf (after the last '\').
                     let last = cand_units
                         .iter()
-                        .rposition(|&c| c == b'\\' as u16)
+                        .rposition(|&c| c == b'\\' as u16 || c == b'/' as u16)
                         .map(|i| i + 1)
                         .unwrap_or(0);
                     core::ptr::write(part_name, buffer.add(last));

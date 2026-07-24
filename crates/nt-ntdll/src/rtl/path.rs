@@ -1009,6 +1009,16 @@ mod tests {
     #[test]
     fn search_candidates_handle_full_paths_and_flags() {
         assert_eq!(
+            dos_search_path_candidates(
+                0,
+                &u("C:\\Windows\\bin"),
+                &u("C:\\Windows\\system32\\csrss.exe"),
+                None,
+            )
+            .unwrap(),
+            [u("C:\\Windows\\system32\\csrss.exe")]
+        );
+        assert_eq!(
             dos_search_path_candidates(0, &u("ignored"), &u("C:\\bin\\app"), Some(&u(".exe")))
                 .unwrap(),
             [u("C:\\bin\\app"), u("C:\\bin\\app.exe")]

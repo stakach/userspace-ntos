@@ -8,36 +8,66 @@
 //!
 //! Category A. Host-tested.
 
+mod ntstatus_to_dos_error_map;
+
 use nt_ntdll_layout::Teb;
 
-/// A subset of the `NTSTATUS` → Win32 `RtlNtStatusToDosError` mapping covering the codes the early
-/// boot / loader path produces. The full table is ~600 entries; this covers the common ones and
-/// falls through to `ERROR_MR_MID_NOT_FOUND` (317, the Windows default for an unmapped status),
-/// matching real ntdll's behaviour for statuses absent from its table.
-pub fn nt_status_to_dos_error(status: u32) -> u32 {
-    match status {
-        0x0000_0000 => 0,    // STATUS_SUCCESS -> ERROR_SUCCESS
-        0x0000_0103 => 997,  // STATUS_PENDING -> ERROR_IO_PENDING
-        0xC000_0001 => 31,   // STATUS_UNSUCCESSFUL -> ERROR_GEN_FAILURE
-        0xC000_0002 => 1,    // STATUS_NOT_IMPLEMENTED -> ERROR_INVALID_FUNCTION
-        0xC000_0008 => 6,    // STATUS_INVALID_HANDLE -> ERROR_INVALID_HANDLE
-        0xC000_000D => 87,   // STATUS_INVALID_PARAMETER -> ERROR_INVALID_PARAMETER
-        0xC000_000F => 2,    // STATUS_NO_SUCH_FILE -> ERROR_FILE_NOT_FOUND
-        0xC000_0011 => 38,   // STATUS_END_OF_FILE -> ERROR_HANDLE_EOF
-        0xC000_0022 => 5,    // STATUS_ACCESS_DENIED -> ERROR_ACCESS_DENIED
-        0xC000_0023 => 122,  // STATUS_BUFFER_TOO_SMALL -> ERROR_INSUFFICIENT_BUFFER
-        0xC000_0034 => 2,    // STATUS_OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND
-        0xC000_0035 => 183,  // STATUS_OBJECT_NAME_COLLISION -> ERROR_ALREADY_EXISTS
-        0xC000_003A => 3,    // STATUS_OBJECT_PATH_NOT_FOUND -> ERROR_PATH_NOT_FOUND
-        0xC000_009A => 1450, // STATUS_INSUFFICIENT_RESOURCES -> ERROR_NO_SYSTEM_RESOURCES
-        0xC000_00BB => 50,   // STATUS_NOT_SUPPORTED -> ERROR_NOT_SUPPORTED
-        0xC000_0135 => 126,  // STATUS_DLL_NOT_FOUND -> ERROR_MOD_NOT_FOUND
-        0xC000_0139 => 127,  // STATUS_ENTRYPOINT_NOT_FOUND -> ERROR_PROC_NOT_FOUND
-        0x8000_0005 => 234,  // STATUS_BUFFER_OVERFLOW -> ERROR_MORE_DATA
-        0x8000_000D => 299,  // STATUS_PARTIAL_COPY -> ERROR_PARTIAL_COPY
-        0x0000_0102 => 258,  // STATUS_TIMEOUT -> WAIT_TIMEOUT
-        _ => 317,            // ERROR_MR_MID_NOT_FOUND
+use ntstatus_to_dos_error_map::*;
+
+const ERROR_MR_MID_NOT_FOUND: u32 = 317;
+
+fn nt_status_table_entry(status: u32) -> Option<u32> {
+    let (start, table): (u32, &[u32]) = match status {
+        0x0000_0102..=0x0000_0121 => (0x0000_0102, &TABLE_00000102),
+        0x4000_0002..=0x4000_0025 => (0x4000_0002, &TABLE_40000002),
+        0x4000_0370 => (0x4000_0370, &TABLE_40000370),
+        0x4002_0056 => (0x4002_0056, &TABLE_40020056),
+        0x4002_00AF => (0x4002_00AF, &TABLE_400200AF),
+        0x8000_0001..=0x8000_0027 => (0x8000_0001, &TABLE_80000001),
+        0x8000_0288..=0x8000_0289 => (0x8000_0288, &TABLE_80000288),
+        0x8009_0300..=0x8009_0347 => (0x8009_0300, &TABLE_80090300),
+        0x8009_2010..=0x8009_2013 => (0x8009_2010, &TABLE_80092010),
+        0x8009_6004 => (0x8009_6004, &TABLE_80096004),
+        0x8013_0001..=0x8013_0005 => (0x8013_0001, &TABLE_80130001),
+        0xC000_0001..=0xC000_019B => (0xC000_0001, &TABLE_C0000001),
+        0xC000_0202..=0xC000_038D => (0xC000_0202, &TABLE_C0000202),
+        0xC002_0001..=0xC002_0063 => (0xC002_0001, &TABLE_C0020001),
+        0xC003_0001..=0xC003_000C => (0xC003_0001, &TABLE_C0030001),
+        0xC003_0059..=0xC003_0061 => (0xC003_0059, &TABLE_C0030059),
+        0xC00A_0001..=0xC00A_0036 => (0xC00A_0001, &TABLE_C00A0001),
+        0xC013_0001..=0xC013_0016 => (0xC013_0001, &TABLE_C0130001),
+        0xC015_0001..=0xC015_0027 => (0xC015_0001, &TABLE_C0150001),
+        _ => return None,
+    };
+    Some(table[(status - start) as usize])
+}
+
+/// Convert an `NTSTATUS` to the corresponding Win32 error.
+///
+/// This follows ReactOS `sdk/lib/rtl/error.c:RtlNtStatusToDosErrorNoTeb`, including its complete
+/// 19-range table, intentional zero holes, customer-bit passthrough, `0xD...` aliases, and the
+/// `FACILITY_NTWIN32`/Win32-HRESULT low-word cases.
+pub fn nt_status_to_dos_error(mut status: u32) -> u32 {
+    if status == 0 || status & 0x2000_0000 != 0 {
+        return status;
     }
+
+    // Customer-severity 0xD statuses alias their ordinary 0xC status.
+    if status & 0xF000_0000 == 0xD000_0000 {
+        status &= !0x1000_0000;
+    }
+
+    match nt_status_table_entry(status) {
+        Some(0) => return ERROR_MR_MID_NOT_FOUND,
+        Some(error) => return error,
+        None => {}
+    }
+
+    if matches!(status >> 16, 0xC001 | 0x8007) {
+        return status & 0xFFFF;
+    }
+
+    ERROR_MR_MID_NOT_FOUND
 }
 
 /// Translate an I/O completion packet into the first two arguments documented for
@@ -364,9 +394,23 @@ mod tests {
     }
 
     #[test]
-    fn status_map_known() {
+    fn status_map_preserves_existing_exact_mappings() {
         assert_eq!(nt_status_to_dos_error(0), 0);
+        assert_eq!(nt_status_to_dos_error(0x0000_0102), 1460); // STATUS_TIMEOUT
+        assert_eq!(nt_status_to_dos_error(0x0000_0103), 997); // STATUS_PENDING
+        assert_eq!(nt_status_to_dos_error(0xC000_0001), 31); // STATUS_UNSUCCESSFUL
+        assert_eq!(nt_status_to_dos_error(0xC000_0002), 1); // STATUS_NOT_IMPLEMENTED
+        assert_eq!(nt_status_to_dos_error(0xC000_0008), 6); // STATUS_INVALID_HANDLE
+        assert_eq!(nt_status_to_dos_error(0xC000_000D), 87); // STATUS_INVALID_PARAMETER
+        assert_eq!(nt_status_to_dos_error(0xC000_000F), 2); // STATUS_NO_SUCH_FILE
+        assert_eq!(nt_status_to_dos_error(0xC000_0011), 38); // STATUS_END_OF_FILE
         assert_eq!(nt_status_to_dos_error(0xC000_0022), 5); // ACCESS_DENIED
+        assert_eq!(nt_status_to_dos_error(0xC000_0023), 122); // BUFFER_TOO_SMALL
+        assert_eq!(nt_status_to_dos_error(0xC000_0034), 2); // OBJECT_NAME_NOT_FOUND
+        assert_eq!(nt_status_to_dos_error(0xC000_0035), 183); // OBJECT_NAME_COLLISION
+        assert_eq!(nt_status_to_dos_error(0xC000_003A), 3); // OBJECT_PATH_NOT_FOUND
+        assert_eq!(nt_status_to_dos_error(0xC000_009A), 1450); // INSUFFICIENT_RESOURCES
+        assert_eq!(nt_status_to_dos_error(0xC000_00BB), 50); // NOT_SUPPORTED
         assert_eq!(nt_status_to_dos_error(0xC000_0135), 126); // DLL_NOT_FOUND -> MOD_NOT_FOUND
         assert_eq!(nt_status_to_dos_error(0x8000_0005), 234); // BUFFER_OVERFLOW -> MORE_DATA
         assert_eq!(nt_status_to_dos_error(0x8000_000D), 299); // PARTIAL_COPY
@@ -374,16 +418,66 @@ mod tests {
     }
 
     #[test]
+    fn status_map_covers_every_reactos_range_boundary() {
+        let boundaries = [
+            (0x0000_0102, 1460),
+            (0x0000_0121, 8201),
+            (0x4000_0002, 87),
+            (0x4000_0025, 722),
+            (0x4000_0370, 8364),
+            (0x4002_0056, 1824),
+            (0x4002_00AF, 1913),
+            (0x8000_0001, 0x8000_0001),
+            (0x8000_0027, 4340),
+            (0x8000_0288, 1165),
+            (0x8000_0289, 1166),
+            (0x8009_0300, 1450),
+            (0x8009_0347, 1368),
+            (0x8009_2010, 1397),
+            (0x8009_2013, 1397),
+            (0x8009_6004, 1397),
+            (0x8013_0001, 5061),
+            (0x8013_0005, 5065),
+            (0xC000_0001, 31),
+            (0xC000_019B, 1810),
+            (0xC000_0202, 1394),
+            (0xC000_038D, 0x8009_0355),
+            (0xC002_0001, 1700),
+            (0xC002_0063, 1915),
+            (0xC003_0001, 1772),
+            (0xC003_000C, 1783),
+            (0xC003_0059, 1827),
+            (0xC003_0061, 1918),
+            (0xC00A_0001, 7001),
+            (0xC00A_0036, 7057),
+            (0xC013_0001, 5039),
+            (0xC013_0016, 5060),
+            (0xC015_0001, 14000),
+            (0xC015_0027, 14110),
+        ];
+        for (status, error) in boundaries {
+            assert_eq!(nt_status_to_dos_error(status), error, "{status:#010x}");
+        }
+    }
+
+    #[test]
+    fn status_map_handles_holes_aliases_and_facilities() {
+        assert_eq!(nt_status_to_dos_error(0x0000_0101), ERROR_MR_MID_NOT_FOUND);
+        assert_eq!(nt_status_to_dos_error(0x0000_0104), ERROR_MR_MID_NOT_FOUND);
+        assert_eq!(nt_status_to_dos_error(0x0000_0122), ERROR_MR_MID_NOT_FOUND);
+        assert_eq!(nt_status_to_dos_error(0xC015_0028), ERROR_MR_MID_NOT_FOUND);
+
+        assert_eq!(nt_status_to_dos_error(0x2000_1234), 0x2000_1234);
+        assert_eq!(nt_status_to_dos_error(0xD000_0022), 5);
+        assert_eq!(nt_status_to_dos_error(0xC001_1234), 0x1234);
+        assert_eq!(nt_status_to_dos_error(0x8007_0057), 0x57);
+    }
+
+    #[test]
     fn io_completion_callback_uses_win32_error_and_dword_byte_count() {
-        assert_eq!(
-            io_completion_callback_arguments(0, 0x1_0000_0003),
-            (0, 3)
-        );
+        assert_eq!(io_completion_callback_arguments(0, 0x1_0000_0003), (0, 3));
         assert_eq!(io_completion_callback_arguments(0xC000_0022, 99), (5, 0));
-        assert_eq!(
-            io_completion_callback_arguments(0x8000_0005, 99),
-            (234, 0)
-        );
+        assert_eq!(io_completion_callback_arguments(0x8000_0005, 99), (234, 0));
     }
 
     #[test]
