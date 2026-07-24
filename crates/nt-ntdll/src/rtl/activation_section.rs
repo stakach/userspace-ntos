@@ -6,7 +6,7 @@ use crate::NtStatus;
 
 use super::{
     activation::DllRedirect,
-    activation_manifest::{ManifestClrSurrogate, ManifestWindowClass},
+    activation_manifest::{ManifestClrSurrogate, ManifestComInterface, ManifestWindowClass},
     guid::Guid,
     strings,
 };
@@ -29,6 +29,7 @@ const WINDOW_CLASS_REDIRECTION_SIZE: usize = 24;
 const HASH_ALGORITHM_X65599: u32 = 1;
 const GUID_HEADER_SIZE: usize = 40;
 const GUID_INDEX_SIZE: usize = 28;
+const COM_INTERFACE_REDIRECTION_SIZE: usize = 68;
 const CLR_SURROGATE_SIZE: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,33 @@ pub struct WindowClassRedirectionMatch {
     pub versioned_name_length: u32,
     pub module_offset: u32,
     pub module_length: u32,
+    pub assembly_roster_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComInterfaceAssembly<'a> {
+    pub files: &'a [DllRedirect],
+    pub interfaces: &'a [ManifestComInterface],
+}
+
+#[derive(Clone, Copy)]
+struct ComInterfaceSectionEntry<'a> {
+    interface: &'a ManifestComInterface,
+    assembly_roster_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComInterfaceRedirectionSection {
+    pub count: u32,
+    pub index_offset: u32,
+    pub length: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComInterfaceMatch {
+    pub data_offset: u32,
+    /// Unpadded payload length returned through `ACTCTX_SECTION_KEYED_DATA`.
+    pub data_length: u32,
     pub assembly_roster_index: u32,
 }
 
@@ -186,8 +214,8 @@ pub fn build_dll_redirection_section_for_assemblies(
                 .checked_add(position.checked_mul(INDEX_SIZE).ok_or(STATUS_NO_MEMORY)?)
                 .ok_or(STATUS_NO_MEMORY)?;
             let name_bytes = utf16_bytes_len(redirect.name.len())?;
-            let name_storage =
-                align4(name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?).ok_or(STATUS_NO_MEMORY)?;
+            let name_storage = align4(name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?)
+                .ok_or(STATUS_NO_MEMORY)?;
             let name_offset = cursor;
             let data_offset = name_offset
                 .checked_add(name_storage)
@@ -201,11 +229,7 @@ pub fn build_dll_redirection_section_for_assemblies(
             write_u32(&mut section, index_offset + 12, to_u32(data_offset)?)?;
             // ReactOS leaves this at the fixed redirection-header size even when a path segment exists.
             write_u32(&mut section, index_offset + 16, REDIRECTION_SIZE as u32)?;
-            write_u32(
-                &mut section,
-                index_offset + 20,
-                assembly_roster_index,
-            )?;
+            write_u32(&mut section, index_offset + 20, assembly_roster_index)?;
             write_utf16(&mut section, name_offset, &redirect.name)?;
 
             if redirect.load_from.is_none() {
@@ -874,6 +898,333 @@ pub fn find_window_class_redirection(
     Ok(None)
 }
 
+/// Build the ReactOS COM-interface GUID section in assembly/entity order.
+///
+/// Assembly-level external proxy stubs precede file-scoped proxy stubs within each assembly.
+pub fn build_com_interface_section(
+    assemblies: &[ComInterfaceAssembly<'_>],
+) -> Result<Vec<u8>, NtStatus> {
+    let assembly_count = u32::try_from(assemblies.len()).map_err(|_| STATUS_NO_MEMORY)?;
+    let count = assemblies.iter().try_fold(0usize, |count, assembly| {
+        count
+            .checked_add(assembly.interfaces.len())
+            .ok_or(STATUS_NO_MEMORY)
+    })?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    for (assembly_index, assembly) in assemblies.iter().enumerate() {
+        let assembly_roster_index =
+            u32::try_from(assembly_index.checked_add(1).ok_or(STATUS_NO_MEMORY)?)
+                .map_err(|_| STATUS_NO_MEMORY)?;
+        for interface in assembly.interfaces {
+            validate_com_interface_manifest(interface, assembly.files.len())?;
+            if interface.file_index.is_none() {
+                entries.push(ComInterfaceSectionEntry {
+                    interface,
+                    assembly_roster_index,
+                });
+            }
+        }
+        for file_index in 0..assembly.files.len() {
+            for interface in assembly.interfaces {
+                if interface.file_index == Some(file_index) {
+                    entries.push(ComInterfaceSectionEntry {
+                        interface,
+                        assembly_roster_index,
+                    });
+                }
+            }
+        }
+    }
+    if entries.len() != count {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+
+    let index_bytes = count.checked_mul(GUID_INDEX_SIZE).ok_or(STATUS_NO_MEMORY)?;
+    let mut total = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .ok_or(STATUS_NO_MEMORY)?;
+    for entry in &entries {
+        total = total
+            .checked_add(com_interface_storage_size(entry.interface)?)
+            .ok_or(STATUS_NO_MEMORY)?;
+    }
+    let total_u32 = checked_section_size(total)?;
+    let count_u32 = u32::try_from(count).map_err(|_| STATUS_NO_MEMORY)?;
+
+    let mut section = Vec::new();
+    section
+        .try_reserve_exact(total)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    section.resize(total, 0);
+    write_u32(&mut section, 0, GUIDSECTION_MAGIC)?;
+    write_u32(&mut section, 4, GUID_HEADER_SIZE as u32)?;
+    write_u32(&mut section, 20, count_u32)?;
+    write_u32(&mut section, 24, GUID_HEADER_SIZE as u32)?;
+
+    let mut cursor = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .ok_or(STATUS_NO_MEMORY)?;
+    for (position, entry) in entries.iter().enumerate() {
+        let interface = entry.interface;
+        let index_offset = GUID_HEADER_SIZE
+            .checked_add(
+                position
+                    .checked_mul(GUID_INDEX_SIZE)
+                    .ok_or(STATUS_NO_MEMORY)?,
+            )
+            .ok_or(STATUS_NO_MEMORY)?;
+        let name_bytes = interface
+            .name
+            .as_ref()
+            .map(|name| utf16_bytes_len(name.len()))
+            .transpose()?
+            .unwrap_or(0);
+        let stored_data_length =
+            align4(name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?).ok_or(STATUS_NO_MEMORY)?;
+        let payload_iid = if interface.file_index.is_none() {
+            interface.proxy_stub_clsid32.unwrap_or(interface.iid)
+        } else {
+            interface.iid
+        };
+        let mask = u32::from(interface.num_methods.is_some())
+            | (u32::from(interface.base_interface.is_some()) << 1);
+
+        write_guid(&mut section, index_offset, interface.iid)?;
+        write_u32(&mut section, index_offset + 16, to_u32(cursor)?)?;
+        // Preserve ReactOS's compiled `sizeof(data) + name_len ? ... : 0` precedence quirk.
+        write_u32(&mut section, index_offset + 20, to_u32(stored_data_length)?)?;
+        write_u32(&mut section, index_offset + 24, entry.assembly_roster_index)?;
+
+        write_u32(&mut section, cursor, COM_INTERFACE_REDIRECTION_SIZE as u32)?;
+        write_u32(&mut section, cursor + 4, mask)?;
+        write_guid(&mut section, cursor + 8, payload_iid)?;
+        write_u32(
+            &mut section,
+            cursor + 24,
+            interface.num_methods.unwrap_or(0),
+        )?;
+        write_guid(
+            &mut section,
+            cursor + 28,
+            interface.type_library.unwrap_or_default(),
+        )?;
+        write_guid(
+            &mut section,
+            cursor + 44,
+            interface.base_interface.unwrap_or_default(),
+        )?;
+        write_u32(&mut section, cursor + 60, to_u32(name_bytes)?)?;
+        write_u32(
+            &mut section,
+            cursor + 64,
+            if name_bytes == 0 {
+                0
+            } else {
+                COM_INTERFACE_REDIRECTION_SIZE as u32
+            },
+        )?;
+        if let Some(name) = &interface.name {
+            write_utf16(&mut section, cursor + COM_INTERFACE_REDIRECTION_SIZE, name)?;
+        }
+        cursor = cursor
+            .checked_add(com_interface_storage_size(interface)?)
+            .ok_or(STATUS_NO_MEMORY)?;
+    }
+    if cursor != total || total_u32 as usize != section.len() {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    validate_com_interface_section(&section, assembly_count)?;
+    Ok(section)
+}
+
+/// Validate a complete COM-interface GUID section.
+pub fn validate_com_interface_section(
+    section: &[u8],
+    assembly_count: u32,
+) -> Result<ComInterfaceRedirectionSection, NtStatus> {
+    let length = u32::try_from(section.len()).map_err(|_| STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    if section.len() < GUID_HEADER_SIZE
+        || read_u32(section, 0)? != GUIDSECTION_MAGIC
+        || read_u32(section, 4)? != GUID_HEADER_SIZE as u32
+        || read_u32(section, 8)? != 0
+        || read_u32(section, 12)? != 0
+        || read_u32(section, 16)? != 0
+        || read_u32(section, 24)? != GUID_HEADER_SIZE as u32
+        || read_u32(section, 28)? != 0
+        || read_u32(section, 32)? != 0
+        || read_u32(section, 36)? != 0
+    {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    let count = read_offset(section, 20)?;
+    let index_bytes = count
+        .checked_mul(GUID_INDEX_SIZE)
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let mut expected = GUID_HEADER_SIZE
+        .checked_add(index_bytes)
+        .filter(|end| *end <= section.len())
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+
+    for position in 0..count {
+        let index_offset = GUID_HEADER_SIZE
+            .checked_add(
+                position
+                    .checked_mul(GUID_INDEX_SIZE)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+            )
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        let data_offset = read_offset(section, index_offset + 16)?;
+        let stored_data_length = read_offset(section, index_offset + 20)?;
+        let roster_index = read_u32(section, index_offset + 24)?;
+        if data_offset != expected
+            || roster_index == 0
+            || roster_index > assembly_count
+            || data_offset
+                .checked_add(COM_INTERFACE_REDIRECTION_SIZE)
+                .filter(|end| *end <= section.len())
+                .is_none()
+            || read_u32(section, data_offset)? != COM_INTERFACE_REDIRECTION_SIZE as u32
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let mask = read_u32(section, data_offset + 4)?;
+        let num_methods = read_u32(section, data_offset + 24)?;
+        let base = read_guid(section, data_offset + 44)?;
+        let name_length = read_offset(section, data_offset + 60)?;
+        let name_offset = read_offset(section, data_offset + 64)?;
+        if mask & !0x03 != 0
+            || mask & 0x01 == 0 && num_methods != 0
+            || mask & 0x02 == 0 && base != Guid::default()
+            || name_length % 2 != 0
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let name_storage = align4(
+            name_length
+                .checked_add(2)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+        )
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        if stored_data_length != name_storage {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let record_storage = if name_length == 0 {
+            if name_offset != 0 {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            COM_INTERFACE_REDIRECTION_SIZE
+        } else {
+            if name_offset != COM_INTERFACE_REDIRECTION_SIZE
+                || section_contains_unit(
+                    section,
+                    data_offset + COM_INTERFACE_REDIRECTION_SIZE,
+                    name_length,
+                    0,
+                )?
+                || read_u16(
+                    section,
+                    data_offset
+                        .checked_add(COM_INTERFACE_REDIRECTION_SIZE)
+                        .and_then(|value| value.checked_add(name_length))
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                )? != 0
+            {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            COM_INTERFACE_REDIRECTION_SIZE
+                .checked_add(name_storage)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
+        };
+        expected = data_offset
+            .checked_add(record_storage)
+            .filter(|end| *end <= section.len())
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    }
+    if expected != section.len() {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    Ok(ComInterfaceRedirectionSection {
+        count: u32::try_from(count).map_err(|_| STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+        index_offset: GUID_HEADER_SIZE as u32,
+        length,
+    })
+}
+
+/// Find an exact IID in a structurally validated COM-interface section.
+pub fn find_com_interface(
+    section: &[u8],
+    assembly_count: u32,
+    iid: &Guid,
+) -> Result<Option<ComInterfaceMatch>, NtStatus> {
+    let metadata = validate_com_interface_section(section, assembly_count)?;
+    for position in 0..metadata.count as usize {
+        let index_offset = GUID_HEADER_SIZE
+            .checked_add(
+                position
+                    .checked_mul(GUID_INDEX_SIZE)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+            )
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        if read_guid(section, index_offset)? != *iid {
+            continue;
+        }
+        let data_offset = read_offset(section, index_offset + 16)?;
+        let name_length = read_offset(section, data_offset + 60)?;
+        let data_length = COM_INTERFACE_REDIRECTION_SIZE
+            .checked_add(if name_length == 0 {
+                0
+            } else {
+                name_length
+                    .checked_add(2)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
+            })
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        return Ok(Some(ComInterfaceMatch {
+            data_offset: invalid_to_u32(data_offset)?,
+            data_length: invalid_to_u32(data_length)?,
+            assembly_roster_index: read_u32(section, index_offset + 24)?,
+        }));
+    }
+    Ok(None)
+}
+
+fn validate_com_interface_manifest(
+    interface: &ManifestComInterface,
+    file_count: usize,
+) -> Result<(), NtStatus> {
+    if interface
+        .file_index
+        .is_some_and(|file_index| file_index >= file_count)
+        || interface
+            .name
+            .as_ref()
+            .is_some_and(|name| name.is_empty() || name.contains(&0))
+    {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    Ok(())
+}
+
+fn com_interface_storage_size(interface: &ManifestComInterface) -> Result<usize, NtStatus> {
+    let name_storage = interface
+        .name
+        .as_ref()
+        .map(|name| {
+            utf16_bytes_len(name.len())?
+                .checked_add(2)
+                .and_then(align4)
+                .ok_or(STATUS_NO_MEMORY)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    COM_INTERFACE_REDIRECTION_SIZE
+        .checked_add(name_storage)
+        .ok_or(STATUS_NO_MEMORY)
+}
+
 /// Build a GUID-keyed CLR-surrogate activation-context section in assembly/entity order.
 pub fn build_clr_surrogate_section(
     assemblies: &[ClrSurrogateAssembly<'_>],
@@ -1491,6 +1842,305 @@ mod tests {
         }
     }
 
+    fn interface_guid(first: u32, last: u8) -> Guid {
+        Guid {
+            data1: first,
+            data2: 0x8888,
+            data3: 0x7777,
+            data4: [0x66, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55, last],
+        }
+    }
+
+    #[test]
+    fn builds_exact_com_interface_section_in_native_entity_order() {
+        let files = [DllRedirect {
+            name: wide("testlib.dll"),
+            load_from: None,
+        }];
+        let interfaces = [
+            ManifestComInterface {
+                file_index: Some(0),
+                iid: interface_guid(0x6666_6666, 0x55),
+                name: Some(wide("Iifaceps")),
+                proxy_stub_clsid32: Some(interface_guid(0x6666_6666, 0x56)),
+                type_library: Some(interface_guid(0x9999_9999, 0x58)),
+                base_interface: Some(interface_guid(0x6666_6666, 0x57)),
+                num_methods: Some(10),
+            },
+            ManifestComInterface {
+                file_index: None,
+                iid: interface_guid(0x7666_6666, 0x55),
+                name: Some(wide("Iifaceps2")),
+                proxy_stub_clsid32: Some(interface_guid(0x6666_6666, 0x56)),
+                type_library: Some(interface_guid(0x9999_9999, 0x58)),
+                base_interface: Some(interface_guid(0x6666_6666, 0x57)),
+                num_methods: Some(10),
+            },
+            ManifestComInterface {
+                file_index: None,
+                iid: interface_guid(0x8666_6666, 0x55),
+                name: Some(wide("Iifaceps3")),
+                proxy_stub_clsid32: None,
+                type_library: Some(interface_guid(0x9999_9999, 0x58)),
+                base_interface: Some(interface_guid(0x6666_6666, 0x57)),
+                num_methods: Some(10),
+            },
+        ];
+        let section = build_com_interface_section(&[ComInterfaceAssembly {
+            files: &files,
+            interfaces: &interfaces,
+        }])
+        .unwrap();
+
+        assert_eq!(section.len(), 388);
+        assert_eq!(
+            validate_com_interface_section(&section, 1),
+            Ok(ComInterfaceRedirectionSection {
+                count: 3,
+                index_offset: 40,
+                length: 388,
+            })
+        );
+        for (position, key, data_offset) in [
+            (0, interface_guid(0x7666_6666, 0x55), 124),
+            (1, interface_guid(0x8666_6666, 0x55), 212),
+            (2, interface_guid(0x6666_6666, 0x55), 300),
+        ] {
+            let index = GUID_HEADER_SIZE + position * GUID_INDEX_SIZE;
+            assert_eq!(read_guid(&section, index), Ok(key));
+            assert_eq!(read_u32(&section, index + 16), Ok(data_offset));
+            assert_eq!(read_u32(&section, index + 20), Ok(20));
+            assert_eq!(read_u32(&section, index + 24), Ok(1));
+        }
+        assert_eq!(read_u32(&section, 124), Ok(68));
+        assert_eq!(read_u32(&section, 128), Ok(3));
+        assert_eq!(
+            read_guid(&section, 132),
+            Ok(interface_guid(0x6666_6666, 0x56))
+        );
+        assert_eq!(read_u32(&section, 148), Ok(10));
+        assert_eq!(
+            read_guid(&section, 152),
+            Ok(interface_guid(0x9999_9999, 0x58))
+        );
+        assert_eq!(
+            read_guid(&section, 168),
+            Ok(interface_guid(0x6666_6666, 0x57))
+        );
+        assert_eq!(read_u32(&section, 184), Ok(18));
+        assert_eq!(read_u32(&section, 188), Ok(68));
+        assert_eq!(read_wide(&section, 192, 18), wide("Iifaceps2"));
+        assert_eq!(
+            read_guid(&section, 308),
+            Ok(interface_guid(0x6666_6666, 0x55))
+        );
+        assert_eq!(
+            find_com_interface(&section, 1, &interface_guid(0x7666_6666, 0x55)),
+            Ok(Some(ComInterfaceMatch {
+                data_offset: 124,
+                data_length: 88,
+                assembly_roster_index: 1,
+            }))
+        );
+        assert_eq!(
+            find_com_interface(&section, 1, &interface_guid(0x6666_6666, 0x55)),
+            Ok(Some(ComInterfaceMatch {
+                data_offset: 300,
+                data_length: 86,
+                assembly_roster_index: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn com_interface_section_preserves_absent_and_explicit_zero_fields() {
+        let interfaces = [
+            ManifestComInterface {
+                file_index: None,
+                iid: interface_guid(0x1666_6666, 0x55),
+                name: None,
+                proxy_stub_clsid32: None,
+                type_library: None,
+                base_interface: None,
+                num_methods: None,
+            },
+            ManifestComInterface {
+                file_index: None,
+                iid: interface_guid(0x2666_6666, 0x55),
+                name: Some(wide("Zero")),
+                proxy_stub_clsid32: Some(Guid::default()),
+                type_library: None,
+                base_interface: Some(Guid::default()),
+                num_methods: Some(0),
+            },
+        ];
+        let section = build_com_interface_section(&[ComInterfaceAssembly {
+            files: &[],
+            interfaces: &interfaces,
+        }])
+        .unwrap();
+        let first_data = read_u32(&section, GUID_HEADER_SIZE + 16).unwrap() as usize;
+        assert_eq!(
+            read_u32(&section, GUID_HEADER_SIZE + 20),
+            Ok(4),
+            "ReactOS index data_len excludes the fixed payload"
+        );
+        assert_eq!(read_u32(&section, first_data + 4), Ok(0));
+        assert_eq!(read_guid(&section, first_data + 8), Ok(interfaces[0].iid));
+        assert_eq!(read_u32(&section, first_data + 60), Ok(0));
+        assert_eq!(read_u32(&section, first_data + 64), Ok(0));
+        assert_eq!(
+            find_com_interface(&section, 1, &interfaces[0].iid),
+            Ok(Some(ComInterfaceMatch {
+                data_offset: first_data as u32,
+                data_length: 68,
+                assembly_roster_index: 1,
+            }))
+        );
+
+        let second_index = GUID_HEADER_SIZE + GUID_INDEX_SIZE;
+        let second_data = read_u32(&section, second_index + 16).unwrap() as usize;
+        assert_eq!(read_u32(&section, second_data + 4), Ok(3));
+        assert_eq!(read_guid(&section, second_data + 8), Ok(Guid::default()));
+        assert_eq!(read_u32(&section, second_data + 24), Ok(0));
+        assert_eq!(read_guid(&section, second_data + 44), Ok(Guid::default()));
+    }
+
+    #[test]
+    fn com_interface_sections_preserve_rosters_and_file_order() {
+        let files = [
+            DllRedirect {
+                name: wide("first.dll"),
+                load_from: None,
+            },
+            DllRedirect {
+                name: wide("second.dll"),
+                load_from: None,
+            },
+        ];
+        let interfaces = [
+            ManifestComInterface {
+                file_index: Some(1),
+                iid: interface_guid(0x3666_6666, 0x55),
+                name: None,
+                proxy_stub_clsid32: None,
+                type_library: None,
+                base_interface: None,
+                num_methods: None,
+            },
+            ManifestComInterface {
+                file_index: None,
+                iid: interface_guid(0x1666_6666, 0x55),
+                name: None,
+                proxy_stub_clsid32: None,
+                type_library: None,
+                base_interface: None,
+                num_methods: None,
+            },
+            ManifestComInterface {
+                file_index: Some(0),
+                iid: interface_guid(0x2666_6666, 0x55),
+                name: None,
+                proxy_stub_clsid32: None,
+                type_library: None,
+                base_interface: None,
+                num_methods: None,
+            },
+        ];
+        let section = build_com_interface_section(&[
+            ComInterfaceAssembly {
+                files: &[],
+                interfaces: &[],
+            },
+            ComInterfaceAssembly {
+                files: &files,
+                interfaces: &interfaces,
+            },
+        ])
+        .unwrap();
+        for (position, expected) in [
+            interface_guid(0x1666_6666, 0x55),
+            interface_guid(0x2666_6666, 0x55),
+            interface_guid(0x3666_6666, 0x55),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = GUID_HEADER_SIZE + position * GUID_INDEX_SIZE;
+            assert_eq!(read_guid(&section, index), Ok(expected));
+            assert_eq!(read_u32(&section, index + 24), Ok(2));
+        }
+    }
+
+    #[test]
+    fn com_interface_builder_and_finder_reject_invalid_data() {
+        let invalid = [ManifestComInterface {
+            file_index: Some(1),
+            iid: interface_guid(0x6666_6666, 0x55),
+            name: None,
+            proxy_stub_clsid32: None,
+            type_library: None,
+            base_interface: None,
+            num_methods: None,
+        }];
+        assert_eq!(
+            build_com_interface_section(&[ComInterfaceAssembly {
+                files: &[],
+                interfaces: &invalid,
+            }]),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+
+        let valid = [ManifestComInterface {
+            file_index: None,
+            iid: interface_guid(0x6666_6666, 0x55),
+            name: Some(wide("Interface")),
+            proxy_stub_clsid32: None,
+            type_library: None,
+            base_interface: None,
+            num_methods: None,
+        }];
+        let original = build_com_interface_section(&[ComInterfaceAssembly {
+            files: &[],
+            interfaces: &valid,
+        }])
+        .unwrap();
+        let data_offset = read_u32(&original, GUID_HEADER_SIZE + 16).unwrap() as usize;
+        for (offset, value) in [
+            (0, 0),
+            (8, 1),
+            (24, 0),
+            (GUID_HEADER_SIZE + 16, 0),
+            (GUID_HEADER_SIZE + 20, 0),
+            (GUID_HEADER_SIZE + 24, 0),
+            (data_offset, 0),
+            (data_offset + 4, 4),
+            (data_offset + 24, 1),
+            (data_offset + 60, 3),
+            (data_offset + 64, 0),
+        ] {
+            let mut section = original.clone();
+            write_u32(&mut section, offset, value).unwrap();
+            assert_eq!(
+                find_com_interface(&section, 1, &valid[0].iid),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT),
+                "offset {offset}"
+            );
+        }
+        let mut truncated = original.clone();
+        truncated.pop();
+        assert_eq!(
+            find_com_interface(&truncated, 1, &valid[0].iid),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+        let mut trailing = original;
+        trailing.push(0);
+        assert_eq!(
+            find_com_interface(&trailing, 1, &valid[0].iid),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+    }
+
     #[test]
     fn builds_exact_clr_surrogate_guid_section() {
         let surrogates = [ManifestClrSurrogate {
@@ -1784,10 +2434,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(read_u32(&section, HEADER_SIZE + 20), Ok(1));
-        assert_eq!(
-            read_u32(&section, HEADER_SIZE + INDEX_SIZE + 20),
-            Ok(2)
-        );
+        assert_eq!(read_u32(&section, HEADER_SIZE + INDEX_SIZE + 20), Ok(2));
         write_u32(&mut section, HEADER_SIZE + INDEX_SIZE + 20, 0).unwrap();
         assert_eq!(
             validate_dll_redirection_section(&section),

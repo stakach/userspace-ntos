@@ -332,6 +332,7 @@ pub struct ActivationContextObject {
     pub ui_access: u32,
     pub dll_redirect_section: Vec<u8>,
     pub window_class_redirect_section: Vec<u8>,
+    pub com_interface_section: Vec<u8>,
     pub clr_surrogate_section: Vec<u8>,
     pub application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
 }
@@ -394,6 +395,7 @@ impl ActivationContextObject {
             Vec::new(),
             super::activation_section::build_dll_redirection_section_for_assemblies(&[])?,
             super::activation_section::build_window_class_redirection_section(&[])?,
+            super::activation_section::build_com_interface_section(&[])?,
             super::activation_section::build_clr_surrogate_section(&[])?,
             Vec::new(),
         ))
@@ -405,6 +407,7 @@ impl ActivationContextObject {
         dll_redirects: Vec<DllRedirect>,
         dll_redirect_section: Vec<u8>,
         window_class_redirect_section: Vec<u8>,
+        com_interface_section: Vec<u8>,
         clr_surrogate_section: Vec<u8>,
         application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
         encoded_assembly_identity: Vec<u16>,
@@ -423,6 +426,7 @@ impl ActivationContextObject {
             assemblies,
             dll_redirect_section,
             window_class_redirect_section,
+            com_interface_section,
             clr_surrogate_section,
             application_settings,
         )
@@ -432,6 +436,7 @@ impl ActivationContextObject {
         assemblies: Vec<ActivationAssembly>,
         dll_redirect_section: Vec<u8>,
         window_class_redirect_section: Vec<u8>,
+        com_interface_section: Vec<u8>,
         clr_surrogate_section: Vec<u8>,
         application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
     ) -> Self {
@@ -446,6 +451,7 @@ impl ActivationContextObject {
             ui_access: 0,
             dll_redirect_section,
             window_class_redirect_section,
+            com_interface_section,
             clr_surrogate_section,
             application_settings,
         }
@@ -959,6 +965,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(object.is_valid());
         assert_eq!(object.reference_count(), 1);
@@ -992,6 +999,14 @@ mod tests {
             Ok(None)
         );
         assert_eq!(
+            super::super::activation_section::find_com_interface(
+                &object.com_interface_section,
+                0,
+                &super::super::guid::Guid::default(),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
             super::super::activation_section::find_clr_surrogate(
                 &object.clr_surrogate_section,
                 &super::super::guid::Guid::default(),
@@ -1005,6 +1020,7 @@ mod tests {
         let object = ActivationContextObject::new(
             Vec::new(),
             b"<assembly/>".to_vec(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

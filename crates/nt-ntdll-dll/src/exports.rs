@@ -14414,11 +14414,15 @@ pub unsafe extern "system" fn rtl_create_activation_context(
 
         let mut dll_assemblies = Vec::new();
         let mut window_assemblies = Vec::new();
+        let mut interface_assemblies = Vec::new();
         let mut clr_assemblies = Vec::new();
         if dll_assemblies
             .try_reserve_exact(resolved.assemblies.len())
             .is_err()
             || window_assemblies
+                .try_reserve_exact(resolved.assemblies.len())
+                .is_err()
+            || interface_assemblies
                 .try_reserve_exact(resolved.assemblies.len())
                 .is_err()
             || clr_assemblies
@@ -14438,6 +14442,12 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     version: assembly.details.root.assembly_identity.version,
                     files: &assembly.details.root.dll_redirects,
                     classes: &assembly.details.window_classes,
+                },
+            );
+            interface_assemblies.push(
+                nt_ntdll::rtl::activation_section::ComInterfaceAssembly {
+                    files: &assembly.details.root.dll_redirects,
+                    interfaces: &assembly.details.com_interfaces,
                 },
             );
             clr_assemblies.push(
@@ -14465,8 +14475,16 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 Ok(section) => section,
                 Err(status) => return status,
             };
+        let com_interface_section =
+            match nt_ntdll::rtl::activation_section::build_com_interface_section(
+                &interface_assemblies,
+            ) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
         drop(dll_assemblies);
         drop(window_assemblies);
+        drop(interface_assemblies);
         drop(clr_assemblies);
 
         let (compatibility, run_level, ui_access) = {
@@ -14518,6 +14536,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 assemblies,
                 dll_redirect_section,
                 window_class_redirect_section,
+                com_interface_section,
                 clr_surrogate_section,
                 application_settings,
             ),
@@ -14813,7 +14832,11 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
     ) {
         return STATUS_SXS_SECTION_NOT_FOUND;
     }
-    if section_id != nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_CLR_SURROGATES {
+    if matches!(
+        section_id,
+        nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION
+            | nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_TYPE_LIBRARY_REDIRECTION
+    ) {
         return STATUS_SXS_KEY_NOT_FOUND;
     }
 
@@ -14844,10 +14867,45 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
                 continue;
             };
             let object = unsafe { &*object_ptr };
-            let found = match nt_ntdll::rtl::activation_section::find_clr_surrogate(
-                &object.clr_surrogate_section,
-                &key,
-            ) {
+            let (section, lookup) = if section_id
+                == nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_INTERFACE_REDIRECTION
+            {
+                (
+                    &object.com_interface_section,
+                    nt_ntdll::rtl::activation_section::find_com_interface(
+                        &object.com_interface_section,
+                        object.assemblies.len() as u32,
+                        &key,
+                    )
+                    .map(|found| {
+                        found.map(|found| {
+                            (
+                                found.data_offset,
+                                found.data_length,
+                                found.assembly_roster_index,
+                            )
+                        })
+                    }),
+                )
+            } else {
+                (
+                    &object.clr_surrogate_section,
+                    nt_ntdll::rtl::activation_section::find_clr_surrogate(
+                        &object.clr_surrogate_section,
+                        &key,
+                    )
+                    .map(|found| {
+                        found.map(|found| {
+                            (
+                                found.data_offset,
+                                found.data_length,
+                                found.assembly_roster_index,
+                            )
+                        })
+                    }),
+                )
+            };
+            let found = match lookup {
                 Ok(Some(found)) => found,
                 Ok(None) => {
                     unsafe { activation_context_release(context) };
@@ -14863,15 +14921,15 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
                 write_activation_section_keyed_data(
                     returned_data,
                     output_size,
-                    &object.clr_surrogate_section,
-                    found.data_offset,
-                    found.data_length,
+                    section,
+                    found.0,
+                    found.1,
                     if return_context {
                         context
                     } else {
                         core::ptr::null_mut()
                     },
-                    found.assembly_roster_index,
+                    found.2,
                 );
             }
             if !return_context {

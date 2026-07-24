@@ -30,6 +30,7 @@ pub struct ParsedManifestDetails {
     pub root_language: Option<Vec<u16>>,
     pub dependencies: Vec<ManifestDependency>,
     pub window_classes: Vec<ManifestWindowClass>,
+    pub com_interfaces: Vec<ManifestComInterface>,
     pub clr_surrogates: Vec<ManifestClrSurrogate>,
     pub application_settings: Vec<ManifestApplicationSetting>,
 }
@@ -48,6 +49,20 @@ pub struct ManifestWindowClass {
     pub file_index: usize,
     pub name: Vec<u16>,
     pub versioned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestComInterface {
+    /// `Some` identifies a file-scoped proxy stub; `None` is an assembly-level external proxy stub.
+    pub file_index: Option<usize>,
+    /// The interface identifier used as the GUID-section lookup key.
+    pub iid: Guid,
+    pub name: Option<Vec<u16>>,
+    pub proxy_stub_clsid32: Option<Guid>,
+    pub type_library: Option<Guid>,
+    pub base_interface: Option<Guid>,
+    /// `Some(0)` preserves an explicitly empty or zero `numMethods` attribute and its mask bit.
+    pub num_methods: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +250,20 @@ fn parse_assembly_version(input: &[u16]) -> Result<[u16; 4], NtStatus> {
     Ok(result)
 }
 
+fn parse_u32_decimal(input: &[u16]) -> Result<u32, NtStatus> {
+    let mut value = 0u32;
+    for unit in input {
+        if !(b'0' as u16..=b'9' as u16).contains(unit) {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(u32::from(*unit - b'0' as u16)))
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    }
+    Ok(value)
+}
+
 fn decode_manifest(bytes: &[u8]) -> Result<Vec<u16>, NtStatus> {
     let (encoding, offset) = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         (Encoding::Utf8, 3)
@@ -322,6 +351,7 @@ struct Parser<'a> {
     root_language: Option<Vec<u16>>,
     dependencies: Vec<ManifestDependency>,
     window_classes: Vec<ManifestWindowClass>,
+    com_interfaces: Vec<ManifestComInterface>,
     clr_surrogates: Vec<ManifestClrSurrogate>,
     application_settings: Vec<ManifestApplicationSetting>,
     selected_settings_application: Option<usize>,
@@ -365,6 +395,7 @@ enum FrameKind {
         name: Vec<u16>,
         value: Vec<u16>,
     },
+    EmptyKnown,
     Other,
 }
 
@@ -378,6 +409,7 @@ impl<'a> Parser<'a> {
             root_language: None,
             dependencies: Vec::new(),
             window_classes: Vec::new(),
+            com_interfaces: Vec::new(),
             clr_surrogates: Vec::new(),
             application_settings: Vec::new(),
             selected_settings_application: None,
@@ -411,6 +443,11 @@ impl<'a> Parser<'a> {
                 let text = &self.input[text_start..self.position];
                 validate_escaped_text(text)?;
                 if let Some(frame) = stack.last_mut() {
+                    if matches!(&frame.kind, FrameKind::EmptyKnown)
+                        && text.iter().copied().any(|unit| !is_whitespace(unit))
+                    {
+                        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                    }
                     let output = match &mut frame.kind {
                         FrameKind::WindowClass { text, .. }
                         | FrameKind::ApplicationSetting { value: text, .. } => Some(text),
@@ -435,6 +472,9 @@ impl<'a> Parser<'a> {
                     let content_end = find_ascii(self.input, content_start, "]]>")
                         .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
                     if let Some(frame) = stack.last_mut() {
+                        if matches!(&frame.kind, FrameKind::EmptyKnown) {
+                            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                        }
                         let output = match &mut frame.kind {
                             FrameKind::WindowClass { text, .. }
                             | FrameKind::ApplicationSetting { value: text, .. } => Some(text),
@@ -466,7 +506,9 @@ impl<'a> Parser<'a> {
                     if stack.last().is_some_and(|frame| {
                         matches!(
                             &frame.kind,
-                            FrameKind::WindowClass { .. } | FrameKind::ApplicationSetting { .. }
+                            FrameKind::WindowClass { .. }
+                                | FrameKind::ApplicationSetting { .. }
+                                | FrameKind::EmptyKnown
                         )
                     }) {
                         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
@@ -519,6 +561,12 @@ impl<'a> Parser<'a> {
                     {
                         self.add_clr_surrogate(tag)?;
                         FrameKind::Other
+                    } else if parent_is_assembly
+                        && local_eq(self.input, tag.name(), "comInterfaceExternalProxyStub")
+                        && is_assembly_v1_namespace(&namespace)
+                    {
+                        self.add_com_interface(tag, None)?;
+                        FrameKind::EmptyKnown
                     } else if parent_dependency_optional.is_some()
                         && local_eq(self.input, tag.name(), "dependentAssembly")
                     {
@@ -551,6 +599,12 @@ impl<'a> Parser<'a> {
                             versioned: self.window_class_is_versioned(tag)?,
                             text: Vec::new(),
                         }
+                    } else if let Some(file_index) = parent_file_index.filter(|_| {
+                        local_eq(self.input, tag.name(), "comInterfaceProxyStub")
+                            && is_assembly_v1_namespace(&namespace)
+                    }) {
+                        self.add_com_interface(tag, Some(file_index))?;
+                        FrameKind::EmptyKnown
                     } else if parent_is_assembly
                         && local_eq(self.input, tag.name(), "application")
                         && is_assembly_namespace(&namespace)
@@ -630,6 +684,7 @@ impl<'a> Parser<'a> {
             root_language: self.root_language,
             dependencies: self.dependencies,
             window_classes: self.window_classes,
+            com_interfaces: self.com_interfaces,
             clr_surrogates: self.clr_surrogates,
             application_settings: self.application_settings,
         })
@@ -783,6 +838,64 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(versioned)
+    }
+
+    fn add_com_interface(&mut self, tag: Tag, file_index: Option<usize>) -> Result<(), NtStatus> {
+        let mut iid = None;
+        let mut name = None;
+        let mut proxy_stub_clsid32 = None;
+        let mut type_library = None;
+        let mut base_interface = None;
+        let mut num_methods = None;
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            let value = || decode_attribute_value(&self.input[attribute.value()]);
+            if attribute_eq(self.input, attribute, "iid") {
+                iid = Some(
+                    super::guid::guid_from_string(&value()?)
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                );
+            } else if attribute_eq(self.input, attribute, "name") {
+                name = Some(value()?);
+            } else if attribute_eq(self.input, attribute, "proxyStubClsid32") {
+                proxy_stub_clsid32 = Some(
+                    super::guid::guid_from_string(&value()?)
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                );
+            } else if attribute_eq(self.input, attribute, "tlbid") {
+                type_library = Some(
+                    super::guid::guid_from_string(&value()?)
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                );
+            } else if attribute_eq(self.input, attribute, "baseInterface") {
+                base_interface = Some(
+                    super::guid::guid_from_string(&value()?)
+                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                );
+            } else if attribute_eq(self.input, attribute, "numMethods") {
+                num_methods = Some(parse_u32_decimal(&value()?)?);
+            }
+        }
+        let iid = iid.ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        if name
+            .as_ref()
+            .is_some_and(|name| name.is_empty() || name.contains(&0))
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        self.com_interfaces
+            .try_reserve(1)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        self.com_interfaces.push(ManifestComInterface {
+            file_index,
+            iid,
+            name,
+            proxy_stub_clsid32,
+            type_library,
+            base_interface,
+            num_methods,
+        });
+        Ok(())
     }
 
     fn add_clr_surrogate(&mut self, tag: Tag) -> Result<(), NtStatus> {
@@ -1203,6 +1316,10 @@ fn is_assembly_namespace(namespace: &[u16]) -> bool {
         || ascii_slice_eq(namespace, "urn:schemas-microsoft-com:asm.v3")
 }
 
+fn is_assembly_v1_namespace(namespace: &[u16]) -> bool {
+    namespace.is_empty() || ascii_slice_eq(namespace, "urn:schemas-microsoft-com:asm.v1")
+}
+
 fn is_application_setting(namespace: &[u16], name: &[u16]) -> bool {
     (ascii_slice_eq(
         namespace,
@@ -1458,6 +1575,15 @@ mod tests {
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().collect()
+    }
+
+    fn interface_guid(first: u32, last: u8) -> Guid {
+        Guid {
+            data1: first,
+            data2: 0x8888,
+            data3: 0x7777,
+            data4: [0x66, 0x66, 0x55, 0x55, 0x55, 0x55, 0x55, last],
+        }
     }
 
     #[test]
@@ -1727,6 +1853,117 @@ mod tests {
         assert_eq!(
             parsed.root.dll_redirects[parsed.window_classes[2].file_index].name,
             wide("second.dll")
+        );
+    }
+
+    #[test]
+    fn parses_file_and_external_com_interface_proxy_stubs() {
+        let parsed = parse_manifest_details(
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <file name="testlib.dll">
+                <comInterfaceProxyStub name="Iifaceps"
+                  iid="{66666666-8888-7777-6666-555555555555}"
+                  proxyStubClsid32="{66666666-8888-7777-6666-555555555556}"
+                  tlbid="{99999999-8888-7777-6666-555555555558}"
+                  numMethods="10"
+                  baseInterface="{66666666-8888-7777-6666-555555555557}"
+                  threadingModel="Free"/>
+              </file>
+              <comInterfaceExternalProxyStub name="Iifaceps2"
+                iid="{76666666-8888-7777-6666-555555555555}"
+                proxyStubClsid32="{66666666-8888-7777-6666-555555555556}"
+                tlbid="{99999999-8888-7777-6666-555555555558}"
+                numMethods="10"
+                baseInterface="{66666666-8888-7777-6666-555555555557}"/>
+              <comInterfaceExternalProxyStub name="Iifaceps3"
+                iid="{86666666-8888-7777-6666-555555555555}"
+                numMethods=""></comInterfaceExternalProxyStub>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.com_interfaces.len(), 3);
+        assert_eq!(
+            parsed.com_interfaces[0],
+            ManifestComInterface {
+                file_index: Some(0),
+                iid: interface_guid(0x6666_6666, 0x55),
+                name: Some(wide("Iifaceps")),
+                proxy_stub_clsid32: Some(interface_guid(0x6666_6666, 0x56)),
+                type_library: Some(interface_guid(0x9999_9999, 0x58)),
+                base_interface: Some(interface_guid(0x6666_6666, 0x57)),
+                num_methods: Some(10),
+            }
+        );
+        assert_eq!(parsed.com_interfaces[1].file_index, None);
+        assert_eq!(
+            parsed.com_interfaces[1].iid,
+            interface_guid(0x7666_6666, 0x55)
+        );
+        assert_eq!(
+            parsed.com_interfaces[1].proxy_stub_clsid32,
+            Some(interface_guid(0x6666_6666, 0x56))
+        );
+        assert_eq!(parsed.com_interfaces[2].file_index, None);
+        assert_eq!(
+            parsed.com_interfaces[2].iid,
+            interface_guid(0x8666_6666, 0x55)
+        );
+        assert_eq!(parsed.com_interfaces[2].num_methods, Some(0));
+        assert_eq!(parsed.com_interfaces[2].name, Some(wide("Iifaceps3")));
+    }
+
+    #[test]
+    fn com_interfaces_require_valid_identifiers_names_and_method_counts() {
+        for manifest in [
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub/></assembly>"#
+                .as_slice(),
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="bad"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" name=""/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" tlbid="bad"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" baseInterface="bad"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" proxyStubClsid32="bad"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" numMethods="1x"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}" numMethods="4294967296"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}">text</comInterfaceExternalProxyStub></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><comInterfaceExternalProxyStub iid="{76666666-8888-7777-6666-555555555555}"><child/></comInterfaceExternalProxyStub></assembly>"#,
+        ] {
+            assert_eq!(
+                parse_manifest_details(manifest),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+            );
+        }
+    }
+
+    #[test]
+    fn com_interfaces_obey_scope_namespace_and_exact_attribute_names() {
+        let parsed = parse_manifest_details(
+            br#"<assembly manifestVersion="1.0">
+              <comInterfaceProxyStub iid="{16666666-8888-7777-6666-555555555555}"/>
+              <file name="test.dll">
+                <comInterfaceExternalProxyStub iid="{26666666-8888-7777-6666-555555555555}"/>
+                <bad:comInterfaceProxyStub xmlns:bad="urn:wrong"
+                  iid="{36666666-8888-7777-6666-555555555555}"/>
+                <comInterfaceProxyStub iid="{46666666-8888-7777-6666-555555555555}"
+                  xmlns:iid="ignored">
+                </comInterfaceProxyStub>
+              </file>
+              <bad:comInterfaceExternalProxyStub xmlns:bad="urn:wrong"
+                iid="{56666666-8888-7777-6666-555555555555}"/>
+              <comInterfaceExternalProxyStub iid="{66666666-8888-7777-6666-555555555555}"
+                proxyStubClsid32="{00000000-0000-0000-0000-000000000000}"/>
+            </assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.com_interfaces.len(), 2);
+        assert_eq!(parsed.com_interfaces[0].file_index, Some(0));
+        assert_eq!(
+            parsed.com_interfaces[0].iid,
+            interface_guid(0x4666_6666, 0x55)
+        );
+        assert_eq!(parsed.com_interfaces[1].file_index, None);
+        assert_eq!(
+            parsed.com_interfaces[1].proxy_stub_clsid32,
+            Some(Guid::default())
         );
     }
 
