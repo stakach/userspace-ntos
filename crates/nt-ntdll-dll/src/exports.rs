@@ -99,6 +99,8 @@ pub(crate) fn ldr_shutdown_in_progress() -> bool {
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 static LDR_MANIFEST_PROBER_ROUTINE: AtomicU64 = AtomicU64::new(0);
 static RTL_PROCESS_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static RTL_IMPLICIT_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static RTL_EMPTY_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static RTL_START_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
@@ -12276,10 +12278,15 @@ unsafe fn isolation_actctx_path(
     {
         return Ok(None);
     }
-    let active = unsafe { current_active_activation_context_no_addref() };
-    let process = unsafe { process_activation_context_no_addref() };
-    for (index, context) in [active, process].into_iter().enumerate() {
-        if context.is_null() || (index == 1 && context == active) {
+    let contexts = unsafe {
+        [
+            current_active_activation_context_no_addref(),
+            process_activation_context_no_addref(),
+            implicit_activation_context_no_addref(),
+        ]
+    };
+    for context in contexts {
+        if context.is_null() {
             continue;
         }
         let Some(object_ptr) = (unsafe { activation_context_acquire_registered(context) }) else {
@@ -12295,9 +12302,9 @@ unsafe fn isolation_actctx_path(
                 unsafe { activation_context_release(context) };
                 continue;
             }
-            Err(status) => {
+            Err(_) => {
                 unsafe { activation_context_release(context) };
-                return Err(status);
+                continue;
             }
         };
         if existence_only && path_is_relative {
@@ -12310,9 +12317,9 @@ unsafe fn isolation_actctx_path(
                 found,
             ) {
                 Ok(redirection) => redirection,
-                Err(status) => {
+                Err(_) => {
                     unsafe { activation_context_release(context) };
-                    return Err(status);
+                    continue;
                 }
             };
         if !nt_ntdll::rtl::activation_redirection::redirection_applies_to_path(
@@ -12980,15 +12987,56 @@ unsafe fn process_activation_context_no_addref() -> *mut c_void {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn publish_peb_process_activation_context(context: *mut c_void) {
+unsafe fn implicit_activation_context_no_addref() -> *mut c_void {
+    RTL_IMPLICIT_ACTIVATION_CONTEXT.load(Ordering::Acquire) as *mut c_void
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn empty_activation_context() -> Result<*mut c_void, NtStatus> {
+    let current = RTL_EMPTY_ACTIVATION_CONTEXT.load(Ordering::Acquire);
+    if current != 0 {
+        return Ok(current as *mut c_void);
+    }
+    let object = nt_ntdll::rtl::activation::ActivationContextObject::empty()?;
+    let memory = crate::process_heap_alloc(core::mem::size_of::<
+        nt_ntdll::rtl::activation::ActivationContextObject,
+    >()) as *mut nt_ntdll::rtl::activation::ActivationContextObject;
+    if memory.is_null() {
+        return Err(STATUS_NO_MEMORY);
+    }
+    unsafe { core::ptr::write(memory, object) };
+    let status = unsafe { activation_context_register(memory) };
+    if !nt_success(status) {
+        unsafe {
+            core::ptr::drop_in_place(memory);
+            crate::process_heap_free(memory.cast());
+        }
+        return Err(status);
+    }
+    match RTL_EMPTY_ACTIVATION_CONTEXT.compare_exchange(
+        0,
+        memory as u64,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(memory.cast()),
+        Err(existing) => {
+            unsafe { activation_context_release(memory.cast()) };
+            Ok(existing as *mut c_void)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_peb_process_activation_context(_context: *mut c_void) {
     let peb = unsafe { current_peb() };
     if peb != 0 {
-        // Our RtlQueryInformationActivationContext consumes the registered object handle directly.
-        // Publish that representation in the native x64 PEB ActivationContextData slot.
+        // This PEB field is a pointer to serialized ACTIVATION_CONTEXT_DATA, not our private
+        // registered object. ReactOS also leaves it NULL until that native blob exists.
         let slot = unsafe {
             core::ptr::addr_of_mut!((*(peb as *mut nt_ntdll_layout::Peb)).activation_context_data)
         };
-        unsafe { core::ptr::write_volatile(slot, context as u64) };
+        unsafe { core::ptr::write_volatile(slot, 0) };
     }
 }
 
@@ -13066,6 +13114,76 @@ pub(crate) unsafe fn ldr_publish_process_activation_context(entry: u64) -> NtSta
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn initialize_implicit_activation_context() -> NtStatus {
+    if RTL_IMPLICIT_ACTIVATION_CONTEXT.load(Ordering::Acquire) != 0 {
+        return STATUS_SUCCESS;
+    }
+
+    let leaf: Vec<u16> = "winsxs\\manifests\\systemcompatible.manifest"
+        .encode_utf16()
+        .collect();
+    let system_root = unsafe { isolation_system_root() };
+    let mut source = match append_activation_path(&system_root, &leaf) {
+        Ok(source) => source,
+        Err(status) => return status,
+    };
+    if source.try_reserve_exact(1).is_err() {
+        return STATUS_NO_MEMORY;
+    }
+    source.push(0);
+
+    let mut descriptor = [0u8; 56];
+    unsafe {
+        core::ptr::write_unaligned(descriptor.as_mut_ptr() as *mut u32, 56);
+        core::ptr::write_unaligned(
+            descriptor.as_mut_ptr().add(8) as *mut *const u16,
+            source.as_ptr(),
+        );
+    }
+    let mut created = core::ptr::null_mut();
+    let create_status = unsafe {
+        rtl_create_activation_context(
+            0,
+            descriptor.as_mut_ptr().cast(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &mut created,
+        )
+    };
+    let (context, borrowed) = if nt_success(create_status) {
+        (created, false)
+    } else {
+        let empty = match unsafe { empty_activation_context() } {
+            Ok(empty) => empty,
+            Err(status) => return status,
+        };
+        if !unsafe { activation_context_try_add_ref(empty) } {
+            return STATUS_INVALID_PARAMETER;
+        }
+        (empty, true)
+    };
+    match RTL_IMPLICIT_ACTIVATION_CONTEXT.compare_exchange(
+        0,
+        context as u64,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            if borrowed {
+                create_status
+            } else {
+                STATUS_SUCCESS
+            }
+        }
+        Err(_) => {
+            unsafe { activation_context_release(context) };
+            STATUS_SUCCESS
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn ldr_initialize_process_activation_context(entry: u64) -> NtStatus {
     if entry == 0 {
         return STATUS_INVALID_PARAMETER;
@@ -13096,11 +13214,21 @@ pub(crate) unsafe fn ldr_initialize_process_activation_context(entry: u64) -> Nt
             )
         };
         // Absence or invalidity of an executable manifest is non-fatal, matching ReactOS actctx_init.
-        if status != STATUS_SUCCESS {
-            return STATUS_SUCCESS;
+        if status == STATUS_SUCCESS {
+            unsafe { core::ptr::write_unaligned(slot, context) };
+        } else {
+            let empty = match unsafe { empty_activation_context() } {
+                Ok(empty) => empty,
+                Err(status) => return status,
+            };
+            if !unsafe { activation_context_try_add_ref(empty) } {
+                return STATUS_INVALID_PARAMETER;
+            }
+            unsafe { core::ptr::write_unaligned(slot, empty) };
         }
-        unsafe { core::ptr::write_unaligned(slot, context) };
     }
+    // ReactOS' loader ignores this routine's status after it logs implicit-context creation failure.
+    let _ = unsafe { initialize_implicit_activation_context() };
     unsafe { ldr_publish_process_activation_context(entry) }
 }
 
@@ -13487,7 +13615,8 @@ impl TargetActivationManifestCatalog {
         pattern_string.buffer = pattern.as_ptr() as u64;
         let directory = match unsafe { open_activation_directory(&resolved_directory.nt_path) } {
             Ok(handle) => handle,
-            Err(_) => return Ok(None),
+            Err(status) if activation_path_missing(status) => return Ok(None),
+            Err(status) => return Err(status),
         };
 
         let mut buffer = ActivationDirectoryBuffer([0; 8192]);
@@ -13517,7 +13646,7 @@ impl TargetActivationManifestCatalog {
                     return Ok(());
                 }
                 if status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW {
-                    return Ok(());
+                    return Err(status);
                 }
                 let information = usize::try_from(iosb[1]).unwrap_or(usize::MAX);
                 if information == 0 {
@@ -14575,6 +14704,9 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
         if !returned_data.is_null() && output_size < ACTCTX_SECTION_KEYED_DATA_MIN_SIZE {
             return STATUS_INVALID_PARAMETER;
         }
+        if returned_data.is_null() {
+            return STATUS_SXS_KEY_NOT_FOUND;
+        }
         if section_id
             != nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION
             && section_id
@@ -14586,10 +14718,13 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
         #[cfg(target_arch = "x86_64")]
         {
             let key_name = core::slice::from_raw_parts(key_buffer, key_length / 2);
-            let active = current_active_activation_context_no_addref();
-            let process = process_activation_context_no_addref();
-            for (index, context) in [active, process].into_iter().enumerate() {
-                if context.is_null() || (index == 1 && context == active) {
+            let contexts = [
+                current_active_activation_context_no_addref(),
+                process_activation_context_no_addref(),
+                implicit_activation_context_no_addref(),
+            ];
+            for context in contexts {
+                if context.is_null() {
                     continue;
                 }
                 let Some(object_ptr) = activation_context_acquire_registered(context) else {
@@ -14612,9 +14747,9 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                                 activation_context_release(context);
                                 continue;
                             }
-                            Err(status) => {
+                            Err(_) => {
                                 activation_context_release(context);
-                                return status;
+                                continue;
                             }
                         }
                     }
@@ -14641,19 +14776,15 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                                 activation_context_release(context);
                                 continue;
                             }
-                            Err(status) => {
+                            Err(_) => {
                                 activation_context_release(context);
-                                return status;
+                                continue;
                             }
                         }
                     }
                     _ => unreachable!(),
                 };
 
-                if returned_data.is_null() {
-                    activation_context_release(context);
-                    return STATUS_SUCCESS;
-                }
                 let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
                 write_activation_section_keyed_data(
                     returned_data,
@@ -14733,10 +14864,15 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
             );
         }
         let key = nt_ntdll::rtl::guid::Guid::from_windows_bytes(encoded);
-        let active = unsafe { current_active_activation_context_no_addref() };
-        let process = unsafe { process_activation_context_no_addref() };
-        for (index, context) in [active, process].into_iter().enumerate() {
-            if context.is_null() || (index == 1 && context == active) {
+        let contexts = unsafe {
+            [
+                current_active_activation_context_no_addref(),
+                process_activation_context_no_addref(),
+                implicit_activation_context_no_addref(),
+            ]
+        };
+        for context in contexts {
+            if context.is_null() {
                 continue;
             }
             let Some(object_ptr) = (unsafe { activation_context_acquire_registered(context) })
@@ -14753,9 +14889,9 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
                     unsafe { activation_context_release(context) };
                     continue;
                 }
-                Err(status) => {
+                Err(_) => {
                     unsafe { activation_context_release(context) };
-                    return status;
+                    continue;
                 }
             };
             let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;

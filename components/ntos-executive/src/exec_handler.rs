@@ -3597,16 +3597,16 @@ impl ExecNtHandler {
                         WINLOGON_CSR_STATIC_VA + 0x0100,
                     );
                     let bssd = sc + 0x0100;
-                    // WindowsDirectory = L"C:\Windows" (9 wchars)
-                    core::ptr::write_volatile((bssd + 0x00) as *mut u16, 9 * 2);
-                    core::ptr::write_volatile((bssd + 0x02) as *mut u16, 10 * 2);
+                    // WindowsDirectory = L"C:\Windows" (10 wchars)
+                    core::ptr::write_volatile((bssd + 0x00) as *mut u16, 10 * 2);
+                    core::ptr::write_volatile((bssd + 0x02) as *mut u16, 11 * 2);
                     core::ptr::write_volatile(
                         (bssd + 0x08) as *mut u64,
                         WINLOGON_CSR_STATIC_VA + 0x3000,
                     );
-                    // WindowsSystemDirectory = L"C:\Windows\System32" (18 wchars)
-                    core::ptr::write_volatile((bssd + 0x10) as *mut u16, 18 * 2);
-                    core::ptr::write_volatile((bssd + 0x12) as *mut u16, 19 * 2);
+                    // WindowsSystemDirectory = L"C:\Windows\System32" (19 wchars)
+                    core::ptr::write_volatile((bssd + 0x10) as *mut u16, 19 * 2);
+                    core::ptr::write_volatile((bssd + 0x12) as *mut u16, 20 * 2);
                     core::ptr::write_volatile(
                         (bssd + 0x18) as *mut u64,
                         WINLOGON_CSR_STATIC_VA + 0x3020,

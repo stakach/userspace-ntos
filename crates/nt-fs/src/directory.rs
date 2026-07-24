@@ -552,6 +552,35 @@ mod tests {
     }
 
     #[test]
+    fn class_three_matches_winsxs_manifest_patterns() {
+        let entries = [entry(
+            "amd64_microsoft.windows.common-controls_6595b64144ccf1df_5.82.2600.2982_none_deadbeef.manifest",
+            "AMD64_~1.MAN",
+            1,
+        )];
+        let pattern =
+            "amd64_microsoft.windows.common-controls_6595b64144ccf1df_5.82.*.*_*_*.manifest"
+                .encode_utf16()
+                .collect::<std::vec::Vec<_>>();
+        let mut state = DirectoryQueryState::new();
+        let mut output = [0u8; 512];
+        let result = query_directory(
+            &mut state,
+            &entries,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            false,
+            Some(&pattern),
+            true,
+            &mut output,
+        );
+        assert_eq!(result.status, STATUS_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes(output[60..64].try_into().unwrap()) as usize,
+            entries[0].name().len() * 2
+        );
+    }
+
+    #[test]
     fn first_truncated_record_does_not_advance() {
         let entries = [entry("a-very-long-name.manifest", "LONG.MAN", 1)];
         let mut state = DirectoryQueryState::new();

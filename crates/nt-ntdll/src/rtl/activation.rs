@@ -86,7 +86,7 @@ impl ActCtxDescriptor {
     }
 
     pub fn uses_unsupported_resolution(&self) -> bool {
-        self.flags & (ACTCTX_FLAG_SET_PROCESS_DEFAULT | ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF) != 0
+        self.flags & ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF != 0
     }
 }
 
@@ -389,6 +389,16 @@ impl<const N: usize> Default for ActivationContextRegistry<N> {
 }
 
 impl ActivationContextObject {
+    pub fn empty() -> Result<Self, NtStatus> {
+        Ok(Self::new_with_assemblies(
+            Vec::new(),
+            super::activation_section::build_dll_redirection_section_for_assemblies(&[])?,
+            super::activation_section::build_window_class_redirection_section(&[])?,
+            super::activation_section::build_clr_surrogate_section(&[])?,
+            Vec::new(),
+        ))
+    }
+
     pub fn new(
         source: Vec<u16>,
         manifest: Vec<u8>,
@@ -818,6 +828,16 @@ mod tests {
             }),
             Err(crate::STATUS_INVALID_PARAMETER)
         );
+        assert!(!ActCtxDescriptor {
+            flags: ACTCTX_FLAG_SET_PROCESS_DEFAULT,
+            ..manifest
+        }
+        .uses_unsupported_resolution());
+        assert!(ActCtxDescriptor {
+            flags: ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF,
+            ..manifest
+        }
+        .uses_unsupported_resolution());
     }
 
     #[test]
@@ -950,6 +970,34 @@ mod tests {
         assert!(!object.is_valid());
         assert!(!object.try_add_ref());
         assert!(!object.release_ref());
+    }
+
+    #[test]
+    fn empty_activation_object_has_valid_zero_entry_sections() {
+        let object = ActivationContextObject::empty().unwrap();
+        assert!(object.assemblies.is_empty());
+        assert_eq!(
+            super::super::activation_section::find_dll_redirection(
+                &object.dll_redirect_section,
+                &"test.dll".encode_utf16().collect::<Vec<_>>(),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            super::super::activation_section::find_window_class_redirection(
+                &object.window_class_redirect_section,
+                0,
+                &"TestClass".encode_utf16().collect::<Vec<_>>(),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            super::super::activation_section::find_clr_surrogate(
+                &object.clr_surrogate_section,
+                &super::super::guid::Guid::default(),
+            ),
+            Ok(None)
+        );
     }
 
     #[test]
