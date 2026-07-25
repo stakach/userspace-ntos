@@ -10304,6 +10304,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(callback_nested_ssn_126b);
     print_str(b" sequence-completions=");
     print_u64(callback_sequence_completions);
+    // Dead-client unwinds: callback continuations torn down (win32k resumed with a failure NTSTATUS)
+    // because the client thread running the callback died. Non-zero = the boot survived a client
+    // dying mid-callback instead of stranding win32k in its callback receive loop.
+    print_str(b" dead-client-unwinds=");
+    print_u64(win32k_glue::dead_client_callback_unwinds());
+    // Callback-window bridge invariant: how often the executive restated the client's
+    // CLIENTINFO.CallbackWnd for the in-flight callback, and how often it had actually been clobbered
+    // (win32k's own untranslated DesktopHeapAddressToUser pointer) and needed repair.
+    let (window_reasserts, window_repairs) = win32k_glue::client_callback_window_bridge_proofs();
+    print_str(b" window-bridge-reasserts=");
+    print_u64(window_reasserts);
+    print_str(b" window-bridge-repairs=");
+    print_u64(window_repairs);
     print_str(b"\n");
     check(
         b"exec_user_callback_real_api0_nested_roundtrip",

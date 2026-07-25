@@ -21,6 +21,13 @@ static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_126B: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SEQUENCE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of client `pi`s whose callback-running thread has DIED (crash-park / critical
+/// termination). A dead client can never reach `NtCallbackReturn`, so every further callback win32k
+/// requests for it must fail closed instead of being redirected into a thread that will never run.
+static USER_CALLBACK_DEAD_CLIENTS: AtomicU64 = AtomicU64::new(0);
+/// Callback continuation frames unwound because their client died mid-callback (the durable proof
+/// the dead-client unwind ran; see [`unwind_dead_client_user_callbacks`]).
+static USER_CALLBACK_DEAD_CLIENT_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -69,6 +76,15 @@ impl UserCallbackDispatchContext {
 
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
+/// The executive-BRIDGED `CLIENTINFO.CallbackWnd` triple (`hWnd`, client `PWND`, `pActCtx`) written
+/// for each active callback frame — parallel to `USER_CALLBACK_ACTIVE`, same index (the
+/// `USER_CALLBACK_ACTIVE_DISPATCHES` pattern). See [`reassert_top_client_callback_window`].
+static mut USER_CALLBACK_BRIDGED_WINDOW: [[u64; 3]; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH] =
+    [[0; 3]; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH];
+/// Times the bridge invariant was re-asserted, and times it had actually been CLOBBERED (a foreign
+/// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
+static USER_CALLBACK_WINDOW_REASSERTS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_WINDOW_REPAIRS: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_ACTIVE_DISPATCHES: [UserCallbackDispatchContext;
     nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH] =
     [UserCallbackDispatchContext::EMPTY; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH];
@@ -104,6 +120,26 @@ pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64,
         USER_CALLBACK_NESTED_SSN_126B.load(Ordering::Relaxed),
         USER_CALLBACK_SEQUENCE_COMPLETIONS.load(Ordering::Relaxed),
     )
+}
+
+/// Frames unwound by [`unwind_dead_client_user_callbacks`] over the whole boot.
+pub(crate) fn dead_client_callback_unwinds() -> u64 {
+    USER_CALLBACK_DEAD_CLIENT_UNWINDS.load(Ordering::Relaxed)
+}
+
+/// `(re-asserts, repairs)` of the callback-window bridge invariant — see
+/// [`reassert_top_client_callback_window`]. `repairs > 0` means a foreign writer really had clobbered
+/// the client's `CLIENTINFO.CallbackWnd`.
+pub(crate) fn client_callback_window_bridge_proofs() -> (u64, u64) {
+    (
+        USER_CALLBACK_WINDOW_REASSERTS.load(Ordering::Relaxed),
+        USER_CALLBACK_WINDOW_REPAIRS.load(Ordering::Relaxed),
+    )
+}
+
+/// Has this client's callback thread died? (Latched by [`unwind_dead_client_user_callbacks`].)
+fn user_callback_client_dead(client_pi: u32) -> bool {
+    client_pi < 64 && USER_CALLBACK_DEAD_CLIENTS.load(Ordering::Relaxed) & (1u64 << client_pi) != 0
 }
 
 pub(crate) unsafe fn begin_nested_user_callback_dispatch(
@@ -159,6 +195,9 @@ pub(crate) unsafe fn complete_nested_user_callback_dispatch(
         return false;
     }
     USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    // The client is about to resume inside its callback thunk with this syscall's result — win32k may
+    // have rewritten CLIENTINFO.CallbackWnd during the nested dispatch, so restate the bridge.
+    reassert_top_client_callback_window();
     true
 }
 
@@ -342,6 +381,14 @@ unsafe fn bind_client_callback_window(
     core::ptr::write_volatile(cache as *mut u64, hwnd);
     core::ptr::write_volatile((cache + 8) as *mut u64, client_pwnd);
     core::ptr::write_volatile((cache + 16) as *mut u64, activation_context);
+    // Remember exactly what the bridge published for THIS frame, so the invariant can be re-asserted
+    // every time control comes back to the client (see `reassert_top_client_callback_window`).
+    if let Some(index) = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len().checked_sub(1) {
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(USER_CALLBACK_BRIDGED_WINDOW) as *mut [u64; 3]).add(index),
+            [hwnd, client_pwnd, activation_context],
+        );
+    }
     if message == 0x0081 {
         print_str(b"[callback-wnd] WM_NCCREATE hwnd=0x");
         print_hex(hwnd as u32);
@@ -370,6 +417,60 @@ unsafe fn restore_client_callback_window(frame: nt_user_callback::ActiveCallback
     let cache = state.teb_alias() + CALLBACK_WND_OFFSET;
     for (offset, value) in state.saved().iter().copied().enumerate() {
         core::ptr::write_volatile((cache + offset as u64 * 8) as *mut u64, value);
+    }
+}
+
+/// ★ CALLBACK-WINDOW BRIDGE INVARIANT: while a redirected callback frame is on top, the client's
+/// `CLIENTINFO.CallbackWnd` (TEB+0x840) MUST hold the executive-bridged triple for that frame —
+/// because `user32!ValidateHwnd`'s fast path returns `CallbackWnd.pWnd` verbatim whenever the queried
+/// `HWND` matches `CallbackWnd.hWnd`, and every window field access (`GetClientRect`, …) then
+/// dereferences it.
+///
+/// The bridge exists because win32k's OWN `IntSetTebWndCallback` writes
+/// `DesktopHeapAddressToUser(pwnd)` there, and in our split-VSpace topology that translation cannot
+/// produce a valid client pointer: the executive publishes the correct
+/// `server_pwnd - (WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA)` instead. But win32k keeps writing that
+/// field on its own schedule — its `IntSetTebWndCallback`/`IntRestoreTebWndCallback` pair straddles
+/// every callback (and `co_IntCallWindowProc` skips the restore entirely when the callback returns an
+/// error, `callback.c:404`). So the executive's one-shot write at redirect time is NOT sufficient:
+/// any nested dispatch or inner callback can leave win32k's untranslated pointer in place, and the
+/// client then dereferences it and dies. Re-assert the invariant at every point where control returns
+/// to the client while a callback is still in flight.
+///
+/// Idempotent, allocation-free, and a no-op when nothing clobbered the field.
+pub(crate) unsafe fn reassert_top_client_callback_window() {
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    let Some(index) = active.len().checked_sub(1) else {
+        return;
+    };
+    let Some(frame) = active.top() else {
+        return;
+    };
+    if !frame.is_redirected() {
+        return;
+    }
+    let Some(state) = frame.callback_window() else {
+        return;
+    };
+    let bridged = core::ptr::read(
+        (core::ptr::addr_of!(USER_CALLBACK_BRIDGED_WINDOW) as *const [u64; 3]).add(index),
+    );
+    if bridged[0] == 0 {
+        return; // nothing was bridged for this frame (no window binding)
+    }
+    const CALLBACK_WND_OFFSET: u64 = 0x840;
+    let cache = state.teb_alias() + CALLBACK_WND_OFFSET;
+    USER_CALLBACK_WINDOW_REASSERTS.fetch_add(1, Ordering::Relaxed);
+    let mut repaired = false;
+    for (offset, value) in bridged.iter().copied().enumerate() {
+        let slot = (cache + offset as u64 * 8) as *mut u64;
+        if core::ptr::read_volatile(slot) != value {
+            repaired = true;
+            core::ptr::write_volatile(slot, value);
+        }
+    }
+    if repaired {
+        USER_CALLBACK_WINDOW_REPAIRS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -474,7 +575,13 @@ pub(crate) unsafe fn service_user_callback(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
     );
     let mut suspend_component = false;
-    if client.pi == 2 && contract_valid {
+    // A client whose callback thread has DIED can never reach `NtCallbackReturn`, so redirecting it
+    // would park win32k forever. Fail such callbacks closed — this is what lets the dead-client
+    // unwind (`unwind_dead_client_user_callbacks`) always converge: win32k may legitimately issue
+    // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
+    // error immediately instead of suspending the component again.
+    let client_dead = user_callback_client_dead(client.pi);
+    if client.pi == 2 && contract_valid && !client_dead {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -600,7 +707,10 @@ pub(crate) unsafe fn service_user_callback(
         const STATUS_UNSUCCESSFUL: i32 = 0xc000_0001u32 as i32;
         const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xc000_0004u32 as i32;
         const STATUS_NOT_SUPPORTED: i32 = 0xc000_00bbu32 as i32;
-        let status = if contract.is_none() || client.pi != 2 {
+        const STATUS_THREAD_IS_TERMINATING: i32 = 0xc000_004bu32 as i32;
+        let status = if client_dead {
+            STATUS_THREAD_IS_TERMINATING
+        } else if contract.is_none() || client.pi != 2 {
             STATUS_NOT_SUPPORTED
         } else if !contract_valid {
             STATUS_INFO_LENGTH_MISMATCH
@@ -871,6 +981,203 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     (result.status, stack_ok)
 }
 
+/// Crash-site diagnostic for a client that faulted while a user-mode callback was in flight. Prints
+/// the faulting GPRs plus the exact client-side state `user32`'s `ValidateHwnd`/`DesktopPtrToUser`
+/// read to produce a `PWND`: the `CLIENTINFO.CallbackWnd` triple the callback bridge maintains
+/// (TEB+0x840 hWnd / +0x848 pWnd / +0x850 pActCtx) and `CLIENTINFO.pDeskInfo` / `.ulClientDelta`
+/// (TEB+0x820 / +0x828). A corrupt `PWND` is either the cached one or a delta-translated one — this
+/// line says WHICH, without which the two are indistinguishable from the fault address alone.
+pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64) {
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    if client_pi != 2 || active.is_empty() {
+        return;
+    }
+    if tcb != 0 {
+        let mut regs = [0u64; 20];
+        tcb_read_regs20(tcb, &mut regs);
+        print_str(b"[cb-crash] regs rip=0x");
+        print_hex(regs[0] as u32);
+        print_str(b" rsp=0x");
+        print_hex((regs[1] >> 32) as u32);
+        print_hex(regs[1] as u32);
+        print_str(b" rax=0x");
+        print_hex((regs[3] >> 32) as u32);
+        print_hex(regs[3] as u32);
+        print_str(b" rcx=0x");
+        print_hex((regs[5] >> 32) as u32);
+        print_hex(regs[5] as u32);
+        print_str(b" rdx=0x");
+        print_hex((regs[6] >> 32) as u32);
+        print_hex(regs[6] as u32);
+        print_str(b"\n");
+        print_str(b"[cb-crash] stack:");
+        let mut slot = 0u64;
+        while slot < 12 {
+            let value = crate::img_spawn::smss_stack_read(regs[1] + slot * 8);
+            print_str(b" +0x");
+            print_hex((slot * 8) as u32);
+            print_str(b":0x");
+            print_hex((value >> 32) as u32);
+            print_hex(value as u32);
+            slot += 1;
+        }
+        print_str(b"\n");
+    }
+    let teb = WINLOGON_MAIN_TEB_MIRROR_VA;
+    let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
+    print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
+    print_hex((read(0x820) >> 32) as u32);
+    print_hex(read(0x820) as u32);
+    print_str(b" ulClientDelta=0x");
+    print_hex((read(0x828) >> 32) as u32);
+    print_hex(read(0x828) as u32);
+    print_str(b" CallbackWnd{hWnd=0x");
+    print_hex(read(0x840) as u32);
+    print_str(b" pWnd=0x");
+    print_hex((read(0x848) >> 32) as u32);
+    print_hex(read(0x848) as u32);
+    print_str(b" pActCtx=0x");
+    print_hex((read(0x850) >> 32) as u32);
+    print_hex(read(0x850) as u32);
+    print_str(b"}\n");
+    if let Some(frame) = active.top() {
+        let request = frame.request();
+        print_str(b"[cb-crash] active callback api=");
+        print_u64(request.api_index as u64);
+        print_str(b" depth=");
+        print_u64(active.len() as u64);
+        print_str(b" redirected=");
+        print_u64(frame.is_redirected() as u64);
+        print_str(b"\n");
+    }
+}
+
+/// ★ DEAD-CLIENT CALLBACK UNWIND — the executive-side answer to "the client died mid-callback".
+///
+/// A user-mode callback is an ADVERSARIAL re-entrancy point (`docs/user-callback-dispatch.md` §1.7):
+/// while win32k's dispatch is suspended inside `KeUserModeCallback`, the *client* thread owns
+/// execution — and it can die there (an unrecoverable user fault → crash-park, a critical
+/// termination). Its `NtCallbackReturn` will never arrive, so the withheld
+/// `W32_USER_CALLBACK_RESUME_LABEL` would never be sent: win32k's single TCB stays blocked in its
+/// callback receive loop with a NON-EMPTY continuation stack, the executive's shared loop blocks in
+/// `recv` forever, and the boot WEDGES — no quiesce, no gate, no measurement. Fault isolation
+/// requires the opposite: one process dying must not strand a service.
+///
+/// Real NT has exactly this obligation and answers it the same way — the callback's kernel
+/// continuation is unwound and `KeUserModeCallback` returns an ERROR `NTSTATUS`. That is a *faithful*
+/// signal, not a shortcut: win32k already revalidates its objects (`PWND`, DCs, …) after every
+/// callback return precisely because the user leg is untrusted, so an error return takes the same
+/// paths a hostile `WndProc` would.
+///
+/// So, for every outstanding `UserCallbackFrame` of the dead client, INNERMOST FIRST:
+/// 1. publish a FAILURE reply in the shared callback frame (`STATUS_THREAD_IS_TERMINATING`);
+/// 2. unwind that callback continuation and pop the active frame (restoring the client TEB's
+///    per-callback window cache exactly as a real return would);
+/// 3. resume win32k's parked continuation and pump it until it re-parks at its normal dispatch
+///    receive loop, then unwind the win32k dispatch continuation underneath it.
+///
+/// The dead `pi` is latched in `USER_CALLBACK_DEAD_CLIENTS` FIRST, so any FURTHER callback win32k
+/// requests while unwinding fails closed through the existing non-redirect path in
+/// [`service_user_callback`] rather than redirecting a thread that can never run again — that is what
+/// makes the pump always converge on `completed`.
+///
+/// General (any client pi, any depth, nested frames unwound in order), bounded (each iteration pops
+/// exactly one of at most `MAX_ACTIVE_CALLBACK_DEPTH` frames), allocation-free, and reset-safe: any
+/// correlation failure falls back to [`abort_controlled_user_callbacks`], which resets the
+/// continuation stack to its initial state so the executive stays consistent either way.
+///
+/// Returns the number of callback frames unwound (0 when the client held none — the common case, so
+/// this is a cheap no-op at every crash-park site).
+pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
+    const STATUS_THREAD_IS_TERMINATING: i32 = 0xc000_004bu32 as i32;
+    if client_pi < 64 {
+        USER_CALLBACK_DEAD_CLIENTS.fetch_or(1u64 << client_pi, Ordering::Relaxed);
+    }
+    let mut unwound = 0u64;
+    loop {
+        let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+        let Some(frame) = active.top().copied() else {
+            break;
+        };
+        let request = *frame.request();
+        if request.client_pi != client_pi {
+            // Another client still owns the top of the (strictly LIFO) stack — its frames are LIVE
+            // and must not be torn down here. Leave the rest intact; this client's frames, buried
+            // below, unwind when that client's own frames do.
+            print_str(b"[user-callback] dead-client unwind stopped: top frame owned by pi=");
+            print_u64(request.client_pi as u64);
+            print_str(b"\n");
+            break;
+        }
+        let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+        let dispatch_context = take_active_dispatch(active.len() - 1);
+        // (1) Fail the withheld KeUserModeCallback.
+        write_callback_failure_reply(request, STATUS_THREAD_IS_TERMINATING);
+        // (2) Unwind the callback continuation + pop the active frame (same order as a real return).
+        if !unwind_controlled_callback(request) {
+            print_str(b"[user-callback] dead-client callback continuation rejected -> reset\n");
+            abort_controlled_user_callbacks();
+            break;
+        }
+        let popped = if frame.is_redirected() {
+            active.pop(correlation)
+        } else {
+            active.cancel_pending(correlation)
+        };
+        let Ok(popped) = popped else {
+            print_str(b"[user-callback] dead-client active frame rejected -> reset\n");
+            abort_controlled_user_callbacks();
+            break;
+        };
+        restore_client_callback_window(popped);
+        // (3) Resume win32k with the failure and let it unwind its own dispatch.
+        let previous_dispatch =
+            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+            dispatch_context,
+        );
+        let component = resume_suspended_user_callback_component(request);
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+            previous_dispatch,
+        );
+        unwound += 1;
+        USER_CALLBACK_DEAD_CLIENT_UNWINDS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[user-callback] dead client pi=");
+        print_u64(client_pi as u64);
+        print_str(b" -> failed callback api=");
+        print_u64(request.api_index as u64);
+        print_str(b"; win32k resumed completed=");
+        print_u64(component.completed as u64);
+        print_str(b" status=0x");
+        print_hex(component.status as u32);
+        print_str(b" depth=");
+        print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
+        print_str(b"\n");
+        if !component.completed
+            || component.callback_suspended
+            || !unwind_controlled_dispatch(request)
+        {
+            print_str(b"[user-callback] dead-client win32k dispatch failed to unwind -> reset\n");
+            abort_controlled_user_callbacks();
+            break;
+        }
+    }
+    if unwound != 0 {
+        let stack = &*core::ptr::addr_of!(USER_CALLBACK_CONTINUATIONS);
+        print_str(b"[user-callback] dead-client unwind complete: frames=");
+        print_u64(unwound);
+        print_str(b" continuation-depth=");
+        print_u64(stack.len() as u64);
+        print_str(b" (win32k back in its dispatch receive loop)\n");
+        if !stack.is_empty() {
+            abort_controlled_user_callbacks();
+        }
+    }
+    unwound
+}
+
 pub(crate) unsafe fn complete_controlled_user_callback(
     client_pi: u32,
     client_badge: u64,
@@ -1117,6 +1424,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] dispatch continuation failed to unwind\n");
         return None;
     }
+    // The client is about to resume in the ENCLOSING callback (or in its original syscall). This inner
+    // callback's teardown — our own `restore_client_callback_window` above plus win32k's
+    // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
+    // so restate the enclosing frame's bridged triple before the client runs again.
+    reassert_top_client_callback_window();
     let Some(tcb) = callback_client_tcb(client_tid) else {
         return None;
     };

@@ -458,6 +458,33 @@ success.
   `continuation-pushes=1643`, `continuation-unwinds=1643`, `nested-dispatches=1327`, and zero
   `callback not redirected` lines.
 
+- **Phase 5 — robustness of the reverse transition (implemented, batch 48).** Two properties the
+  earlier phases assumed but did not enforce:
+
+  1. **The client can DIE mid-callback.** While win32k's dispatch is suspended inside
+     `KeUserModeCallback`, the client thread owns execution; an unrecoverable fault there means its
+     `NtCallbackReturn` never arrives and the withheld resume label is never sent — win32k's single
+     TCB stays blocked in its callback receive loop with a non-empty continuation stack and the boot
+     wedges. `win32k_glue::unwind_dead_client_user_callbacks(pi)` unwinds that client's outstanding
+     `UserCallbackFrame`s innermost-first and resumes each parked win32k continuation with an ERROR
+     `NTSTATUS` (`STATUS_THREAD_IS_TERMINATING`), exactly as in-kernel NT unwinds a callout when the
+     thread dies. This is faithful precisely because of §1.7: win32k revalidates its objects after
+     every callback return, so an error return takes a path it already implements
+     (`co_IntCallWindowProc`'s `Error Callback to User space` branch). The dead `pi` is latched first
+     so any further callback fails closed, which is what makes the unwind pump converge. Wired at
+     every crash-park site and at critical termination.
+  2. **`CLIENTINFO.CallbackWnd` is a SHARED field with two writers.** `user32!ValidateHwnd` returns
+     `CallbackWnd.pWnd` verbatim whenever the queried `HWND` matches `CallbackWnd.hWnd`, and every
+     window-field access then dereferences it. win32k writes that field itself
+     (`IntSetTebWndCallback` → `DesktopHeapAddressToUser`), which cannot produce a valid client
+     pointer in our split-VSpace topology, and `co_IntCallWindowProc` skips its restore entirely when
+     the callback returns an error (`callback.c:404`). The executive's one-shot write at redirect
+     time is therefore NOT sufficient. `win32k_glue::reassert_top_client_callback_window()` restates
+     the bridged triple at every point where control returns to the client while a callback is live
+     (nested-dispatch completion and inner-callback return). Counter-backed
+     (`window-bridge-reasserts` / `window-bridge-repairs` in the gate line); live boots repair the
+     field twice per boot, and that repair is what lets the modal paint pump drain.
+
 ## 8. Risks / notes
 
 - **Context save/restore correctness.** A wrong register/RSP on the redirect or restore

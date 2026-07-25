@@ -183,6 +183,91 @@ unsafe fn observe_completed_dialog_modal_dispatch(
 
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
 /// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
+/// Capture region inside the shared win32k ARG frame (4 pages, mapped in BOTH the executive and
+/// win32k). SSN 0x10FA (`NtUserProcessConnect`) uses the frame from offset 0, so captures live in the
+/// upper pages. Slots are handed out ROUND-ROBIN: window creation re-enters win32k through user-mode
+/// callbacks (WM_NCCREATE/WM_CREATE ...), so a nested dispatch must not clobber an outer capture.
+const RC_ARG_CAPTURE_BASE: u64 = 0x1000;
+const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
+const RC_ARG_CAPTURE_SLOTS: u64 = 0x000C;
+/// Maximum bytes captured per string. `RTL_MAXIMUM_ATOM_LENGTH` is 255 chars, so 0x200 bytes covers
+/// every legal class/window name; anything longer is passed through untouched.
+const RC_ARG_BUF_CAP: u64 = 0x0200;
+static RC_ARG_CAPTURE_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Is `va` inside the client's MAIN IMAGE window? Every hosted process is loaded at the SAME
+/// `PE_LOAD_BASE`, so these VAs COLLIDE across clients: win32k's per-client demand window can observe
+/// an empty/other-client page at such a VA WITHOUT faulting, so the demand-fault client-frame sharing
+/// never runs and win32k reads zeros. Client stack/heap VAs do not have this problem (they are
+/// recorded per-process and resolve correctly), so only this range needs capturing.
+fn client_image_range(va: u64) -> bool {
+    va >= PE_LOAD_BASE && va < PE_LOAD_BASE + IMAGE_MIRROR_WINDOW
+}
+
+/// Capture a client counted-string argument (`UNICODE_STRING` when `large` is false, `LARGE_STRING`
+/// when true) into the shared win32k ARG frame — the NT "probe and capture" contract applied at the
+/// executive's cross-VSpace boundary. Both layouts put `Buffer` at +8; they differ only in the width
+/// of the leading `Length` field and in `LARGE_STRING`'s `MaximumLength:31 | bAnsi:1` word.
+///
+/// Returns the ARG-frame VA of the captured descriptor, or `sp_va` UNCHANGED when capture is
+/// unnecessary or impossible: a `Length == 0` MAKEINTATOM form (`Buffer` IS the atom and must never
+/// be dereferenced), a buffer outside the colliding image range (those already resolve correctly), an
+/// oversized string, or an unreadable descriptor/buffer. Falling back to the original pointer keeps
+/// this strictly fail-safe — it can only ever improve on what win32k would otherwise read.
+unsafe fn capture_client_string_arg(
+    pi: u64,
+    sp_va: u64,
+    large: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> u64 {
+    if sp_va == 0 {
+        return sp_va;
+    }
+    let mut sd = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(pi, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
+        return sp_va;
+    }
+    let length = if large {
+        u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64
+    } else {
+        u16::from_le_bytes([sd[0], sd[1]]) as u64
+    };
+    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
+    if length == 0 || buffer == 0 || length + 2 > RC_ARG_BUF_CAP || !client_image_range(buffer) {
+        return sp_va;
+    }
+    let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        buffer,
+        &mut chars[..length as usize],
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return sp_va;
+    }
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc = win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
+    let buf = desc + 0x20;
+    core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
+    core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
+    if large {
+        // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32), Buffer(u64). Preserve bAnsi.
+        let ansi_bit = u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x8000_0000;
+        core::ptr::write_volatile(desc as *mut u32, length as u32);
+        core::ptr::write_volatile((desc + 4) as *mut u32, (length as u32 + 2) | ansi_bit);
+    } else {
+        core::ptr::write_volatile(desc as *mut u16, length as u16);
+        core::ptr::write_volatile((desc + 2) as *mut u16, (length + 2) as u16);
+        core::ptr::write_volatile((desc + 4) as *mut u32, 0); // explicit x64 padding
+    }
+    core::ptr::write_volatile((desc + 8) as *mut u64, buf);
+    desc
+}
+
 /// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
 /// at `(base, pe)` — so smss's resolved ntdll calls fault ntdll's pages in and EXECUTE. SAFE
 /// STOP: halt (don't loop) on a fault outside BOTH images (a null deref / bad address), a
@@ -546,8 +631,24 @@ pub(crate) unsafe fn service_sec_image(
             procs[__pi].first = first;
             procs[__pi].ntfaults = ntfaults;
             pfilled[__pi] = *filled_pages;
-            // QUIESCE: no live top-level process can still fault → nothing left to serve.
-            if (live_top_badges() & !crash_parked) == 0 {
+            // ★ DEAD-CLIENT CALLBACK UNWIND. If this process died while it was running a win32k
+            // user-mode callback, win32k's dispatch is SUSPENDED inside `KeUserModeCallback` waiting
+            // for a reply this thread can no longer send. Unwind those continuations now and resume
+            // win32k with a failure NTSTATUS, so the isolated component returns to its idle dispatch
+            // receive loop instead of being stranded (which would block the shared loop's next `recv`
+            // forever = boot wedge, no gate, no measurement). No-op when the process held no
+            // callbacks. See win32k_glue::unwind_dead_client_user_callbacks.
+            let _ = win32k_glue::unwind_dead_client_user_callbacks(__pi as u32);
+            // QUIESCE: no live top-level process can still make forward progress → nothing left to
+            // serve. `wait_parked` counts too (matching every other quiesce site): a crash-park plus
+            // all-others-cooperatively-waiting leaves NO runnable signaler, so the next `recv` would
+            // block forever. Additionally, winlogon dying at its post-OpenSCManager GUI/login
+            // frontier (LSA already signalled → services/lsass are just idle RPC servers with no live
+            // client left) is terminal for the boot by the same rule the null-deref arm already
+            // applies — generalized here so it holds for ANY unrecoverable winlogon fault.
+            if (live_top_badges() & !(crash_parked | wait_parked)) == 0
+                || (__pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
+            {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
                 break;
@@ -1456,6 +1557,7 @@ pub(crate) unsafe fn service_sec_image(
                 // gate's crash state is honest.
                 if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
                     crash_parked |= 1u64 << owner_top_badge(badge);
+                    let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
                     stop = m0;
@@ -1673,6 +1775,14 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
+                // A client that faults while a win32k user-mode callback is in flight: dump the exact
+                // client-side state user32 used to derive the PWND it dereferenced (see
+                // `dump_client_callback_crash_state`). Callback-scoped, so it costs nothing on any
+                // other wall.
+                win32k_glue::dump_client_callback_crash_state(
+                    pi,
+                    crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed),
+                );
                 // ★ Checkpoint B containment: once lsass has signaled LSA_RPC_SERVER_ACTIVE (its
                 // essential init is done), an unrecoverable fault on lsass' MAIN thread (badge 8) —
                 // e.g. rpcrt4 NdrSimpleTypeUnmarshall dereferencing a bogus RPC request buffer
@@ -2459,6 +2569,10 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
                         let reply_dropped = drop_current_syscall_reply();
+                        // A critical process can bugcheck while it is running a win32k user-mode
+                        // callback; unwind those continuations so win32k is idle (not stranded in its
+                        // callback receive loop) for the gate. No-op when it held none.
+                        let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
                         print_str(b"[critical-termination] bugcheck=0x");
                         print_hex(code);
                         print_str(b" object=0x");
@@ -3816,7 +3930,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Copy csrss's input buffer into the shared ARG frame (mapped in BOTH), dispatch with
                 // the ARG-frame pointer, then copy win32k's out-params (the USERCONNECT) back to csrss.
                 let has_buf = m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
-                let (d_a1, blen) = if has_buf {
+                let (mut d_a1, blen) = if has_buf {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     let n = a2.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
                     core::ptr::write_bytes(arg as *mut u8, 0, (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize);
@@ -3840,6 +3954,49 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[win32k-svc] csrss -> SSN 0x");
                     print_hex(m0 as u32);
                     print_str(b" (dispatch)\n");
+                }
+                // ── NT ARGUMENT CAPTURE for `NtUserRegisterClassExWOW` (SSN 0x10b4).
+                // arg2 = ClassName and arg3 = ClsVersion are client `PUNICODE_STRING`s whose `Buffer`
+                // still points into the CLIENT's address space. A class-name buffer that lives in the
+                // client's MAIN IMAGE cannot be resolved reliably through win32k's per-client demand
+                // window: every hosted process is loaded at the SAME `PE_LOAD_BASE`, so that VA
+                // COLLIDES across clients and win32k can observe an empty/other-client page WITHOUT
+                // ever faulting (so the demand-fault client-frame sharing never runs). win32k then
+                // copies ZEROS as the class name and `RtlAddAtomToAtomTable` fails
+                // STATUS_OBJECT_NAME_INVALID — the exact wall that made winlogon's "SAS Window class"
+                // registration fail (`sas.c:1767`), so `InitializeSAS` failed and winlogon bugchecked
+                // 0xF4 and called NtTerminateProcess.
+                //
+                // Real NT captures user strings into kernel memory before use. Do the same: stage an
+                // exact copy into the shared ARG frame (mapped in BOTH VSpaces, already the proven
+                // mechanism for `NtUserProcessConnect`) and hand win32k a UNICODE_STRING that points at
+                // that copy. This removes the dependence on client-page mapping for these arguments
+                // entirely. `Length == 0` is the MAKEINTATOM form (`Buffer` IS the atom, never a
+                // pointer) and is passed through untouched; any unreadable/oversized string also falls
+                // back to the original pointer, so this is fail-safe.
+                // `NtUserRegisterClassExWOW` (0x10b4) takes UNICODE_STRING ClassName/ClsVersion;
+                // `NtUserCreateWindowEx` (0x1077) takes LARGE_STRING ClassName/ClsVersion/WindowName.
+                // Capture whichever of them point into the client's colliding main-image range so
+                // win32k reads the real bytes. Without this, winlogon's "SAS Window class" (a string
+                // in winlogon.exe's .rdata) reached win32k as ZEROS: the class registration failed
+                // (`RtlAddAtomToAtomTable` -> STATUS_OBJECT_NAME_INVALID, `sas.c:1767`) and the
+                // subsequent CreateWindowEx could not find the class (`sas.c:1781`), so
+                // `InitializeSAS` failed and winlogon bugchecked 0xF4 -> NtTerminateProcess.
+                let mut d_a2 = a2;
+                let mut d_a3 = a3;
+                if m0 == 0x10b4 || m0 == 0x1077 {
+                    let large = m0 == 0x1077;
+                    d_a1 = capture_client_string_arg(
+                        pi as u64, d_a1, large, filled_pages, faults as usize, scratch_base,
+                    );
+                    d_a2 = capture_client_string_arg(
+                        pi as u64, d_a2, large, filled_pages, faults as usize, scratch_base,
+                    );
+                    if large {
+                        d_a3 = capture_client_string_arg(
+                            pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
+                        );
+                    }
                 }
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
@@ -4167,8 +4324,8 @@ pub(crate) unsafe fn service_sec_image(
                         m0,
                         d_a0,
                         d_a1,
-                        a2,
-                        a3,
+                        d_a2,
+                        d_a3,
                         sp,
                         nargs,
                         &stack_args[..stack_arg_count],

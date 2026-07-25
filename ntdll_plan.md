@@ -2830,6 +2830,138 @@ winlogon's post-SAS-window flow: `ShowWindow(SAS) → co_IntShowDesktop → co_A
 ### Verify
 Gate **175/98**, clean qemu_exit. 5 processes spawn; lsass signals LSA_RPC_SERVER_ACTIVE; all 4 `exec_live_terminate_thread_*` PASS; SEH self-test PASS; `exec_winlogon_worker_multiplex` PASS; `exec_winlogon_sas_window` PASS (NEW). The 5 FAILs (`exec_nic_tx_dma_writeback`/`exec_nic_confined_dma`/`exec_csr_message_plane`/`exec_npfs_flush_pending`/`exec_win32k_desktop_painted`) are the documented baseline set — NO new FAILs. Host green: nt-ntdll 192, nt-io-manager 73, nt-process 21, nt-object-manager 50. Executive-only (no rust-micro/src change; sel4test byte-identical).
 
+## 🎉🎉 BATCH 48 — the win32k reverse-callback ROBUSTNESS batch: NT argument capture + dead-client continuation unwind + the CLIENTINFO.CallbackWnd bridge invariant. **Gate 183/99 (9 FAILs) → 192/99, ZERO FAILs**, deterministic over 3 consecutive boots (DONE 2026-07-25, clean qemu_exit, executive-only / no `rust-micro/src` change)
+
+**Directive:** fix a robustness hole in the win32k reverse-callback machinery — a client that dies
+mid-callback stranded win32k and WEDGED the boot (no gate, no measurement) — then diagnose the
+user32 fault that was killing the client. Three real fixes landed; all 9 remaining baseline FAILs
+cleared as a consequence.
+
+### (1) NT-style ARGUMENT CAPTURE for the colliding client-image VA range (`service_sec_image.rs`)
+
+`NtUserRegisterClassExWOW` (0x10b4, `UNICODE_STRING`) and `NtUserCreateWindowEx` (0x1077,
+`LARGE_STRING`) pass counted strings whose `Buffer` points into the CLIENT's address space. When that
+buffer lives in the client's MAIN IMAGE (`PE_LOAD_BASE 0x100_0056_0000` + `IMAGE_MIRROR_WINDOW`), win32k
+read **ZEROS**: every hosted process is loaded at the SAME `PE_LOAD_BASE`, so those VAs COLLIDE across
+clients and win32k's per-client demand window can observe an empty/other-client page WITHOUT faulting
+— so the demand-fault client-frame sharing never runs. winlogon's `"SAS Window class"` (a string in
+`winlogon.exe`'s `.rdata`) therefore reached win32k as zeros, `RtlAddAtomToAtomTable` failed
+`STATUS_OBJECT_NAME_INVALID` (`sas.c:1767`), `InitializeSAS` failed, and winlogon bugchecked `0xF4`.
+
+Fix = what real NT does: **probe and capture** the user string into kernel-owned memory before use.
+`capture_client_string_arg` stages an exact copy into the shared `WIN32K_ARG` frame (mapped in BOTH
+VSpaces — the already-proven `NtUserProcessConnect` mechanism) and hands win32k a descriptor pointing
+at that copy, so the argument no longer depends on client-page mapping at all. Round-robin slots
+(window creation re-enters win32k through callbacks, so a nested dispatch must not clobber an outer
+capture). Strictly fail-safe: `Length == 0` is the MAKEINTATOM form (`Buffer` IS the atom — never
+dereferenced) and any unreadable/oversized/out-of-range string falls back to the original pointer.
+
+### (2) DEAD-CLIENT CALLBACK CONTINUATION UNWIND (`win32k_glue.rs`, wired in `service_sec_image.rs`)
+
+A user-mode callback is an adversarial re-entrancy point: while win32k's dispatch is suspended inside
+`KeUserModeCallback`, the CLIENT thread owns execution — and it can die there. Its `NtCallbackReturn`
+never arrives, so the withheld `W32_USER_CALLBACK_RESUME_LABEL` is never sent: win32k's single TCB
+stayed blocked in its callback receive loop with a NON-EMPTY continuation stack, the executive's
+shared loop blocked in `recv` forever, and the boot WEDGED (`RUNEXIT=124`, no gate line at all).
+
+`unwind_dead_client_user_callbacks(pi)` is the executive-side answer, and it mirrors NT: unwind the
+callback's kernel continuation and make `KeUserModeCallback` return an ERROR `NTSTATUS`
+(`STATUS_THREAD_IS_TERMINATING`). That is a faithful signal, not a shortcut — win32k already
+revalidates its objects after every callback return because the user leg is untrusted, so it takes
+the same path a hostile `WndProc` would (observed live: `err: Error Callback to User space Status`).
+For each outstanding frame, innermost first: publish a failure reply, unwind the callback + pop the
+active frame (restoring the client TEB's per-callback window cache), resume win32k and pump it until
+it re-parks at its normal dispatch receive loop, then unwind the win32k dispatch continuation.
+The dead `pi` is latched FIRST (`USER_CALLBACK_DEAD_CLIENTS`), so any further callback win32k issues
+while unwinding fails closed through the existing non-redirect path — that is what makes the pump
+always converge. General (any client, any depth), bounded, allocation-free, reset-safe.
+Called from `park_and_log!` (every crash-park), the winlogon GUI-frontier break, and
+`ExecPostAction::CriticalTermination`; a no-op when the process held no callbacks.
+
+`park_and_log!`'s quiesce predicate was also brought in line with every other quiesce site: it now
+counts `wait_parked` as well as `crash_parked` (a crash-park plus all-others-cooperatively-waiting
+leaves NO runnable signaler), and the existing "winlogon died at its post-OpenSCManager GUI/login
+frontier with LSA already signalled ⇒ terminal" rule is generalized from the null-deref arm to ANY
+unrecoverable winlogon fault. **Measured:** with the unwind + quiesce, the wedging boot became
+`RUNEXIT=3` + `dead-client-unwinds=1` + `continuation-pushes == continuation-unwinds (1466/1466)`
++ `[quiesce] ... -> run gate` + `189/99` (logs `/tmp/boot_unwind_1159.log`,
+`/tmp/boot_unwind_diag_10145.log`).
+
+### (3) ROOT CAUSE of the user32 fault: the `CLIENTINFO.CallbackWnd` BRIDGE INVARIANT
+
+Symptom: `user #PF tcb=25 cr2=0x0000000800108e04 rip=0x801e7393` while at callback `depth>=1`.
+Symbolized: `user32 + 0x97393` = `GetClientRect + 0x33`, i.e. `mov eax,[rax+0x34]` on the `PWND`
+returned by `ValidateHwnd` — so `ValidateHwnd` returned `0x0000_0008_0010_8dd0`, a pointer with a
+corrupt high dword. A crash-site diagnostic (`dump_client_callback_crash_state`, kept — it is
+callback-scoped and free) made it decisive:
+
+```
+[cb-crash] regs rip=0x801e7393 rax=0x0000000800108dd0 rcx=0x000000000002009a
+[cb-crash] CLIENTINFO pDeskInfo=0x9906ac60 ulClientDelta=0xff6f400000
+           CallbackWnd{hWnd=0x0002009a pWnd=0x0000000800108dd0 pActCtx=0x0000020400cb0000}
+[cb-crash] active callback api=0 depth=1 redirected=1
+```
+
+`rcx` (the queried `HWND`) == `CallbackWnd.hWnd`, so `ValidateHwnd` took its cache fast path and
+returned `CallbackWnd.pWnd` **verbatim**. The correct client `PWND` for `hwnd=0x2009a` is `0x98478dd0`
+(`server 0x100_07878dd0 − ulClientDelta 0xff_6f400000`, exactly what the bridge publishes) — the
+cached value was NOT one the executive can produce. It is win32k's own
+`IntSetTebWndCallback → DesktopHeapAddressToUser(pwnd)` result, which in our split-VSpace topology
+cannot yield a valid client pointer.
+
+The bridge (`bind_client_callback_window`) wrote the correct triple once, at redirect time — but
+win32k keeps writing that same field on ITS schedule: `IntSetTebWndCallback` /
+`IntRestoreTebWndCallback` straddle *every* callback, and `co_IntCallWindowProc` **skips the restore
+entirely when the callback returns an error** (`callback.c:404`). Any nested dispatch or inner
+callback could therefore leave win32k's untranslated pointer in place, and the client then
+dereferenced it and died.
+
+Fix: make the invariant explicit and re-assert it. `reassert_top_client_callback_window()` restates
+the bridged `(hWnd, client PWND, pActCtx)` for the in-flight top frame at **every point where control
+returns to the client** while a callback is still live — after a nested win32k dispatch completes
+(`complete_nested_user_callback_dispatch`) and after an inner callback returns
+(`complete_controlled_user_callback`). Idempotent and a no-op when nothing clobbered the field; the
+per-frame bridged triple is kept in `USER_CALLBACK_BRIDGED_WINDOW`, parallel to `USER_CALLBACK_ACTIVE`
+(the existing `USER_CALLBACK_ACTIVE_DISPATCHES` pattern). Counter-backed proof in the gate line:
+`window-bridge-reasserts=723 window-bridge-repairs=2` — the field really was clobbered exactly twice
+per boot, and repairing it is what lets the modal pump drain.
+
+### Verify
+Three consecutive clean boots, identical: `RUNEXIT=3`, `microtest sentinel matched`,
+**`[ntos-exec summary: 192/99 executive->isolated-service checks passed]`, 192 PASS / 0 FAIL**
+(baseline HEAD `22772fb` was 183/99 with 9 FAILs — all 9 cleared, none regressed).
+`exec_win32k_desktop_painted` PASS throughout. Modal pump `steps=3/3 completed=1 paints=12 drained=1`;
+`exec_msgina_modal_paint_prefix` + `exec_msgina_logon_dialog_painted` PASS (framebuffer rect
+`302,260..721,507`, 103493 px, ~44–50k non-desktop, ≥16 colors). Callback ledger balanced:
+`real-redirects=268 real-returns=268 continuation-pushes=1642 continuation-unwinds=1642
+nested-dispatches=1327 sequence-completions=1`. Host green: `nt-user-callback` 38.
+Executive-only — NO `rust-micro/src` change (sel4test byte-identical).
+Logs: `/tmp/boot_bridge_3469.log`, `/tmp/boot_bridge_v2_5891.log`, `/tmp/boot_bridge_v3_13650.log`.
+
+### RESIDUAL ISSUES (open, documented — not fixed by this batch)
+1. **UNEXPLAINED: "correct frame + correct mapping still reads zeros" in the colliding image-VA
+   range.** Fix (1) *works around* the class of bug rather than explaining it. The previous
+   investigation established (and disproved the obvious causes) that win32k reading a client VA in the
+   shared `PE_LOAD_BASE` main-image window gets ZEROS even when the correct frame is recorded, no prior
+   mapping exists, and a forced re-map is performed. Argument capture removes the dependence for the two
+   SSNs that hit it, but ANY other win32k argument that points into that colliding range is still
+   exposed. The real fix is per-process image VAs (or a per-client win32k image window) so main-image
+   VAs stop colliding across hosted processes.
+2. **`dead-client-unwinds=0` on the green boot.** With fix (3) the client no longer dies, so the Step-1
+   unwind path is not exercised by the current gate. Its correctness is evidenced by the two recorded
+   boots above (`frames=1`, win32k resumed, quiesce reached, `189/99`), not by a live gate spec. A
+   fault-injection spec that deliberately kills a client mid-callback would make it permanently
+   measurable — worth adding.
+3. **win32k's `DesktopHeapAddressToUser` still produces an invalid client pointer** in our topology
+   (that is the value the bridge now repairs). `s_mm_map_view_of_section` hands back the kernel base
+   (`UserMapping == KernelMapping`), so `W32Process->HeapMappings` cannot describe a real client view.
+   The bridge masks it at the one place user32 reads it (`CLIENTINFO.CallbackWnd`); any OTHER consumer
+   of `DesktopHeapAddressToUser`/`NtUserxGetDesktopMapping` would still get a bad pointer.
+4. `exec_user_callback_real_api0_nested_roundtrip` requires `real_returns == real_redirects`; a
+   dead-client unwind is deliberately NOT counted as a return (it is a failure completion), so that
+   spec is expected to fail on a boot where a client dies mid-callback. Counted separately as
+   `dead-client-unwinds`.
+
 ## 🎉🎉🎉 BATCH 47 — FULLY-GREEN GATE: the last 4 baseline FAILs cleared, **gate 180/98, ZERO FAILs** (DONE 2026-07-19, clean qemu_exit, executive-only / sel4test byte-identical)
 
 **Directive:** clear the 4 remaining baseline FAILs (`exec_nic_tx_dma_writeback`, `exec_nic_confined_dma`, `exec_npfs_flush_pending`, `exec_csr_message_plane`) with REAL fixes (no faking, no flipping specs to always-true), each a green commit. Diagnose-first.
