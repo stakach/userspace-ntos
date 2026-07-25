@@ -6634,6 +6634,441 @@ pub(crate) unsafe fn service_sec_image(
             DBGK_EXCEPTION_SELFTEST.store(ex_ok, Ordering::Relaxed);
         }
 
+        // ═══ Dbgk MODULE LOAD/UNLOAD self-test (post-loop) ═════════════════════════════════════
+        // `DbgkMapViewOfSection` / `DbgkUnMapViewOfSection` + `DbgkpPostFakeModuleMessages` — the
+        // last of the deferred debug-event sources.
+        //
+        // WHAT IS DRIVEN FOR REAL: the DEBUGGER side goes through the REAL dispatch route
+        // (`nt_dispatcher.dispatch(SSN, …)` with the arguments marshalled in CLIENT memory), and the
+        // DEBUGGEE side goes through `ExecNtHandler::dbgk_module_load` / `dbgk_module_unload` —
+        // *the very entries the live `NtMapViewOfSection` SEC_IMAGE branch and the
+        // `NtUnmapViewOfSection` arm call*. Nothing is reimplemented for the test: each throwaway
+        // process sits in a FREE `PM_PIDS` slot, so the pi → pid → `EPROCESS.DebugPort` resolution
+        // is the same one the mapping path performs.
+        {
+            use nt_process::dbgk;
+            const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+            const FILE_GENERIC_READ: u32 = 0x0012_0089;
+            // Client argument block — past the exception self-test's 0x180..0x280 window.
+            const A_HANDLE: u64 = STACK_BASE + 0x280;
+            const A_CLIENT_ID: u64 = STACK_BASE + 0x288;
+            const A_TIMEOUT: u64 = STACK_BASE + 0x298;
+            const A_STATE: u64 = STACK_BASE + 0x2A0;
+            // Free `PM_PIDS` slots (cleared again below); slots 0..=4 are the live hosted set.
+            const MOD_TEST_PI: usize = MAX_PI - 1;
+            const MOD_TEST_PI2: usize = MAX_PI - 2;
+            // The debuggee's own image base + the IMAGE views this test maps into it.
+            const TARGET_IMAGE_BASE: u64 = 0x0000_0001_8000_0000;
+            const DLL_BASE: u64 = 0x0000_0000_7100_0000;
+            const NOT_AN_IMAGE_BASE: u64 = 0x0000_0000_7200_0000;
+            const PLAIN_IMAGE_BASE: u64 = 0x0000_0001_9000_0000;
+            const PLAIN_PROBE_BASE: u64 = 0x0000_0000_7300_0000;
+            const PLAIN_DLL_A: u64 = 0x0000_0000_7400_0000;
+            const PLAIN_DLL_B: u64 = 0x0000_0000_7500_0000;
+            const NAME_POINTER: u64 = SMSS_TEB_VA + 0x28; // NtTib.ArbitraryUserPointer
+            const DBG_INFO: (u32, u32) = (0x0000_1234, 0x0000_0056);
+
+            let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+            let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+            let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+            let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_pi = nt_handler.pi;
+            let saved_tid = nt_handler.current_tid;
+            let saved_ctx = nt_handler.loop_ctx.take();
+            ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            nt_handler.pi = 0;
+
+            let mut md_ok = 0u64;
+            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            macro_rules! sysc {
+                ($ssn:expr, $args:expr) => {
+                    nt_dispatcher
+                        .dispatch($ssn as u32, $args, &dbg_origin, &mut nt_handler)
+                        .status
+                };
+            }
+            let mut sc = [0u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE];
+            macro_rules! sc_u32 {
+                ($o:expr) => {
+                    u32::from_le_bytes(sc[$o..$o + 4].try_into().unwrap_or([0; 4]))
+                };
+            }
+            macro_rules! sc_u64 {
+                ($o:expr) => {
+                    u64::from_le_bytes(sc[$o..$o + 8].try_into().unwrap_or([0; 8]))
+                };
+            }
+
+            let debugger_pid = nt_handler.pm_pid_for_pi(0).unwrap_or(0);
+            let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
+            nt_handler.current_tid = debugger_tid as u64;
+            let client_args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
+            if debugger_pid != 0 && client_args_ready {
+                let created = sysc!(
+                    SSN_NT_CREATE_DEBUG_OBJECT,
+                    &[
+                        A_HANDLE,
+                        dbgk::DEBUG_OBJECT_ALL_ACCESS as u64,
+                        0,
+                        dbgk::DBGK_KILL_PROCESS_ON_EXIT as u64,
+                    ]
+                );
+                let dbg_handle = smss_stack_read(A_HANDLE);
+                let object = match nt_handler
+                    .pm
+                    .lookup_handle(debugger_pid, dbg_handle as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::DebugObject(object)) => Some(object),
+                    _ => None,
+                };
+                if let (0, Some(object)) = (created, object) {
+                    // The DEBUGGED throwaway debuggee.
+                    let target = nt_handler.pm.create_process("dbgk-module.exe", None, None);
+                    nt_handler.pm.set_image_base(target, TARGET_IMAGE_BASE);
+                    let main = nt_handler.pm.create_thread(target, 0x4100, 0, false).ok();
+                    PM_PIDS[MOD_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    // The NEVER-attached control — the live-boot shape, and later the subject of the
+                    // attach-time fake-module proof.
+                    let plain = nt_handler
+                        .pm
+                        .create_process("dbgk-modplain.exe", None, None);
+                    nt_handler.pm.set_image_base(plain, PLAIN_IMAGE_BASE);
+                    let plain_main = nt_handler.pm.create_thread(plain, 0x4200, 0, false).ok();
+                    PM_PIDS[MOD_TEST_PI2].store(plain as u64, Ordering::Relaxed);
+                    let h_target = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(target),
+                            PROCESS_SUSPEND_RESUME,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let h_plain = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(plain),
+                            PROCESS_SUSPEND_RESUME,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    // The DEBUGGEE's own handle to the image file — the thing `DbgkpOpenHandles`
+                    // duplicates. A real per-process handle in the debuggee's own table.
+                    let debuggee_file = nt_handler
+                        .pm
+                        .insert_handle(
+                            target,
+                            nt_process::HandleObject::File(0xF11E_0001),
+                            FILE_GENERIC_READ,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+
+                    // --- 0x0001 setup: attach + drain the fake create message, all by SSN --------
+                    let attached = h_target != 0
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
+                        && nt_handler.pm.process_debug_port(target) == Some(object);
+                    let mut client_id = [0u8; 16];
+                    client_id[0..8].copy_from_slice(&(target as u64).to_le_bytes());
+                    client_id[8..16].copy_from_slice(&(main.unwrap_or(0) as u64).to_le_bytes());
+                    let client_id_written = img_spawn::smss_copyout(A_CLIENT_ID, &client_id);
+                    if attached
+                        && client_id_written
+                        && sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        ) == 0
+                        && img_spawn::smss_copyin(A_STATE, &mut sc)
+                        && sc_u32!(0x00) == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                        ) == 0
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty())
+                    {
+                        md_ok |= 0x0001;
+                    }
+
+                    // --- THE LOAD: the exact entry the live SEC_IMAGE map branch calls -----------
+                    // On the live path the mapping thread is the caller, so report as the debuggee's
+                    // thread (what `self.current_tid` holds inside a serviced syscall).
+                    nt_handler.current_tid = main.unwrap_or(0) as u64;
+                    let loads_before = DBGK_MODULE_LOADS.load(Ordering::Relaxed);
+                    let loaded = nt_handler.dbgk_module_load(
+                        MOD_TEST_PI,
+                        DLL_BASE,
+                        debuggee_file,
+                        DBG_INFO,
+                        NAME_POINTER,
+                    );
+                    nt_handler.current_tid = debugger_tid as u64;
+                    // 0x0002 — the map-path entry queued exactly one DbgKmLoadDllApi, moved the
+                    // counter, and tracked the view as a module of the debuggee.
+                    if loaded
+                        && DBGK_MODULE_LOADS.load(Ordering::Relaxed) == loads_before + 1
+                        && nt_handler.pm.module_count(target) == 1
+                        && nt_handler.pm.debug_object(object).is_some_and(|o| {
+                            o.len() == 1
+                                && o.events()[0].message.api_number() == dbgk::DBGKM_LOAD_DLL_API
+                        })
+                    {
+                        md_ok |= 0x0002;
+                    }
+
+                    // 0x0004 — the debugger retrieves it through the REAL NtWaitForDebugEvent arm
+                    // and the WHOLE payload lands in CLIENT memory, with the image FILE handle
+                    // DUPLICATED into the debugger's own table (`DbgkpOpenHandles`).
+                    let waits_before = DBGK_WAITS_SERVED.load(Ordering::Relaxed);
+                    let wait = sysc!(
+                        SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                        &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                    );
+                    let sc_read = img_spawn::smss_copyin(A_STATE, &mut sc);
+                    let reported_file = sc_u64!(0x18);
+                    if wait == 0
+                        && sc_read
+                        && DBGK_WAITS_SERVED.load(Ordering::Relaxed) == waits_before + 1
+                        && sc_u32!(0x00) == dbgk::DBG_LOAD_DLL_STATE_CHANGE
+                        && sc_u64!(0x08) == target as u64
+                        && main.is_some_and(|main| sc_u64!(0x10) == main as u64)
+                        && sc_u64!(0x20) == DLL_BASE
+                        && sc_u32!(0x28) == DBG_INFO.0
+                        && sc_u32!(0x2c) == DBG_INFO.1
+                        && sc_u64!(0x30) == NAME_POINTER
+                        // The duplicate is a DIFFERENT handle value in the DEBUGGER's table naming
+                        // the SAME file object, with DUPLICATE_SAME_ACCESS.
+                        && debuggee_file != 0
+                        && reported_file != 0
+                        && reported_file != debuggee_file
+                        && nt_handler
+                            .pm
+                            .lookup_handle(debugger_pid, reported_file as nt_process::Handle)
+                            == Some(nt_process::HandleObject::File(0xF11E_0001))
+                        && nt_handler
+                            .pm
+                            .handle_access(debugger_pid, reported_file as nt_process::Handle)
+                            == Some(FILE_GENERIC_READ)
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                        ) == 0
+                    {
+                        md_ok |= 0x0004;
+                    }
+                    let _ = nt_handler
+                        .pm
+                        .close_handle(debugger_pid, reported_file as nt_process::Handle);
+
+                    // --- THE UNLOAD: the exact entry the live NtUnmapViewOfSection arm calls -----
+                    nt_handler.current_tid = main.unwrap_or(0) as u64;
+                    let unloads_before = DBGK_MODULE_UNLOADS.load(Ordering::Relaxed);
+                    let unloaded = nt_handler.dbgk_module_unload(MOD_TEST_PI, DLL_BASE);
+                    nt_handler.current_tid = debugger_tid as u64;
+                    // 0x0008 — DbgKmUnloadDllApi posted, retrieved as DbgUnloadDllStateChange with
+                    // the right base, and the view is no longer tracked.
+                    if unloaded
+                        && DBGK_MODULE_UNLOADS.load(Ordering::Relaxed) == unloads_before + 1
+                        && nt_handler.pm.module_count(target) == 0
+                        && sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        ) == 0
+                        && img_spawn::smss_copyin(A_STATE, &mut sc)
+                        && sc_u32!(0x00) == dbgk::DBG_UNLOAD_DLL_STATE_CHANGE
+                        && sc_u64!(0x18) == DLL_BASE
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                        ) == 0
+                    {
+                        md_ok |= 0x0008;
+                    }
+
+                    // 0x0010 — IMAGE-ONLY. Unmapping a base that was never an IMAGE view (a data or
+                    // anonymous mapping — the CSR shared section and the NLS section on the live
+                    // boot) posts nothing: `MmUnmapViewOfSection` only calls
+                    // `DbgkUnMapViewOfSection` when the VAD it tore down was an image VAD. Same for
+                    // re-unmapping the view already unmapped above.
+                    let quiet_unloads = DBGK_MODULE_UNLOADS.load(Ordering::Relaxed);
+                    nt_handler.current_tid = main.unwrap_or(0) as u64;
+                    let image_only = !nt_handler.dbgk_module_unload(MOD_TEST_PI, NOT_AN_IMAGE_BASE)
+                        && !nt_handler.dbgk_module_unload(MOD_TEST_PI, DLL_BASE);
+                    nt_handler.current_tid = debugger_tid as u64;
+                    if image_only
+                        && DBGK_MODULE_UNLOADS.load(Ordering::Relaxed) == quiet_unloads
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty())
+                    {
+                        md_ok |= 0x0010;
+                    }
+
+                    // 0x0020 — ★ THE NO-DEBUGGER GATE, the safety property the whole mapping-path
+                    // integration rests on: a map AND an unmap in a process with NO
+                    // `EPROCESS.DebugPort` both return false, move no counter and queue nothing.
+                    // This is the path EVERY DLL map on the live boot takes (and with no debug
+                    // object alive at all, `dbgk_module_load` returns on its FIRST line, before any
+                    // lookup — which is the state of every boot today).
+                    let quiet_loads = DBGK_MODULE_LOADS.load(Ordering::Relaxed);
+                    let quiet_unloads = DBGK_MODULE_UNLOADS.load(Ordering::Relaxed);
+                    let queued_before = nt_handler
+                        .pm
+                        .debug_object(object)
+                        .map(|o| o.len())
+                        .unwrap_or(0);
+                    nt_handler.current_tid = plain_main.unwrap_or(0) as u64;
+                    let gated = !nt_handler.dbgk_module_load(
+                        MOD_TEST_PI2,
+                        PLAIN_PROBE_BASE,
+                        0,
+                        DBG_INFO,
+                        NAME_POINTER,
+                    ) && !nt_handler.dbgk_module_unload(MOD_TEST_PI2, PLAIN_PROBE_BASE);
+                    nt_handler.current_tid = debugger_tid as u64;
+                    if gated
+                        && !nt_handler.pm.is_process_being_debugged(plain)
+                        && DBGK_MODULE_LOADS.load(Ordering::Relaxed) == quiet_loads
+                        && DBGK_MODULE_UNLOADS.load(Ordering::Relaxed) == quiet_unloads
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .map(|o| o.len())
+                            .unwrap_or(0)
+                            == queued_before
+                    {
+                        md_ok |= 0x0020;
+                    }
+
+                    // --- 0x0040 — ATTACH-TIME FAKE MODULE MESSAGES -------------------------------
+                    // Two DLLs + the process's OWN image map into the still-UNDEBUGGED control
+                    // process (nothing posts — proven by the counter staying put), and only THEN is
+                    // a debugger attached. `DbgkpPostFakeModuleMessages` must report the two DLLs as
+                    // fake `DbgKmLoadDllApi` messages AFTER the create-process message, attributed
+                    // to the first thread, with the EXE's own view NOT re-reported.
+                    nt_handler.current_tid = plain_main.unwrap_or(0) as u64;
+                    let premapped_loads = DBGK_MODULE_LOADS.load(Ordering::Relaxed);
+                    for base in [PLAIN_DLL_A, PLAIN_DLL_B, PLAIN_IMAGE_BASE] {
+                        nt_handler.dbgk_module_load(MOD_TEST_PI2, base, 0, DBG_INFO, NAME_POINTER);
+                    }
+                    nt_handler.current_tid = debugger_tid as u64;
+                    let premapped = DBGK_MODULE_LOADS.load(Ordering::Relaxed) == premapped_loads
+                        && nt_handler.pm.module_count(plain) == 3;
+                    let fake_before = DBGK_FAKE_MESSAGES.load(Ordering::Relaxed);
+                    let attach_plain = h_plain != 0
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_plain, dbg_handle]) == 0;
+                    if premapped
+                        && attach_plain
+                        // 1 create-process + 2 load-dll fake messages (the EXE view is skipped).
+                        && DBGK_FAKE_MESSAGES.load(Ordering::Relaxed) == fake_before + 3
+                        && nt_handler.pm.debug_object(object).is_some_and(|o| {
+                            o.len() == 3
+                                && o.events()[0].message.api_number()
+                                    == dbgk::DBGKM_CREATE_PROCESS_API
+                                && o.events()[1].message.api_number() == dbgk::DBGKM_LOAD_DLL_API
+                                && o.events()[2].message.api_number() == dbgk::DBGKM_LOAD_DLL_API
+                                // The module messages ride the FIRST reported thread's CLIENT_ID …
+                                && plain_main.is_some_and(|first| {
+                                    o.events()[1].client_id.unique_thread == first
+                                        && o.events()[2].client_id.unique_thread == first
+                                })
+                                // … are NOWAIT backout events, and only the create-process one was
+                                // activated by DbgkpSetProcessDebugObject.
+                                && o.events()[1].flags & dbgk::DEBUG_EVENT_NOWAIT != 0
+                                && !o.events()[0].is_inactive()
+                                && o.events()[1].is_inactive()
+                                && o.events()[2].is_inactive()
+                        })
+                    {
+                        md_ok |= 0x0040;
+                    }
+
+                    // 0x0080 — each of the three is retrieved through the REAL NtWaitForDebugEvent
+                    // arm, in order, and continued by SSN: create-process, then the two
+                    // DbgLoadDllStateChanges carrying the bases that were mapped before the attach.
+                    let mut plain_client = [0u8; 16];
+                    plain_client[0..8].copy_from_slice(&(plain as u64).to_le_bytes());
+                    plain_client[8..16]
+                        .copy_from_slice(&(plain_main.unwrap_or(0) as u64).to_le_bytes());
+                    let mut drained_ok = img_spawn::smss_copyout(A_CLIENT_ID, &plain_client);
+                    for (state, base) in [
+                        (dbgk::DBG_CREATE_PROCESS_STATE_CHANGE, PLAIN_IMAGE_BASE),
+                        (dbgk::DBG_LOAD_DLL_STATE_CHANGE, PLAIN_DLL_A),
+                        (dbgk::DBG_LOAD_DLL_STATE_CHANGE, PLAIN_DLL_B),
+                    ] {
+                        let reported_base_offset =
+                            if state == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE {
+                                0x38 // CreateProcessInfo.NewProcess.BaseOfImage
+                            } else {
+                                0x20 // LoadDll.BaseOfDll
+                            };
+                        drained_ok = drained_ok
+                            && sysc!(
+                                SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                            ) == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == state
+                            && sc_u64!(0x08) == plain as u64
+                            && sc_u64!(reported_base_offset) == base
+                            && sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            ) == 0;
+                    }
+                    if drained_ok
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty())
+                    {
+                        md_ok |= 0x0080;
+                    }
+
+                    PM_PIDS[MOD_TEST_PI].store(0, Ordering::Relaxed);
+                    PM_PIDS[MOD_TEST_PI2].store(0, Ordering::Relaxed);
+                    for handle in [h_target, h_plain] {
+                        if handle != 0 {
+                            let _ = nt_handler
+                                .pm
+                                .close_handle(debugger_pid, handle as nt_process::Handle);
+                        }
+                    }
+                    // DbgkpCloseObject through the real NtClose arm — no debug object survives the
+                    // spec, so the gate's post-spec state matches a plain boot.
+                    let _ = sysc!(SSN_NT_CLOSE, &[dbg_handle]);
+                }
+            }
+
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+            nt_handler.current_tid = saved_tid;
+            nt_handler.loop_ctx = saved_ctx;
+            nt_handler.wait_park_event = -1;
+            nt_handler.wait_deadline_100ns = u64::MAX;
+            DBGK_MODULE_SELFTEST.store(md_ok, Ordering::Relaxed);
+        }
+
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
         delay_timer_shutdown(&delay_queue);

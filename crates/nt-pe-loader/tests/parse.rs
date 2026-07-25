@@ -122,6 +122,29 @@ fn minimal_pe_parses_and_maps() {
     assert_eq!(&img.bytes[0x1000..0x1002], &[0x90, 0xC3]);
 }
 
+/// `DbgkMapViewOfSection` reports `IMAGE_FILE_HEADER.{PointerToSymbolTable, NumberOfSymbols}` to a
+/// debugger as the load-DLL message's `DebugInfoFileOffset`/`DebugInfoSize`. Both live in the COFF
+/// file header at `nt_offset + 4 + 8` / `+ 12`; a linker that emits no COFF symbol table leaves
+/// them zero, which is what the builder produces by default.
+#[test]
+fn debug_info_reads_the_coff_symbol_table_fields() {
+    let mut pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x2000,
+        &[text_section(0x1000, vec![0x90, 0xC3])],
+        &[],
+    );
+    assert_eq!(PeFile::parse(&pe_bytes).unwrap().debug_info(), (0, 0));
+    // An image that DOES carry a COFF symbol table reports both fields verbatim.
+    put_u32(&mut pe_bytes, NT_OFF + 4 + 8, 0x0001_2340); // PointerToSymbolTable
+    put_u32(&mut pe_bytes, NT_OFF + 4 + 12, 0x0000_0042); // NumberOfSymbols
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.debug_info(), (0x0001_2340, 0x42));
+    assert_eq!(pe.headers().pointer_to_symbol_table, 0x0001_2340);
+    assert_eq!(pe.headers().number_of_symbols, 0x42);
+}
+
 #[test]
 fn raw_rva_reads_stay_within_the_backing_section() {
     let pe_bytes = build_pe(

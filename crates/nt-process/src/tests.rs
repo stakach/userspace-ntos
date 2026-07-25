@@ -1493,6 +1493,269 @@ fn dbgk_undebugged_processes_queue_nothing() {
     assert!(pm_object.debug_object(object).unwrap().is_empty());
 }
 
+// --- DbgkMapViewOfSection / DbgkUnMapViewOfSection: the module load/unload event source ---------
+
+fn module_at(base: u64, file_handle: u64) -> ProcessModule {
+    ProcessModule {
+        pid: 0, // filled in by the recorder
+        base,
+        file_handle,
+        debug_info_file_offset: 0x1234,
+        debug_info_size: 0x56,
+        name_pointer: 0x7FFE_1028,
+    }
+}
+
+#[test]
+fn dbgk_module_load_posts_load_dll_and_tracks_the_view() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    // Drain the attach-time fake create message so the load below is the outstanding event.
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    const DLL_BASE: u64 = 0x0000_0000_8000_0000;
+    assert_eq!(
+        pm.report_module_load(target, main, module_at(DLL_BASE, 0)),
+        Some(object)
+    );
+    assert_eq!(pm.module_count(target), 1);
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_LOAD_DLL_STATE_CHANGE);
+    assert_eq!(
+        result.client_id,
+        ClientId {
+            unique_process: target,
+            unique_thread: main
+        }
+    );
+    let sc = &result.state_change;
+    let u32_at = |o: usize| u32::from_le_bytes(sc[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(sc[o..o + 8].try_into().unwrap());
+    assert_eq!(u32_at(0x00), dbgk::DBG_LOAD_DLL_STATE_CHANGE);
+    assert_eq!(u64_at(0x18), 0); // no debuggee file handle to duplicate
+    assert_eq!(u64_at(0x20), DLL_BASE); // BaseOfDll
+    assert_eq!(u32_at(0x28), 0x1234); // DebugInfoFileOffset
+    assert_eq!(u32_at(0x2c), 0x56); // DebugInfoSize
+    assert_eq!(u64_at(0x30), 0x7FFE_1028); // NamePointer
+}
+
+#[test]
+fn dbgk_module_load_duplicates_the_image_file_handle_into_the_debugger() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    // The DEBUGGEE's own handle to the image file — meaningless in the debugger's namespace until
+    // `DbgkpOpenHandles` duplicates it.
+    let file = HandleObject::File(0xF11E);
+    let debuggee_handle = pm.insert_handle(target, file, 0x0012_0089).unwrap();
+    assert_eq!(
+        pm.report_module_load(
+            target,
+            main,
+            module_at(0x0000_0000_9000_0000, debuggee_handle as u64)
+        ),
+        Some(object)
+    );
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_ne!(result.handle_to_file, 0);
+    assert_ne!(
+        result.handle_to_file, debuggee_handle,
+        "the debugger gets its OWN handle value"
+    );
+    assert_eq!(pm.lookup_handle(debugger, result.handle_to_file), Some(file));
+    // DUPLICATE_SAME_ACCESS.
+    assert_eq!(
+        pm.handle_access(debugger, result.handle_to_file),
+        Some(0x0012_0089)
+    );
+    // …and it is the value the rendered state change carries.
+    assert_eq!(
+        u64::from_le_bytes(result.state_change[0x18..0x20].try_into().unwrap()),
+        result.handle_to_file as u64
+    );
+}
+
+#[test]
+fn dbgk_module_unload_reports_only_tracked_image_views() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    const DLL_BASE: u64 = 0x0000_0000_8000_0000;
+    pm.report_module_load(target, main, module_at(DLL_BASE, 0));
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    // A base that was never an IMAGE view reports nothing — `MmUnmapViewOfSection`'s `if (DbgBase)`.
+    assert_eq!(pm.report_module_unload(target, main, 0xDEAD_0000), None);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+    // The tracked view does report, and stops being tracked.
+    assert_eq!(
+        pm.report_module_unload(target, main, DLL_BASE),
+        Some(object)
+    );
+    assert_eq!(pm.module_count(target), 0);
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_UNLOAD_DLL_STATE_CHANGE);
+    assert_eq!(
+        u64::from_le_bytes(result.state_change[0x18..0x20].try_into().unwrap()),
+        DLL_BASE
+    );
+    // A second unmap of the same base is no longer a tracked view.
+    assert_eq!(pm.report_module_unload(target, main, DLL_BASE), None);
+}
+
+#[test]
+fn dbgk_attach_posts_fake_module_messages_after_the_thread_messages() {
+    let mut pm = ProcessManager::new();
+    // A debug object must exist for the map path to track anything at all (the live-boot gate).
+    let object = pm.create_debug_object(0).unwrap();
+    let debugger = pm.create_process("dbg.exe", None, None);
+    let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
+    let target = pm.create_process("target.exe", None, None);
+    pm.set_image_base(target, 0x0000_0001_4000_0000);
+    let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
+    let second = pm.create_thread(target, 0x2100, 0, false).unwrap();
+
+    // Two DLLs + the EXE's own view map BEFORE the attach — nothing is debugged, so nothing posts.
+    const A: u64 = 0x0000_0000_8000_0000;
+    const B: u64 = 0x0000_0000_8100_0000;
+    pm.report_module_load(target, main, module_at(A, 0));
+    pm.report_module_load(target, main, module_at(B, 0));
+    pm.report_module_load(target, main, module_at(0x0000_0001_4000_0000, 0));
+    assert_eq!(pm.module_count(target), 3);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+
+    let posted = pm
+        .debug_active_process(
+            target,
+            object,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: dbg_thread,
+            },
+        )
+        .unwrap();
+    // 2 thread messages + 2 module messages; the EXE's own view is NOT re-reported (the
+    // create-process message already carries `base_of_image`).
+    assert_eq!(posted, 4);
+    let events = pm.debug_object(object).unwrap().events();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].message.state(), dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
+    assert_eq!(events[1].message.state(), dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+    assert_eq!(events[1].client_id.unique_thread, second);
+    // The module messages come LAST and are attributed to the FIRST reported thread.
+    for (index, base) in [(2usize, A), (3, B)] {
+        assert_eq!(events[index].message.state(), dbgk::DBG_LOAD_DLL_STATE_CHANGE);
+        assert_eq!(events[index].client_id.unique_thread, main);
+        assert_eq!(
+            events[index].message,
+            dbgk::DbgKmMessage::LoadDll {
+                file_handle: 0,
+                base_of_dll: base,
+                debug_info_file_offset: 0x1234,
+                debug_info_size: 0x56,
+                name_pointer: 0, // cleared for a FAKE message
+            }
+        );
+        // All fake messages are NOWAIT, and only the first of them is eligible.
+        assert!(events[index].flags & dbgk::DEBUG_EVENT_NOWAIT != 0);
+        assert!(events[index].is_inactive());
+        assert!(events[index].backout_thread.is_none());
+    }
+    assert!(!events[0].is_inactive(), "the create-process message is activated first");
+
+    // Retrieving them: one event per debuggee process at a time, in queue order.
+    for expected in [
+        dbgk::DBG_CREATE_PROCESS_STATE_CHANGE,
+        dbgk::DBG_CREATE_THREAD_STATE_CHANGE,
+        dbgk::DBG_LOAD_DLL_STATE_CHANGE,
+        dbgk::DBG_LOAD_DLL_STATE_CHANGE,
+    ] {
+        let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+        assert_eq!(result.state, expected);
+        pm.debug_continue(object, result.client_id, dbgk::DBG_CONTINUE)
+            .unwrap();
+    }
+    assert!(pm.debug_object(object).unwrap().is_empty());
+}
+
+#[test]
+fn dbgk_module_tracking_is_inert_without_a_debug_object() {
+    // ★ THE LIVE-BOOT SHAPE. With no DEBUG_OBJECT in the system the map/unmap reporting path
+    // records nothing and posts nothing, so a host's section-mapping path is untouched.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("plain.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    assert_eq!(
+        pm.report_module_load(pid, tid, module_at(0x8000_0000, 0)),
+        None
+    );
+    assert_eq!(pm.module_count(pid), 0);
+    assert_eq!(pm.report_module_unload(pid, tid, 0x8000_0000), None);
+    assert_eq!(pm.debug_object_count(), 0);
+}
+
+#[test]
+fn dbgk_module_tracking_respects_its_reserved_capacity() {
+    let mut pm = ProcessManager::new();
+    pm.reserve_modules(3);
+    let _object = pm.create_debug_object(0).unwrap();
+    let pid = pm.create_process("many.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    for i in 0..6u64 {
+        pm.report_module_load(pid, tid, module_at(0x8000_0000 + i * 0x10_0000, 0));
+    }
+    assert_eq!(pm.module_count(pid), 3, "the table is capped, never grown");
+    // Re-mapping a tracked base REPLACES its record rather than consuming another slot…
+    pm.report_module_load(pid, tid, module_at(0x8000_0000, 0x99));
+    assert_eq!(pm.module_count(pid), 3);
+    let mut out = [ProcessModule::default(); 4];
+    assert_eq!(pm.process_modules_into(pid, &mut out), 3);
+    assert_eq!(out[0].file_handle, 0x99);
+    // …and a freed slot is reused.
+    assert!(pm.report_module_unload(pid, tid, 0x8010_0000).is_none()); // not debugged: no post
+    assert_eq!(pm.module_count(pid), 2);
+    pm.report_module_load(pid, tid, module_at(0x9000_0000, 0));
+    assert_eq!(pm.module_count(pid), 3);
+}
+
 // --- DbgkForwardException: the exception / breakpoint / single-step event source -----------------
 
 #[test]

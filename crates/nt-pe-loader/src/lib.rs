@@ -176,6 +176,16 @@ impl<'a> PeFile<'a> {
     pub fn subsystem(&self) -> u16 {
         self.headers.subsystem
     }
+    /// The COFF debug-info pair `(PointerToSymbolTable, NumberOfSymbols)` — exactly what
+    /// `DbgkMapViewOfSection` reads out of `RtlImageNtHeader(BaseOfDll)->FileHeader` and reports to
+    /// a debugger as `DBGKM_LOAD_DLL.{DebugInfoFileOffset, DebugInfoSize}`.
+    pub fn debug_info(&self) -> (u32, u32) {
+        (
+            self.headers.pointer_to_symbol_table,
+            self.headers.number_of_symbols,
+        )
+    }
+
     /// The required subsystem version `(major, minor)`.
     pub fn subsystem_version(&self) -> (u16, u16) {
         (

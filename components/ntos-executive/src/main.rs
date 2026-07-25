@@ -6175,6 +6175,14 @@ static DBGK_DETACHES: AtomicU64 = AtomicU64::new(0);
 /// `EPROCESS.DebugPort` returns immediately having done nothing, which is why this stays **0** on a
 /// plain boot (nothing debugs anything) and the fault path stays byte-identical.
 static DBGK_EXCEPTIONS_FORWARDED: AtomicU64 = AtomicU64::new(0);
+/// `DbgkMapViewOfSection` / `DbgkUnMapViewOfSection` posts: incremented by
+/// `ExecNtHandler::dbgk_module_load` / `dbgk_module_unload`, the entries the REAL section-mapping
+/// path (`NtMapViewOfSection`'s SEC_IMAGE branch / `NtUnmapViewOfSection`) calls when an IMAGE view
+/// becomes mapped or unmapped for a hosted process. Like the exception counter these only count a
+/// post that actually happened: with no debug object alive both helpers return on their first line,
+/// so they stay **0** on a plain boot and the mapping path is byte-identical.
+static DBGK_MODULE_LOADS: AtomicU64 = AtomicU64::new(0);
+static DBGK_MODULE_UNLOADS: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk end-to-end SELF-TEST result** (post-loop, throwaway debugger + debuggee EPROCESSes),
 /// driving the SAME `nt_process::dbgk` plane the five native handlers dispatch into. Bitmask:
 ///   0x0001 NtCreateDebugObject creates a real DEBUG_OBJECT (DBGK_KILL_PROCESS_ON_EXIT honoured)
@@ -6242,6 +6250,33 @@ static DBGK_SYSCALL_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///   0x0080 ★ SIGNAL FIX (non-dbgk syscall poster): the same park is woken by `NtTerminateThread`'s
 ///          lifecycle `DbgKmExitThreadApi` post, an arm that never mirrored the signal before
 static DBGK_EXCEPTION_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk MODULE load/unload self-test result** (post-loop). `DbgkMapViewOfSection` /
+/// `DbgkUnMapViewOfSection` + `DbgkpPostFakeModuleMessages` — the debug-event source deferred until
+/// this batch. The debugger side runs through the REAL dispatch route (`nt_dispatcher.dispatch(SSN,
+/// …)`, arguments marshalled in CLIENT memory); the debuggee side runs through
+/// `ExecNtHandler::dbgk_module_load` / `dbgk_module_unload`, *the very entries the live
+/// `NtMapViewOfSection` / `NtUnmapViewOfSection` arms call*. Bit map:
+///   0x0001 setup: a throwaway debuggee attached BY SSN with its fake create message drained by SSN
+///   0x0002 THE LOAD: the map-path entry resolved pi → pid → `EPROCESS.DebugPort`, queued one
+///          `DbgKmLoadDllApi` event and moved `DBGK_MODULE_LOADS`
+///   0x0004 `NtWaitForDebugEvent` reports `DbgLoadDllStateChange` for the mapping CLIENT_ID with the
+///          WHOLE payload read back OUT OF CLIENT MEMORY — base, debug-info offset/size, name
+///          pointer — plus the image FILE handle `DbgkpOpenHandles` DUPLICATED into the debugger's
+///          own table (a different handle VALUE naming the same object), and `NtDebugContinue`
+///          resolves it
+///   0x0008 THE UNLOAD: unmapping the view posts `DbgKmUnloadDllApi`, retrieved as
+///          `DbgUnloadDllStateChange` with the right base, and moves `DBGK_MODULE_UNLOADS`
+///   0x0010 IMAGE-ONLY: unmapping a base that was never an IMAGE view posts nothing and moves no
+///          counter (`MmUnmapViewOfSection`'s `if (DbgBase)` guard)
+///   0x0020 ★ THE NO-DEBUGGER GATE: mapping and unmapping an IMAGE view in a process with no
+///          `DebugPort` post nothing, move no counter and track nothing — the path EVERY DLL map on
+///          the live boot takes
+///   0x0040 ATTACH-TIME FAKE MODULES: images mapped into an UNDEBUGGED process are reported as fake
+///          `DbgKmLoadDllApi` messages by a later attach, AFTER the create-process/create-thread
+///          messages and attributed to the first thread; the EXE's own view is not re-reported
+///   0x0080 each fake module message is retrieved through the REAL `NtWaitForDebugEvent` arm as
+///          `DbgLoadDllStateChange` carrying its base, and continued by SSN
+static DBGK_MODULE_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -9950,6 +9985,45 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         dbgk_exc & 0x00C8 == 0x00C8,
                         &mut passed,
                     );
+                    // ---- Dbgk MODULE LOAD/UNLOAD (`DbgkMapViewOfSection` /
+                    // `DbgkUnMapViewOfSection` / `DbgkpPostFakeModuleMessages`). The debugger side
+                    // runs through the real dispatcher; the debuggee side through the SAME
+                    // `dbgk_module_load` / `dbgk_module_unload` entries the live `NtMapViewOfSection`
+                    // SEC_IMAGE branch and `NtUnmapViewOfSection` arm call. The no-debugger gate
+                    // (0x0020) is the safety property that keeps every DLL map on this boot
+                    // byte-identical.
+                    let dbgk_mod = DBGK_MODULE_SELFTEST.load(Ordering::Relaxed);
+                    // An IMAGE view mapped into a debugged process posts DbgKmLoadDllApi, retrieved
+                    // as DbgLoadDllStateChange with its whole payload read back out of client
+                    // memory + the image file handle duplicated into the debugger's own table.
+                    check(
+                        b"exec_dbgk_module_load_forwarded",
+                        dbgk_mod & (0x0001 | 0x0002 | 0x0004) == (0x0001 | 0x0002 | 0x0004),
+                        &mut passed,
+                    );
+                    // Unmapping it posts DbgKmUnloadDllApi with the right base; a base that was
+                    // never an IMAGE view posts nothing, and neither does a process with no
+                    // DebugPort (the path every DLL map on this boot takes).
+                    check(
+                        b"exec_dbgk_module_unload_forwarded",
+                        dbgk_mod & (0x0008 | 0x0010 | 0x0020) == (0x0008 | 0x0010 | 0x0020),
+                        &mut passed,
+                    );
+                    // DbgkpPostFakeModuleMessages: attaching to a process that already has images
+                    // mapped reports them as fake DbgKmLoadDllApi messages, after the create
+                    // messages, each retrieved through the real NtWaitForDebugEvent arm.
+                    check(
+                        b"exec_dbgk_attach_posts_fake_modules",
+                        dbgk_mod & (0x0040 | 0x0080) == (0x0040 | 0x0080),
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] dbgk module selftest bits=0x");
+                    print_hex(dbgk_mod as u32);
+                    print_str(b" loads=");
+                    print_u64(DBGK_MODULE_LOADS.load(Ordering::Relaxed));
+                    print_str(b" unloads=");
+                    print_u64(DBGK_MODULE_UNLOADS.load(Ordering::Relaxed));
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] dbgk exception-forward selftest bits=0x");
                     print_hex(dbgk_exc as u32);
                     print_str(b" forwards=");

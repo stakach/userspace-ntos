@@ -3593,7 +3593,7 @@ security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binar
 covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
 `RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
 
-### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199 → 202 → 204/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25/26, gate **193 → 199 → 202 → 204 → 207/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
 
 The 8 `DbgUi*` exports **kernel32.dll imports** (they underpin Win32
 `DebugActiveProcess`/`WaitForDebugEvent`/`ContinueDebugEvent`/`DebugBreakProcess`) were
@@ -3719,10 +3719,43 @@ debugger) and disproven-when-removed by the bypass experiment below.
   executive-internal walls rather than user exceptions (`fault-cap`, `win32k-spin`,
   `unhandled-syscall`, `image-map-resource`, `wl-stack-growth`, `other-fault`) do not forward.
 
-*DEFERRED (the payload/plumbing exists — `DbgKmMessage::{LoadDll, UnloadDll}` encode and convert
-correctly, host-tested — but nothing posts them yet):*
-- **module load/unload** (`DbgkMapViewOfSection`/`DbgkUnMapViewOfSection`) — our loader does not post
-  `DbgKmLoadDllApi`/`DbgKmUnloadDllApi`.
+- **module load / unload** (`DbgkMapViewOfSection` / `DbgkUnMapViewOfSection`) + **attach-time fake
+  module messages** (`DbgkpPostFakeModuleMessages`) — **WIRED in batch 53** (gate 204 → **207/99**).
+  Both halves:
+  | half | where | what |
+  |---|---|---|
+  | (a) live load | `exec_handler.rs`, the `NtMapViewOfSection` arm's **SEC_IMAGE branch** (`reg.index_for_section(pi, sect)` ⇒ a registry DLL mapped at its registry base) — the one place an IMAGE view genuinely becomes mapped for a hosted process | `ExecNtHandler::dbgk_module_load` posts `DbgKmLoadDllApi` with `BaseOfDll`, the mapping process's own image-FILE handle, `DebugInfo{FileOffset,Size}` = `RtlImageNtHeader(BaseOfDll)->FileHeader.{PointerToSymbolTable,NumberOfSymbols}` (new `PeFile::debug_info()`), and `NamePointer` = the mapping thread's `NtTib.ArbitraryUserPointer` |
+  | (a) live unload | `exec_handler.rs`, `NtUnmapViewOfSection` (split out of the no-op group; still `STATUS_SUCCESS`) | `ExecNtHandler::dbgk_module_unload` posts `DbgKmUnloadDllApi { BaseAddress }` |
+  | (b) attach | `ProcessManager::debug_active_process` | after the fake thread messages, one `NOWAIT|INACTIVE` fake `DbgKmLoadDllApi` per already-mapped module, attributed to the FIRST reported thread — exactly `DbgkpPostFakeProcessCreateMessages`'s order (`DbgkpPostFakeThreadMessages` → `DbgkpPostFakeModuleMessages(Process, FirstThread, …)`), then `DbgkpSetProcessDebugObject`'s activation pass |
+  **IMAGE-ONLY** is enforced two ways, both matching NT. On the map side the hook sits *only* in the
+  SEC_IMAGE branch — the anonymous CSR shared section and the named NLS section fall through the same
+  arm and deliberately report nothing (`Section->u.Flags.Image`). On the unmap side the post happens
+  only if the base names a **tracked IMAGE view**: `ProcessManager` keeps a modelled module list
+  (`ProcessModule`, the `PEB->Ldr->InLoadOrderModuleList` equivalent `DbgkpPostFakeModuleMessages`
+  walks), and a base that was never recorded reports nothing — the modelled form of
+  `MmUnmapViewOfSection`'s `if (DbgBase)` guard.
+  `DbgkpOpenHandles`'s tail is now real too: the image FILE handle a load-dll (or create-process)
+  event carries is the DEBUGGEE's own handle, and the wait `ObDuplicateObject`s it
+  (`DUPLICATE_SAME_ACCESS`) into the DEBUGGER's table — a different handle VALUE naming the same
+  object, `0` if that fails, exactly as the kernel leaves it.
+  **★ The safety property (the mapping path is EXTREMELY load-bearing).** Three nested gates:
+  `dbgk_module_load`/`dbgk_module_unload` return on their FIRST line when no `DEBUG_OBJECT` exists
+  anywhere; the call site itself is wrapped in the same `debug_object_count() != 0` test so not even
+  the `reg.file_handle` / `PeFile::debug_info` reads happen; and `report_module_load` posts only when
+  the process is being debugged. On every boot today no debug object is ever created, so the map arm
+  and the unmap arm are byte-identical — verified by diffing the boot serial against `4a99185`
+  (identical modulo per-build address/tid nondeterminism and one already-nondeterministic
+  listener/main-loop interleave, plus the three new spec lines; the PASS/FAIL list is identical plus
+  the three new specs, and `DBGK_MODULE_LOADS`/`UNLOADS` read 1/1 — both from the self-test, 0 from
+  the live boot). **Honest limitation:** the modelled module list is likewise only maintained while a
+  `DEBUG_OBJECT` exists, so a debugger attaching to a process that mapped its images *before any
+  debug object was created* sees no fake module messages for them. That is the price of leaving the
+  live mapping path untouched; the fix (unconditional recording) is deliberately NOT taken.
+  Still **not** covered: image views the executive maps outside that branch (the EXE image itself at
+  spawn — already reported by `DbgKmCreateProcessApi`'s `base_of_image` — and win32k's internal
+  mappings, which are not user-visible views of a hosted process).
+
+*DEFERRED (the payload/plumbing exists but nothing posts them yet):*
 - **target-side blocking on the continue event — STILL DEFERRED after batch 52 (be precise about
   this).** NT blocks the *reporting* thread inside `DbgkpQueueMessage` until `NtDebugContinue`, then
   applies the continue status. Ours is **post-and-continue**: the forward queues the event, wakes the
@@ -3737,6 +3770,14 @@ correctly, host-tested — but nothing posts them yet):*
   item (a) of the scope note above is still open. This also means **the blocking-wait path is still
   NOT proven**; what batch 52 adds is a second, independent proof of the park-request + wake-signal
   half, now from two posting paths that could not signal at all before it.
+- **modules mapped before any `DEBUG_OBJECT` existed** — the modelled module list is only maintained
+  while at least one debug object is alive (the gate that keeps the section-mapping path
+  byte-identical), so `DbgkpPostFakeModuleMessages` reports nothing for images a process mapped
+  before the debugger's own `DbgUiConnectToDbg`. Closing this means recording IMAGE views
+  unconditionally on the live map path — a deliberate non-choice while that path carries the whole
+  boot. Also still deferred: the LOAD-side `DebugInfo`/name for views the executive maps outside the
+  `NtMapViewOfSection` SEC_IMAGE branch, and `Thread->HideFromDebugger` (we have no such flag, so
+  every thread reports).
 - **`PEB.BeingDebugged` write-through to a live hosted process** — modelled on `NtProcess`
   (`DbgkpMarkProcessPeb`'s state) but not written into a hosted PEB page; nothing attaches to a live
   hosted process yet.
@@ -3807,6 +3848,26 @@ fault path calls*. Nothing is reimplemented for the test: the throwaway debuggee
   `exec_dbgk_exception_forwarded` still passes (gate 203/99, 1 FAIL) — i.e. bit `0x0080` is exactly
   the defect, and the fix is load-bearing.
 Both restored and re-verified green.
+
+**5 — the gate, part 4: MODULE LOAD/UNLOAD is gate-proven — 3 specs** (gate **204 → 207/99**,
+batch 53, 2026-07-26). A fourth post-loop self-test (`service_sec_image.rs`,
+`DBGK_MODULE_SELFTEST` bitmask `0xFF`), same shape as part 3: the **debugger** side goes through the
+REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)`, arguments marshalled in smss's CLIENT memory)
+and the **debuggee** side goes through `ExecNtHandler::dbgk_module_load` / `dbgk_module_unload` —
+*the very entries the live `NtMapViewOfSection` SEC_IMAGE branch and `NtUnmapViewOfSection` arm
+call*. Two throwaway processes in FREE `PM_PIDS` slots: one attached, one never attached.
+
+| spec | proves |
+|---|---|
+| `exec_dbgk_module_load_forwarded` (`0x0007`) | attach + the fake create message drained by SSN · the map-path entry queues one `DbgKmLoadDllApi`, moves `DBGK_MODULE_LOADS` and tracks the view · `NtWaitForDebugEvent` reports `DbgLoadDllStateChange` for the mapping `CLIENT_ID` with the WHOLE payload **read back out of client memory** (`BaseOfDll`, `DebugInfoFileOffset`, `DebugInfoSize`, `NamePointer`) **plus** the image FILE handle `DbgkpOpenHandles` duplicated into the DEBUGGER's own table — a different handle VALUE resolving to the same `HandleObject::File`, with `DUPLICATE_SAME_ACCESS` — and `NtDebugContinue` resolves it |
+| `exec_dbgk_module_unload_forwarded` (`0x0038`) | the unmap entry posts `DbgKmUnloadDllApi`, retrieved as `DbgUnloadDllStateChange` with the right `BaseAddress`, moves `DBGK_MODULE_UNLOADS` and stops tracking the view · **image-only**: unmapping a base that was never an IMAGE view (and re-unmapping one already gone) posts nothing and moves no counter · **★ the no-debugger gate**: a map AND an unmap in a process with no `DebugPort` return false, move no counter and queue nothing — the path every DLL map on the live boot takes |
+| `exec_dbgk_attach_posts_fake_modules` (`0x00C0`) | two DLLs + the EXE's own view map into a still-UNDEBUGGED process (`DBGK_MODULE_LOADS` does not move — nothing is posted), and only then does a debugger attach: `DbgkpPostFakeModuleMessages` posts exactly 2 fake `DbgKmLoadDllApi` messages (`DBGK_FAKE_MESSAGES` +3 with the create-process one; the EXE's view is NOT re-reported), AFTER the create message, attributed to the FIRST reported thread, `NOWAIT` and inactive except the activated create · each of the three is then retrieved through the REAL `NtWaitForDebugEvent` arm in order with its base read out of client memory, and continued by SSN |
+
+**Proof-is-real check (batch 53) — BYPASS experiment:** neuter `dbgk_module_load` (`return false`
+first thing, i.e. an image map never posts) → `DBGK_MODULE_SELFTEST` `0xFF → 0x31`, `loads 1 → 0`,
+`unloads 1 → 0`, **all THREE new specs FAIL** (gate 204/99, 3 FAILs). Only the setup, the
+image-only negative and the no-debugger gate survive — every positive bit depends on the posting.
+Restored and re-verified green.
 
 **Proof-is-real check (batch 51):** pointing the attach at `pm.debug_active_process` instead of the
 dispatcher (a one-call bypass) drops `DBGK_SYSCALL_SELFTEST` `0x7FF → 0x7FB`, `attaches 2 → 1`, and

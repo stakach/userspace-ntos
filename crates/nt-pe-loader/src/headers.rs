@@ -39,6 +39,12 @@ pub struct Headers {
     pub nt_offset: usize,
     pub machine: u16,
     pub number_of_sections: u16,
+    /// `IMAGE_FILE_HEADER.PointerToSymbolTable` — the COFF symbol-table file offset. Reported to a
+    /// debugger as `DBGKM_LOAD_DLL.DebugInfoFileOffset` (`DbgkMapViewOfSection`). `0` in every
+    /// modern linker's output (COFF symbols are deprecated in favour of a PDB).
+    pub pointer_to_symbol_table: u32,
+    /// `IMAGE_FILE_HEADER.NumberOfSymbols` — reported as `DBGKM_LOAD_DLL.DebugInfoSize`.
+    pub number_of_symbols: u32,
     pub size_of_optional_header: u16,
     pub characteristics: u16,
     pub magic: u16,
@@ -76,6 +82,9 @@ impl Headers {
         if number_of_sections > MAX_SECTIONS {
             return Err(PeError::TooManySections(number_of_sections));
         }
+        // TimeDateStamp@fh+4; the two COFF debug-info fields a debugger is told about.
+        let pointer_to_symbol_table = u32_at(b, fh + 8)?;
+        let number_of_symbols = u32_at(b, fh + 12)?;
         let size_of_optional_header = u16_at(b, fh + 16)?;
         let characteristics = u16_at(b, fh + 18)?;
 
@@ -122,6 +131,8 @@ impl Headers {
             nt_offset,
             machine,
             number_of_sections,
+            pointer_to_symbol_table,
+            number_of_symbols,
             size_of_optional_header,
             characteristics,
             magic,

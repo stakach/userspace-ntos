@@ -309,6 +309,10 @@ impl ExecNtHandler {
                 // would recycle a value while stale bindings to the old value still exist →
                 // mis-routing the next open; append-only keeps every value monotonic for the run.
                 pm.set_handle_no_reuse(true);
+                // Dbgk module tracking (`DbgkMapViewOfSection`'s `PEB->Ldr` equivalent): reserve the
+                // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
+                // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
+                pm.reserve_modules(64);
                 let smss_pid = pm.create_process("smss.exe", None, None);
                 let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
@@ -1175,6 +1179,79 @@ impl ExecNtHandler {
         DBGK_EXCEPTIONS_FORWARDED.fetch_add(1, Ordering::Relaxed);
         self.sync_debug_object_signals();
         true
+    }
+
+    /// `DbgkMapViewOfSection` — an **IMAGE** view at `base` became mapped in hosted process index
+    /// `pi`. Records it in the process's modelled module list and posts `DbgKmLoadDllApi` to its
+    /// `EPROCESS.DebugPort`, waking a debugger parked on it.
+    ///
+    /// ★ SAFETY PROPERTY: with **no** `DEBUG_OBJECT` alive anywhere — every boot today — this
+    /// returns `false` on its first line, so the section-mapping path (every DLL load, every
+    /// demand-map, win32k's client mappings) is byte-identical. `report_module_load` itself is gated
+    /// the same way, so not even the module list is touched.
+    ///
+    /// `file_handle` is the MAPPING process's own handle to the image file; the wait duplicates it
+    /// into the debugger's table (`DbgkpOpenHandles`) and leaves 0 if it cannot. `name_pointer` is a
+    /// pointer in the debuggee to the module name — NT reports
+    /// `&NtCurrentTeb()->NtTib.ArbitraryUserPointer`.
+    pub(crate) fn dbgk_module_load(
+        &mut self,
+        pi: usize,
+        base: u64,
+        file_handle: u64,
+        debug_info: (u32, u32),
+        name_pointer: u64,
+    ) -> bool {
+        if self.pm.debug_object_count() == 0 {
+            return false;
+        }
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
+            return false;
+        };
+        let tid = self.dbgk_reporting_tid(pid);
+        let module = nt_process::ProcessModule {
+            pid,
+            base,
+            file_handle,
+            debug_info_file_offset: debug_info.0,
+            debug_info_size: debug_info.1,
+            name_pointer,
+        };
+        if self.pm.report_module_load(pid, tid, module).is_none() {
+            return false;
+        }
+        DBGK_MODULE_LOADS.fetch_add(1, Ordering::Relaxed);
+        self.sync_debug_object_signals();
+        true
+    }
+
+    /// `DbgkUnMapViewOfSection` — the view at `base` was unmapped from hosted process index `pi`.
+    /// Posts `DbgKmUnloadDllApi` **only when `base` names a tracked IMAGE view** (the modelled form
+    /// of `MmUnmapViewOfSection`'s `if (DbgBase)` guard — a data / anonymous view was never
+    /// recorded). Same first-line no-debug-object early return as [`dbgk_module_load`].
+    pub(crate) fn dbgk_module_unload(&mut self, pi: usize, base: u64) -> bool {
+        if self.pm.debug_object_count() == 0 || base == 0 {
+            return false;
+        }
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
+            return false;
+        };
+        let tid = self.dbgk_reporting_tid(pid);
+        if self.pm.report_module_unload(pid, tid, base).is_none() {
+            return false;
+        }
+        DBGK_MODULE_UNLOADS.fetch_add(1, Ordering::Relaxed);
+        self.sync_debug_object_signals();
+        true
+    }
+
+    /// The thread a dbgk message from the current syscall reports for: the live caller when the loop
+    /// has resolved one, else the process's main thread (what `dbgk_forward_exception` falls back to).
+    fn dbgk_reporting_tid(&self, pid: nt_process::ProcessId) -> nt_process::ThreadId {
+        match self.current_tid {
+            0 => self.pm.main_thread(pid).unwrap_or(0),
+            tid => tid as nt_process::ThreadId,
+        }
     }
 
     pub(crate) fn waitable_index_for_handle(
@@ -7490,10 +7567,19 @@ impl ExecNtHandler {
             NativeService::NtWriteVirtualMemory => unsafe {
                 self.nt_copy_virtual_memory(args, false)
             },
+            // NtUnmapViewOfSection(ProcessHandle, BaseAddress). We still never RECLAIM a mapped
+            // view (the bump allocator never frees) → STATUS_SUCCESS exactly as before; what is new
+            // is `DbgkUnMapViewOfSection`, which reports the unmap of an IMAGE view to the calling
+            // process's debugger. Only a view this process's map path RECORDED is an image view, so
+            // a data/anonymous base reports nothing — `MmUnmapViewOfSection`'s `if (DbgBase)`. With
+            // no debugger the helper returns on its first line.
+            NativeService::NtUnmapViewOfSection => {
+                self.dbgk_module_unload(self.pi, args.get(1).copied().unwrap_or(0));
+                0
+            }
             NativeService::NtTestAlert
             | NativeService::NtCreateKeyedEvent
             | NativeService::NtInitializeRegistry
-            | NativeService::NtUnmapViewOfSection
             | NativeService::NtSetSecurityObject
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
             // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
@@ -10335,6 +10421,25 @@ impl ExecNtHandler {
                             dbase,
                             b"",
                         );
+                        // ★ `DbgkMapViewOfSection` — THE image-view chokepoint. This branch is the
+                        // one place a SEC_IMAGE view genuinely becomes mapped for a hosted process
+                        // (the anonymous CSR section + the named NLS section below are data views
+                        // and deliberately do NOT report, matching `Section->u.Flags.Image`). The
+                        // `DebugInfo*` pair is `RtlImageNtHeader(BaseOfDll)->FileHeader`'s COFF
+                        // symbol-table fields; the name pointer is the mapping thread's
+                        // `NtTib.ArbitraryUserPointer`. With no debugger the call returns on its
+                        // first line.
+                        if self.pm.debug_object_count() != 0 {
+                            let dbg_file = reg.file_handle(self.pi, i);
+                            let dbg_info = cpe.debug_info();
+                            self.dbgk_module_load(
+                                self.pi,
+                                dbase,
+                                dbg_file,
+                                dbg_info,
+                                SMSS_TEB_VA + 0x28,
+                            );
+                        }
                         0
                     } else {
                         loader_trace_record(

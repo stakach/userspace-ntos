@@ -174,9 +174,42 @@ pub struct DebugWaitResult {
     pub handle_to_process: Handle,
     /// Handle to the reported thread opened in the debugger's handle table (`0` when none).
     pub handle_to_thread: Handle,
+    /// The image FILE handle duplicated into the debugger's handle table for the two states that
+    /// carry one — `DbgCreateProcessStateChange` and `DbgLoadDllStateChange` (`DbgkpOpenHandles`'s
+    /// `ObDuplicateObject`). `0` when the state carries none, or when the debuggee's own handle
+    /// could not be duplicated (exactly what the kernel leaves behind on failure).
+    pub handle_to_file: Handle,
     /// The x64 `DBGUI_WAIT_STATE_CHANGE` image to copy out to the debugger.
     pub state_change: [u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE],
 }
+
+/// A module — an **IMAGE** view mapped into a process. The modelled equivalent of the
+/// `LDR_DATA_TABLE_ENTRY`s on `PEB->Ldr->InLoadOrderModuleList`, which is the list
+/// `DbgkpPostFakeModuleMessages` walks to tell an attaching debugger what is already loaded, and
+/// the "is this base an image view?" test `MmUnmapViewOfSection` performs before calling
+/// `DbgkUnMapViewOfSection`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessModule {
+    /// The owning process. `0` marks a free slot in the tracking table.
+    pub pid: ProcessId,
+    /// `LDR_DATA_TABLE_ENTRY.DllBase` = `DBGKM_LOAD_DLL.BaseOfDll`.
+    pub base: u64,
+    /// The **debuggee's own** handle to the image file. Duplicated into the debugger's handle table
+    /// when the message is reported (`DbgkpOpenHandles`); `0` = none.
+    pub file_handle: u64,
+    /// `IMAGE_FILE_HEADER.PointerToSymbolTable` → `DBGKM_LOAD_DLL.DebugInfoFileOffset`.
+    pub debug_info_file_offset: u32,
+    /// `IMAGE_FILE_HEADER.NumberOfSymbols` → `DBGKM_LOAD_DLL.DebugInfoSize`.
+    pub debug_info_size: u32,
+    /// `DBGKM_LOAD_DLL.NamePointer` — a pointer **in the debuggee** to the module's name
+    /// (`&NtCurrentTeb()->NtTib.ArbitraryUserPointer` in `DbgkMapViewOfSection`). `0` = none, which
+    /// is what `DbgkpPostFakeModuleMessages` reports for its fake messages.
+    pub name_pointer: u64,
+}
+
+/// Default cap on tracked modules across all processes. `DbgkpPostFakeModuleMessages` likewise
+/// stops walking `InLoadOrderModuleList` after 500 entries.
+pub const DEFAULT_TRACKED_MODULES: usize = 64;
 
 /// Architecture-neutral fields returned for `ThreadTimes` (`KERNEL_USER_TIMES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -445,6 +478,17 @@ pub struct ProcessManager {
     no_reuse: bool,
     /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
     dbgk: DebugObjectStore,
+    /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
+    /// `0` marks a free slot, so an unmap never shifts the table (and never reallocates).
+    ///
+    /// ★ Maintained **only while at least one `DEBUG_OBJECT` exists** ([`record_module`] /
+    /// [`forget_module`] return immediately otherwise): with no debugger in the system nothing can
+    /// ever observe the list, so the host's — extremely load-bearing — section-mapping path stays
+    /// literally untouched. See `ntdll_plan.md` §D for what that does and does not cover.
+    modules: Vec<ProcessModule>,
+    /// Cap on [`modules`](Self::modules); a host [`reserve_modules`](Self::reserve_modules)s it up
+    /// front so recording never reallocates.
+    module_limit: usize,
 }
 
 impl ProcessManager {
@@ -453,8 +497,17 @@ impl ProcessManager {
             next_pid: 4, // pid 0=idle, 4=System by convention
             next_tid: 4,
             next_asid: 1,
+            module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
         }
+    }
+
+    /// Pre-allocate the module-tracking table for `capacity` IMAGE views and cap it there, so a
+    /// later [`report_module_load`](Self::report_module_load) never reallocates (the same
+    /// reserve-up-front discipline a bump-allocating host needs for every durable table).
+    pub fn reserve_modules(&mut self, capacity: usize) {
+        self.modules.reserve_exact(capacity.saturating_sub(self.modules.len()));
+        self.module_limit = capacity;
     }
 
     // --- image sections (spec §13) -------------------------------------------
@@ -1531,6 +1584,118 @@ impl ProcessManager {
         }
     }
 
+    // --- the modelled module list (`PEB->Ldr->InLoadOrderModuleList`) -----------------------------
+
+    /// Record `module` as an IMAGE view mapped into `pid`, replacing any earlier record for the
+    /// same base. Returns whether it is now tracked.
+    ///
+    /// ★ No-ops (returning `false`) while **no** `DEBUG_OBJECT` exists: nothing could ever observe
+    /// the list then, and the host's section-mapping path must stay untouched on a boot with no
+    /// debugger. Also no-ops once the table is full, exactly as `DbgkpPostFakeModuleMessages`
+    /// stops walking after 500 modules.
+    fn record_module(&mut self, pid: ProcessId, mut module: ProcessModule) -> bool {
+        if self.dbgk.is_empty() || pid == 0 {
+            return false;
+        }
+        module.pid = pid;
+        if let Some(slot) = self
+            .modules
+            .iter_mut()
+            .find(|m| m.pid == pid && m.base == module.base)
+        {
+            *slot = module;
+            return true;
+        }
+        if let Some(slot) = self.modules.iter_mut().find(|m| m.pid == 0) {
+            *slot = module;
+            return true;
+        }
+        if self.modules.len() >= self.module_limit {
+            return false;
+        }
+        self.modules.push(module);
+        true
+    }
+
+    /// Drop the record for the IMAGE view at `base` in `pid`. Returns whether one existed — the
+    /// modelled equivalent of `MmUnmapViewOfSection`'s "was this an image VAD?" test, which is what
+    /// decides whether `DbgkUnMapViewOfSection` runs at all.
+    fn forget_module(&mut self, pid: ProcessId, base: u64) -> bool {
+        match self
+            .modules
+            .iter_mut()
+            .find(|m| m.pid == pid && m.base == base)
+        {
+            Some(slot) => {
+                *slot = ProcessModule::default();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The IMAGE views currently mapped into `pid`, in load order, written into `out`; returns how
+    /// many were written. This is the list `DbgkpPostFakeModuleMessages` walks.
+    pub fn process_modules_into(&self, pid: ProcessId, out: &mut [ProcessModule]) -> usize {
+        let mut n = 0;
+        for module in self.modules.iter().filter(|m| m.pid == pid) {
+            if n == out.len() {
+                break;
+            }
+            out[n] = *module;
+            n += 1;
+        }
+        n
+    }
+
+    /// How many IMAGE views are tracked for `pid`.
+    pub fn module_count(&self, pid: ProcessId) -> usize {
+        self.modules.iter().filter(|m| m.pid == pid).count()
+    }
+
+    /// `DbgkMapViewOfSection` — an **IMAGE** view became mapped in `pid` (the caller enforces
+    /// image-only, exactly as `MmMapViewOfSection`'s `Section->u.Flags.Image` test does). Records it
+    /// in the process's modelled module list and, when the process is being debugged, posts
+    /// `DbgKmLoadDllApi` to its `EPROCESS.DebugPort`.
+    ///
+    /// Returns the debug object the message landed on (`None` = not debugged, so nothing was
+    /// posted — the path every map on a boot with no debugger takes).
+    pub fn report_module_load(
+        &mut self,
+        pid: ProcessId,
+        tid: ThreadId,
+        module: ProcessModule,
+    ) -> Option<DebugObjectId> {
+        self.record_module(pid, module);
+        self.report_debug_message(
+            pid,
+            tid,
+            DbgKmMessage::LoadDll {
+                file_handle: module.file_handle,
+                base_of_dll: module.base,
+                debug_info_file_offset: module.debug_info_file_offset,
+                debug_info_size: module.debug_info_size,
+                name_pointer: module.name_pointer,
+            },
+        )
+    }
+
+    /// `DbgkUnMapViewOfSection` — the view at `base` was unmapped from `pid`. Reports
+    /// `DbgKmUnloadDllApi` **only when `base` names a tracked IMAGE view**, which is the modelled
+    /// form of `MmUnmapViewOfSection`'s `if (DbgBase)` guard: a data / anonymous view was never
+    /// recorded, so unmapping one reports nothing.
+    pub fn report_module_unload(
+        &mut self,
+        pid: ProcessId,
+        tid: ThreadId,
+        base: u64,
+    ) -> Option<DebugObjectId> {
+        if !self.forget_module(pid, base) {
+            return None;
+        }
+        self.report_debug_message(pid, tid, DbgKmMessage::UnloadDll { base_address: base })
+    }
+
     /// `EPROCESS.DebugPort` for `pid`.
     pub fn process_debug_port(&self, pid: ProcessId) -> Option<DebugObjectId> {
         self.processes.get(&pid).and_then(|p| p.debug_port)
@@ -1545,10 +1710,17 @@ impl ProcessManager {
     ///
     /// Faithful to `DbgkpPostFakeProcessCreateMessages` + `DbgkpSetProcessDebugObject`: a
     /// `DbgKmCreateProcessApi` message is posted for the process's first live thread and a
-    /// `DbgKmCreateThreadApi` message for each remaining one — all `NOWAIT|INACTIVE` with the
-    /// attaching thread as their backout thread — then the debug port is installed and the first
-    /// backout event is activated (which signals the debugger). Returns the number of fake messages
-    /// posted.
+    /// `DbgKmCreateThreadApi` message for each remaining one, **then** — exactly the order
+    /// `DbgkpPostFakeProcessCreateMessages` uses (`DbgkpPostFakeThreadMessages` first, then
+    /// `DbgkpPostFakeModuleMessages(Process, FirstThread, …)`) — a `DbgKmLoadDllApi` message for
+    /// every IMAGE view already mapped in the target, attributed to that FIRST thread. All are
+    /// `NOWAIT|INACTIVE` with the attaching thread as their backout thread; then the debug port is
+    /// installed and the first backout event is activated (which signals the debugger). Returns the
+    /// number of fake messages posted.
+    ///
+    /// The process's own image (`EPROCESS.SectionBaseAddress`) is skipped: the
+    /// `DbgKmCreateProcessApi` message already carries it, which is why
+    /// `DbgkpPostFakeModuleMessages` skips `InLoadOrderModuleList`'s first entry (the executable).
     ///
     /// Errors: `STATUS_ACCESS_DENIED` for a self-attach, `STATUS_PROCESS_IS_TERMINATING` for a dying
     /// target, `STATUS_UNSUCCESSFUL` when the target has no live thread to report,
@@ -1623,6 +1795,48 @@ impl ProcessManager {
                 .unwrap_or(Err(STATUS_INVALID_HANDLE));
             if let Err(status) = queued {
                 // Back out every message this attach posted, exactly as the failure path does.
+                if let Some(o) = self.dbgk.get_mut(object) {
+                    let _ = o.flush_process(pid);
+                }
+                return Err(status);
+            }
+            posted += 1;
+        }
+
+        // `DbgkpPostFakeModuleMessages`: after the thread messages, one fake `DbgKmLoadDllApi` per
+        // module already mapped in the target, all attributed to the FIRST reported thread (NT
+        // passes `FirstThread` in). The executable's own view is skipped — the create-process
+        // message above already reported `base_of_image`.
+        let first_thread = threads[0];
+        let mut modules = [ProcessModule::default(); DEFAULT_TRACKED_MODULES];
+        let module_count = self.process_modules_into(pid, &mut modules);
+        for module in &modules[..module_count] {
+            if module.base == image_base {
+                continue;
+            }
+            let mut event = DebugEvent::new(
+                ClientId {
+                    unique_process: pid,
+                    unique_thread: first_thread,
+                },
+                DbgKmMessage::LoadDll {
+                    file_handle: module.file_handle,
+                    base_of_dll: module.base,
+                    debug_info_file_offset: module.debug_info_file_offset,
+                    debug_info_size: module.debug_info_size,
+                    // `DbgkpPostFakeModuleMessages` clears NamePointer for a fake message (the name
+                    // it does have is a kernel-side UNICODE_STRING, not a debuggee pointer).
+                    name_pointer: 0,
+                },
+                dbgk::DEBUG_EVENT_NOWAIT | dbgk::DEBUG_EVENT_INACTIVE,
+            );
+            event.backout_thread = Some(debugger.unique_thread);
+            let queued = self
+                .dbgk
+                .get_mut(object)
+                .map(|o| o.queue(event))
+                .unwrap_or(Err(STATUS_INVALID_HANDLE));
+            if let Err(status) = queued {
                 if let Some(o) = self.dbgk.get_mut(object) {
                     let _ = o.flush_process(pid);
                 }
@@ -1730,13 +1944,43 @@ impl ProcessManager {
         } else {
             0
         };
+        // `DbgkpOpenHandles`'s tail: the two states that carry an image FILE handle
+        // (`DbgCreateProcessStateChange` and `DbgLoadDllStateChange`) have it `ObDuplicateObject`ed
+        // — `DUPLICATE_SAME_ACCESS` — from the reporting process into the DEBUGGER's table, and
+        // left NULL if that fails. The queued message holds the DEBUGGEE's own handle, which is
+        // meaningless in the debugger's namespace until it is duplicated.
+        let queued_file_handle = match event.message {
+            DbgKmMessage::LoadDll { file_handle, .. }
+            | DbgKmMessage::CreateProcess { file_handle, .. } => file_handle,
+            _ => 0,
+        };
+        let handle_to_file = if queued_file_handle != 0 {
+            self.duplicate_handle(
+                event.client_id.unique_process,
+                queued_file_handle as Handle,
+                debugger_pid,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        // Report the DUPLICATED handle, not the debuggee's.
+        let mut reported = event;
+        match &mut reported.message {
+            DbgKmMessage::LoadDll { file_handle, .. }
+            | DbgKmMessage::CreateProcess { file_handle, .. } => {
+                *file_handle = handle_to_file as u64
+            }
+            _ => {}
+        }
         Ok(Some(DebugWaitResult {
             state,
             client_id: event.client_id,
             handle_to_process,
             handle_to_thread,
+            handle_to_file,
             state_change: dbgk::encode_wait_state_change(
-                &event,
+                &reported,
                 handle_to_process as u64,
                 handle_to_thread as u64,
             ),
