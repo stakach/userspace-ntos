@@ -678,11 +678,14 @@ pub(crate) unsafe fn service_sec_image(
     // faithful `EXCEPTION_RECORD` (code / flags / address / parameters + FirstChance) is queued on
     // its `DEBUG_OBJECT` and any thread parked in `NtWaitForDebugEvent` is woken.
     //
-    // HONEST SCOPE — this is POST-AND-CONTINUE. NT blocks the reporting thread inside
-    // `DbgkpQueueMessage` until `NtDebugContinue`; we do not (the faulting thread's reply cap is not
-    // stolen), so the site's own handling still runs afterwards — the `DBG_EXCEPTION_NOT_HANDLED`
-    // outcome — and `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are recorded, NOT enforced. See
-    // `ntdll_plan.md` §D.
+    // ★ TARGET-SIDE BLOCKING (`DbgkpQueueMessage`'s wait on `DebugEvent->ContinueEvent`). After a
+    // successful forward the FAULTING THREAD IS PARKED on the event — its reply capability is stolen
+    // into the `DEBUG_EVENT` — and the site must recv the next event WITHOUT replying
+    // (`dbgk_block_and_park!` below does exactly that). `NtDebugContinue` then applies the continue
+    // status: `DBG_CONTINUE` resumes it with the FAULT-flavoured reply (a `#PF` retries the faulting
+    // instruction, an int3 resumes past it), `DBG_EXCEPTION_NOT_HANDLED` leaves the site's own
+    // handling standing, and `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are ENFORCED.
+    // See `ntdll_plan.md` §D.
     macro_rules! dbgk_forward_exception {
         ($pi:expr, $record:expr) => {{
             let __record: nt_process::dbgk::ExceptionRecord = $record;
@@ -698,6 +701,46 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
             __forwarded
+        }};
+    }
+    // dbgk_block_and_park!(pi, kind, ip, sp, flags): BLOCK the faulting thread on the debug event it
+    // just reported, then recv the next event WITHOUT replying (the thread stays blocked in-kernel,
+    // exactly like `park_and_log!`'s park, but WAKEABLE — the debugger's continue resumes it).
+    //
+    // ★ SAFETY. Reached only when `dbgk_forward_exception!` returned true, i.e. the process really
+    // has an `EPROCESS.DebugPort` — never on the live boot. If the park cannot be taken (no reply
+    // object, pool exhausted) it yields `false` and the site's ordinary handling runs unchanged.
+    // A blocked reporter counts toward the all-parked QUIESCE (it is a cooperative wait), so a
+    // debugger that never continues still lets the boot reach the gate.
+    macro_rules! dbgk_block_and_park {
+        ($pi:expr, $kind:expr, $ip:expr, $sp:expr, $flags:expr) => {{
+            let __blocked = nt_handler.dbgk_block_reporter(
+                $pi, 0, badge, $kind, 0, $ip, $sp, $flags, 0,
+            );
+            if __blocked {
+                print_str(b"[dbgk] reporter BLOCKED on continue (fault kind=");
+                print_u64($kind as u64);
+                print_str(b") pi=");
+                print_u64($pi as u64);
+                print_str(b" ip=0x");
+                print_hex((($ip as u64) >> 32) as u32);
+                print_hex($ip as u32);
+                print_str(b"\n");
+                procs[$pi].faults = faults;
+                procs[$pi].first = first;
+                procs[$pi].ntfaults = ntfaults;
+                pfilled[$pi] = *filled_pages;
+                mark_wait_parked!($pi, $ip);
+                let (nb, nmi, nm0, nm1, nm2, nm3) =
+                    recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+            }
+            __blocked
         }};
     }
     // mark_wait_parked!(pi): record that this top-level process is now cooperatively wait-parked, and
@@ -1107,13 +1150,23 @@ pub(crate) unsafe fn service_sec_image(
             // DbgkForwardException: a debugged process's debugger sees the trap first (m3 is the
             // delivered exception NUMBER — the x86 vector — which maps to the NTSTATUS
             // `KiDispatchException` would report). No-op when nothing debugs this process.
-            let _ = dbgk_forward_exception!(
+            if dbgk_forward_exception!(
                 pi,
                 nt_process::dbgk::ExceptionRecord::new(
                     nt_process::dbgk::exception_code_for_trap(m3 as u32),
                     fip,
                 )
-            );
+            ) && dbgk_block_and_park!(
+                pi,
+                nt_process::dbgk::DBGK_BLOCK_USER_EXCEPTION,
+                fip,
+                m1,
+                m2
+            ) {
+                // The faulting thread is BLOCKED on the debugger's continue; its reply capability is
+                // held by the DEBUG_EVENT. The next event has already been received.
+                continue;
+            }
             // Unhandled CPU exception (label 3) at a non-skippable site — a real crash. Park+log.
             park_and_log!(pi, b"cpu-exception(3)", fip, fip);
         }
@@ -1257,10 +1310,18 @@ pub(crate) unsafe fn service_sec_image(
             // DbgkForwardException: an int3 is THE event a debugger exists for — it reports as
             // `DbgBreakpointStateChange` (`DbgUiRemoteBreakin`'s break-in lands here). No-op when
             // nothing debugs this process.
-            let _ = dbgk_forward_exception!(
+            if dbgk_forward_exception!(
                 pi,
                 nt_process::dbgk::ExceptionRecord::new(nt_process::dbgk::STATUS_BREAKPOINT, bp_ip)
-            );
+            ) && dbgk_block_and_park!(
+                pi,
+                nt_process::dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                bp_ip,
+                m2,
+                m3
+            ) {
+                continue;
+            }
             // Unhandled int3/#BP (a RtlRaiseException the loader/process can't recover) — a crash. Park+log.
             park_and_log!(pi, b"debug-exception(4)", bp_ip, bp_ip);
         }
@@ -1612,7 +1673,7 @@ pub(crate) unsafe fn service_sec_image(
                 // error code in m3: bit 1 = write, bit 4 = instruction fetch) and the faulting
                 // address. Forwarded BEFORE either terminal branch below so a debugger sees the
                 // crash whichever one this process takes. No-op when nothing debugs it.
-                let _ = dbgk_forward_exception!(
+                if dbgk_forward_exception!(
                     pi,
                     nt_process::dbgk::ExceptionRecord::access_violation(
                         m0,
@@ -1625,7 +1686,12 @@ pub(crate) unsafe fn service_sec_image(
                         },
                         addr,
                     )
-                );
+                ) && dbgk_block_and_park!(pi, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, m0, 0, 0)
+                {
+                    // BLOCKED on the debugger's continue; the next event is already received. A
+                    // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
+                    continue;
+                }
                 if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
                     crash_parked |= 1u64 << owner_top_badge(badge);
                     let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
@@ -1864,7 +1930,7 @@ pub(crate) unsafe fn service_sec_image(
                 // any other process's fault.
                 // DbgkForwardException (same shape as the null-deref site above): report the
                 // unmapped-address access violation to a debugger BEFORE either terminal branch.
-                let _ = dbgk_forward_exception!(
+                if dbgk_forward_exception!(
                     pi,
                     nt_process::dbgk::ExceptionRecord::access_violation(
                         m0,
@@ -1877,7 +1943,12 @@ pub(crate) unsafe fn service_sec_image(
                         },
                         addr,
                     )
-                );
+                ) && dbgk_block_and_park!(pi, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, m0, 0, 0)
+                {
+                    // BLOCKED on the debugger's continue; the next event is already received. A
+                    // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
+                    continue;
+                }
                 if badge == LSASS_BADGE
                     && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                 {
@@ -2355,6 +2426,11 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
             let mut park_pipe_is_write = false;
+            // ★ Dbgk TARGET-SIDE BLOCK request (syscall flavour) latched out of the handler:
+            // a debug event was posted from THIS syscall arm and NT blocks the reporting thread on
+            // the debugger's continue. Consumed at the reply site (the reply-cap steal needs
+            // resume_ip/sp/flags, known only there). Always false with no debugger attached.
+            let mut park_dbgk_reporter = false;
             // Every syscall path, including the still hand-wired ladder below, resolves process-local
             // handles through ExecNtHandler. Refresh caller identity before choosing table vs ladder;
             // doing this only inside table dispatch left a runtime worker using whichever process ran
@@ -2443,6 +2519,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_event_obj_idx = u64::MAX;
                 nt_handler.pipe_park_transceive = false;
                 nt_handler.pipe_park_is_write = false;
+                nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_write_redrive = false;
                 nt_handler.pipe_listen_fid = 0;
                 nt_handler.pipe_listen_event_handle = 0;
@@ -2791,6 +2868,9 @@ pub(crate) unsafe fn service_sec_image(
                 // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
                 // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
                 // write (done HERE, before the writer's own reply — npfs already queued the bytes).
+                if nt_handler.dbgk_block_request {
+                    park_dbgk_reporter = true;
+                }
                 if nt_handler.pipe_park_fid != 0 {
                     park_pipe_fid = nt_handler.pipe_park_fid;
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
@@ -5279,6 +5359,46 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
+            // ★ Dbgk TARGET-SIDE BLOCK, SYSCALL flavour (`DbgkpQueueMessage`'s wait on
+            // `DebugEvent->ContinueEvent`). This syscall posted a debug event for a process whose
+            // debugger is attached, and NT blocks the REPORTING thread until `NtDebugContinue`.
+            // Park it with the SYSCALL reply shape (status in MR0 + resume context in MR15/16/17 —
+            // the shape `dbgk_reporter_resume` replays) and recv the next event WITHOUT replying.
+            // The block rides on the `DEBUG_EVENT`; a debug-object teardown / the post-loop drain
+            // releases it, so it can never wedge the boot. `park_dbgk_reporter` is false on every
+            // boot today (nothing attaches a debugger), so this whole block is skipped.
+            if park_dbgk_reporter && reply_main != 0 {
+                if nt_handler.dbgk_block_reporter(
+                    pi,
+                    nt_handler.current_tid,
+                    badge,
+                    nt_process::dbgk::DBGK_BLOCK_SYSCALL,
+                    0,
+                    resume_ip,
+                    sp,
+                    flags,
+                    result,
+                ) {
+                    print_str(b"[dbgk] reporter BLOCKED on continue (syscall) pi=");
+                    print_u64(pi as u64);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b"\n");
+                    // A blocked reporter is a COOPERATIVE wait (the debugger's continue wakes it),
+                    // so it counts toward the all-parked quiesce exactly like every other wait —
+                    // the boot still reaches the gate if the debugger never continues.
+                    if pi_is_top_level(badge) {
+                        mark_wait_parked!(pi, resume_ip);
+                    }
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+                // Could not park (no reply object / pool exhausted / nothing eligible took the
+                // block) — fall through to the ordinary reply: post-and-continue, never a hang.
+                print_str(b"[dbgk] reporter block unavailable -> post-and-continue\n");
+            }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 recv_full_r12(fault_ep, reply_main)
             } else if redirected_user_callback && reply_main != 0 {
@@ -5306,6 +5426,18 @@ pub(crate) unsafe fn service_sec_image(
         }
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
+    }
+    // ★ THE ESCAPE HATCH (unconditional, bounded). The service loop is done: release every reporter
+    // still blocked on a debug event, so a debugger that attached, took an event and never continued
+    // (or died holding one) can NEVER leave a target parked with its reply capability stranded. With
+    // no debug object alive — every boot today — this returns on its first line and costs nothing.
+    {
+        let released = nt_handler.dbgk_release_all_blocked_reporters();
+        if released != 0 {
+            print_str(b"[dbgk] post-loop drain released ");
+            print_u64(released as u64);
+            print_str(b" blocked reporter(s)\n");
+        }
     }
     // === DEAD-CLIENT CALLBACK-UNWIND FAULT INJECTION (POST-QUIESCE). The boot's whole load-bearing
     // flow is finished here — winlogon's SAS → msgina dialog → the authentic desktop/dialog paints
@@ -7073,6 +7205,699 @@ pub(crate) unsafe fn service_sec_image(
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
         delay_timer_shutdown(&delay_queue);
 
+        // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
+        //
+        // NT blocks the REPORTING thread inside `DbgkpQueueMessage` until `NtDebugContinue` runs
+        // `DbgkpWakeTarget`, then applies the continue status to it. Proving that needs something no
+        // model call can give: a LIVE thread genuinely blocked in-kernel on the Call that delivered
+        // its fault, whose reply capability the executive holds. So this test stands up a REAL
+        // throwaway CLIENT THREAD (`selftests::dbgk_client_spawn` — a fresh VSpace + code page +
+        // hosted-syscalls TCB + SC, the same machinery as the ALPC cross-VSpace proof) that takes ONE
+        // FAULT OF EACH FLAVOUR in order, writing a progress MARKER between them. The executive reads
+        // that marker through its own window on the client's shared frame, so "the reporter blocked"
+        // and "the continue resumed it" are OBSERVED, not inferred.
+        //
+        // The DEBUGGER side runs through the REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)`
+        // with the arguments marshalled in smss's CLIENT memory, the established idiom); the TARGET
+        // side runs through `dbgk_forward_exception` / `dbgk_module_load` / `dbgk_block_reporter` —
+        // the very entries the live fault loop and the live `NtMapViewOfSection` arm call.
+        // Throwaway-only: a free `PM_PIDS` slot, fresh caps, all reclaimed afterwards.
+        {
+            use nt_process::dbgk;
+            const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+            const A_HANDLE: u64 = STACK_BASE + 0x180;
+            const A_CLIENT_ID: u64 = STACK_BASE + 0x188;
+            const A_TIMEOUT: u64 = STACK_BASE + 0x198;
+            const A_STATE: u64 = STACK_BASE + 0x1A0;
+            const BLK_TEST_PI: usize = MAX_PI - 1;
+            // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
+            // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
+            let write_scratch_t = SMSS_SCRATCH_BASE + 3010 * 0x1000;
+            let write_scratch_d = SMSS_SCRATCH_BASE + 3011 * 0x1000;
+            let marker_win_t = SMSS_SCRATCH_BASE + 3012 * 0x1000;
+            let marker_win_d = SMSS_SCRATCH_BASE + 3013 * 0x1000;
+
+            let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+            let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+            let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+            let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_pi = nt_handler.pi;
+            let saved_tid = nt_handler.current_tid;
+            let saved_ctx = nt_handler.loop_ctx.take();
+            ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            nt_handler.pi = 0;
+
+            let mut bk_ok = 0u64;
+            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            macro_rules! sysc {
+                ($ssn:expr, $args:expr) => {
+                    nt_dispatcher
+                        .dispatch($ssn as u32, $args, &dbg_origin, &mut nt_handler)
+                        .status
+                };
+            }
+            let mut sc = [0u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE];
+            macro_rules! sc_u32 {
+                ($o:expr) => {
+                    u32::from_le_bytes(sc[$o..$o + 4].try_into().unwrap())
+                };
+            }
+
+            let debugger_pid = nt_handler.pm_pid_for_pi(0).unwrap_or(0);
+            let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
+            nt_handler.current_tid = debugger_tid as u64;
+            let client_args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
+
+            // Throwaway caps: the client's shared marker frame, the `#PF` fixup frame, the reply
+            // objects each fault is received on, and a spare reply object for the escape-hatch probe.
+            let mut slots = [0u64; 96];
+            let mut nslots = 0usize;
+            let mut make = |kind: u64, bits: u32| -> u64 {
+                let s = alloc_slot();
+                slots[nslots] = s;
+                nslots += 1;
+                let made = untyped_retype_r(CAP_INIT_UNTYPED, kind, bits, 1, s);
+                if made != 0 {
+                    print_str(b"[dbgk-blk] retype FAILED kind=");
+                    print_u64(kind);
+                    print_str(b" status=");
+                    print_u64(made);
+                    print_str(b"\n");
+                }
+                s
+            };
+            let shared_t = make(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let shared_d = make(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let fixup_frame = make(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let reply_a = make(OBJ_REPLY, 0);
+            let reply_b = make(OBJ_REPLY, 0);
+            let reply_c = make(OBJ_REPLY, 0);
+            let reply_d = make(OBJ_REPLY, 0);
+            let reply_spare = make(OBJ_REPLY, 0);
+            // NOTE the ORDER below: each marker frame is mapped into its CLIENT'S VSpace FIRST (by
+            // `dbgk_client_spawn`) and only then windowed into the executive through a `copy_cap`.
+            // A frame capability carries its own mapping, and mapping a COPY first leaves the
+            // ORIGINAL's map attempt failing with `seL4_DeleteFirst` — which is exactly how the
+            // ALPC cross-VSpace self-test orders its shared frames too.
+            if debugger_pid != 0 && client_args_ready {
+                // --- a real DEBUG_OBJECT, by SSN ---------------------------------------------
+                let created = sysc!(
+                    SSN_NT_CREATE_DEBUG_OBJECT,
+                    &[
+                        A_HANDLE,
+                        dbgk::DEBUG_OBJECT_ALL_ACCESS as u64,
+                        0,
+                        dbgk::DBGK_KILL_PROCESS_ON_EXIT as u64,
+                    ]
+                );
+                let dbg_handle = smss_stack_read(A_HANDLE);
+                let object = match nt_handler
+                    .pm
+                    .lookup_handle(debugger_pid, dbg_handle as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::DebugObject(object)) => Some(object),
+                    _ => None,
+                };
+                if let (0, Some(object)) = (created, object) {
+                    // The debuggee EPROCESS standing for the throwaway CLIENT THREAD, in a FREE
+                    // PM_PIDS slot so the pi → pid → DebugPort resolution is the real one. A second
+                    // thread keeps the process alive when the first is terminated by DBG_TERMINATE.
+                    let target = nt_handler.pm.create_process("dbgk-block.exe", None, None);
+                    nt_handler.pm.set_image_base(target, 0x0000_0001_9000_0000);
+                    let main = nt_handler.pm.create_thread(target, 0x5100, 0, false).ok();
+                    let _keepalive = nt_handler.pm.create_thread(target, 0x5200, 0, false).ok();
+                    PM_PIDS[BLK_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let main_tid = main.unwrap_or(0);
+                    let h_target = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(target),
+                            PROCESS_SUSPEND_RESUME,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let mut client_id = [0u8; 16];
+                    client_id[0..8].copy_from_slice(&(target as u64).to_le_bytes());
+                    client_id[8..16].copy_from_slice(&(main_tid as u64).to_le_bytes());
+                    let cid_written = img_spawn::smss_copyout(A_CLIENT_ID, &client_id);
+
+                    // --- THE LIVE CLIENT THREAD ---------------------------------------------
+                    let code = selftests::dbgk_target_client_code();
+                    let (client_pml4, client_tcb, client_ep) = selftests::dbgk_client_spawn(
+                        &code,
+                        shared_t,
+                        write_scratch_t,
+                        0,
+                        &mut slots,
+                        &mut nslots,
+                    );
+                    // 0x0001 — setup: attach BY SSN + drain the fake create message BY SSN. The
+                    // FIRST recv also proves the client thread really ran (marker 1) and really
+                    // faulted (its `#PF` on the deliberately-unmapped page).
+                    let attach_ok = h_target != 0
+                        && cid_written
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
+                        && nt_handler.pm.process_debug_port(target) == Some(object);
+                    // `DbgkpPostFakeProcessCreateMessages` posts one message per live thread — a
+                    // `DbgKmCreateProcessApi` for the first and a `DbgKmCreateThreadApi` for the
+                    // keep-alive one — so drain BOTH (each continued with ITS OWN CLIENT_ID) and
+                    // leave the queue genuinely empty before the client's first fault is reported.
+                    let mut drained = 0u64;
+                    let mut first_state = 0u32;
+                    while attach_ok && drained < 8 {
+                        if sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        ) != 0
+                            || !img_spawn::smss_copyin(A_STATE, &mut sc)
+                        {
+                            break;
+                        }
+                        if drained == 0 {
+                            first_state = sc_u32!(0x00);
+                        }
+                        let mut cid = [0u8; 16];
+                        cid[0..8].copy_from_slice(&sc[0x08..0x10]);
+                        cid[8..16].copy_from_slice(&sc[0x10..0x18]);
+                        if !img_spawn::smss_copyout(A_CLIENT_ID, &cid)
+                            || sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            ) != 0
+                        {
+                            break;
+                        }
+                        drained += 1;
+                    }
+                    // Restore the reporting thread's CLIENT_ID for the blocking continues below.
+                    let cid_restored = img_spawn::smss_copyout(A_CLIENT_ID, &client_id);
+                    let attached = attach_ok
+                        && cid_restored
+                        && drained == 2
+                        && first_state == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty());
+                    // ═══ FAULT 1 — VMFault (`#PF`), the flavour every page fault takes ═══════
+                    // The executive's own window on the client's marker page (a copy_cap of the
+                    // SAME physical frame the client writes — mapped only now that the client's own
+                    // mapping is in place).
+                    let win_t = {
+                        let s = copy_cap(shared_t);
+                        slots[nslots] = s;
+                        nslots += 1;
+                        s
+                    };
+                    let win_t_ok =
+                        page_map_r(win_t, marker_win_t, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+                    let marker_t = || {
+                        if win_t_ok {
+                            core::ptr::read_volatile(marker_win_t as *const u64)
+                        } else {
+                            u64::MAX
+                        }
+                    };
+                    // ★ Every stage below is GUARDED. A blocking `recv` on the client's endpoint is
+                    // only ever issued once the previous continue is KNOWN to have resumed it, and
+                    // any failure breaks out with the bits collected so far — a self-test that could
+                    // block forever would be a boot wedge, which is exactly what this batch must not
+                    // introduce. `loop { … break }` gives the early exits.
+                    loop {
+                        // ═══ FAULT 1 — VMFault (`#PF`), the flavour every page fault takes ═══
+                        let (_fb, f1_mi, f1_m0, f1_m1, _f1m2, _f1m3) =
+                            recv_full_r12(client_ep, reply_a);
+                        dbgk_blk_trace(b"f1", f1_mi, f1_m0, f1_m1, marker_t());
+                        if attached
+                            && client_pml4 != 0
+                            && (f1_mi >> 12) == 6
+                            && f1_m1 == selftests::DBGK_CLIENT_FIXUP
+                            && marker_t() == 1
+                        {
+                            bk_ok |= 0x0001;
+                        }
+                        // 0x0002 — ★ THE BLOCK. Forward the fault through the entry the live loop
+                        // uses, then PARK the reporting thread on the event it just queued.
+                        // Observable: the block rides on the DEBUG_EVENT, the counter moves, and the
+                        // client has NOT progressed (marker still 1) while the debugger holds it.
+                        let blocked_before = DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed);
+                        let forwarded = nt_handler.dbgk_forward_exception(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            dbgk::ExceptionRecord::access_violation(f1_m0, 1, f1_m1),
+                            true,
+                        );
+                        let parked = nt_handler.dbgk_block_reporter(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            0,
+                            dbgk::DBGK_BLOCK_VM_FAULT,
+                            reply_a,
+                            f1_m0,
+                            0,
+                            0,
+                            0,
+                        );
+                        dbgk_blk_trace(
+                            b"blk1",
+                            0,
+                            forwarded as u64,
+                            parked as u64,
+                            nt_handler.pm.blocked_reporter_count(object) as u64,
+                        );
+                        if forwarded
+                            && parked
+                            && DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed) == blocked_before + 1
+                            && nt_handler.pm.blocked_reporter_count(object) == 1
+                            && marker_t() == 1
+                        {
+                            bk_ok |= 0x0002;
+                        }
+                        if !parked {
+                            break; // nothing holds the client's reply cap — never recv again
+                        }
+                        // 0x0004 — ★ THE CONTINUE RESUMES IT. The debugger retrieves the exception,
+                        // maps the page the client faulted on (a real debugger's fixup), and
+                        // continues: `DbgkpWakeTarget` replies with the VMFault shape (length 0, no
+                        // register transfer) so the faulting instruction is RETRIED — and now
+                        // succeeds. Proof it resumed AND continued: its NEXT fault arrives with
+                        // marker 2, i.e. the instruction after the `#PF` really executed.
+                        let mapped = page_map_r(
+                            fixup_frame,
+                            selftests::DBGK_CLIENT_FIXUP,
+                            RW_NX,
+                            client_pml4,
+                        ) == 0;
+                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let wait1 = sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        );
+                        let read1 = wait1 == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == dbgk::DBG_EXCEPTION_STATE_CHANGE;
+                        let cont1 = if read1 {
+                            sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let woke1 =
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before + 1;
+                        dbgk_blk_trace(b"c1", 0, wait1 as u64, cont1 as u64, woke1 as u64);
+                        if !woke1 {
+                            // The reporter was never resumed — release it so nothing is stranded,
+                            // and do NOT recv (the client can no longer produce an event).
+                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            break;
+                        }
+                        // ═══ FAULT 2 — DebugException (int3) ══════════════════════════════
+                        let (_fb, f2_mi, f2_m0, _f2m1, _f2m2, _f2m3) =
+                            recv_full_r12(client_ep, reply_b);
+                        dbgk_blk_trace(b"f2", f2_mi, f2_m0, 0, marker_t());
+                        if mapped
+                            && read1
+                            && cont1 == 0
+                            && nt_handler.pm.blocked_reporter_count(object) == 0
+                            && (f2_mi >> 12) == 4
+                            && marker_t() == 2
+                        {
+                            bk_ok |= 0x0004;
+                        }
+                        // 0x0008 — the DebugException flavour: forward the int3, BLOCK its reporter,
+                        // prove no progress, continue — the client resumes PAST the int3 and its
+                        // next fault carries marker 3.
+                        let forwarded2 = nt_handler.dbgk_forward_exception(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f2_m0),
+                            true,
+                        );
+                        let blocked2 = nt_handler.dbgk_block_reporter(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            0,
+                            dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                            reply_b,
+                            f2_m0,
+                            0,
+                            0,
+                            0,
+                        );
+                        let no_progress2 = forwarded2
+                            && blocked2
+                            && nt_handler.pm.blocked_reporter_count(object) == 1
+                            && marker_t() == 2;
+                        if !blocked2 {
+                            break;
+                        }
+                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let wait2 = sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        );
+                        let read2 = wait2 == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE;
+                        let cont2 = if read2 {
+                            sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let woke2 =
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before + 1;
+                        dbgk_blk_trace(b"c2", no_progress2 as u64, wait2 as u64, cont2 as u64, woke2 as u64);
+                        if !woke2 {
+                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            break;
+                        }
+                        // ═══ FAULT 3 — UnknownSyscall: the SYSCALL flavour ═══════════════
+                        let (_fb, f3_mi, f3_m0, _f3m1, f3_m2, _f3m3) =
+                            recv_full_r12(client_ep, reply_c);
+                        // The service loop's own derivation: for an UnknownSyscall the resume IP is
+                        // RCX (MR2) — the address `syscall` pushed — NOT the message's FaultIP slot.
+                        let f3_ip = f3_m2;
+                        let f3_sp = get_recv_mr(16);
+                        let f3_flags = get_recv_mr(17);
+                        dbgk_blk_trace(b"f3", f3_mi, f3_m0, 0, marker_t());
+                        if no_progress2
+                            && cont2 == 0
+                            && (f3_mi >> 12) == 2
+                            && f3_m0 == 0xDB
+                            && marker_t() == 3
+                        {
+                            bk_ok |= 0x0008;
+                        }
+                        // 0x0010 — the SYSCALL flavour. A real `DbgkMapViewOfSection` load-dll event
+                        // posted from a SYSCALL blocks its reporter (NT queues it with flags 0), and
+                        // DBG_CONTINUE resumes it with the SYSCALL reply shape — status in MR0,
+                        // resume context in MR15/16/17 — so the syscall returns and the client runs
+                        // on.
+                        nt_handler.current_tid = main_tid as u64;
+                        let module_posted = nt_handler.dbgk_module_load(
+                            BLK_TEST_PI,
+                            0x0000_0001_9100_0000,
+                            0,
+                            (0, 0),
+                            0,
+                        );
+                        nt_handler.current_tid = debugger_tid as u64;
+                        nt_handler.dbgk_block_request = false;
+                        let blocked3 = nt_handler.dbgk_block_reporter(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            0,
+                            dbgk::DBGK_BLOCK_SYSCALL,
+                            reply_c,
+                            f3_ip,
+                            f3_sp,
+                            f3_flags,
+                            0,
+                        );
+                        let no_progress3 = module_posted && blocked3 && marker_t() == 3;
+                        if !blocked3 {
+                            break;
+                        }
+                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let wait3 = sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        );
+                        let read3 = wait3 == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == dbgk::DBG_LOAD_DLL_STATE_CHANGE;
+                        let cont3 = if read3 {
+                            sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let woke3 =
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before + 1;
+                        dbgk_blk_trace(b"c3", no_progress3 as u64, wait3 as u64, cont3 as u64, woke3 as u64);
+                        if !woke3 {
+                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            break;
+                        }
+                        // ═══ FAULT 4 — UserException (`ud2`) ════════════════════════════
+                        let (_fb, f4_mi, f4_m0, f4_m1, f4_m2, _f4m3) =
+                            recv_full_r12(client_ep, reply_d);
+                        dbgk_blk_trace(b"f4", f4_mi, f4_m0, 0, marker_t());
+                        if no_progress3 && cont3 == 0 && (f4_mi >> 12) == 3 && marker_t() == 4 {
+                            bk_ok |= 0x0010;
+                        }
+                        // 0x0020 — ★ DBG_TERMINATE_THREAD **ENFORCED**. Block the `ud2` reporter,
+                        // then continue with DBG_TERMINATE_THREAD: the reporting ETHREAD is really
+                        // terminated and it is NEVER resumed — the marker stays 4, i.e. the
+                        // instruction after the `ud2` never executed. (Before this batch the status
+                        // was recorded, not enforced.)
+                        let forwarded4 = nt_handler.dbgk_forward_exception(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            dbgk::ExceptionRecord::new(0xC000_001D, f4_m0),
+                            true,
+                        );
+                        let blocked4 = nt_handler.dbgk_block_reporter(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            0,
+                            dbgk::DBGK_BLOCK_USER_EXCEPTION,
+                            reply_d,
+                            f4_m0,
+                            f4_m1,
+                            f4_m2,
+                            0,
+                        );
+                        let terms_before = DBGK_TERMINATES_ENFORCED.load(Ordering::Relaxed);
+                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let wait4 = sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        );
+                        let terminated = forwarded4
+                            && blocked4
+                            && wait4 == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == dbgk::DBG_EXCEPTION_STATE_CHANGE
+                            && sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_TERMINATE_THREAD as u64]
+                            ) == 0;
+                        dbgk_blk_trace(
+                            b"term",
+                            terminated as u64,
+                            DBGK_TERMINATES_ENFORCED.load(Ordering::Relaxed),
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed),
+                            marker_t(),
+                        );
+                        if terminated
+                            && DBGK_TERMINATES_ENFORCED.load(Ordering::Relaxed) == terms_before + 1
+                            && DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before
+                            && nt_handler
+                                .pm
+                                .thread(main_tid)
+                                .is_some_and(|t| t.state == nt_process::ThreadState::Terminated)
+                            && marker_t() == 4
+                        {
+                            bk_ok |= 0x0020;
+                        }
+                        break;
+                    }
+
+                    // ═══ 0x0080 — ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT ═══════
+                    // A second real client thread issues a syscall the test services as
+                    // `NtWaitForDebugEvent` with an EMPTY queue. Its fault is received on the
+                    // executive's REAL fault endpoint bound to REPLY_MAIN, so the PRODUCTION
+                    // `wait_park` steals its reply capability exactly as the service loop does. The
+                    // client cannot progress until a queue-side post runs `wait_wake_dispatcher_set`.
+                    let dcode = selftests::dbgk_debugger_client_code();
+                    let (dbg_pml4, dbg_tcb, _dbg_ep) = selftests::dbgk_client_spawn(
+                        &dcode,
+                        shared_d,
+                        write_scratch_d,
+                        fault_ep,
+                        &mut slots,
+                        &mut nslots,
+                    );
+                    let win_d = {
+                        let s = copy_cap(shared_d);
+                        slots[nslots] = s;
+                        nslots += 1;
+                        s
+                    };
+                    let win_d_ok =
+                        page_map_r(win_d, marker_win_d, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+                    let marker_d = || {
+                        if win_d_ok {
+                            core::ptr::read_volatile(marker_win_d as *const u64)
+                        } else {
+                            u64::MAX
+                        }
+                    };
+                    // Drain anything still queued so the wait genuinely finds nothing to report.
+                    let mut drain_guard = 0;
+                    while drain_guard < 16 {
+                        drain_guard += 1;
+                        if sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        ) != 0
+                        {
+                            break;
+                        }
+                        if !img_spawn::smss_copyin(A_STATE, &mut sc) {
+                            break;
+                        }
+                        let mut cid = [0u8; 16];
+                        cid[0..8].copy_from_slice(&sc[0x08..0x10]);
+                        cid[8..16].copy_from_slice(&sc[0x10..0x18]);
+                        if !img_spawn::smss_copyout(A_CLIENT_ID, &cid)
+                            || sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            ) != 0
+                        {
+                            break;
+                        }
+                    }
+                    let (_wb, w_mi, w_m0, _w1, w_m2, _w3) =
+                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    let w_ip = w_m2; // RCX = the syscall return address (the loop's `resume_ip`)
+                    let w_sp = get_recv_mr(16);
+                    let w_flags = get_recv_mr(17);
+                    dbgk_blk_trace(b"dw1", w_mi, w_m0, 0, marker_d());
+                    // The handler's own park REQUEST (NULL *Timeout, empty queue) — the exact arm a
+                    // hosted debugger would take.
+                    nt_handler.wait_park_event = -1;
+                    let wait_status = sysc!(
+                        SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                        &[dbg_handle, 0, 0, A_STATE]
+                    );
+                    let park_index = nt_handler.wait_park_event;
+                    let live_parked = dbg_pml4 != 0
+                        && (w_mi >> 12) == 2
+                        && w_m0 == 0xD1
+                        && wait_status == 0x102
+                        && park_index >= 0
+                        && wait_park(
+                            park_index as usize,
+                            w_ip,
+                            w_sp,
+                            w_flags,
+                            0xD1D1_0001,
+                            None,
+                        )
+                        && marker_d() == 0;
+                    // A queue-side post through the very entry the fault path uses SETS the
+                    // object's EventsPresent dispatcher event and wakes the parked client.
+                    let _ = nt_handler.dbgk_forward_exception(
+                        BLK_TEST_PI,
+                        main_tid as u64,
+                        dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x9999),
+                        true,
+                    );
+                    // GUARD: only recv again when the client was really parked (else nothing
+                    // could ever resume it and the recv would block forever).
+                    if live_parked {
+                        let (_wb2, w2_mi, w2_m0, _x1, _x2, _x3) =
+                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        dbgk_blk_trace(b"dw2", w2_mi, w2_m0, 0, marker_d());
+                        if (w2_mi >> 12) == 2 && w2_m0 == 0xD2 && marker_d() == 1 {
+                            bk_ok |= 0x0080;
+                        }
+                    }
+
+                    // 0x0040 — ★ THE ESCAPE HATCH. Leave a reporter blocked and destroy the debug
+                    // object (`NtClose` → `DbgkpCloseObject`, i.e. the debugger died holding the
+                    // event): every blocked target is RELEASED, so nothing can stay parked forever.
+                    let released_before = DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed);
+                    let stranded = nt_handler.dbgk_block_reporter(
+                        BLK_TEST_PI,
+                        main_tid as u64,
+                        0,
+                        dbgk::DBGK_BLOCK_VM_FAULT,
+                        reply_spare,
+                        0x1000,
+                        0,
+                        0,
+                        0,
+                    );
+                    if stranded
+                        && nt_handler.pm.blocked_reporter_count(object) == 1
+                        && sysc!(SSN_NT_CLOSE, &[dbg_handle]) == 0
+                        && DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed) == released_before + 1
+                        && nt_handler.pm.debug_object(object).is_none()
+                        && !nt_handler.pm.is_process_being_debugged(target)
+                    {
+                        bk_ok |= 0x0040;
+                    }
+
+                    // Reclaim: suspend both throwaway client threads, then delete every cap this
+                    // test made (child-first), leaving the TCBs + PML4s last. The executive's own
+                    // `fault_ep` is NOT in `slots` (it was passed in, not minted).
+                    let _ = tcb_suspend_r(client_tcb);
+                    let _ = tcb_suspend_r(dbg_tcb);
+                    for index in (0..nslots).rev() {
+                        let s = slots[index];
+                        if s == 0 || s == client_tcb || s == dbg_tcb || s == client_pml4 || s == dbg_pml4
+                        {
+                            continue;
+                        }
+                        let _ = cnode_delete_r(s);
+                    }
+                    let _ = cnode_delete_r(client_tcb);
+                    let _ = cnode_delete_r(dbg_tcb);
+                    let _ = cnode_delete_r(client_pml4);
+                    let _ = cnode_delete_r(dbg_pml4);
+                    PM_PIDS[BLK_TEST_PI].store(0, Ordering::Relaxed);
+                }
+            }
+
+            print_str(b"[ntos-exec] dbgk target-block selftest bits=0x");
+            print_hex(bk_ok as u32);
+            print_str(b" blocked=");
+            print_u64(DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed));
+            print_str(b" resumed=");
+            print_u64(DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed));
+            print_str(b" terminated=");
+            print_u64(DBGK_TERMINATES_ENFORCED.load(Ordering::Relaxed));
+            print_str(b" released=");
+            print_u64(DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed));
+            print_str(b"\n");
+
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+            nt_handler.current_tid = saved_tid;
+            nt_handler.loop_ctx = saved_ctx;
+            nt_handler.wait_park_event = -1;
+            nt_handler.wait_deadline_100ns = u64::MAX;
+            DBGK_BLOCK_SELFTEST.store(bk_ok, Ordering::Relaxed);
+        }
+
         // Path 1b COUNTED SPEC — process-local dense handle VALUES. Two DISTINCT live EPROCESSes each
         // allocate their first handle and BOTH get the SAME dense value (0x4), yet it refers to a
         // DIFFERENT object in each: proof of per-process handle namespaces (a global value scheme
@@ -7977,4 +8802,21 @@ unsafe fn live_top_badges() -> u64 {
         m |= 1u64 << LSASS_BADGE;
     }
     m
+}
+
+/// One-line progress trace for the dbgk target-blocking self-test: which fault the throwaway client
+/// took and what its progress MARKER read at that moment. Six lines per boot — they are the
+/// human-readable record of "parked, not progressed" / "resumed, and continued".
+unsafe fn dbgk_blk_trace(tag: &[u8], msginfo: u64, m0: u64, m1: u64, marker: u64) {
+    print_str(b"[dbgk-blk] ");
+    print_str(tag);
+    print_str(b" label=");
+    print_u64(msginfo >> 12);
+    print_str(b" m0=0x");
+    print_hex(m0 as u32);
+    print_str(b" m1=0x");
+    print_hex(m1 as u32);
+    print_str(b" marker=");
+    print_u64(marker);
+    print_str(b"\n");
 }

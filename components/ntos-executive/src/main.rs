@@ -3605,6 +3605,119 @@ unsafe fn wait_cancel_thread(tid: u64) {
     }
 }
 
+/// ═══ Dbgk TARGET-SIDE BLOCKING: park / resume / abandon a REPORTING thread ═══════════════════
+///
+/// `DbgkpQueueMessage` blocks the thread that reported a debug event on the event's `ContinueEvent`
+/// until `NtDebugContinue` runs `DbgkpWakeTarget`. Our reporting thread is blocked in-kernel on the
+/// Call that delivered its fault/syscall, so "park" is the SAME reply-capability steal every other
+/// wait uses (`wait_park` / `keyed_wait_park` / `pipe_wait_park`): take the Reply object the last
+/// recv bound to this caller and rotate a fresh pool object into `REPLY_MAIN_SLOT` so the loop's
+/// next recv binds a NEW one. The stolen capability rides on the `DEBUG_EVENT` itself
+/// ([`nt_process::dbgk::ReporterBlock`]) — exactly where NT keeps the waiting reporter.
+///
+/// Returns `None` (⇒ the caller must NOT block: it falls back to post-and-continue) when there is no
+/// active reply object or the pool is exhausted. Never a hang.
+#[allow(clippy::too_many_arguments)]
+unsafe fn dbgk_reporter_park(
+    kind: u8,
+    pi: usize,
+    tid: u64,
+    badge: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    resume_status: u64,
+) -> Option<nt_process::dbgk::ReporterBlock> {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return None;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let (fresh_index, fresh) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
+        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
+    })?;
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    let block = nt_process::dbgk::ReporterBlock {
+        kind,
+        reply_cap: stolen,
+        pi: pi as u32,
+        tid,
+        badge,
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+        resume_status,
+    };
+    DBGK_REPORTERS_BLOCKED.fetch_add(1, Ordering::Relaxed);
+    block.is_blocked().then_some(block)
+}
+
+/// `DbgkpWakeTarget`'s RESUME half: reply to the blocked reporter so it CONTINUES EXECUTION.
+///
+/// ★ The reply SHAPE is per fault flavour — this is the whole reason target-side blocking needed its
+/// own machinery. The kernel's `apply_fault_reply` transfers different registers per `pending_fault`:
+/// * **UnknownSyscall** (a syscall reporter) — slots 0=RAX … 15=FaultIP, 16=SP, 17=FLAGS: the
+///   ordinary syscall reply (status in MR0, resume context in MR15/16/17), length 18.
+/// * **UserException** — slots 0=FaultIP, 1=SP, 2=FLAGS, length 3. Sending the *syscall* shape here
+///   would write the status into the faulter's FaultIP and resume it at garbage.
+/// * **VMFault / DebugException** — no register transfer at all; a length-0, label-0 reply restarts
+///   the faulter (the `#PF` retries the faulting instruction, the int3 resumes past it).
+/// In every case label 0 = restart (`handleFaultReply`'s `label == 0` rule).
+unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool {
+    use nt_process::dbgk::{
+        DBGK_BLOCK_SYSCALL, DBGK_BLOCK_USER_EXCEPTION,
+    };
+    if !block.is_blocked() {
+        return false;
+    }
+    match block.kind {
+        DBGK_BLOCK_SYSCALL => {
+            set_reply_mr(15, block.resume_ip);
+            set_reply_mr(16, block.resume_sp);
+            set_reply_mr(17, block.resume_flags);
+            send_on_reply(block.reply_cap, 18, block.resume_status, 0, 0, 0);
+        }
+        DBGK_BLOCK_USER_EXCEPTION => send_on_reply(
+            block.reply_cap,
+            3,
+            block.resume_ip,
+            block.resume_sp,
+            block.resume_flags,
+            0,
+        ),
+        // VMFault / DebugException: restart with no register transfer.
+        _ => send_on_reply(block.reply_cap, 0, 0, 0, 0, 0),
+    }
+    release_reply_pool_cap(block.reply_cap);
+    DBGK_REPORTERS_RESUMED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// `DbgkpWakeTarget`'s NON-resuming half: the reporter is never woken (`DBG_EXCEPTION_NOT_HANDLED`
+/// at a fault ⇒ the fault site's own unrecoverable handling stands; `DBG_TERMINATE_*` ⇒ the thread
+/// is dead; a teardown release ⇒ the fault was unrecoverable anyway). The thread stays blocked
+/// in-kernel exactly as `park_and_log!`'s recv-without-reply leaves it.
+///
+/// The Reply object is RECYCLED (delete → re-retype gives a fresh UNBOUND one) so a run of abandoned
+/// reporters can never drain the reply pool — the same discipline `wait_cancel_thread` uses.
+unsafe fn dbgk_reporter_abandon(block: &nt_process::dbgk::ReporterBlock) -> bool {
+    if block.reply_cap == 0 {
+        return false;
+    }
+    let deleted = cnode_delete_r(block.reply_cap);
+    let retyped = if deleted == 0 {
+        untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, block.reply_cap)
+    } else {
+        u64::MAX
+    };
+    if deleted == 0 && retyped == 0 {
+        release_reply_pool_cap(block.reply_cap);
+    }
+    true
+}
+
 fn keyed_wait_clear_slot(slot: usize) {
     KEYED_WAITER_KEY[slot].store(u64::MAX, Ordering::Relaxed);
     KEYED_WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
@@ -5159,6 +5272,14 @@ struct ExecNtHandler {
     pipe_park_event_obj_idx: u64,
     pipe_park_transceive: bool,
     pipe_park_is_write: bool,
+    /// ★ Dbgk TARGET-SIDE BLOCKING, SYSCALL flavour. Set by a debug-event post issued from a
+    /// SYSCALL arm (`dbgk_module_load` — `DbgkMapViewOfSection`, which NT queues with flags 0 and
+    /// therefore BLOCKS the mapping thread on the continue). The handler cannot park: the reply-cap
+    /// steal needs the caller's resume_ip/sp/flags, known only at the reply site. The LOOP consumes
+    /// this latch there, parks the caller as the event's blocked reporter and recvs the next event
+    /// WITHOUT replying. `false` = no block requested — the plain-boot value, since the poster
+    /// returns on its first line with no debug object alive.
+    dbgk_block_request: bool,
     /// BATCH 33 — set by NtWriteFile when a write completes into npfs (non-PENDING): the LOOP must
     /// re-drive EVERY parked pipe read (re-issue each against npfs; npfs's own FCB pairing decides
     /// which reader now has bytes) and wake the satisfied ones. `false` = no re-drive requested.
@@ -6183,6 +6304,25 @@ static DBGK_EXCEPTIONS_FORWARDED: AtomicU64 = AtomicU64::new(0);
 /// so they stay **0** on a plain boot and the mapping path is byte-identical.
 static DBGK_MODULE_LOADS: AtomicU64 = AtomicU64::new(0);
 static DBGK_MODULE_UNLOADS: AtomicU64 = AtomicU64::new(0);
+/// **TARGET-SIDE BLOCKING counters** (`DbgkpQueueMessage`'s wait on `DebugEvent->ContinueEvent` +
+/// `DbgkpWakeTarget`). A reporting thread whose process IS being debugged is parked on the event it
+/// just queued — its seL4 Reply capability is stolen into the `DEBUG_EVENT` — and `NtDebugContinue`
+/// then applies the continue status to it. With no debugger attached (every boot today) nothing is
+/// ever parked, so all five stay **0** and every fault site behaves byte-identically.
+static DBGK_REPORTERS_BLOCKED: AtomicU64 = AtomicU64::new(0);
+/// `DBG_CONTINUE` / `DBG_EXCEPTION_HANDLED` (and a syscall reporter's `DBG_EXCEPTION_NOT_HANDLED`):
+/// the reporter was RESUMED with its fault-flavoured reply and continues execution.
+static DBGK_REPORTERS_RESUMED: AtomicU64 = AtomicU64::new(0);
+/// `DBG_EXCEPTION_NOT_HANDLED` at a FAULT: the debugger declined it, so the fault site's own
+/// unrecoverable handling stands and the reporter is left blocked (its Reply object recycled).
+static DBGK_REPORTERS_LEFT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+/// `DBG_TERMINATE_THREAD` / `DBG_TERMINATE_PROCESS` ENFORCED: the reporting thread (or its whole
+/// process) is really terminated in the process manager and never resumed.
+static DBGK_TERMINATES_ENFORCED: AtomicU64 = AtomicU64::new(0);
+/// ★ THE ESCAPE HATCH: blocked reporters released because the debug object was destroyed / the
+/// debuggee detached / the boot reached its post-loop drain — so a debugger that dies or never
+/// continues can never wedge the boot.
+static DBGK_REPORTERS_RELEASED: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk end-to-end SELF-TEST result** (post-loop, throwaway debugger + debuggee EPROCESSes),
 /// driving the SAME `nt_process::dbgk` plane the five native handlers dispatch into. Bitmask:
 ///   0x0001 NtCreateDebugObject creates a real DEBUG_OBJECT (DBGK_KILL_PROCESS_ON_EXIT honoured)
@@ -6277,6 +6417,46 @@ static DBGK_EXCEPTION_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///   0x0080 each fake module message is retrieved through the REAL `NtWaitForDebugEvent` arm as
 ///          `DbgLoadDllStateChange` carrying its base, and continued by SSN
 static DBGK_MODULE_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk TARGET-SIDE BLOCKING self-test result** (post-loop). The keystone deferred item: NT blocks
+/// the REPORTING thread inside `DbgkpQueueMessage` until `NtDebugContinue` runs `DbgkpWakeTarget`,
+/// then applies the continue status to it.
+///
+/// This is the one self-test that cannot be driven from the model alone, so it stands up a REAL
+/// throwaway CLIENT THREAD (`selftests::dbgk_client_spawn` — a fresh VSpace, a code page, a
+/// hosted-syscalls TCB + SC, the same machinery as the ALPC cross-VSpace proof) which takes ONE
+/// FAULT OF EACH FLAVOUR in sequence and writes a progress MARKER between them. The executive reads
+/// that marker through its own window on the client's shared page, so "the reporter genuinely
+/// blocked" and "the continue genuinely resumed it" are OBSERVED, not inferred. The debugger side
+/// runs through the REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)`, arguments marshalled in
+/// smss's client memory), and the target side through `dbgk_forward_exception` / `dbgk_module_load`
+/// / `dbgk_block_reporter` — the very entries the live fault loop and syscall arms call. Bit map:
+///   0x0001 setup: the client thread runs (marker 1) and a real DEBUG_OBJECT is attached to its
+///          EPROCESS BY SSN, with the fake create message drained + continued BY SSN
+///   0x0002 ★ THE BLOCK: the client's `#PF` is forwarded, the reporting thread is PARKED on the
+///          event it queued (`DbgkpQueueMessage`'s wait — the block rides on the `DEBUG_EVENT`,
+///          `DBGK_REPORTERS_BLOCKED` moves) and it has NOT PROGRESSED — the marker is still 1 while
+///          the debugger holds the event
+///   0x0004 ★ THE CONTINUE RESUMES IT: `NtDebugContinue(DBG_CONTINUE)` BY SSN replies with the
+///          **VMFault** shape (length 0, no register transfer) so the faulting instruction is
+///          RETRIED against the page the debugger mapped — the client continues and reaches its
+///          next fault with marker 2
+///   0x0008 the **DebugException** flavour: an `int3` blocks the reporter and `DBG_CONTINUE` resumes
+///          it PAST the int3 (marker 3)
+///   0x0010 the **SYSCALL** flavour: a `DbgkMapViewOfSection` load-dll event posted from a SYSCALL
+///          blocks its reporter and `DBG_CONTINUE` resumes it with the syscall reply shape (status
+///          in MR0 + resume context in MR15/16/17) — marker 4
+///   0x0020 ★ `DBG_TERMINATE_THREAD` **ENFORCED**: a `ud2` UserException blocks the reporter; the
+///          continue really terminates its ETHREAD (`DBGK_TERMINATES_ENFORCED` moves) and it is
+///          NEVER resumed — the marker stays 4, i.e. the instruction after the `ud2` never ran
+///   0x0040 ★ THE ESCAPE HATCH: a reporter left blocked is RELEASED by the debug-object teardown
+///          (`NtClose` → `DbgkpCloseObject`), `DBGK_REPORTERS_RELEASED` moves and nothing stays
+///          parked — a debugger that dies or never continues can never wedge the boot
+///   0x0080 ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT: a second real client thread
+///          blocks inside `NtWaitForDebugEvent` on the executive's REAL fault endpoint — the
+///          production `wait_park` steals its reply capability — does not progress, and a
+///          queue-side post WAKES it through `wait_wake_dispatcher_set`; its marker and its next
+///          syscall are the proof it really resumed
+static DBGK_BLOCK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -10017,12 +10197,66 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         dbgk_mod & (0x0040 | 0x0080) == (0x0040 | 0x0080),
                         &mut passed,
                     );
+                    // ---- Dbgk TARGET-SIDE BLOCKING (`DbgkpQueueMessage`'s wait on
+                    // `DebugEvent->ContinueEvent` + `DbgkpWakeTarget`). The keystone deferred item:
+                    // until this batch every debug event was POST-AND-CONTINUE, so DBG_CONTINUE did
+                    // not resume a faulting thread and DBG_TERMINATE_* were recorded, not enforced.
+                    // These four are driven by a REAL throwaway CLIENT THREAD (a live seL4 thread
+                    // in its own VSpace, genuinely blocked in-kernel on the Call that delivered its
+                    // fault) whose progress MARKER the executive reads back — so "parked, not
+                    // progressed" and "resumed, and continued" are OBSERVED, not inferred.
+                    let dbgk_blk = DBGK_BLOCK_SELFTEST.load(Ordering::Relaxed);
+                    // The reporting thread really BLOCKS: its `#PF` is forwarded, its reply
+                    // capability is parked on the DEBUG_EVENT, and it makes no further progress
+                    // while the debugger holds the event.
+                    check(
+                        b"exec_dbgk_target_blocks_until_continue",
+                        dbgk_blk & (0x0001 | 0x0002) == (0x0001 | 0x0002),
+                        &mut passed,
+                    );
+                    // DBG_CONTINUE resumes it — with the right reply shape per fault flavour:
+                    // VMFault (retry the faulting instruction), DebugException (resume past the
+                    // int3) and the syscall shape (status + resume context) — and it CONTINUES.
+                    check(
+                        b"exec_dbgk_continue_resumes_target",
+                        dbgk_blk & (0x0004 | 0x0008 | 0x0010) == (0x0004 | 0x0008 | 0x0010),
+                        &mut passed,
+                    );
+                    // DBG_TERMINATE_THREAD is ENFORCED (the reporting ETHREAD really dies and is
+                    // never resumed), and the escape hatch releases a reporter left blocked when the
+                    // debug object is destroyed — so a debugger that dies cannot wedge the boot.
+                    check(
+                        b"exec_dbgk_terminate_status_enforced",
+                        dbgk_blk & (0x0020 | 0x0040) == (0x0020 | 0x0040),
+                        &mut passed,
+                    );
+                    // The DEBUGGER side: a LIVE client blocked inside NtWaitForDebugEvent — its
+                    // reply capability withheld by the production `wait_park` — is woken by a
+                    // queue-side post and observably resumes.
+                    check(
+                        b"exec_dbgk_debugger_wait_blocks_and_wakes",
+                        dbgk_blk & 0x0080 == 0x0080,
+                        &mut passed,
+                    );
                     print_str(b"[ntos-exec] dbgk module selftest bits=0x");
                     print_hex(dbgk_mod as u32);
                     print_str(b" loads=");
                     print_u64(DBGK_MODULE_LOADS.load(Ordering::Relaxed));
                     print_str(b" unloads=");
                     print_u64(DBGK_MODULE_UNLOADS.load(Ordering::Relaxed));
+                    print_str(b"\n");
+                    print_str(b"[ntos-exec] dbgk target-block selftest bits=0x");
+                    print_hex(dbgk_blk as u32);
+                    print_str(b" blocked=");
+                    print_u64(DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed));
+                    print_str(b" resumed=");
+                    print_u64(DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed));
+                    print_str(b" left-blocked=");
+                    print_u64(DBGK_REPORTERS_LEFT_BLOCKED.load(Ordering::Relaxed));
+                    print_str(b" terminates=");
+                    print_u64(DBGK_TERMINATES_ENFORCED.load(Ordering::Relaxed));
+                    print_str(b" released=");
+                    print_u64(DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed));
                     print_str(b"\n");
                     print_str(b"[ntos-exec] dbgk exception-forward selftest bits=0x");
                     print_hex(dbgk_exc as u32);

@@ -1987,8 +1987,51 @@ impl ProcessManager {
         }))
     }
 
+    /// `DbgkpQueueMessage`'s blocking half — record `block` as the **blocked reporting thread** of
+    /// the event just queued for `client_id` on `object`.
+    ///
+    /// The reporting thread does not return from its fault/syscall until `NtDebugContinue` resolves
+    /// that event; the host owns the actual park (it holds the thread's reply capability) and this
+    /// carries the association on the `DEBUG_EVENT`, exactly where NT keeps it. Returns `false` if
+    /// no eligible event is queued (the reporter must then NOT be parked).
+    pub fn block_reporter(
+        &mut self,
+        object: DebugObjectId,
+        client_id: ClientId,
+        block: dbgk::ReporterBlock,
+    ) -> bool {
+        self.dbgk
+            .get_mut(object)
+            .is_some_and(|o| o.attach_reporter(client_id, block))
+    }
+
+    /// Release every blocked reporter on `object` (optionally only those of `pid`) — the escape
+    /// hatch a debug-object teardown / debuggee detach runs so no target stays parked forever.
+    pub fn drain_blocked_reporters(
+        &mut self,
+        object: DebugObjectId,
+        pid: Option<ProcessId>,
+    ) -> Vec<(ClientId, dbgk::ReporterBlock)> {
+        match self.dbgk.get_mut(object) {
+            Some(o) => o.drain_reporters(pid),
+            None => Vec::new(),
+        }
+    }
+
+    /// How many events on `object` currently carry a blocked reporter.
+    pub fn blocked_reporter_count(&self, object: DebugObjectId) -> usize {
+        self.dbgk
+            .get(object)
+            .map(|o| o.blocked_reporters())
+            .unwrap_or(0)
+    }
+
     /// `NtDebugContinue` — resolve the read event for `client_id` with `continue_status`. Returns
     /// the removed event (whose `returned_status` is the continue status the target would see).
+    ///
+    /// The removed event carries the **blocked reporting thread** (`DebugEvent::reporter_block`) if
+    /// one was parked on it; [`dbgk::wake_action`] turns the continue status into what
+    /// `DbgkpWakeTarget` must do with it (resume / leave blocked / terminate).
     pub fn debug_continue(
         &mut self,
         object: DebugObjectId,

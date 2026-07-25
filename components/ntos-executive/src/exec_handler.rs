@@ -275,6 +275,7 @@ impl ExecNtHandler {
             pipe_park_event_obj_idx: u64::MAX,
             pipe_park_transceive: false,
             pipe_park_is_write: false,
+            dbgk_block_request: false,
             pipe_write_redrive: false,
             pipe_listen_fid: 0,
             pipe_listen_event_handle: 0,
@@ -1181,6 +1182,192 @@ impl ExecNtHandler {
         true
     }
 
+    /// ★ TARGET-SIDE BLOCKING — `DbgkpQueueMessage`'s wait on `DebugEvent->ContinueEvent`.
+    ///
+    /// Park the thread that just reported a debug event for hosted process `pi` on the event it
+    /// queued, so it does **not** return from its fault/syscall until `NtDebugContinue` resolves it
+    /// (`dbgk_wake_target`). The park itself is the ordinary reply-capability steal
+    /// ([`dbgk_reporter_park`]); the stolen capability is recorded ON THE `DEBUG_EVENT`
+    /// ([`nt_process::dbgk::ReporterBlock`]) — where NT keeps the waiting reporter.
+    ///
+    /// `kind` is the fault flavour that says which reply shape resumes it (`DBGK_BLOCK_*`);
+    /// `resume_status` is what a SYSCALL-flavoured reporter returns when resumed.
+    ///
+    /// ★ SAFETY PROPERTY: returns `false` having done NOTHING when the process is not being
+    /// debugged (the path every fault on the live boot takes), when no debug port resolves, when the
+    /// reply pool is exhausted, or when the queued event could not take the block — so the caller
+    /// falls back to its existing post-and-continue handling and the fault path is byte-identical.
+    ///
+    /// `reply_cap` names the Reply capability the reporter's blocked Call is bound to: pass **0**
+    /// (every production call site) to steal the ACTIVE one out of `REPLY_MAIN_SLOT`, or an explicit
+    /// capability when the caller already received the fault on a reply object of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn dbgk_block_reporter(
+        &mut self,
+        pi: usize,
+        tid_hint: u64,
+        badge: u64,
+        kind: u8,
+        reply_cap: u64,
+        resume_ip: u64,
+        resume_sp: u64,
+        resume_flags: u64,
+        resume_status: u64,
+    ) -> bool {
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
+            return false;
+        };
+        let Some(object) = self.pm.process_debug_port(pid) else {
+            return false;
+        };
+        let tid = match tid_hint {
+            0 => self.pm.main_thread(pid).unwrap_or(0),
+            hint => hint as nt_process::ThreadId,
+        };
+        let client_id = nt_process::ClientId {
+            unique_process: pid,
+            unique_thread: tid,
+        };
+        let parked = if reply_cap != 0 {
+            let block = nt_process::dbgk::ReporterBlock {
+                kind,
+                reply_cap,
+                pi: pi as u32,
+                tid: tid as u64,
+                badge,
+                resume_ip,
+                resume_sp,
+                resume_flags,
+                resume_status,
+            };
+            DBGK_REPORTERS_BLOCKED.fetch_add(1, Ordering::Relaxed);
+            block.is_blocked().then_some(block)
+        } else {
+            dbgk_reporter_park(
+                kind,
+                pi,
+                tid as u64,
+                badge,
+                resume_ip,
+                resume_sp,
+                resume_flags,
+                resume_status,
+            )
+        };
+        let Some(block) = parked else {
+            return false;
+        };
+        if self.pm.block_reporter(object, client_id, block) {
+            return true;
+        }
+        // Nothing eligible took the block (no non-NOWAIT event queued for this client). Recycle the
+        // stolen Reply object and let the caller's own handling proceed — the reporter is left
+        // blocked exactly as `park_and_log!`'s recv-without-reply would leave it.
+        dbgk_reporter_abandon(&block);
+        false
+    }
+
+    /// `DbgkpWakeTarget` — apply a continue status to the reporter blocked on a resolved event.
+    ///
+    /// | continue status | what happens to the reporting thread |
+    /// |---|---|
+    /// | `DBG_CONTINUE` / `DBG_EXCEPTION_HANDLED` | **RESUMED** with its fault-flavoured reply — the exception is dismissed and it CONTINUES EXECUTION (a `#PF` retries the faulting instruction, an int3 resumes past it, a syscall returns its status) |
+    /// | `DBG_EXCEPTION_NOT_HANDLED` at a FAULT | left blocked: the fault site's own unrecoverable handling stands (today's outcome). Its win32k user-mode callbacks are unwound, exactly as `park_and_log!` does |
+    /// | `DBG_EXCEPTION_NOT_HANDLED` from a SYSCALL | resumed (there is no exception to decline — the syscall simply completes) |
+    /// | `DBG_TERMINATE_THREAD` | **ENFORCED**: the reporting thread is really terminated and never resumed |
+    /// | `DBG_TERMINATE_PROCESS` | **ENFORCED**: its whole process is terminated (every thread), and never resumed |
+    ///
+    /// Returns the [`WakeAction`](nt_process::dbgk::WakeAction) taken.
+    pub(crate) unsafe fn dbgk_wake_target(
+        &mut self,
+        client_id: nt_process::ClientId,
+        block: Option<nt_process::dbgk::ReporterBlock>,
+        continue_status: u32,
+    ) -> nt_process::dbgk::WakeAction {
+        use nt_process::dbgk::{wake_action, ReporterBlock, WakeAction};
+        let block = block.unwrap_or(ReporterBlock::default());
+        let action = wake_action(&block, continue_status);
+        match action {
+            WakeAction::None => {}
+            WakeAction::Resume => {
+                dbgk_reporter_resume(&block);
+            }
+            WakeAction::LeaveBlocked => {
+                dbgk_reporter_abandon(&block);
+                DBGK_REPORTERS_LEFT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                // The reporter will never return, so any win32k user-mode callback it owns must be
+                // unwound — the same dead-client discipline `park_and_log!` applies.
+                crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
+            }
+            WakeAction::TerminateThread => {
+                dbgk_reporter_abandon(&block);
+                let _ = self.pm.terminate_thread_at(
+                    client_id.unique_thread,
+                    nt_process::dbgk::DBG_TERMINATE_THREAD,
+                    nt_system_time_100ns() as i64,
+                );
+                DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
+            }
+            WakeAction::TerminateProcess => {
+                dbgk_reporter_abandon(&block);
+                let _ = self.pm.terminate_process_at(
+                    client_id.unique_process,
+                    nt_process::dbgk::DBG_TERMINATE_PROCESS,
+                    nt_system_time_100ns() as i64,
+                );
+                DBGK_TERMINATES_ENFORCED.fetch_add(1, Ordering::Relaxed);
+                if block.is_blocked() {
+                    crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
+                }
+            }
+        }
+        action
+    }
+
+    /// ★ THE ESCAPE HATCH. Release every reporter blocked on `object` (optionally only `pid`'s), so
+    /// a debugger that dies, closes its debug object, or simply never continues can NEVER leave a
+    /// target parked forever — which would be a boot that fails to quiesce.
+    ///
+    /// Faithful to `DbgkClearProcessDebugObject`, which marks every flushed event
+    /// `STATUS_DEBUGGER_INACTIVE` and wakes its target: a **syscall** reporter is genuinely resumed
+    /// (its operation completes), while a **fault** reporter — whose fault was unrecoverable and
+    /// whose site would have parked it anyway — is left blocked with its Reply object recycled.
+    /// Returns how many reporters were released.
+    pub(crate) unsafe fn dbgk_release_blocked_reporters(
+        &mut self,
+        object: nt_process::dbgk::DebugObjectId,
+        pid: Option<nt_process::ProcessId>,
+    ) -> usize {
+        let released = self.pm.drain_blocked_reporters(object, pid);
+        let n = released.len();
+        for (_client, block) in released {
+            if block.is_fault() {
+                dbgk_reporter_abandon(&block);
+                crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
+            } else {
+                dbgk_reporter_resume(&block);
+            }
+            DBGK_REPORTERS_RELEASED.fetch_add(1, Ordering::Relaxed);
+        }
+        n
+    }
+
+    /// Release every blocked reporter on EVERY live debug object — the unconditional, bounded
+    /// backstop the boot runs before the gate. With no debug object alive it returns on its first
+    /// line, so a plain boot pays nothing.
+    pub(crate) unsafe fn dbgk_release_all_blocked_reporters(&mut self) -> usize {
+        if self.pm.debug_object_count() == 0 {
+            return 0;
+        }
+        let mut ids = [0 as nt_process::dbgk::DebugObjectId; 8];
+        let n = self.pm.debug_object_ids_into(&mut ids);
+        let mut released = 0;
+        for &object in &ids[..n] {
+            released += self.dbgk_release_blocked_reporters(object, None);
+        }
+        released
+    }
+
     /// `DbgkMapViewOfSection` — an **IMAGE** view at `base` became mapped in hosted process index
     /// `pi`. Records it in the process's modelled module list and posts `DbgKmLoadDllApi` to its
     /// `EPROCESS.DebugPort`, waking a debugger parked on it.
@@ -1221,6 +1408,9 @@ impl ExecNtHandler {
             return false;
         }
         DBGK_MODULE_LOADS.fetch_add(1, Ordering::Relaxed);
+        // `DbgkMapViewOfSection` queues with flags 0 ⇒ the MAPPING THREAD BLOCKS on the continue.
+        // The park needs this caller's resume context, so latch the request for the reply site.
+        self.dbgk_block_request = true;
         self.sync_debug_object_signals();
         true
     }
@@ -2409,6 +2599,11 @@ impl ExecNtHandler {
             // every debuggee, and drop it. (Debug-object handles are never duplicated on this path,
             // so a single close is the last reference.)
             nt_process::HandleObject::DebugObject(object) => {
+                // ★ ESCAPE HATCH: the DEBUGGER IS GONE. Release every target still blocked on one
+                // of this object's events before the object (and its event list) is dropped —
+                // otherwise a debugger that dies mid-event would leave a reporter parked forever
+                // and the boot could never quiesce.
+                unsafe { self.dbgk_release_blocked_reporters(object, None) };
                 self.pm.destroy_debug_object(object);
             }
             _ => {}
@@ -10905,7 +11100,15 @@ impl ExecNtHandler {
                     .pm
                     .debug_continue(object, client_id, args[2] as u32)
                 {
-                    Ok(_event) => {
+                    Ok(event) => {
+                        // ★ `DbgkpWakeTarget`: apply the continue status to the reporting thread
+                        // blocked on this event — resume it, leave the fault site's handling
+                        // standing, or ENFORCE a DBG_TERMINATE_THREAD / DBG_TERMINATE_PROCESS.
+                        self.dbgk_wake_target(
+                            event.client_id,
+                            event.reporter_block(),
+                            args[2] as u32,
+                        );
                         self.sync_debug_object_signal(object);
                         DBGK_CONTINUES.fetch_add(1, Ordering::Relaxed);
                         0
@@ -10929,6 +11132,9 @@ impl ExecNtHandler {
                         Ok(resolved) => resolved,
                         Err(status) => return status,
                     };
+                // ★ ESCAPE HATCH: this debuggee's queued events are about to be flushed, so every
+                // reporter blocked on one must be released FIRST or it would stay parked forever.
+                unsafe { self.dbgk_release_blocked_reporters(object, Some(target)) };
                 match self.pm.remove_process_debug(target, object) {
                     Ok(_flushed) => {
                         self.sync_debug_object_signal(object);

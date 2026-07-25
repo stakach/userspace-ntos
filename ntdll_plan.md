@@ -3593,7 +3593,7 @@ security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binar
 covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
 `RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
 
-### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25/26, gate **193 → 199 → 202 → 204 → 207/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25/26, gate **193 → 199 → 202 → 204 → 207 → 211/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
 
 The 8 `DbgUi*` exports **kernel32.dll imports** (they underpin Win32
 `DebugActiveProcess`/`WaitForDebugEvent`/`ContinueDebugEvent`/`DebugBreakProcess`) were
@@ -3653,10 +3653,13 @@ onto it; a zero/immediate timeout returns `STATUS_TIMEOUT` instead), `NtClose` o
 > park REQUEST and the WAKE SIGNAL: the handler binds `wait_park_event` to the object's `EventsPresent`
 > dispatcher event, and a later queue-side post through the dispatch route sets that event (spec
 > `exec_dbgk_syscall_wait_park_and_signal`). What is **not** proven and **not** yet complete:
-> (a) the reply-cap steal + thread resume of a **live** client blocked inside `NtWaitForDebugEvent`
-> (no binary in the current set issues these syscalls, so nothing ever blocks on one); and
+> ~~(a) the reply-cap steal + thread resume of a **live** client blocked inside
+> `NtWaitForDebugEvent`~~ — **(a) is CLOSED in batch 54**: a REAL throwaway client thread now blocks
+> inside the wait on the executive's REAL fault endpoint (the production `wait_park` steals its reply
+> capability), does not progress, and is woken by a queue-side post — proven by its own progress
+> marker plus its next syscall arriving (`exec_dbgk_debugger_wait_blocks_and_wakes`, bit `0x0080`).
 > ~~(b) `sync_debug_object_signal` is called only from the five dbgk arms…~~ — **(b) is FIXED in
-> batch 52, see below.** (a) still stands.
+> batch 52, see below.**
 
 **★ BATCH 52 (2026-07-25, gate 202 → 204/99) — the POST-SIDE SIGNAL DEFECT, fixed.** `(b)` above was
 real: `sync_debug_object_signal` ran **only** in the five dbgk arms, so an event queued by any other
@@ -3756,20 +3759,12 @@ debugger) and disproven-when-removed by the bypass experiment below.
   mappings, which are not user-visible views of a hosted process).
 
 *DEFERRED (the payload/plumbing exists but nothing posts them yet):*
-- **target-side blocking on the continue event — STILL DEFERRED after batch 52 (be precise about
-  this).** NT blocks the *reporting* thread inside `DbgkpQueueMessage` until `NtDebugContinue`, then
-  applies the continue status. Ours is **post-and-continue**: the forward queues the event, wakes the
-  debugger, and returns `false`-as-in-"not handled", after which the fault site's own handling runs —
-  i.e. the `DBG_EXCEPTION_NOT_HANDLED` outcome, by construction. So `DBG_CONTINUE` does **not** resume
-  a faulting thread and `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are **recorded, not enforced**.
-  Blocking the reporting thread needs a fault-flavoured reply-cap steal (the syscall-shaped
-  `wait_park`/`wait_wake_dispatcher` reply — MR15/16/17 + status in r10 — is the wrong shape for a
-  UserException/VMFault reply) plus a resume hook in `NtDebugContinue`. It was deliberately NOT built
-  in batch 52: on the current boot nothing is debugged, so that machinery would be unreachable in the
-  live path AND unprovable post-loop (no live client is blocked inside a syscall) — the same reason
-  item (a) of the scope note above is still open. This also means **the blocking-wait path is still
-  NOT proven**; what batch 52 adds is a second, independent proof of the park-request + wake-signal
-  half, now from two posting paths that could not signal at all before it.
+- ~~**target-side blocking on the continue event**~~ — **LANDED in batch 54 (gate 207 → 211/99)**;
+  see part 5 below. The reporting thread now genuinely BLOCKS until `NtDebugContinue`, in **both**
+  flavours (fault-shaped and syscall-shaped), and the continue status is applied to it —
+  `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are **ENFORCED**, no longer merely recorded. What
+  remains deferred at this site is only `#DB` single-step blocking (nothing sets TF) and the
+  executive-internal fault walls that never forwarded in the first place.
 - **modules mapped before any `DEBUG_OBJECT` existed** — the modelled module list is only maintained
   while at least one debug object is alive (the gate that keeps the section-mapping path
   byte-identical), so `DbgkpPostFakeModuleMessages` reports nothing for images a process mapped
@@ -3868,6 +3863,128 @@ first thing, i.e. an image map never posts) → `DBGK_MODULE_SELFTEST` `0xFF →
 `unloads 1 → 0`, **all THREE new specs FAIL** (gate 204/99, 3 FAILs). Only the setup, the
 image-only negative and the no-debugger gate survive — every positive bit depends on the posting.
 Restored and re-verified green.
+
+**5 — the gate, part 5: TARGET-SIDE BLOCKING on the continue event — the keystone deferred item,
+LANDED — 4 specs** (gate **207 → 211/99**, batch 54, 2026-07-26). Until this batch every debug event
+was **post-and-continue**: the reporting thread queued its event and kept going, so `DBG_CONTINUE`
+did not resume a faulting thread (`DBG_EXCEPTION_NOT_HANDLED` was the outcome *by construction*) and
+`DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` were **recorded, not enforced**. All three are now
+closed.
+
+**(a) HOW A REPORTER IS PARKED.** `DbgkpQueueMessage` blocks the reporting thread on the event's
+`ContinueEvent`. Ours is already blocked in-kernel on the Call that delivered its fault/syscall, so
+"park" is the SAME reply-capability steal every other wait uses (`wait_park` / `keyed_wait_park` /
+`pipe_wait_park`): `dbgk_reporter_park` (main.rs) takes the Reply object the last recv bound to this
+caller and rotates a fresh pool object into `REPLY_MAIN_SLOT`. The stolen capability + the resume
+context ride on the **`DEBUG_EVENT` itself** — `nt_process::dbgk::ReporterBlock` on
+`DebugEvent.reporter`, exactly where NT keeps the waiting reporter — attached by
+`DebugObject::attach_reporter` (`ProcessManager::block_reporter`) and handed back by
+`continue_event`. `ExecNtHandler::dbgk_block_reporter` is the one entry both flavours use.
+
+**(b) THE TWO REPLY SHAPES — why this needed its own machinery.** The kernel's `apply_fault_reply`
+transfers *different registers per `pending_fault`*, so the generic syscall-shaped reply is WRONG for
+a faulting reporter. `dbgk_reporter_resume` selects:
+
+| `DBGK_BLOCK_*` | fault type | reply sent | effect |
+|---|---|---|---|
+| `SYSCALL` | UnknownSyscall (2) | length 18, MR0 = status, MR15/16/17 = FaultIP/SP/FLAGS (MR4..14 = the faulter's own registers, still in the IPC buffer from its recv) | the syscall returns |
+| `USER_EXCEPTION` | UserException (3) | length 3, MR0/1/2 = FaultIP/SP/FLAGS | resumes at the faulting context |
+| `VM_FAULT` | VMFault (6) | length 0, label 0 | no register transfer — the faulting instruction is **RETRIED** |
+| `DEBUG_EXCEPTION` | DebugException (4) | length 0, label 0 | resumes past the int3 |
+
+★ The resume IP for a SYSCALL reporter is **RCX (MR2)** — the address `syscall` pushed — the same
+derivation the service loop makes (`let resume_ip = m2`), NOT the message's FaultIP slot. Getting
+this wrong re-executes the `syscall` (observed and fixed during bring-up).
+
+**(c) WHERE THE BLOCK IS TAKEN.**
+* **Fault flavour** — `service_sec_image.rs`, macro `dbgk_block_and_park!`, at all four
+  `dbgk_forward_exception!` sites: label 3 (`#GP`/`#UD`/CPU exception) → `USER_EXCEPTION`, label 4
+  (int3) → `DEBUG_EXCEPTION`, and both label-6 unrecoverable page-fault branches → `VM_FAULT`. On a
+  successful park the site recvs the next event WITHOUT replying and `continue`s — the faulting
+  thread stays blocked in-kernel exactly as `park_and_log!` would leave it, but **wakeable**.
+* **Syscall flavour** — `dbgk_module_load` (`DbgkMapViewOfSection`, which NT queues with flags 0 and
+  therefore blocks the mapping thread) latches `nt_handler.dbgk_block_request`; the LOOP consumes it
+  at the reply site (where `resume_ip`/`sp`/`flags` are known), parks with `DBGK_BLOCK_SYSCALL` and
+  recvs without replying — the identical shape to the pipe/io-completion/keyed parks next to it.
+
+**(d) `NtDebugContinue` → `DbgkpWakeTarget` (`ExecNtHandler::dbgk_wake_target`).** The decision table
+is pure (`nt_process::dbgk::wake_action`, host-tested):
+
+| continue status | reporting thread |
+|---|---|
+| `DBG_CONTINUE` / `DBG_EXCEPTION_HANDLED` | **RESUMED** with its fault-flavoured reply — the exception is dismissed and it CONTINUES EXECUTION |
+| `DBG_EXCEPTION_NOT_HANDLED` at a **fault** | left blocked: the fault site's own unrecoverable handling stands (today's behaviour). Its win32k user-mode callbacks are unwound, exactly as `park_and_log!` does |
+| `DBG_EXCEPTION_NOT_HANDLED` from a **syscall** | resumed — a module-load report is not an exception the debugger can decline, so the syscall simply completes |
+| `DBG_TERMINATE_THREAD` | **ENFORCED** — `terminate_thread_at` on the reporting ETHREAD; never resumed |
+| `DBG_TERMINATE_PROCESS` | **ENFORCED** — `terminate_process_at` on its whole process; never resumed, callbacks unwound |
+
+A reporter that is never resumed has its Reply object RECYCLED (delete → re-retype = a fresh unbound
+one, the `wait_cancel_thread` discipline), so a run of abandoned reporters can never drain the pool.
+
+**(e) ★ THE ESCAPE HATCH — three layers, so a debugger can never wedge the boot.**
+1. **Teardown release.** `NtClose` on the debug handle (`DbgkpCloseObject`) and `NtRemoveProcessDebug`
+   both run `dbgk_release_blocked_reporters` FIRST — a syscall reporter is genuinely resumed, a fault
+   reporter is abandoned + its callbacks unwound. This is `DbgkClearProcessDebugObject`'s
+   "mark every flushed event `STATUS_DEBUGGER_INACTIVE` and wake its target".
+2. **Quiesce accounting.** A blocked reporter is a COOPERATIVE wait, so every park site calls
+   `mark_wait_parked!` — if the debugger never continues, the all-parked quiesce still fires and the
+   boot reaches the gate. **A boot that fails to quiesce is a FAIL, and this is why it cannot.**
+3. **Unconditional post-loop drain.** `dbgk_release_all_blocked_reporters()` runs right after the
+   service loop breaks. With no debug object alive it returns on its first line.
+
+**★ THE SAFETY PROPERTY — no debugger attached ⇒ byte-identical.** Every divert is gated on the
+process actually having an `EPROCESS.DebugPort`: `dbgk_forward_exception` returns false before the
+block is even attempted, `dbgk_block_reporter` returns false on its first two lookups, and
+`dbgk_module_load` returns on its first line with no debug object alive. Nothing on the current boot
+attaches a debugger, so **the live serial is unchanged** — verified by a normalized diff against
+`de180c4`: the ONLY differences are per-build bootloader addresses/timestamps, the four new spec PASS
+lines, the new self-test summary line, and the dbgk counters (which grow only because the new
+self-test also drives the plane). Zero `[dbgk] reporter BLOCKED` lines on the live boot; the
+`DBGK_REPORTERS_*` counters' live-boot contribution is 0.
+
+**THE PROOF NEEDED A REAL CLIENT.** No model call can show "parked, not progressed", so the self-test
+stands up a REAL throwaway CLIENT THREAD (`selftests::dbgk_client_spawn` — a fresh VSpace, code page,
+stack, IPC buffer, hosted-syscalls TCB + SC, the same machinery as the ALPC cross-VSpace proof) that
+takes **one fault of each flavour in sequence**, writing a progress MARKER between them into a page
+the executive windows into its own VSpace. The debugger side goes through the REAL dispatch route
+(`nt_dispatcher.dispatch(SSN, …)`, arguments marshalled in smss's CLIENT memory); the target side
+through `dbgk_forward_exception` / `dbgk_module_load` / `dbgk_block_reporter` — the very entries the
+live fault loop and the live `NtMapViewOfSection` arm call. Every stage is GUARDED: a blocking recv
+is only issued once the previous continue is KNOWN to have resumed the client, so the self-test itself
+can never wedge the boot. (Bring-up lesson: a frame capability carries its own mapping — map the
+CLIENT's view FIRST and the executive's `copy_cap` window second, or the original's map fails
+`seL4_DeleteFirst`.)
+
+| spec | proves (`DBGK_BLOCK_SELFTEST` bits) |
+|---|---|
+| `exec_dbgk_target_blocks_until_continue` (`0x0003`) | setup: the client thread really runs (marker 1) and really faults; a DEBUG_OBJECT is attached BY SSN with **both** attach-time fake create messages drained + continued BY SSN · **★ THE BLOCK**: the `#PF` is forwarded, the reporting thread is PARKED on the event it queued (`DBGK_REPORTERS_BLOCKED` moves, `blocked_reporter_count == 1`) and **has NOT PROGRESSED** — the marker is still 1 while the debugger holds the event |
+| `exec_dbgk_continue_resumes_target` (`0x001C`) | **★ VMFault**: the debugger maps the page and `NtDebugContinue(DBG_CONTINUE)` BY SSN replies length-0 → the faulting instruction is RETRIED and succeeds; the client's NEXT fault arrives with marker 2 · **DebugException**: an int3 blocks its reporter and the continue resumes it PAST the int3 (marker 3) · **SYSCALL flavour**: a real `DbgkMapViewOfSection` load-dll event posted from a syscall blocks its reporter and the continue resumes it with the syscall reply shape (marker 4) |
+| `exec_dbgk_terminate_status_enforced` (`0x0060`) | **★ `DBG_TERMINATE_THREAD` ENFORCED**: a `ud2` UserException blocks its reporter; the continue really terminates the reporting ETHREAD (`DBGK_TERMINATES_ENFORCED` moves, the thread is `Terminated`), `DBGK_REPORTERS_RESUMED` does **not** move, and the marker stays 4 — the instruction after the `ud2` never ran · **★ THE ESCAPE HATCH**: a reporter left blocked is RELEASED by `NtClose` → `DbgkpCloseObject` (`DBGK_REPORTERS_RELEASED` moves, the object is gone, the debuggee detached) |
+| `exec_dbgk_debugger_wait_blocks_and_wakes` (`0x0080`) | **★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT** — this closes scope note (a). A second real client thread issues a syscall serviced as `NtWaitForDebugEvent` with an EMPTY queue; its fault is received on the executive's **REAL fault endpoint bound to `REPLY_MAIN`**, so the PRODUCTION `wait_park` steals its reply capability exactly as the service loop does. It does not progress (marker 0); a queue-side post through `dbgk_forward_exception` runs `wait_wake_dispatcher_set` and WAKES it — proven by its marker turning 1 and its next syscall (`rax = 0xD2`) arriving |
+
+**Proof-is-real check (batch 54) — BYPASS EXPERIMENT:** `return false` on the first line of
+`dbgk_block_reporter` (post-and-continue, as before this batch) **plus** skipping the debugger-side
+`wait_park` → `DBGK_BLOCK_SELFTEST` `0xFF → 0x01`, `blocked 5 → 0`, `resumed 3 → 0`,
+`terminates 1 → 0`, `released 1 → 0`, and **ALL FOUR new specs FAIL** (gate **207/99, 4 FAILs**).
+Only the setup bit survives — every other bit depends on a reporter actually being parked. Restored
+and re-verified green.
+
+**Verify (batch 54):** 3 consecutive clean foreground boots — **211/99, ZERO FAILs, RUNEXIT=3,
+`[microtest sentinel matched]`** each time, `dbgk target-block selftest bits=0xff blocked=5 resumed=3
+left-blocked=0 terminates=1 released=1` alongside the unchanged `bits=0x1fff` / `0x7ff` / `0xff` /
+`0xff`. No regression: `exec_win32k_desktop_painted`, `exec_msgina_logon_dialog_painted`,
+`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip` and **all 18**
+`exec_dbgk_*` PASS. Host tests: `nt-process` 75 → **79**, `nt-ntdll` **690** (unchanged — no ntdll
+change, so `ntdll.dll` was NOT rebuilt). No `rust-micro/src` change.
+
+**Still deferred after batch 54:** `#DB` single-step reporting/blocking (nothing sets TF) · the
+executive-internal fault walls (`fault-cap`, `win32k-spin`, `unhandled-syscall`,
+`image-map-resource`, `wl-stack-growth`, `other-fault`) which are not user exceptions and so never
+forward, hence never block · `DBG_EXCEPTION_NOT_HANDLED` at a fault does not re-run the fault site's
+`[parked]` bookkeeping in the LOOP (the process is left cooperatively wait-parked rather than
+crash-parked; the dead-client callback unwind IS run from the wake path) · a live HOSTED binary
+driving any of this — nothing in the current set issues the five debug syscalls or attaches a
+debugger, so the proof is the throwaway-client self-test, not the boot itself.
 
 **Proof-is-real check (batch 51):** pointing the attach at `pm.debug_active_process` instead of the
 dispatcher (a one-call bypass) drops `DBGK_SYSCALL_SELFTEST` `0x7FF → 0x7FB`, `attaches 2 → 1`, and

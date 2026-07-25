@@ -357,6 +357,123 @@ impl DbgKmMessage {
     }
 }
 
+// --- the BLOCKED REPORTING THREAD (`DbgkpQueueMessage`'s `ContinueEvent` wait) ------------------
+
+/// No reporter is blocked on this event (`DEBUG_EVENT_NOWAIT` — the attach-time fake messages and
+/// the lifecycle posts, which NT also queues without a waiting reporter).
+pub const DBGK_BLOCK_NONE: u8 = 0;
+/// The reporter blocked inside a **syscall** (seL4 `UnknownSyscall` fault). Resuming it replies with
+/// the syscall reply shape: the return status in MR0 (RAX) plus MR15/16/17 = FaultIP/SP/FLAGS.
+pub const DBGK_BLOCK_SYSCALL: u8 = 1;
+/// The reporter blocked at a **UserException** fault (`#UD`/`#GP`/a CPU exception the executive's
+/// fault loop classified at label 3). Resuming it replies with the UserException shape — length 3,
+/// MR0/1/2 = FaultIP/SP/FLAGS.
+pub const DBGK_BLOCK_USER_EXCEPTION: u8 = 2;
+/// The reporter blocked at a **VMFault** (`#PF`, the fault loop's label 6). Resuming it replies
+/// length 0: no register transfer, the faulting instruction is retried (NT's "exception dismissed,
+/// resume at the faulting context").
+pub const DBGK_BLOCK_VM_FAULT: u8 = 3;
+/// The reporter blocked at a **DebugException** (int3 / `#BP`, the fault loop's label 4). Resuming
+/// it replies length 0; the recorded resume IP already points past the trapping instruction.
+pub const DBGK_BLOCK_DEBUG_EXCEPTION: u8 = 4;
+
+/// The **blocked reporting thread** carried by a [`DebugEvent`].
+///
+/// `DbgkpQueueMessage` keeps the reporting thread parked on the event's `ContinueEvent` until
+/// `NtDebugContinue` runs `DbgkpWakeTarget`. We have no in-kernel thread to park, so the host
+/// records everything needed to RESUME that thread here — the seL4 Reply capability its blocked
+/// Call is bound to, the fault flavour that says which reply shape resumes it, and the resume
+/// context. The whole struct is opaque, plain data to this module: the pure state machine only
+/// carries it from the queue site to the continue site (exactly the role `DebugEvent->ContinueEvent`
+/// plays in the kernel), and the host performs the actual wake.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReporterBlock {
+    /// `DBGK_BLOCK_*` — which reply shape resumes this reporter.
+    pub kind: u8,
+    /// The host's Reply capability bound to the blocked reporter's Call (0 = none).
+    pub reply_cap: u64,
+    /// Hosted-process index the reporter belongs to (the host's `pi`).
+    pub pi: u32,
+    /// The reporter's thread id (the `CLIENT_ID.UniqueThread` of the event).
+    pub tid: u64,
+    /// The reporter's fault-endpoint badge (its identity in the host's service multiplex).
+    pub badge: u64,
+    /// Resume `FaultIP` — for a syscall block, the instruction after the `syscall`.
+    pub resume_ip: u64,
+    /// Resume stack pointer.
+    pub resume_sp: u64,
+    /// Resume RFLAGS.
+    pub resume_flags: u64,
+    /// The status a **syscall**-flavoured reporter returns when it is resumed (what the syscall
+    /// would have returned had it never blocked). Ignored for the fault flavours.
+    pub resume_status: u64,
+}
+
+impl ReporterBlock {
+    /// Whether this block names a resumable reporter.
+    pub fn is_blocked(&self) -> bool {
+        self.kind != DBGK_BLOCK_NONE && self.reply_cap != 0
+    }
+
+    /// Whether the reporter blocked at a FAULT (as opposed to inside a syscall). A fault reporter
+    /// resumes only on `DBG_CONTINUE`; a syscall reporter resumes on any non-terminating continue.
+    pub fn is_fault(&self) -> bool {
+        matches!(
+            self.kind,
+            DBGK_BLOCK_USER_EXCEPTION | DBGK_BLOCK_VM_FAULT | DBGK_BLOCK_DEBUG_EXCEPTION
+        )
+    }
+}
+
+/// What `DbgkpWakeTarget` must do to a blocked reporter for a given continue status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WakeAction {
+    /// Nothing was blocked (or nothing to do) — `NtDebugContinue` just resolves the event.
+    None,
+    /// Resume the reporter so it CONTINUES EXECUTION (`DBG_CONTINUE` / `DBG_EXCEPTION_HANDLED`,
+    /// and — for a syscall reporter — `DBG_EXCEPTION_NOT_HANDLED` too, since a syscall-reported
+    /// event is not an exception the debugger can decline).
+    Resume,
+    /// Leave the reporter blocked: the fault site's own handling stands (`DBG_EXCEPTION_NOT_HANDLED`
+    /// at a fault — the second-chance / park outcome).
+    LeaveBlocked,
+    /// `DBG_TERMINATE_THREAD` — terminate the reporting thread; it is never resumed.
+    TerminateThread,
+    /// `DBG_TERMINATE_PROCESS` — terminate the reporting thread's whole process.
+    TerminateProcess,
+}
+
+/// `DbgkpWakeTarget`'s decision table: what a continue status does to the reporter blocked on the
+/// event being continued. Pure — the host performs the action.
+pub fn wake_action(block: &ReporterBlock, continue_status: u32) -> WakeAction {
+    if !block.is_blocked() {
+        // NT still terminates on a DBG_TERMINATE_* continue even when the event carried no waiting
+        // reporter (`DbgkpWakeTarget` calls PspTerminateThreadByPointer regardless); with nothing
+        // parked there is no thread of ours to resume, so only the terminations survive.
+        return match continue_status {
+            DBG_TERMINATE_THREAD => WakeAction::TerminateThread,
+            DBG_TERMINATE_PROCESS => WakeAction::TerminateProcess,
+            _ => WakeAction::None,
+        };
+    }
+    match continue_status {
+        DBG_TERMINATE_THREAD => WakeAction::TerminateThread,
+        DBG_TERMINATE_PROCESS => WakeAction::TerminateProcess,
+        DBG_CONTINUE | DBG_EXCEPTION_HANDLED => WakeAction::Resume,
+        // `DBG_EXCEPTION_NOT_HANDLED`: the debugger declined the exception, so the normal path
+        // proceeds. For a FAULT that means the fault site's own unrecoverable handling stands (the
+        // thread stays blocked, exactly as `park_and_log!` leaves it); for a SYSCALL-reported event
+        // (a module load) there is no exception to decline, so the syscall simply completes.
+        _ => {
+            if block.is_fault() {
+                WakeAction::LeaveBlocked
+            } else {
+                WakeAction::Resume
+            }
+        }
+    }
+}
+
 /// A queued `DEBUG_EVENT`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DebugEvent {
@@ -372,6 +489,10 @@ pub struct DebugEvent {
     pub returned_status: u32,
     /// `DebugEvent->BackoutThread` — the thread that queued an inactive (attach-time) event.
     pub backout_thread: Option<ThreadId>,
+    /// The **blocked reporting thread** NT parks on `DebugEvent->ContinueEvent` until
+    /// `NtDebugContinue` runs `DbgkpWakeTarget`. `None` = post-and-continue (a `NOWAIT` event or a
+    /// lifecycle post) — the reporter was never blocked.
+    pub reporter: Option<ReporterBlock>,
 }
 
 impl DebugEvent {
@@ -384,7 +505,13 @@ impl DebugEvent {
             status: crate::STATUS_SUCCESS,
             returned_status: crate::STATUS_SUCCESS,
             backout_thread: None,
+            reporter: None,
         }
+    }
+
+    /// The blocked reporter this event carries, if any (`DebugEvent->ContinueEvent`'s waiter).
+    pub fn reporter_block(&self) -> Option<ReporterBlock> {
+        self.reporter.filter(|block| block.is_blocked())
     }
 
     /// The debuggee process this event belongs to.
@@ -495,6 +622,59 @@ impl DebugObject {
             self.events_present = true;
         }
         Ok(())
+    }
+
+    /// `DbgkpQueueMessage`'s **blocking** half: record `block` as the reporting thread parked on the
+    /// most recently queued event for `client_id` that is not already `NOWAIT` and has no reporter.
+    ///
+    /// NT queues the `DEBUG_EVENT` on the reporter's own stack and then waits on its `ContinueEvent`;
+    /// we queue first and attach the (host-owned) block second, which is the same association. The
+    /// event stops being a post-and-continue one, so `NtDebugContinue` will run `DbgkpWakeTarget`
+    /// against it. Returns `false` when no such event exists (nothing was blocked).
+    pub fn attach_reporter(&mut self, client_id: ClientId, block: ReporterBlock) -> bool {
+        if !block.is_blocked() {
+            return false;
+        }
+        for event in self.events.iter_mut().rev() {
+            if event.client_id == client_id
+                && event.reporter.is_none()
+                && event.flags & DEBUG_EVENT_NOWAIT == 0
+            {
+                event.reporter = Some(block);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Take the blocked reporter off every event of this object (optionally only those belonging to
+    /// `pid`), returning them.
+    ///
+    /// The debugger-death escape hatch: `DbgkpCloseObject` marks the object inactive, and
+    /// `DbgkClearProcessDebugObject` detaches one debuggee — in both cases every blocked target must
+    /// be released rather than left parked forever (a boot that cannot quiesce is a failure). The
+    /// events themselves are left in place; the caller decides what to do with each reporter.
+    pub fn drain_reporters(&mut self, pid: Option<ProcessId>) -> Vec<(ClientId, ReporterBlock)> {
+        let mut out = Vec::new();
+        for event in self.events.iter_mut() {
+            if pid.is_some_and(|pid| event.process_id() != pid) {
+                continue;
+            }
+            if let Some(block) = event.reporter.take() {
+                if block.is_blocked() {
+                    out.push((event.client_id, block));
+                }
+            }
+        }
+        out
+    }
+
+    /// How many events currently carry a blocked reporter.
+    pub fn blocked_reporters(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| event.reporter_block().is_some())
+            .count()
     }
 
     /// `DbgkpSetProcessDebugObject`'s activation pass: the fake create messages queued for

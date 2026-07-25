@@ -183,6 +183,176 @@ pub(crate) fn xview_reader_code(view: u64) -> alloc::vec::Vec<u8> {
 /// `f1` — pass copies for the 2nd endpoint) mapped RW at the view VA + a code page (RX) + stack +
 /// IPC buffer, a fault EP, a hosted-syscalls TCB, an SC — resumed. Every new cap slot is appended to
 /// `slots`. Returns (pml4, tcb, fault_ep). VAs live in the fresh VSpace so any layout is free.
+// ═══ Dbgk TARGET-SIDE BLOCKING harness — a REAL throwaway client thread ════════════════════════
+//
+// The dbgk blocking proofs need something no post-loop model call can give: a LIVE thread genuinely
+// blocked in-kernel on the Call that delivered its fault/syscall, whose reply capability the
+// executive holds. This is the SAME machinery `xview_spawn` (the ALPC cross-VSpace proof) already
+// uses post-loop — a fresh VSpace, a code page, a stack, an IPC buffer, a hosted-syscalls TCB + SC —
+// with two differences: ONE shared data page (the progress MARKER the executive reads back to prove
+// the thread did or did not run), and an optional CALLER-SUPPLIED fault endpoint so a client can be
+// pointed at the executive's REAL `fault_ep` and exercise the production `wait_park` /
+// `wait_wake_dispatcher_set` path verbatim.
+//
+// The client VSpace layout (all VAs private to it, so any layout is free):
+//   VIEW           the shared marker page (frame `shared`, also windowed into the executive)
+//   VIEW + 0x2000  DELIBERATELY UNMAPPED — the `#PF` fixup target (inside the same 2 MiB PT, so a
+//                  later `page_map` there succeeds: that is how DBG_CONTINUE's instruction RETRY
+//                  is proven to make progress)
+pub(crate) const DBGK_CLIENT_VIEW: u64 = 0x0000_0000_4000_0000;
+/// The `#PF` target: mapped by the test only after the reporter has been proven blocked.
+pub(crate) const DBGK_CLIENT_FIXUP: u64 = DBGK_CLIENT_VIEW + 0x2000;
+
+/// `mov qword [imm64], imm32` — writes `value` to the absolute address `at` (via RCX).
+fn emit_store(t: &mut alloc::vec::Vec<u8>, at: u64, value: u32) {
+    t.extend_from_slice(&[0x48, 0xB9]);
+    t.extend_from_slice(&at.to_le_bytes()); // movabs rcx, at
+    t.extend_from_slice(&[0x48, 0xC7, 0x01]);
+    t.extend_from_slice(&value.to_le_bytes()); // mov qword [rcx], value
+}
+
+/// The TARGET-side blocking client. Its whole point is to take **one fault of each flavour**, in
+/// order, writing a progress marker between them so the executive can prove — by reading that
+/// marker through its own window on the shared frame — whether the thread was really parked and
+/// whether a `DBG_CONTINUE` really resumed it.
+///
+/// | step | instruction | fault delivered | what the test does |
+/// |---|---|---|---|
+/// | marker = 1 | `mov [VIEW],1` | — | it is running |
+/// | | `mov [FIXUP],0xAA` | **VMFault** (label 6) | block → prove marker still 1 → map the page → `DBG_CONTINUE` ⇒ the instruction is RETRIED and succeeds |
+/// | marker = 2 | `mov [VIEW],2` | — | proof it resumed AND continued |
+/// | | `int3` | **DebugException** (label 4) | block → `DBG_CONTINUE` ⇒ resumes past the int3 |
+/// | marker = 3 | `mov [VIEW],3` | — | proof |
+/// | | `mov rax,0xDB; syscall` | **UnknownSyscall** (label 2) | the SYSCALL flavour: block → `DBG_CONTINUE` ⇒ resumed with the syscall reply shape |
+/// | marker = 4 | `mov [VIEW],4` | — | proof |
+/// | | `ud2` | **UserException** (label 3) | block → `DBG_TERMINATE_THREAD` ⇒ **never** resumed |
+/// | marker = 5 | `mov [VIEW],5` | — | MUST NOT be reached — that is the enforcement proof |
+pub(crate) fn dbgk_target_client_code() -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 1);
+    // The `#PF`: RDX addresses the deliberately-unmapped page.
+    t.extend_from_slice(&[0x48, 0xBA]);
+    t.extend_from_slice(&DBGK_CLIENT_FIXUP.to_le_bytes()); // movabs rdx, FIXUP
+    t.extend_from_slice(&[0x48, 0xC7, 0x02, 0xAA, 0x00, 0x00, 0x00]); // mov qword [rdx], 0xAA
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 2);
+    t.push(0xCC); // int3          → DebugException
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 3);
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&0xDBu64.to_le_bytes()); // movabs rax, 0xDB
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall       → UnknownSyscall (hosted-syscalls flag)
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 4);
+    t.extend_from_slice(&[0x0F, 0x0B]); // ud2           → UserException
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 5);
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    t
+}
+
+/// The DEBUGGER-side blocking client: `syscall(0xD1)` — which the test services as
+/// `NtWaitForDebugEvent` with an empty queue, so the production wait-park STEALS its reply
+/// capability — then a marker write and `syscall(0xD2)`. Neither can execute until a queue-side post
+/// wakes it through `wait_wake_dispatcher_set`, so the marker + the second syscall ARE the proof
+/// that a live client really blocked inside the wait and was really resumed.
+pub(crate) fn dbgk_debugger_client_code() -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&0xD1u64.to_le_bytes()); // movabs rax, 0xD1
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall  → the blocking NtWaitForDebugEvent
+    emit_store(&mut t, DBGK_CLIENT_VIEW, 1); // only reachable once woken
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&0xD2u64.to_le_bytes()); // movabs rax, 0xD2
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall  → recv'd as the "it resumed" proof
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    t
+}
+
+/// Stand up ONE throwaway client VSpace running `code`, with `shared` mapped RW at
+/// [`DBGK_CLIENT_VIEW`] (the marker page), a code page (RX), a stack, an IPC buffer, a
+/// hosted-syscalls TCB and an SC — resumed. `fault_ep` selects the endpoint its faults are delivered
+/// to: pass the executive's REAL `fault_ep` (badged) to exercise the production reply-cap machinery,
+/// or `0` to mint a fresh private endpoint. Every new cap slot is appended to `slots`.
+/// Returns `(pml4, tcb, fault_ep)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn dbgk_client_spawn(
+    code: &[u8],
+    shared: u64,
+    write_scratch: u64,
+    fault_ep: u64,
+    slots: &mut [u64; 96],
+    n: &mut usize,
+) -> (u64, u64, u64) {
+    const VIEW: u64 = DBGK_CLIENT_VIEW;
+    const CODE: u64 = VIEW + 0x10000;
+    const STK: u64 = VIEW + 0x20000;
+    const IPC: u64 = VIEW + 0x30000;
+    let mut push = |s: u64| {
+        slots[*n] = s;
+        *n += 1;
+        s
+    };
+    let pml4 = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, VIEW, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, VIEW, pml4);
+    // ONE page table covers [VIEW, VIEW+2 MiB) — including the deliberately-unmapped FIXUP page, so
+    // the test can map a frame there later without needing another paging structure.
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, VIEW, pml4);
+    let shared_map = page_map_r(shared, VIEW, RW_NX, pml4);
+    if shared_map != 0 {
+        print_str(b"[dbgk-client] marker page map FAILED status=");
+        print_u64(shared_map);
+        print_str(b"\n");
+    }
+    // Code page: write the trampoline through an executive scratch mapping, then map a COPY RX (W^X).
+    let codef = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, codef);
+    let _ = page_map(codef, write_scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    for (i, b) in code.iter().enumerate() {
+        core::ptr::write_volatile((write_scratch + i as u64) as *mut u8, *b);
+    }
+    let codecopy = push(copy_cap(codef));
+    let _ = page_map(codecopy, CODE, /* RX */ 2, pml4);
+    let stk = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, stk);
+    let _ = page_map(stk, STK, RW_NX, pml4);
+    let ipc = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipc);
+    let _ = page_map(ipc, IPC, RW_NX, pml4);
+    let ep = if fault_ep != 0 {
+        fault_ep
+    } else {
+        push(make_object(OBJ_ENDPOINT))
+    };
+    let raw = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = push(alloc_slot());
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let fault_copy = push(copy_cap(ep));
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_copy, 0);
+    let tcb = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPC, ipc, 0);
+    let _ = tcb_write_registers(tcb, CODE, STK + 0x1000 - 16, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    let sc = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
+    let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 1000, 1000);
+    let _ = sched_context_bind(sc, tcb);
+    // Hosted-syscalls flag: `syscall` faults as UnknownSyscall (delivering the register file to the
+    // fault EP) instead of trapping natively — the same mechanism every live hosted thread uses.
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    let _ = tcb_resume(tcb);
+    (pml4, tcb, ep)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn xview_spawn(
     code: &[u8],

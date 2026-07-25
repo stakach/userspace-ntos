@@ -1909,3 +1909,198 @@ fn dbgk_trap_vectors_map_to_the_ntstatus_kidispatchexception_reports() {
     assert_eq!(record.number_parameters, 15);
     assert_eq!(record.exception_information[14], 7);
 }
+
+// --- TARGET-SIDE BLOCKING: the reporting thread parks on the event until NtDebugContinue ---------
+
+/// A blocked reporter for `tid`, in the given fault/syscall flavour.
+fn reporter(kind: u8, tid: ThreadId, cap: u64) -> dbgk::ReporterBlock {
+    dbgk::ReporterBlock {
+        kind,
+        reply_cap: cap,
+        pi: 7,
+        tid: tid as u64,
+        badge: 0,
+        resume_ip: 0x7FFE_1000,
+        resume_sp: 0x1_0000,
+        resume_flags: 0x202,
+        resume_status: 0,
+    }
+}
+
+#[test]
+fn dbgk_reporter_block_rides_on_the_debug_event_and_comes_back_from_continue() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let client = ClientId {
+        unique_process: target,
+        unique_thread: main,
+    };
+    // Drain the attach-time fake create message (a NOWAIT event — never blocks a reporter).
+    let create = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(create.state, dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+
+    // The fault path: post the exception, then park the reporting thread on it.
+    let record = dbgk::ExceptionRecord::access_violation(0x7FFE_1000, 1, 0x18);
+    assert_eq!(pm.report_exception(target, main, record, true), Some(object));
+    assert_eq!(pm.blocked_reporter_count(object), 0, "not blocked yet");
+    let block = reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0xBEEF);
+    assert!(pm.block_reporter(object, client, block));
+    assert_eq!(pm.blocked_reporter_count(object), 1);
+
+    // The debugger retrieves the event; the reporter stays blocked across the wait.
+    let seen = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(seen.state, dbgk::DBG_EXCEPTION_STATE_CHANGE);
+    assert_eq!(pm.blocked_reporter_count(object), 1);
+
+    // The continue hands the block back — this is `DbgkpWakeTarget`'s input.
+    let resolved = pm
+        .debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
+    assert_eq!(resolved.reporter_block(), Some(block));
+    assert_eq!(
+        dbgk::wake_action(&block, dbgk::DBG_CONTINUE),
+        dbgk::WakeAction::Resume
+    );
+    assert_eq!(pm.blocked_reporter_count(object), 0, "event is gone");
+}
+
+#[test]
+fn dbgk_wake_action_maps_every_continue_status_for_both_flavours() {
+    let fault = reporter(dbgk::DBGK_BLOCK_USER_EXCEPTION, 9, 1);
+    let syscall = reporter(dbgk::DBGK_BLOCK_SYSCALL, 9, 1);
+    assert!(fault.is_fault() && !syscall.is_fault());
+    for kind in [
+        dbgk::DBGK_BLOCK_VM_FAULT,
+        dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+        dbgk::DBGK_BLOCK_USER_EXCEPTION,
+    ] {
+        assert!(reporter(kind, 9, 1).is_fault());
+    }
+    // DBG_CONTINUE / DBG_EXCEPTION_HANDLED resume both flavours.
+    for status in [dbgk::DBG_CONTINUE, dbgk::DBG_EXCEPTION_HANDLED] {
+        assert_eq!(dbgk::wake_action(&fault, status), dbgk::WakeAction::Resume);
+        assert_eq!(dbgk::wake_action(&syscall, status), dbgk::WakeAction::Resume);
+    }
+    // NOT_HANDLED: a FAULT reporter is left blocked (the fault site's own handling stands); a
+    // syscall-reported event has no exception to decline, so the syscall completes.
+    assert_eq!(
+        dbgk::wake_action(&fault, dbgk::DBG_EXCEPTION_NOT_HANDLED),
+        dbgk::WakeAction::LeaveBlocked
+    );
+    assert_eq!(
+        dbgk::wake_action(&syscall, dbgk::DBG_EXCEPTION_NOT_HANDLED),
+        dbgk::WakeAction::Resume
+    );
+    // DBG_TERMINATE_* are ENFORCED for both flavours, and even with no reporter parked.
+    let none = dbgk::ReporterBlock::default();
+    assert!(!none.is_blocked());
+    for block in [fault, syscall, none] {
+        assert_eq!(
+            dbgk::wake_action(&block, dbgk::DBG_TERMINATE_THREAD),
+            dbgk::WakeAction::TerminateThread
+        );
+        assert_eq!(
+            dbgk::wake_action(&block, dbgk::DBG_TERMINATE_PROCESS),
+            dbgk::WakeAction::TerminateProcess
+        );
+    }
+    assert_eq!(
+        dbgk::wake_action(&none, dbgk::DBG_CONTINUE),
+        dbgk::WakeAction::None
+    );
+}
+
+#[test]
+fn dbgk_teardown_releases_every_blocked_reporter() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let client = ClientId {
+        unique_process: target,
+        unique_thread: main,
+    };
+    let _ = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+
+    let record = dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x401000);
+    assert_eq!(pm.report_exception(target, main, record, true), Some(object));
+    let block = reporter(dbgk::DBGK_BLOCK_DEBUG_EXCEPTION, main, 0xC0DE);
+    assert!(pm.block_reporter(object, client, block));
+
+    // A never-blocked event for a DIFFERENT process is untouched by the pid-scoped drain.
+    let other = pm.create_process("other.exe", None, None);
+    let other_thread = pm.create_thread(other, 0x10, 0, false).unwrap();
+    pm.debug_active_process(
+        other,
+        object,
+        ClientId {
+            unique_process: debugger,
+            unique_thread: 1,
+        },
+    )
+    .unwrap();
+    let other_client = ClientId {
+        unique_process: other,
+        unique_thread: other_thread,
+    };
+    let other_block = reporter(dbgk::DBGK_BLOCK_SYSCALL, other_thread, 0xFEED);
+    assert_eq!(
+        pm.report_exception(
+            other,
+            other_thread,
+            dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x20),
+            true
+        ),
+        Some(object)
+    );
+    assert!(pm.block_reporter(object, other_client, other_block));
+    assert_eq!(pm.blocked_reporter_count(object), 2);
+
+    // Detaching ONE debuggee releases only its reporter (`DbgkClearProcessDebugObject`).
+    let released = pm.drain_blocked_reporters(object, Some(target));
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0], (client, block));
+    assert_eq!(pm.blocked_reporter_count(object), 1);
+
+    // Destroying the object releases the rest (`DbgkpCloseObject`) — nothing stays parked.
+    let released = pm.drain_blocked_reporters(object, None);
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0], (other_client, other_block));
+    assert_eq!(pm.blocked_reporter_count(object), 0);
+}
+
+#[test]
+fn dbgk_block_reporter_refuses_nowait_and_unblocked_events() {
+    let mut pm = ProcessManager::new();
+    let (target, main, _debugger, object) = attach_debugger(&mut pm);
+    let client = ClientId {
+        unique_process: target,
+        unique_thread: main,
+    };
+    // The only queued event is the attach-time NOWAIT fake create message: NT never blocks a
+    // reporter on one, so neither do we.
+    let block = reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0x11);
+    assert!(!pm.block_reporter(object, client, block));
+    assert_eq!(pm.blocked_reporter_count(object), 0);
+    // A block with no reply capability is not a block.
+    assert_eq!(
+        pm.report_exception(
+            target,
+            main,
+            dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x30),
+            true
+        ),
+        Some(object)
+    );
+    assert!(!pm.block_reporter(object, client, reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0)));
+    assert!(!pm.block_reporter(object, client, reporter(dbgk::DBGK_BLOCK_NONE, main, 0x22)));
+    assert_eq!(pm.blocked_reporter_count(object), 0);
+    // The real block lands, and a SECOND block for the same event does not double-park.
+    assert!(pm.block_reporter(object, client, block));
+    assert!(!pm.block_reporter(object, client, reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0x33)));
+    assert_eq!(pm.blocked_reporter_count(object), 1);
+    // An unknown object is a no-op, never a panic.
+    assert!(!pm.block_reporter(object + 99, client, block));
+    assert_eq!(pm.blocked_reporter_count(object + 99), 0);
+    assert!(pm.drain_blocked_reporters(object + 99, None).is_empty());
+}
