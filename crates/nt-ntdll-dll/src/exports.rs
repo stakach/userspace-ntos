@@ -2078,6 +2078,165 @@ unsafe fn critical_section_owned_count(delta: i32) {
     }
 }
 
+/// `RtlpWaitForCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS` — the **slow path of
+/// `RtlEnterCriticalSection`**: block until the current owner releases the lock
+/// (`references/reactos/sdk/lib/rtl/critical.c:117`).
+///
+/// This is the same machinery `RtlEnterCriticalSection` already drives internally; exporting it
+/// under its real name completes the family (real ntdll exports it, and it is the routine every
+/// contended-lock stack trace bottoms out in). Faithful in all four observable respects:
+///
+/// 1. `DebugInfo->EntryCount` is bumped once on entry, `ContentionCount` once per wait iteration —
+///    both gated on `CRITSECT_HAS_DEBUG_INFO` (NULL / `-1` sentinel are skipped).
+/// 2. The loader-shutdown escape: the thread running `LdrShutdownProcess` is granted ownership by
+///    force (that thread publishes its id into `PEB_LDR_DATA+0x48/+0x50`, our
+///    `LdrpShutdownInProgress`/`LdrpShutdownThreadId`).
+/// 3. The wait itself goes to the CS's `LockSemaphore` event, or the global keyed event when the
+///    event could not be created (the `INVALID_HANDLE_VALUE` sentinel) — `critical_section_wait`.
+/// 4. Two consecutive `STATUS_TIMEOUT`s raise `STATUS_POSSIBLE_DEADLOCK` with the critical section
+///    as `ExceptionInformation[0]`, rather than silently granting the lock.
+///
+/// The decision logic (1/2/4) is the host-tested `nt_ntdll::sync` core.
+///
+/// Note on (4): our wait is issued with a NULL timeout — the configuration ReactOS calls
+/// `RtlpTimeoutDisable` (critical.c:26) — so `STATUS_TIMEOUT` cannot currently be returned and the
+/// deadlock arm is a correctness backstop rather than a live path. It is implemented anyway so that
+/// enabling a finite `RtlpTimeout` later is a one-line change, not a semantics change.
+///
+/// # Safety
+/// `cs` a valid `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlpWaitForCriticalSection"]
+pub unsafe extern "system" fn rtlp_wait_for_critical_section(cs: *mut c_void) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use nt_ntdll::sync::{classify_wait, critsect_has_debug_info, WaitOutcome};
+
+        // DebugInfo @ +0x00; EntryCount @ DebugInfo+0x20, ContentionCount @ +0x24.
+        // SAFETY: cs is a valid RTL_CRITICAL_SECTION per the contract.
+        let debug_info = unsafe { core::ptr::read_unaligned(cs as *const u64) };
+        if critsect_has_debug_info(debug_info) {
+            // SAFETY: the debug record is our own 0x30-byte RTL_CRITICAL_SECTION_DEBUG.
+            unsafe {
+                let entry = (debug_info + 0x20) as *mut u32;
+                core::ptr::write_unaligned(entry, core::ptr::read_unaligned(entry).wrapping_add(1));
+            }
+        }
+
+        // The loader-shutdown force-ownership escape (critical.c:132).
+        // SAFETY: PEB_LDR_DATA is process-owned; +0x48 ShutdownInProgress, +0x50 ShutdownThreadId.
+        let forced = unsafe {
+            let ldr = current_peb_ldr();
+            if ldr == 0 {
+                false
+            } else {
+                nt_ntdll::sync::shutdown_forces_ownership(
+                    core::ptr::read_unaligned((ldr + 0x48) as *const u8) != 0,
+                    core::ptr::read_unaligned((ldr + 0x50) as *const u64),
+                    resource_current_thread(),
+                )
+            }
+        };
+        if forced {
+            return STATUS_SUCCESS;
+        }
+
+        let mut last_chance = false;
+        loop {
+            if critsect_has_debug_info(debug_info) {
+                // SAFETY: as above.
+                unsafe {
+                    let contention = (debug_info + 0x24) as *mut u32;
+                    core::ptr::write_unaligned(
+                        contention,
+                        core::ptr::read_unaligned(contention).wrapping_add(1),
+                    );
+                }
+            }
+            // SAFETY: blocks on the CS's event / the global keyed event.
+            let status = unsafe { critical_section_wait(cs) };
+            match classify_wait(status, last_chance) {
+                WaitOutcome::Acquired => return STATUS_SUCCESS,
+                WaitOutcome::RetryLastChance => last_chance = true,
+                WaitOutcome::Deadlock => {
+                    // EXCEPTION_RECORD (x64): Code@0, Flags@4, Record@8, Address@0x10,
+                    // NumberParameters@0x18, Information[15]@0x20 — 0x98 bytes.
+                    let mut record = [0u8; 0x98];
+                    // SAFETY: a stack-owned EXCEPTION_RECORD handed to RtlRaiseException.
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            record.as_mut_ptr() as *mut u32,
+                            nt_ntdll::sync::STATUS_POSSIBLE_DEADLOCK,
+                        );
+                        core::ptr::write_unaligned(record.as_mut_ptr().add(0x18) as *mut u32, 1);
+                        core::ptr::write_unaligned(
+                            record.as_mut_ptr().add(0x20) as *mut u64,
+                            cs as u64,
+                        );
+                        crate::seh::rtl_raise_exception(record.as_mut_ptr().cast());
+                    }
+                    // If a handler continued execution, give the lock one more chance.
+                    last_chance = false;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `RtlpUnWaitCriticalSection(PRTL_CRITICAL_SECTION)` — the **slow path of
+/// `RtlLeaveCriticalSection`**: signal the CS's event (or release the global keyed event) so
+/// exactly one queued waiter wakes (`references/reactos/sdk/lib/rtl/critical.c:217`). A failing
+/// signal is raised as a status, never swallowed — ReactOS calls `RtlRaiseStatus(Status)`.
+///
+/// # Safety
+/// `cs` a valid `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlpUnWaitCriticalSection"]
+pub unsafe extern "system" fn rtlp_un_wait_critical_section(cs: *mut c_void) {
+    if cs.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: signals the CS's event / the global keyed event.
+        let status = unsafe { critical_section_wake_one(cs) };
+        if !nt_success(status) {
+            // SAFETY: raises the failure as a software exception (critical.c:242).
+            unsafe { rtl_raise_status(status) };
+        }
+    }
+}
+
+/// `RtlpNotOwnerCriticalSection(PRTL_CRITICAL_SECTION)` — raise `STATUS_RESOURCE_NOT_OWNED`
+/// (`references/reactos/sdk/lib/rtl/critical.c:883`). Called when a thread releases a critical
+/// section it does not own; it does not return.
+///
+/// # Safety
+/// `cs` is only used for the diagnostic; the call raises and does not return.
+#[export_name = "RtlpNotOwnerCriticalSection"]
+pub unsafe extern "system" fn rtlp_not_owner_critical_section(_cs: *mut c_void) {
+    const STATUS_RESOURCE_NOT_OWNED: NtStatus = 0xC000_0264;
+    // SAFETY: raises a non-continuable software exception, exactly as ReactOS does.
+    unsafe { rtl_raise_status(STATUS_RESOURCE_NOT_OWNED) };
+}
+
+/// `RtlCheckForOrphanedCriticalSections(HANDLE ThreadHandle)` — walk the process lock list looking
+/// for critical sections still owned by a terminated thread.
+///
+/// **Deliberately a no-op**, matching `references/reactos/sdk/lib/rtl/critical.c:861`, which is
+/// `UNIMPLEMENTED` with a `VOID` return: there is no observable contract to honour beyond "does not
+/// crash". Doing anything else here would mean inventing an orphan-recovery policy that neither
+/// ReactOS nor our runtime defines (and our runtime has no thread that dies holding a CS).
+///
+/// # Safety
+/// Touches no memory.
+#[export_name = "RtlCheckForOrphanedCriticalSections"]
+pub unsafe extern "system" fn rtl_check_for_orphaned_critical_sections(_thread_handle: *mut c_void) {
+}
+
 /// `RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
 ///
 /// # Safety
@@ -2144,7 +2303,10 @@ pub unsafe extern "system" fn rtl_enter_critical_section(cs: *mut c_void) -> NtS
         }
         #[cfg(target_arch = "x86_64")]
         {
-            let status = unsafe { critical_section_wait(cs) };
+            // critical.c:520 — the contended path goes through RtlpWaitForCriticalSection (which
+            // maintains the DebugInfo EntryCount/ContentionCount counters and honours the
+            // loader-shutdown force-ownership escape), not a bare wait.
+            let status = unsafe { rtlp_wait_for_critical_section(cs) };
             if !nt_success(status) {
                 lock_count.fetch_sub(1, Ordering::Release);
                 return status;
@@ -2187,13 +2349,11 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
     let new_count = lock_count.fetch_sub(1, Ordering::Release) - 1;
     if new_count != -1 {
         #[cfg(target_arch = "x86_64")]
-        {
-            let status = unsafe { critical_section_wake_one(cs) };
-            if !nt_success(status) {
-                unsafe { rtl_raise_status(status) };
-                return status;
-            }
-        }
+        // SAFETY: critical.c:800 — the wake goes through RtlpUnWaitCriticalSection, which raises
+        // the failure status itself rather than returning it.
+        unsafe {
+            rtlp_un_wait_critical_section(cs)
+        };
     }
     STATUS_SUCCESS
 }
@@ -19912,30 +20072,36 @@ pub unsafe extern "system" fn rtl_trace_database_unlock(database: *mut c_void) {
 
 // `RtlCaptureStackBackTrace` is provided by the security_exports module (part of that family).
 
-/// `RtlWow64EnableFsRedirection(BOOLEAN Enable) -> NTSTATUS` — we are native x64, no WOW64
-/// redirection → STATUS_SUCCESS no-op.
+/// `RtlWow64EnableFsRedirection(BOOLEAN Enable) -> NTSTATUS`.
+///
+/// **This is a native (non-WOW64) process, so the correct answer is a FAILURE, not a no-op
+/// success.** `references/reactos/dll/ntdll/rtl/libsupp.c:1166` is `@implemented` and returns
+/// `STATUS_NOT_IMPLEMENTED` with the comment *"This is what Windows returns on x86"* — i.e. the
+/// redirection layer only exists inside the WOW64 thunk ntdll, and 64-bit callers are told so. Our
+/// previous `STATUS_SUCCESS` made kernel32's `Wow64EnableWow64FsRedirection` claim it had toggled a
+/// redirection layer that does not exist.
 ///
 /// # Safety
 /// Reads no memory.
 #[export_name = "RtlWow64EnableFsRedirection"]
 pub unsafe extern "system" fn rtl_wow64_enable_fs_redirection(_enable: u8) -> NtStatus {
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `RtlWow64EnableFsRedirectionEx(PVOID DisableFsRedirection, PVOID* OldValue) -> NTSTATUS`.
+/// `RtlWow64EnableFsRedirectionEx(PVOID DisableFsRedirection, PVOID* OldValue) -> NTSTATUS` — the
+/// same native-process contract as [`rtl_wow64_enable_fs_redirection`]
+/// (`references/reactos/dll/ntdll/rtl/libsupp.c:1178`). ReactOS does **not** touch `OldValue` on
+/// this path, so neither do we — a caller that inspects it after a failure sees its own value, not
+/// a fabricated NULL.
 ///
 /// # Safety
 /// `old_value` null or writable.
 #[export_name = "RtlWow64EnableFsRedirectionEx"]
 pub unsafe extern "system" fn rtl_wow64_enable_fs_redirection_ex(
     _disable: *mut c_void,
-    old_value: *mut *mut c_void,
+    _old_value: *mut *mut c_void,
 ) -> NtStatus {
-    if !old_value.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *old_value = core::ptr::null_mut() };
-    }
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
 // =================================================================================================
@@ -22191,7 +22357,15 @@ pub extern "system" fn rtl_validate_process_heaps() -> u8 {
     }
 }
 
-/// `RtlGetNtProductType(PNT_PRODUCT_TYPE ProductType) -> BOOLEAN` — 1 = NtProductWinNt.
+/// `RtlGetNtProductType(PNT_PRODUCT_TYPE ProductType) -> BOOLEAN` — report the OS product type
+/// (1 = `NtProductWinNt`, 2 = `NtProductLanManNt`, 3 = `NtProductServer`).
+///
+/// Faithful to `references/reactos/dll/ntdll/rtl/version.c:105`: the value is **read live from
+/// `SharedUserData->NtProductType`** (`KUSER_SHARED_DATA + 0x264`), not baked into the export. The
+/// executive stamps that field when it builds each process's KUSER page
+/// (`img_spawn.rs::initialize_kuser_snapshot` → `nt_ntdll_layout::kuser::NT_PRODUCT_TYPE`), so this
+/// now tracks the system's actual configuration instead of a hardcoded constant. (ReactOS's
+/// `g_ReportProductType` compatibility override is a shim-engine feature we do not host.)
 ///
 /// # Safety
 /// `product_type` writable.
@@ -22200,8 +22374,19 @@ pub unsafe extern "system" fn rtl_get_nt_product_type(product_type: *mut u32) ->
     if product_type.is_null() {
         return 0;
     }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: KUSER_SHARED_DATA is mapped read-only into every process at its fixed VA;
+    // `product_type` is writable per the contract.
+    unsafe {
+        *product_type = core::ptr::read_volatile(
+            (KUSER_SHARED_DATA_VA + nt_ntdll_layout::kuser::NT_PRODUCT_TYPE) as *const u32,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     // SAFETY: writable per the contract.
-    unsafe { *product_type = 1 }; // NtProductWinNt
+    unsafe {
+        *product_type = 1
+    }; // NtProductWinNt — no KUSER page on the host build.
     1
 }
 
@@ -23508,8 +23693,15 @@ pub unsafe extern "system" fn rtl_compute_import_table_hash(
     }
 }
 
-/// `RtlFlushSecureMemoryCache(PVOID MemoryCache, SIZE_T MemoryLength) -> BOOLEAN` — flush a secure
-/// memory region from the CPU cache. No secure-memory plane; return TRUE (nothing to flush).
+/// `RtlFlushSecureMemoryCache(PVOID MemoryCache, SIZE_T MemoryLength) -> BOOLEAN` — ask the
+/// registered secure-memory cache callback to release the range before it is decommitted.
+///
+/// We host no secure-memory plane and export no `RtlRegisterSecureMemoryCacheCallback`, so **there
+/// is no callback that could have flushed anything** — the honest answer is FALSE.
+/// `references/reactos/sdk/lib/rtl/security.c:830` is `@unimplemented` and returns FALSE for the
+/// same reason; its one in-tree caller (`heappage.c:336`) treats FALSE as "the range was not
+/// released by a cache" and proceeds, which is exactly right for us. Our previous TRUE was a
+/// fabricated success claiming a flush that never happened.
 ///
 /// # Safety
 /// `memory_cache` a mapped region or NULL.
@@ -23518,7 +23710,7 @@ pub unsafe extern "system" fn rtl_flush_secure_memory_cache(
     _memory_cache: *mut c_void,
     _memory_length: usize,
 ) -> u8 {
-    1
+    0
 }
 
 /// `RtlSetCriticalSectionSpinCount(PRTL_CRITICAL_SECTION, ULONG SpinCount) -> ULONG` — set the

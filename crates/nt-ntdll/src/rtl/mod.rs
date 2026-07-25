@@ -51,6 +51,7 @@ pub mod propvariant;
 pub mod random;
 pub mod registry;
 pub mod resource;
+pub mod rxact;
 pub mod security;
 pub mod splay;
 pub mod status;

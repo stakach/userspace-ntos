@@ -298,6 +298,69 @@ impl WaitSeam {
     }
 }
 
+// --- RtlpWaitForCriticalSection's decision logic (pure, host-tested) ---------------------------
+//
+// `references/reactos/sdk/lib/rtl/critical.c:117`. The blocking syscall itself is a target concern
+// (the DLL wrapper drives NtWaitForSingleObject / NtWaitForKeyedEvent); what is *logic* — and what
+// used to be the project's recurring deadlock-debugging tax — is the surrounding state machine:
+// which `DebugInfo` counters get bumped, when the loader-shutdown force-ownership escape applies,
+// and the two-strikes timeout → `STATUS_POSSIBLE_DEADLOCK` progression. That lives here.
+
+/// `STATUS_TIMEOUT` — the wait expired without the lock being released.
+pub const STATUS_TIMEOUT: NtStatus = 0x0000_0102;
+
+/// `STATUS_POSSIBLE_DEADLOCK` — raised (as a software exception) after a second timeout.
+pub const STATUS_POSSIBLE_DEADLOCK: NtStatus = 0xC000_0194;
+
+/// `RTL_CRITICAL_SECTION_DEBUG_NO_DEBUG_INFO` — the `-1` sentinel a critical section stores in
+/// `DebugInfo` when it was initialised with `RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO`.
+pub const CRITSECT_NO_DEBUG_INFO: u64 = u64::MAX;
+
+/// `CRITSECT_HAS_DEBUG_INFO` (`references/reactos/sdk/lib/rtl/rtlp.h`): a `DebugInfo` pointer is
+/// usable only when it is neither NULL nor the `-1` no-debug-info sentinel. Every counter bump in
+/// the wait path is gated on this.
+pub fn critsect_has_debug_info(debug_info: u64) -> bool {
+    debug_info != 0 && debug_info != CRITSECT_NO_DEBUG_INFO
+}
+
+/// The loader-shutdown escape (critical.c:132-139): *"If we're shutting down the process, we're
+/// allowed to acquire any critical section by force (the loader lock in particular)"* — but only on
+/// the very thread that is running the shutdown, so an unrelated thread still blocks normally.
+pub fn shutdown_forces_ownership(
+    shutdown_in_progress: bool,
+    shutdown_thread: u64,
+    current_thread: u64,
+) -> bool {
+    shutdown_in_progress && shutdown_thread == current_thread && current_thread != 0
+}
+
+/// What the wait loop does with the status a single blocking wait returned.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The wait completed — the caller owns the critical section (critical.c:194).
+    Acquired,
+    /// First timeout: ReactOS gives the lock exactly one more chance (`LastChance = TRUE`) before
+    /// declaring a deadlock (critical.c:189).
+    RetryLastChance,
+    /// Second timeout: raise `STATUS_POSSIBLE_DEADLOCK` with the critical section as
+    /// `ExceptionInformation[0]` (critical.c:173-184).
+    Deadlock,
+}
+
+/// The timeout state machine of `RtlpWaitForCriticalSection`'s `for (;;)` loop. `last_chance` is the
+/// loop-carried flag; any non-`STATUS_TIMEOUT` status (success *or* failure) ends the loop, exactly
+/// as ReactOS's `else { return STATUS_SUCCESS; }` arm does.
+pub fn classify_wait(status: NtStatus, last_chance: bool) -> WaitOutcome {
+    if status != STATUS_TIMEOUT {
+        return WaitOutcome::Acquired;
+    }
+    if last_chance {
+        WaitOutcome::Deadlock
+    } else {
+        WaitOutcome::RetryLastChance
+    }
+}
+
 // --- RTL_SRWLOCK ------------------------------------------------------------------------------
 
 /// `RTL_SRWLOCK` — a single pointer-width word. Bit 0 is the `Locked` bit; the upper bits form the
@@ -589,5 +652,53 @@ mod tests {
         ro.complete();
         assert!(ro.is_complete());
         assert_eq!(ro.begin(), RunOnceBegin::AlreadyComplete);
+    }
+
+    #[test]
+    fn debug_info_gate_rejects_null_and_the_minus_one_sentinel() {
+        assert!(!critsect_has_debug_info(0));
+        assert!(!critsect_has_debug_info(CRITSECT_NO_DEBUG_INFO));
+        assert!(critsect_has_debug_info(0x1234_5678_9ABC));
+    }
+
+    #[test]
+    fn shutdown_forces_ownership_only_on_the_shutting_down_thread() {
+        assert!(shutdown_forces_ownership(true, 0x40, 0x40));
+        // A different thread must still block.
+        assert!(!shutdown_forces_ownership(true, 0x40, 0x44));
+        // No shutdown in progress -> never forced.
+        assert!(!shutdown_forces_ownership(false, 0x40, 0x40));
+        // A zero thread id (no shutdown thread recorded) must not match a zero current id.
+        assert!(!shutdown_forces_ownership(true, 0, 0));
+    }
+
+    #[test]
+    fn wait_classification_gives_exactly_one_last_chance_before_deadlock() {
+        assert_eq!(classify_wait(0, false), WaitOutcome::Acquired);
+        // A hard failure also ends the loop (ReactOS's `else` arm).
+        assert_eq!(classify_wait(0xC000_0008, false), WaitOutcome::Acquired);
+        assert_eq!(
+            classify_wait(STATUS_TIMEOUT, false),
+            WaitOutcome::RetryLastChance
+        );
+        assert_eq!(classify_wait(STATUS_TIMEOUT, true), WaitOutcome::Deadlock);
+    }
+
+    #[test]
+    fn wait_loop_reaches_deadlock_on_the_second_timeout_only() {
+        // Drive the loop-carried flag exactly as the wrapper does.
+        let mut last_chance = false;
+        let mut outcomes = alloc::vec::Vec::new();
+        for status in [STATUS_TIMEOUT, STATUS_TIMEOUT] {
+            let outcome = classify_wait(status, last_chance);
+            outcomes.push(outcome);
+            if outcome == WaitOutcome::RetryLastChance {
+                last_chance = true;
+            }
+        }
+        assert_eq!(
+            outcomes,
+            alloc::vec![WaitOutcome::RetryLastChance, WaitOutcome::Deadlock]
+        );
     }
 }

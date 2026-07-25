@@ -7736,6 +7736,14 @@ const KVPI_DATA_OFFSET: u64 = 0x0C;
 /// `KeyValuePartialInformation` class.
 const KEY_VALUE_PARTIAL_INFORMATION: u64 = 2;
 const SSN_NT_SET_VALUE_KEY: u32 = 256;
+/// `NtDeleteKey` / `NtEnumerateKey` / `NtFlushKey` — the RXACT + `RtlpNt*` registry tail
+/// (`crates/nt-syscall-abi`, the shared SSN table).
+const SSN_NT_DELETE_KEY: u32 = 66;
+const SSN_NT_ENUMERATE_KEY: u32 = 75;
+const SSN_NT_FLUSH_KEY: u32 = 83;
+/// `REG_BINARY` — the type `RtlApplyRXact` persists its log under.
+const REG_BINARY: u32 = 3;
+const STATUS_BUFFER_TOO_SMALL_U32: u32 = 0xC000_0023;
 const STATUS_NO_MEMORY_U: u64 = 0xC000_0017;
 const STATUS_BUFFER_OVERFLOW_U: u64 = 0x8000_0005;
 
@@ -7883,6 +7891,947 @@ pub unsafe extern "system" fn rtlp_nt_set_value_key(
             data_length,
         ) as u32
     }
+}
+
+/// `RtlpNtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES, ULONG
+/// TitleIndex, PUNICODE_STRING Class, PULONG Disposition)` — mask off `OBJ_PERMANENT|OBJ_EXCLUSIVE`,
+/// then `NtCreateKey` with a zero TitleIndex / NULL Class, exactly as
+/// `references/reactos/sdk/lib/rtl/registry.c:818`. (ReactOS ignores the caller's `TitleIndex` and
+/// `Class` arguments and passes `0`/`NULL` — that is deliberate, not an omission here.)
+///
+/// # Safety
+/// `key_handle`/`disposition` writable; `object_attributes` a valid `OBJECT_ATTRIBUTES` or NULL.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtCreateKey"]
+pub unsafe extern "system" fn rtlp_nt_create_key(
+    key_handle: u64,
+    desired_access: u64,
+    object_attributes: u64,
+    _title_index: u64,
+    _class: u64,
+    disposition: u64,
+) -> u32 {
+    // OBJECT_ATTRIBUTES.Attributes @ +0x10 (ULONG). Clear OBJ_PERMANENT(0x10)|OBJ_EXCLUSIVE(0x20).
+    if object_attributes != 0 {
+        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x10.
+        unsafe {
+            let attr_ptr = (object_attributes + 0x10) as *mut u32;
+            let a = core::ptr::read_unaligned(attr_ptr);
+            core::ptr::write_unaligned(attr_ptr, a & !(0x10 | 0x20));
+        }
+    }
+    // SAFETY: NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex=0, Class=NULL,
+    // CreateOptions=0, Disposition) — SSN 43, 7 args.
+    unsafe {
+        syscall8(
+            SSN_NT_CREATE_KEY,
+            key_handle,
+            desired_access,
+            object_attributes,
+            0,
+            0,
+            0,
+            disposition,
+            0,
+        ) as u32
+    }
+}
+
+/// `RtlpNtMakeTemporaryKey(HANDLE KeyHandle)` — "this just deletes the key"
+/// (`references/reactos/sdk/lib/rtl/registry.c:904`).
+///
+/// # Safety
+/// `key_handle` is an open registry key handle.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtMakeTemporaryKey"]
+pub unsafe extern "system" fn rtlp_nt_make_temporary_key(key_handle: u64) -> u32 {
+    // SAFETY: NtDeleteKey(KeyHandle) — SSN 66, 1 arg.
+    unsafe { syscall4(SSN_NT_DELETE_KEY, key_handle, 0, 0, 0) as u32 }
+}
+
+/// `KEY_BASIC_INFORMATION` (x64): LastWriteTime(8), TitleIndex(4), NameLength(4), Name[...] — so
+/// `Name` starts at +0x10 and the header is 0x10 bytes.
+const KEY_BASIC_INFORMATION_HEADER: u64 = 0x10;
+/// `KeyBasicInformation` class.
+const KEY_BASIC_INFORMATION: u64 = 0;
+
+/// `RtlpNtEnumerateSubKey(HANDLE KeyHandle, PUNICODE_STRING SubKeyName, ULONG Index, ULONG Unused)`
+/// — `NtEnumerateKey(KeyBasicInformation)` into a process-heap scratch buffer, then copy the name
+/// into the caller's `UNICODE_STRING` (`references/reactos/sdk/lib/rtl/registry.c:847`). A name
+/// longer than `MaximumLength` yields `STATUS_BUFFER_OVERFLOW`; a zero `MaximumLength` skips the
+/// allocation entirely and just returns the enumerate status (ReactOS passes NULL/0 through).
+///
+/// # Safety
+/// `sub_key_name` is a writable `UNICODE_STRING` whose `Buffer` holds `MaximumLength` bytes.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtEnumerateSubKey"]
+pub unsafe extern "system" fn rtlp_nt_enumerate_sub_key(
+    key_handle: u64,
+    sub_key_name: u64,
+    index: u64,
+    _unused: u64,
+) -> u32 {
+    if sub_key_name == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    // SAFETY: UNICODE_STRING { Length@0, MaximumLength@2, Buffer@8 } per the ABI.
+    let (maximum_length, buffer) = unsafe {
+        (
+            core::ptr::read_unaligned((sub_key_name + 2) as *const u16),
+            core::ptr::read_unaligned((sub_key_name + 8) as *const u64),
+        )
+    };
+
+    let mut scratch: *mut u8 = core::ptr::null_mut();
+    let mut buffer_length: u64 = 0;
+    if maximum_length != 0 {
+        buffer_length = u64::from(maximum_length) + KEY_BASIC_INFORMATION_HEADER;
+        // SAFETY: process-heap scratch for the KEY_BASIC_INFORMATION record (freed below).
+        scratch = unsafe { crate::process_heap_alloc(buffer_length as usize) };
+        if scratch.is_null() {
+            return STATUS_NO_MEMORY_U as u32;
+        }
+    }
+
+    let mut returned_length: u32 = 0;
+    // SAFETY: NtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length,
+    // ResultLength) — SSN 75, 6 args.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_ENUMERATE_KEY,
+            key_handle,
+            index,
+            KEY_BASIC_INFORMATION,
+            scratch as u64,
+            buffer_length,
+            &mut returned_length as *mut u32 as u64,
+        ) as u32
+    };
+
+    let mut result = status;
+    if (status as i32) >= 0 && !scratch.is_null() {
+        // SAFETY: the executive filled the record; NameLength@+0x0C, Name@+0x10.
+        unsafe {
+            let name_length = core::ptr::read_unaligned(scratch.add(0x0C) as *const u32);
+            if name_length <= u32::from(maximum_length) {
+                core::ptr::write_unaligned(sub_key_name as *mut u16, name_length as u16);
+                if buffer != 0 && name_length != 0 {
+                    core::ptr::copy(
+                        scratch.add(KEY_BASIC_INFORMATION_HEADER as usize),
+                        buffer as *mut u8,
+                        name_length as usize,
+                    );
+                }
+            } else {
+                result = STATUS_BUFFER_OVERFLOW_U as u32;
+            }
+        }
+    }
+    if !scratch.is_null() {
+        // SAFETY: scratch came from process_heap_alloc above.
+        unsafe { crate::process_heap_free(scratch) };
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------------------------
+// RXACT — the registry-transaction family (references/reactos/sdk/lib/rtl/rxact.c). The LOG FORMAT
+// (RXACT_DATA/RXACT_ACTION layout, offset relocation, sizing + growth) is the host-tested pure core
+// `nt_ntdll::rtl::rxact`; everything below is the target tail: process-heap allocation and the
+// Nt*Key syscalls, issued through OUR transport and serviced by the executive's Config Manager.
+//
+// The context is `RXACT_CONTEXT { HANDLE RootDirectory; HANDLE KeyHandle; BOOLEAN CanUseHandles;
+// PRXACT_DATA Data; }` — x64 offsets 0x00 / 0x08 / 0x10 / 0x18 (Data is pointer-aligned).
+// ---------------------------------------------------------------------------------------------
+
+const RXACT_CTX_ROOT_DIRECTORY: u64 = 0x00;
+const RXACT_CTX_KEY_HANDLE: u64 = 0x08;
+const RXACT_CTX_CAN_USE_HANDLES: u64 = 0x10;
+const RXACT_CTX_DATA: u64 = 0x18;
+const RXACT_CONTEXT_SIZE: usize = 0x20;
+
+const STATUS_RXACT_INVALID_STATE: u32 = 0xC000_011C;
+const STATUS_RXACT_STATE_CREATED: u32 = 0x4000_0004;
+const STATUS_RXACT_COMMIT_NECESSARY: u32 = 0x8000_0018;
+const STATUS_OBJECT_NAME_NOT_FOUND_U32: u32 = 0xC000_0034;
+const REG_CREATED_NEW_KEY: u32 = 1;
+const KEY_VALUE_BASIC_INFORMATION: u64 = 0;
+/// `DELETE` / `KEY_WRITE` / `KEY_READ|KEY_WRITE|DELETE` access masks used by rxact.c.
+const ACCESS_DELETE: u64 = 0x0001_0000;
+const KEY_WRITE_ACCESS: u64 = 0x0002_0006;
+const KEY_READ_ACCESS: u64 = 0x0002_0019;
+const OBJ_OPENIF: u32 = 0x80;
+
+/// Read `Context->Data` (the live log buffer) as a byte slice of `BufferSize` bytes, or `None` when
+/// no transaction is active.
+///
+/// # Safety
+/// `context` is a valid `RXACT_CONTEXT`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rxact_log(context: u64) -> Option<(*mut u8, u32)> {
+    // SAFETY: Data@+0x18 per the layout above.
+    let data = unsafe { core::ptr::read_unaligned((context + RXACT_CTX_DATA) as *const u64) };
+    if data == 0 {
+        return None;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(data as *const u8, 12) };
+    let size = nt_ntdll::rtl::rxact::buffer_size(slice)?;
+    Some((data as *mut u8, size))
+}
+
+/// Build an inline `UNICODE_STRING` over a caller-owned UTF-16 literal. `slot` must outlive the
+/// syscall it is passed to.
+#[cfg(target_arch = "x86_64")]
+unsafe fn inline_unicode_string(slot: &mut [u64; 2], units: &[u16]) -> u64 {
+    let bytes = (units.len() * 2) as u64;
+    slot[0] = bytes | (bytes << 16);
+    slot[1] = units.as_ptr() as u64;
+    slot.as_ptr() as u64
+}
+
+/// Build an inline `OBJECT_ATTRIBUTES { ULONG Length; HANDLE RootDirectory; PUNICODE_STRING
+/// ObjectName; ULONG Attributes; PVOID SecurityDescriptor; PVOID SecurityQualityOfService; }` (x64:
+/// 0x30 bytes, ObjectName@0x10, Attributes@0x18).
+#[cfg(target_arch = "x86_64")]
+unsafe fn inline_object_attributes(
+    slot: &mut [u64; 6],
+    root_directory: u64,
+    object_name: u64,
+    attributes: u32,
+) -> u64 {
+    slot[0] = 0x30; // Length | padding
+    slot[1] = root_directory;
+    slot[2] = object_name;
+    slot[3] = u64::from(attributes);
+    slot[4] = 0;
+    slot[5] = 0;
+    slot.as_ptr() as u64
+}
+
+/// `RXactpOpenTargetKey` (rxact.c:74): open-for-DELETE on a delete action, open-or-create for write
+/// on a set action.
+///
+/// # Safety
+/// `key_name` is a valid `PUNICODE_STRING`; `key_handle_out` is writable.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rxact_open_target_key(
+    root_directory: u64,
+    action_type: u32,
+    key_name: u64,
+    key_handle_out: *mut u64,
+) -> u32 {
+    let mut oa_slot = [0u64; 6];
+    if action_type == nt_ntdll::rtl::rxact::RXACT_DELETE_KEY {
+        // SAFETY: stack-owned OA; NtOpenKey(KeyHandle, DELETE, OA) — SSN 125, 3 args.
+        unsafe {
+            let oa =
+                inline_object_attributes(&mut oa_slot, root_directory, key_name, OBJ_CASE_INSENSITIVE);
+            syscall4(
+                SSN_NT_OPEN_KEY,
+                key_handle_out as u64,
+                ACCESS_DELETE,
+                oa,
+                0,
+            ) as u32
+        }
+    } else if action_type == nt_ntdll::rtl::rxact::RXACT_SET_VALUE_KEY {
+        let mut disposition: u32 = 0;
+        // SAFETY: stack-owned OA; NtCreateKey(..., KEY_WRITE, ...) — SSN 43, 7 args.
+        unsafe {
+            let oa = inline_object_attributes(
+                &mut oa_slot,
+                root_directory,
+                key_name,
+                OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            );
+            syscall8(
+                SSN_NT_CREATE_KEY,
+                key_handle_out as u64,
+                KEY_WRITE_ACCESS,
+                oa,
+                0,
+                0,
+                0,
+                &mut disposition as *mut u32 as u64,
+                0,
+            ) as u32
+        }
+    } else {
+        STATUS_INVALID_PARAMETER_U32
+    }
+}
+
+/// `RXactpCommit` (rxact.c:124): replay every recorded action against the registry. Offsets stored
+/// in the log are relocated against the log base here (rxact.c:141-144).
+///
+/// # Safety
+/// `context` is a valid `RXACT_CONTEXT` with an active log.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rxact_commit(context: u64) -> u32 {
+    let Some((data, size)) = (unsafe { rxact_log(context) }) else {
+        return STATUS_RXACT_INVALID_STATE;
+    };
+    // SAFETY: the log occupies `size` bytes from `data` (its own BufferSize).
+    let log = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
+    let Some(count) = nt_ntdll::rtl::rxact::action_count(log) else {
+        return STATUS_RXACT_INVALID_STATE;
+    };
+    // SAFETY: RootDirectory@0 / CanUseHandles@0x10 per the layout.
+    let (root_directory, can_use_handles) = unsafe {
+        (
+            core::ptr::read_unaligned((context + RXACT_CTX_ROOT_DIRECTORY) as *const u64),
+            core::ptr::read_unaligned((context + RXACT_CTX_CAN_USE_HANDLES) as *const u8) != 0,
+        )
+    };
+
+    for index in 0..count {
+        let Ok(action) = nt_ntdll::rtl::rxact::action_at(log, index) else {
+            return STATUS_INVALID_PARAMETER_U32;
+        };
+        // Relocate the stored offsets against the log base.
+        let key_name_ptr = data as u64 + u64::from(action.key_name_offset);
+        let value_name_ptr = data as u64 + u64::from(action.value_name_offset);
+        let value_data_ptr = data as u64 + u64::from(action.value_data_offset);
+
+        let mut key_name_slot = [0u64; 2];
+        key_name_slot[0] =
+            u64::from(action.key_name_length) | (u64::from(action.key_name_maximum_length) << 16);
+        key_name_slot[1] = key_name_ptr;
+        let key_name = key_name_slot.as_ptr() as u64;
+
+        let mut value_name_slot = [0u64; 2];
+        value_name_slot[0] = u64::from(action.value_name_length)
+            | (u64::from(action.value_name_maximum_length) << 16);
+        value_name_slot[1] = if action.value_name_length == 0 {
+            0
+        } else {
+            value_name_ptr
+        };
+        let value_name = value_name_slot.as_ptr() as u64;
+
+        let by_handle =
+            action.key_handle != nt_ntdll::rtl::rxact::RXACT_INVALID_HANDLE && can_use_handles;
+
+        if action.action_type == nt_ntdll::rtl::rxact::RXACT_DELETE_KEY {
+            if by_handle {
+                // SAFETY: NtDeleteKey(KeyHandle) — SSN 66, 1 arg.
+                let status = unsafe { syscall4(SSN_NT_DELETE_KEY, action.key_handle, 0, 0, 0) as u32 };
+                if (status as i32) < 0 {
+                    return status;
+                }
+            } else {
+                let mut handle: u64 = 0;
+                // SAFETY: opens the key named by the record.
+                let status = unsafe {
+                    rxact_open_target_key(
+                        root_directory,
+                        action.action_type,
+                        key_name,
+                        &mut handle,
+                    )
+                };
+                if (status as i32) >= 0 {
+                    // SAFETY: NtDeleteKey then NtClose on the handle we just opened.
+                    let delete = unsafe { syscall4(SSN_NT_DELETE_KEY, handle, 0, 0, 0) as u32 };
+                    let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+                    if (delete as i32) < 0 {
+                        return delete;
+                    }
+                } else if status != STATUS_OBJECT_NAME_NOT_FOUND_U32 {
+                    // "Failed to open the key, it's ok, if it was not found" (rxact.c:176).
+                    return status;
+                }
+            }
+        } else if by_handle {
+            // SAFETY: NtSetValueKey(KeyHandle, ValueName, 0, Type, Data, DataSize) — SSN 256.
+            let status = unsafe {
+                syscall6(
+                    SSN_NT_SET_VALUE_KEY,
+                    action.key_handle,
+                    value_name,
+                    0,
+                    u64::from(action.value_type),
+                    value_data_ptr,
+                    u64::from(action.value_data_size),
+                ) as u32
+            };
+            if (status as i32) < 0 {
+                return status;
+            }
+        } else {
+            let mut handle: u64 = 0;
+            // SAFETY: open-or-create the key named by the record.
+            let status = unsafe {
+                rxact_open_target_key(root_directory, action.action_type, key_name, &mut handle)
+            };
+            if (status as i32) < 0 {
+                return status;
+            }
+            // SAFETY: NtSetValueKey on the freshly opened handle, then NtClose.
+            let set = unsafe {
+                syscall6(
+                    SSN_NT_SET_VALUE_KEY,
+                    handle,
+                    value_name,
+                    0,
+                    u64::from(action.value_type),
+                    value_data_ptr,
+                    u64::from(action.value_data_size),
+                ) as u32
+            };
+            let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+            if (set as i32) < 0 {
+                return set;
+            }
+        }
+    }
+    STATUS_SUCCESS_U32
+}
+
+/// `RtlStartRXact(PRXACT_CONTEXT Context)` (rxact.c:243) — allocate + initialise the transaction
+/// log. Fails with `STATUS_RXACT_INVALID_STATE` if one is already active.
+///
+/// # Safety
+/// `context` is a valid `RXACT_CONTEXT`.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlStartRXact"]
+pub unsafe extern "system" fn rtl_start_rxact(context: u64) -> u32 {
+    if context == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    // SAFETY: Data@+0x18 per the layout.
+    if unsafe { core::ptr::read_unaligned((context + RXACT_CTX_DATA) as *const u64) } != 0 {
+        return STATUS_RXACT_INVALID_STATE;
+    }
+    let size = nt_ntdll::rtl::rxact::RXACT_DEFAULT_BUFFER_SIZE as usize;
+    // SAFETY: process-heap allocation owned by the context until Abort/Apply.
+    let buffer = unsafe { crate::process_heap_alloc(size) };
+    if buffer.is_null() {
+        return STATUS_NO_MEMORY_U as u32;
+    }
+    // SAFETY: `buffer` covers `size` bytes; the core writes only the 12-byte header.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buffer, size) };
+    if nt_ntdll::rtl::rxact::init_data(slice, nt_ntdll::rtl::rxact::RXACT_DEFAULT_BUFFER_SIZE)
+        .is_err()
+    {
+        // SAFETY: buffer came from process_heap_alloc above.
+        unsafe { crate::process_heap_free(buffer) };
+        return STATUS_NO_MEMORY_U as u32;
+    }
+    // SAFETY: publishes the log into the context.
+    unsafe { core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, buffer as u64) };
+    STATUS_SUCCESS_U32
+}
+
+/// `RtlAbortRXact(PRXACT_CONTEXT Context)` (rxact.c:275) — free the log and reset the context
+/// (`RXactInitializeContext`: `CanUseHandles = TRUE`, `Data = NULL`, handles preserved).
+///
+/// # Safety
+/// `context` is a valid `RXACT_CONTEXT`.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlAbortRXact"]
+pub unsafe extern "system" fn rtl_abort_rxact(context: u64) -> u32 {
+    if context == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    // SAFETY: Data@+0x18 per the layout.
+    let data = unsafe { core::ptr::read_unaligned((context + RXACT_CTX_DATA) as *const u64) };
+    if data == 0 {
+        return STATUS_RXACT_INVALID_STATE;
+    }
+    // SAFETY: the log came from process_heap_alloc; the context is reset to the initialised state.
+    unsafe {
+        crate::process_heap_free(data as *mut u8);
+        core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, 0);
+        core::ptr::write_unaligned((context + RXACT_CTX_CAN_USE_HANDLES) as *mut u8, 1);
+    }
+    STATUS_SUCCESS_U32
+}
+
+/// `RtlAddAttributeActionToRXact(PRXACT_CONTEXT, ULONG ActionType, PUNICODE_STRING KeyName, HANDLE
+/// KeyHandle, PUNICODE_STRING ValueName, ULONG ValueType, PVOID ValueData, ULONG ValueDataSize)`
+/// (rxact.c:487) — append one action record, growing the log by doubling when needed.
+///
+/// # Safety
+/// `context` valid with an active log; the two `UNICODE_STRING`s and `value_data` valid.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlAddAttributeActionToRXact"]
+pub unsafe extern "system" fn rtl_add_attribute_action_to_rxact(
+    context: u64,
+    action_type: u64,
+    key_name: u64,
+    key_handle: u64,
+    value_name: u64,
+    value_type: u64,
+    value_data: u64,
+    value_data_size: u64,
+) -> u32 {
+    let action_type = action_type as u32;
+    if action_type != nt_ntdll::rtl::rxact::RXACT_DELETE_KEY
+        && action_type != nt_ntdll::rtl::rxact::RXACT_SET_VALUE_KEY
+    {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    if context == 0 || key_name == 0 || value_name == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let Some((mut data, mut size)) = (unsafe { rxact_log(context) }) else {
+        return STATUS_RXACT_INVALID_STATE;
+    };
+
+    // SAFETY: UNICODE_STRING { Length@0, MaximumLength@2, Buffer@8 }.
+    let (key_len, key_max, key_buf, value_len, value_max, value_buf) = unsafe {
+        (
+            core::ptr::read_unaligned(key_name as *const u16),
+            core::ptr::read_unaligned((key_name + 2) as *const u16),
+            core::ptr::read_unaligned((key_name + 8) as *const u64),
+            core::ptr::read_unaligned(value_name as *const u16),
+            core::ptr::read_unaligned((value_name + 2) as *const u16),
+            core::ptr::read_unaligned((value_name + 8) as *const u64),
+        )
+    };
+    let value_data_size = value_data_size as u32;
+
+    // Grow the log first (rxact.c:508-546) so the pure writer only ever sees a big-enough buffer.
+    let Some(action_size) =
+        nt_ntdll::rtl::rxact::action_record_size(key_len, value_len, value_data_size)
+    else {
+        return STATUS_NO_MEMORY_U as u32;
+    };
+    // SAFETY: the header is the first 12 bytes of the live log.
+    let current = {
+        let header = unsafe { core::slice::from_raw_parts(data as *const u8, 12) };
+        match nt_ntdll::rtl::rxact::current_size(header) {
+            Some(current) => current,
+            None => return STATUS_RXACT_INVALID_STATE,
+        }
+    };
+    let required = match nt_ntdll::rtl::rxact::required_size(current, action_size) {
+        Ok(required) => required,
+        Err(_) => return STATUS_NO_MEMORY_U as u32,
+    };
+    if required > size {
+        let Some(grown) = nt_ntdll::rtl::rxact::grown_buffer_size(size, required) else {
+            return STATUS_NO_MEMORY_U as u32;
+        };
+        // SAFETY: fresh block; the old log's live bytes are copied over, then it is freed.
+        let fresh = unsafe { crate::process_heap_alloc(grown as usize) };
+        if fresh.is_null() {
+            return STATUS_NO_MEMORY_U as u32;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(data as *const u8, fresh, current as usize);
+            crate::process_heap_free(data);
+            core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, fresh as u64);
+        }
+        data = fresh;
+        size = grown;
+        // SAFETY: `fresh` covers `grown` bytes.
+        let header = unsafe { core::slice::from_raw_parts_mut(data, 12) };
+        let _ = nt_ntdll::rtl::rxact::set_buffer_size(header, grown);
+    }
+
+    // SAFETY: names/data are caller-owned buffers of the recorded lengths.
+    let (key_units, value_units, data_bytes) = unsafe {
+        (
+            if key_buf == 0 || key_len == 0 {
+                &[][..]
+            } else {
+                core::slice::from_raw_parts(key_buf as *const u16, usize::from(key_len) / 2)
+            },
+            if value_buf == 0 || value_len == 0 {
+                &[][..]
+            } else {
+                core::slice::from_raw_parts(value_buf as *const u16, usize::from(value_len) / 2)
+            },
+            if value_data == 0 || value_data_size == 0 {
+                &[][..]
+            } else {
+                core::slice::from_raw_parts(value_data as *const u8, value_data_size as usize)
+            },
+        )
+    };
+    // SAFETY: the log owns `size` bytes.
+    let log = unsafe { core::slice::from_raw_parts_mut(data, size as usize) };
+    match nt_ntdll::rtl::rxact::append_action(
+        log,
+        action_type,
+        key_units,
+        key_max,
+        key_handle,
+        value_units,
+        value_max,
+        value_type as u32,
+        data_bytes,
+    ) {
+        Ok(()) => STATUS_SUCCESS_U32,
+        Err(nt_ntdll::rtl::rxact::RxactError::InvalidParameter) => STATUS_INVALID_PARAMETER_U32,
+        Err(nt_ntdll::rtl::rxact::RxactError::NoMemory) => STATUS_NO_MEMORY_U as u32,
+        Err(nt_ntdll::rtl::rxact::RxactError::InvalidState) => STATUS_RXACT_INVALID_STATE,
+    }
+}
+
+/// `RtlAddActionToRXact(PRXACT_CONTEXT, ULONG ActionType, PUNICODE_STRING KeyName, ULONG ValueType,
+/// PVOID ValueData, ULONG ValueDataSize)` (rxact.c:592) — the default-value form: an empty value
+/// name and `INVALID_HANDLE_VALUE` for the key handle (so the commit opens the key by name).
+///
+/// # Safety
+/// `context` valid with an active log; `key_name`/`value_data` valid.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlAddActionToRXact"]
+pub unsafe extern "system" fn rtl_add_action_to_rxact(
+    context: u64,
+    action_type: u64,
+    key_name: u64,
+    value_type: u64,
+    value_data: u64,
+    value_data_size: u64,
+) -> u32 {
+    let mut value_name_slot = [0u64; 2];
+    // SAFETY: stack-owned empty UNICODE_STRING, alive across the call below.
+    let value_name = unsafe { empty_unicode_string(&mut value_name_slot) };
+    // SAFETY: forwards to the attribute form with INVALID_HANDLE_VALUE, exactly as rxact.c:600.
+    unsafe {
+        rtl_add_attribute_action_to_rxact(
+            context,
+            action_type,
+            key_name,
+            nt_ntdll::rtl::rxact::RXACT_INVALID_HANDLE,
+            value_name,
+            value_type,
+            value_data,
+            value_data_size,
+        )
+    }
+}
+
+/// `RtlApplyRXactNoFlush(PRXACT_CONTEXT Context)` (rxact.c:625) — commit the recorded actions
+/// WITHOUT first persisting the log, then reset the transaction.
+///
+/// # Safety
+/// `context` valid with an active log.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlApplyRXactNoFlush"]
+pub unsafe extern "system" fn rtl_apply_rxact_no_flush(context: u64) -> u32 {
+    if context == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    // SAFETY: replays the log against the registry.
+    let status = unsafe { rxact_commit(context) };
+    if (status as i32) < 0 {
+        return status;
+    }
+    // SAFETY: frees + resets the transaction.
+    unsafe { rtl_abort_rxact(context) }
+}
+
+/// `RtlApplyRXact(PRXACT_CONTEXT Context)` (rxact.c:646) — the crash-consistent commit: persist the
+/// log to `RXACT\Log` (`REG_BINARY`) and `NtFlushKey` it, replay it, then delete the log value and
+/// reset. Any failure after the log was written deletes it again before returning.
+///
+/// # Safety
+/// `context` valid with an active log.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlApplyRXact"]
+pub unsafe extern "system" fn rtl_apply_rxact(context: u64) -> u32 {
+    if context == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let Some((data, _size)) = (unsafe { rxact_log(context) }) else {
+        return STATUS_RXACT_INVALID_STATE;
+    };
+    // SAFETY: the 12-byte header carries CurrentSize — the number of bytes to persist.
+    let current = {
+        let header = unsafe { core::slice::from_raw_parts(data as *const u8, 12) };
+        match nt_ntdll::rtl::rxact::current_size(header) {
+            Some(current) => current,
+            None => return STATUS_RXACT_INVALID_STATE,
+        }
+    };
+    // SAFETY: KeyHandle@+0x08 per the layout.
+    let key_handle =
+        unsafe { core::ptr::read_unaligned((context + RXACT_CTX_KEY_HANDLE) as *const u64) };
+
+    // Stack-owned (not a `const`, whose `&` would be a promoted temporary) so the UNICODE_STRING we
+    // hand the syscalls points at storage that outlives every call below.
+    let log = [b'L' as u16, b'o' as u16, b'g' as u16];
+    let mut name_slot = [0u64; 2];
+    // SAFETY: stack-owned UNICODE_STRING over `log`, alive for the rest of this function.
+    let value_name = unsafe { inline_unicode_string(&mut name_slot, &log) };
+
+    // SAFETY: NtSetValueKey(KeyHandle, "Log", 0, REG_BINARY, Data, CurrentSize) — SSN 256.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_SET_VALUE_KEY,
+            key_handle,
+            value_name,
+            0,
+            u64::from(REG_BINARY),
+            data as u64,
+            u64::from(current),
+        ) as u32
+    };
+    if (status as i32) < 0 {
+        return status;
+    }
+    // SAFETY: NtFlushKey(KeyHandle) — SSN 83, 1 arg.
+    let status = unsafe { syscall4(SSN_NT_FLUSH_KEY, key_handle, 0, 0, 0) as u32 };
+    if (status as i32) < 0 {
+        // SAFETY: NtDeleteValueKey(KeyHandle, "Log") — SSN 68, 2 args.
+        let _ = unsafe { syscall4(SSN_NT_DELETE_VALUE_KEY, key_handle, value_name, 0, 0) };
+        return status;
+    }
+    // SAFETY: replays the log.
+    let status = unsafe { rxact_commit(context) };
+    if (status as i32) < 0 {
+        // SAFETY: NtDeleteValueKey(KeyHandle, "Log").
+        let _ = unsafe { syscall4(SSN_NT_DELETE_VALUE_KEY, key_handle, value_name, 0, 0) };
+        return status;
+    }
+    // SAFETY: NtDeleteValueKey(KeyHandle, "Log") then reset the transaction.
+    let _ = unsafe { syscall4(SSN_NT_DELETE_VALUE_KEY, key_handle, value_name, 0, 0) };
+    let _ = unsafe { rtl_abort_rxact(context) };
+    STATUS_SUCCESS_U32
+}
+
+/// `RtlInitializeRXact(HANDLE RootDirectory, BOOLEAN Commit, PRXACT_CONTEXT *OutContext)`
+/// (rxact.c:293) — open-or-create the `RXACT` key under `RootDirectory`, allocate the context, and
+/// (on an existing key) validate the revision + replay any surviving `Log` value.
+///
+/// Returns `STATUS_RXACT_STATE_CREATED` when the `RXACT` key was newly created,
+/// `STATUS_RXACT_COMMIT_NECESSARY` when a log survives but `Commit` was FALSE, and
+/// `STATUS_UNKNOWN_REVISION` when the stored revision is not 1.
+///
+/// # Safety
+/// `out_context` is a writable `PRXACT_CONTEXT` slot.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlInitializeRXact"]
+pub unsafe extern "system" fn rtl_initialize_rxact(
+    root_directory: u64,
+    commit: u64,
+    out_context: u64,
+) -> u32 {
+    const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058;
+    // Stack-owned (see the note in RtlApplyRXact) so the UNICODE_STRING buffers stay valid.
+    let rxact = [
+        b'R' as u16,
+        b'X' as u16,
+        b'A' as u16,
+        b'C' as u16,
+        b'T' as u16,
+    ];
+    if out_context == 0 {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let mut key_name_slot = [0u64; 2];
+    let mut oa_slot = [0u64; 6];
+    let mut key_handle: u64 = 0;
+    let mut disposition: u32 = 0;
+    // SAFETY: stack-owned OA/name; NtCreateKey(KEY_READ|KEY_WRITE|DELETE, OBJ_OPENIF) — SSN 43.
+    let status = unsafe {
+        let name = inline_unicode_string(&mut key_name_slot, &rxact);
+        let oa = inline_object_attributes(
+            &mut oa_slot,
+            root_directory,
+            name,
+            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+        );
+        syscall8(
+            SSN_NT_CREATE_KEY,
+            &mut key_handle as *mut u64 as u64,
+            KEY_READ_ACCESS | KEY_WRITE_ACCESS | ACCESS_DELETE,
+            oa,
+            0,
+            0,
+            0,
+            &mut disposition as *mut u32 as u64,
+            0,
+        ) as u32
+    };
+    if (status as i32) < 0 {
+        return status;
+    }
+
+    // SAFETY: the context is process-heap owned and handed to the caller.
+    let context = unsafe { crate::process_heap_alloc(RXACT_CONTEXT_SIZE) };
+    // ReactOS publishes *OutContext BEFORE the NULL test (rxact.c:317) — match it.
+    // SAFETY: out_context is writable per the contract.
+    unsafe { core::ptr::write_unaligned(out_context as *mut u64, context as u64) };
+    if context.is_null() {
+        // SAFETY: NtDeleteKey + NtClose on the key we just created.
+        unsafe {
+            let _ = syscall4(SSN_NT_DELETE_KEY, key_handle, 0, 0, 0);
+            let _ = syscall4(SSN_NT_CLOSE, key_handle, 0, 0, 0);
+        }
+        return STATUS_NO_MEMORY_U as u32;
+    }
+    let context = context as u64;
+    // SAFETY: RXactInitializeContext — Data = NULL, CanUseHandles = TRUE (rxact.c:62).
+    unsafe {
+        core::ptr::write_unaligned((context + RXACT_CTX_ROOT_DIRECTORY) as *mut u64, root_directory);
+        core::ptr::write_unaligned((context + RXACT_CTX_KEY_HANDLE) as *mut u64, key_handle);
+        core::ptr::write_unaligned((context + RXACT_CTX_CAN_USE_HANDLES) as *mut u8, 1);
+        core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, 0);
+    }
+
+    if disposition == REG_CREATED_NEW_KEY {
+        // New key: stamp RXACT_INFO { Revision = 1, 0, 0 } into the default value (rxact.c:331).
+        let info = [nt_ntdll::rtl::rxact::RXACT_REVISION, 0u32, 0u32];
+        let mut name_slot = [0u64; 2];
+        // SAFETY: NtSetValueKey(KeyHandle, "", 0, REG_NONE, &info, 12) — SSN 256.
+        let status = unsafe {
+            let name = empty_unicode_string(&mut name_slot);
+            syscall6(
+                SSN_NT_SET_VALUE_KEY,
+                key_handle,
+                name,
+                0,
+                u64::from(REG_NONE),
+                info.as_ptr() as u64,
+                12,
+            ) as u32
+        };
+        if (status as i32) < 0 {
+            // SAFETY: unwind exactly as rxact.c:363-371.
+            unsafe {
+                let _ = syscall4(SSN_NT_DELETE_KEY, key_handle, 0, 0, 0);
+                let _ = syscall4(SSN_NT_CLOSE, key_handle, 0, 0, 0);
+                crate::process_heap_free(context as *mut u8);
+            }
+            return status;
+        }
+        return STATUS_RXACT_STATE_CREATED;
+    }
+
+    // Existing key: validate the stored revision.
+    let mut info = [0u32; 3];
+    let mut value_type: u32 = 0;
+    let mut value_length: u32 = 12;
+    // SAFETY: RtlpNtQueryValueKey on the default value.
+    let status = unsafe {
+        rtlp_nt_query_value_key(
+            key_handle,
+            &mut value_type as *mut u32 as u64,
+            info.as_mut_ptr() as u64,
+            &mut value_length as *mut u32 as u64,
+            0,
+        )
+    };
+    if (status as i32) < 0 {
+        // SAFETY: unwind (rxact.c:388-392).
+        unsafe {
+            let _ = syscall4(SSN_NT_CLOSE, key_handle, 0, 0, 0);
+            crate::process_heap_free(context as *mut u8);
+        }
+        return status;
+    }
+    if value_length != 12 || info[0] != nt_ntdll::rtl::rxact::RXACT_REVISION {
+        // SAFETY: unwind (rxact.c:396-403).
+        unsafe {
+            let _ = syscall4(SSN_NT_CLOSE, key_handle, 0, 0, 0);
+            crate::process_heap_free(context as *mut u8);
+        }
+        return STATUS_UNKNOWN_REVISION;
+    }
+
+    // Is there a surviving 'Log' value to replay?
+    let log = [b'L' as u16, b'o' as u16, b'g' as u16];
+    let mut log_name_slot = [0u64; 2];
+    // SAFETY: stack-owned UNICODE_STRING; alive for every syscall below.
+    let log_name = unsafe { inline_unicode_string(&mut log_name_slot, &log) };
+    let mut basic = [0u8; 0x20];
+    let mut length: u32 = 0;
+    // SAFETY: NtQueryValueKey(KeyValueBasicInformation) — SSN 185, 6 args.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            log_name,
+            KEY_VALUE_BASIC_INFORMATION,
+            basic.as_mut_ptr() as u64,
+            basic.len() as u64,
+            &mut length as *mut u32 as u64,
+        ) as u32
+    };
+    if (status as i32) < 0 {
+        // No 'Log' — nothing to replay (rxact.c:412).
+        return STATUS_SUCCESS_U32;
+    }
+    if commit == 0 {
+        return STATUS_RXACT_COMMIT_NECESSARY;
+    }
+
+    // Size the full-information record.
+    let mut needed: u32 = 0;
+    // SAFETY: probing call with a NULL buffer.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            log_name,
+            KEY_VALUE_FULL_INFORMATION,
+            0,
+            0,
+            &mut needed as *mut u32 as u64,
+        ) as u32
+    };
+    if status != STATUS_BUFFER_TOO_SMALL_U32 {
+        return status;
+    }
+    // SAFETY: process-heap buffer for the full-information record.
+    let record = unsafe { crate::process_heap_alloc(needed as usize) };
+    if record.is_null() {
+        return STATUS_NO_MEMORY_U as u32;
+    }
+    // SAFETY: NtQueryValueKey(KeyValueFullInformation) into the sized buffer.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            log_name,
+            KEY_VALUE_FULL_INFORMATION,
+            record as u64,
+            u64::from(needed),
+            &mut needed as *mut u32 as u64,
+        ) as u32
+    };
+    if (status as i32) < 0 {
+        // SAFETY: unwind (rxact.c:452-456).
+        unsafe {
+            crate::process_heap_free(record);
+            crate::process_heap_free(context as *mut u8);
+        }
+        return status;
+    }
+
+    // KEY_VALUE_FULL_INFORMATION.DataOffset @ +0x08 → the persisted RXACT_DATA.
+    // SAFETY: the executive filled the record.
+    let data_offset = unsafe { core::ptr::read_unaligned(record.add(0x08) as *const u32) };
+    // SAFETY: publishes the replayed log + "old log: do NOT trust the recorded handles".
+    unsafe {
+        core::ptr::write_unaligned(
+            (context + RXACT_CTX_DATA) as *mut u64,
+            record as u64 + u64::from(data_offset),
+        );
+        core::ptr::write_unaligned((context + RXACT_CTX_CAN_USE_HANDLES) as *mut u8, 0);
+    }
+    // SAFETY: replays the surviving log.
+    let status = unsafe { rxact_commit(context) };
+    if (status as i32) < 0 {
+        // SAFETY: unwind (rxact.c:461-467).
+        unsafe {
+            crate::process_heap_free(record);
+            crate::process_heap_free(context as *mut u8);
+        }
+        return status;
+    }
+    // SAFETY: NtDeleteValueKey(KeyHandle, "Log").
+    let _ = unsafe { syscall4(SSN_NT_DELETE_VALUE_KEY, key_handle, log_name, 0, 0) };
+    // Point Data at the ALLOCATED block so RtlAbortRXact frees the right pointer (rxact.c:473).
+    // SAFETY: the record is the process-heap block that backs the replayed log.
+    unsafe { core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, record as u64) };
+    // SAFETY: frees the record and resets the context.
+    unsafe { rtl_abort_rxact(context) }
 }
 
 // ---------------------------------------------------------------------------------------------

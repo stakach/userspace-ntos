@@ -3127,6 +3127,11 @@ not exercised, heap validate/compact/tag) · **6 explicit NOT_IMPLEMENTED**. So 
 (no-op → real where a consumer needs it), NOT breadth.
 
 **The explicit stubs (returns STATUS_NOT_IMPLEMENTED / a fixed error / a no-op body):**
+> ⚠️ **STALE as of 2026-07-25 — see §E.0 for the re-measured list.** Most names below now have real
+> bodies (activation contexts, boot-status data, `RtlFindMessage`, the `Rtl*SecurityObject` family,
+> `RtlDosSearchPath_Ustr`, `RtlVerifyVersionInfo`, `RtlWalkHeap`, the heap user-value/lock family,
+> the `Csr*` client). §E.0 also shows the import surface is **100% covered (0 missing)** and that the
+> "97 `STATUS_NOT_IMPLEMENTED`" figure is a raw token count, 77 of which are host-build fallback arms.
 - *Unconditional:* `RtlGetSetBootStatusData`/`RtlLockBootStatusData`/`RtlUnlockBootStatusData`
   (boot-status-data — LKG boot; tolerated) · `RtlFindMessage` (→ STATUS_MESSAGE_NOT_FOUND) ·
   `RtlFindActivationContextSectionString`/`…Guid` (→ STATUS_SXS_KEY_NOT_FOUND — no manifests) ·
@@ -3837,6 +3842,186 @@ Tier-2/3 Rtl breadth.
 **Frontier hand-off:** the desktop/logon-UI advance (past the SAS park) is a **win32k** batch —
 implement `UserGetMessage 0x1006` / `UserPostMessage 0x100e` (message-queue) + `WlxLoggedOutSAS`/msgina
 dialog dispatch in `win32k_subsystem.rs` — NOT an ntdll batch. Tracked separately.
+
+### E — RXACT + the `RtlpNt*`/critical-section completion + 4 fidelity corrections — ✅ LANDED (2026-07-25, gate **204/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+
+#### E.0 — RE-MEASURED THE SURFACE FIRST: §A's "explicit stub" list is STALE, and the import surface is now **100% covered**
+
+Before writing anything this batch re-derived the gap list from the two ground truths, because §A's
+prose had drifted badly:
+
+* **Our real export set** = the **export directory of the BUILT `.tmp/nt-ntdll.dll`** (not a grep of
+  `#[export_name]`, which misses the `zw_alias!`/`generate_trap_stubs!` macro expansions and
+  therefore invents ~200 phantom "missing" `Nt*`/`Zw*` names). **1323 exports** before this batch.
+* **The required set** = the `ntdll.dll` **import directory (normal dir 1 + delay dir 13)** of every
+  staged ReactOS binary under `rust-micro/.tmp/reactos/reactos/system32`.
+
+| measurement | result |
+|---|---|
+| distinct `ntdll` imports across the **live-loaded set** (38 binaries: kernel32(+vista), user32, gdi32, advapi32(+vista), rpcrt4, msvcrt, csrsrv, basesrv, winsrv, secur32, netapi32, msgina, lsasrv, samsrv, msv1_0, userenv, mpr, ws2_32, ws2help, win32k.sys, ntdll_vista, comdlg32, comctl32, shell32, shlwapi, ole32, oleaut32, version, ntmarta, psapi, imm32, setupapi, winspool, ftfd, framebuf + csrss/winlogon/services/lsass) | **546** |
+| distinct `ntdll` imports across the **whole `system32` tree** (~1000 PEs) | **593** |
+| of those, **missing from our DLL** | **0** — live set AND whole tree |
+
+**So the ntdll import surface is CLOSED: every `ntdll` export any staged ReactOS binary imports
+exists in our DLL.** Completion is now purely about *fidelity* and *breadth toward the 1303-name
+spec*, never about a missing name.
+
+**The "97 `STATUS_NOT_IMPLEMENTED`" figure is a miscount** (it is a raw `grep -c` of the token in
+`exports.rs`). Classifying every export body shows what those 97 occurrences actually are:
+
+| bucket | count | what it is |
+|---|---|---|
+| the `#[cfg(not(target_arch = "x86_64"))]` **host-build fallback arm** of an export that is REAL on target (its `#[cfg(target_arch = "x86_64")]` arm calls `on_target::*` / a real body) | **77 functions** | not a stub at all — the DLL only ever builds for x86_64 |
+| genuinely unconditional `STATUS_NOT_IMPLEMENTED` | **1** — `DbgUiIssueRemoteBreakin` | left alone on purpose (see §D) |
+| the rest of the 97 tokens | — | error arms *inside* real bodies (unsupported info class, bad revision, …) |
+
+§A's stub list is therefore **out of date**: `RtlFindMessage` (real `.rsrc` message-table walker),
+`RtlGetSetBootStatusData`/`Lock`/`Unlock`/`RtlCreateBootStatusDataFile` (real `\Device\...\bootstat.dat`
+file I/O), `RtlFindActivationContextSectionString`/`Guid`, `RtlCreateActivationContext`/`Activate`/
+`Deactivate`/`Zombify`/`QueryInformationActivationContext` (a real activation-context registry with
+refcounting + a TEB activation stack), `RtlNewSecurityObject`/`Set`/`Query`/`Delete`,
+`RtlDosSearchPath_Ustr`, `RtlVerifyVersionInfo`, `RtlWalkHeap`, `RtlGetUserInfoHeap`/
+`RtlSetUserValueHeap`, `RtlLockHeap`/`RtlUnlockHeap`, `CsrClientCallServer`/`CsrGetProcessId`/
+`CsrClientConnectToServer` are **all real bodies now**. The `@unimplemented`-in-ReactOS ones that we
+correctly mirror are called out in E.3.
+
+Only **four** imported exports still had an observable contract that diverged from ReactOS — E.3
+fixes all four. The rest of this batch is §C Tier-2/3 breadth.
+
+#### E.1 — the **RXACT registry-transaction family** (7 new exports) — `references/reactos/sdk/lib/rtl/rxact.c`
+
+RXACT is the RTL's crash-consistent registry transaction (SAM/LSA's mechanism for applying a batch of
+key/value edits atomically): record actions into an in-memory log, persist the log to
+`RXACT\Log` (`REG_BINARY`) + `NtFlushKey`, replay it, delete the log. If the machine dies mid-replay,
+the next `RtlInitializeRXact(Commit = TRUE)` finds the surviving log and finishes the job.
+
+**Pure host-tested core — `crates/nt-ntdll/src/rtl/rxact.rs` (new, 12 tests).** Everything about the
+log *format* is logic and lives here: the `RXACT_DATA` header (`ActionCount`/`BufferSize`/
+`CurrentSize`, 12 bytes), the 0x40-byte `RXACT_ACTION` record (x64 field map documented in the module
+header), the **pointer→offset relocation** that makes the log position-independent (so it can
+round-trip through the registry), `action_record_size` (`ALIGN_UP_BY(…, sizeof(ULONG))` on all three
+payloads), ReactOS's `RequiredSize < ActionSize` overflow test (rxact.c:514-520), the
+doubling growth policy (rxact.c:524-530), and the record-chain walker. Deliberate documented
+deviation: for a `DeleteKey` action ReactOS leaves `ValueData` uninitialised (its buffer is
+non-zeroed heap); we write `0` — deterministic and unobservable through the API.
+
+**Target tail — `crates/nt-ntdll-dll/src/on_target.rs`:**
+
+| export | ReactOS ref | notes |
+|---|---|---|
+| `RtlStartRXact` | rxact.c:243 | allocate + `init_data` the 16 KiB log; `STATUS_RXACT_INVALID_STATE` if one is already active |
+| `RtlAbortRXact` | rxact.c:275 | free the log, `RXactInitializeContext` reset (`CanUseHandles = TRUE`) |
+| `RtlAddAttributeActionToRXact` | rxact.c:487 | grow-by-doubling then append one record |
+| `RtlAddActionToRXact` | rxact.c:592 | the default-value form: empty `ValueName` + `INVALID_HANDLE_VALUE` |
+| `RtlApplyRXactNoFlush` | rxact.c:625 | `RXactpCommit` then reset, no persistence |
+| `RtlApplyRXact` | rxact.c:646 | persist `Log` → `NtFlushKey` → commit → delete `Log` → reset; every post-write failure deletes `Log` again |
+| `RtlInitializeRXact` | rxact.c:293 | open-or-create `RXACT` (`OBJ_OPENIF`), stamp/validate `RXACT_INFO.Revision == 1`, and replay a surviving `Log` (with `CanUseHandles = FALSE` — an old log's handles are dead). Returns `STATUS_RXACT_STATE_CREATED` / `STATUS_RXACT_COMMIT_NECESSARY` / `STATUS_UNKNOWN_REVISION` exactly as ReactOS |
+
+`RXactpCommit` (rxact.c:124) is implemented as the internal `rxact_commit`, including
+`RXactpOpenTargetKey`'s two modes (open-for-`DELETE` vs `OBJ_OPENIF` create-for-`KEY_WRITE`) and the
+"a delete whose key is already gone is not an error" rule (`STATUS_OBJECT_NAME_NOT_FOUND` tolerated,
+rxact.c:176). Syscalls used: `NtCreateKey`(43) `NtOpenKey`(125) `NtDeleteKey`(66) `NtSetValueKey`(256)
+`NtDeleteValueKey`(68) `NtQueryValueKey`(185) `NtFlushKey`(83) `NtClose`(27) — all already in the
+shared SSN table.
+
+#### E.2 — completing the `RtlpNt*` registry-helper + critical-section families (7 new exports)
+
+| export | ReactOS ref | body |
+|---|---|---|
+| `RtlpNtCreateKey` | registry.c:818 | mask `OBJ_PERMANENT\|OBJ_EXCLUSIVE`, `NtCreateKey(…, TitleIndex = 0, Class = NULL, …)` — ReactOS deliberately drops the caller's TitleIndex/Class |
+| `RtlpNtEnumerateSubKey` | registry.c:847 | `NtEnumerateKey(KeyBasicInformation)` into a process-heap scratch, copy the name back; over-long name ⇒ `STATUS_BUFFER_OVERFLOW` |
+| `RtlpNtMakeTemporaryKey` | registry.c:904 | *"This just deletes the key"* → `NtDeleteKey` |
+| `RtlpWaitForCriticalSection` | critical.c:117 | the **slow path of `RtlEnterCriticalSection`** — see below |
+| `RtlpUnWaitCriticalSection` | critical.c:217 | the **slow path of `RtlLeaveCriticalSection`**; a failing signal is `RtlRaiseStatus`'d, not swallowed |
+| `RtlpNotOwnerCriticalSection` | critical.c:883 | `RtlRaiseStatus(STATUS_RESOURCE_NOT_OWNED)` |
+| `RtlCheckForOrphanedCriticalSections` | critical.c:861 | **`UNIMPLEMENTED` in ReactOS with a `VOID` return** ⇒ we match it with a documented no-op. Inventing an orphan-recovery policy neither ReactOS nor our runtime defines would be worse than honest |
+
+`RtlpWaitForCriticalSection` is a real body, not a rename: it bumps `DebugInfo->EntryCount` once and
+`ContentionCount` once per iteration (both gated on `CRITSECT_HAS_DEBUG_INFO` — NULL and the `-1`
+sentinel skipped), honours the **loader-shutdown force-ownership escape** (the thread running
+`LdrShutdownProcess` takes any lock by force; that thread's id is already published to
+`PEB_LDR_DATA+0x48/+0x50`), waits on the CS's `LockSemaphore` event or the global keyed event, and
+turns two consecutive `STATUS_TIMEOUT`s into a raised `STATUS_POSSIBLE_DEADLOCK` with the critical
+section as `ExceptionInformation[0]` instead of silently granting the lock. The decision logic is the
+new host-tested `nt_ntdll::sync` core (`critsect_has_debug_info`, `shutdown_forces_ownership`,
+`classify_wait`/`WaitOutcome`, 4 tests).
+
+`RtlEnterCriticalSection`/`RtlLeaveCriticalSection` were rewired to go **through** these two exports
+(critical.c:520 / critical.c:800) so they are load-bearing rather than inert. **Honest caveat:** our
+wait is issued with a NULL timeout — the configuration ReactOS calls `RtlpTimeoutDisable` — so the
+deadlock arm cannot fire today; it is a correctness backstop that makes enabling a finite
+`RtlpTimeout` a one-line change. And the boot never contends a critical section at all (`[cs-event]`
+count = 0 across all three boots), so this path is **structurally correct + host-tested but not
+exercised live** — stated plainly rather than claimed as boot-proven.
+
+#### E.3 — four IMPORTED exports whose contract diverged from ReactOS (fidelity corrections)
+
+These are the only real fidelity gaps E.0's measurement found in the imported surface. Three were
+**fabricated successes** — the exact failure mode the "no fake success" rule exists to prevent.
+
+| export | was | now | ReactOS ref |
+|---|---|---|---|
+| `RtlWow64EnableFsRedirection` (kernel32) | `STATUS_SUCCESS` | **`STATUS_NOT_IMPLEMENTED`** | `dll/ntdll/rtl/libsupp.c:1166` — `@implemented`, *"This is what Windows returns on x86"*. The redirection layer lives only in the WOW64 thunk ntdll; a native 64-bit caller must be told so. Our SUCCESS made kernel32's `Wow64EnableWow64FsRedirection` claim it toggled a layer that does not exist |
+| `RtlWow64EnableFsRedirectionEx` (kernel32) | `*OldValue = NULL` + `STATUS_SUCCESS` | **`STATUS_NOT_IMPLEMENTED`**, `OldValue` untouched | `libsupp.c:1178` — ReactOS does not write `OldValue` on this path either |
+| `RtlFlushSecureMemoryCache` (kernel32) | `TRUE` | **`FALSE`** | `sdk/lib/rtl/security.c:830` — `@unimplemented` ⇒ FALSE. We export no `RtlRegisterSecureMemoryCacheCallback`, so no callback *could* have flushed anything; TRUE was a fabricated success. Its only in-tree caller (`heappage.c:336`) treats FALSE as "not released by a cache" and proceeds |
+| `RtlGetNtProductType` (lsasrv, samsrv, ws2help, advapi32, …) | hardcoded `1` | **live read of `SharedUserData->NtProductType`** (`KUSER_SHARED_DATA+0x264`) | `dll/ntdll/rtl/version.c:105`. The executive already stamps that field (`img_spawn.rs::initialize_kuser_snapshot` → `nt_ntdll_layout::kuser::NT_PRODUCT_TYPE = 1`), so the *value* is unchanged today (zero boot risk) but it now tracks the system's actual configuration instead of a constant. ReactOS's `g_ReportProductType` shim override is a shim-engine feature we do not host |
+
+#### E.4 — verified
+
+* **Exports 1323 → 1337** (+14: the 7 RXACT + 3 `RtlpNt*` + 4 critical-section). `ntdll-dll-verify`
+  hard gate green (PE32+/DLL, 212 `Nt*` stubs, `.reloc`, per-binary import coverage 0-missing ×12).
+* **Host tests: `nt-ntdll` 674 → 690** (+12 rxact log-format/growth/overflow/walker-fails-closed,
+  +4 critical-section decision logic). `nt-process` **69** (untouched).
+* **3 consecutive clean foreground boots**, each `[ntos-exec summary: 204/99 …]`, **ZERO FAIL lines**,
+  `RUNEXIT=3`, `[microtest sentinel matched -- exiting QEMU]`, `desktop-bg match 767/768 px @
+  0x003a6ea5`. The `PASS` line sets of boot 1 and boot 3 are **byte-identical** (`diff` clean), and
+  `exec_win32k_desktop_painted` / `exec_msgina_logon_dialog_painted` /
+  `exec_user_callback_dead_client_unwind` / `exec_user_callback_real_api0_nested_roundtrip` / all 11
+  `exec_dbgk_*` PASS. No `rust-micro/src` change.
+* **Live-behaviour watch:** the three E.3 return-value flips are only reachable from kernel32's
+  `Wow64*FsRedirection` wrappers and the page-heap secure-memory path, neither of which the boot
+  exercises — no divergence observed. The E.2 critical-section rewire is on the contended path, which
+  the boot never enters (`[cs-event]` = 0).
+
+#### E.5 — what is STILL stubbed, and WHY (the honest remainder)
+
+**`STATUS_NOT_IMPLEMENTED` count: 97 → 97 raw tokens in `exports.rs`, of which genuinely
+unconditional stubs remain 1** (`DbgUiIssueRemoteBreakin`). The E.3 corrections *added* two honest
+`STATUS_NOT_IMPLEMENTED` returns (`RtlWow64EnableFsRedirection`/`Ex`) and the new exports added none;
+the raw token count is dominated by the 77 host-build fallback arms and is not a useful metric —
+E.0's classification table is.
+
+Deliberately left as-is, with the reason:
+
+* `DbgUiIssueRemoteBreakin` — needs a cross-VSpace `RtlCreateUserThread` with a start context in the
+  *target* process. We have no such machinery; a success here would be a lie (§D).
+* `RtlCheckForOrphanedCriticalSections`, `RtlCreateTagHeap` (⇒ 0), `RtlQueryTagHeap` (⇒ NULL),
+  `LdrAlternateResourcesEnabled` (⇒ FALSE), `LdrFlushAlternateResourceModules` (⇒ FALSE),
+  `LdrUnloadAlternateResourceModule(Ex)` (⇒ TRUE), `RtlCompactHeap` (⇒ 0) — **these already match
+  ReactOS's `@unimplemented` observable contract exactly** (heap.c:4012/4037/3103,
+  ldrapi.c:81/1614/1640, critical.c:861). Verified this batch; changing them would be invention.
+* `RtlGetCurrentProcessorNumber(Ex)` (⇒ 0) — ReactOS forwards to `NtGetCurrentProcessorNumber(Ex)`
+  (processor.c:33/47), which is **not in our SSN table and not implemented by the executive**.
+  Adding the stub without the service would turn a correct answer into an `UnknownSyscall` fault.
+* `RtlMapSecurityErrorToNtStatus`, `RtlCreateAndSetSD`, `RtlCreateServiceSid`,
+  `RtlConvertUiListToApiList`, `RtlZeroHeap`, `RtlEnumProcessHeaps`, `RtlProtectHeap`,
+  `RtlUsageHeap`, `RtlExtendHeap`, `RtlAddCompoundAce`, `RtlRemoteCall`, `RtlInitializeContext`,
+  `LdrHotPatchRoutine`, `sscanf` — **not exported at all**, and **not imported by any binary in the
+  tree** (E.0). Most are `@unimplemented` in ReactOS too, so adding them would be pure count-padding;
+  `RtlRemoteCall` additionally needs cross-VSpace thread manipulation. Tier-3: add on demand.
+
+**Spec-vs-ours delta after this batch:** 1303 spec names, 1337 of ours; **194 spec names still
+unexported** — 168 of them `Nt*`/`Zw*` (event-pair, profiling, boot-entry, quota, `NtContinue`/
+`NtRaiseException`, the `*AndAuditAlarm` variants), 26 `Rtl*`/`Ldr*` (the list above + the
+`RtlQueryProcess{BackTrace,Lock}Information`/`RtlLogStackBackTrace` diagnostics). **None is imported
+by anything we host.**
+
+**Suggested next batch:** the `Nt*` breadth pass — add the ~26 spec `Zw*` aliases that already have
+an `Nt*` twin (`ZwContinue`, `ZwRaiseException`, `ZwCreateDebugObject`, `ZwDebugActiveProcess`,
+`ZwDebugContinue`, `ZwRemoveProcessDebug`, `ZwWaitForDebugEvent`, …) — zero-risk, mechanical, and
+purely additive — **paired with** the executive-side services for the handful of `Nt*` names that
+would otherwise fault (`NtContinue`, `NtRaiseException`, `NtGetCurrentProcessorNumber`). Do NOT add a
+trap stub whose SSN the executive cannot service.
 
 ---
 
