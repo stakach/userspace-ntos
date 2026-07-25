@@ -6143,6 +6143,11 @@ static PM_POST_TERM_CONTINUED_BADGES: AtomicU64 = AtomicU64::new(0);
 ///   0x20 exit_thread (no-cascade) terminates the init thread yet the EPROCESS stays Running
 ///   0x40 an unrelated live thread in the same process keeps running past the terminate
 static PM_TERMINATE_THREAD_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
+/// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
+/// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
+/// the recovery was observed on the live boot.
+static DEAD_CLIENT_UNWIND_INJECTION: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -10307,8 +10312,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // Dead-client unwinds: callback continuations torn down (win32k resumed with a failure NTSTATUS)
     // because the client thread running the callback died. Non-zero = the boot survived a client
     // dying mid-callback instead of stranding win32k in its callback receive loop.
+    let dead_client_unwinds = win32k_glue::dead_client_callback_unwinds();
+    let dead_client_unwind_redirects = win32k_glue::dead_client_callback_unwind_redirects();
     print_str(b" dead-client-unwinds=");
-    print_u64(win32k_glue::dead_client_callback_unwinds());
+    print_u64(dead_client_unwinds);
+    print_str(b" dead-client-unwind-redirects=");
+    print_u64(dead_client_unwind_redirects);
     // Callback-window bridge invariant: how often the executive restated the client's
     // CLIENTINFO.CallbackWnd for the in-flight callback, and how often it had actually been clobbered
     // (win32k's own untranslated DesktopHeapAddressToUser pointer) and needed repair.
@@ -10318,17 +10327,49 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b" window-bridge-repairs=");
     print_u64(window_repairs);
     print_str(b"\n");
+    // The redirect LEDGER must balance EXACTLY: every real redirect either came back through
+    // `NtCallbackReturn` (a real return) or was torn down because its client died mid-callback (a
+    // dead-client unwind, deliberately NOT counted as a return — it is a failure completion). Both
+    // terms are load-bearing: `real_returns` must still dominate (the live paint/dialog flow), and the
+    // injected unwind must be accounted for rather than silently tolerated.
     check(
         b"exec_user_callback_real_api0_nested_roundtrip",
         callback_table_valid != 0
             && callback_real_redirects >= 1
-            && callback_real_returns == callback_real_redirects
+            && callback_real_returns >= 1
+            && callback_real_returns + dead_client_unwind_redirects == callback_real_redirects
             && callback_nested_ssn_1298 >= 1
             && (1..=4).contains(&callback_nested_ssn_126b)
             && callback_nested_dispatches >= 1 + callback_nested_ssn_126b
             && callback_continuation_pushes >= callback_nested_dispatches + 2
             && callback_continuation_unwinds == callback_continuation_pushes
             && callback_sequence_completions == 1,
+        &mut passed,
+    );
+
+    // --- PROOF the DEAD-CLIENT CALLBACK UNWIND is a live, working recovery — not just a code path.
+    // A user-mode callback is an adversarial re-entrancy point: while win32k's dispatch is suspended
+    // inside `KeUserModeCallback` the CLIENT thread owns execution and can die there. Before the
+    // unwind existed, that WEDGED the whole boot — win32k's single TCB stayed blocked in its callback
+    // receive loop, the executive's shared loop blocked in `recv` forever, `RUNEXIT=124`, no gate line
+    // at all. On a healthy boot no client dies, so this spec MANUFACTURES the condition for real
+    // (post-quiesce, on an expendable winlogon RPC worker thread, with WM_NULL so nothing can change):
+    // a genuine win32k dispatch → a genuine `KeUserModeCallback` park → a genuine redirect into
+    // `KiUserCallbackDispatcher` → the thread is genuinely TERMINATED at callback depth >= 1 → the
+    // unwind must recover. All six bits must hold; the last one (a FRESH win32k dispatch that
+    // completes) is the direct refutation of the wedge — a stranded win32k could not service it.
+    let dead_client_injection = DEAD_CLIENT_UNWIND_INJECTION.load(Ordering::Relaxed);
+    print_str(b"[user-callback] dead-client unwind fault injection: proof=0x");
+    print_hex(dead_client_injection as u32);
+    print_str(b"/0x");
+    print_hex(win32k_glue::DEAD_CLIENT_INJECT_ALL as u32);
+    print_str(b" (parked/redirected/victim-dead/unwound/drained/win32k-idle)\n");
+    check(
+        b"exec_user_callback_dead_client_unwind",
+        dead_client_injection == win32k_glue::DEAD_CLIENT_INJECT_ALL
+            && dead_client_unwinds >= 1
+            && dead_client_unwind_redirects >= 1
+            && callback_continuation_unwinds == callback_continuation_pushes,
         &mut passed,
     );
 

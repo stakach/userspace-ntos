@@ -5220,6 +5220,27 @@ pub(crate) unsafe fn service_sec_image(
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
     }
+    // === DEAD-CLIENT CALLBACK-UNWIND FAULT INJECTION (POST-QUIESCE). The boot's whole load-bearing
+    // flow is finished here — winlogon's SAS → msgina dialog → the authentic desktop/dialog paints
+    // have completed and their counters are latched — and win32k is idle in its dispatch receive
+    // loop. That makes this the one point where a client can be deliberately killed MID-CALLBACK
+    // without perturbing anything: the injection drives an expendable winlogon RPC worker thread into
+    // a REAL win32k user-mode callback (WM_NULL, so nothing can change), terminates it there, and
+    // asserts `unwind_dead_client_user_callbacks` recovers win32k. Without that unwind this is the
+    // shape that WEDGED the boot (RUNEXIT=124, no gate at all). See `exec_user_callback_dead_client_unwind`. ===
+    if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
+        let client_pid = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
+        let scratch_base = procs[2].scratch_base;
+        let mut kill_victim = |victim_tid: u64| {
+            terminate_hosted_thread_mechanism(victim_tid, &mut delay_queue, &mut nt_handler)
+        };
+        let proof = win32k_glue::inject_dead_client_callback_unwind(
+            client_pid,
+            scratch_base,
+            &mut kill_victim,
+        );
+        DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
+    }
     // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
     // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
     // The 3 HOSTED EPROCESSes are left untouched — terminate runs on a THROWAWAY process. ===

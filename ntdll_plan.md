@@ -2830,6 +2830,66 @@ winlogon's post-SAS-window flow: `ShowWindow(SAS) → co_IntShowDesktop → co_A
 ### Verify
 Gate **175/98**, clean qemu_exit. 5 processes spawn; lsass signals LSA_RPC_SERVER_ACTIVE; all 4 `exec_live_terminate_thread_*` PASS; SEH self-test PASS; `exec_winlogon_worker_multiplex` PASS; `exec_winlogon_sas_window` PASS (NEW). The 5 FAILs (`exec_nic_tx_dma_writeback`/`exec_nic_confined_dma`/`exec_csr_message_plane`/`exec_npfs_flush_pending`/`exec_win32k_desktop_painted`) are the documented baseline set — NO new FAILs. Host green: nt-ntdll 192, nt-io-manager 73, nt-process 21, nt-object-manager 50. Executive-only (no rust-micro/src change; sel4test byte-identical).
 
+## 🎉 BATCH 49 — the dead-client callback unwind becomes GATE-PROTECTED: a REAL mid-callback fault-injection spec. **Gate 192/99 → 193/99, ZERO FAILs**, deterministic over 3 consecutive boots (DONE 2026-07-25, clean qemu_exit, executive-only / no `rust-micro/src` change)
+
+**Directive:** BATCH 48's `unwind_dead_client_user_callbacks` was correct but UNEXERCISED — on the
+green boot the client no longer dies, so `dead-client-unwinds=0` and the recovery rested on two
+historical crash logs. A future refactor could silently break it. Make it permanently measurable.
+
+### The spec — `exec_user_callback_dead_client_unwind` (`win32k_glue::inject_dead_client_callback_unwind`)
+
+Nothing about it is mocked. POST-QUIESCE (right after the hosted receive loop breaks, so the whole
+load-bearing SAS → msgina-dialog → paint flow has finished and every counter it feeds is latched):
+
+1. **VICTIM** = an expendable winlogon (pi 2) RPC worker thread — `WINLOGON_WORKER2_BADGE`, a real
+   hosted thread with a live TCB, a registered client stack and a TEB alias the callback-window bridge
+   can write (fallback: the winlogon RPC listener). NEVER winlogon's main thread (the gate still
+   samples its parked RIP). Its RSP is first staged to the top of its original always-mapped stack so
+   the redirect's callout-frame write has guaranteed room — it is about to be destroyed anyway.
+2. **A REAL CALLBACK.** `win32k_dispatch_wide(NtUserMessageCall=0x1007, SAS hwnd, WM_NULL, …,
+   ResultInfo=0, dwType=FNID_SENDMESSAGE(0x2B1), Ansi=0)` on that thread's identity. win32k runs
+   `co_IntDoSendMessage → co_IntSendMessage → co_IntCallWindowProc → KeUserModeCallback`; the
+   component SUSPENDS itself in its callback receive loop (`status=STATUS_PENDING`, `completed=0`,
+   `callback-parked=1`). `WM_NULL` is chosen precisely because it is defined to do nothing — no window
+   state, no pixel, can change.
+3. **A REAL REDIRECT.** `begin_controlled_user_callback_redirect` rewrites the victim's registers to
+   `KiUserCallbackDispatcher` and writes the callout frame to its stack. Live: `callback depth=1
+   continuation-depth=2 redirected=1`.
+4. **A REAL DEATH.** `terminate_hosted_thread_mechanism(tid)` — TCB suspended, cap revoked, TCB cell
+   cleared. From here the thread can NEVER reach `NtCallbackReturn`: exactly the wedge condition.
+5. **THE RECOVERY (the thing under test).** `unwind_dead_client_user_callbacks(2)`; six proof bits, all
+   required: component parked / frame redirected at depth >= 1 / victim really dead / frame unwound
+   (and counted as a redirect teardown) / both stacks drained (`pushes == unwinds`) / **a FRESH win32k
+   dispatch (`SSN_TEST_FAULT`) COMPLETES** — the direct refutation of the wedge, since a stranded
+   win32k cannot service a new dispatch.
+
+### Ledger fix — keeping `exec_user_callback_real_api0_nested_roundtrip` meaningful
+A dead-client unwind is deliberately NOT a `real-return` (it is a failure completion), so the naive
+`real_returns == real_redirects` invariant would have broken. New counter
+`USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS` counts ONLY unwound frames that had already been
+redirected, and the roundtrip spec now asserts the exact identity
+`real_returns + dead_client_unwind_redirects == real_redirects` **and** `real_returns >= 1`: every
+real redirect is accounted for as returned-by-the-client or torn-down-because-the-client-died, and the
+live paint/dialog returns must still dominate. Neither spec was weakened.
+
+### Verify — the spec is MEANINGFUL, not decorative
+Three consecutive clean boots, identical: `RUNEXIT=3`, `microtest sentinel matched`,
+**`193/99`, 193 PASS / 0 FAIL**, `[cb-inject] recovery: frames-unwound=1 active-depth=0
+continuation-depth=0 win32k-probe status=0x600d600d ok=1 proof=0x3f`, ledger
+`real-redirects=269 real-returns=268 continuation-pushes=1644 continuation-unwinds=1644
+dead-client-unwinds=1 dead-client-unwind-redirects=1`. The spec SET is baseline + exactly this one
+spec (diffed); the paint/dialog proofs are byte-identical to HEAD (`767/768 @ 0x003a6ea5`; IDD rect
+`302,260..721,507`, 103493 px, 49547 non-desktop). Logs `/tmp/boot_faultinj_v1.log`,
+`v2`, `v3` (+ `/tmp/boot_faultinj_a1.log`).
+
+**DISABLE-THE-FIX EXPERIMENT** (`/tmp/boot_faultinj_nofix.log`): with
+`unwind_dead_client_user_callbacks` stubbed to return 0, the identical injection leaves
+`frames-unwound=0 active-depth=1 continuation-depth=2` and the fresh win32k dispatch is REJECTED
+(`status=0xC000000D ok=0`) — win32k stranded with a non-empty continuation stack, i.e. the wedge.
+`proof=0x07` (only parked/redirected/victim-dead) → `exec_user_callback_dead_client_unwind` FAILS, and
+the unbalanced ledger fails `exec_user_callback_real_api0_nested_roundtrip` too: **`191/99`, 2 FAILs**.
+The spec cannot pass without the fix.
+
 ## 🎉🎉 BATCH 48 — the win32k reverse-callback ROBUSTNESS batch: NT argument capture + dead-client continuation unwind + the CLIENTINFO.CallbackWnd bridge invariant. **Gate 183/99 (9 FAILs) → 192/99, ZERO FAILs**, deterministic over 3 consecutive boots (DONE 2026-07-25, clean qemu_exit, executive-only / no `rust-micro/src` change)
 
 **Directive:** fix a robustness hole in the win32k reverse-callback machinery — a client that dies
@@ -2947,20 +3007,18 @@ Logs: `/tmp/boot_bridge_3469.log`, `/tmp/boot_bridge_v2_5891.log`, `/tmp/boot_br
    SSNs that hit it, but ANY other win32k argument that points into that colliding range is still
    exposed. The real fix is per-process image VAs (or a per-client win32k image window) so main-image
    VAs stop colliding across hosted processes.
-2. **`dead-client-unwinds=0` on the green boot.** With fix (3) the client no longer dies, so the Step-1
-   unwind path is not exercised by the current gate. Its correctness is evidenced by the two recorded
-   boots above (`frames=1`, win32k resumed, quiesce reached, `189/99`), not by a live gate spec. A
-   fault-injection spec that deliberately kills a client mid-callback would make it permanently
-   measurable — worth adding.
+2. ~~**`dead-client-unwinds=0` on the green boot.**~~ **CLOSED by BATCH 49** — the fault-injection spec
+   `exec_user_callback_dead_client_unwind` now kills a client mid-callback on every boot, so the
+   unwind path is permanently gate-protected (`dead-client-unwinds=1`). See below.
 3. **win32k's `DesktopHeapAddressToUser` still produces an invalid client pointer** in our topology
    (that is the value the bridge now repairs). `s_mm_map_view_of_section` hands back the kernel base
    (`UserMapping == KernelMapping`), so `W32Process->HeapMappings` cannot describe a real client view.
    The bridge masks it at the one place user32 reads it (`CLIENTINFO.CallbackWnd`); any OTHER consumer
    of `DesktopHeapAddressToUser`/`NtUserxGetDesktopMapping` would still get a bad pointer.
-4. `exec_user_callback_real_api0_nested_roundtrip` requires `real_returns == real_redirects`; a
-   dead-client unwind is deliberately NOT counted as a return (it is a failure completion), so that
-   spec is expected to fail on a boot where a client dies mid-callback. Counted separately as
-   `dead-client-unwinds`.
+4. ~~`exec_user_callback_real_api0_nested_roundtrip` requires `real_returns == real_redirects`~~ —
+   **CLOSED by BATCH 49**: the invariant is now the exact ledger identity
+   `real_returns + dead_client_unwind_redirects == real_redirects` (plus `real_returns >= 1`), so a
+   boot on which a client dies mid-callback is accounted for rather than failing.
 
 ## 🎉🎉🎉 BATCH 47 — FULLY-GREEN GATE: the last 4 baseline FAILs cleared, **gate 180/98, ZERO FAILs** (DONE 2026-07-19, clean qemu_exit, executive-only / sel4test byte-identical)
 

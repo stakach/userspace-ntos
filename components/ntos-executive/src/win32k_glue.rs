@@ -28,6 +28,12 @@ static USER_CALLBACK_DEAD_CLIENTS: AtomicU64 = AtomicU64::new(0);
 /// Callback continuation frames unwound because their client died mid-callback (the durable proof
 /// the dead-client unwind ran; see [`unwind_dead_client_user_callbacks`]).
 static USER_CALLBACK_DEAD_CLIENT_UNWINDS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the frames that had already been REDIRECTED into the client (a real reverse transition
+/// that will never be answered by an `NtCallbackReturn`). A dead-client unwind is deliberately NOT a
+/// `real-return` — it is a failure completion — so this counter is what keeps the redirect ledger
+/// exact: `real-returns + dead-client-unwind-redirects == real-redirects` (every real redirect is
+/// either returned by the client or torn down because the client died).
+static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -125,6 +131,23 @@ pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64,
 /// Frames unwound by [`unwind_dead_client_user_callbacks`] over the whole boot.
 pub(crate) fn dead_client_callback_unwinds() -> u64 {
     USER_CALLBACK_DEAD_CLIENT_UNWINDS.load(Ordering::Relaxed)
+}
+
+/// Of the unwound frames, those that had already been REDIRECTED — i.e. real redirects that will
+/// never produce a `real-return`. See [`USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS`].
+pub(crate) fn dead_client_callback_unwind_redirects() -> u64 {
+    USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS.load(Ordering::Relaxed)
+}
+
+/// `(active callback depth, continuation-stack depth)`. Both ZERO = win32k holds no suspended
+/// callback/dispatch continuation, i.e. it is idle in its normal dispatch receive loop.
+pub(crate) fn user_callback_stack_depths() -> (usize, usize) {
+    unsafe {
+        (
+            (*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len(),
+            (*core::ptr::addr_of!(USER_CALLBACK_CONTINUATIONS)).len(),
+        )
+    }
 }
 
 /// `(re-asserts, repairs)` of the callback-window bridge invariant — see
@@ -1119,7 +1142,8 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             abort_controlled_user_callbacks();
             break;
         }
-        let popped = if frame.is_redirected() {
+        let was_redirected = frame.is_redirected();
+        let popped = if was_redirected {
             active.pop(correlation)
         } else {
             active.cancel_pending(correlation)
@@ -1144,6 +1168,9 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
         );
         unwound += 1;
         USER_CALLBACK_DEAD_CLIENT_UNWINDS.fetch_add(1, Ordering::Relaxed);
+        // A REDIRECTED frame consumed a `real-redirect` that can never become a `real-return`; record
+        // it so the redirect ledger stays exact (see the counter's doc comment).
+        USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS.fetch_add(was_redirected as u64, Ordering::Relaxed);
         print_str(b"[user-callback] dead client pi=");
         print_u64(client_pi as u64);
         print_str(b" -> failed callback api=");
@@ -1176,6 +1203,241 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
         }
     }
     unwound
+}
+
+// ── FAULT INJECTION: `exec_user_callback_dead_client_unwind` ────────────────────────────────────
+// Proof bits returned by [`inject_dead_client_callback_unwind`]; ALL set = the spec passes.
+/// win32k really SUSPENDED itself inside `KeUserModeCallback` awaiting the injected client's reply.
+pub(crate) const DEAD_CLIENT_INJECT_PARKED: u64 = 0x01;
+/// The client really entered the reverse transition: the top active frame is REDIRECTED, depth >= 1.
+pub(crate) const DEAD_CLIENT_INJECT_REDIRECTED: u64 = 0x02;
+/// The injected client thread was really TERMINATED (TCB suspended + revoked) while at that depth.
+pub(crate) const DEAD_CLIENT_INJECT_VICTIM_DEAD: u64 = 0x04;
+/// `unwind_dead_client_user_callbacks` unwound the frame (and counted it as a redirect teardown).
+pub(crate) const DEAD_CLIENT_INJECT_UNWOUND: u64 = 0x08;
+/// The continuation + active stacks DRAINED (pushes == unwinds, nothing left for that client).
+pub(crate) const DEAD_CLIENT_INJECT_DRAINED: u64 = 0x10;
+/// win32k is back in its NORMAL dispatch receive loop — proven by a fresh dispatch that COMPLETES.
+pub(crate) const DEAD_CLIENT_INJECT_WIN32K_IDLE: u64 = 0x20;
+pub(crate) const DEAD_CLIENT_INJECT_ALL: u64 = 0x3f;
+
+/// ★ DELIBERATE FAULT INJECTION that makes [`unwind_dead_client_user_callbacks`] a GATE-PROTECTED
+/// path instead of a path evidenced only by historical crash boots.
+///
+/// The wedge this guards against is real and was measured (BATCH 48): a client that dies while
+/// win32k's dispatch is suspended inside `KeUserModeCallback` never sends its `NtCallbackReturn`, the
+/// withheld `W32_USER_CALLBACK_RESUME_LABEL` is never sent, win32k's single TCB stays blocked in its
+/// callback receive loop and the executive's shared loop blocks in `recv` FOREVER — `RUNEXIT=124`,
+/// no gate, no measurement. But on a green boot no client dies, so nothing exercises the recovery.
+/// This self-test manufactures the exact condition, for real, and asserts the recovery.
+///
+/// It is REAL, not a mock, at every step:
+///  1. a genuine win32k dispatch (`NtUserMessageCall(hwnd, WM_NULL, …, FNID_SENDMESSAGE)`) is issued
+///     on the VICTIM thread's identity → win32k's `co_IntDoSendMessage → co_IntSendMessage →
+///     co_IntCallWindowProc` reaches the client's window procedure and calls `KeUserModeCallback`;
+///  2. `service_user_callback` SUSPENDS the component for real (its dispatch parks in the callback
+///     receive loop with a non-empty continuation stack) and the victim is REDIRECTED for real into
+///     `KiUserCallbackDispatcher` (registers rewritten, callout frame written to its stack);
+///  3. the victim thread is then genuinely TERMINATED through the normal hosted-thread terminate
+///     mechanism (TCB suspended, cap revoked) — from here it can never reach `NtCallbackReturn`,
+///     which is precisely the wedge condition;
+///  4. `unwind_dead_client_user_callbacks` runs, and the recovery is asserted: the frame unwinds,
+///     both stacks drain, and a FRESH win32k dispatch COMPLETES (win32k really is back in its idle
+///     dispatch receive loop rather than stranded).
+///
+/// SAFETY FOR THE REAL FLOW. This runs POST-QUIESCE — after the hosted receive loop has broken, so
+/// after the entire load-bearing boot (winlogon SAS → msgina dialog → the authentic desktop/dialog
+/// paints) has already completed and its counters are latched. The victim is a NON-CRITICAL winlogon
+/// RPC worker thread (never the main thread, which the gate still samples), and the message sent is
+/// `WM_NULL` — the one message defined to do nothing, so no window state and no pixel can change.
+/// Note the `pi`-scoped dead latch this sets is likewise harmless here: no further win32k callback is
+/// requested for winlogon after quiesce.
+///
+/// Returns the `DEAD_CLIENT_INJECT_*` proof mask.
+pub(crate) unsafe fn inject_dead_client_callback_unwind(
+    client_pid: u64,
+    scratch_base: u64,
+    kill_victim: &mut dyn FnMut(u64) -> bool,
+) -> u64 {
+    const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
+    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
+    const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
+    const WM_NULL: u64 = 0x0000;
+    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
+
+    let mut proof = 0u64;
+    // (0) VICTIM SELECTION — an expendable winlogon (pi 2) worker thread. Both candidates are real
+    // hosted threads with a live TCB, a registered client stack and a TEB alias the callback-window
+    // bridge can write, which is what a redirect needs; neither is winlogon's main thread.
+    let candidates = [
+        (
+            WINLOGON_WORKER2_BADGE,
+            WL_WORKER2_TID.load(Ordering::Relaxed),
+            WL_WORKER2_TEB_VA,
+            WL_WORKER2_STACK_BASE + WL_WORKER2_STACK_FRAMES * 0x1000,
+        ),
+        (
+            WINLOGON_WORKER_BADGE,
+            PM_LISTENER_TID.load(Ordering::Relaxed),
+            WL_LISTENER_TEB_VA,
+            WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
+        ),
+    ];
+    let Some(&(badge, tid, teb, stack_top)) = candidates
+        .iter()
+        .find(|(_, tid, _, _)| *tid != 0 && callback_client_tcb(*tid).is_some())
+    else {
+        print_str(b"[cb-inject] no expendable winlogon worker thread available -> skipped\n");
+        return proof;
+    };
+    let Some(tcb) = callback_client_tcb(tid) else {
+        return proof;
+    };
+    // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
+    // the redirect's callout-frame write has guaranteed room. The thread is about to be destroyed, so
+    // its live context is irrelevant; this only removes a spurious failure mode from the self-test.
+    let mut saved = [0u64; 20];
+    tcb_read_regs20(tcb, &mut saved);
+    let victim_rip = saved[nt_user_callback::USER_CONTEXT_RIP];
+    let victim_flags = saved[nt_user_callback::USER_CONTEXT_RFLAGS];
+    let victim_rsp = (stack_top - 0x400) & !0xfu64;
+    saved[nt_user_callback::USER_CONTEXT_RSP] = victim_rsp;
+    let write_error = tcb_write_regs20(tcb, &saved, false);
+    print_str(b"[cb-inject] victim winlogon worker badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" staged-rsp=0x");
+    print_hex((victim_rsp >> 32) as u32);
+    print_hex(victim_rsp as u32);
+    print_str(b" write-error=");
+    print_u64(write_error);
+    print_str(b"\n");
+
+    let client = Win32kClientContext {
+        pi: 2,
+        pid: client_pid,
+        badge,
+        tid,
+        teb,
+        peb_mirror: WINLOGON_PEB_MIRROR,
+        scratch_base,
+    };
+    // (1) Drive a REAL win32k dispatch that reaches a client window procedure. WM_NULL is the
+    // do-nothing message, so the only observable effect is the reverse transition itself.
+    let sas_hwnd = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
+    );
+    let targets = [sas_hwnd, last_real_wm_paint_hwnd()];
+    let mut parked = false;
+    for hwnd in targets {
+        if hwnd == 0 || parked {
+            continue;
+        }
+        let (status, completed) = win32k_dispatch_wide(
+            NTUSER_MESSAGE_CALL_SSN,
+            hwnd,
+            WM_NULL,
+            0,
+            0,
+            victim_rsp,
+            NTUSER_MESSAGE_CALL_ARGC,
+            &[0 /* ResultInfo */, FNID_SENDMESSAGE, 0 /* Ansi */],
+            client,
+        );
+        parked = take_user_callback_pump_suspended();
+        print_str(b"[cb-inject] NtUserMessageCall(WM_NULL) hwnd=0x");
+        print_hex(hwnd as u32);
+        print_str(b" -> status=0x");
+        print_hex(status as u32);
+        print_str(b" completed=");
+        print_u64(completed as u64);
+        print_str(b" callback-parked=");
+        print_u64(parked as u64);
+        print_str(b"\n");
+    }
+    if !parked {
+        print_str(b"[cb-inject] win32k issued no user callback -> injection did not arm\n");
+        return proof;
+    }
+    proof |= DEAD_CLIENT_INJECT_PARKED;
+
+    // (2) REDIRECT the victim into `KiUserCallbackDispatcher` — the real reverse transition.
+    if !begin_controlled_user_callback_redirect(client, victim_rip, victim_rsp, victim_flags) {
+        print_str(b"[cb-inject] redirect failed -> cancelling the parked callback\n");
+        let _ = cancel_suspended_user_callback();
+        return proof;
+    }
+    let (active_depth, continuation_depth) = user_callback_stack_depths();
+    let top_redirected = (*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
+        .top()
+        .is_some_and(|frame| frame.is_redirected());
+    if active_depth >= 1 && top_redirected {
+        proof |= DEAD_CLIENT_INJECT_REDIRECTED;
+    }
+    print_str(b"[cb-inject] armed: callback depth=");
+    print_u64(active_depth as u64);
+    print_str(b" continuation-depth=");
+    print_u64(continuation_depth as u64);
+    print_str(b" redirected=");
+    print_u64(top_redirected as u64);
+    print_str(b" (win32k parked awaiting the callback result)\n");
+
+    // (3) KILL the client thread while it is AT that depth — it can never send NtCallbackReturn now.
+    let killed = kill_victim(tid);
+    let tcb_gone = callback_client_tcb(tid).is_none();
+    if killed && tcb_gone {
+        proof |= DEAD_CLIENT_INJECT_VICTIM_DEAD;
+    }
+    print_str(b"[cb-inject] victim terminated mid-callback: terminated=");
+    print_u64(killed as u64);
+    print_str(b" tcb-reclaimed=");
+    print_u64(tcb_gone as u64);
+    print_str(b"\n");
+
+    // (4) RECOVERY — the path under test.
+    let unwinds_before = USER_CALLBACK_DEAD_CLIENT_UNWINDS.load(Ordering::Relaxed);
+    let redirect_unwinds_before =
+        USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS.load(Ordering::Relaxed);
+    let unwound = unwind_dead_client_user_callbacks(client.pi);
+    if unwound >= 1
+        && USER_CALLBACK_DEAD_CLIENT_UNWINDS.load(Ordering::Relaxed) >= unwinds_before + 1
+        && USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS.load(Ordering::Relaxed)
+            >= redirect_unwinds_before + 1
+    {
+        proof |= DEAD_CLIENT_INJECT_UNWOUND;
+    }
+    let (active_after, continuation_after) = user_callback_stack_depths();
+    if active_after == 0
+        && continuation_after == 0
+        && USER_CALLBACK_CONTINUATION_UNWINDS.load(Ordering::Relaxed)
+            == USER_CALLBACK_CONTINUATION_PUSHES.load(Ordering::Relaxed)
+    {
+        proof |= DEAD_CLIENT_INJECT_DRAINED;
+    }
+    // win32k is genuinely BACK in its normal dispatch receive loop, not stranded: a fresh dispatch
+    // round-trips and COMPLETES. Had the unwind not resumed + re-parked it, this would WALL — which
+    // is exactly what the wedge looked like.
+    let (probe_status, probe_ok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
+    if probe_ok && probe_status == win32k_subsystem::TEST_FAULT_STATUS {
+        proof |= DEAD_CLIENT_INJECT_WIN32K_IDLE;
+    }
+    print_str(b"[cb-inject] recovery: frames-unwound=");
+    print_u64(unwound);
+    print_str(b" active-depth=");
+    print_u64(active_after as u64);
+    print_str(b" continuation-depth=");
+    print_u64(continuation_after as u64);
+    print_str(b" win32k-probe status=0x");
+    print_hex(probe_status as u32);
+    print_str(b" ok=");
+    print_u64(probe_ok as u64);
+    print_str(b" proof=0x");
+    print_hex(proof as u32);
+    print_str(b"\n");
+    proof
 }
 
 pub(crate) unsafe fn complete_controlled_user_callback(

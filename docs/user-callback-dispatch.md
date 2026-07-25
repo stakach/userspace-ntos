@@ -473,6 +473,31 @@ success.
      (`co_IntCallWindowProc`'s `Error Callback to User space` branch). The dead `pi` is latched first
      so any further callback fails closed, which is what makes the unwind pump converge. Wired at
      every crash-park site and at critical termination.
+
+     **GATE-PROTECTED (batch 49): `exec_user_callback_dead_client_unwind`.** On a healthy boot no
+     client dies, so `dead-client-unwinds` was `0` and this recovery was evidenced only by two
+     historical crash boots. `win32k_glue::inject_dead_client_callback_unwind` now MANUFACTURES the
+     condition for real, POST-QUIESCE (after the whole load-bearing SAS → msgina → paint flow has
+     finished and its counters are latched, so it cannot perturb them): it drives an expendable
+     winlogon RPC worker thread through a real `NtUserMessageCall(hwnd, WM_NULL, …, FNID_SENDMESSAGE)`
+     → `co_IntDoSendMessage → co_IntCallWindowProc → KeUserModeCallback`, so the component genuinely
+     suspends and the worker is genuinely redirected into `KiUserCallbackDispatcher`; then it
+     TERMINATES that thread (TCB suspended + cap revoked) at callback depth 1 and asserts the
+     recovery. Six proof bits, all required: component parked / frame redirected at depth >= 1 /
+     victim really dead / frame unwound / both stacks drained / **a FRESH win32k dispatch completes**.
+     `WM_NULL` is chosen precisely because it changes nothing, and the victim is never winlogon's main
+     thread. Measured live: `dead-client-unwinds=1 dead-client-unwind-redirects=1`,
+     `continuation-pushes == continuation-unwinds (1644/1644)`, `193/99` ZERO FAILs.
+     Disabling the unwind (experiment, `/tmp/boot_faultinj_nofix.log`) leaves
+     `active-depth=1 continuation-depth=2` and the fresh dispatch is REJECTED (`0xC000000D`) —
+     win32k stranded — so the spec fails (`191/99`, 2 FAILs). It cannot pass without the fix.
+
+     **Ledger note.** A dead-client unwind is deliberately NOT a `real-return` (it is a failure
+     completion), so `exec_user_callback_real_api0_nested_roundtrip` now asserts the exact identity
+     `real-returns + dead-client-unwind-redirects == real-redirects` (plus `real-returns >= 1`):
+     every real redirect is accounted for as either returned by the client or torn down because the
+     client died. `USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS` counts only unwound frames that had
+     already been redirected, so the two specs stay independent and both stay meaningful.
   2. **`CLIENTINFO.CallbackWnd` is a SHARED field with two writers.** `user32!ValidateHwnd` returns
      `CallbackWnd.pWnd` verbatim whenever the queried `HWND` matches `CallbackWnd.hWnd`, and every
      window-field access then dereferences it. win32k writes that field itself
