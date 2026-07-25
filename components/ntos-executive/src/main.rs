@@ -6169,6 +6169,12 @@ static DBGK_FAKE_MESSAGES: AtomicU64 = AtomicU64::new(0);
 static DBGK_WAITS_SERVED: AtomicU64 = AtomicU64::new(0);
 static DBGK_CONTINUES: AtomicU64 = AtomicU64::new(0);
 static DBGK_DETACHES: AtomicU64 = AtomicU64::new(0);
+/// `DbgkForwardException` forwards: incremented by `ExecNtHandler::dbgk_forward_exception`, the
+/// entry the LIVE FAULT PATH calls for every user exception (`#PF`/`#GP`/`#UD`/int3/single-step)
+/// taken by a hosted process. It only counts a forward that actually happened — a process with no
+/// `EPROCESS.DebugPort` returns immediately having done nothing, which is why this stays **0** on a
+/// plain boot (nothing debugs anything) and the fault path stays byte-identical.
+static DBGK_EXCEPTIONS_FORWARDED: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk end-to-end SELF-TEST result** (post-loop, throwaway debugger + debuggee EPROCESSes),
 /// driving the SAME `nt_process::dbgk` plane the five native handlers dispatch into. Bitmask:
 ///   0x0001 NtCreateDebugObject creates a real DEBUG_OBJECT (DBGK_KILL_PROCESS_ON_EXIT honoured)
@@ -6216,6 +6222,26 @@ static DBGK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///          handle = STATUS_INVALID_HANDLE, detach without attach = STATUS_PORT_NOT_SET
 ///   0x0400 NtClose on the debug handle runs DbgkpCloseObject (object destroyed, debuggee detached)
 static DBGK_SYSCALL_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk EXCEPTION-FORWARDING self-test result** (post-loop). `DbgkForwardException` — the debug
+/// event source that was DEFERRED until this batch. The debugger side runs through the REAL
+/// dispatch route; the debuggee side runs through `ExecNtHandler::dbgk_forward_exception`, *the very
+/// entry the live fault path calls* at its `#PF`/`#GP`/int3 classification sites. Bit map:
+///   0x0001 setup: a throwaway debuggee attached BY SSN, its fake create event drained by SSN
+///   0x0002 THE FORWARD: the fault-path entry resolved pi → pid → `EPROCESS.DebugPort`, queued one
+///          `DbgKmExceptionApi` event and moved `DBGK_EXCEPTIONS_FORWARDED`
+///   0x0004 `NtWaitForDebugEvent` reports `DbgExceptionStateChange` for the faulting CLIENT_ID with
+///          the WHOLE `EXCEPTION_RECORD` read back OUT OF CLIENT MEMORY — code, address, both
+///          `MmAccessFault` parameters, `FirstChance`
+///   0x0008 `NtDebugContinue` rejects an illegal status and resolves the exception with DBG_CONTINUE
+///   0x0010 an `int3` reports as `DbgBreakpointStateChange`, and the trap-vector → NTSTATUS map the
+///          label-3 fault site uses matches what `KiDispatchException` reports
+///   0x0020 ★ THE NO-DEBUGGER GATE: forwarding for a process with no `DebugPort` returns false,
+///          moves no counter and queues nothing — the path EVERY fault on the live boot takes
+///   0x0040 ★ SIGNAL FIX (fault-path poster): a debugger parked on the object's `EventsPresent`
+///          dispatcher event is woken by a forward issued from the FAULT-PATH entry (not a syscall)
+///   0x0080 ★ SIGNAL FIX (non-dbgk syscall poster): the same park is woken by `NtTerminateThread`'s
+///          lifecycle `DbgKmExitThreadApi` post, an arm that never mirrored the signal before
+static DBGK_EXCEPTION_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -9903,6 +9929,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         dbgk_sys & 0x0100 == 0x0100,
                         &mut passed,
                     );
+                    // ---- Dbgk EXCEPTION FORWARDING (`DbgkForwardException`). The event source the
+                    // fault path now feeds: the debugger side goes through the real dispatcher, the
+                    // debuggee side through the SAME `dbgk_forward_exception` entry the loop's
+                    // `#PF`/`#GP`/int3 sites call. The no-debugger gate (0x0020) is the safety
+                    // property that keeps every fault on this boot byte-identical.
+                    let dbgk_exc = DBGK_EXCEPTION_SELFTEST.load(Ordering::Relaxed);
+                    check(
+                        b"exec_dbgk_exception_forwarded",
+                        dbgk_exc & 0x0037 == 0x0037,
+                        &mut passed,
+                    );
+                    // NtDebugContinue resolves the exception event, and BOTH previously-unsignalled
+                    // posting paths — the fault-path forward and a lifecycle post from a non-dbgk
+                    // syscall arm — now wake a debugger parked on the object's EventsPresent event.
+                    // NOT covered: the reporting (faulting) thread does not BLOCK on the continue,
+                    // so DBG_TERMINATE_* are recorded, not enforced. See ntdll_plan.md §D.
+                    check(
+                        b"exec_dbgk_exception_continue_and_wake",
+                        dbgk_exc & 0x00C8 == 0x00C8,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] dbgk exception-forward selftest bits=0x");
+                    print_hex(dbgk_exc as u32);
+                    print_str(b" forwards=");
+                    print_u64(DBGK_EXCEPTIONS_FORWARDED.load(Ordering::Relaxed));
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] dbgk syscall-dispatch selftest bits=0x");
                     print_hex(dbgk_sys as u32);
                     print_str(b"\n");

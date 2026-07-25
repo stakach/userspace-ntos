@@ -726,7 +726,7 @@ impl ProcessManager {
                     initial_thread_start_address: start_address,
                 }
             };
-            self.report_debug_message(pid, tid, message);
+            let _ = self.report_debug_message(pid, tid, message);
         }
         Ok(tid)
     }
@@ -1367,7 +1367,7 @@ impl ProcessManager {
             return Ok(());
         }
         // Dbgk event source: a thread exit in a debugged process reports DbgKmExitThreadApi.
-        self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
+        let _ = self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
         if !was_system {
             let remaining = self
                 .threads
@@ -1415,7 +1415,7 @@ impl ProcessManager {
         }
         if transitioned {
             // Dbgk event source: DbgKmExitThreadApi (the no-cascade self-exit path).
-            self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
+            let _ = self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
         }
         Ok(())
     }
@@ -1470,7 +1470,7 @@ impl ProcessManager {
             .get(&pid)
             .and_then(|p| p.main_thread)
             .unwrap_or(0);
-        self.report_debug_message(pid, main, DbgKmMessage::ExitProcess { exit_status });
+        let _ = self.report_debug_message(pid, main, DbgKmMessage::ExitProcess { exit_status });
         Ok(())
     }
 
@@ -1757,17 +1757,19 @@ impl ProcessManager {
         }
     }
 
-    /// Queue a `DBGKM_MSG` against `pid`'s debug port, if it has one. Returns `true` when an event
-    /// was actually queued (`false` = not debugged, or the debugger has gone).
+    /// Queue a `DBGKM_MSG` against `pid`'s debug port, if it has one. Returns the debug object the
+    /// event landed on (`None` = not debugged, or the debugger has gone).
+    ///
+    /// ★ Every caller is a POSTING SITE: the host mirrors the object's `EventsPresent` onto its
+    /// dispatcher object after any post, so a thread parked in `NtWaitForDebugEvent` is woken no
+    /// matter which path queued the event.
     fn report_debug_message(
         &mut self,
         pid: ProcessId,
         tid: ThreadId,
         message: DbgKmMessage,
-    ) -> bool {
-        let Some(object) = self.processes.get(&pid).and_then(|p| p.debug_port) else {
-            return false;
-        };
+    ) -> Option<DebugObjectId> {
+        let object = self.processes.get(&pid).and_then(|p| p.debug_port)?;
         let event = DebugEvent::new(
             ClientId {
                 unique_process: pid,
@@ -1779,6 +1781,51 @@ impl ProcessManager {
         self.dbgk
             .get_mut(object)
             .is_some_and(|o| o.queue(event).is_ok())
+            .then_some(object)
+    }
+
+    /// `DbgkForwardException` — report a user-mode exception taken by `tid` in `pid` to that
+    /// process's `EPROCESS.DebugPort`.
+    ///
+    /// Faithful to `ntoskrnl/dbgk/dbgkobj.c::DbgkForwardException`: nothing happens (and `None` is
+    /// returned) when the process has no debug port, so the caller's ordinary
+    /// SEH / unhandled-exception path proceeds untouched. `first_chance` is
+    /// `DbgkForwardException`'s `!SecondChance` — the debugger sees a first-chance report before
+    /// the exception is offered to the process, and a second-chance one after nothing handled it.
+    ///
+    /// Returns the debug object the `DbgKmExceptionApi` message was queued on. The reporting thread
+    /// is NOT blocked on the continue (see the module docs) — the continue status the debugger
+    /// supplies is recorded by [`debug_continue`](Self::debug_continue), not applied to a thread.
+    pub fn report_exception(
+        &mut self,
+        pid: ProcessId,
+        tid: ThreadId,
+        record: dbgk::ExceptionRecord,
+        first_chance: bool,
+    ) -> Option<DebugObjectId> {
+        self.report_debug_message(
+            pid,
+            tid,
+            DbgKmMessage::Exception {
+                record,
+                first_chance: u32::from(first_chance),
+            },
+        )
+    }
+
+    /// Every live debug object's id, written into `out` (creation order); returns how many were
+    /// written. A host uses this to mirror each object's modelled `EventsPresent` onto its
+    /// dispatcher object without allocating.
+    pub fn debug_object_ids_into(&self, out: &mut [DebugObjectId]) -> usize {
+        let mut n = 0;
+        for id in self.dbgk.ids() {
+            if n == out.len() {
+                break;
+            }
+            out[n] = id;
+            n += 1;
+        }
+        n
     }
 
     // --- handle tables (spec §8) ---------------------------------------------

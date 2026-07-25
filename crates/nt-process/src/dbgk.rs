@@ -185,6 +185,53 @@ pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 /// `STATUS_SINGLE_STEP` — reports as `DbgSingleStepStateChange`.
 pub const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 
+// --- Trap-vector → NTSTATUS (the exception code a fault reports to a debugger) -------------------
+
+/// `STATUS_DATATYPE_MISALIGNMENT`.
+pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+/// `STATUS_ACCESS_VIOLATION`.
+pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// `STATUS_ILLEGAL_INSTRUCTION`.
+pub const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+/// `STATUS_ARRAY_BOUNDS_EXCEEDED`.
+pub const STATUS_ARRAY_BOUNDS_EXCEEDED: u32 = 0xC000_008C;
+/// `STATUS_FLOAT_DIVIDE_BY_ZERO`.
+pub const STATUS_FLOAT_DIVIDE_BY_ZERO: u32 = 0xC000_008E;
+/// `STATUS_INTEGER_DIVIDE_BY_ZERO`.
+pub const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+/// `STATUS_INTEGER_OVERFLOW`.
+pub const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
+/// `STATUS_PRIVILEGED_INSTRUCTION`.
+pub const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
+/// `STATUS_STACK_OVERFLOW`.
+pub const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+/// The NTSTATUS exception code an x86/x64 trap `vector` reports, matching what ReactOS's
+/// `KiTrapXXHandler`s hand to `KiDispatchException` (`ntoskrnl/ke/i386/traphdlr.c`).
+///
+/// `#GP` (13) reports `STATUS_ACCESS_VIOLATION` — the fall-through `KiTrap0D` takes for a
+/// non-privileged-instruction general protection fault; a privileged-instruction `#GP` is a
+/// decode-time refinement the caller applies itself. Anything unrecognised reports
+/// `STATUS_ACCESS_VIOLATION`, the code `KiDispatchException` uses for an unclassified user fault.
+pub fn exception_code_for_trap(vector: u32) -> u32 {
+    match vector {
+        0 => STATUS_INTEGER_DIVIDE_BY_ZERO,   // #DE
+        1 => STATUS_SINGLE_STEP,              // #DB
+        3 => STATUS_BREAKPOINT,               // #BP
+        4 => STATUS_INTEGER_OVERFLOW,         // #OF
+        5 => STATUS_ARRAY_BOUNDS_EXCEEDED,    // #BR
+        6 => STATUS_ILLEGAL_INSTRUCTION,      // #UD
+        7 => STATUS_ILLEGAL_INSTRUCTION,      // #NM (no math coprocessor)
+        12 => STATUS_STACK_OVERFLOW,          // #SS
+        13 => STATUS_ACCESS_VIOLATION,        // #GP
+        14 => STATUS_ACCESS_VIOLATION,        // #PF
+        16 => STATUS_FLOAT_DIVIDE_BY_ZERO,    // #MF (the reported x87 status refines this)
+        17 => STATUS_DATATYPE_MISALIGNMENT,   // #AC
+        19 => STATUS_FLOAT_DIVIDE_BY_ZERO,    // #XM (the reported MXCSR status refines this)
+        _ => STATUS_ACCESS_VIOLATION,
+    }
+}
+
 /// The x64 `EXCEPTION_RECORD` carried by a `DbgKmExceptionApi` message.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ExceptionRecord {
@@ -206,6 +253,35 @@ impl Default for ExceptionRecord {
             number_parameters: 0,
             exception_information: [0; 15],
         }
+    }
+}
+
+impl ExceptionRecord {
+    /// A parameter-less record for `code` raised at `address` (`KiDispatchException0Args`).
+    pub fn new(code: u32, address: u64) -> Self {
+        ExceptionRecord {
+            exception_code: code,
+            exception_address: address,
+            ..ExceptionRecord::default()
+        }
+    }
+
+    /// Attach `parameters` (`ExceptionInformation`, at most 15 — `EXCEPTION_MAXIMUM_PARAMETERS`)
+    /// and set `NumberParameters` accordingly. Extra entries beyond 15 are dropped, exactly as
+    /// `KiDispatchException` clamps.
+    pub fn with_parameters(mut self, parameters: &[u64]) -> Self {
+        let n = parameters.len().min(self.exception_information.len());
+        self.exception_information[..n].copy_from_slice(&parameters[..n]);
+        self.number_parameters = n as u32;
+        self
+    }
+
+    /// The `STATUS_ACCESS_VIOLATION` record a page fault reports: `ExceptionInformation[0]` = the
+    /// access type (0 read / 1 write / 8 execute) and `[1]` = the faulting virtual address, the
+    /// two arguments `MmAccessFault` hands `KiDispatchException2Args`.
+    pub fn access_violation(address: u64, access_type: u64, fault_address: u64) -> Self {
+        ExceptionRecord::new(STATUS_ACCESS_VIOLATION, address)
+            .with_parameters(&[access_type, fault_address])
     }
 }
 
@@ -607,6 +683,11 @@ impl DebugObjectStore {
     /// Whether no debug object is live.
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
+    }
+
+    /// The id of every live object, in creation order.
+    pub fn ids(&self) -> impl Iterator<Item = DebugObjectId> + '_ {
+        self.objects.keys().copied()
     }
 }
 

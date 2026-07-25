@@ -1091,6 +1091,92 @@ impl ExecNtHandler {
         }
     }
 
+    /// ★ POST-SIDE WAKE CORRECTNESS. Mirror **every** live debug object's modelled `EventsPresent`
+    /// onto the dispatcher event backing it, and — when that newly signals one — run the ordinary
+    /// dispatcher wake so a thread parked inside `NtWaitForDebugEvent` is resumed.
+    ///
+    /// Why blanket rather than per-object: debug events are posted from many places that are not
+    /// the five dbgk syscall arms — the `nt-process` lifecycle (thread create / thread exit /
+    /// process exit, reached through `NtCreateThread`/`NtTerminate*`) and now
+    /// [`dbgk_forward_exception`](Self::dbgk_forward_exception) from the FAULT path. Before this,
+    /// only the dbgk arms mirrored the signal, so an event queued by any other path marked the
+    /// modelled `EventsPresent` but never set the dispatcher event and could not wake a parked
+    /// debugger. This runs at the one chokepoint every syscall passes through
+    /// (`NativeSyscallHandler::handle`) plus the fault-path forward, so posting is uniformly
+    /// wake-correct wherever it happens.
+    ///
+    /// Costs nothing on a plain boot: with no debug object alive it returns on the first line, so
+    /// the live syscall path is byte-identical.
+    pub(crate) fn sync_debug_object_signals(&mut self) {
+        if self.pm.debug_object_count() == 0 {
+            return;
+        }
+        // Debug objects are per-debugger and few (one per `DbgUiConnectToDbg`); 8 covers every
+        // realistic set, and a longer one simply keeps the objects the loop already mirrored.
+        let mut ids = [0 as nt_process::dbgk::DebugObjectId; 8];
+        let n = self.pm.debug_object_ids_into(&mut ids);
+        let mut newly_signalled = false;
+        for &object in &ids[..n] {
+            let Some((key, present)) = self
+                .pm
+                .debug_object(object)
+                .map(|o| (o.host_event, o.events_present()))
+            else {
+                continue;
+            };
+            if key == 0 {
+                continue;
+            }
+            let index = key - 1;
+            if present && !self.dispatcher_ready(index as usize) {
+                newly_signalled = true;
+            }
+            self.sync_debug_object_signal(object);
+        }
+        if newly_signalled {
+            unsafe { wait_wake_dispatcher_set(self) };
+        }
+    }
+
+    /// `DbgkForwardException` — report a user-mode exception taken by hosted process index `pi` to
+    /// that process's `EPROCESS.DebugPort`, and wake a debugger parked on it.
+    ///
+    /// ★ SAFETY PROPERTY: when the process is **not** being debugged this returns `false` having
+    /// done nothing at all (two table lookups, no logging, no state change), so every caller's
+    /// existing unrecoverable-fault handling runs byte-identically. On the current boot nothing
+    /// attaches a debugger to a hosted process, so this always takes that early return.
+    ///
+    /// `tid_hint` is the reporting thread (0 ⇒ the process's main thread — the fault path's
+    /// per-badge identity is not yet resolved where the classification happens). `first_chance` is
+    /// `DbgkForwardException`'s `!SecondChance`.
+    ///
+    /// Returns `true` when the event was queued. The reporting thread is **not** blocked on the
+    /// debugger's continue — see `ntdll_plan.md` §D for what that does and does not mean.
+    pub(crate) fn dbgk_forward_exception(
+        &mut self,
+        pi: usize,
+        tid_hint: u64,
+        record: nt_process::dbgk::ExceptionRecord,
+        first_chance: bool,
+    ) -> bool {
+        let Some(pid) = self.pm_pid_for_pi(pi) else {
+            return false;
+        };
+        if !self.pm.is_process_being_debugged(pid) {
+            return false;
+        }
+        let tid = match tid_hint {
+            0 => self.pm.main_thread(pid).unwrap_or(0),
+            hint => hint as nt_process::ThreadId,
+        };
+        if self.pm.report_exception(pid, tid, record, first_chance).is_none() {
+            return false;
+        }
+        DBGK_EXCEPTIONS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        self.sync_debug_object_signals();
+        true
+    }
+
     pub(crate) fn waitable_index_for_handle(
         &self,
         handle: u64,
@@ -3989,7 +4075,26 @@ impl ExecNtHandler {
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
+    /// The dispatcher's entry point. It is a thin wrapper so that ONE thing is guaranteed to run
+    /// after **every** service arm however it returned (most arms `return` early from the giant
+    /// match): the debug-object signal mirror. Any arm that queues a debug event — the five dbgk
+    /// services, and equally the `nt-process` lifecycle sources reached through
+    /// `NtCreateThread`/`NtTerminateThread`/`NtTerminateProcess` — therefore signals the dispatcher
+    /// event a parked `NtWaitForDebugEvent` waits on. With no debug object alive (the plain boot)
+    /// this is a single load and a branch.
     fn handle(
+        &mut self,
+        ctx: &NativeCallContext,
+        args: &[u64],
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> u32 {
+        let status = self.handle_service(ctx, args, out);
+        self.sync_debug_object_signals();
+        status
+    }
+}
+impl ExecNtHandler {
+    fn handle_service(
         &mut self,
         ctx: &NativeCallContext,
         args: &[u64],

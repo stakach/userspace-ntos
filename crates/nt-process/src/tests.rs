@@ -1492,3 +1492,157 @@ fn dbgk_undebugged_processes_queue_nothing() {
     assert_eq!(pm.debug_object_count(), 0);
     assert!(pm_object.debug_object(object).unwrap().is_empty());
 }
+
+// --- DbgkForwardException: the exception / breakpoint / single-step event source -----------------
+
+#[test]
+fn dbgk_forward_exception_queues_a_first_chance_exception_event() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    // Drain the attach-time fake create message so the exception is the outstanding event.
+    let create = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(create.state, dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    // A REAL page fault: STATUS_ACCESS_VIOLATION at RIP 0x7FFE_1000 touching 0x0000_0018 for write.
+    let record = dbgk::ExceptionRecord::access_violation(0x7FFE_1000, 1, 0x18);
+    let posted = pm.report_exception(target, main, record, true);
+    assert_eq!(posted, Some(object), "a debugged process reports to its port");
+    let debug_object = pm.debug_object(object).unwrap();
+    assert_eq!(debug_object.len(), 1);
+    // Queuing a non-NOWAIT event signals the debugger awake.
+    assert!(debug_object.events_present());
+    assert_eq!(
+        debug_object.events()[0].message.api_number(),
+        dbgk::DBGKM_EXCEPTION_API
+    );
+
+    // The debugger retrieves it: DbgExceptionStateChange for the faulting CLIENT_ID, carrying the
+    // whole EXCEPTION_RECORD + FirstChance in the rendered DBGUI_WAIT_STATE_CHANGE.
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_EXCEPTION_STATE_CHANGE);
+    assert_eq!(result.client_id.unique_process, target);
+    assert_eq!(result.client_id.unique_thread, main);
+    let sc = &result.state_change;
+    let u32_at = |o: usize| u32::from_le_bytes(sc[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(sc[o..o + 8].try_into().unwrap());
+    assert_eq!(u32_at(0x18), dbgk::STATUS_ACCESS_VIOLATION);
+    assert_eq!(u64_at(0x28), 0x7FFE_1000, "ExceptionAddress");
+    assert_eq!(u32_at(0x30), 2, "NumberParameters");
+    assert_eq!(u64_at(0x38), 1, "ExceptionInformation[0] = write access");
+    assert_eq!(u64_at(0x40), 0x18, "ExceptionInformation[1] = fault address");
+    assert_eq!(u32_at(0xb0), 1, "FirstChance");
+
+    // DBG_CONTINUE resolves it and its returned status is recorded on the event.
+    let resolved = pm
+        .debug_continue(
+            object,
+            ClientId {
+                unique_process: target,
+                unique_thread: main,
+            },
+            dbgk::DBG_CONTINUE,
+        )
+        .unwrap();
+    assert_eq!(resolved.returned_status, dbgk::DBG_CONTINUE);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+}
+
+#[test]
+fn dbgk_forward_exception_refines_breakpoint_single_step_and_second_chance() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let _ = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    let client = ClientId {
+        unique_process: target,
+        unique_thread: main,
+    };
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+
+    // int3 → DbgBreakpointStateChange; a second-chance report clears FirstChance.
+    let record = dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x4010_00);
+    assert_eq!(pm.report_exception(target, main, record, false), Some(object));
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_BREAKPOINT_STATE_CHANGE);
+    assert_eq!(
+        u32::from_le_bytes(result.state_change[0xb0..0xb4].try_into().unwrap()),
+        0,
+        "SecondChance ⇒ FirstChance == 0"
+    );
+    pm.debug_continue(object, client, dbgk::DBG_EXCEPTION_NOT_HANDLED)
+        .unwrap();
+
+    // Trap 1 (#DB) → DbgSingleStepStateChange.
+    let code = dbgk::exception_code_for_trap(1);
+    assert_eq!(code, dbgk::STATUS_SINGLE_STEP);
+    assert_eq!(
+        pm.report_exception(target, main, dbgk::ExceptionRecord::new(code, 0x401002), true),
+        Some(object)
+    );
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_SINGLE_STEP_STATE_CHANGE);
+}
+
+#[test]
+fn dbgk_forward_exception_is_inert_without_a_debug_port() {
+    let mut pm = ProcessManager::new();
+    let (target, main, _debugger, object) = attach_debugger(&mut pm);
+    // A process that was never attached reports nothing at all.
+    let plain = pm.create_process("plain.exe", None, None);
+    let plain_tid = pm.create_thread(plain, 0x1000, 0, false).unwrap();
+    let record = dbgk::ExceptionRecord::new(dbgk::STATUS_ACCESS_VIOLATION, 0x1234);
+    assert_eq!(pm.report_exception(plain, plain_tid, record, true), None);
+    assert_eq!(pm.debug_object(object).unwrap().len(), 1, "only the fake create");
+
+    // ...and neither does a DETACHED one — this is the live-boot shape (no debugger anywhere), the
+    // gate the fault path checks before it diverts anything.
+    pm.remove_process_debug(target, object).unwrap();
+    assert!(!pm.is_process_being_debugged(target));
+    assert_eq!(pm.report_exception(target, main, record, true), None);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+}
+
+#[test]
+fn dbgk_debug_object_ids_enumerates_every_live_object() {
+    let mut pm = ProcessManager::new();
+    let mut ids = [0u32; 4];
+    assert_eq!(pm.debug_object_ids_into(&mut ids), 0);
+    let a = pm.create_debug_object(0).unwrap();
+    let b = pm.create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT).unwrap();
+    assert_eq!(pm.debug_object_ids_into(&mut ids), 2);
+    assert_eq!(&ids[..2], &[a, b]);
+    // A short output buffer truncates rather than overflowing.
+    let mut one = [0u32; 1];
+    assert_eq!(pm.debug_object_ids_into(&mut one), 1);
+    pm.destroy_debug_object(a);
+    assert_eq!(pm.debug_object_ids_into(&mut ids), 1);
+    assert_eq!(ids[0], b);
+}
+
+#[test]
+fn dbgk_trap_vectors_map_to_the_ntstatus_kidispatchexception_reports() {
+    use super::dbgk as d;
+    assert_eq!(d::exception_code_for_trap(0), d::STATUS_INTEGER_DIVIDE_BY_ZERO);
+    assert_eq!(d::exception_code_for_trap(1), d::STATUS_SINGLE_STEP);
+    assert_eq!(d::exception_code_for_trap(3), d::STATUS_BREAKPOINT);
+    assert_eq!(d::exception_code_for_trap(4), d::STATUS_INTEGER_OVERFLOW);
+    assert_eq!(d::exception_code_for_trap(5), d::STATUS_ARRAY_BOUNDS_EXCEEDED);
+    assert_eq!(d::exception_code_for_trap(6), d::STATUS_ILLEGAL_INSTRUCTION);
+    assert_eq!(d::exception_code_for_trap(13), d::STATUS_ACCESS_VIOLATION);
+    assert_eq!(d::exception_code_for_trap(14), d::STATUS_ACCESS_VIOLATION);
+    assert_eq!(d::exception_code_for_trap(17), d::STATUS_DATATYPE_MISALIGNMENT);
+    // Unclassified vectors report the generic user-fault code, never panic.
+    assert_eq!(d::exception_code_for_trap(0xFF), d::STATUS_ACCESS_VIOLATION);
+    // The record builders clamp at EXCEPTION_MAXIMUM_PARAMETERS.
+    let record = d::ExceptionRecord::new(d::STATUS_BREAKPOINT, 0x20).with_parameters(&[7u64; 20]);
+    assert_eq!(record.number_parameters, 15);
+    assert_eq!(record.exception_information[14], 7);
+}

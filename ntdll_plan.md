@@ -3588,7 +3588,7 @@ security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binar
 covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
 `RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
 
-### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199 → 202/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199 → 202 → 204/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
 
 The 8 `DbgUi*` exports **kernel32.dll imports** (they underpin Win32
 `DebugActiveProcess`/`WaitForDebugEvent`/`ContinueDebugEvent`/`DebugBreakProcess`) were
@@ -3650,11 +3650,23 @@ onto it; a zero/immediate timeout returns `STATUS_TIMEOUT` instead), `NtClose` o
 > `exec_dbgk_syscall_wait_park_and_signal`). What is **not** proven and **not** yet complete:
 > (a) the reply-cap steal + thread resume of a **live** client blocked inside `NtWaitForDebugEvent`
 > (no binary in the current set issues these syscalls, so nothing ever blocks on one); and
-> (b) `sync_debug_object_signal` is called **only from the five dbgk arms**, so a debug event posted by
-> a *different* syscall (thread create/exit, process exit via `NtTerminate*`) marks the modelled
-> `EventsPresent` but does **not** signal the dispatcher event and would therefore **not** wake a
-> parked waiter. Closing (b) needs a `sync_process_debug_signal(pid)` + `wait_wake_dispatcher_set` at
-> the lifecycle-posting seams; DEFERRED — it is unreachable today because nothing parks.
+> ~~(b) `sync_debug_object_signal` is called only from the five dbgk arms…~~ — **(b) is FIXED in
+> batch 52, see below.** (a) still stands.
+
+**★ BATCH 52 (2026-07-25, gate 202 → 204/99) — the POST-SIDE SIGNAL DEFECT, fixed.** `(b)` above was
+real: `sync_debug_object_signal` ran **only** in the five dbgk arms, so an event queued by any other
+path (thread create/exit, process exit — and, from this batch, an exception) marked the modelled
+`EventsPresent` but left the dispatcher event backing it CLEAR, and would not have woken a parked
+debugger. The fix pushes the mirror down to the ONE chokepoint every service passes through:
+`NativeSyscallHandler::handle` is now a thin wrapper (`handle` → `handle_service` + the mirror) so it
+runs after **every** arm however that arm returned — most `return` early out of the giant match, which
+is exactly why a post-match hook had to live outside it. `ExecNtHandler::sync_debug_object_signals`
+mirrors **every** live debug object and, when that newly signals one, runs
+`wait_wake_dispatcher_set` — so posting is uniformly wake-correct wherever it happens. The fault-path
+forward (below) calls the same helper directly, since it is not a syscall at all. With no debug object
+alive — every boot today — the helper returns on its first line, so the live syscall path is
+byte-identical. Proven by spec bit `0x0080` (a `NtTerminateThread` lifecycle post wakes a parked
+debugger) and disproven-when-removed by the bypass experiment below.
 
 **3 — `DbgUi*` status (`crates/nt-ntdll-dll/src/exports.rs`):**
 
@@ -3681,19 +3693,45 @@ onto it; a zero/immediate timeout returns `STATUS_TIMEOUT` instead), `NtClose` o
 - **thread exit** — `DbgKmExitThreadApi` from `terminate_thread_at` **and** `exit_thread_at`.
 - **process exit** — `DbgKmExitProcessApi` from `terminate_process_at`.
 
-*DEFERRED (the payload/plumbing exists — `DbgKmMessage::{Exception, LoadDll, UnloadDll}` encode and
-convert correctly, host-tested — but nothing posts them yet):*
-- **exceptions / breakpoints / single-step** (`DbgkForwardException`) — our fault + SEH path
-  (`KiUserExceptionDispatcher`, the executive's fault loop) does **not** consult `EPROCESS.DebugPort`
-  first-chance/second-chance. This is the biggest remaining gap: without it a debugger cannot see a
-  crash or an `int3`.
+- **exceptions / breakpoints / single-step** (`DbgkForwardException`) — **WIRED in batch 52** (was the
+  load-bearing gap). `ExecNtHandler::dbgk_forward_exception` is called from the executive's REAL fault
+  loop (`service_sec_image.rs`, macro `dbgk_forward_exception!`) at every site where it has classified
+  an unrecoverable USER exception, BEFORE that site's existing handling:
+  | fault site | reported `EXCEPTION_RECORD` |
+  |---|---|
+  | label 3 (CPU exception, after the `int 0x2d` DebugService skip) | `exception_code_for_trap(m3)` — the x86 vector → the NTSTATUS `KiDispatchException` reports — at the faulting IP |
+  | label 4 (int3 / `#BP`, after the `[bp-diag]` decode) | `STATUS_BREAKPOINT` at the int3 IP ⇒ `DbgBreakpointStateChange` |
+  | label 6 unrecoverable page fault (both the null-deref and the vmf-out terminal branches) | `STATUS_ACCESS_VIOLATION` with `MmAccessFault`'s two arguments: access type (from the x86 PF error code — bit 1 write, bit 4 exec) + the faulting address |
+  **★ The safety property:** `dbgk_forward_exception` first resolves pi → pid → `EPROCESS.DebugPort`
+  and returns `false` having done *nothing* (two lookups, no log, no state change) when the process is
+  not being debugged. Nothing on the current boot attaches a debugger, so **every** fault takes that
+  early return and `park_and_log!` / `crash_parked` / the dead-client callback unwind / the win32k
+  paths are byte-identical — verified by diffing the boot serial against `c445fcc` (identical modulo
+  per-build address/tid/cluster nondeterminism + the new post-loop spec lines; the PASS/FAIL spec list
+  is identical plus the two new specs). `DBGK_EXCEPTIONS_FORWARDED` reads the forwards; the live-boot
+  contribution is 0.
+  Still **not** covered: `#DB` single-step delivery (nothing sets TF), and the fault sites that are
+  executive-internal walls rather than user exceptions (`fault-cap`, `win32k-spin`,
+  `unhandled-syscall`, `image-map-resource`, `wl-stack-growth`, `other-fault`) do not forward.
+
+*DEFERRED (the payload/plumbing exists — `DbgKmMessage::{LoadDll, UnloadDll}` encode and convert
+correctly, host-tested — but nothing posts them yet):*
 - **module load/unload** (`DbgkMapViewOfSection`/`DbgkUnMapViewOfSection`) — our loader does not post
   `DbgKmLoadDllApi`/`DbgKmUnloadDllApi`.
-- **target-side blocking on the continue event.** NT blocks the *reporting* thread in
-  `DbgkpQueueMessage` until the debugger continues; our wired sources queue and return immediately
-  (the `DebugEvent.status`/`returned_status` resolution is modelled and returned by
-  `debug_continue`, but no live thread is suspended on it). So `DBG_TERMINATE_THREAD`/
-  `DBG_TERMINATE_PROCESS` continue statuses are recorded, not enforced.
+- **target-side blocking on the continue event — STILL DEFERRED after batch 52 (be precise about
+  this).** NT blocks the *reporting* thread inside `DbgkpQueueMessage` until `NtDebugContinue`, then
+  applies the continue status. Ours is **post-and-continue**: the forward queues the event, wakes the
+  debugger, and returns `false`-as-in-"not handled", after which the fault site's own handling runs —
+  i.e. the `DBG_EXCEPTION_NOT_HANDLED` outcome, by construction. So `DBG_CONTINUE` does **not** resume
+  a faulting thread and `DBG_TERMINATE_THREAD`/`DBG_TERMINATE_PROCESS` are **recorded, not enforced**.
+  Blocking the reporting thread needs a fault-flavoured reply-cap steal (the syscall-shaped
+  `wait_park`/`wait_wake_dispatcher` reply — MR15/16/17 + status in r10 — is the wrong shape for a
+  UserException/VMFault reply) plus a resume hook in `NtDebugContinue`. It was deliberately NOT built
+  in batch 52: on the current boot nothing is debugged, so that machinery would be unreachable in the
+  live path AND unprovable post-loop (no live client is blocked inside a syscall) — the same reason
+  item (a) of the scope note above is still open. This also means **the blocking-wait path is still
+  NOT proven**; what batch 52 adds is a second, independent proof of the park-request + wake-signal
+  half, now from two posting paths that could not signal at all before it.
 - **`PEB.BeingDebugged` write-through to a live hosted process** — modelled on `NtProcess`
   (`DbgkpMarkProcessPeb`'s state) but not written into a hosted PEB page; nothing attaches to a live
   hosted process yet.
@@ -3742,6 +3780,29 @@ process id back to a hosted-process index — no live EPROCESS is touched.
 | `exec_dbgk_syscall_access_checks` | the security-relevant negatives, all through the dispatch route: a debug handle without the required `DbgkDebugObjectMapping` access = `STATUS_ACCESS_DENIED` on all four services · a non-debug handle = `STATUS_OBJECT_TYPE_MISMATCH` · NULL `*StateChange`/`*AppClientId` = `STATUS_ACCESS_VIOLATION` · NULL/misaligned `*DebugHandle` = `STATUS_ACCESS_VIOLATION`/`STATUS_DATATYPE_MISALIGNMENT` · bad `DBGK_*` flags = `STATUS_INVALID_PARAMETER` · a process handle without `PROCESS_SUSPEND_RESUME` = `STATUS_ACCESS_DENIED` · an unknown process handle = `STATUS_INVALID_HANDLE` · detach-without-attach = `STATUS_PORT_NOT_SET` · an illegal continue status = `STATUS_INVALID_PARAMETER` · a wait whose immediate `*Timeout` the handler READ FROM CLIENT MEMORY with nothing reportable = `STATUS_TIMEOUT`, no park requested |
 | `exec_dbgk_syscall_wait_park_and_signal` | with the queue drained and a NULL (infinite) `*Timeout` the handler PARKS: it binds `wait_park_event` to the object's `EventsPresent` dispatcher event (the field the service loop consumes to steal the reply cap), leaves no deadline, and that event is NOT ready; a queue-side post through the same dispatch route (attaching a second debuggee) SETS that very event, and the re-issued wait returns the new event. **NOT covered:** the reply-cap steal + resume of a live blocked client — see the ⚠️ scope note above |
 
+**5 — the gate, part 3: EXCEPTION FORWARDING is gate-proven — 2 specs** (gate **202 → 204/99**,
+batch 52, 2026-07-25). A third post-loop self-test (`service_sec_image.rs`,
+`DBGK_EXCEPTION_SELFTEST` bitmask `0xFF`): the **debugger** side goes through the REAL dispatch route
+(`nt_dispatcher.dispatch(SSN, …)` with the arguments marshalled in smss's CLIENT memory), and the
+**debuggee** side goes through `ExecNtHandler::dbgk_forward_exception` — *the very entry the live
+fault path calls*. Nothing is reimplemented for the test: the throwaway debuggee sits in a FREE
+`PM_PIDS` slot, so the pi → pid → `DebugPort` resolution is the same one the fault sites perform.
+
+| spec | proves |
+|---|---|
+| `exec_dbgk_exception_forwarded` (`0x0037`) | attach + BOTH attach-time fake create messages drained by SSN · the fault-path forward queues one `DbgKmExceptionApi` and moves `DBGK_EXCEPTIONS_FORWARDED` · `NtWaitForDebugEvent` reports `DbgExceptionStateChange` for the faulting `CLIENT_ID` with the WHOLE `EXCEPTION_RECORD` **read back out of client memory** (code `STATUS_ACCESS_VIOLATION`, `ExceptionAddress`, `NumberParameters`=2 and both `MmAccessFault` parameters, `FirstChance`=1) · an `int3` reports as `DbgBreakpointStateChange` and the trap-vector → NTSTATUS map matches `KiDispatchException` · **★ the no-debugger gate**: forwarding for a process with no `DebugPort` returns false, moves no counter and queues nothing — the path every fault on the live boot takes |
+| `exec_dbgk_exception_continue_and_wake` (`0x00C8`) | `NtDebugContinue` rejects an illegal status and resolves the EXCEPTION event with `DBG_CONTINUE` (counter moves, queue drains) · **★ signal fix, fault-path poster**: a debugger parked on the object's `EventsPresent` dispatcher event is woken by a forward issued from the FAULT-PATH entry (not a syscall), and the re-issued wait returns it with `FirstChance`=0 for a second-chance report · **★ signal fix, non-dbgk syscall poster**: the same park is woken by `NtTerminateThread`'s lifecycle `DbgKmExitThreadApi` post — an arm that never mirrored the signal before batch 52 — and the re-issued wait returns `DbgExitThreadStateChange` with the worker's tid + exit status. **NOT covered:** the faulting thread does not block on the continue (see the DEFERRED list) |
+
+**Proof-is-real check (batch 52) — two BYPASS experiments, each a one-line disable:**
+- neuter `dbgk_forward_exception` (`return false` first thing, i.e. the fault path never forwards) →
+  `DBGK_EXCEPTION_SELFTEST` `0xFF → 0xA1`, `forwards 3 → 0`, **BOTH new specs FAIL** (gate 202/99, 2
+  FAILs). Only the setup, the no-debugger gate and the lifecycle-poster wake survive.
+- remove the mirror from the `handle` wrapper only (the signal-defect fix, forwarding left intact) →
+  `0xFF → 0x7F`, **`exec_dbgk_exception_continue_and_wake` FAILs** while
+  `exec_dbgk_exception_forwarded` still passes (gate 203/99, 1 FAIL) — i.e. bit `0x0080` is exactly
+  the defect, and the fix is load-bearing.
+Both restored and re-verified green.
+
 **Proof-is-real check (batch 51):** pointing the attach at `pm.debug_active_process` instead of the
 dispatcher (a one-call bypass) drops `DBGK_SYSCALL_SELFTEST` `0x7FF → 0x7FB`, `attaches 2 → 1`, and
 **FAILs `exec_dbgk_syscall_dispatch_roundtrip`** (gate 201/99, 1 FAIL) — i.e. the spec cannot pass
@@ -3756,6 +3817,15 @@ No regression (`202 = 193 + 6 + 3`, including `exec_msgina_logon_dialog_painted`
 `exec_user_callback_real_api0_nested_roundtrip` and the 6 `exec_dbgk_*` plane specs). Host tests:
 `nt-process` 42→64, `nt-ntdll` 668→674, `nt-syscall-abi` 15→15, `nt-syscall` 41→41,
 `nt-io-manager` 86→86 (all green, unchanged by batch 51). No `rust-micro/src` change.
+
+**Verify (batch 52):** 3 consecutive clean foreground boots — **204/99, ZERO FAILs, RUNEXIT=3,
+`[microtest sentinel matched]`** each time, `dbgk exception-forward selftest bits=0xff forwards=3`
+alongside the unchanged `bits=0x1fff` / `0x7ff`. No regression: the PASS/FAIL spec list is **identical
+to `c445fcc` plus the two new specs** (`exec_win32k_desktop_painted`,
+`exec_msgina_logon_dialog_painted`, `exec_user_callback_dead_client_unwind`,
+`exec_user_callback_real_api0_nested_roundtrip`, all 6 `exec_dbgk_*` plane specs and all 3
+`exec_dbgk_syscall_*` still PASS). Host tests: `nt-process` 64 → **69**, `nt-ntdll` **674**
+(unchanged — no ntdll change this batch, so `ntdll.dll` was NOT rebuilt). No `rust-micro/src` change.
 
 **Remaining ntdll gaps after this batch:** `DbgUiIssueRemoteBreakin` (needs cross-VSpace
 `RtlCreateUserThread` with a start context) · the debug-event sources listed as DEFERRED above
