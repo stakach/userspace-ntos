@@ -196,6 +196,13 @@ pub enum NativeService {
     NtQueryDefaultLocale,
     NtSetDefaultLocale,
     NtCreateProcess,
+    // Dbgk — the user-mode debugging plane (`ntoskrnl/dbgk`). Backed by the real DEBUG_OBJECT in
+    // `nt_process::dbgk`: create/attach/wait/continue/detach.
+    NtCreateDebugObject,
+    NtDebugActiveProcess,
+    NtDebugContinue,
+    NtRemoveProcessDebug,
+    NtWaitForDebugEvent,
 }
 
 impl NativeService {
@@ -317,6 +324,11 @@ impl NativeService {
             NtQueryDefaultLocale => "NtQueryDefaultLocale",
             NtSetDefaultLocale => "NtSetDefaultLocale",
             NtCreateProcess => "NtCreateProcess",
+            NtCreateDebugObject => "NtCreateDebugObject",
+            NtDebugActiveProcess => "NtDebugActiveProcess",
+            NtDebugContinue => "NtDebugContinue",
+            NtRemoveProcessDebug => "NtRemoveProcessDebug",
+            NtWaitForDebugEvent => "NtWaitForDebugEvent",
         }
     }
 
@@ -443,6 +455,11 @@ impl NativeService {
         NativeService::NtQueryInformationThread,
         NativeService::NtReadVirtualMemory,
         NativeService::NtWriteVirtualMemory,
+        NativeService::NtCreateDebugObject,
+        NativeService::NtDebugActiveProcess,
+        NativeService::NtDebugContinue,
+        NativeService::NtRemoveProcessDebug,
+        NativeService::NtWaitForDebugEvent,
     ];
 }
 

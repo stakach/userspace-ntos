@@ -19,8 +19,13 @@ use alloc::vec::Vec;
 use nt_pe_loader::{MappedImage, PeError, PeFile};
 use nt_security::TokenId;
 
+pub mod dbgk;
+
+use dbgk::{DebugEvent, DebugObjectId, DebugObjectStore, DbgKmMessage};
+
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
 pub const THREAD_NAME_MAX_UNITS: usize = 256;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
@@ -156,6 +161,23 @@ pub struct ThreadBasicInformation {
     pub base_priority: i32,
 }
 
+/// What a successful [`ProcessManager::wait_for_debug_event`] hands back: the rendered
+/// `DBGUI_WAIT_STATE_CHANGE` plus the handles/`CLIENT_ID` the host needs to finish the call.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DebugWaitResult {
+    /// The `DBG_STATE` reported (`DbgCreateProcessStateChange`, …).
+    pub state: u32,
+    /// The debuggee `CLIENT_ID` the debugger passes back to `NtDebugContinue`.
+    pub client_id: ClientId,
+    /// Handle to the reported process opened in the debugger's handle table (`0` when the state
+    /// carries none).
+    pub handle_to_process: Handle,
+    /// Handle to the reported thread opened in the debugger's handle table (`0` when none).
+    pub handle_to_thread: Handle,
+    /// The x64 `DBGUI_WAIT_STATE_CHANGE` image to copy out to the debugger.
+    pub state_change: [u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE],
+}
+
 /// Architecture-neutral fields returned for `ThreadTimes` (`KERNEL_USER_TIMES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThreadTimes {
@@ -248,6 +270,16 @@ pub struct NtProcess {
     process_cookie: u32,
     /// `ProcessBreakOnTermination`, initially clear and mutable through the native info class.
     break_on_termination: bool,
+    /// `EPROCESS.SectionBaseAddress` — the mapped base of the process image. Reported to a
+    /// debugger in the `DbgKmCreateProcessApi` message. `0` until the host records it.
+    pub image_base: u64,
+    /// `EPROCESS.DebugPort` — the `DEBUG_OBJECT` a debugger attached to this process, if any.
+    debug_port: Option<DebugObjectId>,
+    /// `PEB.BeingDebugged` — mirrors `DebugPort != NULL` (`DbgkpMarkProcessPeb`).
+    being_debugged: bool,
+    /// `PSF_CREATE_REPORTED_BIT` — the `DbgKmCreateProcessApi` message has already been reported,
+    /// so a later thread create reports `DbgKmCreateThreadApi` instead.
+    create_reported: bool,
     /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
     /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
     /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
@@ -256,6 +288,21 @@ pub struct NtProcess {
     /// pre-allocated storage with **no reallocation**, so it can run on a bump allocator whose
     /// transient region is reset per call without corrupting the durable table.
     handles: Vec<Option<HandleEntry>>,
+}
+
+impl NtProcess {
+    /// `EPROCESS.DebugPort`.
+    pub fn debug_port(&self) -> Option<DebugObjectId> {
+        self.debug_port
+    }
+    /// `PEB.BeingDebugged`.
+    pub fn being_debugged(&self) -> bool {
+        self.being_debugged
+    }
+    /// `PSF_CREATE_REPORTED_BIT`.
+    pub fn create_reported(&self) -> bool {
+        self.create_reported
+    }
 }
 
 /// What a handle refers to (spec §8.1). v0.1 covers the object kinds the loader needs.
@@ -287,6 +334,8 @@ pub enum HandleObject {
     Token(ProcessId),
     /// A stable, independently owned token object.
     TokenObject(TokenId),
+    /// A `DEBUG_OBJECT` (the user-mode debugging plane's event port).
+    DebugObject(DebugObjectId),
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
@@ -394,6 +443,8 @@ pub struct ProcessManager {
     /// external bindings to the old value still exist, mis-routing the next open. Default `false`
     /// (real NT reuses freed handle slots). Path 1b of the nt-process convergence.
     no_reuse: bool,
+    /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
+    dbgk: DebugObjectStore,
 }
 
 impl ProcessManager {
@@ -488,6 +539,10 @@ impl ProcessManager {
                 win32_window_station: None,
                 process_cookie: 0,
                 break_on_termination: false,
+                image_base: 0,
+                debug_port: None,
+                being_debugged: false,
+                create_reported: false,
                 handles: Vec::new(),
             },
         );
@@ -638,6 +693,41 @@ impl ProcessManager {
                 thread_name: [0; THREAD_NAME_MAX_UNITS],
             },
         );
+        // Dbgk event source: a thread create in a debugged process reports DbgKmCreateThreadApi —
+        // unless this is the first reported thread of the process, which reports
+        // DbgKmCreateProcessApi (`PSF_CREATE_REPORTED_BIT`, cleared until either an attach or the
+        // first create reports it).
+        if self
+            .processes
+            .get(&pid)
+            .is_some_and(|p| p.debug_port.is_some())
+        {
+            let (reported, image_base) = self
+                .processes
+                .get(&pid)
+                .map(|p| (p.create_reported, p.image_base))
+                .unwrap_or((true, 0));
+            let message = if reported {
+                DbgKmMessage::CreateThread {
+                    sub_system_key: 0,
+                    start_address,
+                }
+            } else {
+                if let Some(p) = self.processes.get_mut(&pid) {
+                    p.create_reported = true;
+                }
+                DbgKmMessage::CreateProcess {
+                    sub_system_key: 0,
+                    file_handle: 0,
+                    base_of_image: image_base,
+                    debug_info_file_offset: 0,
+                    debug_info_size: 0,
+                    initial_thread_sub_system_key: 0,
+                    initial_thread_start_address: start_address,
+                }
+            };
+            self.report_debug_message(pid, tid, message);
+        }
         Ok(tid)
     }
 
@@ -1276,6 +1366,8 @@ impl ProcessManager {
         if !transitioned {
             return Ok(());
         }
+        // Dbgk event source: a thread exit in a debugged process reports DbgKmExitThreadApi.
+        self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
         if !was_system {
             let remaining = self
                 .threads
@@ -1312,12 +1404,18 @@ impl ProcessManager {
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if t.state != ThreadState::Terminated {
+        let transitioned = t.state != ThreadState::Terminated;
+        let pid = t.process_id;
+        if transitioned {
             t.state = ThreadState::Terminated;
             t.exit_status = Some(exit_status);
             if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                 t.exit_time_100ns = exit_time_100ns;
             }
+        }
+        if transitioned {
+            // Dbgk event source: DbgKmExitThreadApi (the no-cascade self-exit path).
+            self.report_debug_message(pid, tid, DbgKmMessage::ExitThread { exit_status });
         }
         Ok(())
     }
@@ -1363,6 +1461,16 @@ impl ProcessManager {
                 s.map_refs = s.map_refs.saturating_sub(1);
             }
         }
+        // Dbgk event source (`DbgkExitProcess`): report the process exit against its main thread's
+        // CLIENT_ID. The debug port itself stays set — the debugger still has to retrieve and
+        // continue this last event; it is dropped by an explicit detach or by the debug object's
+        // destruction.
+        let main = self
+            .processes
+            .get(&pid)
+            .and_then(|p| p.main_thread)
+            .unwrap_or(0);
+        self.report_debug_message(pid, main, DbgKmMessage::ExitProcess { exit_status });
         Ok(())
     }
 
@@ -1383,6 +1491,294 @@ impl ProcessManager {
     pub fn wait_process(&self, pid: ProcessId) -> Option<u32> {
         let p = self.processes.get(&pid)?;
         (p.state == ProcessState::Terminated).then_some(p.exit_status.unwrap_or(0))
+    }
+
+    // --- Dbgk: the user-mode debugging plane (ntoskrnl/dbgk) -----------------
+    //
+    // The DEBUG_OBJECT itself (queue + waiter + continue) is the pure state machine in [`dbgk`];
+    // what lives here is the half that needs the process/thread tables: which EPROCESS owns which
+    // debug port, the fake create messages an attach posts, and the create/exit event sources.
+
+    /// `NtCreateDebugObject` — create a `DEBUG_OBJECT` with the given `DBGK_*` flags.
+    pub fn create_debug_object(&mut self, create_flags: u32) -> Result<DebugObjectId, u32> {
+        self.dbgk.create(create_flags)
+    }
+
+    /// Borrow a live debug object.
+    pub fn debug_object(&self, object: DebugObjectId) -> Option<&dbgk::DebugObject> {
+        self.dbgk.get(object)
+    }
+
+    /// Mutably borrow a live debug object (`NtSetInformationDebugObject`).
+    pub fn debug_object_mut(&mut self, object: DebugObjectId) -> Option<&mut dbgk::DebugObject> {
+        self.dbgk.get_mut(object)
+    }
+
+    /// Number of live debug objects.
+    pub fn debug_object_count(&self) -> usize {
+        self.dbgk.len()
+    }
+
+    /// Record `EPROCESS.SectionBaseAddress` for `pid` (reported to a debugger in the
+    /// `DbgKmCreateProcessApi` message). Returns `false` for an unknown process.
+    pub fn set_image_base(&mut self, pid: ProcessId, base: u64) -> bool {
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.image_base = base;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `EPROCESS.DebugPort` for `pid`.
+    pub fn process_debug_port(&self, pid: ProcessId) -> Option<DebugObjectId> {
+        self.processes.get(&pid).and_then(|p| p.debug_port)
+    }
+
+    /// `PEB.BeingDebugged` for `pid` (`DbgkpMarkProcessPeb`'s modelled state).
+    pub fn is_process_being_debugged(&self, pid: ProcessId) -> bool {
+        self.processes.get(&pid).is_some_and(|p| p.being_debugged)
+    }
+
+    /// `NtDebugActiveProcess` — attach `object` to `pid` on behalf of the `debugger` client.
+    ///
+    /// Faithful to `DbgkpPostFakeProcessCreateMessages` + `DbgkpSetProcessDebugObject`: a
+    /// `DbgKmCreateProcessApi` message is posted for the process's first live thread and a
+    /// `DbgKmCreateThreadApi` message for each remaining one — all `NOWAIT|INACTIVE` with the
+    /// attaching thread as their backout thread — then the debug port is installed and the first
+    /// backout event is activated (which signals the debugger). Returns the number of fake messages
+    /// posted.
+    ///
+    /// Errors: `STATUS_ACCESS_DENIED` for a self-attach, `STATUS_PROCESS_IS_TERMINATING` for a dying
+    /// target, `STATUS_UNSUCCESSFUL` when the target has no live thread to report,
+    /// `STATUS_PORT_ALREADY_SET` when another debugger already owns the process.
+    pub fn debug_active_process(
+        &mut self,
+        pid: ProcessId,
+        object: DebugObjectId,
+        debugger: ClientId,
+    ) -> Result<usize, u32> {
+        if self.dbgk.get(object).is_none() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if pid == debugger.unique_process {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let Some(proc) = self.processes.get(&pid) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if matches!(proc.state, ProcessState::Exiting | ProcessState::Terminated) {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        if proc.debug_port.is_some() {
+            return Err(dbgk::STATUS_PORT_ALREADY_SET);
+        }
+        let image_base = proc.image_base;
+        let candidates: Vec<ThreadId> = proc.threads.iter().copied().collect();
+        let threads: Vec<ThreadId> = candidates
+            .into_iter()
+            .filter(|tid| {
+                self.threads
+                    .get(tid)
+                    .is_some_and(|t| t.state != ThreadState::Terminated)
+            })
+            .collect();
+        if threads.is_empty() {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+
+        let mut posted = 0usize;
+        for (index, tid) in threads.iter().enumerate() {
+            let start_address = self.threads.get(tid).map(|t| t.start_address).unwrap_or(0);
+            let message = if index == 0 {
+                DbgKmMessage::CreateProcess {
+                    sub_system_key: 0,
+                    file_handle: 0,
+                    base_of_image: image_base,
+                    debug_info_file_offset: 0,
+                    debug_info_size: 0,
+                    initial_thread_sub_system_key: 0,
+                    initial_thread_start_address: start_address,
+                }
+            } else {
+                DbgKmMessage::CreateThread {
+                    sub_system_key: 0,
+                    start_address,
+                }
+            };
+            let mut event = DebugEvent::new(
+                ClientId {
+                    unique_process: pid,
+                    unique_thread: *tid,
+                },
+                message,
+                dbgk::DEBUG_EVENT_NOWAIT | dbgk::DEBUG_EVENT_INACTIVE,
+            );
+            event.backout_thread = Some(debugger.unique_thread);
+            let queued = self
+                .dbgk
+                .get_mut(object)
+                .map(|o| o.queue(event))
+                .unwrap_or(Err(STATUS_INVALID_HANDLE));
+            if let Err(status) = queued {
+                // Back out every message this attach posted, exactly as the failure path does.
+                if let Some(o) = self.dbgk.get_mut(object) {
+                    let _ = o.flush_process(pid);
+                }
+                return Err(status);
+            }
+            posted += 1;
+        }
+
+        if let Some(p) = self.processes.get_mut(&pid) {
+            p.debug_port = Some(object);
+            p.being_debugged = true;
+            p.create_reported = true;
+        }
+        if let Some(o) = self.dbgk.get_mut(object) {
+            o.activate_backout_events(debugger.unique_thread);
+        }
+        Ok(posted)
+    }
+
+    /// `NtRemoveProcessDebug` / `DbgkClearProcessDebugObject` — detach `object` from `pid`, clear
+    /// `PEB.BeingDebugged`, and flush the process's queued events. Returns the number flushed.
+    pub fn remove_process_debug(
+        &mut self,
+        pid: ProcessId,
+        object: DebugObjectId,
+    ) -> Result<usize, u32> {
+        let Some(proc) = self.processes.get_mut(&pid) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if proc.debug_port != Some(object) {
+            return Err(dbgk::STATUS_PORT_NOT_SET);
+        }
+        proc.debug_port = None;
+        proc.being_debugged = false;
+        let flushed = self
+            .dbgk
+            .get_mut(object)
+            .map(|o| o.flush_process(pid).len())
+            .unwrap_or(0);
+        Ok(flushed)
+    }
+
+    /// `DbgkpCloseObject` — the debugger's last handle went away: mark the object inactive, detach
+    /// every process still pointing at it, and drop it. Returns the number of processes detached.
+    pub fn destroy_debug_object(&mut self, object: DebugObjectId) -> usize {
+        if let Some(o) = self.dbgk.get_mut(object) {
+            o.mark_debugger_inactive();
+        }
+        let attached: Vec<ProcessId> = self
+            .processes
+            .values()
+            .filter(|p| p.debug_port == Some(object))
+            .map(|p| p.process_id)
+            .collect();
+        for pid in &attached {
+            if let Some(p) = self.processes.get_mut(pid) {
+                p.debug_port = None;
+                p.being_debugged = false;
+            }
+        }
+        self.dbgk.destroy(object);
+        attached.len()
+    }
+
+    /// `NtWaitForDebugEvent`'s non-blocking core: dequeue the next reportable event from `object`,
+    /// open the debugger-process handles the state change carries (`DbgkpOpenHandles`), and render
+    /// the `DBGUI_WAIT_STATE_CHANGE`. `Ok(None)` = nothing to report (the caller blocks or times
+    /// out); `Err(STATUS_DEBUGGER_INACTIVE)` = the object is dead.
+    pub fn wait_for_debug_event(
+        &mut self,
+        object: DebugObjectId,
+        debugger_pid: ProcessId,
+    ) -> Result<Option<DebugWaitResult>, u32> {
+        let index = match self.dbgk.get_mut(object) {
+            Some(o) => o.dequeue_for_wait()?,
+            None => return Err(STATUS_INVALID_HANDLE),
+        };
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let event = match self.dbgk.get(object).and_then(|o| o.events().get(index)) {
+            Some(event) => *event,
+            None => return Ok(None),
+        };
+        let state = event.message.state();
+        let want_process = state == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE;
+        let want_thread = want_process || state == dbgk::DBG_CREATE_THREAD_STATE_CHANGE;
+        let handle_to_process = if want_process && self.processes.contains_key(&debugger_pid) {
+            self.insert_handle(
+                debugger_pid,
+                HandleObject::Process(event.client_id.unique_process),
+                PROCESS_ALL_ACCESS,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        let handle_to_thread = if want_thread && self.processes.contains_key(&debugger_pid) {
+            self.insert_handle(
+                debugger_pid,
+                HandleObject::Thread(event.client_id.unique_thread),
+                THREAD_ALL_ACCESS,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(DebugWaitResult {
+            state,
+            client_id: event.client_id,
+            handle_to_process,
+            handle_to_thread,
+            state_change: dbgk::encode_wait_state_change(
+                &event,
+                handle_to_process as u64,
+                handle_to_thread as u64,
+            ),
+        }))
+    }
+
+    /// `NtDebugContinue` — resolve the read event for `client_id` with `continue_status`. Returns
+    /// the removed event (whose `returned_status` is the continue status the target would see).
+    pub fn debug_continue(
+        &mut self,
+        object: DebugObjectId,
+        client_id: ClientId,
+        continue_status: u32,
+    ) -> Result<DebugEvent, u32> {
+        match self.dbgk.get_mut(object) {
+            Some(o) => o.continue_event(client_id, continue_status),
+            None => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    /// Queue a `DBGKM_MSG` against `pid`'s debug port, if it has one. Returns `true` when an event
+    /// was actually queued (`false` = not debugged, or the debugger has gone).
+    fn report_debug_message(
+        &mut self,
+        pid: ProcessId,
+        tid: ThreadId,
+        message: DbgKmMessage,
+    ) -> bool {
+        let Some(object) = self.processes.get(&pid).and_then(|p| p.debug_port) else {
+            return false;
+        };
+        let event = DebugEvent::new(
+            ClientId {
+                unique_process: pid,
+                unique_thread: tid,
+            },
+            message,
+            0,
+        );
+        self.dbgk
+            .get_mut(object)
+            .is_some_and(|o| o.queue(event).is_ok())
     }
 
     // --- handle tables (spec §8) ---------------------------------------------

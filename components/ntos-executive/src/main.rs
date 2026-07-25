@@ -794,6 +794,16 @@ pub const SSN_NT_SUSPEND_PROCESS: u64 = 262;
 /// UUID seed probes the caller buffer but no kernel UUID allocator currently reads the cached value.
 pub const SSN_NT_SET_SYSTEM_POWER_STATE: u64 = 250;
 pub const SSN_NT_SET_UUID_SEED: u64 = 255;
+/// **Dbgk — the user-mode debugging plane** (`ntoskrnl/dbgk`). The five debug-object services our
+/// ntdll's `DbgUi*` wrappers issue (`references/reactos/dll/ntdll/dbg/dbgui.c`), each with its
+/// `sysfuncs.lst`-derived SSN (0-based line index — `NtCreateDebugObject` is line 36, …). Serviced
+/// by the real `DEBUG_OBJECT` plane in `nt_process::dbgk` (create / attach / wait / continue /
+/// detach), NOT stubs.
+pub const SSN_NT_CREATE_DEBUG_OBJECT: u64 = 35;
+pub const SSN_NT_DEBUG_ACTIVE_PROCESS: u64 = 59;
+pub const SSN_NT_DEBUG_CONTINUE: u64 = 60;
+pub const SSN_NT_REMOVE_PROCESS_DEBUG: u64 = 199;
+pub const SSN_NT_WAIT_FOR_DEBUG_EVENT: u64 = 279;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -5479,6 +5489,12 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtSetSystemPowerState, SSN_NT_SET_SYSTEM_POWER_STATE as u32),
             (NativeService::NtSetUuidSeed, SSN_NT_SET_UUID_SEED as u32),
             (NativeService::NtSuspendProcess, SSN_NT_SUSPEND_PROCESS as u32),
+            // Dbgk: the user-mode debugging plane (DEBUG_OBJECT create/attach/wait/continue/detach).
+            (NativeService::NtCreateDebugObject, SSN_NT_CREATE_DEBUG_OBJECT as u32),
+            (NativeService::NtDebugActiveProcess, SSN_NT_DEBUG_ACTIVE_PROCESS as u32),
+            (NativeService::NtDebugContinue, SSN_NT_DEBUG_CONTINUE as u32),
+            (NativeService::NtRemoveProcessDebug, SSN_NT_REMOVE_PROCESS_DEBUG as u32),
+            (NativeService::NtWaitForDebugEvent, SSN_NT_WAIT_FOR_DEBUG_EVENT as u32),
             // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
             (NativeService::NtAllocateVirtualMemory, SSN_NT_ALLOCATE_VM as u32),
             (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),
@@ -6143,6 +6159,36 @@ static PM_POST_TERM_CONTINUED_BADGES: AtomicU64 = AtomicU64::new(0);
 ///   0x20 exit_thread (no-cascade) terminates the init thread yet the EPROCESS stays Running
 ///   0x40 an unrelated live thread in the same process keeps running past the terminate
 static PM_TERMINATE_THREAD_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk (the user-mode debugging plane) counters.** Incremented by the REAL
+/// `NtCreateDebugObject`/`NtDebugActiveProcess`/`NtWaitForDebugEvent`/`NtDebugContinue`/
+/// `NtRemoveProcessDebug` handlers in `exec_handler.rs` — nothing in the current hosted set issues
+/// them yet, so on a plain boot they stay 0 and the plane's proof is the post-loop self-test below.
+static DBGK_OBJECTS_CREATED: AtomicU64 = AtomicU64::new(0);
+static DBGK_ATTACHES: AtomicU64 = AtomicU64::new(0);
+static DBGK_FAKE_MESSAGES: AtomicU64 = AtomicU64::new(0);
+static DBGK_WAITS_SERVED: AtomicU64 = AtomicU64::new(0);
+static DBGK_CONTINUES: AtomicU64 = AtomicU64::new(0);
+static DBGK_DETACHES: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk end-to-end SELF-TEST result** (post-loop, throwaway debugger + debuggee EPROCESSes),
+/// driving the SAME `nt_process::dbgk` plane the five native handlers dispatch into. Bitmask:
+///   0x0001 NtCreateDebugObject creates a real DEBUG_OBJECT (DBGK_KILL_PROCESS_ON_EXIT honoured)
+///          and an invalid creation flag is rejected with STATUS_INVALID_PARAMETER
+///   0x0002 attach installs EPROCESS.DebugPort + PEB.BeingDebugged and posts the fake
+///          DbgKmCreateProcessApi message, activated (EventsPresent signalled)
+///   0x0004 a self-attach is STATUS_ACCESS_DENIED and a second attach is STATUS_PORT_ALREADY_SET
+///   0x0008 NtWaitForDebugEvent retrieves it as DbgCreateProcessStateChange with the right
+///          CLIENT_ID + a rendered DBGUI_WAIT_STATE_CHANGE carrying the opened handles
+///   0x0010 DbgkpOpenHandles minted REAL process/thread handles in the DEBUGGER's handle table
+///   0x0020 a second wait reports nothing while the event is outstanding (one per process)
+///   0x0040 NtDebugContinue with a bogus status is rejected; DBG_CONTINUE resolves the read event
+///   0x0080 EVENT SOURCE — a thread create in the debuggee queues DbgKmCreateThreadApi, retrieved
+///          with its real start address
+///   0x0100 EVENT SOURCE — a thread exit queues DbgKmExitThreadApi with its exit status
+///   0x0200 EVENT SOURCE — a process exit queues DbgKmExitProcessApi with its exit status
+///   0x0400 NtRemoveProcessDebug clears the port + BeingDebugged and flushes the queue; a second
+///          detach is STATUS_PORT_NOT_SET
+///   0x0800 after detaching, further lifecycle events are NOT reported (the plane is inert)
+static DBGK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -9751,6 +9797,68 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         term_self & 0x40 != 0,
                         &mut passed,
                     );
+                    // ---- Dbgk: the user-mode debugging plane (ntdll DbgUi* → the five debug-object
+                    // syscalls → nt_process::dbgk). Six counted specs over the post-loop end-to-end
+                    // self-test, which drives the SAME plane the native handlers dispatch into.
+                    let dbgk = DBGK_SELFTEST.load(Ordering::Relaxed);
+                    // The DEBUG_OBJECT is real: created with validated DBGK_* flags, and its handle
+                    // is a TYPED per-process entry the handler resolves with real access checks.
+                    check(
+                        b"exec_dbgk_debug_object_created",
+                        dbgk & (0x0001 | 0x1000) == (0x0001 | 0x1000),
+                        &mut passed,
+                    );
+                    // NtDebugActiveProcess installs EPROCESS.DebugPort + PEB.BeingDebugged, posts +
+                    // activates the fake create-process message, and rejects self/double attaches.
+                    check(
+                        b"exec_dbgk_attach_posts_fake_create",
+                        dbgk & (0x0002 | 0x0004) == (0x0002 | 0x0004),
+                        &mut passed,
+                    );
+                    // NtWaitForDebugEvent retrieves it as DbgCreateProcessStateChange, opens REAL
+                    // process/thread handles in the debugger's table, and renders them into the
+                    // DBGUI_WAIT_STATE_CHANGE ntdll's DbgUiWaitStateChange receives.
+                    check(
+                        b"exec_dbgk_wait_retrieves_state_change",
+                        dbgk & (0x0008 | 0x0010) == (0x0008 | 0x0010),
+                        &mut passed,
+                    );
+                    // One outstanding event per debuggee process, and NtDebugContinue validates its
+                    // continue status before resolving the read event.
+                    check(
+                        b"exec_dbgk_continue_resolves_event",
+                        dbgk & (0x0020 | 0x0040) == (0x0020 | 0x0040),
+                        &mut passed,
+                    );
+                    // The WIRED event sources: thread create, thread exit, process exit — each
+                    // generated by the real nt-process lifecycle, each retrieved with its payload.
+                    check(
+                        b"exec_dbgk_lifecycle_event_sources",
+                        dbgk & (0x0080 | 0x0100 | 0x0200) == (0x0080 | 0x0100 | 0x0200),
+                        &mut passed,
+                    );
+                    // NtRemoveProcessDebug clears the port + flushes the queue; a detached process
+                    // reports nothing further and a second detach is STATUS_PORT_NOT_SET.
+                    check(
+                        b"exec_dbgk_detach_makes_plane_inert",
+                        dbgk & (0x0400 | 0x0800) == (0x0400 | 0x0800),
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] dbgk selftest bits=0x");
+                    print_hex(dbgk as u32);
+                    print_str(b" created=");
+                    print_u64(DBGK_OBJECTS_CREATED.load(Ordering::Relaxed));
+                    print_str(b" attaches=");
+                    print_u64(DBGK_ATTACHES.load(Ordering::Relaxed));
+                    print_str(b" fake-msgs=");
+                    print_u64(DBGK_FAKE_MESSAGES.load(Ordering::Relaxed));
+                    print_str(b" waits=");
+                    print_u64(DBGK_WAITS_SERVED.load(Ordering::Relaxed));
+                    print_str(b" continues=");
+                    print_u64(DBGK_CONTINUES.load(Ordering::Relaxed));
+                    print_str(b" detaches=");
+                    print_u64(DBGK_DETACHES.load(Ordering::Relaxed));
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] item2a terminate-thread-selftest bits=0x");
                     print_hex(term_self as u32);
                     print_str(b" live-count=0x");

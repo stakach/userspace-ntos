@@ -1040,6 +1040,57 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    /// Resolve a typed process-local `DEBUG_OBJECT` handle and enforce the access the operation
+    /// requires (`DbgkDebugObjectMapping`-mapped at create time).
+    pub(crate) fn debug_object_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<nt_process::dbgk::DebugObjectId, u32> {
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let object = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::DebugObject(object)) => object,
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(nt_process::STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        if self.pm.debug_object(object).is_none() {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        Ok(object)
+    }
+
+    /// Mirror a debug object's modelled `EventsPresent` onto the dispatcher event backing it, so a
+    /// parked `NtWaitForDebugEvent` waiter is woken (or re-blocked) by the ordinary wait machinery.
+    pub(crate) fn sync_debug_object_signal(&mut self, object: nt_process::dbgk::DebugObjectId) {
+        let Some((key, present)) = self
+            .pm
+            .debug_object(object)
+            .map(|o| (o.host_event, o.events_present()))
+        else {
+            return;
+        };
+        if key == 0 {
+            return;
+        }
+        let index = key - 1;
+        if present {
+            let _ = self.events.set_existing(index);
+        } else {
+            self.events.clear_existing(index);
+        }
+    }
+
     pub(crate) fn waitable_index_for_handle(
         &self,
         handle: u64,
@@ -2190,6 +2241,12 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
+            }
+            // DbgkpCloseObject: the debugger's handle went away — mark the object inactive, detach
+            // every debuggee, and drop it. (Debug-object handles are never duplicated on this path,
+            // so a single close is the last reference.)
+            nt_process::HandleObject::DebugObject(object) => {
+                self.pm.destroy_debug_object(object);
             }
             _ => {}
         }
@@ -10470,6 +10527,208 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             }
+            // --- Dbgk: the user-mode debugging plane (`ntoskrnl/dbgk`) -------------------------
+            //
+            // The five debug-object services our ntdll's DbgUi* wrappers issue. Each resolves a
+            // typed `HandleObject::DebugObject` out of the caller's REAL EPROCESS handle table and
+            // drives the real `nt_process::dbgk` DEBUG_OBJECT (queue/waiter/continue), then mirrors
+            // the object's `EventsPresent` onto its backing dispatcher event so a blocking
+            // NtWaitForDebugEvent parks and wakes through the SAME machinery as every other wait.
+
+            // NtCreateDebugObject(*DebugHandle[R10]=args[0], DesiredAccess, *OA[R8]=args[2], Flags).
+            NativeService::NtCreateDebugObject => unsafe {
+                let out = args[0];
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                let object = match self.pm.create_debug_object(args[3] as u32) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                // DebugObject->EventsPresent: a REAL notification dispatcher object (index+1 is
+                // stored so 0 stays "unbound" when the namespace is full).
+                if let Some(index) = self.obj_create_anon_event(false, false) {
+                    if let Some(o) = self.pm.debug_object_mut(object) {
+                        o.host_event = index as u64 + 1;
+                    }
+                }
+                let access = nt_process::dbgk::map_debug_object_access(args[1] as u32);
+                let Ok(handle) = self.pm.insert_handle(
+                    pid,
+                    nt_process::HandleObject::DebugObject(object),
+                    access,
+                ) else {
+                    self.pm.destroy_debug_object(object);
+                    return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                };
+                if !self.xas_write_u64(out, handle as u64) {
+                    let _ = self.pm.close_handle(pid, handle);
+                    self.pm.destroy_debug_object(object);
+                    return 0xC000_0005;
+                }
+                DBGK_OBJECTS_CREATED.fetch_add(1, Ordering::Relaxed);
+                0
+            },
+
+            // NtDebugActiveProcess(ProcessHandle[R10]=args[0], DebugHandle=args[1]).
+            NativeService::NtDebugActiveProcess => {
+                let object = match self.debug_object_for_handle(
+                    args[1],
+                    nt_process::dbgk::DEBUG_OBJECT_ADD_REMOVE_PROCESS,
+                ) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+                let (target, _pi) =
+                    match self.resolve_process_for_access(args[0], PROCESS_SUSPEND_RESUME) {
+                        Ok(resolved) => resolved,
+                        Err(status) => return status,
+                    };
+                let debugger = nt_process::ClientId {
+                    unique_process: self.pm_pid_for_pi(self.pi).unwrap_or(0),
+                    unique_thread: self.current_tid as nt_process::ThreadId,
+                };
+                match self.pm.debug_active_process(target, object, debugger) {
+                    Ok(posted) => {
+                        self.sync_debug_object_signal(object);
+                        DBGK_ATTACHES.fetch_add(1, Ordering::Relaxed);
+                        DBGK_FAKE_MESSAGES.fetch_add(posted as u64, Ordering::Relaxed);
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
+
+            // NtWaitForDebugEvent(DebugHandle[R10]=args[0], Alertable, *Timeout=args[2],
+            //                     *StateChange=args[3]).
+            NativeService::NtWaitForDebugEvent => unsafe {
+                let object = match self.debug_object_for_handle(
+                    args[0],
+                    nt_process::dbgk::DEBUG_OBJECT_WAIT_STATE_CHANGE,
+                ) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                let state_change = args[3];
+                if state_change == 0 {
+                    return 0xC000_0005;
+                }
+                if !self.probe_user_output(
+                    state_change,
+                    nt_process::dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE,
+                ) {
+                    return 0xC000_0005;
+                }
+                let debugger = self.pm_pid_for_pi(self.pi).unwrap_or(0);
+                let result = match self.pm.wait_for_debug_event(object, debugger) {
+                    Ok(result) => result,
+                    Err(status) => return status,
+                };
+                self.sync_debug_object_signal(object);
+                if let Some(result) = result {
+                    if !self.xas_try_write_buf(state_change, &result.state_change) {
+                        return 0xC000_0005;
+                    }
+                    DBGK_WAITS_SERVED.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
+                // Nothing reportable. An immediate (zero/positive) timeout returns STATUS_TIMEOUT;
+                // anything else parks the caller on the object's EventsPresent dispatcher event, so
+                // the queue-side signal wakes it through the ordinary wait machinery.
+                let timeout_ptr = args[2];
+                if timeout_ptr != 0 {
+                    let interval = smss_stack_read(timeout_ptr) as i64;
+                    match nt_delay_execution::due_time(
+                        interval,
+                        monotonic_time_100ns(),
+                        nt_system_time_100ns(),
+                    ) {
+                        nt_delay_execution::Due::Immediate => return 0x102, // STATUS_TIMEOUT
+                        nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                            self.wait_deadline_100ns = deadline;
+                        }
+                    }
+                }
+                match self.pm.debug_object(object).map(|o| o.host_event) {
+                    Some(key) if key != 0 => {
+                        self.wait_park_event = (key - 1) as i64;
+                        0x102 // parked; the loop ignores this sentinel
+                    }
+                    // No dispatcher object could be bound at create time — report the timeout
+                    // rather than parking on nothing.
+                    _ => 0x102,
+                }
+            },
+
+            // NtDebugContinue(DebugHandle[R10]=args[0], *AppClientId=args[1], ContinueStatus).
+            NativeService::NtDebugContinue => unsafe {
+                let object = match self.debug_object_for_handle(
+                    args[0],
+                    nt_process::dbgk::DEBUG_OBJECT_WAIT_STATE_CHANGE,
+                ) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                let client_id_ptr = args[1];
+                if client_id_ptr == 0 {
+                    return 0xC000_0005;
+                }
+                let mut raw = [0u8; 16];
+                if !smss_copyin(client_id_ptr, &mut raw) {
+                    return 0xC000_0005;
+                }
+                let client_id = nt_process::ClientId {
+                    unique_process: u64::from_le_bytes(raw[0..8].try_into().unwrap()) as u32,
+                    unique_thread: u64::from_le_bytes(raw[8..16].try_into().unwrap()) as u32,
+                };
+                match self
+                    .pm
+                    .debug_continue(object, client_id, args[2] as u32)
+                {
+                    Ok(_event) => {
+                        self.sync_debug_object_signal(object);
+                        DBGK_CONTINUES.fetch_add(1, Ordering::Relaxed);
+                        0
+                    }
+                    Err(status) => status,
+                }
+            },
+
+            // NtRemoveProcessDebug(ProcessHandle[R10]=args[0], DebugHandle=args[1]).
+            NativeService::NtRemoveProcessDebug => {
+                let object = match self.debug_object_for_handle(
+                    args[1],
+                    nt_process::dbgk::DEBUG_OBJECT_ADD_REMOVE_PROCESS,
+                ) {
+                    Ok(object) => object,
+                    Err(status) => return status,
+                };
+                const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+                let (target, _pi) =
+                    match self.resolve_process_for_access(args[0], PROCESS_SUSPEND_RESUME) {
+                        Ok(resolved) => resolved,
+                        Err(status) => return status,
+                    };
+                match self.pm.remove_process_debug(target, object) {
+                    Ok(_flushed) => {
+                        self.sync_debug_object_signal(object);
+                        DBGK_DETACHES.fetch_add(1, Ordering::Relaxed);
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
+
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }

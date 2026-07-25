@@ -1207,3 +1207,288 @@ fn process_cookie_is_nonzero_process_local_and_first_writer_wins() {
     );
     assert_eq!(pm.process_cookie(0xffff_fffe), None);
 }
+
+// --- Dbgk: the user-mode debugging plane, driven through the ProcessManager -------------------
+
+fn attach_debugger(pm: &mut ProcessManager) -> (ProcessId, ThreadId, ProcessId, DebugObjectId) {
+    let debugger = pm.create_process("dbg.exe", None, None);
+    let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
+    let target = pm.create_process("target.exe", None, None);
+    if let Some(p) = pm.processes.get_mut(&target) {
+        p.image_base = 0x0000_0001_4000_0000;
+    }
+    let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
+    let object = pm.create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT).unwrap();
+    let posted = pm
+        .debug_active_process(
+            target,
+            object,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: dbg_thread,
+            },
+        )
+        .unwrap();
+    assert_eq!(posted, 1, "one live thread → one fake create-process message");
+    (target, main, debugger, object)
+}
+
+#[test]
+fn dbgk_attach_installs_the_debug_port_and_posts_fake_create_messages() {
+    let mut pm = ProcessManager::new();
+    let (target, main, _debugger, object) = attach_debugger(&mut pm);
+    assert_eq!(pm.process_debug_port(target), Some(object));
+    assert!(pm.is_process_being_debugged(target));
+    assert!(pm.process(target).unwrap().create_reported());
+    let debug_object = pm.debug_object(object).unwrap();
+    assert_eq!(debug_object.len(), 1);
+    assert!(debug_object.kill_process_on_exit());
+    // The fake message was activated by DbgkpSetProcessDebugObject → the debugger is signalled.
+    assert!(debug_object.events_present());
+    assert!(!debug_object.events()[0].is_inactive());
+    assert_eq!(debug_object.events()[0].client_id.unique_thread, main);
+    assert_eq!(
+        debug_object.events()[0].message.state(),
+        dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+    );
+}
+
+#[test]
+fn dbgk_attach_rejects_self_double_attach_and_dead_targets() {
+    let mut pm = ProcessManager::new();
+    let (target, _main, debugger, object) = attach_debugger(&mut pm);
+    // Already attached.
+    let second = pm.create_debug_object(0).unwrap();
+    assert_eq!(
+        pm.debug_active_process(
+            target,
+            second,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: 0
+            }
+        ),
+        Err(dbgk::STATUS_PORT_ALREADY_SET)
+    );
+    // Self-attach.
+    assert_eq!(
+        pm.debug_active_process(
+            debugger,
+            second,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: 0
+            }
+        ),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    // A process with no live thread cannot be attached.
+    let empty = pm.create_process("empty.exe", None, None);
+    assert_eq!(
+        pm.debug_active_process(
+            empty,
+            second,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: 0
+            }
+        ),
+        Err(STATUS_UNSUCCESSFUL)
+    );
+    // A terminating target is refused.
+    let dying = pm.create_process("dying.exe", None, None);
+    pm.create_thread(dying, 0x10, 0, false).unwrap();
+    pm.terminate_process(dying, 0).unwrap();
+    assert_eq!(
+        pm.debug_active_process(
+            dying,
+            second,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: 0
+            }
+        ),
+        Err(STATUS_PROCESS_IS_TERMINATING)
+    );
+    assert_eq!(pm.debug_object_count(), 2);
+}
+
+#[test]
+fn dbgk_wait_opens_handles_and_renders_the_state_change() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(result.state, dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
+    assert_eq!(
+        result.client_id,
+        ClientId {
+            unique_process: target,
+            unique_thread: main
+        }
+    );
+    // DbgkpOpenHandles opened REAL handles in the DEBUGGER's handle table.
+    assert_ne!(result.handle_to_process, 0);
+    assert_ne!(result.handle_to_thread, 0);
+    assert_eq!(
+        pm.lookup_handle(debugger, result.handle_to_process),
+        Some(HandleObject::Process(target))
+    );
+    assert_eq!(
+        pm.lookup_handle(debugger, result.handle_to_thread),
+        Some(HandleObject::Thread(main))
+    );
+    // The rendered DBGUI_WAIT_STATE_CHANGE carries them + the image base.
+    let sc = &result.state_change;
+    let u64_at = |o: usize| u64::from_le_bytes(sc[o..o + 8].try_into().unwrap());
+    assert_eq!(
+        u32::from_le_bytes(sc[0..4].try_into().unwrap()),
+        dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+    );
+    assert_eq!(u64_at(0x08), target as u64);
+    assert_eq!(u64_at(0x10), main as u64);
+    assert_eq!(u64_at(0x18), result.handle_to_process as u64);
+    assert_eq!(u64_at(0x20), result.handle_to_thread as u64);
+    assert_eq!(u64_at(0x38), 0x0000_0001_4000_0000); // BaseOfImage
+    assert_eq!(u64_at(0x50), 0x2000); // InitialThread.StartAddress
+    // A second wait with the event still outstanding reports nothing.
+    assert!(pm.wait_for_debug_event(object, debugger).unwrap().is_none());
+}
+
+#[test]
+fn dbgk_thread_create_and_exit_generate_real_events() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    // Retrieve + continue the attach message so the queue is clear.
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().len(), 0);
+
+    // EVENT SOURCE 1: a thread create in the debugged process.
+    let worker = pm.create_thread(target, 0x3000, 0, false).unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().len(), 1);
+    let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(created.state, dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+    assert_eq!(created.client_id.unique_thread, worker);
+    assert_eq!(
+        u64::from_le_bytes(created.state_change[0x28..0x30].try_into().unwrap()),
+        0x3000
+    );
+    pm.debug_continue(object, created.client_id, dbgk::DBG_CONTINUE)
+        .unwrap();
+
+    // EVENT SOURCE 2: a thread exit (no cascade — the main thread keeps the process alive).
+    pm.exit_thread(worker, 0x1234).unwrap();
+    let exited = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(exited.state, dbgk::DBG_EXIT_THREAD_STATE_CHANGE);
+    assert_eq!(exited.client_id.unique_thread, worker);
+    assert_eq!(
+        u32::from_le_bytes(exited.state_change[0x18..0x1c].try_into().unwrap()),
+        0x1234
+    );
+    pm.debug_continue(object, exited.client_id, dbgk::DBG_CONTINUE)
+        .unwrap();
+
+    // EVENT SOURCE 3: process exit.
+    pm.terminate_process(target, 0x99).unwrap();
+    let dead = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(dead.state, dbgk::DBG_EXIT_PROCESS_STATE_CHANGE);
+    assert_eq!(
+        u32::from_le_bytes(dead.state_change[0x18..0x1c].try_into().unwrap()),
+        0x99
+    );
+}
+
+#[test]
+fn dbgk_continue_serialises_multiple_events_for_one_process() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let worker = pm.create_thread(target, 0x3000, 0, false).unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().len(), 2);
+
+    // Only ONE event at a time is reported for a given debuggee process.
+    let first = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(first.client_id.unique_thread, main);
+    assert!(pm.wait_for_debug_event(object, debugger).unwrap().is_none());
+
+    // A continue for a thread with no read event fails.
+    assert_eq!(
+        pm.debug_continue(
+            object,
+            ClientId {
+                unique_process: target,
+                unique_thread: worker
+            },
+            dbgk::DBG_CONTINUE
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+
+    let resolved = pm
+        .debug_continue(object, first.client_id, dbgk::DBG_EXCEPTION_NOT_HANDLED)
+        .unwrap();
+    assert_eq!(resolved.returned_status, dbgk::DBG_EXCEPTION_NOT_HANDLED);
+    // …and now the worker's create event becomes reportable.
+    let second = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(second.client_id.unique_thread, worker);
+    assert_eq!(second.state, dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+}
+
+#[test]
+fn dbgk_detach_clears_the_port_and_flushes_queued_events() {
+    let mut pm = ProcessManager::new();
+    let (target, _main, debugger, object) = attach_debugger(&mut pm);
+    pm.create_thread(target, 0x3000, 0, false).unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().len(), 2);
+
+    assert_eq!(pm.remove_process_debug(target, object), Ok(2));
+    assert_eq!(pm.process_debug_port(target), None);
+    assert!(!pm.is_process_being_debugged(target));
+    assert!(pm.debug_object(object).unwrap().is_empty());
+    assert!(!pm.debug_object(object).unwrap().events_present());
+    // A second detach reports PORT_NOT_SET.
+    assert_eq!(
+        pm.remove_process_debug(target, object),
+        Err(dbgk::STATUS_PORT_NOT_SET)
+    );
+    // Detached: further lifecycle events are NOT reported.
+    pm.create_thread(target, 0x4000, 0, false).unwrap();
+    assert!(pm.debug_object(object).unwrap().is_empty());
+    assert!(pm.wait_for_debug_event(object, debugger).unwrap().is_none());
+}
+
+#[test]
+fn dbgk_destroying_the_object_detaches_every_debuggee() {
+    let mut pm = ProcessManager::new();
+    let (target, _main, debugger, object) = attach_debugger(&mut pm);
+    assert_eq!(pm.destroy_debug_object(object), 1);
+    assert_eq!(pm.process_debug_port(target), None);
+    assert!(!pm.is_process_being_debugged(target));
+    assert!(pm.debug_object(object).is_none());
+    assert_eq!(
+        pm.wait_for_debug_event(object, debugger),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.debug_object_count(), 0);
+}
+
+#[test]
+fn dbgk_undebugged_processes_queue_nothing() {
+    let mut pm = ProcessManager::new();
+    let mut pm_object = ProcessManager::new();
+    let object = pm_object.create_debug_object(0).unwrap();
+    let pid = pm.create_process("plain.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    pm.exit_thread(tid, 0).unwrap();
+    pm.terminate_process(pid, 0).unwrap();
+    // No debug port anywhere → the plane is inert (this is the live-boot shape).
+    assert_eq!(pm.debug_object_count(), 0);
+    assert!(pm_object.debug_object(object).unwrap().is_empty());
+}

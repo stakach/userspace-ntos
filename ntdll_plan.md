@@ -3588,6 +3588,138 @@ security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binar
 covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
 `RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
 
+### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+
+The 8 `DbgUi*` exports **kernel32.dll imports** (they underpin Win32
+`DebugActiveProcess`/`WaitForDebugEvent`/`ContinueDebugEvent`/`DebugBreakProcess`) were
+`STATUS_NOT_IMPLEMENTED` because the five debug-object syscalls they shim over existed **nowhere** —
+not in the SSN table, not in the executive. This batch builds the real plane.
+
+**1 — the five SSNs (`crates/nt-syscall-abi/src/lib.rs`, same derivation as every neighbour: the
+0-based line index in `references/reactos/ntoskrnl/sysfuncs.lst`):**
+
+| service | sysfuncs.lst line | SSN | argc |
+|---|---|---|---|
+| `NtCreateDebugObject` | 36 | **35** | 4 |
+| `NtDebugActiveProcess` | 60 | **59** | 2 |
+| `NtDebugContinue` | 61 | **60** | 3 |
+| `NtRemoveProcessDebug` | 200 | **199** | 2 |
+| `NtWaitForDebugEvent` | 280 | **279** | 4 |
+
+Cross-checked against the already-present neighbours in the same file (`NtQueryDebugFilterState`
+line 149 → 148 ✓, `NtSetInformationDebugObject` line 233 → 232 ✓, `NtCreateFile` line 40 → 39 ✓,
+`NtReadVirtualMemory` line 195 → 194 ✓, `NtWaitForMultipleObjects` line 281 → 280 ✓). `Zw*` aliases +
+`NT_ARGC` rows added alongside; `NT_SYSCALLS`/`ZW_ALIASES` 207 → **212**, and the trap-stub generator
+(`crates/nt-ntdll/src/trap_stubs.rs`) emits all five so they are real exports of our `ntdll.dll`
+(verified in the built PE: 212 native stubs, the five names present).
+
+**2 — the plane. PURE state machine: `crates/nt-process/src/dbgk.rs`** (new module, host-tested) — a
+faithful port of the pure half of `ntoskrnl/dbgk/dbgkobj.c`:
+- `DebugObject` = event list + the `EventsPresent` notification signal + the
+  `DebuggerInactive`/`KillProcessOnExit` flag bits; `DebugEvent` = flags/`CLIENT_ID`/`DBGKM_MSG`
+  payload/status/returned-status/backout-thread; `DbgKmMessage` covers all seven api numbers.
+- `queue` (`DbgkpQueueMessage`), `activate_backout_events` (`DbgkpSetProcessDebugObject`'s activation
+  pass), `dequeue_for_wait` (`NtWaitForDebugEvent`'s scan — skip `INACTIVE|READ`, enforce
+  **one outstanding event per debuggee process**, clear the signal when nothing qualifies),
+  `continue_event` (`NtDebugContinue` — validate the 5 legal continue statuses, remove the matching
+  `READ` event, activate the next same-process event + re-signal), `flush_process`
+  (`DbgkClearProcessDebugObject`'s temp-list drain), `encode_wait_state_change`
+  (`DbgkpConvertKernelToUserStateChange` → the x64 `DBGUI_WAIT_STATE_CHANGE` byte image, all 9 states).
+- **Process-side lifecycle on `ProcessManager`** (it owns the process/thread tables):
+  `create_debug_object`, `debug_active_process` (= `DbgkpPostFakeProcessCreateMessages` +
+  `DbgkpSetProcessDebugObject`), `wait_for_debug_event` (dequeue + `DbgkpOpenHandles` minting REAL
+  process/thread handles in the **debugger's** handle table + render), `debug_continue`,
+  `remove_process_debug`, `destroy_debug_object` (`DbgkpCloseObject`). `NtProcess` gained
+  `DebugPort` / `BeingDebugged` / `CREATE_REPORTED` / `SectionBaseAddress`; `HandleObject` gained a
+  typed `DebugObject(id)`.
+- Host tests: **`cargo test -p nt-process` 42 → 64** (16 pure state-machine + 8 ProcessManager
+  end-to-end). `cargo test -p nt-ntdll` 668 → **674** (SSN/argc/Zw/trap-stub coverage for the five +
+  DBGUI→`DEBUG_EVENT` conversion of a create-process/exit-process state change).
+
+**Executive wiring (`components/ntos-executive/src/exec_handler.rs`)** — all five services registered
+in `build_nt_table` and dispatched for real: typed-handle resolution with `DbgkDebugObjectMapping`
+access checks (`debug_object_for_handle`), a REAL anonymous **notification dispatcher event** created
+per debug object to back `EventsPresent` so a blocking `NtWaitForDebugEvent` **parks and wakes through
+the same wait machinery as every other wait** (`sync_debug_object_signal` mirrors the modelled signal
+onto it; a zero/immediate timeout returns `STATUS_TIMEOUT` instead), `NtClose` on the handle runs
+`DbgkpCloseObject` (mark inactive → detach every debuggee → drop).
+
+**3 — `DbgUi*` status (`crates/nt-ntdll-dll/src/exports.rs`):**
+
+| export | status |
+|---|---|
+| `DbgUiConnectToDbg` | **REAL** — create-once via `TEB->DbgSsReserved[1]`, else `NtCreateDebugObject(ALL_ACCESS, DBGK_KILL_PROCESS_ON_EXIT)` straight into that slot |
+| `DbgUiWaitStateChange` | **REAL** — `NtWaitForDebugEvent(DbgSsReserved[1], TRUE, TimeOut, StateChange)` |
+| `DbgUiContinue` | **REAL** — `NtDebugContinue(DbgSsReserved[1], ClientId, ContinueStatus)` |
+| `DbgUiStopDebugging` | **REAL** — `NtRemoveProcessDebug(Process, DbgSsReserved[1])` |
+| `DbgUiDebugActiveProcess` | **REAL attach** — `NtDebugActiveProcess`, then `dbgui.c`'s break-in + cancel-on-failure. Because `DbgUiIssueRemoteBreakin` is still unimplemented it reports the break-in's status (and cancels the attach), exactly as `dbgui.c` does |
+| `DbgUiConvertStateChangeStructure` | **REAL** (already was) — pure conversion in `nt_ntdll::dbg::convert_state_change`, host-tested |
+| `DbgUiGetThreadDebugObject` / `…Set…` | **REAL** (already were) — `TEB->DbgSsReserved[1]` |
+| `DbgUiRemoteBreakin` | **REAL** (already was) — `PEB->BeingDebugged` ⇒ `int3`, then `RtlExitUserThread` |
+| `DbgUiIssueRemoteBreakin` | **STILL STUBBED** — needs `RtlCreateUserThread` in a *foreign* VSpace honouring a start context (`DbgUiRemoteBreakin`); the cross-VSpace remote-thread-with-context path does not exist yet, and faking success would create the wrong thread |
+
+**4 — DEBUG-EVENT SOURCES: what is WIRED vs DEFERRED.** ⚠️ This is **not** a complete debugger.
+
+*WIRED (real, generated by the real `nt-process` lifecycle — the process manager owns it):*
+- **attach-time fake create messages** — `DbgKmCreateProcessApi` for the debuggee's first live thread
+  + `DbgKmCreateThreadApi` for each other one, `NOWAIT|INACTIVE` with the attaching thread as their
+  backout thread, then activated (`DbgkpSetProcessDebugObject`).
+- **thread create** — `DbgKmCreateThreadApi` from `ProcessManager::create_thread` (the first reported
+  thread of a not-yet-reported process reports `DbgKmCreateProcessApi`, `PSF_CREATE_REPORTED_BIT`).
+- **thread exit** — `DbgKmExitThreadApi` from `terminate_thread_at` **and** `exit_thread_at`.
+- **process exit** — `DbgKmExitProcessApi` from `terminate_process_at`.
+
+*DEFERRED (the payload/plumbing exists — `DbgKmMessage::{Exception, LoadDll, UnloadDll}` encode and
+convert correctly, host-tested — but nothing posts them yet):*
+- **exceptions / breakpoints / single-step** (`DbgkForwardException`) — our fault + SEH path
+  (`KiUserExceptionDispatcher`, the executive's fault loop) does **not** consult `EPROCESS.DebugPort`
+  first-chance/second-chance. This is the biggest remaining gap: without it a debugger cannot see a
+  crash or an `int3`.
+- **module load/unload** (`DbgkMapViewOfSection`/`DbgkUnMapViewOfSection`) — our loader does not post
+  `DbgKmLoadDllApi`/`DbgKmUnloadDllApi`.
+- **target-side blocking on the continue event.** NT blocks the *reporting* thread in
+  `DbgkpQueueMessage` until the debugger continues; our wired sources queue and return immediately
+  (the `DebugEvent.status`/`returned_status` resolution is modelled and returned by
+  `debug_continue`, but no live thread is suspended on it). So `DBG_TERMINATE_THREAD`/
+  `DBG_TERMINATE_PROCESS` continue statuses are recorded, not enforced.
+- **`PEB.BeingDebugged` write-through to a live hosted process** — modelled on `NtProcess`
+  (`DbgkpMarkProcessPeb`'s state) but not written into a hosted PEB page; nothing attaches to a live
+  hosted process yet.
+- **`DbgkClearProcessDebugObject` on process-object *deletion*** — we clear on explicit
+  `NtRemoveProcessDebug` or debug-object destruction; a terminated debuggee keeps its port so the
+  debugger can still retrieve the final `ExitProcess` event.
+- **`NtDebugActiveProcess` on a hosted process** — the plane is fully wired, but no binary in the
+  current set issues these syscalls, so the five handler counters read `0` on a plain boot. The proof
+  is the post-loop self-test below.
+
+**5 — the gate: 6 counted specs** (gate **193 → 199/99**), all driven by a post-loop END-TO-END
+self-test (`service_sec_image.rs`, `DBGK_SELFTEST` bitmask `0x1FFF`) that uses **smss's REAL EPROCESS**
+as the debugger (so the handler's own typed-handle resolution + access checks run against a real
+per-process handle table) and a throwaway debuggee:
+
+| spec | proves |
+|---|---|
+| `exec_dbgk_debug_object_created` | a real `DEBUG_OBJECT` with validated `DBGK_*` flags; its typed handle resolves through the handler's `debug_object_for_handle`, a wrong-access handle is `STATUS_ACCESS_DENIED`, a non-debug handle is `STATUS_OBJECT_TYPE_MISMATCH` |
+| `exec_dbgk_attach_posts_fake_create` | attach installs `EPROCESS.DebugPort` + `BeingDebugged`, posts **and activates** the fake `DbgKmCreateProcessApi`; self-attach = `STATUS_ACCESS_DENIED`, second attach = `STATUS_PORT_ALREADY_SET` |
+| `exec_dbgk_wait_retrieves_state_change` | the wait reports `DbgCreateProcessStateChange` with the right `CLIENT_ID`, **REAL** process/thread handles opened in the debugger's table, and a `DBGUI_WAIT_STATE_CHANGE` carrying them + the image base + the initial thread's start address |
+| `exec_dbgk_continue_resolves_event` | one outstanding event per debuggee process; `NtDebugContinue` rejects an illegal continue status and resolves the `READ` event |
+| `exec_dbgk_lifecycle_event_sources` | the three WIRED sources — thread create (with its start address), thread exit (with its exit status), process exit (with its exit status) — each retrieved through the wait |
+| `exec_dbgk_detach_makes_plane_inert` | detach clears the port + flushes the queue, a second detach is `STATUS_PORT_NOT_SET`, and an attached-then-detached LIVE process reports nothing further |
+
+**Verify:** 3 consecutive clean foreground boots — **199/99, ZERO FAILs, RUNEXIT=3,
+`[microtest sentinel matched]`** each time, `dbgk selftest bits=0x1fff`; no regression (`199 = 193 + 6`,
+including `exec_msgina_logon_dialog_painted`, `exec_win32k_desktop_painted`,
+`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`). Host tests:
+`nt-process` 42→64, `nt-ntdll` 668→674, `nt-syscall-abi` 15→15, `nt-syscall` 41→41,
+`nt-io-manager` 86→86 (all green). No `rust-micro/src` change.
+
+**Remaining ntdll gaps after this batch:** `DbgUiIssueRemoteBreakin` (needs cross-VSpace
+`RtlCreateUserThread` with a start context) · the debug-event sources listed as DEFERRED above
+(exception forwarding is the load-bearing one) · everything in §A's stub list that is unchanged
+(`CsrClientCallServer`/`CsrGetProcessId`, boot-status data, SxS/activation-context,
+`RtlNewSecurityObject`/`Set`/`Query`, `RtlFindMessage`, `RtlVerifyVersionInfo`, heap tag/walk) · §C
+Tier-2/3 Rtl breadth.
+
 **Frontier hand-off:** the desktop/logon-UI advance (past the SAS park) is a **win32k** batch —
 implement `UserGetMessage 0x1006` / `UserPostMessage 0x100e` (message-queue) + `WlxLoggedOutSAS`/msgina
 dialog dispatch in `win32k_subsystem.rs` — NOT an ntdll batch. Tracked separately.

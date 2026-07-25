@@ -375,6 +375,123 @@ mod tests {
     extern crate std;
     use super::*;
 
+    /// The five debug-object services `DbgUi*` is a thin shim over — name, `sysfuncs.lst`-derived
+    /// SSN (its 0-based line index) and parameter count. Kept here so the DbgUi surface's ABI is
+    /// asserted next to the conversion logic it feeds.
+    const DEBUG_OBJECT_SERVICES: &[(&str, u32, u8)] = &[
+        ("NtCreateDebugObject", 35, 4),
+        ("NtDebugActiveProcess", 59, 2),
+        ("NtDebugContinue", 60, 3),
+        ("NtRemoveProcessDebug", 199, 2),
+        ("NtWaitForDebugEvent", 279, 4),
+    ];
+
+    #[test]
+    fn debug_object_services_have_the_reactos_ssns_and_arities() {
+        for (name, ssn, argc) in DEBUG_OBJECT_SERVICES {
+            assert_eq!(
+                nt_syscall_abi::ssn_of(name),
+                Some(*ssn),
+                "{name} SSN drifted"
+            );
+            assert_eq!(nt_syscall_abi::exact_argc_of(name), Some(*argc), "{name} argc");
+        }
+    }
+
+    #[test]
+    fn debug_object_services_have_generated_trap_stubs() {
+        for (name, ssn, argc) in DEBUG_OBJECT_SERVICES {
+            let stub = crate::trap_stubs::trap_stub(name)
+                .unwrap_or_else(|| panic!("no trap stub generated for {name}"));
+            assert_eq!(stub.ssn, *ssn);
+            assert_eq!(stub.argc, *argc);
+        }
+    }
+
+    #[test]
+    fn debug_object_services_have_zw_aliases_on_the_same_ssn() {
+        for (name, ssn, _) in DEBUG_OBJECT_SERVICES {
+            let zw = std::format!("Zw{}", &name[2..]);
+            assert_eq!(nt_syscall_abi::ssn_of(&zw), Some(*ssn), "{zw} missing/drifted");
+        }
+    }
+
+    /// Build the x64 `DBGUI_WAIT_STATE_CHANGE` a `DbgCreateProcessStateChange` carries, in the exact
+    /// layout the kernel side (`nt_process::dbgk::encode_wait_state_change`) writes.
+    fn create_process_state_change() -> [u8; DBGUI_WAIT_STATE_CHANGE_SIZE] {
+        let mut sc = [0u8; DBGUI_WAIT_STATE_CHANGE_SIZE];
+        let put32 = |sc: &mut [u8], o: usize, v: u32| sc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |sc: &mut [u8], o: usize, v: u64| sc[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        put32(&mut sc, 0x00, 3); // DbgCreateProcessStateChange
+        put64(&mut sc, 0x08, 0x20); // AppClientId.UniqueProcess
+        put64(&mut sc, 0x10, 0x24); // AppClientId.UniqueThread
+        put64(&mut sc, 0x18, 0x40); // HandleToProcess
+        put64(&mut sc, 0x20, 0x44); // HandleToThread
+        put64(&mut sc, 0x30, 0x50); // NewProcess.FileHandle
+        put64(&mut sc, 0x38, 0x0000_0001_4000_0000); // NewProcess.BaseOfImage
+        put32(&mut sc, 0x40, 0xAABB); // DebugInfoFileOffset
+        put32(&mut sc, 0x44, 0xCCDD); // DebugInfoSize
+        put64(&mut sc, 0x50, 0x0000_0001_4000_1000); // InitialThread.StartAddress
+        sc
+    }
+
+    #[test]
+    fn dbgui_create_process_state_change_converts_to_a_win32_debug_event() {
+        let sc = create_process_state_change();
+        let mut event = [0u8; DEBUG_EVENT_SIZE];
+        convert_state_change(&sc, &mut event, |thread| {
+            assert_eq!(thread, 0x44, "the TEB query uses HandleToThread");
+            Some(0x7FFD_0000)
+        })
+        .unwrap();
+        let u32_at = |o: usize| u32::from_le_bytes(event[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(event[o..o + 8].try_into().unwrap());
+        assert_eq!(u32_at(0x00), 3); // CREATE_PROCESS_DEBUG_EVENT
+        assert_eq!(u32_at(0x04), 0x20);
+        assert_eq!(u32_at(0x08), 0x24);
+        assert_eq!(u64_at(0x10), 0x50); // hFile
+        assert_eq!(u64_at(0x18), 0x40); // hProcess
+        assert_eq!(u64_at(0x20), 0x44); // hThread
+        assert_eq!(u64_at(0x28), 0x0000_0001_4000_0000); // lpBaseOfImage
+        assert_eq!(u32_at(0x30), 0xAABB);
+        assert_eq!(u32_at(0x34), 0xCCDD);
+        assert_eq!(u64_at(0x38), 0x7FFD_0000); // lpThreadLocalBase (from the TEB query)
+        assert_eq!(u64_at(0x40), 0x0000_0001_4000_1000); // lpStartAddress
+        assert_eq!(u64_at(0x48), 0); // lpImageName
+        assert_eq!(u16::from_le_bytes(event[0x50..0x52].try_into().unwrap()), 1); // fUnicode
+    }
+
+    #[test]
+    fn dbgui_create_process_conversion_tolerates_a_failed_teb_query() {
+        let sc = create_process_state_change();
+        let mut event = [0u8; DEBUG_EVENT_SIZE];
+        convert_state_change(&sc, &mut event, |_| None).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(event[0x38..0x40].try_into().unwrap()),
+            0,
+            "a failed ThreadBasicInformation query yields a NULL TEB, as native ntdll specifies"
+        );
+    }
+
+    #[test]
+    fn dbgui_exit_process_state_change_converts() {
+        let mut sc = [0u8; DBGUI_WAIT_STATE_CHANGE_SIZE];
+        sc[0..4].copy_from_slice(&5u32.to_le_bytes()); // DbgExitProcessStateChange
+        sc[0x08..0x10].copy_from_slice(&0x20u64.to_le_bytes());
+        sc[0x10..0x18].copy_from_slice(&0x24u64.to_le_bytes());
+        sc[0x18..0x1c].copy_from_slice(&0x99u32.to_le_bytes());
+        let mut event = [0u8; DEBUG_EVENT_SIZE];
+        convert_state_change(&sc, &mut event, |_| None).unwrap();
+        assert_eq!(u32::from_le_bytes(event[0..4].try_into().unwrap()), 5); // EXIT_PROCESS
+        assert_eq!(u32::from_le_bytes(event[0x10..0x14].try_into().unwrap()), 0x99);
+        // An unknown DBG_STATE is refused rather than silently mis-converted.
+        sc[0..4].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(
+            convert_state_change(&sc, &mut event, |_| None),
+            Err(STATUS_UNSUCCESSFUL)
+        );
+    }
+
     #[test]
     fn error_level_always_prints() {
         let f = ComponentFilter::default();

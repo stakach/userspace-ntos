@@ -28005,26 +28005,75 @@ pub extern "C" fn misaligned_access() -> u32 {
     0
 }
 
+/// `DEBUG_OBJECT_ALL_ACCESS` (`STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xF`).
+const DEBUG_OBJECT_ALL_ACCESS: u32 = 0x001F_000F;
+/// `DBGK_KILL_PROCESS_ON_EXIT` — the flag `DbgUiConnectToDbg` always passes.
+const DBGK_KILL_PROCESS_ON_EXIT: u32 = 0x1;
+/// `sizeof(OBJECT_ATTRIBUTES)` on x64 — the `Length` field of a zeroed, name-less attribute block.
+const OBJECT_ATTRIBUTES_SIZE_X64: u32 = 48;
+
 /// `DbgUiConnectToDbg() -> NTSTATUS`.
 ///
-/// Reusing an installed per-thread debug object is complete. Creating the first object requires the
-/// executive debug-object plane, which is not available yet.
+/// `references/reactos/dll/ntdll/dbg/dbgui.c`: don't connect twice (a debug object already parked in
+/// `NtCurrentTeb()->DbgSsReserved[1]` is success), otherwise create one with
+/// `DEBUG_OBJECT_ALL_ACCESS | DBGK_KILL_PROCESS_ON_EXIT` **directly into that TEB slot** — the
+/// handle the rest of the family reads back.
 #[export_name = "DbgUiConnectToDbg"]
 pub unsafe extern "system" fn dbg_ui_connect_to_dbg() -> NtStatus {
     if !unsafe { dbg_ui_get_thread_debug_object() }.is_null() {
-        STATUS_SUCCESS
-    } else {
+        return STATUS_SUCCESS;
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the TEB self pointer is gs:[0x30]; `DbgSsReserved[1]` is a HANDLE-sized slot the
+    // syscall writes, and `attributes` is a live 48-byte zeroed OBJECT_ATTRIBUTES on our stack.
+    unsafe {
+        let teb = current_teb();
+        if teb == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mut attributes = [0u64; 6];
+        attributes[0] = OBJECT_ATTRIBUTES_SIZE_X64 as u64;
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut *mut c_void, u32, *mut c_void, u32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_create_debug_object)(
+            (teb + TEB_DBGSS_RESERVED1_OFFSET) as *mut *mut c_void,
+            DEBUG_OBJECT_ALL_ACCESS,
+            attributes.as_mut_ptr().cast(),
+            DBGK_KILL_PROCESS_ON_EXIT,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
         STATUS_NOT_IMPLEMENTED
     }
 }
 
-/// `DbgUiContinue(PCLIENT_ID, NTSTATUS) -> NTSTATUS`.
+/// `DbgUiContinue(PCLIENT_ID, NTSTATUS) -> NTSTATUS` — `NtDebugContinue` against this thread's
+/// debug object (`dbgui.c`).
 #[export_name = "DbgUiContinue"]
 pub unsafe extern "system" fn dbg_ui_continue(
-    _client_id: *const c_void,
-    _continue_status: NtStatus,
+    client_id: *const c_void,
+    continue_status: NtStatus,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: transmuting the generated `NtDebugContinue` trap stub to its real prototype; the
+    // debug-object handle comes from this thread's TEB slot.
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, *const c_void, NtStatus) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_debug_continue)(
+            dbg_ui_get_thread_debug_object(),
+            client_id,
+            continue_status,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (client_id, continue_status);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `DbgUiConvertStateChangeStructure(PDBGUI_WAIT_STATE_CHANGE, PDEBUG_EVENT) -> NTSTATUS`.
@@ -28084,15 +28133,62 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
 }
 
 /// `DbgUiDebugActiveProcess(HANDLE) -> NTSTATUS`.
+///
+/// `dbgui.c`: attach this thread's debug object to `process`, then break the target in. When the
+/// break-in fails, debugging is cancelled again (so a failed attach leaves no debug port behind).
+///
+/// **`DbgUiIssueRemoteBreakin` is still unimplemented here** (a remote thread with a start context
+/// in a foreign VSpace), so this wrapper would always unwind its own successful attach. Native
+/// ntdll's own contract is "attach, then break in"; we keep the attach and report the break-in's
+/// status, cancelling exactly as `dbgui.c` does — a caller that only wants the attach uses
+/// `NtDebugActiveProcess` directly.
 #[export_name = "DbgUiDebugActiveProcess"]
-pub unsafe extern "system" fn dbg_ui_debug_active_process(_process: *mut c_void) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+pub unsafe extern "system" fn dbg_ui_debug_active_process(process: *mut c_void) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: transmuting the generated `NtDebugActiveProcess` trap stub to its real prototype.
+    unsafe {
+        let status = core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_debug_active_process)(
+            process,
+            dbg_ui_get_thread_debug_object(),
+        );
+        if !nt_success(status) {
+            return status;
+        }
+        let breakin = dbg_ui_issue_remote_breakin(process);
+        if !nt_success(breakin) {
+            dbg_ui_stop_debugging(process);
+        }
+        breakin
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = process;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `DbgUiStopDebugging(HANDLE) -> NTSTATUS`.
+/// `DbgUiStopDebugging(HANDLE) -> NTSTATUS` — `NtRemoveProcessDebug` for this thread's debug object.
 #[export_name = "DbgUiStopDebugging"]
-pub unsafe extern "system" fn dbg_ui_stop_debugging(_process: *mut c_void) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+pub unsafe extern "system" fn dbg_ui_stop_debugging(process: *mut c_void) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: transmuting the generated `NtRemoveProcessDebug` trap stub to its real prototype.
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_remove_process_debug)(
+            process,
+            dbg_ui_get_thread_debug_object(),
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = process;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `DbgUiIssueRemoteBreakin(HANDLE) -> NTSTATUS`.
@@ -28104,13 +28200,31 @@ pub unsafe extern "system" fn dbg_ui_issue_remote_breakin(_process: *mut c_void)
     STATUS_NOT_IMPLEMENTED
 }
 
-/// `DbgUiWaitStateChange(PDBGUI_WAIT_STATE_CHANGE, PLARGE_INTEGER) -> NTSTATUS`.
+/// `DbgUiWaitStateChange(PDBGUI_WAIT_STATE_CHANGE, PLARGE_INTEGER) -> NTSTATUS` —
+/// `NtWaitForDebugEvent(DbgSsReserved[1], TRUE, TimeOut, WaitStateChange)` (`dbgui.c`).
 #[export_name = "DbgUiWaitStateChange"]
 pub unsafe extern "system" fn dbg_ui_wait_state_change(
-    _wait_state_change: *mut c_void,
-    _timeout: *const i64,
+    wait_state_change: *mut c_void,
+    timeout: *const i64,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: transmuting the generated `NtWaitForDebugEvent` trap stub to its real prototype.
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, u8, *const i64, *mut c_void) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_wait_for_debug_event)(
+            dbg_ui_get_thread_debug_object(),
+            1,
+            timeout,
+            wait_state_change,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (wait_state_change, timeout);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `DbgUiRemoteBreakin()` — debugger break-in thread entry. If the PEB says the process is being

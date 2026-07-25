@@ -5420,6 +5420,266 @@ pub(crate) unsafe fn service_sec_image(
             PM_TERMINATE_THREAD_SELFTEST.store(term_ok, Ordering::Relaxed);
         }
 
+        // === Dbgk END-TO-END SELF-TEST (POST-LOOP) =================================================
+        // Drives the REAL user-mode debugging plane the five native handlers dispatch into:
+        // create a DEBUG_OBJECT, mint a TYPED handle for it in smss's REAL EPROCESS handle table and
+        // resolve it through the handler's own `debug_object_for_handle` (access checks included),
+        // attach it to a THROWAWAY debuggee, retrieve the fake create-process message with
+        // NtWaitForDebugEvent's core (handles opened in the debugger's table + a rendered
+        // DBGUI_WAIT_STATE_CHANGE), resolve it with NtDebugContinue, observe the thread-create /
+        // thread-exit / process-exit EVENT SOURCES, then detach and prove the plane goes inert.
+        // The 3 hosted EPROCESSes are otherwise untouched (only smss gains + loses handles).
+        {
+            use nt_process::dbgk;
+            nt_handler.pi = 0;
+            let mut dbg_ok = 0u64;
+            let debugger_pid = nt_handler.pm_pid_for_pi(0);
+            if let Some(debugger_pid) = debugger_pid {
+                let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
+                let bad_flags_rejected = nt_handler.pm.create_debug_object(0x8000)
+                    == Err(nt_process::STATUS_INVALID_PARAMETER);
+                if let Ok(object) = nt_handler
+                    .pm
+                    .create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT)
+                {
+                    if bad_flags_rejected
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.kill_process_on_exit())
+                    {
+                        dbg_ok |= 0x0001;
+                    }
+                    // 0x1000 — the handler's typed-handle resolution + access enforcement, driven
+                    // against smss's REAL per-process handle table.
+                    let full = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::DebugObject(object),
+                            dbgk::DEBUG_OBJECT_ALL_ACCESS,
+                        )
+                        .ok();
+                    let no_access = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::DebugObject(object),
+                            0,
+                        )
+                        .ok();
+                    let wrong_type = nt_handler
+                        .pm
+                        .insert_handle(debugger_pid, nt_process::HandleObject::Opaque(0xDB6), 0)
+                        .ok();
+                    if full.is_some_and(|h| {
+                        nt_handler
+                            .debug_object_for_handle(h as u64, dbgk::DEBUG_OBJECT_ADD_REMOVE_PROCESS)
+                            == Ok(object)
+                    }) && no_access.is_some_and(|h| {
+                        nt_handler
+                            .debug_object_for_handle(h as u64, dbgk::DEBUG_OBJECT_ADD_REMOVE_PROCESS)
+                            == Err(0xC000_0022)
+                    }) && wrong_type.is_some_and(|h| {
+                        nt_handler.debug_object_for_handle(h as u64, 0) == Err(0xC000_0024)
+                    }) {
+                        dbg_ok |= 0x1000;
+                    }
+                    for handle in [full, no_access, wrong_type].into_iter().flatten() {
+                        let _ = nt_handler.pm.close_handle(debugger_pid, handle);
+                    }
+
+                    // A throwaway debuggee with a real image base + main thread.
+                    let target = nt_handler.pm.create_process("dbgk-selftest.exe", None, None);
+                    nt_handler.pm.set_image_base(target, 0x0000_0001_4000_0000);
+                    if let Ok(main) = nt_handler.pm.create_thread(target, 0x2000, 0, false) {
+                        let debugger = nt_process::ClientId {
+                            unique_process: debugger_pid,
+                            unique_thread: debugger_tid,
+                        };
+                        // 0x0002 — attach installs the port + PEB.BeingDebugged and posts + activates
+                        // the fake DbgKmCreateProcessApi message.
+                        if nt_handler.pm.debug_active_process(target, object, debugger) == Ok(1)
+                            && nt_handler.pm.process_debug_port(target) == Some(object)
+                            && nt_handler.pm.is_process_being_debugged(target)
+                            && nt_handler
+                                .pm
+                                .debug_object(object)
+                                .is_some_and(|o| o.len() == 1 && o.events_present())
+                        {
+                            dbg_ok |= 0x0002;
+                        }
+                        // 0x0004 — a self-attach is denied and a second attach is PORT_ALREADY_SET.
+                        if let Ok(second) = nt_handler.pm.create_debug_object(0) {
+                            if nt_handler.pm.debug_active_process(debugger_pid, second, debugger)
+                                == Err(nt_process::STATUS_ACCESS_DENIED)
+                                && nt_handler.pm.debug_active_process(target, second, debugger)
+                                    == Err(dbgk::STATUS_PORT_ALREADY_SET)
+                            {
+                                dbg_ok |= 0x0004;
+                            }
+                            nt_handler.pm.destroy_debug_object(second);
+                        }
+                        // 0x0008 / 0x0010 — the wait retrieves it, with REAL handles opened in the
+                        // debugger's table and the state change rendered around them.
+                        if let Ok(Some(result)) =
+                            nt_handler.pm.wait_for_debug_event(object, debugger_pid)
+                        {
+                            let sc = &result.state_change;
+                            let u64_at = |o: usize| {
+                                u64::from_le_bytes(sc[o..o + 8].try_into().unwrap_or([0; 8]))
+                            };
+                            if result.state == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+                                && result.client_id.unique_process == target
+                                && result.client_id.unique_thread == main
+                                && u64_at(0x08) == target as u64
+                                && u64_at(0x38) == 0x0000_0001_4000_0000
+                                && u64_at(0x50) == 0x2000
+                            {
+                                dbg_ok |= 0x0008;
+                            }
+                            if result.handle_to_process != 0
+                                && result.handle_to_thread != 0
+                                && nt_handler
+                                    .pm
+                                    .lookup_handle(debugger_pid, result.handle_to_process)
+                                    == Some(nt_process::HandleObject::Process(target))
+                                && nt_handler
+                                    .pm
+                                    .lookup_handle(debugger_pid, result.handle_to_thread)
+                                    == Some(nt_process::HandleObject::Thread(main))
+                                && u64_at(0x18) == result.handle_to_process as u64
+                                && u64_at(0x20) == result.handle_to_thread as u64
+                            {
+                                dbg_ok |= 0x0010;
+                            }
+                            let _ = nt_handler
+                                .pm
+                                .close_handle(debugger_pid, result.handle_to_process);
+                            let _ = nt_handler
+                                .pm
+                                .close_handle(debugger_pid, result.handle_to_thread);
+                            // 0x0020 — one outstanding event per debuggee process.
+                            if matches!(
+                                nt_handler.pm.wait_for_debug_event(object, debugger_pid),
+                                Ok(None)
+                            ) {
+                                dbg_ok |= 0x0020;
+                            }
+                            // 0x0040 — continue validates its status and resolves the read event.
+                            if nt_handler
+                                .pm
+                                .debug_continue(object, result.client_id, 0x1234)
+                                == Err(nt_process::STATUS_INVALID_PARAMETER)
+                                && nt_handler
+                                    .pm
+                                    .debug_continue(object, result.client_id, dbgk::DBG_CONTINUE)
+                                    .is_ok()
+                                && nt_handler.pm.debug_object(object).is_some_and(|o| o.is_empty())
+                            {
+                                dbg_ok |= 0x0040;
+                            }
+                        }
+                        // 0x0080 — EVENT SOURCE: thread create.
+                        if let Ok(worker) = nt_handler.pm.create_thread(target, 0x3000, 0, false) {
+                            if let Ok(Some(created)) =
+                                nt_handler.pm.wait_for_debug_event(object, debugger_pid)
+                            {
+                                if created.state == dbgk::DBG_CREATE_THREAD_STATE_CHANGE
+                                    && created.client_id.unique_thread == worker
+                                    && u64::from_le_bytes(
+                                        created.state_change[0x28..0x30].try_into().unwrap_or([0; 8]),
+                                    ) == 0x3000
+                                {
+                                    dbg_ok |= 0x0080;
+                                }
+                                let _ = nt_handler
+                                    .pm
+                                    .close_handle(debugger_pid, created.handle_to_thread);
+                                let _ = nt_handler
+                                    .pm
+                                    .debug_continue(object, created.client_id, dbgk::DBG_CONTINUE);
+                            }
+                            // 0x0100 — EVENT SOURCE: thread exit (no cascade: main still lives).
+                            let _ = nt_handler.pm.exit_thread(worker, 0x1234);
+                            if let Ok(Some(exited)) =
+                                nt_handler.pm.wait_for_debug_event(object, debugger_pid)
+                            {
+                                if exited.state == dbgk::DBG_EXIT_THREAD_STATE_CHANGE
+                                    && exited.client_id.unique_thread == worker
+                                    && u32::from_le_bytes(
+                                        exited.state_change[0x18..0x1c].try_into().unwrap_or([0; 4]),
+                                    ) == 0x1234
+                                {
+                                    dbg_ok |= 0x0100;
+                                }
+                                let _ = nt_handler
+                                    .pm
+                                    .debug_continue(object, exited.client_id, dbgk::DBG_CONTINUE);
+                            }
+                        }
+                        // 0x0200 — EVENT SOURCE: process exit.
+                        let _ = nt_handler.pm.terminate_process(target, 0x99);
+                        if let Ok(Some(dead)) =
+                            nt_handler.pm.wait_for_debug_event(object, debugger_pid)
+                        {
+                            if dead.state == dbgk::DBG_EXIT_PROCESS_STATE_CHANGE
+                                && u32::from_le_bytes(
+                                    dead.state_change[0x18..0x1c].try_into().unwrap_or([0; 4]),
+                                ) == 0x99
+                            {
+                                dbg_ok |= 0x0200;
+                            }
+                        }
+                        // 0x0400 — detach clears the port + flushes; a second detach is PORT_NOT_SET.
+                        let flushed = nt_handler.pm.remove_process_debug(target, object);
+                        if flushed.is_ok()
+                            && nt_handler.pm.process_debug_port(target).is_none()
+                            && !nt_handler.pm.is_process_being_debugged(target)
+                            && nt_handler.pm.debug_object(object).is_some_and(|o| o.is_empty())
+                            && nt_handler.pm.remove_process_debug(target, object)
+                                == Err(dbgk::STATUS_PORT_NOT_SET)
+                        {
+                            dbg_ok |= 0x0400;
+                        }
+                        // 0x0800 — a LIVE process that was attached then detached reports nothing
+                        // further: attach a second throwaway debuggee, detach it, then create a
+                        // thread in it and prove the plane stays inert.
+                        let target2 =
+                            nt_handler.pm.create_process("dbgk-selftest-b.exe", None, None);
+                        if nt_handler.pm.create_thread(target2, 0x6000, 0, false).is_ok() {
+                            let attached =
+                                nt_handler.pm.debug_active_process(target2, object, debugger)
+                                    == Ok(1);
+                            let detached =
+                                nt_handler.pm.remove_process_debug(target2, object) == Ok(1);
+                            let drained = nt_handler
+                                .pm
+                                .debug_object(object)
+                                .is_some_and(|o| o.is_empty());
+                            let _ = nt_handler.pm.create_thread(target2, 0x7000, 0, false);
+                            if attached
+                                && detached
+                                && drained
+                                && nt_handler
+                                    .pm
+                                    .debug_object(object)
+                                    .is_some_and(|o| o.is_empty())
+                                && matches!(
+                                    nt_handler.pm.wait_for_debug_event(object, debugger_pid),
+                                    Ok(None)
+                                )
+                            {
+                                dbg_ok |= 0x0800;
+                            }
+                        }
+                    }
+                    nt_handler.pm.destroy_debug_object(object);
+                }
+            }
+            DBGK_SELFTEST.store(dbg_ok, Ordering::Relaxed);
+        }
+
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
         delay_timer_shutdown(&delay_queue);
