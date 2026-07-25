@@ -5680,6 +5680,453 @@ pub(crate) unsafe fn service_sec_image(
             DBGK_SELFTEST.store(dbg_ok, Ordering::Relaxed);
         }
 
+        // === Dbgk SYSCALL-DISPATCH SELF-TEST (POST-LOOP) ===========================================
+        // The block above drives the PLANE (ProcessManager + the pure `nt_process::dbgk` state
+        // machine) directly; it proves nothing about the five NATIVE HANDLER ARMS. This block drives
+        // those arms through the REAL dispatch route a hosted process uses —
+        // `nt_dispatcher.dispatch(SSN, argv, origin, &mut nt_handler)`, the exact call the service
+        // loop makes for every syscall — with REAL MARSHALLED ARGUMENTS living in CLIENT memory
+        // (smss's mirrored stack). So the handler's own SSN→service resolution, typed-handle lookup,
+        // `DbgkDebugObjectMapping` access checks, ProbeForWrite/copyin/copyout of the `*DebugHandle`,
+        // `*Timeout`, `*CLIENT_ID` and `DBGUI_WAIT_STATE_CHANGE`, its counters and its wait-park
+        // request all execute for real. Verified by the DBGK_* counters, which read 0 without it.
+        {
+            use nt_process::dbgk;
+            const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+            const ST_TIMEOUT: u32 = 0x0000_0102;
+            const ST_ACCESS_VIOLATION: u32 = 0xC000_0005;
+            const ST_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+            const ST_INVALID_HANDLE: u32 = 0xC000_0008;
+            const ST_INVALID_PARAMETER: u32 = 0xC000_000D;
+            const ST_ACCESS_DENIED: u32 = 0xC000_0022;
+            const ST_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+            // The client-side argument block: the DEEPEST (unused) end of smss's 16 KiB stack, which
+            // is inside its mirrored range so the handler's copyin/copyout reach it exactly as they
+            // reach a live caller's stack. smss is parked in its final syscall and the boot exits
+            // right after the specs, so nothing ever reads these bytes back.
+            const A_HANDLE: u64 = STACK_BASE + 0x80; // *DebugHandle out (8)
+            const A_CLIENT_ID: u64 = STACK_BASE + 0x88; // CLIENT_ID in (16)
+            const A_TIMEOUT: u64 = STACK_BASE + 0x98; // LARGE_INTEGER *Timeout in (8)
+            const A_STATE: u64 = STACK_BASE + 0xA0; // DBGUI_WAIT_STATE_CHANGE out (0xB8)
+            // Free `PM_PIDS` slots: the handler maps a resolved process id back to a hosted-process
+            // index, so each throwaway debuggee is registered in an UNUSED slot for the duration of
+            // the test and cleared afterwards. Slots 0..=4 are the live hosted set — untouched.
+            const DBGK_TEST_PI: usize = MAX_PI - 1;
+            const DBGK_TEST_PI2: usize = MAX_PI - 2;
+
+            let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+            let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+            let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+            let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_pi = nt_handler.pi;
+            let saved_tid = nt_handler.current_tid;
+            // Take the loop context so every client access goes through smss's mirrors (the same
+            // idiom the post-loop pipe / io-completion re-drive helpers use).
+            let saved_ctx = nt_handler.loop_ctx.take();
+            ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            nt_handler.pi = 0;
+
+            let mut sc_ok = 0u64;
+            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            // Every service below goes through THIS — the dispatcher, by SSN. An unregistered number
+            // returns STATUS_INVALID_SYSTEM_SERVICE and never reaches a handler; a wrong argument
+            // count returns STATUS_INVALID_PARAMETER before the handler.
+            macro_rules! sysc {
+                ($ssn:expr, $args:expr) => {
+                    nt_dispatcher
+                        .dispatch($ssn as u32, $args, &dbg_origin, &mut nt_handler)
+                        .status
+                };
+            }
+
+            // 0x0001 — the five services really are registered at the sysfuncs.lst-derived SSNs, with
+            // their documented argument counts.
+            if [
+                (NativeService::NtCreateDebugObject, 35u32, 4u8),
+                (NativeService::NtDebugActiveProcess, 59, 2),
+                (NativeService::NtDebugContinue, 60, 3),
+                (NativeService::NtRemoveProcessDebug, 199, 2),
+                (NativeService::NtWaitForDebugEvent, 279, 4),
+            ]
+            .iter()
+            .all(|&(service, ssn, argc)| {
+                nt_dispatcher.table().number_of(service) == Some(ssn)
+                    && nt_dispatcher.table().lookup(ssn).is_some_and(|entry| {
+                        entry.service == service && entry.min_args == argc && entry.max_args == argc
+                    })
+            }) {
+                sc_ok |= 0x0001;
+            }
+
+            let debugger_pid = nt_handler.pm_pid_for_pi(0).unwrap_or(0);
+            let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
+            nt_handler.current_tid = debugger_tid as u64;
+            // Zero the client argument block through the mirror; if that fails the mirrors are not
+            // usable and the whole test would be meaningless, so it stays 0 (=> FAIL) rather than
+            // silently "passing".
+            let client_args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100]);
+            if debugger_pid != 0 && client_args_ready {
+                // --- NtCreateDebugObject (SSN 35): [*DebugHandle, DesiredAccess, *OA, Flags] ------
+                let create = sysc!(
+                    SSN_NT_CREATE_DEBUG_OBJECT,
+                    &[
+                        A_HANDLE,
+                        dbgk::DEBUG_OBJECT_ALL_ACCESS as u64,
+                        0,
+                        dbgk::DBGK_KILL_PROCESS_ON_EXIT as u64,
+                    ]
+                );
+                // Read the handle back out of CLIENT memory the way the caller would — proof the
+                // out-parameter was really marshalled, not just returned.
+                let dbg_handle = smss_stack_read(A_HANDLE);
+                let object = match nt_handler
+                    .pm
+                    .lookup_handle(debugger_pid, dbg_handle as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::DebugObject(object)) => Some(object),
+                    _ => None,
+                };
+                let host_event = object
+                    .and_then(|object| nt_handler.pm.debug_object(object))
+                    .map(|o| o.host_event)
+                    .unwrap_or(0);
+                let create_negatives = sysc!(
+                    SSN_NT_CREATE_DEBUG_OBJECT,
+                    &[0, dbgk::DEBUG_OBJECT_ALL_ACCESS as u64, 0, 0]
+                ) == ST_ACCESS_VIOLATION
+                    && sysc!(
+                        SSN_NT_CREATE_DEBUG_OBJECT,
+                        &[A_HANDLE + 1, dbgk::DEBUG_OBJECT_ALL_ACCESS as u64, 0, 0]
+                    ) == ST_DATATYPE_MISALIGNMENT
+                    && sysc!(
+                        SSN_NT_CREATE_DEBUG_OBJECT,
+                        &[A_HANDLE, dbgk::DEBUG_OBJECT_ALL_ACCESS as u64, 0, 0x8000]
+                    ) == ST_INVALID_PARAMETER;
+                // 0x0002 — the handler created a real object, bound its EventsPresent dispatcher
+                // event, minted a TYPED per-process handle and copied it out; its counter moved.
+                if create == 0
+                    && dbg_handle != 0
+                    && object.is_some()
+                    && host_event != 0
+                    && DBGK_OBJECTS_CREATED.load(Ordering::Relaxed) >= 1
+                    && create_negatives
+                {
+                    sc_ok |= 0x0002;
+                }
+
+                if let Some(object) = object {
+                    // A throwaway debuggee with a real image base + main thread.
+                    let target = nt_handler.pm.create_process("dbgk-syscall.exe", None, None);
+                    nt_handler.pm.set_image_base(target, 0x0000_0001_5000_0000);
+                    let main = nt_handler.pm.create_thread(target, 0x2100, 0, false).ok();
+                    PM_PIDS[DBGK_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let h_target = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(target),
+                            PROCESS_SUSPEND_RESUME,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let h_target_noaccess = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(target),
+                            0,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let h_dbg_noaccess = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::DebugObject(object),
+                            0,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let h_wrong_type = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Opaque(0xDB65),
+                            dbgk::DEBUG_OBJECT_ALL_ACCESS,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+
+                    // 0x0080 — the DEBUG-handle checks, all through the dispatch route: a handle
+                    // without the required DbgkDebugObjectMapping access is ACCESS_DENIED on every
+                    // service, a non-debug handle is OBJECT_TYPE_MISMATCH, and a NULL out/in pointer
+                    // is ACCESS_VIOLATION.
+                    if sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, h_dbg_noaccess])
+                        == ST_ACCESS_DENIED
+                        && sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[h_dbg_noaccess, 0, A_TIMEOUT, A_STATE]
+                        ) == ST_ACCESS_DENIED
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[h_dbg_noaccess, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                        ) == ST_ACCESS_DENIED
+                        && sysc!(SSN_NT_REMOVE_PROCESS_DEBUG, &[h_target, h_dbg_noaccess])
+                            == ST_ACCESS_DENIED
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, h_wrong_type])
+                            == ST_OBJECT_TYPE_MISMATCH
+                        && sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[h_wrong_type, 0, A_TIMEOUT, A_STATE]
+                        ) == ST_OBJECT_TYPE_MISMATCH
+                        && sysc!(SSN_NT_WAIT_FOR_DEBUG_EVENT, &[dbg_handle, 0, A_TIMEOUT, 0])
+                            == ST_ACCESS_VIOLATION
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[dbg_handle, 0, dbgk::DBG_CONTINUE as u64]
+                        ) == ST_ACCESS_VIOLATION
+                    {
+                        sc_ok |= 0x0080;
+                    }
+                    // 0x0200 — the PROCESS-handle side: a process handle lacking
+                    // PROCESS_SUSPEND_RESUME is ACCESS_DENIED, an unknown one is INVALID_HANDLE, and
+                    // detaching a process that was never attached is STATUS_PORT_NOT_SET.
+                    if sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target_noaccess, dbg_handle])
+                        == ST_ACCESS_DENIED
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[0xDEAD_BEEF, dbg_handle])
+                            == ST_INVALID_HANDLE
+                        && sysc!(SSN_NT_REMOVE_PROCESS_DEBUG, &[h_target, dbg_handle])
+                            == dbgk::STATUS_PORT_NOT_SET
+                    {
+                        sc_ok |= 0x0200;
+                    }
+
+                    // --- NtDebugActiveProcess (SSN 59): [ProcessHandle, DebugHandle] -------------
+                    let attaches_before = DBGK_ATTACHES.load(Ordering::Relaxed);
+                    let fake_before = DBGK_FAKE_MESSAGES.load(Ordering::Relaxed);
+                    let attach = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]);
+                    // 0x0004 — the attach ran IN THE HANDLER (its counter moved), installed the port
+                    // + PEB.BeingDebugged and posted the fake create message; a second one is
+                    // STATUS_PORT_ALREADY_SET.
+                    if attach == 0
+                        && DBGK_ATTACHES.load(Ordering::Relaxed) == attaches_before + 1
+                        && DBGK_FAKE_MESSAGES.load(Ordering::Relaxed) >= fake_before + 1
+                        && nt_handler.pm.process_debug_port(target) == Some(object)
+                        && nt_handler.pm.is_process_being_debugged(target)
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle])
+                            == dbgk::STATUS_PORT_ALREADY_SET
+                    {
+                        sc_ok |= 0x0004;
+                    }
+
+                    // --- NtWaitForDebugEvent (SSN 279): [DebugHandle, Alertable, *Timeout,
+                    //     *StateChange] — a REAL immediate timeout in client memory + a REAL
+                    //     DBGUI_WAIT_STATE_CHANGE copied back out to client memory.
+                    let timeout_written = img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
+                    let waits_before = DBGK_WAITS_SERVED.load(Ordering::Relaxed);
+                    let wait = sysc!(
+                        SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                        &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                    );
+                    let mut sc = [0u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE];
+                    let sc_read = img_spawn::smss_copyin(A_STATE, &mut sc);
+                    let sc_u32 =
+                        |o: usize| u32::from_le_bytes(sc[o..o + 4].try_into().unwrap_or([0; 4]));
+                    let sc_u64 =
+                        |o: usize| u64::from_le_bytes(sc[o..o + 8].try_into().unwrap_or([0; 8]));
+                    let handle_to_process = sc_u64(0x18);
+                    let handle_to_thread = sc_u64(0x20);
+                    // 0x0008 — the handler served the wait and the OUT-PARAM LANDED IN CLIENT MEMORY:
+                    // DbgCreateProcessStateChange for the right CLIENT_ID, carrying REAL process /
+                    // thread handles opened in the debugger's own table, the image base and the
+                    // initial thread's start address.
+                    if wait == 0
+                        && timeout_written
+                        && sc_read
+                        && DBGK_WAITS_SERVED.load(Ordering::Relaxed) == waits_before + 1
+                        && sc_u32(0x00) == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+                        && sc_u64(0x08) == target as u64
+                        && main.is_some_and(|main| sc_u64(0x10) == main as u64)
+                        && sc_u64(0x38) == 0x0000_0001_5000_0000
+                        && sc_u64(0x50) == 0x2100
+                        && handle_to_process != 0
+                        && handle_to_thread != 0
+                        && nt_handler
+                            .pm
+                            .lookup_handle(debugger_pid, handle_to_process as nt_process::Handle)
+                            == Some(nt_process::HandleObject::Process(target))
+                        && main.is_some_and(|main| {
+                            nt_handler
+                                .pm
+                                .lookup_handle(debugger_pid, handle_to_thread as nt_process::Handle)
+                                == Some(nt_process::HandleObject::Thread(main))
+                        })
+                    {
+                        sc_ok |= 0x0008;
+                    }
+                    let _ = nt_handler
+                        .pm
+                        .close_handle(debugger_pid, handle_to_process as nt_process::Handle);
+                    let _ = nt_handler
+                        .pm
+                        .close_handle(debugger_pid, handle_to_thread as nt_process::Handle);
+                    // 0x0010 — nothing further is reportable for this debuggee (one outstanding event
+                    // per process) and the *Timeout the handler READ from client memory is immediate
+                    // ⇒ STATUS_TIMEOUT, with no park requested.
+                    if sysc!(
+                        SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                        &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                    ) == ST_TIMEOUT
+                        && nt_handler.wait_park_event < 0
+                    {
+                        sc_ok |= 0x0010;
+                    }
+
+                    // --- NtDebugContinue (SSN 60): [DebugHandle, *AppClientId, ContinueStatus] ---
+                    let mut client_id = [0u8; 16];
+                    client_id[0..8].copy_from_slice(&(target as u64).to_le_bytes());
+                    client_id[8..16]
+                        .copy_from_slice(&(main.unwrap_or(0) as u64).to_le_bytes());
+                    let client_id_written = img_spawn::smss_copyout(A_CLIENT_ID, &client_id);
+                    let continues_before = DBGK_CONTINUES.load(Ordering::Relaxed);
+                    // 0x0020 — the handler read the CLIENT_ID out of client memory, rejected an
+                    // illegal continue status and resolved the read event; its counter moved.
+                    if client_id_written
+                        && sysc!(SSN_NT_DEBUG_CONTINUE, &[dbg_handle, A_CLIENT_ID, 0x1234])
+                            == ST_INVALID_PARAMETER
+                        && sysc!(
+                            SSN_NT_DEBUG_CONTINUE,
+                            &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                        ) == 0
+                        && DBGK_CONTINUES.load(Ordering::Relaxed) == continues_before + 1
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty())
+                    {
+                        sc_ok |= 0x0020;
+                    }
+
+                    // 0x0100 — WAIT-PARK / WAKE-SIGNAL. With the queue drained and a NULL (=
+                    // infinite) *Timeout the handler must PARK: it binds `wait_park_event` to the
+                    // debug object's EventsPresent dispatcher event — the same field the service loop
+                    // consumes to steal the caller's reply cap — and that event is NOT ready. A later
+                    // queue-side post through the same dispatch route (attaching a second debuggee)
+                    // SETS that very dispatcher event, which is exactly what the loop's wake path
+                    // consumes, and the re-issued wait then returns the new event.
+                    // HONEST SCOPE: the reply-cap steal + thread resume itself is NOT exercised —
+                    // post-loop there is no live client blocked inside the syscall.
+                    nt_handler.wait_park_event = -1;
+                    nt_handler.wait_deadline_100ns = u64::MAX;
+                    let park_status =
+                        sysc!(SSN_NT_WAIT_FOR_DEBUG_EVENT, &[dbg_handle, 0, 0, A_STATE]);
+                    let park_index = nt_handler.wait_park_event;
+                    let parked = park_status == ST_TIMEOUT
+                        && park_index >= 0
+                        && park_index as u64 + 1 == host_event
+                        && !nt_handler.dispatcher_ready(park_index as usize)
+                        && nt_handler.wait_deadline_100ns == u64::MAX;
+                    nt_handler.wait_park_event = -1;
+                    let target2 = nt_handler
+                        .pm
+                        .create_process("dbgk-syscall-b.exe", None, None);
+                    nt_handler.pm.set_image_base(target2, 0x0000_0001_6000_0000);
+                    let _ = nt_handler.pm.create_thread(target2, 0x2200, 0, false);
+                    PM_PIDS[DBGK_TEST_PI2].store(target2 as u64, Ordering::Relaxed);
+                    let h_target2 = nt_handler
+                        .pm
+                        .insert_handle(
+                            debugger_pid,
+                            nt_process::HandleObject::Process(target2),
+                            PROCESS_SUSPEND_RESUME,
+                        )
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    let woke = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target2, dbg_handle]) == 0
+                        && park_index >= 0
+                        && nt_handler.dispatcher_ready(park_index as usize);
+                    let redriven = sysc!(
+                        SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                        &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                    ) == 0;
+                    let mut sc2 = [0u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE];
+                    let redriven_payload = img_spawn::smss_copyin(A_STATE, &mut sc2)
+                        && u32::from_le_bytes(sc2[0..4].try_into().unwrap_or([0; 4]))
+                            == dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+                        && u64::from_le_bytes(sc2[8..16].try_into().unwrap_or([0; 8]))
+                            == target2 as u64;
+                    if parked && woke && redriven && redriven_payload {
+                        sc_ok |= 0x0100;
+                    }
+                    nt_handler.wait_park_event = -1;
+                    nt_handler.wait_deadline_100ns = u64::MAX;
+
+                    // --- NtRemoveProcessDebug (SSN 199): [ProcessHandle, DebugHandle] ------------
+                    let detaches_before = DBGK_DETACHES.load(Ordering::Relaxed);
+                    // 0x0040 — the detach ran IN THE HANDLER (its counter moved), cleared the port +
+                    // BeingDebugged, and a second detach is STATUS_PORT_NOT_SET.
+                    if sysc!(SSN_NT_REMOVE_PROCESS_DEBUG, &[h_target, dbg_handle]) == 0
+                        && DBGK_DETACHES.load(Ordering::Relaxed) == detaches_before + 1
+                        && nt_handler.pm.process_debug_port(target).is_none()
+                        && !nt_handler.pm.is_process_being_debugged(target)
+                        && sysc!(SSN_NT_REMOVE_PROCESS_DEBUG, &[h_target, dbg_handle])
+                            == dbgk::STATUS_PORT_NOT_SET
+                    {
+                        sc_ok |= 0x0040;
+                    }
+                    // 0x0400 — NtClose (SSN 27) on the debug handle, through the same dispatch route,
+                    // runs DbgkpCloseObject: the object is destroyed and the STILL-ATTACHED second
+                    // debuggee is detached.
+                    if nt_handler.pm.process_debug_port(target2) == Some(object)
+                        && sysc!(SSN_NT_CLOSE, &[dbg_handle]) == 0
+                        && nt_handler.pm.debug_object(object).is_none()
+                        && nt_handler.pm.process_debug_port(target2).is_none()
+                    {
+                        sc_ok |= 0x0400;
+                    }
+
+                    PM_PIDS[DBGK_TEST_PI].store(0, Ordering::Relaxed);
+                    PM_PIDS[DBGK_TEST_PI2].store(0, Ordering::Relaxed);
+                    for handle in [
+                        h_target,
+                        h_target2,
+                        h_target_noaccess,
+                        h_dbg_noaccess,
+                        h_wrong_type,
+                    ] {
+                        if handle != 0 {
+                            let _ = nt_handler
+                                .pm
+                                .close_handle(debugger_pid, handle as nt_process::Handle);
+                        }
+                    }
+                }
+            }
+
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+            nt_handler.current_tid = saved_tid;
+            nt_handler.loop_ctx = saved_ctx;
+            nt_handler.wait_park_event = -1;
+            nt_handler.wait_deadline_100ns = u64::MAX;
+            DBGK_SYSCALL_SELFTEST.store(sc_ok, Ordering::Relaxed);
+        }
+
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
         delay_timer_shutdown(&delay_queue);

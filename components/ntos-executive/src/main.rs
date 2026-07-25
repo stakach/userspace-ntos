@@ -6189,6 +6189,33 @@ static DBGK_DETACHES: AtomicU64 = AtomicU64::new(0);
 ///          detach is STATUS_PORT_NOT_SET
 ///   0x0800 after detaching, further lifecycle events are NOT reported (the plane is inert)
 static DBGK_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// Dbgk SYSCALL-DISPATCH self-test result (post-loop). Where `DBGK_SELFTEST` drives the PLANE
+/// (ProcessManager + the pure state machine) directly, this one drives the five NATIVE HANDLER ARMS
+/// through the REAL dispatcher (`nt_dispatcher.dispatch(SSN, argv, origin, handler)`) with the
+/// arguments marshalled in CLIENT memory, so the handler-level code — SSN routing, typed-handle
+/// resolution, `DbgkDebugObjectMapping` access checks, probe/copyin/copyout, the counters and the
+/// wait-park request — actually executes. Bit map:
+///   0x0001 the five services are registered at SSN 35/59/60/199/279 with argc 4/2/3/2/4
+///   0x0002 NtCreateDebugObject: object + EventsPresent dispatcher event + TYPED handle, the handle
+///          copied OUT to client memory; NULL / misaligned / bad-flags are rejected
+///   0x0004 NtDebugActiveProcess: DBGK_ATTACHES moved, port + BeingDebugged installed, fake create
+///          message posted, second attach STATUS_PORT_ALREADY_SET
+///   0x0008 NtWaitForDebugEvent: DBGK_WAITS_SERVED moved and the DBGUI_WAIT_STATE_CHANGE READ BACK
+///          FROM CLIENT MEMORY carries the state / CLIENT_ID / real handles / image base / start addr
+///   0x0010 a second wait with the immediate *Timeout the handler read from client memory is
+///          STATUS_TIMEOUT, and no park was requested
+///   0x0020 NtDebugContinue: DBGK_CONTINUES moved, the CLIENT_ID was read from client memory, an
+///          illegal continue status is STATUS_INVALID_PARAMETER
+///   0x0040 NtRemoveProcessDebug: DBGK_DETACHES moved, port cleared, second detach PORT_NOT_SET
+///   0x0080 DEBUG-handle access checks: wrong access = STATUS_ACCESS_DENIED on all four services,
+///          wrong type = STATUS_OBJECT_TYPE_MISMATCH, NULL out/in pointer = STATUS_ACCESS_VIOLATION
+///   0x0100 WAIT-PARK: a NULL (infinite) *Timeout with an empty queue binds `wait_park_event` to the
+///          object's EventsPresent dispatcher event (not ready); a queue-side post through the same
+///          dispatch route SETS it and the re-issued wait returns the new event
+///   0x0200 PROCESS-handle checks: missing PROCESS_SUSPEND_RESUME = STATUS_ACCESS_DENIED, unknown
+///          handle = STATUS_INVALID_HANDLE, detach without attach = STATUS_PORT_NOT_SET
+///   0x0400 NtClose on the debug handle runs DbgkpCloseObject (object destroyed, debuggee detached)
+static DBGK_SYSCALL_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -9844,6 +9871,41 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         dbgk & (0x0400 | 0x0800) == (0x0400 | 0x0800),
                         &mut passed,
                     );
+                    // ---- Dbgk HANDLER-LEVEL proof. The six specs above drive the PLANE
+                    // (ProcessManager + the pure dbgk state machine) directly and say nothing about
+                    // the five SSN handler arms. These three drive those arms through the REAL
+                    // dispatcher with arguments marshalled in client memory — which is why the
+                    // DBGK_* counters below are now non-zero (they read 0 before this existed).
+                    let dbgk_sys = DBGK_SYSCALL_SELFTEST.load(Ordering::Relaxed);
+                    // The full round trip create -> attach -> wait -> continue -> detach -> close,
+                    // every step issued by SSN through `NativeSyscallDispatcher::dispatch`, each
+                    // proven to have run IN THE HANDLER by its own counter, and the
+                    // DBGUI_WAIT_STATE_CHANGE read back out of client memory.
+                    check(
+                        b"exec_dbgk_syscall_dispatch_roundtrip",
+                        dbgk_sys & 0x046F == 0x046F,
+                        &mut passed,
+                    );
+                    // The security-relevant negative paths, through the same dispatch route: wrong
+                    // access, wrong handle type, NULL pointers, missing PROCESS_SUSPEND_RESUME, an
+                    // unknown process handle, an illegal continue status and the immediate timeout.
+                    check(
+                        b"exec_dbgk_syscall_access_checks",
+                        dbgk_sys & 0x0290 == 0x0290,
+                        &mut passed,
+                    );
+                    // The wait-park request binds to the debug object's EventsPresent dispatcher
+                    // event and a queue-side post through the dispatch route signals that same event
+                    // (the loop's wake input). The reply-cap resume of a live blocked client is NOT
+                    // covered — post-loop no client is blocked inside the syscall.
+                    check(
+                        b"exec_dbgk_syscall_wait_park_and_signal",
+                        dbgk_sys & 0x0100 == 0x0100,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] dbgk syscall-dispatch selftest bits=0x");
+                    print_hex(dbgk_sys as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] dbgk selftest bits=0x");
                     print_hex(dbgk as u32);
                     print_str(b" created=");

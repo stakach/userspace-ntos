@@ -3588,7 +3588,7 @@ security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binar
 covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
 `RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
 
-### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+### D — `DbgUi*` + the executive DEBUG-OBJECT plane (Dbgk) — ✅ LANDED (2026-07-25, gate **193 → 199 → 202/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
 
 The 8 `DbgUi*` exports **kernel32.dll imports** (they underpin Win32
 `DebugActiveProcess`/`WaitForDebugEvent`/`ContinueDebugEvent`/`DebugBreakProcess`) were
@@ -3639,10 +3639,22 @@ faithful port of the pure half of `ntoskrnl/dbgk/dbgkobj.c`:
 **Executive wiring (`components/ntos-executive/src/exec_handler.rs`)** — all five services registered
 in `build_nt_table` and dispatched for real: typed-handle resolution with `DbgkDebugObjectMapping`
 access checks (`debug_object_for_handle`), a REAL anonymous **notification dispatcher event** created
-per debug object to back `EventsPresent` so a blocking `NtWaitForDebugEvent` **parks and wakes through
-the same wait machinery as every other wait** (`sync_debug_object_signal` mirrors the modelled signal
+per debug object to back `EventsPresent` so a blocking `NtWaitForDebugEvent` **parks on the same
+`wait_park_event` seam as every other wait** (`sync_debug_object_signal` mirrors the modelled signal
 onto it; a zero/immediate timeout returns `STATUS_TIMEOUT` instead), `NtClose` on the handle runs
 `DbgkpCloseObject` (mark inactive → detach every debuggee → drop).
+
+> ⚠️ **Scope of the "parks and wakes" claim** (corrected 2026-07-25, batch 51). What is proven is the
+> park REQUEST and the WAKE SIGNAL: the handler binds `wait_park_event` to the object's `EventsPresent`
+> dispatcher event, and a later queue-side post through the dispatch route sets that event (spec
+> `exec_dbgk_syscall_wait_park_and_signal`). What is **not** proven and **not** yet complete:
+> (a) the reply-cap steal + thread resume of a **live** client blocked inside `NtWaitForDebugEvent`
+> (no binary in the current set issues these syscalls, so nothing ever blocks on one); and
+> (b) `sync_debug_object_signal` is called **only from the five dbgk arms**, so a debug event posted by
+> a *different* syscall (thread create/exit, process exit via `NtTerminate*`) marks the modelled
+> `EventsPresent` but does **not** signal the dispatcher event and would therefore **not** wake a
+> parked waiter. Closing (b) needs a `sync_process_debug_signal(pid)` + `wait_wake_dispatcher_set` at
+> the lifecycle-posting seams; DEFERRED — it is unreachable today because nothing parks.
 
 **3 — `DbgUi*` status (`crates/nt-ntdll-dll/src/exports.rs`):**
 
@@ -3689,13 +3701,21 @@ convert correctly, host-tested — but nothing posts them yet):*
   `NtRemoveProcessDebug` or debug-object destruction; a terminated debuggee keeps its port so the
   debugger can still retrieve the final `ExitProcess` event.
 - **`NtDebugActiveProcess` on a hosted process** — the plane is fully wired, but no binary in the
-  current set issues these syscalls, so the five handler counters read `0` on a plain boot. The proof
-  is the post-loop self-test below.
+  current set issues these syscalls, so nothing drives the five handler arms during the boot itself.
+  The proof is the post-loop **syscall-dispatch** self-test (part 2 below), which issues them through
+  the real dispatcher; its counters are the evidence the arms ran.
 
-**5 — the gate: 6 counted specs** (gate **193 → 199/99**), all driven by a post-loop END-TO-END
+**5 — the gate, part 1: 6 PLANE specs** (gate **193 → 199/99**), all driven by a post-loop END-TO-END
 self-test (`service_sec_image.rs`, `DBGK_SELFTEST` bitmask `0x1FFF`) that uses **smss's REAL EPROCESS**
-as the debugger (so the handler's own typed-handle resolution + access checks run against a real
-per-process handle table) and a throwaway debuggee:
+as the debugger and a throwaway debuggee.
+
+> ⚠️ **What these 6 do and do NOT prove** (corrected 2026-07-25, batch 51). They call
+> `nt_handler.pm.*` — the `ProcessManager` API — **directly**, so they prove the *plane*
+> (`nt_process::dbgk` + the ProcessManager lifecycle) and, for
+> `exec_dbgk_debug_object_created` only, the handler helper `debug_object_for_handle` called as a
+> function. They do **not** exercise the five SSN dispatch arms at all: on every boot of `63fef2e`
+> the handler counters read `created=0 attaches=0 fake-msgs=0 waits=0 continues=0 detaches=0`.
+> The handler arms are covered by the **3 syscall-dispatch specs in part 2** below.
 
 | spec | proves |
 |---|---|
@@ -3706,12 +3726,36 @@ per-process handle table) and a throwaway debuggee:
 | `exec_dbgk_lifecycle_event_sources` | the three WIRED sources — thread create (with its start address), thread exit (with its exit status), process exit (with its exit status) — each retrieved through the wait |
 | `exec_dbgk_detach_makes_plane_inert` | detach clears the port + flushes the queue, a second detach is `STATUS_PORT_NOT_SET`, and an attached-then-detached LIVE process reports nothing further |
 
-**Verify:** 3 consecutive clean foreground boots — **199/99, ZERO FAILs, RUNEXIT=3,
-`[microtest sentinel matched]`** each time, `dbgk selftest bits=0x1fff`; no regression (`199 = 193 + 6`,
-including `exec_msgina_logon_dialog_painted`, `exec_win32k_desktop_painted`,
-`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`). Host tests:
+**5 — the gate, part 2: the SYSCALL-HANDLER path is now gate-proven — 3 specs** (gate **199 → 202/99**,
+batch 51, 2026-07-25). A second post-loop self-test (`service_sec_image.rs`, `DBGK_SYSCALL_SELFTEST`
+bitmask `0x7FF`) drives the five services through the **REAL dispatch route** a hosted process uses —
+`nt_dispatcher.dispatch(SSN, argv, &origin, &mut nt_handler)`, the exact call the service loop makes
+for every syscall — with the arguments **marshalled in CLIENT memory** (smss's mirrored stack, the
+cross-AS window bound to pi 0 and `loop_ctx` taken, the same idiom as the post-loop pipe/io-completion
+re-drive helpers). The debugger is smss's REAL EPROCESS; each throwaway debuggee is registered in a
+FREE `PM_PIDS` slot (`MAX_PI-1`/`MAX_PI-2`, cleared afterwards) because the handler maps a resolved
+process id back to a hosted-process index — no live EPROCESS is touched.
+
+| spec | proves |
+|---|---|
+| `exec_dbgk_syscall_dispatch_roundtrip` | the five services are registered at SSN 35/59/60/199/279 with argc 4/2/3/2/4; the full create → attach → wait → continue → detach → `NtClose` round trip issued **by SSN**, each step proven to have executed IN THE HANDLER by its own counter (`DBGK_OBJECTS_CREATED`/`ATTACHES`/`FAKE_MESSAGES`/`WAITS_SERVED`/`CONTINUES`/`DETACHES`); the `*DebugHandle` copied OUT to client memory and read back; the `DBGUI_WAIT_STATE_CHANGE` **read back out of client memory** carrying state / `CLIENT_ID` / real process+thread handles / image base / initial start address; `NtClose` runs `DbgkpCloseObject` (object destroyed, still-attached debuggee detached) |
+| `exec_dbgk_syscall_access_checks` | the security-relevant negatives, all through the dispatch route: a debug handle without the required `DbgkDebugObjectMapping` access = `STATUS_ACCESS_DENIED` on all four services · a non-debug handle = `STATUS_OBJECT_TYPE_MISMATCH` · NULL `*StateChange`/`*AppClientId` = `STATUS_ACCESS_VIOLATION` · NULL/misaligned `*DebugHandle` = `STATUS_ACCESS_VIOLATION`/`STATUS_DATATYPE_MISALIGNMENT` · bad `DBGK_*` flags = `STATUS_INVALID_PARAMETER` · a process handle without `PROCESS_SUSPEND_RESUME` = `STATUS_ACCESS_DENIED` · an unknown process handle = `STATUS_INVALID_HANDLE` · detach-without-attach = `STATUS_PORT_NOT_SET` · an illegal continue status = `STATUS_INVALID_PARAMETER` · a wait whose immediate `*Timeout` the handler READ FROM CLIENT MEMORY with nothing reportable = `STATUS_TIMEOUT`, no park requested |
+| `exec_dbgk_syscall_wait_park_and_signal` | with the queue drained and a NULL (infinite) `*Timeout` the handler PARKS: it binds `wait_park_event` to the object's `EventsPresent` dispatcher event (the field the service loop consumes to steal the reply cap), leaves no deadline, and that event is NOT ready; a queue-side post through the same dispatch route (attaching a second debuggee) SETS that very event, and the re-issued wait returns the new event. **NOT covered:** the reply-cap steal + resume of a live blocked client — see the ⚠️ scope note above |
+
+**Proof-is-real check (batch 51):** pointing the attach at `pm.debug_active_process` instead of the
+dispatcher (a one-call bypass) drops `DBGK_SYSCALL_SELFTEST` `0x7FF → 0x7FB`, `attaches 2 → 1`, and
+**FAILs `exec_dbgk_syscall_dispatch_roundtrip`** (gate 201/99, 1 FAIL) — i.e. the spec cannot pass
+without the handler arm running. Restored, and re-verified green.
+
+**Verify (batch 51):** 3 consecutive clean foreground boots — **202/99, ZERO FAILs, RUNEXIT=3,
+`[microtest sentinel matched]`** each time, `dbgk selftest bits=0x1fff` +
+`dbgk syscall-dispatch selftest bits=0x7ff`, and the handler counters now read
+**`created=1 attaches=2 fake-msgs=2 waits=2 continues=1 detaches=1`** (all `0` before this batch).
+No regression (`202 = 193 + 6 + 3`, including `exec_msgina_logon_dialog_painted`,
+`exec_win32k_desktop_painted`, `exec_user_callback_dead_client_unwind`,
+`exec_user_callback_real_api0_nested_roundtrip` and the 6 `exec_dbgk_*` plane specs). Host tests:
 `nt-process` 42→64, `nt-ntdll` 668→674, `nt-syscall-abi` 15→15, `nt-syscall` 41→41,
-`nt-io-manager` 86→86 (all green). No `rust-micro/src` change.
+`nt-io-manager` 86→86 (all green, unchanged by batch 51). No `rust-micro/src` change.
 
 **Remaining ntdll gaps after this batch:** `DbgUiIssueRemoteBreakin` (needs cross-VSpace
 `RtlCreateUserThread` with a start context) · the debug-event sources listed as DEFERRED above
