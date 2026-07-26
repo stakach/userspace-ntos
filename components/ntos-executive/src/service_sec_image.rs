@@ -546,6 +546,9 @@ pub(crate) unsafe fn service_sec_image(
         p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
     }
     procs[0].pml4 = pml4;
+    // Mirror into PM_PML4S so a service arm can reach this VSpace without the loop context
+    // (the cross-VSpace NtCreateThread path).
+    PM_PML4S[0].store(pml4, Ordering::Relaxed);
     procs[0].scratch_base = scratch_base;
     procs[0].img_end = img_end;
     // Per-process demand-fill bookkeeping is kept in static storage rather than on the bounded
@@ -2958,6 +2961,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     procs[1].pml4 = cpml4;
+                    PM_PML4S[1].store(cpml4, Ordering::Relaxed);
                     CSRSS_SPAWNED.store(1, Ordering::Relaxed);
                     procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
                     procs[1].scratch_base = CSRSS_SCRATCH_BASE;
@@ -3022,6 +3026,7 @@ pub(crate) unsafe fn service_sec_image(
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[2].pml4 = wpml4;
+                    PM_PML4S[2].store(wpml4, Ordering::Relaxed);
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
                     procs[2].scratch_base = WINLOGON_SCRATCH_BASE;
                     map_demand_scratch_pts(WINLOGON_SCRATCH_BASE); // own 64 MiB scratch window PTs
@@ -3085,6 +3090,7 @@ pub(crate) unsafe fn service_sec_image(
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[3].pml4 = spml4;
+                    PM_PML4S[3].store(spml4, Ordering::Relaxed);
                     procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
                     procs[3].scratch_base = SERVICES_SCRATCH_BASE;
                     map_demand_scratch_pts(SERVICES_SCRATCH_BASE); // own 64 MiB scratch window PTs
@@ -3148,6 +3154,7 @@ pub(crate) unsafe fn service_sec_image(
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[4].pml4 = lpml4;
+                    PM_PML4S[4].store(lpml4, Ordering::Relaxed);
                     procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
                     procs[4].scratch_base = LSASS_SCRATCH_BASE;
                     map_demand_scratch_pts(LSASS_SCRATCH_BASE); // own 64 MiB scratch window PTs
@@ -3540,6 +3547,12 @@ pub(crate) unsafe fn service_sec_image(
                             fault_ep,
                         );
                     }
+                }
+                // ★ CROSS-VSPACE NtCreateThread: the handler decided the policy; build the REAL
+                // thread inside the TARGET's address space here, where the main fault endpoint the
+                // new thread must be badged onto is in scope. `None` on every boot today.
+                if let Some(request) = nt_handler.remote_thread_request.take() {
+                    spawn_requested_remote_thread(&mut nt_handler, &request, fault_ep);
                 }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
@@ -7898,6 +7911,568 @@ pub(crate) unsafe fn service_sec_image(
             DBGK_BLOCK_SELFTEST.store(bk_ok, Ordering::Relaxed);
         }
 
+        // === Dbgk REMOTE BREAK-IN SELF-TEST (POST-LOOP) — `DbgUiIssueRemoteBreakin`, end to end ===
+        //
+        // Three things had to become real together, because each is inert without the others:
+        //   (1) CROSS-VSPACE THREAD CREATION — `NtCreateThread` with a FOREIGN `ProcessHandle` that
+        //       really builds a thread (own stack + TEB + IPC buffer, caller-supplied entry AND
+        //       parameter) inside the TARGET's address space (`create_remote_thread` →
+        //       `rendezvous::spawn_slot_thread`).
+        //   (2) `PEB->BeingDebugged` WRITE-THROUGH into the target's LIVE PEB page
+        //       (`DbgkpMarkProcessPeb`) — without it `DbgUiRemoteBreakin` reads a zero byte, skips
+        //       `DbgBreakPoint()` and exits silently, so the whole feature would be a no-op.
+        //   (3) the `int3` → `DbgkForwardException` → `NtWaitForDebugEvent` → `NtDebugContinue`
+        //       chain that batches 52 and 54 already built.
+        //
+        // The DEBUGGER side goes through the REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)`
+        // with the arguments marshalled in smss's CLIENT memory — the established idiom); the
+        // TARGET side goes through `dbgk_forward_exception` / `dbgk_block_reporter`, the very
+        // entries the live fault loop calls. The MECHANISM spawn calls `rendezvous::spawn_slot_thread`
+        // — exactly what the loop's `spawn_requested_remote_thread` calls with the request the
+        // handler produced — differing only in the two transport switches a target with no ntdll
+        // mapped requires (direct entry instead of `LdrInitializeThunk`, hosted-syscalls instead of
+        // the native Call) and a private endpoint, so the post-loop test can service it itself.
+        {
+            use nt_process::dbgk;
+            const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+            const PROCESS_CREATE_THREAD: u32 = 0x0002;
+            const THREAD_ALL_ACCESS: u64 = 0x001F_03FF;
+            const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+            const BRK_TEST_PI: usize = MAX_PI - 3;
+            // Argument scratch in smss's CLIENT memory (its stack mirror), clear of the block
+            // self-test's window and of the live stack (which grows DOWN from the top).
+            const A_HANDLE: u64 = STACK_BASE + 0x300;
+            const A_CLIENT_ID: u64 = STACK_BASE + 0x308;
+            const A_TIMEOUT: u64 = STACK_BASE + 0x318;
+            const A_STATE: u64 = STACK_BASE + 0x320;
+            // A_STATE holds a whole DBGUI_WAIT_STATE_CHANGE (0xB8) → 0x320..0x3D8; keep the
+            // NtCreateThread argument block clear of it.
+            const A_THREAD_HANDLE: u64 = STACK_BASE + 0x400;
+            const A_CID_OUT: u64 = STACK_BASE + 0x408;
+            const A_CALLER_SP: u64 = STACK_BASE + 0x420; // the "client stack" NtCreateThread reads
+            const A_CONTEXT: u64 = STACK_BASE + 0x500; // the caller's CONTEXT record
+            // Executive scratch inside the SAME proven-resident 2 MiB page table the other post-loop
+            // self-tests use (SMSS_SCRATCH_BASE + 3000*0x1000, PT index 5).
+            let write_scratch = SMSS_SCRATCH_BASE + 3020 * 0x1000;
+            let mark_win = SMSS_SCRATCH_BASE + 3021 * 0x1000;
+            let peb_win = SMSS_SCRATCH_BASE + 3022 * 0x1000;
+
+            let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+            let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+            let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+            let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_pi = nt_handler.pi;
+            let saved_tid = nt_handler.current_tid;
+            let saved_ctx = nt_handler.loop_ctx.take();
+            ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            nt_handler.pi = 0;
+
+            let mut br_ok = 0u64;
+            let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+            // Every dispatch through the real route, with the out-param write queue drained exactly
+            // as the service loop drains it (`xas_write_u64` per queued write).
+            macro_rules! sysc {
+                ($ssn:expr, $args:expr) => {{
+                    nt_handler.out_writes_n = 0;
+                    let status = nt_dispatcher
+                        .dispatch($ssn as u32, $args, &dbg_origin, &mut nt_handler)
+                        .status;
+                    for k in 0..nt_handler.out_writes_n {
+                        let (ptr, val) = nt_handler.out_writes[k];
+                        let _ = nt_handler.xas_write_u64(ptr, val);
+                    }
+                    nt_handler.out_writes_n = 0;
+                    status
+                }};
+            }
+            let mut sc = [0u8; dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE];
+            macro_rules! sc_u32 {
+                ($o:expr) => {
+                    u32::from_le_bytes(sc[$o..$o + 4].try_into().unwrap())
+                };
+            }
+
+            let debugger_pid = nt_handler.pm_pid_for_pi(0).unwrap_or(0);
+            let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
+            nt_handler.current_tid = debugger_tid as u64;
+
+            let mut slots = [0u64; 64];
+            let mut nslots = 0usize;
+            // Macros (not closures) so the slot list stays freely usable alongside them.
+            macro_rules! push_slot {
+                ($cap:expr) => {{
+                    let s = $cap;
+                    slots[nslots] = s;
+                    nslots += 1;
+                    s
+                }};
+            }
+            macro_rules! make {
+                ($kind:expr, $bits:expr) => {{
+                    let s = push_slot!(alloc_slot());
+                    let made = untyped_retype_r(CAP_INIT_UNTYPED, $kind, $bits, 1, s);
+                    if made != 0 {
+                        print_str(b"[dbgk-brk] retype FAILED kind=");
+                        print_u64($kind);
+                        print_str(b" status=");
+                        print_u64(made);
+                        print_str(b"\n");
+                    }
+                    s
+                }};
+            }
+
+            // ── The throwaway TARGET's address space ────────────────────────────────────────
+            // A real hosted-process paging skeleton: the image PT (which covers the env block —
+            // PEB @0x53, DESKINFO @0x54 and PE_LOAD_BASE @0x56) plus the WORK_CLUSTER PT that holds
+            // the bounded thread-slot windows the remote thread's stack/TEB/IPC/trampoline land in.
+            let target_pml4 = make!(OBJ_X86_PML4, PAGING_BITS);
+            map_image_skeleton(target_pml4, 1);
+            // The target's PEB page: mapped in ITS VSpace first, then windowed into the executive
+            // (a frame capability carries its own mapping — map the original before any copy), and
+            // registered with that window as its permanent alias, exactly as `spawn_sec_image`
+            // registers a hosted process's PEB. That registration is what lets the general
+            // client-memory writer reach it — `dbgk_mark_process_peb` invents no new mechanism.
+            let peb_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let peb_mapped = page_map_r(peb_frame, SMSS_PEB_VA, RW_NX, target_pml4) == 0;
+            let peb_alias = push_slot!(copy_cap(peb_frame));
+            let peb_win_ok =
+                peb_mapped && page_map_r(peb_alias, peb_win, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+            if peb_win_ok {
+                csrss_frame_put_at(BRK_TEST_PI as u64, SMSS_PEB_VA, peb_frame, peb_win);
+            }
+            // The marker page (target-only) + the executive's window on the same frame.
+            let mark_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let mark_mapped =
+                page_map_r(mark_frame, selftests::DBGK_BREAKIN_MARK_VA, RW_NX, target_pml4) == 0;
+            let mark_alias = push_slot!(copy_cap(mark_frame));
+            let mark_win_ok =
+                mark_mapped && page_map_r(mark_alias, mark_win, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+            let marker = |offset: u64| -> u64 {
+                if mark_win_ok {
+                    core::ptr::read_volatile((mark_win + offset) as *const u64)
+                } else {
+                    u64::MAX
+                }
+            };
+            let peb_being_debugged = || -> u64 {
+                if peb_win_ok {
+                    core::ptr::read_volatile(
+                        (peb_win + nt_ntdll_layout::PEB_BEING_DEBUGGED_OFFSET as u64) as *const u8,
+                    ) as u64
+                } else {
+                    u64::MAX
+                }
+            };
+            // `DbgUiRemoteBreakin`'s code page: written through an executive alias, mapped RX (W^X).
+            let code = selftests::dbgk_breakin_thread_code();
+            let code_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
+            let code_written =
+                page_map_r(code_frame, write_scratch, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+            if code_written {
+                for (i, b) in code.iter().enumerate() {
+                    core::ptr::write_volatile((write_scratch + i as u64) as *mut u8, *b);
+                }
+            }
+            let code_copy = push_slot!(copy_cap(code_frame));
+            let code_mapped = code_written
+                && page_map_r(code_copy, selftests::DBGK_BREAKIN_CODE_VA, /* RX */ 2, target_pml4)
+                    == 0;
+
+            let brk_ep = make!(OBJ_ENDPOINT, 0);
+            let reply_a = make!(OBJ_REPLY, 0);
+            let reply_b = make!(OBJ_REPLY, 0);
+
+            // ── The throwaway TARGET process object ────────────────────────────────────────
+            let target = nt_handler.pm.create_process("dbgk-breakin.exe", None, None);
+            nt_handler.pm.set_image_base(target, 0x0000_0001_A000_0000);
+            let target_main = nt_handler
+                .pm
+                .create_thread(target, selftests::DBGK_BREAKIN_CODE_VA, 0, false)
+                .unwrap_or(0);
+            // The target's pre-created spare ETHREAD pool — the same reset-safe pool every hosted
+            // process gets at boot, and what a runtime thread create draws from.
+            let pool_tid = nt_handler.pm.create_thread(target, 0, 0, false).unwrap_or(0);
+            PM_PIDS[BRK_TEST_PI].store(target as u64, Ordering::Relaxed);
+            PM_PML4S[BRK_TEST_PI].store(target_pml4, Ordering::Relaxed);
+            PM_POOL_TID[BRK_TEST_PI][0].store(pool_tid as u64, Ordering::Relaxed);
+            PM_POOL_USED[BRK_TEST_PI].store(0, Ordering::Relaxed);
+            // This process HAS its initial thread, so a foreign-handle create is a genuine
+            // ADDITIONAL thread — the real cross-VSpace path (exactly the live rule).
+            PM_INITIAL_THREAD_DONE.fetch_or(1u64 << BRK_TEST_PI, Ordering::Relaxed);
+
+            let h_target = nt_handler
+                .pm
+                .insert_handle(
+                    debugger_pid,
+                    nt_process::HandleObject::Process(target),
+                    PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD,
+                )
+                .map(u64::from)
+                .unwrap_or(0);
+            // The SAME process, through a handle that lacks PROCESS_CREATE_THREAD.
+            let h_target_no_create = nt_handler
+                .pm
+                .insert_handle(
+                    debugger_pid,
+                    nt_process::HandleObject::Process(target),
+                    PROCESS_SUSPEND_RESUME,
+                )
+                .map(u64::from)
+                .unwrap_or(0);
+
+            let args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
+            let setup_ok = peb_win_ok
+                && mark_win_ok
+                && code_mapped
+                && target_main != 0
+                && pool_tid != 0
+                && h_target != 0
+                && h_target_no_create != 0
+                && args_ready
+                && debugger_pid != 0;
+
+            if setup_ok {
+                // ── 0x0001 — a real DEBUG_OBJECT + attach BY SSN, fake create messages drained ──
+                let created = sysc!(
+                    SSN_NT_CREATE_DEBUG_OBJECT,
+                    &[
+                        A_HANDLE,
+                        dbgk::DEBUG_OBJECT_ALL_ACCESS as u64,
+                        0,
+                        dbgk::DBGK_KILL_PROCESS_ON_EXIT as u64,
+                    ]
+                );
+                let dbg_handle = smss_stack_read(A_HANDLE);
+                let object = match nt_handler
+                    .pm
+                    .lookup_handle(debugger_pid, dbg_handle as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::DebugObject(object)) => Some(object),
+                    _ => None,
+                };
+                if let (0, Some(object)) = (created, object) {
+                    let peb_before = peb_being_debugged();
+                    let marks_before = DBGK_PEB_MARKS.load(Ordering::Relaxed);
+                    let attached = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
+                        && nt_handler.pm.process_debug_port(target) == Some(object);
+                    // `DbgkpPostFakeProcessCreateMessages` posts one message per live thread.
+                    let mut drained = 0u64;
+                    while attached && drained < 8 {
+                        if sysc!(
+                            SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                            &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                        ) != 0
+                            || !img_spawn::smss_copyin(A_STATE, &mut sc)
+                        {
+                            break;
+                        }
+                        let mut cid = [0u8; 16];
+                        cid[0..8].copy_from_slice(&sc[0x08..0x10]);
+                        cid[8..16].copy_from_slice(&sc[0x10..0x18]);
+                        if !img_spawn::smss_copyout(A_CLIENT_ID, &cid)
+                            || sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            ) != 0
+                        {
+                            break;
+                        }
+                        drained += 1;
+                    }
+                    if attached
+                        && drained == 2
+                        && nt_handler
+                            .pm
+                            .debug_object(object)
+                            .is_some_and(|o| o.is_empty())
+                    {
+                        br_ok |= 0x0001;
+                    }
+                    // ── 0x0002 — ★ `PEB->BeingDebugged` WRITTEN THROUGH, read back out of the
+                    // TARGET's own PEB page (the very frame its VSpace maps at SMSS_PEB_VA).
+                    if peb_before == 0
+                        && peb_being_debugged() == 1
+                        && DBGK_PEB_MARKS.load(Ordering::Relaxed) == marks_before + 1
+                        && nt_handler.pm.is_process_being_debugged(target)
+                    {
+                        br_ok |= 0x0002;
+                    }
+
+                    // ── 0x0008 — ★ THE CROSS-VSPACE CREATE, BY SSN. Marshal NtCreateThread's
+                    // stack-resident arguments (ClientId / ThreadContext / InitialTeb /
+                    // CreateSuspended) in CLIENT memory and stage the caller stack pointer the
+                    // handler reads them through, then issue SSN 55 with the TARGET's handle.
+                    let ctx_ok = img_spawn::smss_copyout(
+                        A_CONTEXT + nt_thread_start::CONTEXT_RIP_OFFSET,
+                        &selftests::DBGK_BREAKIN_CODE_VA.to_le_bytes(),
+                    ) && img_spawn::smss_copyout(
+                        A_CONTEXT + nt_thread_start::CONTEXT_RCX_OFFSET,
+                        &selftests::DBGK_BREAKIN_PARAM.to_le_bytes(),
+                    ) && img_spawn::smss_copyout(A_CALLER_SP + 0x28, &A_CID_OUT.to_le_bytes())
+                        && img_spawn::smss_copyout(A_CALLER_SP + 0x30, &A_CONTEXT.to_le_bytes())
+                        && img_spawn::smss_copyout(A_CALLER_SP + 0x38, &0u64.to_le_bytes())
+                        && img_spawn::smss_copyout(A_CALLER_SP + 0x40, &0u64.to_le_bytes())
+                        && img_spawn::smss_copyout(A_THREAD_HANDLE, &0u64.to_le_bytes())
+                        && img_spawn::smss_copyout(A_CID_OUT, &[0u8; 16]);
+                    set_recv_mr(16, A_CALLER_SP);
+                    // ★ The security negative FIRST (it must change nothing): the same target
+                    // through a handle without PROCESS_CREATE_THREAD.
+                    // NtCreateThread's full 8-argument shape (the dispatcher enforces argc):
+                    // ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle, ClientId,
+                    // ThreadContext, InitialTeb, CreateSuspended — the last four also readable
+                    // through the caller's stack, which is where the handler takes them from.
+                    let denied = sysc!(
+                        SSN_NT_CREATE_THREAD,
+                        &[
+                            A_THREAD_HANDLE,
+                            THREAD_ALL_ACCESS,
+                            0,
+                            h_target_no_create,
+                            A_CID_OUT,
+                            A_CONTEXT,
+                            0,
+                            0,
+                        ]
+                    );
+                    let created_before = PM_REMOTE_THREADS_CREATED.load(Ordering::Relaxed);
+                    set_recv_mr(16, A_CALLER_SP);
+                    let create_status = sysc!(
+                        SSN_NT_CREATE_THREAD,
+                        &[
+                            A_THREAD_HANDLE,
+                            THREAD_ALL_ACCESS,
+                            0,
+                            h_target,
+                            A_CID_OUT,
+                            A_CONTEXT,
+                            0,
+                            0,
+                        ]
+                    );
+                    let thread_handle = smss_stack_read(A_THREAD_HANDLE);
+                    let cid_proc = smss_stack_read(A_CID_OUT);
+                    let breakin_tid = smss_stack_read(A_CID_OUT + 8);
+                    let request = nt_handler.remote_thread_request.take();
+                    print_str(b"[dbgk-brk] denied=0x");
+                    print_hex(denied);
+                    print_str(b" create=0x");
+                    print_hex(create_status);
+                    print_str(b" ctx_ok=");
+                    print_u64(ctx_ok as u64);
+                    print_str(b" h=0x");
+                    print_hex(thread_handle as u32);
+                    print_str(b" tid=");
+                    print_u64(breakin_tid);
+                    print_str(b" req=");
+                    print_u64(request.is_some() as u64);
+                    print_str(b"\n");
+                    let handle_ok = matches!(
+                        nt_handler
+                            .pm
+                            .lookup_handle(debugger_pid, thread_handle as nt_process::Handle),
+                        Some(nt_process::HandleObject::Thread(t)) if t as u64 == breakin_tid
+                    );
+                    if ctx_ok
+                        && denied == STATUS_ACCESS_DENIED
+                        && create_status == 0
+                        && PM_REMOTE_THREADS_CREATED.load(Ordering::Relaxed) == created_before + 1
+                        && thread_handle != 0
+                        && handle_ok
+                        && cid_proc == target as u64
+                        && breakin_tid != 0
+                        && breakin_tid != target_main as u64
+                        && request.is_some_and(|r| {
+                            r.target_pi == BRK_TEST_PI
+                                && r.pml4 == target_pml4
+                                && r.start.rip == selftests::DBGK_BREAKIN_CODE_VA
+                                && r.start.rcx == selftests::DBGK_BREAKIN_PARAM
+                                && r.cid_thread == breakin_tid
+                        })
+                    {
+                        br_ok |= 0x0008;
+                    }
+
+                    // ── 0x0010 — ★ THE REMOTE THREAD REALLY RUNS IN THE TARGET'S VSPACE.
+                    // Build the mechanism through the same entry the loop uses; the thread's own
+                    // stack/TEB/IPC buffer are mapped in the TARGET's pml4, and the marker it writes
+                    // lands in a page that exists ONLY there.
+                    let mut tcb = 0u64;
+                    if let Some(request) = request {
+                        tcb = rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
+                            target_pi: request.target_pi,
+                            slot: request.slot,
+                            pml4: request.pml4,
+                            start: request.start,
+                            cid_proc: request.cid_proc,
+                            cid_thread: request.cid_thread,
+                            fault_ep: brk_ep,
+                            // The throwaway target has no ntdll mapped, so enter the start routine
+                            // directly and keep the hosted-syscalls trap (its exit `syscall` is
+                            // delivered here as an UnknownSyscall fault).
+                            use_loader: false,
+                            native: false,
+                            resume: request.resume,
+                        });
+                        if tcb != 0 {
+                            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if tcb != 0 {
+                        // Its first fault: the `int3` if it read BeingDebugged = 1, else its exit
+                        // syscall. Either way it must have RUN — the marker proves the thread
+                        // executed in the target's address space with a correct TEB/PEB.
+                        let (_fb, f1_mi, f1_m0, _f1m1, _f1m2, _f1m3) =
+                            recv_full_r12(brk_ep, reply_a);
+                        if marker(0x00) == 0x11
+                            && marker(0x08) == SMSS_PEB_VA
+                            && marker(0x18) == selftests::DBGK_BREAKIN_PARAM
+                        {
+                            br_ok |= 0x0010;
+                        }
+                        // ── 0x0020 — ★ IT HIT THE BREAKPOINT, and the debugger sees it.
+                        // The byte it read is the write-through; the `int3` (DebugException,
+                        // label 4) is forwarded through the live fault-loop entry and its reporter
+                        // parked, then retrieved BY SSN as DbgBreakpointStateChange carrying the
+                        // BREAK-IN THREAD's CLIENT_ID.
+                        let is_breakpoint = (f1_mi >> 12) == 4 && marker(0x10) == 1;
+                        let forwarded = is_breakpoint
+                            && nt_handler.dbgk_forward_exception(
+                                BRK_TEST_PI,
+                                breakin_tid,
+                                dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f1_m0),
+                                true,
+                            );
+                        let parked = forwarded
+                            && nt_handler.dbgk_block_reporter(
+                                BRK_TEST_PI,
+                                breakin_tid,
+                                0,
+                                dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                                reply_a,
+                                f1_m0,
+                                0,
+                                0,
+                                0,
+                            );
+                        let waited = parked
+                            && sysc!(
+                                SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                            ) == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc);
+                        let reported = waited
+                            && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE
+                            && u64::from_le_bytes(sc[0x08..0x10].try_into().unwrap())
+                                == target as u64
+                            && u64::from_le_bytes(sc[0x10..0x18].try_into().unwrap())
+                                == breakin_tid
+                            && sc_u32!(0x18) == dbgk::STATUS_BREAKPOINT;
+                        if reported {
+                            br_ok |= 0x0020;
+                        }
+                        // ── 0x0040 — ★ CONTINUE RESUMES IT PAST THE int3 AND IT EXITS CLEANLY.
+                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let mut cid = [0u8; 16];
+                        cid[0..8].copy_from_slice(&(target as u64).to_le_bytes());
+                        cid[8..16].copy_from_slice(&breakin_tid.to_le_bytes());
+                        let continued = reported
+                            && img_spawn::smss_copyout(A_CLIENT_ID, &cid)
+                            && sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            ) == 0
+                            && DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before + 1;
+                        if continued {
+                            // Its exit path: marker 0x12 (it really resumed past the breakpoint)
+                            // then the `RtlExitUserThread` stand-in syscall arrives here.
+                            let (_eb, e_mi, e_m0, _em1, _em2, _em3) =
+                                recv_full_r12(brk_ep, reply_b);
+                            if (e_mi >> 12) == 2
+                                && e_m0 == selftests::DBGK_BREAKIN_EXIT_SSN
+                                && marker(0x00) == 0x12
+                            {
+                                br_ok |= 0x0040;
+                            }
+                        } else if parked {
+                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                        }
+                    }
+
+                    // ── 0x0004 — ★ DETACH CLEARS `PEB->BeingDebugged` in the LIVE PEB page.
+                    let marks_before_detach = DBGK_PEB_MARKS.load(Ordering::Relaxed);
+                    let detached =
+                        sysc!(SSN_NT_REMOVE_PROCESS_DEBUG, &[h_target, dbg_handle]) == 0;
+                    if detached
+                        && peb_being_debugged() == 0
+                        && DBGK_PEB_MARKS.load(Ordering::Relaxed) == marks_before_detach + 1
+                        && !nt_handler.pm.is_process_being_debugged(target)
+                    {
+                        br_ok |= 0x0004;
+                    }
+                    let _ = sysc!(SSN_NT_CLOSE, &[dbg_handle, 0, 0, 0]);
+                    // Reclaim: suspend the remote thread, then drop every throwaway cap.
+                    let brk_tcb = TP_WORKER_TCB[BRK_TEST_PI][0].load(Ordering::Relaxed);
+                    if brk_tcb > 1 {
+                        let _ = tcb_suspend_r(brk_tcb);
+                    }
+                }
+            }
+            print_str(b"[ntos-exec] dbgk remote-breakin selftest bits=0x");
+            print_hex(br_ok as u32);
+            print_str(b" peb-marks=");
+            print_u64(DBGK_PEB_MARKS.load(Ordering::Relaxed));
+            print_str(b" remote-created=");
+            print_u64(PM_REMOTE_THREADS_CREATED.load(Ordering::Relaxed));
+            print_str(b" remote-spawned=");
+            print_u64(PM_REMOTE_THREADS_SPAWNED.load(Ordering::Relaxed));
+            print_str(b" marker=0x");
+            print_hex(if mark_win_ok {
+                core::ptr::read_volatile(mark_win as *const u64) as u32
+            } else {
+                0xFFFF_FFFF
+            });
+            print_str(b"\n");
+            for i in (0..nslots).rev() {
+                let s = slots[i];
+                if s != 0 && s != target_pml4 {
+                    let _ = cnode_delete_r(s);
+                }
+            }
+            PM_PIDS[BRK_TEST_PI].store(0, Ordering::Relaxed);
+            PM_PML4S[BRK_TEST_PI].store(0, Ordering::Relaxed);
+            PM_POOL_TID[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
+            TP_WORKER_TID[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
+            TP_WORKER_TCB[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
+            PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << BRK_TEST_PI), Ordering::Relaxed);
+            nt_handler.remote_thread_request = None;
+
+            ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+            ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+            ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+            ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            nt_handler.pi = saved_pi;
+            nt_handler.current_tid = saved_tid;
+            nt_handler.loop_ctx = saved_ctx;
+            nt_handler.wait_park_event = -1;
+            nt_handler.wait_deadline_100ns = u64::MAX;
+            DBGK_BREAKIN_SELFTEST.store(br_ok, Ordering::Relaxed);
+        }
+
         // Path 1b COUNTED SPEC — process-local dense handle VALUES. Two DISTINCT live EPROCESSes each
         // allocate their first handle and BOTH get the SAME dense value (0x4), yet it refers to a
         // DIFFERENT object in each: proof of per-process handle namespaces (a global value scheme
@@ -8166,6 +8741,52 @@ unsafe fn spawn_requested_tp_worker(
     } else {
         b" resumed into generic multiplex\n"
     });
+}
+
+/// ★ Build the seL4 thread for a pending cross-VSpace `NtCreateThread`: the MECHANISM half of
+/// `create_remote_thread`. The new thread's faults/syscalls arrive on the MAIN service endpoint
+/// badged with its `(target pi, slot)` identity, so the loop's existing N-threads multiplex
+/// (`tp_worker_identity_from_badge` → `mirror_ctx_for`) sub-selects it exactly like any other extra
+/// thread of that process — a remote thread is not a special kind of thread once it exists.
+///
+/// A target index outside the live range has no place in that multiplex; such a request only comes
+/// from a post-loop self-test, which supplies its own endpoint and services the thread itself.
+pub(crate) unsafe fn spawn_requested_remote_thread(
+    nt_handler: &mut ExecNtHandler,
+    request: &RemoteThreadRequest,
+    fault_ep: u64,
+) -> u64 {
+    if request.target_pi >= TP_WORKER_PI_COUNT {
+        return 0;
+    }
+    let badged = mint_badged(fault_ep, tp_worker_badge(request.target_pi, request.slot));
+    let tcb = rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
+        target_pi: request.target_pi,
+        slot: request.slot,
+        pml4: request.pml4,
+        start: request.start,
+        cid_proc: request.cid_proc,
+        cid_thread: request.cid_thread,
+        fault_ep: badged,
+        use_loader: true,
+        native: true,
+        resume: request.resume,
+    });
+    TP_WORKER_TCB[request.target_pi][request.slot].store(tcb, Ordering::Relaxed);
+    if tcb != 0 {
+        PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = nt_handler;
+    print_str(b"[remote-thread] spawned target_pi=");
+    print_u64(request.target_pi as u64);
+    print_str(b" slot=");
+    print_u64(request.slot as u64);
+    print_str(b" tid=");
+    print_u64(request.cid_thread);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b"\n");
+    tcb
 }
 
 /// The active memory context for the thread identified by `badge`: stack base/size/mirror, process

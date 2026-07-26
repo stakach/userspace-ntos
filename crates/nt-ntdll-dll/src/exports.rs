@@ -28329,11 +28329,9 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
 /// `dbgui.c`: attach this thread's debug object to `process`, then break the target in. When the
 /// break-in fails, debugging is cancelled again (so a failed attach leaves no debug port behind).
 ///
-/// **`DbgUiIssueRemoteBreakin` is still unimplemented here** (a remote thread with a start context
-/// in a foreign VSpace), so this wrapper would always unwind its own successful attach. Native
-/// ntdll's own contract is "attach, then break in"; we keep the attach and report the break-in's
-/// status, cancelling exactly as `dbgui.c` does — a caller that only wants the attach uses
-/// `NtDebugActiveProcess` directly.
+/// `DbgUiIssueRemoteBreakin` is REAL as of the cross-VSpace remote-thread batch, so this is now the
+/// complete `dbgui.c` flow: a successful attach is followed by a real break-in thread in the target,
+/// and only a genuinely failing break-in cancels the attach.
 #[export_name = "DbgUiDebugActiveProcess"]
 pub unsafe extern "system" fn dbg_ui_debug_active_process(process: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
@@ -28383,13 +28381,50 @@ pub unsafe extern "system" fn dbg_ui_stop_debugging(process: *mut c_void) -> NtS
     }
 }
 
-/// `DbgUiIssueRemoteBreakin(HANDLE) -> NTSTATUS`.
+/// `DbgUiIssueRemoteBreakin(HANDLE) -> NTSTATUS` — `dbgui.c:303`.
 ///
-/// The foreign-process thread path does not yet honor the requested start context, so claiming
-/// success would create the wrong thread rather than execute `DbgUiRemoteBreakin`.
+/// Creates the break-in thread inside the DEBUGGEE at [`dbg_ui_remote_breakin`]:
+/// `RtlCreateUserThread(Process, NULL, FALSE, 0, 0, PAGE_SIZE, DbgUiRemoteBreakin, NULL,
+/// &hThread, &ClientId)`, then closes the handle on success — verbatim ReactOS.
+///
+/// ★ The start address is taken from OUR OWN ntdll mapping and is valid in the *target* as well:
+/// every hosted process maps the one `ntdll.dll` image at the same base, exactly as native ntdll
+/// relies on (`(PVOID)DbgUiRemoteBreakin` is passed unrelocated there too). The executive's
+/// `NtCreateThread` service is what makes the foreign-`ProcessHandle` case real: it builds the
+/// thread's own stack + TEB in the TARGET's address space and starts it at that RIP.
 #[export_name = "DbgUiIssueRemoteBreakin"]
-pub unsafe extern "system" fn dbg_ui_issue_remote_breakin(_process: *mut c_void) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+pub unsafe extern "system" fn dbg_ui_issue_remote_breakin(process: *mut c_void) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `thread_handle`/`client_id` are stack locals; `RtlCreateUserThread` validates the rest.
+    unsafe {
+        const PAGE_SIZE: usize = 0x1000;
+        let mut thread_handle: *mut c_void = core::ptr::null_mut();
+        let mut client_id = [0u64; 2];
+        let status = rtl_create_user_thread(
+            process,
+            core::ptr::null_mut(),
+            0, // CreateSuspended = FALSE
+            0, // StackZeroBits
+            0, // StackReserve — RtlCreateUserStack's default
+            PAGE_SIZE,
+            dbg_ui_remote_breakin as *mut c_void,
+            core::ptr::null_mut(), // Parameter
+            core::ptr::addr_of_mut!(thread_handle),
+            client_id.as_mut_ptr().cast(),
+        );
+        if nt_success(status) {
+            let _ = core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(*mut c_void) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_close)(thread_handle);
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = process;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `DbgUiWaitStateChange(PDBGUI_WAIT_STATE_CHANGE, PLARGE_INTEGER) -> NTSTATUS` —
@@ -28427,10 +28462,20 @@ pub unsafe extern "system" fn dbg_ui_wait_state_change(
 #[export_name = "DbgUiRemoteBreakin"]
 pub unsafe extern "system" fn dbg_ui_remote_breakin() {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: PEB is mapped at spawn; BeingDebugged is the byte at PEB+2.
+    // SAFETY: PEB is mapped at spawn; BeingDebugged is the byte at PEB+2 — the byte the kernel's
+    // `DbgkpMarkProcessPeb` writes through at attach, read here through the shared layout constant.
     unsafe {
         let peb = current_peb();
-        if peb != 0 && core::ptr::read_volatile((peb + 2) as *const u8) != 0 {
+        let being_debugged = if peb == 0 {
+            0
+        } else {
+            core::ptr::read_volatile(
+                (peb + nt_ntdll::dbg::PEB_BEING_DEBUGGED_OFFSET as u64) as *const u8,
+            )
+        };
+        if nt_ntdll::dbg::remote_breakin_action(being_debugged)
+            == nt_ntdll::dbg::RemoteBreakinAction::BreakThenExit
+        {
             dbg_break_point();
         }
         rtl_exit_user_thread(STATUS_SUCCESS);

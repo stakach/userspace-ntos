@@ -337,6 +337,45 @@ pub mod service {
     pub const UNLOAD_SYMBOLS: u32 = 4;
 }
 
+// --- The remote break-in contract (`DbgUiIssueRemoteBreakin` / `DbgUiRemoteBreakin`) -----------
+
+/// What `DbgUiRemoteBreakin` does once it is running inside the debuggee (`dbgui.c:342`):
+///
+/// ```c
+/// VOID NTAPI DbgUiRemoteBreakin(VOID) {
+///     if (NtCurrentPeb()->BeingDebugged) DbgBreakPoint();
+///     RtlExitUserThread(STATUS_SUCCESS);
+/// }
+/// ```
+///
+/// The whole break-in hinges on one byte the KERNEL side has to have written into the debuggee's
+/// live PEB (`DbgkpMarkProcessPeb` at attach). Without it the thread is created, runs, takes the
+/// `else` branch and exits silently — the feature is INERT rather than broken, which is exactly the
+/// failure mode this enum exists to make explicit and testable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RemoteBreakinAction {
+    /// `PEB->BeingDebugged` is set: raise `DbgBreakPoint()` (`int3`), THEN exit.
+    BreakThenExit,
+    /// Not being debugged: exit without disturbing the process.
+    ExitOnly,
+}
+
+/// The offset of `PEB.BeingDebugged` — re-exported from the byte-exact PEB layout so the read here
+/// and the kernel-side write cannot drift apart.
+pub const PEB_BEING_DEBUGGED_OFFSET: usize = nt_ntdll_layout::PEB_BEING_DEBUGGED_OFFSET;
+
+/// `DbgUiRemoteBreakin`'s decision, given the `BeingDebugged` byte read out of the process's PEB.
+/// Any non-zero value counts (NT stores a `BOOLEAN`, and a debugger-written PEB may hold any
+/// non-zero truth value).
+#[inline]
+pub const fn remote_breakin_action(being_debugged: u8) -> RemoteBreakinAction {
+    if being_debugged != 0 {
+        RemoteBreakinAction::BreakThenExit
+    } else {
+        RemoteBreakinAction::ExitOnly
+    }
+}
+
 // --- Target-only breakpoint + emit primitives -------------------------------------------------
 
 /// `DbgBreakPoint` / `DbgUserBreakPoint` — a debugger breakpoint (`int3`).
@@ -765,5 +804,27 @@ mod tests {
     fn breakpoint_is_callable_on_host() {
         // On the host this is a no-op; the assertion is that it links + returns.
         breakpoint();
+    }
+
+    #[test]
+    fn remote_breakin_breaks_only_when_the_peb_says_so() {
+        assert_eq!(remote_breakin_action(0), RemoteBreakinAction::ExitOnly);
+        assert_eq!(remote_breakin_action(1), RemoteBreakinAction::BreakThenExit);
+        // NT stores a BOOLEAN; any non-zero truth value a debugger writes must break in.
+        assert_eq!(remote_breakin_action(0xff), RemoteBreakinAction::BreakThenExit);
+    }
+
+    #[test]
+    fn being_debugged_lives_at_peb_plus_two() {
+        // The kernel side writes this exact byte (`DbgkpMarkProcessPeb`); a drift here would make
+        // the break-in silently inert, so pin it against the byte-exact PEB layout.
+        assert_eq!(PEB_BEING_DEBUGGED_OFFSET, 2);
+        let peb = core::mem::MaybeUninit::<nt_ntdll_layout::Peb>::uninit();
+        let base = peb.as_ptr() as usize;
+        let flags = unsafe { core::ptr::addr_of!((*peb.as_ptr()).flags_bytes) } as usize;
+        assert_eq!(flags - base, 0);
+        assert!(PEB_BEING_DEBUGGED_OFFSET < core::mem::size_of_val(&unsafe {
+            core::ptr::read(core::ptr::addr_of!((*peb.as_ptr()).flags_bytes))
+        }));
     }
 }

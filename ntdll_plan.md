@@ -3684,11 +3684,11 @@ debugger) and disproven-when-removed by the bypass experiment below.
 | `DbgUiWaitStateChange` | **REAL** — `NtWaitForDebugEvent(DbgSsReserved[1], TRUE, TimeOut, StateChange)` |
 | `DbgUiContinue` | **REAL** — `NtDebugContinue(DbgSsReserved[1], ClientId, ContinueStatus)` |
 | `DbgUiStopDebugging` | **REAL** — `NtRemoveProcessDebug(Process, DbgSsReserved[1])` |
-| `DbgUiDebugActiveProcess` | **REAL attach** — `NtDebugActiveProcess`, then `dbgui.c`'s break-in + cancel-on-failure. Because `DbgUiIssueRemoteBreakin` is still unimplemented it reports the break-in's status (and cancels the attach), exactly as `dbgui.c` does |
+| `DbgUiDebugActiveProcess` | **REAL attach + REAL break-in** (completed in §F) — `NtDebugActiveProcess`, then `dbgui.c`'s break-in, cancelling the attach only if the break-in genuinely fails |
 | `DbgUiConvertStateChangeStructure` | **REAL** (already was) — pure conversion in `nt_ntdll::dbg::convert_state_change`, host-tested |
 | `DbgUiGetThreadDebugObject` / `…Set…` | **REAL** (already were) — `TEB->DbgSsReserved[1]` |
 | `DbgUiRemoteBreakin` | **REAL** (already was) — `PEB->BeingDebugged` ⇒ `int3`, then `RtlExitUserThread` |
-| `DbgUiIssueRemoteBreakin` | **STILL STUBBED** — needs `RtlCreateUserThread` in a *foreign* VSpace honouring a start context (`DbgUiRemoteBreakin`); the cross-VSpace remote-thread-with-context path does not exist yet, and faking success would create the wrong thread |
+| `DbgUiIssueRemoteBreakin` | **REAL** (§F, 2026-07-26) — verbatim `dbgui.c:303`: `RtlCreateUserThread(Process, NULL, FALSE, 0, 0, PAGE_SIZE, DbgUiRemoteBreakin, NULL, &hThread, &ClientId)` + `NtClose` on success. Made possible by the REAL cross-VSpace `NtCreateThread` (a thread built in the TARGET's address space at a caller-supplied entry + parameter) and the `PEB->BeingDebugged` write-through. **This was the last genuinely unconditional stub in our ntdll — there are now ZERO.** |
 
 **4 — DEBUG-EVENT SOURCES: what is WIRED vs DEFERRED.** ⚠️ This is **not** a complete debugger.
 
@@ -3773,9 +3773,11 @@ debugger) and disproven-when-removed by the bypass experiment below.
   boot. Also still deferred: the LOAD-side `DebugInfo`/name for views the executive maps outside the
   `NtMapViewOfSection` SEC_IMAGE branch, and `Thread->HideFromDebugger` (we have no such flag, so
   every thread reports).
-- **`PEB.BeingDebugged` write-through to a live hosted process** — modelled on `NtProcess`
-  (`DbgkpMarkProcessPeb`'s state) but not written into a hosted PEB page; nothing attaches to a live
-  hosted process yet.
+- ~~**`PEB.BeingDebugged` write-through to a live hosted process**~~ — **LANDED in §F**
+  (`ExecNtHandler::dbgk_mark_process_peb`): attach writes the byte into the target's LIVE PEB page
+  and detach / debug-object destruction clears it, through the same general cross-process
+  client-memory path `NtWriteVirtualMemory` uses. Proven by reading it back out of the target's own
+  PEB page — and by the debuggee itself, which reads it through its own `gs:[0x60]`.
 - **`DbgkClearProcessDebugObject` on process-object *deletion*** — we clear on explicit
   `NtRemoveProcessDebug` or debug-object destruction; a terminated debuggee keeps its port so the
   debugger can still retrieve the final `ExitProcess` event.
@@ -4050,7 +4052,7 @@ spec*, never about a missing name.
 | bucket | count | what it is |
 |---|---|---|
 | the `#[cfg(not(target_arch = "x86_64"))]` **host-build fallback arm** of an export that is REAL on target (its `#[cfg(target_arch = "x86_64")]` arm calls `on_target::*` / a real body) | **77 functions** | not a stub at all — the DLL only ever builds for x86_64 |
-| genuinely unconditional `STATUS_NOT_IMPLEMENTED` | **1** — `DbgUiIssueRemoteBreakin` | left alone on purpose (see §D) |
+| genuinely unconditional `STATUS_NOT_IMPLEMENTED` | **0** (was 1 — `DbgUiIssueRemoteBreakin`, made REAL in §F) | — |
 | the rest of the 97 tokens | — | error arms *inside* real bodies (unsupported info class, bad revision, …) |
 
 §A's stub list is therefore **out of date**: `RtlFindMessage` (real `.rsrc` message-table walker),
@@ -4164,15 +4166,15 @@ These are the only real fidelity gaps E.0's measurement found in the imported su
 #### E.5 — what is STILL stubbed, and WHY (the honest remainder)
 
 **`STATUS_NOT_IMPLEMENTED` count: 97 → 97 raw tokens in `exports.rs`, of which genuinely
-unconditional stubs remain 1** (`DbgUiIssueRemoteBreakin`). The E.3 corrections *added* two honest
+unconditional stubs remain 1** (`DbgUiIssueRemoteBreakin`) — **and 0 as of §F, which made it real**. The E.3 corrections *added* two honest
 `STATUS_NOT_IMPLEMENTED` returns (`RtlWow64EnableFsRedirection`/`Ex`) and the new exports added none;
 the raw token count is dominated by the 77 host-build fallback arms and is not a useful metric —
 E.0's classification table is.
 
 Deliberately left as-is, with the reason:
 
-* `DbgUiIssueRemoteBreakin` — needs a cross-VSpace `RtlCreateUserThread` with a start context in the
-  *target* process. We have no such machinery; a success here would be a lie (§D).
+* ~~`DbgUiIssueRemoteBreakin`~~ — **DONE in §F**: the cross-VSpace `RtlCreateUserThread` with a start
+  context in the *target* process now exists, so the success is real (gate-proven end to end).
 * `RtlCheckForOrphanedCriticalSections`, `RtlCreateTagHeap` (⇒ 0), `RtlQueryTagHeap` (⇒ NULL),
   `LdrAlternateResourcesEnabled` (⇒ FALSE), `LdrFlushAlternateResourceModules` (⇒ FALSE),
   `LdrUnloadAlternateResourceModule(Ex)` (⇒ TRUE), `RtlCompactHeap` (⇒ 0) — **these already match
@@ -4200,6 +4202,183 @@ an `Nt*` twin (`ZwContinue`, `ZwRaiseException`, `ZwCreateDebugObject`, `ZwDebug
 purely additive — **paired with** the executive-side services for the handful of `Nt*` names that
 would otherwise fault (`NtContinue`, `NtRaiseException`, `NtGetCurrentProcessorNumber`). Do NOT add a
 trap stub whose SSN the executive cannot service.
+
+
+### F — `DbgUiIssueRemoteBreakin` + cross-VSpace thread creation + `PEB->BeingDebugged` write-through — ✅ LANDED (2026-07-26, gate **214/99**, ZERO FAILs, RUNEXIT=3, sentinel, 3 consecutive clean boots)
+
+**ZERO unconditional stubs remain in our ntdll.** `DbgUiIssueRemoteBreakin` was the last one, and it
+was left alone on purpose: it needs `RtlCreateUserThread` against a **foreign** `ProcessHandle`, and
+faking success would have created the wrong thread in the wrong place. Closing it honestly meant
+closing three things at once, because each is inert without the others:
+
+| # | what | why it is load-bearing |
+|---|---|---|
+| 1 | **cross-VSpace thread creation with a start context** | `RtlCreateUserThread(Process, …, DbgUiRemoteBreakin, NULL, …)` must build a thread in the TARGET's address space at the caller's entry point |
+| 2 | **`PEB->BeingDebugged` write-through** into the target's LIVE PEB page | without it `DbgUiRemoteBreakin` takes the `else` branch and exits silently — the break-in would be a NO-OP, not a failure (proven by the bypass below) |
+| 3 | the `int3` → `DbgkForwardException` → `NtWaitForDebugEvent` → `NtDebugContinue` chain | already built by batches 52 + 54 |
+
+#### F.1 — the ntdll half (`crates/nt-ntdll-dll/src/exports.rs`, `crates/nt-ntdll/src/dbg.rs`)
+
+`DbgUiIssueRemoteBreakin` is now verbatim `dll/ntdll/dbg/dbgui.c:303`:
+
+```rust
+let status = rtl_create_user_thread(process, NULL, /*CreateSuspended*/0, 0, 0, PAGE_SIZE,
+                                    dbg_ui_remote_breakin as *mut c_void, NULL,
+                                    &mut thread_handle, client_id.as_mut_ptr().cast());
+if nt_success(status) { NtClose(thread_handle); }
+status
+```
+
+The start address is taken from OUR OWN ntdll mapping and is valid in the target too — every hosted
+process maps the one `ntdll.dll` image at the same base, exactly the assumption native ntdll makes
+when it passes `(PVOID)DbgUiRemoteBreakin` unrelocated. `DbgUiDebugActiveProcess` therefore now runs
+the complete `dbgui.c` flow (attach → break in → cancel only on a genuine break-in failure) instead
+of always unwinding its own attach.
+
+`DbgUiRemoteBreakin` itself was already real; it was rewired onto a **shared, host-tested contract**
+so the two halves of the system cannot drift: `nt_ntdll_layout::PEB_BEING_DEBUGGED_OFFSET` (the
+byte-exact PEB layout's own constant, `PEB+0x02`) plus `nt_ntdll::dbg::remote_breakin_action` —
+`BreakThenExit` for any NON-ZERO `BOOLEAN`, `ExitOnly` for 0. The executive's write and ntdll's read
+now name the same constant. `cargo test -p nt-ntdll` 690 → **692**.
+
+#### F.2 — cross-VSpace thread creation (the real service, not a one-off)
+
+**Mechanism (`rendezvous::spawn_slot_thread`, generalised out of `spawn_tp_worker_thread`).** One
+function now builds a REAL hosted Windows thread in an **arbitrary** target process's address space:
+its own stack, its own TEB (→ GS base, `ClientId`, the process's shared PEB pointer, an
+ACTIVATION_CONTEXT_STACK), its own IPC buffer and entry trampoline — all mapped in the TARGET's
+`pml4` — starting at a caller-supplied `rip` with a caller-supplied `rcx`. `RemoteThreadSpawn`
+carries the target pi + slot + VSpace + start context + fault endpoint + `use_loader` (enter
+`LdrInitializeThunk` first, what a real hosted process needs) + `native` + `resume`.
+`spawn_tp_worker_thread` is now a thin wrapper over it (byte-identical: same slot layout, same
+badge, same `prio: 106`, same loader entry) — the ntdll thread-pool worker is simply the
+same-process case of the same mechanism.
+
+The **bounded per-process thread windows** are shared with those workers (they are the same
+resource: a process's Nth extra thread). `tp_worker_stack_mirror_va` gained an AUX region
+(`TP_WORKER_AUX_EXEC_BASE = 0x…1800_0000`, the free 32 MiB gap between the file-buffer POOL and
+`FSD_EXEC_BASE`) for process indices beyond the five live ones, because the two live regions are
+only disjoint for `pi < TP_WORKER_PI_COUNT`; `pi < 5` is byte-identical. `TP_WORKER_TID`/`TCB` are
+sized `MAX_PI`.
+
+**Policy (`ExecNtHandler::create_remote_thread`)** — `PspCreateThread`'s policy half, reached from
+the `NtCreateThread` service arm:
+
+1. **ACCESS CHECK** — the `ProcessHandle` is re-resolved through `resolve_process_for_access`
+   demanding **`PROCESS_CREATE_THREAD` (0x0002)**. Without it: `STATUS_ACCESS_DENIED`; an unknown
+   handle: `STATUS_INVALID_HANDLE`. Creating a thread in another process is never an ambient side
+   effect — it is only reachable through the real service with a properly-access-checked handle.
+2. the target must be ALIVE with a real address space (`PM_PML4S`, a new static mirror of the loop's
+   `procs[pi].pml4` so a service arm can reach a foreign VSpace without the loop context) and not
+   exiting.
+3. the start context is read out of the caller's `ThreadContext` argument (`CONTEXT.Rip` = start
+   routine, `.Rcx` = parameter) — this is what makes it the RIGHT thread.
+4. a real ETHREAD is claimed from the **TARGET's** pre-created pool (`claim_pool_thread`, extracted
+   out of `nt_create_thread_handle` and now taking `pi` as a PARAMETER — the thread belongs to the
+   target, not the caller), its TEB VA bound, and a TYPED `Thread(tid)` handle minted in the
+   **CALLER's** table.
+5. `*ThreadHandle` and `*ClientId {target pid, new tid}` are written out.
+6. the seL4 thread is requested from the LOOP (`RemoteThreadRequest` → `spawn_requested_remote_thread`),
+   which owns the main fault endpoint the new thread is badged onto; its faults then multiplex
+   through the EXISTING N-threads machinery (`tp_worker_identity_from_badge` → `mirror_ctx_for`) —
+   a remote thread is not a special kind of thread once it exists.
+
+**★ How the two meanings of a foreign `ProcessHandle` are told apart** (this is the safety crux, and
+it is NT's own rule). `RtlCreateUserProcess` creates a process and then *its initial thread*, so the
+live boot already issues `NtCreateThread` with a foreign handle — three or four times, once per
+spawned process. That case must keep binding the pre-created main ETHREAD + the seL4 main TCB the
+spawn already built. So: `PM_INITIAL_THREAD_DONE` is a per-pi bit set by that path; the **FIRST**
+foreign create for a target is its initial thread (unchanged behaviour), every **SUBSEQUENT** one is
+a genuine additional thread and takes the real cross-VSpace path. A process has exactly one initial
+thread — the discriminator is semantic, not a heuristic. `PM_REMOTE_THREADS_CREATED` reads the new
+path; **its live-boot contribution is 0** (the boot's only creation is the self-test's).
+
+#### F.3 — `PEB->BeingDebugged` write-through (`DbgkpMarkProcessPeb`)
+
+`ExecNtHandler::dbgk_mark_process_peb(pi, being_debugged)` writes the byte at `PEB+0x02` into the
+target's **live PEB page**, using the SAME general cross-process client-memory path
+`NtWriteVirtualMemory` uses (`img_spawn::client_copyout_mapped`). No new mechanism was invented:
+every hosted process's PEB frame is registered at spawn with a permanent executive alias
+(`csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000)`), which that writer consults first — so it
+works with or without the loop context. Call sites, all NT's:
+
+| site | call |
+|---|---|
+| `NtDebugActiveProcess` → `DbgkpSetProcessDebugObject` | `dbgk_mark_process_peb(target_pi, true)` |
+| `NtRemoveProcessDebug` → `DbgkClearProcessDebugObject` | `dbgk_mark_process_peb(target_pi, false)` |
+| `NtClose` → `DbgkpCloseObject` (the debugger's last handle went away) | `dbgk_clear_peb_marks_for_object(object)` — every process still attached, cleared BEFORE the detach while the attachment is still resolvable |
+
+`DBGK_PEB_MARKS` counts them; **0 on a plain boot**, because these are only reachable from the five
+dbgk arms and nothing attaches a debugger.
+
+#### F.4 — the gate: 3 specs (gate **211 → 214/99**), driven by a REAL throwaway debuggee
+
+A fifth post-loop self-test (`service_sec_image.rs`, `DBGK_BREAKIN_SELFTEST` bitmask `0x7F`). The
+DEBUGGER side goes through the REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)` with the
+arguments marshalled in smss's CLIENT memory — including `NtCreateThread`'s full 8-argument shape,
+its stack-resident `ClientId`/`ThreadContext`/`InitialTeb`/`CreateSuspended` staged in client memory
+with the caller stack pointer the handler reads them through); the TARGET side goes through
+`dbgk_forward_exception` / `dbgk_block_reporter`, the very entries the live fault loop calls; the
+MECHANISM spawn calls `rendezvous::spawn_slot_thread` — exactly what the loop's
+`spawn_requested_remote_thread` calls with the request the handler produced.
+
+The debuggee is a genuinely real throwaway: a fresh PML4 with a real hosted-process paging skeleton
+(`map_image_skeleton` → the env-block PT + the WORK_CLUSTER PT that holds the thread-slot windows),
+a REAL PEB page at `SMSS_PEB_VA` registered exactly as a spawned process's is, a marker page that
+exists ONLY in its address space, and a code page holding `DbgUiRemoteBreakin` **hand-emitted**
+(`selftests::dbgk_breakin_thread_code` — the target has no ntdll mapped), instruction for
+instruction the same shape as `dbgui.c`: read `gs:[0x60]` → `PEB+2`, `int3` if set, then an exit
+syscall. It publishes what it observes into the marker page, which the executive reads back through
+its own window on that frame.
+
+| spec | proves (`DBGK_BREAKIN_SELFTEST` bits) |
+|---|---|
+| `exec_dbgk_peb_being_debugged_writethrough` (`0x0007`) | setup: a real DEBUG_OBJECT + attach BY SSN, both attach-time fake create messages drained + continued BY SSN · **★ the write-through**: `BeingDebugged` is 0 before the attach and **1 after — read back out of the TARGET's own live PEB page**, `DBGK_PEB_MARKS` moves and the modelled `EPROCESS` flag agrees · **★ detach CLEARS it** in that same live page (`DbgkClearProcessDebugObject`) |
+| `exec_dbgk_remote_breakin_thread_runs` (`0x0018`) | **★ the cross-VSpace create BY SSN** (SSN 55, foreign `ProcessHandle`): a handle WITHOUT `PROCESS_CREATE_THREAD` is `STATUS_ACCESS_DENIED` and changes nothing; with it, a REAL `Thread(tid)` handle appears in the CALLER's table, `*ClientId` = {target pid, new tid} read back out of client memory, and the pending spawn request carries the TARGET's VSpace + the caller's entry point AND parameter · **★ the thread REALLY RUNS IN THE TARGET'S ADDRESS SPACE**: it executes, publishing into a page mapped ONLY there — its running marker, the `NtCurrentPeb()` it read through its OWN `gs:[0x60]` (= `SMSS_PEB_VA`), and the caller-supplied Parameter echoed back |
+| `exec_dbgk_remote_breakin_reports_breakpoint` (`0x0060`) | **★ it hits the breakpoint**: it read `BeingDebugged` = 1, took `DbgBreakPoint()`, its `int3` (DebugException) is forwarded through the live fault-loop entry and its reporter parked, and the debugger's `NtWaitForDebugEvent` reports **`DbgBreakpointStateChange` for the BREAK-IN THREAD's `CLIENT_ID`** with `STATUS_BREAKPOINT`, read back out of client memory · **★ `NtDebugContinue(DBG_CONTINUE)` resumes it PAST the int3** (its marker advances 0x11 → 0x12) and it runs its `RtlExitUserThread` exit path, whose syscall arrives — a clean end-to-end break-in |
+
+**Proof-is-real check — BYPASS EXPERIMENT (`dbgk_mark_process_peb` → `return false` on its first
+line):** `DBGK_BREAKIN_SELFTEST` `0x7F → 0x19`, `peb-marks 2 → 0`, and the break-in thread's marker
+stays **0x11 instead of 0x12** — it was created, it RAN, it read a zero `BeingDebugged`, took the
+`else` branch and **exited silently without ever hitting the breakpoint**. Gate **212/99, 2 FAILs**:
+`exec_dbgk_peb_being_debugged_writethrough` and `exec_dbgk_remote_breakin_reports_breakpoint` FAIL
+while `exec_dbgk_remote_breakin_thread_runs` still PASSES — exactly the intended separation, and the
+proof that the write-through is load-bearing rather than cosmetic. Restored and re-verified green.
+
+**★ THE SAFETY PROPERTY — no debugger attached ⇒ byte-identical.** The `PEB` write-through is only
+reachable from the five dbgk arms (none of which runs on a plain boot). The real cross-VSpace create
+is only reachable through `NtCreateThread` with a foreign handle whose target ALREADY has its
+initial thread — which never happens live — and only with `PROCESS_CREATE_THREAD` granted. Verified
+by a normalized diff of the boot serial against `fbb3971`: the ONLY differences are per-build
+timestamps / bootloader addresses / cap numbers, the already-nondeterministic
+`[user #PF]`/`[nt-read-file]` interleave, and the three new spec lines. `PM_REMOTE_THREADS_CREATED`
+= 1 and `DBGK_PEB_MARKS` = 2 — every one of them from the self-test.
+
+**Verify:** 3 consecutive clean foreground boots — **214/99, ZERO FAILs, RUNEXIT=3,
+`[microtest sentinel matched]`** each time, `dbgk remote-breakin selftest bits=0x7f peb-marks=2
+remote-created=1 remote-spawned=1 marker=0x12`. Boots 1 and 3 have byte-identical PASS lists, and
+that list is `fbb3971`'s **plus exactly the three new specs**. No regression:
+`exec_win32k_desktop_painted`, `exec_msgina_logon_dialog_painted`,
+`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip` and **all
+21** `exec_dbgk_*` PASS. Host tests: `nt-ntdll` 690 → **692**, `nt-process` **79** (unchanged — no
+process-manager logic this batch). No `rust-micro/src` change.
+
+**Still deferred after §F** (nothing about the break-in remains): the loop-side multiplex for a
+remote thread created into a LIVE process is wired (`spawn_requested_remote_thread` badges it onto
+the main fault EP and `mirror_ctx_for` already sub-selects that badge) but **not live-exercised** —
+nothing hosted issues `RtlCreateUserThread` against another live process yet, so the proof is the
+self-test's private-endpoint client, not the boot · a remote create does not post its own
+`DbgKmCreateThreadApi` (it draws from the pre-created pool rather than `ProcessManager::create_thread`) ·
+`#DB` single-step reporting/blocking (nothing sets TF) · the executive-internal fault walls that are
+not user exceptions · modules mapped before any `DEBUG_OBJECT` existed · `Thread->HideFromDebugger`.
+The remaining ntdll gaps are all §C Tier-2/3 BREADTH (the ~26 `Zw*` aliases + the unexported spec
+names, **none of which is imported by anything we host**) — **there are no stubs left to make real.**
+
+> Re-measured: the only two remaining unconditional `STATUS_NOT_IMPLEMENTED` bodies in `exports.rs`
+> are `RtlWow64EnableFsRedirection`/`Ex`, which are **E.3's deliberate fidelity corrections** —
+> `libsupp.c:1166/1178` is `@implemented` and returns exactly that on x86 ("this is what Windows
+> returns"). They are correct implementations of their contract, not stubs, and E.0's classification
+> never counted them in that bucket.
 
 ---
 

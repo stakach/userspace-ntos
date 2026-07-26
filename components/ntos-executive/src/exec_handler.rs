@@ -253,6 +253,7 @@ impl ExecNtHandler {
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
             tp_worker_spawn_request: 0,
+            remote_thread_request: None,
             wait_park_event: -1,
             wait_deadline_100ns: u64::MAX,
             keyed_wait_key: u64::MAX,
@@ -1435,6 +1436,78 @@ impl ExecNtHandler {
         true
     }
 
+    /// ★ `DbgkpMarkProcessPeb` — write `PEB->BeingDebugged` THROUGH into the target's LIVE PEB page.
+    ///
+    /// `ProcessManager` already models the flag (`EPROCESS.being_debugged`, set by
+    /// `debug_active_process` and cleared by `remove_process_debug` / `destroy_debug_object`), but
+    /// the byte a debuggee actually reads is `NtCurrentPeb()->BeingDebugged` — `PEB+2` in its own
+    /// address space. Without this write-through the whole break-in is INERT: `DbgUiRemoteBreakin`
+    /// reads a zero byte, skips `DbgBreakPoint` and exits silently.
+    ///
+    /// The write uses the SAME general cross-process client-memory path `NtWriteVirtualMemory` uses
+    /// (`client_copyout_mapped` against the target's registered frames / demand-fill scratch); every
+    /// hosted process's PEB frame is registered with a permanent executive alias at spawn
+    /// (`csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000)`), so no new mechanism is invented
+    /// and the write works with or without the loop context.
+    ///
+    /// ★ SAFETY: only ever reached from the five dbgk service arms, none of which runs on a boot
+    /// with no debugger — so the live PEB is never touched.
+    pub(crate) unsafe fn dbgk_mark_process_peb(&mut self, pi: usize, being_debugged: bool) -> bool {
+        // `PEB.BeingDebugged` — the byte-exact PEB layout's own constant, shared with the ntdll
+        // side that READS it (`nt_ntdll::dbg::remote_breakin_action`), so the two cannot drift.
+        const PEB_BEING_DEBUGGED_OFFSET: u64 = nt_ntdll_layout::PEB_BEING_DEBUGGED_OFFSET as u64;
+        if pi >= MAX_PI {
+            return false;
+        }
+        let (filled, nfilled, scratch_base) = match self.loop_ctx {
+            Some(ctx) => {
+                let procs = unsafe { &*ctx.procs };
+                let filled: &[u64] = if pi == self.pi {
+                    let current = unsafe { &*ctx.filled_pages };
+                    &current[..]
+                } else {
+                    let per_process = unsafe { &*ctx.pfilled };
+                    &per_process[pi][..]
+                };
+                (filled, procs[pi].faults as usize, procs[pi].scratch_base)
+            }
+            // Post-loop (the self-tests) there is no loop context; the PEB page is reachable through
+            // its registered permanent alias, which `client_copyout_mapped` consults first.
+            None => (&[][..], 0usize, 0u64),
+        };
+        let written = unsafe {
+            img_spawn::client_copyout_mapped(
+                pi as u64,
+                SMSS_PEB_VA + PEB_BEING_DEBUGGED_OFFSET,
+                &[u8::from(being_debugged)],
+                filled,
+                nfilled,
+                scratch_base,
+            )
+        };
+        if written {
+            DBGK_PEB_MARKS.fetch_add(1, Ordering::Relaxed);
+        }
+        written
+    }
+
+    /// Write `PEB->BeingDebugged` through for every process still attached to `object` — the
+    /// detach-side half of [`Self::dbgk_mark_process_peb`], used by `NtRemoveProcessDebug`'s
+    /// object-wide sibling `DbgkpCloseObject` (the debugger's last handle went away).
+    pub(crate) unsafe fn dbgk_clear_peb_marks_for_object(
+        &mut self,
+        object: nt_process::dbgk::DebugObjectId,
+    ) {
+        for pi in 0..MAX_PI {
+            let Some(pid) = self.pm_pid_for_pi(pi) else {
+                continue;
+            };
+            if self.pm.process_debug_port(pid) == Some(object) {
+                unsafe { self.dbgk_mark_process_peb(pi, false) };
+            }
+        }
+    }
+
     /// The thread a dbgk message from the current syscall reports for: the live caller when the loop
     /// has resolved one, else the process's main thread (what `dbgk_forward_exception` falls back to).
     fn dbgk_reporting_tid(&self, pid: nt_process::ProcessId) -> nt_process::ThreadId {
@@ -1590,21 +1663,151 @@ impl ExecNtHandler {
             let _ = self.io_completion_ports.release(port_id);
         }
     }
-    /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
-    /// caller-supplied start routine + parameter (all alloc-free field writes, reset-safe),
-    /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
-    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns
-    /// `(slot, tid, handle)`
-    /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
-    pub(crate) fn nt_create_thread_handle(
+    /// ★ CROSS-VSPACE `NtCreateThread` — a genuine ADDITIONAL thread inside a FOREIGN process
+    /// (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`; `DbgUiIssueRemoteBreakin`'s
+    /// break-in thread is the first real user). This is the POLICY half of `PspCreateThread`:
+    ///
+    /// 1. **Access check** — creating a thread in another process is a privileged capability
+    ///    operation, so the `ProcessHandle` is re-resolved through `resolve_process_for_access`
+    ///    demanding `PROCESS_CREATE_THREAD` (0x0002). A handle without it is `STATUS_ACCESS_DENIED`,
+    ///    an unknown handle `STATUS_INVALID_HANDLE` — never an ambient side effect.
+    /// 2. The target must be ALIVE with a real address space (`PM_PML4S`), and not exiting.
+    /// 3. The start context (`CONTEXT.Rip` = start routine, `.Rcx` = parameter) is read out of the
+    ///    caller's `ThreadContext` argument — this is what makes the created thread the RIGHT
+    ///    thread rather than "some thread somewhere".
+    /// 4. A real ETHREAD is claimed from the **TARGET's** pool (the thread belongs to the target),
+    ///    its TEB VA bound, and a TYPED `Thread(tid)` handle minted in the **CALLER's** table.
+    /// 5. `*ThreadHandle` / `*ClientId {target pid, new tid}` out-params are queued.
+    /// 6. The MECHANISM (the seL4 thread in the target's VSpace) is requested from the loop, which
+    ///    owns the main fault endpoint the new thread is badged onto.
+    pub(crate) unsafe fn create_remote_thread(&mut self, args: &[u64]) -> u32 {
+        const PROCESS_CREATE_THREAD: u32 = 0x0002;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        macro_rules! reject {
+            ($why:expr, $status:expr) => {{
+                print_str(b"[remote-thread] reject ");
+                print_str($why);
+                print_str(b"\n");
+                return $status;
+            }};
+        }
+        let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
+            reject!(b"no-caller-pid", nt_process::STATUS_INVALID_HANDLE);
+        };
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[3], PROCESS_CREATE_THREAD) {
+                Ok(resolved) => resolved,
+                Err(status) => {
+                    if status != 0xC000_0022 {
+                        print_str(b"[remote-thread] reject resolve status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                    }
+                    return status;
+                }
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            reject!(b"target-terminating", nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        let pml4 = PM_PML4S[target_pi].load(Ordering::Relaxed);
+        if pml4 == 0 {
+            reject!(b"no-target-vspace", nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        // The caller's remaining NtCreateThread arguments live on its stack (x64: 5th..8th).
+        let sp = unsafe { get_recv_mr(16) };
+        let cid_ptr = unsafe { smss_stack_read(sp + 0x28) };
+        let ctx_va = unsafe { smss_stack_read(sp + 0x30) };
+        if ctx_va == 0 {
+            reject!(b"null-thread-context", STATUS_INVALID_PARAMETER);
+        }
+        let start = nt_thread_start::Amd64ThreadContext::read(
+            |address| unsafe { smss_stack_read(address) },
+            ctx_va,
+        );
+        if start.rip == 0 {
+            reject!(b"null-start-address", STATUS_INVALID_PARAMETER);
+        }
+        let create_suspended = unsafe { smss_stack_read(sp + 0x40) } != 0;
+        // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
+        // workers — one window per extra thread of that process.
+        let Some(slot) = (0..TP_WORKER_SLOT_COUNT)
+            .find(|slot| TP_WORKER_TID[target_pi][*slot].load(Ordering::Relaxed) == 0)
+        else {
+            reject!(b"no-free-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let Some((_pool_slot, tid)) = self.claim_pool_thread(target_pi, start.rip, create_suspended)
+        else {
+            reject!(b"no-pool-ethread", STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let thread = tid as nt_process::ThreadId;
+        let handle = match self.pm.insert_handle(
+            caller_pid,
+            nt_process::HandleObject::Thread(thread),
+            args[1] as u32,
+        ) {
+            Ok(handle) => handle as u64,
+            Err(status) => reject!(b"handle-insert", status),
+        };
+        self.pm.set_thread_teb(thread, tp_worker_teb_va(slot));
+        let _ = self
+            .pm
+            .set_thread_create_time(thread, nt_system_time_100ns() as i64);
+        TP_WORKER_TID[target_pi][slot].store(tid, Ordering::Relaxed);
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+        self.queue_write(args[0], handle);
+        if cid_ptr != 0 {
+            self.queue_write(cid_ptr, target_pid as u64);
+            self.queue_write(cid_ptr + 8, tid);
+        }
+        self.remote_thread_request = Some(RemoteThreadRequest {
+            target_pi,
+            slot,
+            pml4,
+            start,
+            cid_proc: target_pid as u64,
+            cid_thread: tid,
+            resume: !create_suspended,
+        });
+        print_str(b"[remote-thread] cross-vspace create caller_pi=");
+        print_u64(self.pi as u64);
+        print_str(b" target_pi=");
+        print_u64(target_pi as u64);
+        print_str(b" slot=");
+        print_u64(slot as u64);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" entry=0x");
+        print_hex((start.rip >> 32) as u32);
+        print_hex(start.rip as u32);
+        print_str(b" param=0x");
+        print_hex(start.rcx as u32);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
+        print_str(b"\n");
+        0
+    }
+
+    /// Claim the next free pre-created pool ETHREAD belonging to hosted process `pi` and bind the
+    /// caller-supplied start routine (alloc-free field writes, reset-safe — the pool exists so
+    /// runtime thread creation never allocates under the per-syscall bump heap). Returns
+    /// `(pool slot, tid)`, releasing the slot again on any failure. `pi` is a PARAMETER, not
+    /// `self.pi`: a cross-VSpace `NtCreateThread` creates a thread that belongs to the TARGET
+    /// process, so it must come out of the TARGET's pool.
+    pub(crate) fn claim_pool_thread(
         &mut self,
+        pi: usize,
         entry: u64,
         create_suspended: bool,
-        desired_access: u32,
-    ) -> Option<(usize, u64, u64)> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        let pool = PM_POOL_TID.get(self.pi)?;
-        let used = PM_POOL_USED.get(self.pi)?;
+    ) -> Option<(usize, u64)> {
+        let pool = PM_POOL_TID.get(pi)?;
+        let used = PM_POOL_USED.get(pi)?;
         let mut claimed = used.load(Ordering::Relaxed);
         let slot = loop {
             let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| claimed & (1 << slot) == 0)?;
@@ -1646,6 +1849,25 @@ impl ExecNtHandler {
             used.fetch_and(!(1 << slot), Ordering::Relaxed);
             return None;
         }
+        Some((slot, tid))
+    }
+
+    /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
+    /// caller-supplied start routine + parameter (all alloc-free field writes, reset-safe),
+    /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
+    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns
+    /// `(slot, tid, handle)`
+    /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
+    pub(crate) fn nt_create_thread_handle(
+        &mut self,
+        entry: u64,
+        create_suspended: bool,
+        desired_access: u32,
+    ) -> Option<(usize, u64, u64)> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let (slot, tid) = self.claim_pool_thread(self.pi, entry, create_suspended)?;
+        let used = PM_POOL_USED.get(self.pi)?;
+        let t = tid as nt_process::ThreadId;
         let h =
             match self
                 .pm
@@ -2604,6 +2826,9 @@ impl ExecNtHandler {
                 // otherwise a debugger that dies mid-event would leave a reporter parked forever
                 // and the boot could never quiesce.
                 unsafe { self.dbgk_release_blocked_reporters(object, None) };
+                // `DbgkpMarkProcessPeb(Process, FALSE)` for every debuggee this object still holds —
+                // done BEFORE the detach, while the attachment is still resolvable.
+                unsafe { self.dbgk_clear_peb_marks_for_object(object) };
                 self.pm.destroy_debug_object(object);
             }
             _ => {}
@@ -6173,6 +6398,15 @@ impl ExecNtHandler {
                 // to spawn the REAL seL4 thread in the caller's VSpace (`spawn_wl_listener_thread`). The
                 // no-op (a bare fake handle) is RETIRED for this path — kernel32/rpcrt4 now read a real
                 // TEB/ClientId (NtQueryInformationThread(162) resolves the typed handle → the ETHREAD).
+                //
+                // A FOREIGN `ProcessHandle` has TWO distinct meanings, and NT tells them apart the
+                // same way we do here — by whether the target already HAS its initial thread:
+                //   * the process's INITIAL thread, the second half of `RtlCreateUserProcess`
+                //     ("create the process, then its first thread"). The pre-created main ETHREAD +
+                //     the seL4 main TCB the spawn already built ARE that thread → bind them (below).
+                //   * any SUBSEQUENT thread — a genuine additional thread that must be BUILT inside
+                //     the target's address space (`RtlCreateUserThread(ProcessHandle != self)`, i.e.
+                //     `DbgUiIssueRemoteBreakin` / `CreateRemoteThread`) → `create_remote_thread`.
                 if matches!(ctx.service, NativeService::NtCreateThread) && args[3] != u64::MAX {
                     unsafe {
                         let caller_pid = match self.pm_pid_for_pi(self.pi) {
@@ -6183,6 +6417,13 @@ impl ExecNtHandler {
                             Some(pid) => pid,
                             None => return 0xC000_0008,
                         };
+                        let target_pi = self.pi_for_pid(target_pid);
+                        if target_pi.is_some_and(|pi| {
+                            PM_INITIAL_THREAD_DONE.load(Ordering::Relaxed) & (1u64 << pi) != 0
+                        }) {
+                            // The target already has its initial thread ⇒ REAL cross-VSpace create.
+                            return self.create_remote_thread(args);
+                        }
                         let tid = match self.pm.main_thread(target_pid) {
                             Some(tid) => tid,
                             None => return 0xC000_0008,
@@ -6230,6 +6471,11 @@ impl ExecNtHandler {
                             print_str(b" handle=0x");
                             print_hex(handle as u32);
                             print_str(b" status=0\n");
+                        }
+                        // This target now HAS its initial thread; any further foreign create for it
+                        // is a genuine additional thread (the cross-VSpace path above).
+                        if let Some(pi) = target_pi {
+                            PM_INITIAL_THREAD_DONE.fetch_or(1u64 << pi, Ordering::Relaxed);
                         }
                         return 0;
                     }
@@ -10994,7 +11240,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
-                let (target, _pi) =
+                let (target, target_pi) =
                     match self.resolve_process_for_access(args[0], PROCESS_SUSPEND_RESUME) {
                         Ok(resolved) => resolved,
                         Err(status) => return status,
@@ -11005,6 +11251,11 @@ impl ExecNtHandler {
                 };
                 match self.pm.debug_active_process(target, object, debugger) {
                     Ok(posted) => {
+                        // ★ `DbgkpSetProcessDebugObject` → `DbgkpMarkProcessPeb(Process, TRUE)`:
+                        // the modelled flag is not enough — write it through to the target's LIVE
+                        // PEB page, which is the byte `DbgUiRemoteBreakin` (and every
+                        // `IsDebuggerPresent`) actually reads.
+                        unsafe { self.dbgk_mark_process_peb(target_pi, true) };
                         self.sync_debug_object_signal(object);
                         DBGK_ATTACHES.fetch_add(1, Ordering::Relaxed);
                         DBGK_FAKE_MESSAGES.fetch_add(posted as u64, Ordering::Relaxed);
@@ -11127,7 +11378,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
-                let (target, _pi) =
+                let (target, target_pi) =
                     match self.resolve_process_for_access(args[0], PROCESS_SUSPEND_RESUME) {
                         Ok(resolved) => resolved,
                         Err(status) => return status,
@@ -11137,6 +11388,8 @@ impl ExecNtHandler {
                 unsafe { self.dbgk_release_blocked_reporters(object, Some(target)) };
                 match self.pm.remove_process_debug(target, object) {
                     Ok(_flushed) => {
+                        // `DbgkClearProcessDebugObject` → `DbgkpMarkProcessPeb(Process, FALSE)`.
+                        unsafe { self.dbgk_mark_process_peb(target_pi, false) };
                         self.sync_debug_object_signal(object);
                         DBGK_DETACHES.fetch_add(1, Ordering::Relaxed);
                         0

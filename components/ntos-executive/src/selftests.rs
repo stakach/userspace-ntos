@@ -265,6 +265,64 @@ pub(crate) fn dbgk_debugger_client_code() -> alloc::vec::Vec<u8> {
     t
 }
 
+// ═══ Dbgk REMOTE BREAK-IN harness — `DbgUiRemoteBreakin`, hand-emitted ═════════════════════════
+//
+// The break-in proof needs a thread that is created by the REAL cross-VSpace `NtCreateThread`
+// service INSIDE a throwaway target process and then behaves exactly like ntdll's
+// `DbgUiRemoteBreakin`. The target has no ntdll mapped (it is a bare throwaway VSpace), so the
+// break-in entry point is hand-emitted here — instruction for instruction the same shape as
+// `dll/ntdll/dbg/dbgui.c`:
+//
+// ```c
+// VOID NTAPI DbgUiRemoteBreakin(VOID) {
+//     if (NtCurrentPeb()->BeingDebugged) DbgBreakPoint();   // int3
+//     RtlExitUserThread(STATUS_SUCCESS);
+// }
+// ```
+//
+// Everything it observes is published into a MARKER page that exists ONLY in the target's address
+// space, which the executive reads back through its own window on that frame:
+//
+// | offset | published |
+// |---|---|
+// | +0x00 | `0x11` once it is running — i.e. the remote thread REALLY EXECUTES in the target's VSpace; `0x12` once it has resumed PAST the `int3` |
+// | +0x08 | `NtCurrentPeb()` as read through ITS OWN `gs:[0x60]` — proof the thread got a correct TEB |
+// | +0x10 | the `PEB->BeingDebugged` BYTE it actually read — the write-through, observed by the debuggee |
+// | +0x18 | the caller-supplied thread PARAMETER (RCX at entry) — proof the start context is honoured |
+/// The marker page's VA inside the throwaway break-in target (its own address space).
+pub(crate) const DBGK_BREAKIN_MARK_VA: u64 = SMSS_DESKINFO_VA;
+/// The break-in thread's entry point inside the throwaway target (its code page).
+pub(crate) const DBGK_BREAKIN_CODE_VA: u64 = PE_LOAD_BASE;
+/// The `Parameter` the break-in create passes, echoed back by the thread at `MARK + 0x18`.
+pub(crate) const DBGK_BREAKIN_PARAM: u64 = 0xB4EA_4114;
+/// The `rax` the break-in thread's `RtlExitUserThread` stand-in reports through its exit syscall.
+pub(crate) const DBGK_BREAKIN_EXIT_SSN: u64 = 0xE0;
+
+/// `DbgUiRemoteBreakin`, hand-emitted for a target with no ntdll (see the block comment above).
+pub(crate) fn dbgk_breakin_thread_code() -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x49, 0x89, 0xC8]); // mov r8, rcx           (the caller's Parameter)
+    t.extend_from_slice(&[0x48, 0xB9]);
+    t.extend_from_slice(&DBGK_BREAKIN_MARK_VA.to_le_bytes()); // movabs rcx, MARK
+    t.extend_from_slice(&[0x48, 0xC7, 0x01, 0x11, 0x00, 0x00, 0x00]); // mov qword [rcx], 0x11
+    t.extend_from_slice(&[0x4C, 0x89, 0x41, 0x18]); // mov [rcx+0x18], r8
+    // NtCurrentPeb(): gs:[0x60].
+    t.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // mov rax, gs:[0x60]
+    t.extend_from_slice(&[0x48, 0x89, 0x41, 0x08]); // mov [rcx+0x08], rax
+    t.extend_from_slice(&[0x0F, 0xB6, 0x50, 0x02]); // movzx edx, byte [rax+2]  (PEB->BeingDebugged)
+    t.extend_from_slice(&[0x48, 0x89, 0x51, 0x10]); // mov [rcx+0x10], rdx
+    t.extend_from_slice(&[0x84, 0xD2]); // test dl, dl
+    t.extend_from_slice(&[0x74, 0x08]); // jz .exit  (over int3 + the 7-byte store)
+    t.push(0xCC); // int3 = DbgBreakPoint()
+    t.extend_from_slice(&[0x48, 0xC7, 0x01, 0x12, 0x00, 0x00, 0x00]); // mov qword [rcx], 0x12
+    // .exit: RtlExitUserThread(STATUS_SUCCESS) — a syscall, delivered as UnknownSyscall.
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&DBGK_BREAKIN_EXIT_SSN.to_le_bytes()); // movabs rax, EXIT
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    t
+}
+
 /// Stand up ONE throwaway client VSpace running `code`, with `shared` mapped RW at
 /// [`DBGK_CLIENT_VIEW`] (the marker page), a code page (RX), a stack, an IPC buffer, a
 /// hosted-syscalls TCB and an SC — resumed. `fault_ep` selects the endpoint its faults are delivered

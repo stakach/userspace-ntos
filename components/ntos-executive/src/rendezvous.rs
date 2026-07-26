@@ -1417,7 +1417,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     pi: usize,
     worker_slot: usize,
     pml4: u64,
-    mut start: nt_thread_start::Amd64ThreadContext,
+    start: nt_thread_start::Amd64ThreadContext,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
@@ -1426,44 +1426,126 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     if pi >= TP_WORKER_PI_COUNT || worker_slot >= TP_WORKER_SLOT_COUNT {
         return 0;
     }
-    let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
-    if loader_rva == 0 {
+    if img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed) == 0 {
         return 0;
     }
-
-    // ReactOS amd64 RtlInitializeContext: (StackBase - 6 pointers), align down to 16, then -8.
-    start.rsp = tp_worker_context_rsp(worker_slot);
-    let initial_teb = nt_thread_start::InitialTeb64 {
-        stack_base: tp_worker_stack_top(worker_slot),
-        stack_limit: tp_worker_stack_base(worker_slot),
-        allocated_stack_base: tp_worker_stack_base(worker_slot),
-    };
     let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi, worker_slot));
+    spawn_slot_thread(&RemoteThreadSpawn {
+        target_pi: pi,
+        slot: worker_slot,
+        pml4,
+        start,
+        cid_proc,
+        cid_thread,
+        fault_ep: worker_ep,
+        use_loader: true,
+        native: true,
+        resume,
+    })
+}
+
+/// Everything the general cross-VSpace thread spawn needs. See [`spawn_slot_thread`].
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteThreadSpawn {
+    /// Hosted-process index the new thread BELONGS TO (selects its executive-side mirror/scratch).
+    pub target_pi: usize,
+    /// Which bounded per-process thread window to build it in.
+    pub slot: usize,
+    /// The TARGET's VSpace (PML4) cap — the address space the stack/TEB/IPC/trampoline land in.
+    pub pml4: u64,
+    /// Caller-supplied start context: `rip` = the start routine, `rcx` = its parameter.
+    pub start: nt_thread_start::Amd64ThreadContext,
+    /// The `ClientId` stamped into the new thread's TEB.
+    pub cid_proc: u64,
+    pub cid_thread: u64,
+    /// Endpoint the thread's faults/syscalls are delivered to.
+    pub fault_ep: u64,
+    /// Enter `LdrInitializeThunk` first (a real hosted process) or the start routine directly.
+    pub use_loader: bool,
+    /// NATIVE seL4-Call transport (our ntdll). `false` sets `TCBSetHostedSyscalls`, so a raw
+    /// `syscall` faults as UnknownSyscall instead of dispatching natively.
+    pub native: bool,
+    /// Resume immediately, or leave suspended (`CreateSuspended`).
+    pub resume: bool,
+}
+
+/// ★ THE GENERAL CROSS-VSPACE THREAD SPAWN — `PspCreateThread`'s mechanism half.
+///
+/// Build a REAL hosted Windows thread inside an **arbitrary target process's address space**: its
+/// own stack, its own TEB (→ GS base, `ClientId`, the process's shared PEB pointer, an
+/// ACTIVATION_CONTEXT_STACK), its own IPC buffer and entry trampoline — all mapped in `pml4`, the
+/// TARGET's VSpace — starting at a **caller-supplied entry point with a caller-supplied
+/// parameter**. Nothing here is specific to the caller: `target_pi` names the process the thread
+/// belongs to (selecting its executive-side mirror/scratch windows) and `pml4` its address space,
+/// so `RtlCreateUserThread(ProcessHandle != NtCurrentProcess)` — `DbgUiIssueRemoteBreakin`'s
+/// break-in thread, `CreateRemoteThread`, an injected worker — lands correctly.
+///
+/// `slot` picks one of the bounded per-process thread windows (`TP_WORKER_SLOT_COUNT` of them,
+/// shared with the ntdll thread-pool workers: they are the same resource — a process's Nth extra
+/// thread). `use_loader` routes the new thread through `LdrInitializeThunk` first, which is what a
+/// real hosted process needs (TLS + `DLL_THREAD_ATTACH` before the start routine runs); `false`
+/// enters the start routine directly, for a target with no ntdll mapped. `fault_ep` is the endpoint
+/// the thread's faults and syscalls are delivered to (the badged main service EP for a live
+/// process; a private endpoint when the caller services the thread itself).
+pub(crate) unsafe fn spawn_slot_thread(spawn: &RemoteThreadSpawn) -> u64 {
+    let RemoteThreadSpawn {
+        target_pi,
+        slot,
+        pml4,
+        mut start,
+        cid_proc,
+        cid_thread,
+        fault_ep,
+        use_loader,
+        native,
+        resume,
+    } = *spawn;
+    if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || fault_ep == 0 {
+        return 0;
+    }
+    let loader_context = if use_loader {
+        let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
+        if loader_rva == 0 {
+            return 0;
+        }
+        // The caller-supplied stack allocation is not mapped into this userspace kernel, so
+        // normalize both INITIAL_TEB and CONTEXT.Rsp to the fixed 16-page slot stack before entering
+        // LdrInitializeThunk. The original RIP/RCX/RDX remain intact and are restored by the loader
+        // trampoline. ReactOS amd64 RtlInitializeContext: (StackBase - 6 pointers), align 16, -8.
+        start.rsp = tp_worker_context_rsp(slot);
+        Some(LoaderThreadContext {
+            loader_va: NTDLL_BASE + loader_rva,
+            start,
+            initial_teb: nt_thread_start::InitialTeb64 {
+                stack_base: tp_worker_stack_top(slot),
+                stack_limit: tp_worker_stack_base(slot),
+                allocated_stack_base: tp_worker_stack_base(slot),
+            },
+        })
+    } else {
+        None
+    };
     spawn_hosted_thread(&HostedThread {
         pml4,
-        client_pi: pi as u64,
+        client_pi: target_pi as u64,
         entry_rip: start.rip,
         arg0: start.rcx,
         arg1: start.rdx,
-        loader_context: Some(LoaderThreadContext {
-            loader_va: NTDLL_BASE + loader_rva,
-            start,
-            initial_teb,
-        }),
-        scr: tp_worker_env_scratch_va(pi, worker_slot),
-        teb_va: tp_worker_teb_va(worker_slot),
-        stack_base: tp_worker_stack_base(worker_slot),
+        loader_context,
+        scr: tp_worker_env_scratch_va(target_pi, slot),
+        teb_va: tp_worker_teb_va(slot),
+        stack_base: tp_worker_stack_base(slot),
         stack_frames: TP_WORKER_STACK_FRAMES,
-        ipcbuf_va: tp_worker_ipcbuf_va(worker_slot),
-        tramp_va: tp_worker_tramp_va(worker_slot),
+        ipcbuf_va: tp_worker_ipcbuf_va(slot),
+        tramp_va: tp_worker_tramp_va(slot),
         peb_va: SMSS_PEB_VA,
-        stack_mirror_va: tp_worker_stack_mirror_va(pi, worker_slot),
-        fault_ep: worker_ep,
+        stack_mirror_va: tp_worker_stack_mirror_va(target_pi, slot),
+        fault_ep,
         cid_proc,
         cid_thread,
         resume,
         prio: 106,
-        native: true,
+        native,
         diag: false,
     })
 }

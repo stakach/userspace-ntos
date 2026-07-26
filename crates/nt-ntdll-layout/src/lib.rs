@@ -272,6 +272,15 @@ pub struct RtlUserProcessParameters {
     pub runtime_data: UnicodeString,
 }
 
+/// `PEB.BeingDebugged` — the third byte of the PEB's leading flags (x64 `PEB+0x02`).
+///
+/// This one byte is the whole debugger-presence contract, and BOTH halves of the system depend on
+/// it agreeing: the kernel side writes it (`DbgkpMarkProcessPeb`, at attach and detach) and the
+/// user side reads it (`DbgUiRemoteBreakin`'s `if (NtCurrentPeb()->BeingDebugged) DbgBreakPoint()`,
+/// `IsDebuggerPresent`). Naming it once here — next to the struct the static asserts pin — keeps a
+/// magic `+2` from drifting between them.
+pub const PEB_BEING_DEBUGGED_OFFSET: usize = 2;
+
 /// `PEB` — the Process Environment Block (`peb_teb.h`, x64). Only the fields hosted binaries read
 /// by offset are named; the rest is `_rsvd*` padding sized to hold each named field at its exact
 /// x64 offset (verified by the static asserts below against the NDK `C_ASSERT` block).

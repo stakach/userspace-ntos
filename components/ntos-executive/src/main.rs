@@ -441,6 +441,13 @@ pub const TP_WORKER_SLOT1_IPCBUF_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x1_000
 pub const TP_WORKER_SLOT1_TEB_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x2_0000;
 pub const TP_WORKER_SLOT1_TRAMP_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x3_0000;
 pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
+/// Executive-side windows for hosted-process indices BEYOND the five live ones. The two live
+/// `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and are only disjoint for
+/// `pi < TP_WORKER_PI_COUNT`; a throwaway/self-test process index (the free high `PM_PIDS` slots)
+/// would alias slot 1's window. Those indices get their own densely-packed `(pi, slot)` region
+/// here — a genuinely free 32 MiB gap between the file-buffer POOL (`0x1500`+24×2 MiB = `0x1800`)
+/// and `FSD_EXEC_BASE` (`0x1A00`). `pi < TP_WORKER_PI_COUNT` is byte-identical to before.
+pub const TP_WORKER_AUX_EXEC_BASE: u64 = 0x0000_0100_1800_0000;
 
 #[inline]
 pub const fn tp_worker_badge(pi: usize, slot: usize) -> u64 {
@@ -492,6 +499,12 @@ pub const fn tp_worker_tramp_va(slot: usize) -> u64 {
 
 #[inline]
 pub const fn tp_worker_stack_mirror_va(pi: usize, slot: usize) -> u64 {
+    if pi >= TP_WORKER_PI_COUNT {
+        // Throwaway / self-test process indices — their own densely-packed region (see
+        // TP_WORKER_AUX_EXEC_BASE); never aliases the two live per-slot regions.
+        let index = (pi - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT + slot;
+        return TP_WORKER_AUX_EXEC_BASE + index as u64 * TP_WORKER_EXEC_STRIDE;
+    }
     let base = if slot == 0 { TP_WORKER_EXEC_BASE } else { TP_WORKER_SLOT1_EXEC_BASE };
     base + pi as u64 * TP_WORKER_EXEC_STRIDE
 }
@@ -599,6 +612,14 @@ const _: () = {
     assert!(TP_WORKER_SLOT1_TRAMP_VA + 0x1000 <= TP_WORKER_SLOT1_REGION_BASE + 0x20_0000);
     assert!(tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 1) + 0x4000
         <= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
+    // The AUX region (throwaway/self-test process indices) must not alias either live region, and
+    // must stay inside the free 32 MiB gap [POOL end 0x1800_0000, FSD_EXEC_BASE 0x1A00_0000).
+    assert!(TP_WORKER_AUX_EXEC_BASE >= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
+    assert!(
+        tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
+            <= 0x0000_0100_1A00_0000
+    );
+    assert!(tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0) == TP_WORKER_AUX_EXEC_BASE);
 };
 
 /// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
@@ -1505,11 +1526,21 @@ static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
 /// Two bounded generic ntdll thread-pool workers per boot process (pi 0..4). These identities remain
 /// separate from the listener-specific state so badge routing cannot accidentally inherit a server
 /// listener's park/drop policy.
-static TP_WORKER_TID: [[AtomicU64; TP_WORKER_SLOT_COUNT]; TP_WORKER_PI_COUNT] =
-    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; TP_WORKER_PI_COUNT];
-static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; TP_WORKER_PI_COUNT] =
-    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; TP_WORKER_PI_COUNT];
+/// Sized `MAX_PI` (not `TP_WORKER_PI_COUNT`): the SAME bounded windows are what a cross-VSpace
+/// `NtCreateThread` claims for an extra thread of ANY hosted process index, including the free high
+/// `PM_PIDS` slots the post-loop self-tests use. Slots 5.. are zero on every live boot.
+static TP_WORKER_TID: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
+    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; MAX_PI];
+static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
+    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; MAX_PI];
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Threads created in a FOREIGN process's address space through the real cross-VSpace
+/// `NtCreateThread` path (`create_remote_thread`). 0 on every boot today — nothing hosted issues
+/// `RtlCreateUserThread` against another live process yet; the self-test drives it.
+pub(crate) static PM_REMOTE_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Cross-VSpace thread creations the loop (or the post-loop self-test) actually BUILT — i.e. the
+/// seL4 thread really exists in the target's VSpace.
+pub(crate) static PM_REMOTE_THREADS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// BATCH 25 — count of fixup-preserving re-maps (a re-faulted per-process image page re-mapped from
@@ -2142,7 +2173,7 @@ unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
-unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
+pub(crate) unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
     let _ = csrss_frame_put_at_cap(pi, page, fr, alias, 0);
 }
 unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
@@ -2777,7 +2808,7 @@ unsafe fn attach_sched_context(tcb: u64) {
 /// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to
 /// piggyback the image's 2 MiB PT; now that the working VAs moved high (out of the 64 MiB ELF
 /// reserve) it needs its own PT in every executive-image VSpace and in the executive's own.
-unsafe fn map_cluster_pt(pml4: u64) {
+pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
     let pt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
@@ -2801,7 +2832,7 @@ unsafe fn map_heap_pt(pml4: u64) {
 /// slot, one PT per 2 MiB of image (so the ELF can grow into its 64 MiB reserve), and the
 /// relocated cluster PT. Callers then map the image frames + any region-specific buffer PTs. The
 /// pd is 1 GiB-granular, so it also covers the cluster / heap / buffer PTs (all < 512 MiB).
-unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
+pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
@@ -4285,7 +4316,7 @@ pub(crate) unsafe fn get_recv_mr(i: usize) -> u64 {
 /// `(mi>>12)==2` UnknownSyscall service arm reads (which reads args from the fault frame's saved
 /// register slots via `get_recv_mr`), so the native transport reuses that arm's full servicing body
 /// unchanged. Same address math as `set_reply_mr`/`get_recv_mr` (MR `i` at byte `8 + i*8`).
-unsafe fn set_recv_mr(i: usize, v: u64) {
+pub(crate) unsafe fn set_recv_mr(i: usize, v: u64) {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
@@ -5105,6 +5136,26 @@ impl ExecLoopCtx {
     }
 }
 
+/// A pending cross-VSpace thread creation: everything the LOOP needs to turn the handler's
+/// already-completed policy decision into the real seL4 thread inside the TARGET process.
+/// See [`rendezvous::spawn_slot_thread`] and `ExecNtHandler::create_remote_thread`.
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteThreadRequest {
+    /// Hosted-process index of the TARGET (the process the new thread belongs to).
+    pub target_pi: usize,
+    /// The bounded per-process thread window claimed for it.
+    pub slot: usize,
+    /// The TARGET's VSpace (PML4) cap, resolved from `PM_PML4S`.
+    pub pml4: u64,
+    /// The caller-supplied start context (`rip` = start routine, `rcx` = parameter).
+    pub start: nt_thread_start::Amd64ThreadContext,
+    /// The new thread's `ClientId` — the TARGET's pid + the ETHREAD's tid.
+    pub cid_proc: u64,
+    pub cid_thread: u64,
+    /// `CreateSuspended = FALSE` ⇒ resume it as soon as it is built.
+    pub resume: bool,
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -5223,6 +5274,12 @@ struct ExecNtHandler {
     /// Encoded generic ntdll worker identity awaiting mechanism construction. Zero means none;
     /// `1 + slot * TP_WORKER_PI_COUNT + pi` identifies the process and worker role.
     tp_worker_spawn_request: u8,
+    /// ★ CROSS-VSPACE `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`):
+    /// the handler did the POLICY (handle + `PROCESS_CREATE_THREAD` access check, the target's real
+    /// ETHREAD, the `*ThreadHandle`/`*ClientId` out-params) and asks the LOOP to build the
+    /// MECHANISM — the seL4 thread in the TARGET's VSpace — because only the loop holds the main
+    /// fault endpoint the new thread must be badged onto. `None` = no request (every boot today).
+    pub(crate) remote_thread_request: Option<RemoteThreadRequest>,
     /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
     /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
     /// event index) instead of replying, and wake it on the matching NtSetEvent. -1 = no park (either
@@ -6221,6 +6278,18 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Each hosted process's seL4 VSpace (PML4) cap, mirrored out of the service loop's `procs[pi].pml4`
+/// so a service arm can reach a FOREIGN process's address space without the loop context (which the
+/// post-loop self-tests deliberately take away). Written wherever `procs[pi].pml4` is assigned.
+/// This is what makes a cross-VSpace `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != self)`)
+/// resolvable: pid → pi → the target VSpace the new thread's stack/TEB are built in.
+pub(crate) static PM_PML4S: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
+/// with a foreign `ProcessHandle` (`RtlCreateUserProcess`'s "create the process, then its first
+/// thread" pair). The FIRST such create binds the process's pre-created main ETHREAD (and the seL4
+/// main TCB the spawn already made); every SUBSEQUENT one is a genuine ADDITIONAL thread and takes
+/// the real cross-VSpace spawn path. Exactly NT's rule — a process has one initial thread.
+pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
 /// creation remains allocation-free. Three slots cover the existing specialized fan-out and two
 /// more admit the ntdll scheduler and completion worker without reallocating under the loop reset.
@@ -6323,6 +6392,10 @@ static DBGK_TERMINATES_ENFORCED: AtomicU64 = AtomicU64::new(0);
 /// debuggee detached / the boot reached its post-loop drain — so a debugger that dies or never
 /// continues can never wedge the boot.
 static DBGK_REPORTERS_RELEASED: AtomicU64 = AtomicU64::new(0);
+/// `DbgkpMarkProcessPeb` write-throughs: `PEB->BeingDebugged` really written into a target's LIVE
+/// PEB page (set at attach, cleared at detach / debug-object destruction). This is what makes the
+/// break-in NON-INERT — `DbgUiRemoteBreakin` reads exactly this byte. 0 on a plain boot.
+static DBGK_PEB_MARKS: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk end-to-end SELF-TEST result** (post-loop, throwaway debugger + debuggee EPROCESSes),
 /// driving the SAME `nt_process::dbgk` plane the five native handlers dispatch into. Bitmask:
 ///   0x0001 NtCreateDebugObject creates a real DEBUG_OBJECT (DBGK_KILL_PROCESS_ON_EXIT honoured)
@@ -6457,6 +6530,28 @@ static DBGK_MODULE_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///          queue-side post WAKES it through `wait_wake_dispatcher_set`; its marker and its next
 ///          syscall are the proof it really resumed
 static DBGK_BLOCK_SELFTEST: AtomicU64 = AtomicU64::new(0);
+/// **Dbgk REMOTE BREAK-IN self-test result** (post-loop) — `DbgUiIssueRemoteBreakin` end to end
+/// against a throwaway debuggee whose address space, PEB page and marker page are all real:
+///   0x0001 setup: a real DEBUG_OBJECT + attach BY SSN, both attach-time fake create messages
+///          drained and continued BY SSN, the queue genuinely empty
+///   0x0002 ★ `PEB->BeingDebugged` WRITE-THROUGH (`DbgkpMarkProcessPeb`): 0 before the attach, 1
+///          after — **read back out of the TARGET's own live PEB page** — `DBGK_PEB_MARKS` moves
+///          and the modelled `EPROCESS` flag agrees
+///   0x0004 ★ DETACH CLEARS it again in that same live page (`DbgkClearProcessDebugObject`)
+///   0x0008 ★ CROSS-VSPACE `NtCreateThread` BY SSN with a FOREIGN `ProcessHandle`: a handle without
+///          `PROCESS_CREATE_THREAD` is `STATUS_ACCESS_DENIED` and changes nothing; with it, a REAL
+///          `Thread(tid)` handle appears in the CALLER's table, `*ClientId` = {target pid, new
+///          tid}, and the pending spawn request carries the TARGET's VSpace + the caller's entry
+///          point AND parameter
+///   0x0010 ★ THE REMOTE THREAD REALLY RUNS IN THE TARGET'S ADDRESS SPACE: it executes, publishing
+///          into a page mapped ONLY there — its running marker, the `NtCurrentPeb()` it read
+///          through its OWN `gs:[0x60]`, and the caller-supplied Parameter echoed back
+///   0x0020 ★ IT HITS THE BREAKPOINT: it read `BeingDebugged` = 1, took `DbgBreakPoint()`, and the
+///          debugger's `NtWaitForDebugEvent` reports `DbgBreakpointStateChange` for the BREAK-IN
+///          THREAD's `CLIENT_ID` with `STATUS_BREAKPOINT`, read back out of client memory
+///   0x0040 ★ `NtDebugContinue(DBG_CONTINUE)` resumes it PAST the int3 (its marker advances) and it
+///          runs its `RtlExitUserThread` exit path — a clean end-to-end break-in
+static DBGK_BREAKIN_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
 /// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
@@ -10238,6 +10333,44 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         dbgk_blk & 0x0080 == 0x0080,
                         &mut passed,
                     );
+                    // ---- `DbgUiIssueRemoteBreakin` END TO END. The last unconditional ntdll stub,
+                    // and the two things it depended on: cross-VSpace thread creation with a start
+                    // context, and the `PEB->BeingDebugged` write-through that makes the break-in
+                    // thread do anything at all.
+                    let dbgk_brk = DBGK_BREAKIN_SELFTEST.load(Ordering::Relaxed);
+                    // `DbgkpMarkProcessPeb`: attaching writes BeingDebugged into the target's LIVE
+                    // PEB page and detaching clears it — read back out of that very page, not out
+                    // of the model.
+                    check(
+                        b"exec_dbgk_peb_being_debugged_writethrough",
+                        dbgk_brk & (0x0001 | 0x0002 | 0x0004) == (0x0001 | 0x0002 | 0x0004),
+                        &mut passed,
+                    );
+                    // `RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`: the access-checked
+                    // service creates a REAL thread inside the target's address space at the
+                    // caller's entry point with the caller's parameter — and it RUNS there.
+                    check(
+                        b"exec_dbgk_remote_breakin_thread_runs",
+                        dbgk_brk & (0x0008 | 0x0010) == (0x0008 | 0x0010),
+                        &mut passed,
+                    );
+                    // The break-in thread reads PEB->BeingDebugged, executes `int3`, the debugger
+                    // retrieves DbgBreakpointStateChange for ITS ClientId, and DBG_CONTINUE resumes
+                    // it past the breakpoint into a clean thread exit.
+                    check(
+                        b"exec_dbgk_remote_breakin_reports_breakpoint",
+                        dbgk_brk & (0x0020 | 0x0040) == (0x0020 | 0x0040),
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] dbgk remote-breakin selftest bits=0x");
+                    print_hex(dbgk_brk as u32);
+                    print_str(b" peb-marks=");
+                    print_u64(DBGK_PEB_MARKS.load(Ordering::Relaxed));
+                    print_str(b" remote-created=");
+                    print_u64(PM_REMOTE_THREADS_CREATED.load(Ordering::Relaxed));
+                    print_str(b" remote-spawned=");
+                    print_u64(PM_REMOTE_THREADS_SPAWNED.load(Ordering::Relaxed));
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] dbgk module selftest bits=0x");
                     print_hex(dbgk_mod as u32);
                     print_str(b" loads=");
