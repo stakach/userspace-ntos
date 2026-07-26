@@ -488,6 +488,41 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
    against the previous commit; the only differences should be per-build addresses/timestamps/tids,
    known-nondeterministic interleaves, and your new spec lines.
 
+> **Update (2026-07-27, gate 230/99) — the "npfs concurrent-IRP hang" was never npfs, and never an
+> ntdll item either. It was the SHARED COMPONENT-DISPATCH TRANSPORT.** The LSA self-RPC's 48-byte
+> `LsarOpenPolicy` response write *completes correctly* inside the hosted `npfs.sys`
+> (`[fsd-ret] ret=0`, `[fsd-done] st=0 info=48`, both data queues consistent on the way in). What
+> never came back was the **executive**: `component_main` publishes its completion (`send_done`)
+> *before* it waits for the next request, and `component_pump` accepted **any** `dispatch_label`
+> message as the answer to the request it had just sent. A `done` queued for an earlier cycle
+> satisfies that `Recv` just as well, the two sides drift one message apart, and one dispatch later
+> BOTH are blocked in `Send` on the dispatch endpoint — a deadlock with no fault, no log line and no
+> driver involvement. The extra concurrency of the LSA route (the per-connection worker badge 26 plus
+> the ntdll thread-pool worker badge 25) is what made the drift happen: **8 slips on the route-ON
+> boot**, zero with a single IRP driver.
+>
+> Fixed by a **sequence handshake**: the pump samples `SH_REQ_SEQ` before sending and accepts only a
+> `done` that carries a new sequence, consuming stale ones and re-waiting (`PUMP_STALE_DONES`).
+> Scoped to the IRP substrate — win32k's Syscall pump deliberately re-enters around usermode
+> callbacks, where an unmoved sequence IS the outer dispatch's real completion.
+>
+> Three further real fixes landed with it, all executive-side: **one FILE_OBJECT per OPEN** instead of
+> per IRP (npfs stores it in `Ccb->FileObject[end]` and writes through it on disconnect — with the old
+> lifetime the pool had recycled the block, and the audit measures **30 dangling FSD-held pointers**
+> in the bypass arm vs 0 now); **`KeBugCheckEx` bound**, so a hosted driver's own `NpBugCheck` is
+> caught, reported with its code + 4 parameters + raising component, and the dispatch unwound
+> fail-closed instead of the assertion being silently skipped; and a **pre-dispatch npfs data-queue
+> audit** that turns the one call-free spin state `NpGetNextRealDataQueueEntry` can reach into a
+> bounded, counter-backed report (`FSD_QUEUE_REPAIRS`, 0 on a healthy boot).
+>
+> Gate specs: `exec_npfs_concurrent_irp_read_and_write`, `exec_npfs_write_split_across_pending_read`,
+> `exec_npfs_file_object_lifetime`, `exec_kebugcheck_bound_and_reported`,
+> `exec_component_dispatch_in_phase`. **The LSA worker route is still GATED OFF**: with it on the boot
+> now sails past the LSA response write (msgina demand-loads, the SCM pipe traffic resumes) and stops
+> at a **win32k** dispatch (`csrss -> SSN 0x1002`) — the same transport class on the substrate the
+> handshake is scoped out of. That is the next frontier; no logon, token or RPC reply is fabricated.
+> See the NPFS CONCURRENT-IRP BATCH section of `ntdll_plan.md`.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

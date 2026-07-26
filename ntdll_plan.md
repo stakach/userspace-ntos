@@ -4796,3 +4796,160 @@ serialisation queue (what a real FSD's `NpAcquireExclusiveVcb` + IRP queue provi
 `s_io_complete_request`'s per-completion `pool_free(slot.file_object)` (a FILE_OBJECT outlives one
 IRP; freeing it per completion is a semantic bug that the new idempotent `pool_free` now merely
 survives).
+
+### NPFS CONCURRENT-IRP BATCH (2026-07-27, gate 225 -> **230/99 ZERO FAILs**) - the "npfs.sys spins forever on a concurrent IRP" wall was **NOT AN npfs BUG AT ALL**: npfs' `\pipe\lsarpc` response write COMPLETES correctly. The boot died in the SHARED COMPONENT-DISPATCH TRANSPORT, which slips a message out of phase and then deadlocks executive-vs-component, both blocked in `Send`
+
+**What was believed (previous batch) vs what is true.** The LSA-RPC batch concluded that the 48-byte
+`LsarOpenPolicy` response write "spins forever inside `NpWriteDataQueue`/`NpGetNextRealDataQueueEntry`
+(`writesup.c:48`, `datasup.c`)" because the write is the first one issued while a SECOND IRP (the
+worker's pending read) is outstanding on the same FILE_OBJECT. Every part of that except the symptom
+turned out to be wrong. Bracketing the dispatch with `ENTER`/`EXIT` markers, then bracketing the
+handler call itself, then bracketing the component's reply, produced this on the live boot:
+
+```
+[fsd-svc]  ENTER inst=0 major=4 fid=0x0e802711
+[fsd-ccb]  ccb=0x0e802710 state=3 readmode=11 complmode=00 fcb=0x0e802640 cfg=2 pipetype=1 instances=2
+[fsd-queue] dq=0x0e802790 state=0 entries=1 walked=1 types=0x1 bytes=16 quotaused=16 byteoff=0 quota=4096
+[fsd-queue]   entry=0x0e802fb0 type=0 size=16 quota=16 irp=0x0e802e80 irp-major=3 pending=1
+[fsd-call] major=4 handler=0x0e00c390 inlen=48 outlen=0 ...
+[fsd-ret]  major=4 ret=0x00000000          <- npfs RETURNED, cleanly
+[fsd-done] major=4 st=0x00000000 info=48   <- run_irp finished, 48 bytes accepted
+[cm] replying seq=39                       <- the component published the completion
+<silence for 555 s>
+```
+
+npfs did its job: the OUTBOUND data queue was perfectly consistent going in (one 16-byte `Buffered`
+read entry holding a live pending read IRP - the ordinary rpcrt4 "read the 16-byte PDU header first"
+shape), `NpWriteDataQueue` split the 48 bytes correctly, and the whole IRP came back `STATUS_SUCCESS`
+/ `Information = 48`. **The executive never came back.** `[pump] sent -> recv` (the marker placed
+immediately after `component_pump`'s `ep_send`) never printed for that dispatch, and the component
+was sitting in `send_done_on`. Both sides were blocked in **`Send` on the same endpoint** - a
+deadlock no fault, no log line and no watchdog can break.
+
+**ROOT CAUSE - the dispatch transport is a Send/Recv pair with NO request<->reply binding.**
+`component_main`'s loop is `send_done -> recv_req -> dispatch -> write status -> loop`, i.e. it
+publishes its completion **before** it waits for the next request. `component_pump` is
+`ep_send(request) -> ep_recv(any dispatch_label message)`. Nothing ties the message the pump receives
+to the request it just sent: a `done` the component queued for an EARLIER cycle satisfies that `Recv`
+just as well. When it does, the pump returns a completion for work the component has not run yet
+(reading a STALE status/information out of the shared page), the two sides drift one message apart,
+and one dispatch later the executive's `ep_send` finds the component blocked in `Send` instead of
+`Recv`. With one hosted thread driving IRPs the drift never happened; the LSA self-RPC adds two more
+(`LSA_WORKER_BADGE 26` + the ntdll thread-pool worker badge 25 running `RPCRT4_worker_thread`), and
+then it does - **8 slips on the route-ON boot**.
+
+**FIX 1 - the SEQUENCE HANDSHAKE (`spawn_hosts::component_pump`).** `component_main` already bumps
+`SH_REQ_SEQ` after every dispatch it actually ran. The pump now samples it before `ep_send` and
+accepts only a `done` that carries a NEW sequence; a stale one is consumed and the pump keeps waiting
+for its own completion (`PUMP_STALE_DONES`). That re-phases the transport - and because the executive
+is then always the side parked in `Recv`, the component's `Send` never has to queue, so the deadlock
+cannot form. Scoped to the IRP (driver) substrate: win32k's Syscall substrate deliberately RE-ENTERS
+the pump around usermode callbacks, where a `done` whose sequence has not moved IS the legitimate
+completion of the outer dispatch (proven the hard way - an unscoped handshake hung the win32k
+`api=3` nested-callback dispatch).
+
+**FIX 2 - FILE_OBJECT LIFETIME: one FILE_OBJECT per OPEN, not per IRP (`driver_launch.rs`).** The
+flagged semantic bug is real and worse than "a semantic bug": `run_irp` built a fresh FILE_OBJECT per
+IRP and `s_io_complete_request` freed it on every completion, but an FSD keeps the pointer -
+`NpSetFileObject` stores it and `NpCreateClientEnd`/`NpCreateExistingNamedPipe`/
+`NpSetConnectedPipeState` record it in **`Ccb->FileObject[NamedPipeEnd]`** (`create.c:645/772`,
+`strucsup.c:334`, `statesup.c:51`), and on disconnect npfs WRITES THROUGH it
+(`NpSetFileObject(Ccb->FileObject[end], NULL, NULL, ...)`, `statesup.c:163/289/292/310/...` zeroes
+`FsContext`(+0x18) / `FsContext2`(+0x20), sets `PrivateCacheMap`(+0x30) = 1) into a block the FSD pool
+had already recycled - and the next consumer of that 0x100 size class is npfs' own
+`NP_DATA_QUEUE_ENTRY`/`NP_CCB`. Now a FILE_OBJECT is allocated once per open, keyed by the `FsContext`
+npfs hands back (`FILE_OBJECTS`, 64 slots), reused by every IRP on that open, and destroyed only at
+CLEANUP/CLOSE. `PendingIrp` also captures its `fid` at ISSUE time instead of re-reading
+`FILE_OBJECT->FsContext` at completion time (npfs NULLs that field on disconnect, so a completion
+racing a disconnect used to key the delivered bytes under fid 0 and never wake the parked reader).
+**Measured: with the old lifetime npfs holds 30 dangling FILE_OBJECT pointers by the end of the npfs
+selftest; with the fix, 0.**
+
+**FIX 3 - `KeBugCheckEx` is BOUND: a hosted driver's own consistency bugcheck is CAUGHT, REPORTED and
+UNWOUND.** Every hosted driver imports it and npfs wraps it as `NpBugCheck(p1,p2,p3)` =
+`KeBugCheckEx(NPFS_FILE_SYSTEM, (FILE_ID << 16) | __LINE__, p1, p2, p3)` (`npfs.h:106`) - the driver's
+own statement that its state is inconsistent, complete with source file id and line. It was an
+UNBOUND import resolving to the fail-soft `s_true` no-op, so the assertion was SKIPPED and the driver
+carried on. `s_ke_bug_check_ex` now records + prints the code, all four parameters and (for
+`NPFS_FILE_SYSTEM`) the decoded file/line, and **unwinds the offending dispatch** through a
+purpose-written asm setjmp/longjmp pair (`fsd_guarded_call`/`fsd_guarded_longjmp`; the escape
+abandons the driver's frames, so no Rust value may be live across it). The dispatch fails
+`STATUS_UNSUCCESSFUL`, the request graph is deliberately leaked (the driver may still hold pointers
+into it), the component keeps serving, and `dispatch_irp` attributes the bugcheck to the instance it
+was driving. Fail-closed, never a hang, never a dead boot.
+
+**FIX 4 - the npfs DATA-QUEUE CONSISTENCY AUDIT + hang guard (`audit_ccb`/`audit_data_queue`).**
+npfs' own `ASSERT`s over its data-queue invariants are compiled out of the release binary we host,
+and the one state they guard (`QueueState == Empty` with a non-empty list whose head is not
+`Buffered`/`Unbuffered`) IS a call-free infinite spin in `NpGetNextRealDataQueueEntry`
+(`datasup.c:183`). Before every pipe IRP the host now decodes the CCB and validates both
+`NP_DATA_QUEUE`s (state vs list-emptiness, `EntriesInQueue` vs the walked length, entry types, link
+sanity) plus the FILE_OBJECT pointers npfs is holding; an inconsistency is reported and the queue is
+re-initialised exactly as `NpInitializeDataQueue` does, so npfs can never spin on it.
+`FSD_QUEUE_REPAIRS` must be 0 - it is (the audit is a guard, not a crutch).
+
+**WHAT THE ROUTE-ON BOOT NOW REACHES (and the new wall).** With `LSA_WORKER_ROUTE_ENABLED = true` and
+all four fixes, the LSA self-RPC response write no longer ends the boot: the worker (badge 26) and the
+thread-pool worker (badge 25) both run past it, msgina demand-loads (728064 B), and the SCM `\ntsvcs`
+pipe traffic resumes. The boot then stops at a **win32k** dispatch (`[win32k-svc] csrss -> SSN 0x1002
+(dispatch)` with no completion) - the SAME transport class, on the Syscall substrate the handshake is
+deliberately scoped OUT of. That is a new, different wall and its own batch (the win32k pump's
+nested-callback protocol needs a request<->reply binding that is compatible with re-entry), so the
+route is **GATED OFF** for this commit and the boot QUIESCES cleanly. **No logon is fabricated:**
+`LsaOpenPolicy` still does not return, `SamIConnect` still fails on the NULL-RootDirectory miss,
+`Administrator` is NOT validated and `WLX_SAS_ACTION_LOGON` is NOT returned.
+
+**Gate specs (+5 -> 230/99, ZERO FAILs).**
+* `exec_npfs_concurrent_irp_read_and_write` - a pending READ and a WRITE outstanding on ONE
+  FILE_OBJECT both complete with the RIGHT BYTES: the server's read pends, a 48-byte response is
+  written on the same handle while it is outstanding, the client reads those exact 48 bytes, and the
+  client's later write completes the still-pending read with its exact payload. Also asserts the
+  write REUSED the open's FILE_OBJECT (`fo_reused >= 4`) and that npfs' queues never needed repair.
+* `exec_npfs_write_split_across_pending_read` - the rpcrt4 header-then-body shape: a 48-byte write
+  against a SMALLER 16-byte pending read must complete the reader with `STATUS_BUFFER_OVERFLOW` + the
+  first 16 bytes and queue the 32-byte remainder for the next read. (This is byte-for-byte the live
+  LSA response shape; proving it in isolation is what showed the queue shape was never the problem.)
+* `exec_npfs_file_object_lifetime` - >= 2 per-open FILE_OBJECTs, >= 4 re-validations of the pointers
+  npfs is holding, ZERO dangling and ZERO corrupted (the held pointer must still be one of our live
+  objects AND still contain `Type == IO_TYPE_FILE`, `Size == 0x100`).
+* `exec_kebugcheck_bound_and_reported` - npfs' `NpDecodeFileObject` is handed a node type it does not
+  know; its own `NpBugCheck` fires and is CAUGHT: code `0x25` (NPFS_FILE_SYSTEM), a real npfs file id
+  + line in P1, P2 == the node type we planted (so the parameters really do arrive), >= 1 unwind,
+  attributed to instance 0, and the dispatch failed cleanly with `STATUS_UNSUCCESSFUL`.
+* `exec_component_dispatch_in_phase` - the phase slip, FAULT-INJECTED: the component publishes a
+  premature `done` for a dispatch it has not run, and the pump must re-wait past it and still return
+  the READ's real `(0, 11, "PHASE-SLIP!")` rather than the previous dispatch's `(0, 0)`.
+
+Observed: `C-e pended=1 response_ok=1 wake_written=1 pending_delivered=1 fo_reused=15 queue_repairs=0`,
+`C-f opens=2 held-checks=30 dangling=0 corrupted=0 audits=30`, `C-g count=1 unwinds=1 code=0x25
+p1=0x00060036 (file=6 line=54) p2=0xaa instance=1 dispatch_status=0xc0000001`,
+`C-h write=0x0 hdr_ok=1 rest_ok=1`, `C-i stale-before=0 stale-after=1 read=0x0 info=11 bytes_ok=1`.
+
+**BYPASS EXPERIMENTS.**
+* `FSD_FILE_OBJECT_PER_OPEN = false` + `KEBUGCHECK_BOUND = false` (main.rs) -> **227/99 with exactly
+  three FAILs**: `exec_npfs_file_object_lifetime` (`opens=0 held-checks=30 **dangling=30**` - npfs is
+  holding thirty pointers to recycled pool blocks), `exec_npfs_concurrent_irp_read_and_write`
+  (`fo_reused=0` - every IRP rebuilds and destroys its own FILE_OBJECT) and
+  `exec_kebugcheck_bound_and_reported` (`count=0 unwinds=0`, and the dispatch returns
+  `0xC00000B0 STATUS_PIPE_DISCONNECTED` because npfs SKIPPED its own assertion and carried on).
+* `FSD_DISPATCH_SEQ_HANDSHAKE = false` (main.rs) -> `exec_component_dispatch_in_phase` FAILs
+  (`stale-after=0`, the read returns the PREVIOUS dispatch's `info=0` and the wrong bytes) **and the
+  boot then HANGS, RUNEXIT=124** - the injected slip cascades into exactly the executive/component
+  `Send`/`Send` deadlock the handshake prevents. The strongest possible bypass evidence.
+* Restored -> **230/99 ZERO FAILs on three consecutive boots** (RUNEXIT=3, `microtest sentinel`), the
+  three PASS-lists `diff`-identical and equal to `4fe4c50`'s **plus exactly the five new specs**. No
+  regression: `exec_pipe_syscalls_routed_through_npfs`, `npfs_isolated_vspace`,
+  `exec_npfs_flush_pending`, `exec_fsd_on_shared_harness`, `exec_svc_rpc_listener_multiplex`,
+  `exec_second_irp_driver_via_harness`, `exec_win32k_desktop_painted`, all 7 `exec_msgina_*`, all 5
+  `exec_lsa_*`, the SAM/hive specs, both `exec_user_callback_*` and all 21 `exec_dbgk_*` PASS.
+  Host: `nt-ntdll` 694, `nt-process` 79, `nt-io-manager` 86, `nt-syscall` 42, `nt-user-callback` 41,
+  `nt-syscall-abi` 15, `nt-hive-core` 16, `nt-hive-regf` 5 (executive-only change; no crate logic
+  added). No `rust-micro/src` change.
+
+**NEW FRONTIER: the win32k Syscall substrate needs the same request<->reply binding.** The IRP
+substrate is now phase-safe; win32k's is not, and with the LSA route on it is what stops the boot
+(`csrss -> SSN 0x1002` never completes). Its pump is deliberately re-entrant around usermode
+callbacks, so the fix is not the IRP handshake verbatim - it needs a per-dispatch token that survives
+nesting (or a genuine `Call`/`ReplyRecv` transport). With that, the LSA route can go back ON and the
+chain continues at `LsaOpenPolicy` -> `SampInitDatabase` -> `SamIConnect` ->
+`SamrLookupNamesInDomain(Administrator)` -> `MsvpCheckPassword` -> `WLX_SAS_ACTION_LOGON`.

@@ -174,6 +174,10 @@ const STATUS_PENDING: u32 = 0x0000_0103;
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
 const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
 const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
+/// `IRP_MJ_CLOSE` / `IRP_MJ_CLEANUP` — the requests that END an open (and therefore the ONLY
+/// requests that may destroy its FILE_OBJECT). See [`FILE_OBJECTS`].
+const IRP_MJ_CLOSE: u64 = 0x02;
+const IRP_MJ_CLEANUP: u64 = 0x12;
 
 #[derive(Clone, Copy)]
 struct PendingIrp {
@@ -182,17 +186,36 @@ struct PendingIrp {
     file_object: u64,
     data: u64,
     major: u8,
+    /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
+    /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
+    /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
+    /// (`statesup.c:163/289/…`), so a completion racing a disconnect would key the delivered
+    /// bytes under fid 0 and the parked reader would never be woken.
+    fid: u64,
+    /// Whether THIS IRP owns the FILE_OBJECT block (a transient one, not the per-open object in
+    /// [`FILE_OBJECTS`]). Only a transient FILE_OBJECT may be freed on completion — see
+    /// [`fo_for_open`].
+    owns_fo: bool,
 }
 
 const PENDING_IRP_CAP: usize = 32;
-static mut PENDING_IRPS: [PendingIrp; PENDING_IRP_CAP] = [PendingIrp {
+const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
     irp: 0,
     iosl: 0,
     file_object: 0,
     data: 0,
     major: 0,
-}; PENDING_IRP_CAP];
+    fid: 0,
+    owns_fo: false,
+};
+static mut PENDING_IRPS: [PendingIrp; PENDING_IRP_CAP] = [EMPTY_PENDING_IRP; PENDING_IRP_CAP];
 static mut DATA_TRACE_COUNT: u32 = 0;
+/// Bounded ENTER/EXIT trace of IRP dispatches (see [`dispatch_irp`]).
+static mut FSD_DISPATCH_TRACE: u32 = 0;
+/// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
+static mut IO_COMPLETE_CALLS: u64 = 0;
+static mut POOL_CALLS: u64 = 0;
+static mut POOL_LONG_WALKS: u32 = 0;
 static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 
 // BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
@@ -278,6 +301,14 @@ pub(crate) static FSD_POOL_LIST_CYCLES: AtomicU64 = AtomicU64::new(0);
 /// double-freed it. `pool_free` now refuses the double free (the real fix); this bound is the
 /// belt-and-braces so a corrupt list can never again hang the system.
 pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
+    POOL_CALLS += 1;
+    if POOL_CALLS % 16384 == 0 {
+        print_str(b"[fsd-pool-heartbeat] calls=");
+        print_u64(POOL_CALLS);
+        print_str(b" size=");
+        print_u64(size);
+        print_str(b"\n");
+    }
     // first-fit the free list
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
     let mut prev = head_slot;
@@ -332,6 +363,14 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
 /// response on it — the second completion double-freed it. A real allocator must reject that rather
 /// than corrupt its own list, so scan (bounded) and drop the redundant push.
 unsafe fn pool_free(p: u64) {
+    POOL_CALLS += 1;
+    if POOL_CALLS % 16384 == 0 {
+        print_str(b"[fsd-pool-heartbeat] calls=");
+        print_u64(POOL_CALLS);
+        print_str(b" free p=");
+        print_hex(p as u32);
+        print_str(b"\n");
+    }
     if p < FSD_POOL_VADDR + POOL_DATA_OFF
         || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
     {
@@ -341,6 +380,14 @@ unsafe fn pool_free(p: u64) {
     let mut cur = read_volatile(head_slot);
     let mut steps = 0u64;
     while cur != 0 && steps < POOL_FREE_LIST_MAX {
+        if steps == 4096 && POOL_LONG_WALKS < 8 {
+            POOL_LONG_WALKS += 1;
+            print_str(b"[fsd-pool] LONG free-list walk p=");
+            print_hex(p as u32);
+            print_str(b" cur=");
+            print_hex(cur as u32);
+            print_str(b"\n");
+        }
         if cur == p {
             if FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
                 print_str(b"[fsd-host] rejected DOUBLE pool_free p=0x");
@@ -362,6 +409,470 @@ unsafe fn pool_free(p: u64) {
     let head = read_volatile(head_slot);
     write_volatile((p - 8) as *mut u64, head);
     write_volatile(head_slot, p);
+}
+
+// --- FILE_OBJECT LIFETIME: one FILE_OBJECT per OPEN, not per IRP -------------------------------
+//
+// ★ THE BUG THIS FIXES (the root cause of the LSA-self-RPC npfs hang). `run_irp` used to build a
+// FRESH `FILE_OBJECT` for every dispatched IRP and free it the moment that IRP completed. But an
+// FSD keeps the FILE_OBJECT pointer well past the IRP that introduced it:
+//
+//   * `NpSetFileObject(FileObject, Ccb, NonPagedCcb, End)` (`fileobsup.c:64`) stores our pointer,
+//     and `NpCreateClientEnd`/`NpCreateExistingNamedPipe`/`NpSetConnectedPipeState` record it in
+//     **`Ccb->FileObject[NamedPipeEnd]`** (`create.c:645/772`, `strucsup.c:334`, `statesup.c:51`).
+//   * on disconnect/close npfs WRITES THROUGH that stored pointer —
+//     `NpSetFileObject(Ccb->FileObject[end], NULL, NULL, …)` (`statesup.c:163/289/292/310/…`) zeroes
+//     `FsContext`(+0x18) / `FsContext2`(+0x20) and sets `PrivateCacheMap`(+0x30) = 1.
+//
+// With the per-IRP lifetime those stores landed on a block the pool had already RECYCLED. The FSD
+// pool hands 0x100-byte blocks straight back out, and the very next consumer of that size class is
+// npfs' own `NP_DATA_QUEUE_ENTRY`/`NP_CCB`, so npfs silently corrupted its OWN data-queue
+// bookkeeping: +0x10 of an `NP_DATA_QUEUE_ENTRY` is `DataEntryType`, +0x18 is `Irp`, +0x30 is
+// `DataSize`; +0x10 of an `NP_DATA_QUEUE` is `QueueState`. A `DataEntryType` outside
+// {Buffered, Unbuffered} with `QueueState == Empty` is precisely the state in which
+// `NpGetNextRealDataQueueEntry` (`datasup.c:183`) loops forever: it re-reads `Queue.Flink`, calls
+// `NpRemoveDataQueueEntry`, and that function returns WITHOUT removing anything when
+// `QueueState == Empty` — a call-free infinite spin inside npfs (zero faults, zero imports), which
+// is exactly what was observed.
+//
+// The fix is the NT lifetime: ONE FILE_OBJECT per OPEN, reused by every IRP on that open (which is
+// also what makes two concurrent IRPs on one handle — a pending read plus a write, the ordinary
+// rpcrt4 server shape — structurally correct rather than merely lucky), freed on CLEANUP/CLOSE.
+
+#[derive(Clone, Copy)]
+struct FileObjectSlot {
+    /// npfs' `FsContext` for this open (the opaque file id the executive routes by).
+    fid: u64,
+    /// The FILE_OBJECT block in the FSD pool.
+    fo: u64,
+}
+
+const FILE_OBJECT_CAP: usize = 64;
+static mut FILE_OBJECTS: [FileObjectSlot; FILE_OBJECT_CAP] =
+    [FileObjectSlot { fid: 0, fo: 0 }; FILE_OBJECT_CAP];
+
+/// FILE_OBJECTs created for an open (one per open, not per IRP).
+pub(crate) static FSD_FO_OPENS: AtomicU64 = AtomicU64::new(0);
+/// IRPs that REUSED the open's existing FILE_OBJECT (the concurrent-IRP proof).
+pub(crate) static FSD_FO_REUSED: AtomicU64 = AtomicU64::new(0);
+/// Times a `Ccb->FileObject[end]` pointer npfs still holds was checked for liveness.
+pub(crate) static FSD_FO_LIVE_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// …and was NOT one of our live per-open FILE_OBJECTs (a dangling FSD-held pointer).
+pub(crate) static FSD_FO_DANGLING: AtomicU64 = AtomicU64::new(0);
+/// …and no longer even CONTAINS a FILE_OBJECT (`Type != IO_TYPE_FILE` / wrong `Size`) — the hard,
+/// non-circular evidence of a use-after-free: the pool recycled the block under npfs' feet.
+pub(crate) static FSD_FO_CORRUPTED: AtomicU64 = AtomicU64::new(0);
+/// Opens whose FILE_OBJECT had to be transient because [`FILE_OBJECTS`] was full (bounded fallback).
+pub(crate) static FSD_FO_TABLE_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// The per-open FILE_OBJECT for `fid`, or 0.
+unsafe fn fo_lookup(fid: u64) -> u64 {
+    if fid == 0 {
+        return 0;
+    }
+    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
+    for slot in table.iter() {
+        if slot.fid == fid {
+            return slot.fo;
+        }
+    }
+    0
+}
+
+/// Is `fo` one of the live per-open FILE_OBJECTs?
+unsafe fn fo_is_registered(fo: u64) -> bool {
+    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
+    table.iter().any(|slot| slot.fid != 0 && slot.fo == fo)
+}
+
+/// Register `fo` as the per-open FILE_OBJECT for `fid`. A stale row for the same `fid` (the pool
+/// re-issued a CCB address after a close) is replaced and its old block released.
+unsafe fn fo_register(fid: u64, fo: u64) -> bool {
+    if fid == 0 || fo == 0 {
+        return false;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
+    for slot in table.iter_mut() {
+        if slot.fid == fid {
+            if slot.fo != fo {
+                pool_free(slot.fo);
+                slot.fo = fo;
+            }
+            return true;
+        }
+    }
+    for slot in table.iter_mut() {
+        if slot.fid == 0 {
+            *slot = FileObjectSlot { fid, fo };
+            FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    FSD_FO_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// Release the per-open FILE_OBJECT for `fid` (CLEANUP/CLOSE — the ONLY place a FILE_OBJECT dies).
+unsafe fn fo_release(fid: u64) {
+    if fid == 0 {
+        return;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
+    for slot in table.iter_mut() {
+        if slot.fid == fid {
+            pool_free(slot.fo);
+            *slot = FileObjectSlot { fid: 0, fo: 0 };
+            return;
+        }
+    }
+}
+
+// --- npfs DATA-QUEUE CONSISTENCY AUDIT (the hang guard + the lifetime proof) -------------------
+//
+// npfs' own `ASSERT`s over these invariants are compiled out of the release `npfs.sys` we host, so
+// an inconsistency is not caught — it becomes the call-free `NpGetNextRealDataQueueEntry` spin
+// described above, which freezes the WHOLE boot (the executive blocks in `component_pump`'s recv,
+// RUNEXIT=124). Auditing the queues from the host BEFORE we dispatch into npfs turns that class of
+// failure into a bounded, counter-backed report — and, because the audit also validates the
+// FILE_OBJECT pointers npfs is holding, it is the direct proof that the lifetime fix above works.
+//
+// x64 offsets (`npfs.h`): NP_CCB { NodeType@0, NamedPipeState@2, ClientQos@8, CcbEntry@0x18,
+// Fcb@0x28, FileObject[2]@0x30, Process@0x40, ClientSession@0x48, NonPagedCcb@0x50,
+// DataQueue[2]@0x58 (0x28 each), ClientContext@0xA8, IrpList@0xB0 }.
+// NP_DATA_QUEUE { Queue(LIST_ENTRY)@0, QueueState@0x10, BytesInQueue@0x14, EntriesInQueue@0x18,
+// QuotaUsed@0x1c, ByteOffset@0x20, Quota@0x24 }.
+// NP_DATA_QUEUE_ENTRY { QueueEntry(LIST_ENTRY)@0, DataEntryType@0x10, Irp@0x18, QuotaInEntry@0x20,
+// ClientSecurityContext@0x28, DataSize@0x30 }.
+const NPFS_NTC_CCB: u16 = 6;
+const NP_CCB_FILE_OBJECT: u64 = 0x30;
+const NP_CCB_DATA_QUEUE: u64 = 0x58;
+const NP_DATA_QUEUE_SIZE: u64 = 0x28;
+/// `NP_DATA_QUEUE_STATE::Empty`.
+const NP_QUEUE_EMPTY: u32 = 2;
+/// Largest legal `NP_DATA_QUEUE_ENTRY::DataEntryType` (Buffered=0, Unbuffered=1, plus npfs'
+/// internal 2 = flush-buffers marker and 3).
+const NP_ENTRY_TYPE_MAX: u32 = 3;
+/// Hard bound on a data-queue walk (npfs' quotas keep real queues tiny).
+const NP_QUEUE_WALK_MAX: u32 = 64;
+
+/// Data queues audited before dispatch.
+pub(crate) static FSD_QUEUE_AUDITS: AtomicU64 = AtomicU64::new(0);
+/// Data queues found INCONSISTENT and re-initialised to a consistent empty state (the hang guard).
+/// MUST be 0 on a healthy boot — a non-zero value is a gate failure, not a silent 555-second hang.
+pub(crate) static FSD_QUEUE_REPAIRS: AtomicU64 = AtomicU64::new(0);
+static mut QUEUE_DUMP_COUNT: u32 = 0;
+
+/// Print one data-queue dump line (bounded).
+unsafe fn queue_dump(tag: &[u8], dq: u64, state: u32, entries: u32, walked: u32, types: u32) {
+    print_str(tag);
+    print_str(b" dq=0x");
+    print_hex(dq as u32);
+    print_str(b" state=");
+    print_u64(state as u64);
+    print_str(b" entries=");
+    print_u64(entries as u64);
+    print_str(b" walked=");
+    print_u64(walked as u64);
+    print_str(b" types=0x");
+    print_hex(types);
+    unsafe {
+        print_str(b" bytes=");
+        print_u64(read_volatile((dq + 0x14) as *const u32) as u64);
+        print_str(b" quotaused=");
+        print_u64(read_volatile((dq + 0x1c) as *const u32) as u64);
+        print_str(b" byteoff=");
+        print_u64(read_volatile((dq + 0x20) as *const u32) as u64);
+        print_str(b" quota=");
+        print_u64(read_volatile((dq + 0x24) as *const u32) as u64);
+    }
+    print_str(b"\n");
+}
+
+/// Audit ONE `NP_DATA_QUEUE`; repair (re-init to a consistent Empty) if any npfs invariant is
+/// broken. Returns true if a repair was made.
+unsafe fn audit_data_queue(dq: u64) -> bool {
+    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+    let flink = read_volatile(dq as *const u64);
+    let state = read_volatile((dq + 0x10) as *const u32);
+    let entries = read_volatile((dq + 0x18) as *const u32);
+    let list_empty = flink == dq;
+    let mut walked = 0u32;
+    let mut types = 0u32; // a bitmask of the DataEntryTypes seen (diagnostic)
+    let mut bad_link = false;
+    let mut bad_type = false;
+    let mut cur = flink;
+    while cur != dq {
+        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur + 0x38 > pool_end || cur & 7 != 0 {
+            bad_link = true;
+            break;
+        }
+        let ty = read_volatile((cur + 0x10) as *const u32);
+        if ty > NP_ENTRY_TYPE_MAX {
+            bad_type = true;
+        } else {
+            types |= 1 << ty;
+        }
+        cur = read_volatile(cur as *const u64);
+        walked += 1;
+        if walked > NP_QUEUE_WALK_MAX {
+            bad_link = true;
+            break;
+        }
+    }
+    let inconsistent = bad_link
+        || bad_type
+        || state > NP_QUEUE_EMPTY
+        || (state == NP_QUEUE_EMPTY) != list_empty
+        || walked != entries;
+    FSD_QUEUE_AUDITS.fetch_add(1, Ordering::Relaxed);
+    if !inconsistent {
+        if QUEUE_DUMP_COUNT < 24 && !list_empty {
+            QUEUE_DUMP_COUNT += 1;
+            queue_dump(b"[fsd-queue]", dq, state, entries, walked, types);
+            let mut e = read_volatile(dq as *const u64);
+            let mut n = 0u32;
+            while e != dq && n <= NP_QUEUE_WALK_MAX {
+                if e < FSD_POOL_VADDR + POOL_DATA_OFF || e + 0x38 > pool_end {
+                    break;
+                }
+                let ty = read_volatile((e + 0x10) as *const u32);
+                let eirp = read_volatile((e + 0x18) as *const u64);
+                let dsz = read_volatile((e + 0x30) as *const u32);
+                let quota = read_volatile((e + 0x20) as *const u32);
+                print_str(b"[fsd-queue]   entry=");
+                print_hex(e as u32);
+                print_str(b" type=");
+                print_u64(ty as u64);
+                print_str(b" size=");
+                print_u64(dsz as u64);
+                print_str(b" quota=");
+                print_u64(quota as u64);
+                print_str(b" irp=");
+                print_hex(eirp as u32);
+                if eirp != 0 && eirp >= FSD_POOL_VADDR + POOL_DATA_OFF && eirp + 0x120 <= pool_end {
+                    let stack = read_volatile((eirp + 0xb8) as *const u64);
+                    let mj = if stack >= FSD_POOL_VADDR + POOL_DATA_OFF && stack + 0x48 <= pool_end
+                    {
+                        read_volatile(stack as *const u8) as u64
+                    } else {
+                        0xFF
+                    };
+                    print_str(b" irp-major=");
+                    print_u64(mj);
+                    print_str(b" pending=");
+                    let table = &*core::ptr::addr_of!(PENDING_IRPS);
+                    print_u64(table.iter().any(|s| s.irp == eirp) as u64);
+                }
+                print_str(b"\n");
+                e = read_volatile(e as *const u64);
+                n += 1;
+            }
+        }
+        return false;
+    }
+    FSD_QUEUE_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    queue_dump(b"[fsd-queue] INCONSISTENT -> repaired", dq, state, entries, walked, types);
+    // Re-initialise exactly as `NpInitializeDataQueue` (`datasup.c:32`) does, keeping Quota: an
+    // empty circular list in state Empty. npfs can no longer spin on it.
+    write_volatile(dq as *mut u64, dq); // Flink = &Queue
+    write_volatile((dq + 8) as *mut u64, dq); // Blink = &Queue
+    write_volatile((dq + 0x10) as *mut u32, NP_QUEUE_EMPTY);
+    write_volatile((dq + 0x14) as *mut u32, 0); // BytesInQueue
+    write_volatile((dq + 0x18) as *mut u32, 0); // EntriesInQueue
+    write_volatile((dq + 0x1c) as *mut u32, 0); // QuotaUsed
+    write_volatile((dq + 0x20) as *mut u32, 0); // ByteOffset
+    true
+}
+
+/// Audit the CCB behind `fid` before an IRP is dispatched on it: the FILE_OBJECT pointers npfs is
+/// holding, then both data queues. No-op unless `fid` really is a `NPFS_NTC_CCB` inside the FSD pool.
+unsafe fn audit_ccb(fid: u64) {
+    if fid == 0 || fid == 1 {
+        return;
+    }
+    let ccb = fid & !1;
+    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+    if ccb < FSD_POOL_VADDR + POOL_DATA_OFF || ccb + 0xC0 > pool_end || ccb & 7 != 0 {
+        return;
+    }
+    if read_volatile(ccb as *const u16) != NPFS_NTC_CCB {
+        return;
+    }
+    if QUEUE_DUMP_COUNT < 24 {
+        let fcb = read_volatile((ccb + 0x28) as *const u64);
+        print_str(b"[fsd-ccb] ccb=");
+        print_hex(ccb as u32);
+        print_str(b" state=");
+        print_u64(read_volatile((ccb + 2) as *const u8) as u64);
+        print_str(b" readmode=");
+        print_u64(read_volatile((ccb + 3) as *const u8) as u64);
+        print_u64(read_volatile((ccb + 4) as *const u8) as u64);
+        print_str(b" complmode=");
+        print_u64(read_volatile((ccb + 5) as *const u8) as u64);
+        print_u64(read_volatile((ccb + 6) as *const u8) as u64);
+        print_str(b" fcb=");
+        print_hex(fcb as u32);
+        if fcb >= FSD_POOL_VADDR + POOL_DATA_OFF && fcb + 0x80 <= pool_end {
+            print_str(b" cfg=");
+            print_u64(read_volatile((fcb + 0x34) as *const u16) as u64);
+            print_str(b" pipetype=");
+            print_u64(read_volatile((fcb + 0x36) as *const u16) as u64);
+            print_str(b" instances=");
+            print_u64(read_volatile((fcb + 0x20) as *const u32) as u64);
+        }
+        print_str(b"\n");
+    }
+    // (a) the FILE_OBJECTs npfs still holds must still BE FILE_OBJECTs (the lifetime proof).
+    for end in 0..2u64 {
+        let held = read_volatile((ccb + NP_CCB_FILE_OBJECT + end * 8) as *const u64);
+        if held == 0 {
+            continue;
+        }
+        FSD_FO_LIVE_CHECKS.fetch_add(1, Ordering::Relaxed);
+        let in_pool = held >= FSD_POOL_VADDR + POOL_DATA_OFF && held + 0x100 <= pool_end;
+        let looks_like_fo = in_pool
+            && read_volatile(held as *const u16) == 5 // IO_TYPE_FILE
+            && read_volatile((held + 2) as *const u16) == 0x100;
+        if !looks_like_fo && FSD_FO_CORRUPTED.fetch_add(1, Ordering::Relaxed) < 4 {
+            print_str(b"[fsd-fo] CORRUPT FSD-held FILE_OBJECT ccb=0x");
+            print_hex(ccb as u32);
+            print_str(b" end=");
+            print_u64(end);
+            print_str(b" fo=0x");
+            print_hex(held as u32);
+            print_str(b"\n");
+        }
+        if !fo_is_registered(held) && FSD_FO_DANGLING.fetch_add(1, Ordering::Relaxed) < 4 {
+            print_str(b"[fsd-fo] DANGLING FSD-held FILE_OBJECT ccb=0x");
+            print_hex(ccb as u32);
+            print_str(b" end=");
+            print_u64(end);
+            print_str(b" fo=0x");
+            print_hex(held as u32);
+            print_str(b"\n");
+        }
+    }
+    // (b) both data queues.
+    for q in 0..2u64 {
+        audit_data_queue(ccb + NP_CCB_DATA_QUEUE + q * NP_DATA_QUEUE_SIZE);
+    }
+}
+
+// --- KeBugCheckEx: a hosted driver's consistency bugcheck is CAUGHT, REPORTED and UNWOUND -------
+//
+// Every hosted driver imports `KeBugCheckEx` and npfs wraps it in `NpBugCheck(p1,p2,p3)` =
+// `KeBugCheckEx(NPFS_FILE_SYSTEM, (FILE_ID << 16) | __LINE__, p1, p2, p3)` (`npfs.h:106`) — the
+// driver's own statement that its state is inconsistent, complete with the source file id and line.
+// It was an UNBOUND import, so it resolved to the fail-soft `s_true` no-op: the driver's assertion
+// was SKIPPED and it carried on with a broken invariant. Now it is bound: the code + all four
+// parameters + the raising component are reported, and the offending dispatch is failed CLEANLY by
+// unwinding back to `run_irp` (the park/fail-closed discipline — never a hang, never a dead boot).
+
+/// Bugchecks raised by a hosted driver (caught, not skipped).
+pub(crate) static FSD_BUGCHECKS: AtomicU64 = AtomicU64::new(0);
+/// …of which were unwound back to the dispatch loop (vs reported-and-returned outside an IRP).
+pub(crate) static FSD_BUGCHECK_UNWINDS: AtomicU64 = AtomicU64::new(0);
+/// The LAST bugcheck's code + 4 parameters (for the gate spec + the report).
+pub(crate) static FSD_BUGCHECK_CODE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_BUGCHECK_P1: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_BUGCHECK_P2: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_BUGCHECK_P3: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_BUGCHECK_P4: AtomicU64 = AtomicU64::new(0);
+/// The driver INSTANCE that raised the last bugcheck (recorded by the executive-side dispatcher,
+/// which is the only side that knows which component it just drove).
+pub(crate) static FSD_BUGCHECK_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// The dispatch escape buffer: `[0]` = the saved `rsp` inside [`fsd_guarded_call`], `[1]` = the
+/// resume address (non-zero == ARMED), `[2]` = set by the longjmp path so the caller can tell a
+/// bugchecked dispatch from a normal return.
+static mut BUGCHECK_JB: [u64; 3] = [0; 3];
+
+// The setjmp/longjmp pair. Written in assembly on purpose: the escape abandons npfs' frames, so no
+// Rust value may be live across it. `fsd_guarded_call` saves every Win64 callee-saved GPR, records
+// (rsp, resume-address) in the jump buffer, then calls `handler(devobj, irp)`; both the normal
+// return and the longjmp land on the SAME epilogue, so the register file is restored either way.
+core::arch::global_asm!(
+    ".text",
+    ".globl fsd_guarded_call",
+    "fsd_guarded_call:", // rcx = handler, rdx = devobj, r8 = irp, r9 = jump buffer
+    "push rbp",
+    "push rbx",
+    "push rsi",
+    "push rdi",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "sub rsp, 0x28", // 32 B shadow space + 8 B so the callee sees rsp % 16 == 8
+    "lea rax, [rip + 9f]",
+    "mov [r9], rsp",
+    "mov [r9 + 8], rax",
+    "mov r10, rcx",
+    "mov rcx, rdx",
+    "mov rdx, r8",
+    "call r10",
+    "9:", // the longjmp lands here with rsp already restored from the buffer
+    "add rsp, 0x28",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rdi",
+    "pop rsi",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+    ".globl fsd_guarded_longjmp",
+    "fsd_guarded_longjmp:", // rcx = jump buffer
+    "mov rsp, [rcx]",
+    "jmp qword ptr [rcx + 8]",
+);
+
+extern "win64" {
+    fn fsd_guarded_call(handler: u64, devobj: u64, irp: u64, jb: *mut u64) -> i32;
+    fn fsd_guarded_longjmp(jb: *mut u64) -> !;
+}
+
+/// `DECLSPEC_NORETURN void KeBugCheckEx(ULONG Code, ULONG_PTR P1, P2, P3, P4)`. Report the driver's
+/// bugcheck (code, all four parameters, and — for `NPFS_FILE_SYSTEM` — the source file id + line
+/// `NpBugCheck` encodes in P1) and unwind the current dispatch. A bugcheck raised OUTSIDE an IRP
+/// dispatch (i.e. during `DriverEntry`, before the escape is armed) is reported and returns, which
+/// is the historical fail-soft behaviour — but now visible instead of silent.
+extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u64) {
+    unsafe {
+        FSD_BUGCHECKS.fetch_add(1, Ordering::Relaxed);
+        FSD_BUGCHECK_CODE.store(code, Ordering::Relaxed);
+        FSD_BUGCHECK_P1.store(p1, Ordering::Relaxed);
+        FSD_BUGCHECK_P2.store(p2, Ordering::Relaxed);
+        FSD_BUGCHECK_P3.store(p3, Ordering::Relaxed);
+        FSD_BUGCHECK_P4.store(p4, Ordering::Relaxed);
+        print_str(b"[fsd-bugcheck] code=0x");
+        print_hex(code as u32);
+        print_str(b" p1=0x");
+        print_hex(p1 as u32);
+        print_str(b" p2=0x");
+        print_hex(p2 as u32);
+        print_str(b" p3=0x");
+        print_hex(p3 as u32);
+        print_str(b" p4=0x");
+        print_hex(p4 as u32);
+        if code == 0x25 {
+            // NPFS_FILE_SYSTEM — `NpBugCheck` packs (FILE_ID << 16) | __LINE__ into P1.
+            print_str(b" (npfs file=");
+            print_u64(p1 >> 16);
+            print_str(b" line=");
+            print_u64(p1 & 0xFFFF);
+            print_str(b")");
+        }
+        let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
+        if jb[1] != 0 {
+            print_str(b" -> dispatch UNWOUND\n");
+            jb[2] = 1;
+            FSD_BUGCHECK_UNWINDS.fetch_add(1, Ordering::Relaxed);
+            fsd_guarded_longjmp(jb.as_mut_ptr());
+        }
+        print_str(b" -> outside a dispatch (reported, not unwound)\n");
+    }
 }
 
 // --- ntoskrnl trampolines (extern "win64"; args = rcx, rdx, r8, r9, then stack) --------------
@@ -500,6 +1011,18 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 /// npfs's deferred list; reclaim that retained request graph here instead of leaking it forever.
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
+        // DIAGNOSTIC heartbeat: `NpCompleteDeferredIrps` walks a driver-built LIST_ENTRY chain, so a
+        // corrupted (cyclic) deferred list becomes an unbounded completion loop with no other output.
+        {
+            IO_COMPLETE_CALLS += 1;
+            if IO_COMPLETE_CALLS % 4096 == 0 {
+                print_str(b"[fsd-complete-heartbeat] calls=");
+                print_u64(IO_COMPLETE_CALLS);
+                print_str(b" irp=");
+                print_hex(irp as u32);
+                print_str(b"\n");
+            }
+        }
         let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
         let Some(slot) = table.iter_mut().find(|entry| entry.irp == irp) else {
             if PEER_COMPLETION_TRACE_COUNT < 8 {
@@ -524,7 +1047,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
         // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
         if slot.major as u64 == IRP_MJ_READ {
-            let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
+            let fid = slot.fid;
             // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
             // it). Fall back to our original buffer only if npfs left it in place.
             let sysbuf = read_unaligned((irp + 0x18) as *const u64);
@@ -555,7 +1078,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 pool_free(sysbuf);
             }
         } else if slot.major as u64 == IRP_MJ_WRITE {
-            let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
+            let fid = slot.fid;
             let completed = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
             if let Some(completed) = completed.iter_mut().find(|entry| entry.fid == 0) {
                 completed.fid = fid;
@@ -578,8 +1101,14 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         pool_free(slot.data);
         pool_free(slot.iosl);
         pool_free(slot.irp);
-        pool_free(slot.file_object);
-        *slot = PendingIrp { irp: 0, iosl: 0, file_object: 0, data: 0, major: 0 };
+        // ★ The FILE_OBJECT is NOT freed here. It OUTLIVES the IRP: it belongs to the OPEN and npfs
+        // keeps pointing at it (`Ccb->FileObject[end]`, written through on disconnect/close). Only a
+        // transient FILE_OBJECT — one this IRP itself owns because the per-open table was full — dies
+        // with the request. See [`FILE_OBJECTS`].
+        if slot.owns_fo {
+            pool_free(slot.file_object);
+        }
+        *slot = EMPTY_PENDING_IRP;
     }
 }
 
@@ -864,6 +1393,11 @@ fn register_fsd_trampolines() {
     reg.bind("ExAcquireSharedWaitForExclusive", s_acquire_resource as usize as u64);
     reg.bind("ExReleaseResourceLite", s_release_resource as usize as u64);
     reg.bind("ExReleaseResourceForThreadLite", s_release_resource as usize as u64);
+    // The driver's OWN consistency bugchecks (npfs' `NpBugCheck`) — caught + reported + unwound,
+    // never skipped. Previously an UNBOUND import resolving to the fail-soft `s_true` no-op.
+    if crate::KEBUGCHECK_BOUND {
+        reg.bind("KeBugCheckEx", s_ke_bug_check_ex as usize as u64);
+    }
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as usize as u64);
     reg.bind("memmove", s_memcpy as usize as u64);
@@ -1064,19 +1598,38 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let outlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
     let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
 
-    // FILE_OBJECT (0x100 bytes) — DeviceObject + FileName (points at the ARG frame name buffer).
-    let fo = pool_alloc(0x100);
-    zero(fo, 0x100);
-    write_unaligned(fo as *mut i16, 5); // Type = IO_TYPE_FILE
-    write_unaligned((fo + 2) as *mut u16, 0x100);
-    write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
-    // Follow-up IRPs rebuild a transient FILE_OBJECT around the context returned by CREATE/OPEN.
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-    write_unaligned((fo + 0x18) as *mut u64, file_id); // FsContext
-    // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
-    write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
-    write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
-    write_unaligned((fo + 0x60) as *mut u64, FSD_ARG_VADDR); // Buffer = the pipe name (UTF-16)
+
+    // ★ Audit the CCB's data queues (and the FILE_OBJECTs npfs holds) BEFORE handing it an IRP.
+    // npfs' own ASSERTs over these invariants are compiled out of the release binary, and a broken
+    // one is a call-free infinite spin inside `NpGetNextRealDataQueueEntry` that freezes the whole
+    // boot. See [`audit_ccb`].
+    audit_ccb(file_id);
+
+    // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
+    // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
+    // and writes through that pointer on disconnect), so it must NOT be rebuilt/freed per request.
+    let existing = if crate::FSD_FILE_OBJECT_PER_OPEN { fo_lookup(file_id) } else { 0 };
+    let owns_fo = existing == 0;
+    let fo = if owns_fo { pool_alloc(0x100) } else { existing };
+    if fo == 0 {
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    if owns_fo {
+        zero(fo, 0x100);
+        write_unaligned(fo as *mut i16, 5); // Type = IO_TYPE_FILE
+        write_unaligned((fo + 2) as *mut u16, 0x100);
+        write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
+        write_unaligned((fo + 0x18) as *mut u64, file_id); // FsContext
+        // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
+        write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
+        write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
+        write_unaligned((fo + 0x60) as *mut u64, FSD_ARG_VADDR); // Buffer = the pipe name (UTF-16)
+    } else {
+        // The open's FILE_OBJECT: npfs owns its contents (FsContext/FsContext2/Flags/PrivateCacheMap
+        // were set by `NpSetFileObject` at create time and must persist). Leave them alone.
+        FSD_FO_REUSED.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Give every request its own buffered-I/O storage. The ARG frame is transport scratch and is
     // overwritten by the next dispatch, so it cannot back an IRP retained in an npfs data queue.
@@ -1084,7 +1637,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let data_capacity = (data_len + 7) & !7;
     let data = pool_alloc(data_capacity);
     if data == 0 {
-        pool_free(fo);
+        if owns_fo {
+            pool_free(fo);
+        }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     zero(data, data_capacity);
@@ -1183,8 +1738,24 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     }
     write_unaligned((irp + 0xb8) as *mut u64, iosl); // CurrentStackLocation
 
-    let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(handler as *const ());
-    let ret = f(devobj, irp);
+    // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
+    // own consistency bugcheck (`NpBugCheck` → `KeBugCheckEx`) we unwind back here and fail THIS
+    // dispatch cleanly instead of letting it continue on a broken invariant (or hang the boot).
+    let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
+    jb[0] = 0;
+    jb[1] = 0;
+    jb[2] = 0;
+    let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr());
+    let bugchecked = jb[2] != 0;
+    jb[1] = 0; // disarm
+    jb[2] = 0;
+    if bugchecked {
+        // The driver's state is undefined past its own bugcheck. Leak this request graph (the driver
+        // may still hold pointers into it) rather than recycle memory it might write to, report the
+        // failure to the caller, and let the dispatch loop keep serving — fail-closed, never a hang.
+        write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, file_id);
+        return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
+    }
 
     let irp_status = read_unaligned((irp + 0x30) as *const i32);
     let info = read_unaligned((irp + 0x38) as *const u64);
@@ -1192,6 +1763,18 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
     let fsctx = read_unaligned((fo + 0x18) as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
+    // A freshly-created open: bind THIS FILE_OBJECT to the context npfs just handed back, so every
+    // later IRP on that open reuses it (and npfs' stored `Ccb->FileObject[end]` stays valid).
+    let mut fo_registered = false;
+    if crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
+        fo_registered = fo_register(fsctx, fo);
+    }
+    // CLEANUP / CLOSE end the open — this is where a FILE_OBJECT legitimately dies.
+    if major == IRP_MJ_CLEANUP || major == IRP_MJ_CLOSE {
+        fo_release(file_id);
+        fo_registered = false;
+    }
+    let irp_owns_fo = owns_fo && !fo_registered;
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
@@ -1213,6 +1796,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 file_object: fo,
                 data,
                 major: major as u8,
+                // Capture the file id NOW: npfs NULLs `FILE_OBJECT->FsContext` on disconnect, so it
+                // cannot be recovered from the object at completion time.
+                fid: if fsctx != 0 { fsctx } else { file_id },
+                owns_fo: irp_owns_fo,
             };
         } else {
             print_str(b"[fsd-host] pending IRP table exhausted\n");
@@ -1230,7 +1817,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         pool_free(data);
         pool_free(iosl);
         pool_free(irp);
-        pool_free(fo);
+        if irp_owns_fo {
+            pool_free(fo);
+        }
     }
     (st, info)
 }
@@ -1902,7 +2491,40 @@ pub(crate) unsafe fn dispatch_irp(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
+    let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
+    // DIAGNOSTIC (bounded): an IRP dispatch is the ONE place the executive blocks on a hosted
+    // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never
+    // returned (the failure mode that used to end the boot in a 555-second silence).
+    if FSD_DISPATCH_TRACE < 40 {
+        FSD_DISPATCH_TRACE += 1;
+        print_str(b"[fsd-svc] ENTER inst=");
+        print_u64(inst as u64);
+        print_str(b" major=");
+        print_u64(major);
+        print_str(b" fid=");
+        print_hex(file_id as u32);
+        print_str(b"\n");
+    }
     let pr = crate::spawn_hosts::component_pump(&ch);
+    if FSD_DISPATCH_TRACE <= 40 {
+        print_str(b"[fsd-svc] EXIT inst=");
+        print_u64(inst as u64);
+        print_str(b" major=");
+        print_u64(major);
+        print_str(b" status=");
+        print_hex(pr.status as u32);
+        print_str(b"\n");
+    }
+    // Attribute any bugcheck the component raised to THIS instance — the executive is the only side
+    // that knows which hosted component it just drove.
+    if FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before {
+        FSD_BUGCHECK_INSTANCE.store(inst as u64 + 1, Ordering::Relaxed);
+        print_str(b"[fsd-bugcheck] raised by hosted driver instance=");
+        print_u64(inst as u64);
+        print_str(b" during IRP_MJ_");
+        print_u64(major);
+        print_str(b" -> dispatch failed CLEANLY (component still serving)\n");
+    }
     if !pr.completed {
         print_str(b"[fsd-svc] IRP fault wall inst=");
         print_u64(inst as u64);

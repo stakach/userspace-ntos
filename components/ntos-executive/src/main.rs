@@ -755,6 +755,28 @@ pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
 pub const SSN_NT_FLUSH_KEY: u64 = 83;
 /// Bypass switch for the `NtFlushKey` gate specs (see the `build_nt_table` row). `true` in tree.
 pub const NT_FLUSH_KEY_SERVICED: bool = true;
+/// **FILE_OBJECT LIFETIME switch** (bypass experiment for `exec_npfs_file_object_lifetime` +
+/// `exec_npfs_concurrent_irp_read_and_write`). `true` in tree = the NT lifetime: ONE FILE_OBJECT per
+/// OPEN, reused by every IRP on that open, destroyed at CLEANUP/CLOSE. `false` restores the old
+/// per-IRP object that was freed on every completion — which leaves npfs' stored
+/// `Ccb->FileObject[end]` pointing at a RECYCLED pool block it then writes through
+/// (`NpSetFileObject(…, NULL, NULL, …)` on disconnect), corrupting its own data-queue bookkeeping.
+/// See [`driver_launch::FILE_OBJECTS`].
+pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
+/// **COMPONENT-DISPATCH SEQUENCE HANDSHAKE switch** (bypass experiment for
+/// `exec_component_dispatch_in_phase`). `true` in tree = `component_pump` accepts only the `done`
+/// message whose `SH_REQ_SEQ` proves the component ran THIS dispatch. `false` restores the old
+/// "any `dispatch_label` message ends the pump" rule, which lets the Send/Recv transport slip a
+/// message out of phase and then DEADLOCK (executive and component both blocked in `Send` on the
+/// dispatch endpoint — no fault, no log line, no npfs involvement). See
+/// [`spawn_hosts::component_pump`].
+pub const FSD_DISPATCH_SEQ_HANDSHAKE: bool = true;
+/// **`KeBugCheckEx` BINDING switch** (bypass experiment for `exec_kebugcheck_bound_and_reported`).
+/// `true` in tree = a hosted driver's own consistency bugcheck (npfs' `NpBugCheck`) is caught,
+/// reported with its code + 4 parameters + raising component, and the offending dispatch is failed
+/// cleanly. `false` leaves the import unbound, so it resolves to the fail-soft `s_true` no-op and the
+/// driver's assertion is SKIPPED — the historical behaviour. See [`driver_launch::s_ke_bug_check_ex`].
+pub const KEBUGCHECK_BOUND: bool = true;
 /// NtSetSystemInformation — smss sets system-wide config in SmpInit (priority separation, etc.).
 /// We don't model system-info classes → no-op success so bring-up proceeds.
 pub const SSN_NT_SET_SYSTEM_INFORMATION: u64 = 249;
@@ -10497,6 +10519,293 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_str(b" pend_count=");
                             print_u64(NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed));
                             print_str(b"\n");
+
+                            // ★ C-e: TWO CONCURRENT IRPs ON ONE FILE_OBJECT — the ordinary rpcrt4
+                            // server shape, and the exact shape that used to HANG the hosted
+                            // npfs.sys. `RPCRT4_io_thread` keeps a READ pending on the connection
+                            // while `RPCRT4_worker_thread` WRITES the response on the SAME handle.
+                            // Drive precisely that here and assert the BYTES both ways:
+                            //   1. the server end issues a READ npfs must PEND (inbound queue empty),
+                            //   2. with that read still outstanding, the server end WRITES a 48-byte
+                            //      response — the second live IRP on the same FILE_OBJECT,
+                            //   3. the client reads exactly those 48 bytes,
+                            //   4. the client writes, which COMPLETES the server's still-pending read
+                            //      (npfs' `NpWriteDataQueue` → `IofCompleteRequest`) and the delivered
+                            //      payload must be byte-exact in the completion stash.
+                            let mut pend_out = [0u8; 64];
+                            let srv_pending = npfs_dispatch_irp(
+                                3 /* READ */, 0, srv_fid, &[], &mut pend_out);
+                            let srv_read_pended =
+                                matches!(srv_pending, Some((st, _)) if st as u32 == 0x0000_0103);
+                            let mut response = [0u8; 48];
+                            for (i, slot) in response.iter_mut().enumerate() {
+                                *slot = 0x40u8.wrapping_add(i as u8);
+                            }
+                            let mut cnone = [];
+                            let concur_write = npfs_dispatch_irp(
+                                4 /* WRITE */, 0, srv_fid, &response, &mut cnone);
+                            let mut resp_in = [0u8; 64];
+                            let concur_read = npfs_dispatch_irp(
+                                3 /* READ */, 0, cli_fid, &[], &mut resp_in);
+                            let response_ok = matches!(concur_write, Some((0, 48)))
+                                && matches!(concur_read, Some((0, 48)))
+                                && resp_in[..48] == response[..48];
+                            // Now wake the server's STILL-pending read from the other end.
+                            let wake = *b"WAKE-PENDING-READ";
+                            let cli_wake = npfs_dispatch_irp(
+                                4 /* WRITE */, 0, cli_fid, &wake, &mut cnone);
+                            let stash = driver_launch::take_completed_read(srv_fid);
+                            let pending_delivered = match &stash {
+                                Some((st, info, bytes)) => {
+                                    *st == 0
+                                        && *info == wake.len() as u64
+                                        && bytes.len() == wake.len()
+                                        && bytes[..] == wake[..]
+                                }
+                                None => false,
+                            };
+                            print_str(b"[npfs-svc] C-e CONCURRENT-IRP pended=");
+                            print_u64(srv_read_pended as u64);
+                            print_str(b" response_ok=");
+                            print_u64(response_ok as u64);
+                            print_str(b" wake_written=");
+                            print_u64(matches!(cli_wake, Some((0, _))) as u64);
+                            print_str(b" pending_delivered=");
+                            print_u64(pending_delivered as u64);
+                            print_str(b" fo_reused=");
+                            print_u64(driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed));
+                            print_str(b" queue_repairs=");
+                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            // A pending read AND a write on ONE FILE_OBJECT both complete with the
+                            // right bytes, npfs' queues stayed consistent (zero repairs), and the
+                            // write actually reused the open's FILE_OBJECT rather than a fresh one.
+                            check(
+                                b"exec_npfs_concurrent_irp_read_and_write",
+                                srv_read_pended
+                                    && response_ok
+                                    && pending_delivered
+                                    && driver_launch::FSD_FO_REUSED.load(Ordering::Relaxed) >= 4
+                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed) == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-f: the FILE_OBJECT LIFETIME proof. npfs stores our FILE_OBJECT in
+                            // `Ccb->FileObject[NamedPipeEnd]` (create.c:645/772, statesup.c:51) and
+                            // WRITES THROUGH it on disconnect. `audit_ccb` therefore re-validates
+                            // every FSD-held FILE_OBJECT pointer before each IRP: it must still be
+                            // one of our live per-open objects AND still CONTAIN a FILE_OBJECT
+                            // (`Type == IO_TYPE_FILE`, `Size == 0x100`). With the old per-IRP
+                            // lifetime the pool had already recycled those blocks into npfs' own
+                            // `NP_DATA_QUEUE_ENTRY`/`NP_CCB` allocations, so both checks fail.
+                            let fo_checks = driver_launch::FSD_FO_LIVE_CHECKS.load(Ordering::Relaxed);
+                            let fo_dangling = driver_launch::FSD_FO_DANGLING.load(Ordering::Relaxed);
+                            let fo_corrupt = driver_launch::FSD_FO_CORRUPTED.load(Ordering::Relaxed);
+                            let fo_opens = driver_launch::FSD_FO_OPENS.load(Ordering::Relaxed);
+                            print_str(b"[npfs-svc] C-f FO-LIFETIME opens=");
+                            print_u64(fo_opens);
+                            print_str(b" held-checks=");
+                            print_u64(fo_checks);
+                            print_str(b" dangling=");
+                            print_u64(fo_dangling);
+                            print_str(b" corrupted=");
+                            print_u64(fo_corrupt);
+                            print_str(b" audits=");
+                            print_u64(driver_launch::FSD_QUEUE_AUDITS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            check(
+                                b"exec_npfs_file_object_lifetime",
+                                fo_opens >= 2
+                                    && fo_checks >= 4
+                                    && fo_dangling == 0
+                                    && fo_corrupt == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-g: `KeBugCheckEx` is BOUND — a hosted driver's own consistency
+                            // bugcheck is CAUGHT + REPORTED + unwound, not silently skipped.
+                            // npfs' `NpDecodeFileObject` (fileobsup.c) ends its NodeTypeCode switch
+                            // in `NpBugCheck(Node->NodeType, 0, 0)` =
+                            // `KeBugCheckEx(NPFS_FILE_SYSTEM, (FILE_ID << 16) | __LINE__, type, 0, 0)`.
+                            // Hand it exactly that: a READ whose file id points at the ARG frame,
+                            // whose first two bytes we set to a node type npfs does not know. Before
+                            // this batch the import fell to the fail-soft `s_true` no-op and npfs
+                            // carried on past its own assertion; now the dispatch fails CLEANLY.
+                            let bogus_node: u16 = 0x00AA;
+                            let bogus_in = bogus_node.to_le_bytes();
+                            let mut bogus_out = [0u8; 8];
+                            let bug_dispatch = npfs_dispatch_irp(
+                                3 /* READ */,
+                                0,
+                                driver_launch::FSD_ARG_VADDR,
+                                &bogus_in,
+                                &mut bogus_out,
+                            );
+                            let bug_code = driver_launch::FSD_BUGCHECK_CODE.load(Ordering::Relaxed);
+                            let bug_p1 = driver_launch::FSD_BUGCHECK_P1.load(Ordering::Relaxed);
+                            let bug_p2 = driver_launch::FSD_BUGCHECK_P2.load(Ordering::Relaxed);
+                            let bug_count = driver_launch::FSD_BUGCHECKS.load(Ordering::Relaxed);
+                            let bug_unwinds =
+                                driver_launch::FSD_BUGCHECK_UNWINDS.load(Ordering::Relaxed);
+                            let bug_inst =
+                                driver_launch::FSD_BUGCHECK_INSTANCE.load(Ordering::Relaxed);
+                            print_str(b"[npfs-svc] C-g KEBUGCHECK count=");
+                            print_u64(bug_count);
+                            print_str(b" unwinds=");
+                            print_u64(bug_unwinds);
+                            print_str(b" code=0x");
+                            print_hex(bug_code as u32);
+                            print_str(b" p1=0x");
+                            print_hex(bug_p1 as u32);
+                            print_str(b" (file=");
+                            print_u64(bug_p1 >> 16);
+                            print_str(b" line=");
+                            print_u64(bug_p1 & 0xFFFF);
+                            print_str(b") p2=0x");
+                            print_hex(bug_p2 as u32);
+                            print_str(b" instance=");
+                            print_u64(bug_inst);
+                            print_str(b" dispatch_status=0x");
+                            print_hex(match bug_dispatch {
+                                Some((st, _)) => st as u32,
+                                None => 0xFFFF_FFFF,
+                            });
+                            print_str(b"\n");
+                            // NPFS_FILE_SYSTEM (0x25), a real npfs source file id (1..=0x14) + line,
+                            // P2 == the bogus node type WE planted (so it is provably OUR trigger and
+                            // the parameters really do arrive), the dispatch was unwound (not skipped,
+                            // not hung), it was attributed to instance 0 (npfs), and it failed cleanly.
+                            // ★ C-h: the rpcrt4 HEADER-THEN-BODY shape — a 48-byte write against a
+                            // SMALLER (16-byte) pending read. This is byte-for-byte the shape the LSA
+                            // self-RPC response takes (`rpcrt4_conn_np_read` reads the 16-byte PDU
+                            // header first, so the reader's queued entry is 16 bytes while the server
+                            // writes the whole 48-byte response), and it is the dispatch that used to
+                            // never return from npfs. npfs must complete the reader with
+                            // STATUS_BUFFER_OVERFLOW + 16 bytes and queue the 32-byte remainder.
+                            let mut hdr_in = [0u8; 16];
+                            let hdr_pend = npfs_dispatch_irp(
+                                3 /* READ */, 0, cli_fid, &[], &mut hdr_in);
+                            let hdr_pended =
+                                matches!(hdr_pend, Some((st, _)) if st as u32 == 0x0000_0103);
+                            print_str(b"[npfs-svc] C-h HDR-READ pended=");
+                            print_u64(hdr_pended as u64);
+                            print_str(b" -> now writing 48 over a 16-byte pending read\n");
+                            let body_write = npfs_dispatch_irp(
+                                4 /* WRITE */, 0, srv_fid, &response, &mut cnone);
+                            let hdr_stash = driver_launch::take_completed_read(cli_fid);
+                            let hdr_ok = match &hdr_stash {
+                                Some((st, info, bytes)) => {
+                                    *st == 0x8000_0005
+                                        && *info == 16
+                                        && bytes.len() == 16
+                                        && bytes[..] == response[..16]
+                                }
+                                None => false,
+                            };
+                            // The remaining 32 bytes stay queued; drain them with a second read.
+                            let mut rest_in = [0u8; 64];
+                            let rest_read = npfs_dispatch_irp(
+                                3 /* READ */, 0, cli_fid, &[], &mut rest_in);
+                            let rest_ok = matches!(rest_read, Some((0, 32)))
+                                && rest_in[..32] == response[16..48];
+                            print_str(b"[npfs-svc] C-h SPLIT-WRITE write=");
+                            print_hex(match body_write {
+                                Some((st, _)) => st as u32,
+                                None => 0xFFFF_FFFF,
+                            });
+                            print_str(b" hdr_ok=");
+                            print_u64(hdr_ok as u64);
+                            print_str(b" rest_ok=");
+                            print_u64(rest_ok as u64);
+                            print_str(b" repairs=");
+                            print_u64(driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed));
+                            print_str(b"\n");
+                            check(
+                                b"exec_npfs_write_split_across_pending_read",
+                                hdr_pended
+                                    && body_write.is_some()
+                                    && hdr_ok
+                                    && rest_ok
+                                    && driver_launch::FSD_QUEUE_REPAIRS.load(Ordering::Relaxed) == 0,
+                                &mut passed,
+                            );
+
+                            // ★ C-i: THE DISPATCH PHASE-SLIP, fault-injected. `component_main`
+                            // publishes its completion BEFORE it waits for the next request, so a
+                            // `done` queued for an EARLIER cycle satisfies the pump's `Recv` just as
+                            // well as the one it is waiting for — and then the executive and the
+                            // component drift a message apart until BOTH block in `Send` on the
+                            // dispatch endpoint (no fault, no log line, no driver involvement).
+                            // Inject that slip deterministically: (1) queue an 11-byte payload the
+                            // client has not read, (2) run a dispatch whose result is
+                            // DISTINGUISHABLE (SET_INFORMATION → status 0, information 0), (3) arm
+                            // the injector so the next dispatch publishes a premature `done`, (4)
+                            // read. Only a pump that re-waits past the stale `done` returns the READ's
+                            // real (0, 11, payload); a pump that accepts it returns the previous
+                            // dispatch's (0, 0).
+                            let slip_payload = *b"PHASE-SLIP!";
+                            let mut snone = [];
+                            let slip_write = npfs_dispatch_irp(
+                                4 /* WRITE */, 0, srv_fid, &slip_payload, &mut snone);
+                            let mut set_out2 = [];
+                            let slip_set = npfs_dispatch_irp(
+                                6 /* IRP_MJ_SET_INFORMATION */,
+                                23 /* FilePipeInformation */,
+                                cli_fid,
+                                &[1u8, 0, 0, 0, 0, 0, 0, 0],
+                                &mut set_out2,
+                            );
+                            let stale_before =
+                                spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
+                            spawn_hosts::PUMP_SLIP_INJECT.store(1, Ordering::Relaxed);
+                            let mut slip_in = [0u8; 32];
+                            let slip_read = npfs_dispatch_irp(
+                                3 /* READ */, 0, cli_fid, &[], &mut slip_in);
+                            let stale_after =
+                                spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
+                            let slip_ok = matches!(slip_write, Some((0, 11)))
+                                && matches!(slip_set, Some((0, 0)))
+                                && matches!(slip_read, Some((0, 11)))
+                                && slip_in[..11] == slip_payload[..];
+                            print_str(b"[npfs-svc] C-i PHASE-SLIP stale-before=");
+                            print_u64(stale_before);
+                            print_str(b" stale-after=");
+                            print_u64(stale_after);
+                            print_str(b" read=");
+                            print_hex(match slip_read {
+                                Some((st, _)) => st as u32,
+                                None => 0xFFFF_FFFF,
+                            });
+                            print_str(b" info=");
+                            print_u64(match slip_read {
+                                Some((_, n)) => n,
+                                None => 0,
+                            });
+                            print_str(b" bytes_ok=");
+                            print_u64((slip_in[..11] == slip_payload[..]) as u64);
+                            print_str(b"\n");
+                            check(
+                                b"exec_component_dispatch_in_phase",
+                                FSD_DISPATCH_SEQ_HANDSHAKE
+                                    && stale_after == stale_before + 1
+                                    && slip_ok,
+                                &mut passed,
+                            );
+
+                            let bug_file = bug_p1 >> 16;
+                            check(
+                                b"exec_kebugcheck_bound_and_reported",
+                                bug_count >= 1
+                                    && bug_unwinds >= 1
+                                    && bug_code == 0x25
+                                    && bug_file >= 1
+                                    && bug_file <= 0x14
+                                    && (bug_p1 & 0xFFFF) != 0
+                                    && bug_p2 == bogus_node as u64
+                                    && bug_inst == 1
+                                    && matches!(bug_dispatch, Some((st, _)) if st as u32 == 0xC000_0001),
+                                &mut passed,
+                            );
                         }
                     }
                 }
@@ -11827,6 +12136,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(harness_irp);
     print_str(b"\n");
     check(b"exec_fsd_on_shared_harness", harness_irp >= 8, &mut passed);
+
+    // --- THE COMPONENT-DISPATCH TRANSPORT IS IN PHASE. `component_main` publishes its completion
+    // (`send_done`) BEFORE it waits for the next request, so a `done` the component queued for an
+    // EARLIER cycle satisfies the pump's `Recv` just as well as the one it is waiting for. When that
+    // happens the pump returns a completion for work the component has not done yet, and one dispatch
+    // later the executive and the component are BOTH blocked in `Send` on the dispatch endpoint — an
+    // unbreakable deadlock with no fault and no log line (this is what actually ended the LSA
+    // self-RPC boot; npfs' 48-byte `\pipe\lsarpc` response write itself completed correctly).
+    // `component_pump` now accepts only the `done` whose `SH_REQ_SEQ` proves the component ran THIS
+    // dispatch, and counts every stale one it re-waited past. The slip is REAL on a live boot, so the
+    // counter must be non-zero — a zero would mean the handshake is not actually engaged.
+    let stale_dones = spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
+    print_str(b"[harness] component-dispatch stale `done` messages re-waited past: ");
+    print_u64(stale_dones);
+    print_str(b" (handshake=");
+    print_u64(FSD_DISPATCH_SEQ_HANDSHAKE as u64);
+    print_str(b")\n");
 
     // --- PROOF win32k GENUINELY runs on the SAME SHARED HARNESS (Phase B Step 4b). `component_pump`
     // increments `HARNESS_SYSCALL_DISPATCHES` per serviced win32k SSN dispatch (kind=Syscall). By this

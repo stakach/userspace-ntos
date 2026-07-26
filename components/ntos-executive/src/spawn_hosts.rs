@@ -570,6 +570,40 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     } else if ch.wake_first {
         crate::ep_send(ch.fault_ep, ch.dispatch_label);
     }
+    // ★ SEQUENCE HANDSHAKE (the fix for the FSD dispatch PHASE-SLIP deadlock).
+    //
+    // The dispatch transport is a plain Send/Recv pair on ONE endpoint, and the component's loop is
+    // `send_done → recv_req → dispatch → …`, i.e. it publishes its completion BEFORE it waits for the
+    // next request. Nothing in that shape ties a received `dispatch_label` message to the request
+    // this pump just sent: a `done` that the component queued for an EARLIER cycle satisfies this
+    // pump's recv just as well. When that happens the pump returns a completion for work the
+    // component has not done yet and the two sides are one message out of phase — and one dispatch
+    // later BOTH are blocked in `Send` on the same endpoint (the executive sending the next request,
+    // the component sending the previous reply), which is an unbreakable deadlock: the boot stops
+    // with no fault, no log line and no npfs involvement whatsoever. That is exactly what ended the
+    // LSA self-RPC boot (the `\pipe\lsarpc` 48-byte response write COMPLETED inside npfs —
+    // `[fsd-ret] ret=0`, `[fsd-done] st=0 info=48` — and the executive still never came back).
+    //
+    // `component_main` bumps `SH_REQ_SEQ` after every dispatch it actually ran, so the fix is exact:
+    // remember the sequence before sending and accept only a `done` that carries a NEW sequence.
+    // A stale one is consumed and the pump keeps waiting for its own completion, which re-phases the
+    // transport (and, because the executive is then always the one parked in `Recv`, the component's
+    // `Send` never has to queue).
+    let seq_before = if ch.wake_first && ch.shared_va != 0 {
+        core::ptr::read_volatile((ch.shared_va + SH_REQ_SEQ) as *const u64)
+    } else {
+        0
+    };
+    // Scoped to the IRP (driver) substrate. win32k's Syscall substrate deliberately RE-ENTERS the
+    // pump around usermode callbacks (`nested_reply_cap`/`usermode_callback`), where a `done` whose
+    // sequence has not moved is the legitimate completion of the OUTER dispatch — the handshake must
+    // not second-guess that. Drivers have no such nesting.
+    let seq_handshake = crate::FSD_DISPATCH_SEQ_HANDSHAKE
+        && ch.wake_first
+        && ch.shared_va != 0
+        && ch.caps.kind == ReqKind::Irp
+        && !ch.caps.nested_reply_cap
+        && !ch.caps.usermode_callback;
     let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = if use_reply_cap {
         crate::recv_full_r12(ch.fault_ep, ch.reply_cap)
     } else {
@@ -584,6 +618,28 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     loop {
         let label = mi >> 12;
         if label == ch.dispatch_label {
+            if seq_handshake
+                && core::ptr::read_volatile((ch.shared_va + SH_REQ_SEQ) as *const u64) == seq_before
+            {
+                // A `done` the component queued for an EARLIER cycle — it has not run OUR request
+                // yet. Consume it and keep waiting, so the transport stays in phase.
+                if PUMP_STALE_DONES.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::print_str(b"[pump] stale done (seq=");
+                    crate::print_u64(seq_before);
+                    crate::print_str(b") -> re-waiting for THIS dispatch\n");
+                }
+                let (_b, nmi, nm0, nm1, nm2, nm3) = if use_reply_cap {
+                    crate::recv_full_r12(ch.fault_ep, ch.reply_cap)
+                } else {
+                    crate::ep_recv_full(ch.fault_ep)
+                };
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                _m2 = nm2;
+                _m3 = nm3;
+                continue;
+            }
             completed = true;
             break;
         } else if label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL
@@ -918,6 +974,13 @@ pub(crate) unsafe fn component_main(
     loop {
         crate::driver_launch::send_done_on(dispatch_label);
         crate::driver_launch::recv_req_on();
+        // FAULT INJECTION (gate spec `exec_component_dispatch_in_phase`): publish a `done` for a
+        // dispatch we have NOT run yet — exactly the phase slip the live transport produces on its
+        // own once several hosted threads drive IRPs concurrently. With the sequence handshake the
+        // pump must re-wait past it and still return THIS dispatch's real result.
+        if PUMP_SLIP_INJECT.swap(0, Ordering::Relaxed) != 0 {
+            crate::driver_launch::send_done_on(dispatch_label);
+        }
         let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
         let (st, info) = dispatch(&DispatchReq { sel, drv });
         // Write info FIRST, then status LAST: the FSD has distinct offsets (status@0x70, info@0x78) so
@@ -928,8 +991,18 @@ pub(crate) unsafe fn component_main(
         core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
         seq += 1;
         core::ptr::write_volatile((shared_va + SH_REQ_SEQ) as *mut u64, seq);
+        let _ = CM_TRACE;
     }
 }
+
+static mut CM_TRACE: u32 = 0;
+/// `done` messages the pump rejected as belonging to an EARLIER dispatch cycle (the phase-slip the
+/// sequence handshake above repairs). Counter-backed: a non-zero value on a live boot is the proof
+/// that the transport really does slip, and with the handshake disabled that slip deadlocks.
+pub(crate) static PUMP_STALE_DONES: AtomicU64 = AtomicU64::new(0);
+/// Set to 1 by the gate spec to make the NEXT dispatch publish a premature `done` (see
+/// [`component_main`]). One-shot: the component clears it as it consumes it.
+pub(crate) static PUMP_SLIP_INJECT: AtomicU64 = AtomicU64::new(0);
 
 // Header-prefix offsets shared by both Family-A frames (design §1.2 "the header prefix (0x00-0x30)
 // is the same shape"). These name the SAME bytes the FSD/win32k modules already use under their own
