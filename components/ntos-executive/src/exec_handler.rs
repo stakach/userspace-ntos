@@ -7031,26 +7031,34 @@ impl ExecNtHandler {
                 // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (pi 4 + the
                 // \lsarpc server thread's badge), never by creation order.
                 //
-                // ★★ ROUTE GATED OFF FOR THIS COMMIT — the same call the BATCH-38 SCM worker made.
-                // With `LSA_WORKER_ROUTE_ENABLED = true` the whole self-RPC RUNS FOR REAL and was
-                // proven end to end (`/tmp/boot_lsarpc_w4.log`): the worker reads the 72-byte bind
-                // (`05 00 0b 03`), `process_bind_packet` writes the 68-byte bind_ack (`05 00 0c 03`)
-                // which wakes lsass' own parked client read, the client writes the 56-byte
-                // `LsarOpenPolicy` request (`05 00 00 03`), the worker reads it and
-                // `QueueUserWorkItem`s `RPCRT4_worker_thread`, and that thread runs the real server
-                // stub (it opens `SECURITY\Policy` with KEY_ALL_ACCESS) and writes the 48-byte
-                // RESPONSE (`05 00 02 03`). The boot then HANGS — not in the LSA plane, but inside
-                // **npfs.sys**: that response write is the first pipe write issued while a SECOND IRP
-                // (the worker's own pending read, the normal rpcrt4 server shape) is outstanding on
-                // the same FILE_OBJECT, and npfs' `NpWriteDataQueue`/`NpGetNextRealDataQueueEntry`
-                // data-queue walk (`writesup.c:48`, `datasup.c`) spins forever on it with ZERO
-                // imports called and ZERO faults — its `ASSERT`/`KeBugCheckEx` guard for exactly that
-                // queue-state inconsistency is one of the fail-soft-unbound imports, so the
-                // inconsistency is skipped instead of caught. The executive is stuck inside
-                // `component_pump`'s blocking recv, so the boot never quiesces (RUNEXIT=124).
-                // Fixing npfs' concurrent-IRP-per-FILE_OBJECT handling is its own batch; until then
-                // the route stays OFF so the boot quiesces, and the counter below still records that
-                // `RPCRT4_new_client` was genuinely REACHED (which is what `NtFlushKey` unblocked).
+                // ★★ ROUTE STILL GATED OFF — but for a NEWLY ISOLATED reason, no longer the
+                // dispatch-correlation one. With `LSA_WORKER_ROUTE_ENABLED = true` the whole
+                // self-RPC RUNS FOR REAL: the worker reads the 72-byte bind (`05 00 0b 03`),
+                // `process_bind_packet` writes the 68-byte bind_ack (`05 00 0c 03`) which wakes
+                // lsass' own parked client read, the client writes the 56-byte `LsarOpenPolicy`
+                // request (`05 00 00 03`), the worker reads it and `QueueUserWorkItem`s
+                // `RPCRT4_worker_thread`, and that thread runs the real server stub (it opens
+                // `SECURITY\Policy` with KEY_ALL_ACCESS) and writes the 48-byte RESPONSE
+                // (`05 00 02 03`). npfs is exonerated (its write completes: `[fsd-ret] ret=0`,
+                // `[fsd-done] st=0 info=48`), and so is the dispatch CORRELATION: the IRP substrate
+                // has the `SH_REQ_SEQ` handshake and the win32k Syscall substrate now has the
+                // per-dispatch TOKEN binding (`W32_DISPATCH_TOKEN_BINDING`) — a route-ON boot
+                // records ZERO token mismatches, ZERO pump walls, and a callback plane that drains
+                // to depth 0.
+                //
+                // What it stops on now (measured, instrumented): the executive's WAKE `Send` for a
+                // fresh top-level win32k dispatch (`csrss -> SSN 0x1002`) never returns. The
+                // instrumented boot sampled win32k's TCB RIP immediately before every wake: 907 of
+                // 908 healthy wakes sample `driver_launch::send_done_on`+2 (win32k runnable, on its
+                // way back to `recv_req_on`), 3 sample the `recv_req_on` syscall itself — and the
+                // ONE wake that never completes is the only sample at `recv_req_on`+2. The
+                // dispatch-endpoint cap is stable across all 909 wakes (no cap clobber). So the
+                // remaining wall is win32k RENDEZVOUS AVAILABILITY under the route's extra
+                // concurrency, not reply correlation — a different, newly-separated problem. A
+                // timing-perturbed route-ON run also diverges earlier and loses the desktop paint,
+                // so the route is NOT safe to enable yet. The counter below still records that
+                // `RPCRT4_new_client` was genuinely REACHED. No logon, token or RPC reply is
+                // fabricated.
                 const LSA_WORKER_ROUTE_ENABLED: bool = false;
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 4

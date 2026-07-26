@@ -523,6 +523,34 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 > handshake is scoped out of. That is the next frontier; no logon, token or RPC reply is fabricated.
 > See the NPFS CONCURRENT-IRP BATCH section of `ntdll_plan.md`.
 
+> **Update (2026-07-27, gate 231/99) — the win32k Syscall substrate now has a NESTING-SAFE
+> request↔reply binding, and the LSA-route wall is a DIFFERENT problem than we thought.** The
+> `SH_REQ_SEQ` handshake above repairs the IRP substrate only; it cannot be used on win32k, whose
+> dispatch loop legitimately RE-ENTERS (an outer dispatch parks inside `KeUserModeCallback` while the
+> client's redirected `WndProc` issues nested `NtUser*`/`NtGdi*` syscalls, unwound innermost-first).
+> A shared-memory counter cannot name the LEVEL a completion belongs to. Each request now carries a
+> **per-dispatch token in MR0** which the component ECHOES in its completion, so every pump level
+> matches ONLY its own token; the one level that sends no request of its own — the callback RESUME —
+> takes its token off an explicit LIFO stack, which is exact because the re-entrancy is strictly LIFO.
+> Switch `W32_DISPATCH_TOKEN_BINDING`; gate spec `exec_win32k_dispatch_in_phase_nested` (a real
+> post-quiesce `WM_NULL` callback park + real client redirect + a real NESTED dispatch preceded by a
+> `done` carrying the SUSPENDED OUTER dispatch's token). Bypass: the nested dispatch returns the outer
+> dispatch's `0x0` instead of its own `0x600D600D` **and the boot HANGS (RUNEXIT=124)**. The live boot
+> nests to depth **5** on its own. See `docs/component-harness.md` §7.
+>
+> **The LSA worker route stays GATED OFF — for a newly isolated reason.** With the route on, npfs is
+> exonerated (its 48-byte response write completes) and so is dispatch CORRELATION: a route-ON boot
+> records ZERO token mismatches, ZERO pump walls and a callback plane that drains to depth 0. What it
+> stops on is the executive's WAKE `Send` for a fresh `csrss -> SSN 0x1002` dispatch never returning.
+> Instrumented: 907 of 908 healthy wakes sample win32k's RIP at `send_done_on`+2, 3 at the
+> `recv_req_on` syscall — the single wake that never completes is the only sample at `recv_req_on`+2,
+> and the dispatch-endpoint cap is stable across all 909 wakes. So the remaining wall is win32k
+> **rendezvous availability** under the route's extra concurrency, not reply correlation. A
+> timing-perturbed route-ON run also diverges earlier and loses the desktop paint, so enabling it is
+> not safe yet. **No logon, token or RPC reply is fabricated**: `LsaOpenPolicy` still does not return,
+> `SamIConnect` is not reached, `Administrator` is not validated, `WLX_SAS_ACTION_LOGON` is not
+> returned.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

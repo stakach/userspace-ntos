@@ -4953,3 +4953,114 @@ callbacks, so the fix is not the IRP handshake verbatim - it needs a per-dispatc
 nesting (or a genuine `Call`/`ReplyRecv` transport). With that, the LSA route can go back ON and the
 chain continues at `LsaOpenPolicy` -> `SampInitDatabase` -> `SamIConnect` ->
 `SamrLookupNamesInDomain(Administrator)` -> `MsvpCheckPassword` -> `WLX_SAS_ACTION_LOGON`.
+
+---
+
+## ★★ WIN32K NESTED DISPATCH-BINDING BATCH — the Syscall substrate gets a nesting-safe request↔reply binding; the LSA-route wall is RE-ISOLATED (gate 230 → **231/99, ZERO FAILs**, 2026-07-27)
+
+**THE NESTING SHAPE (mapped first, from code + a live boot).** win32k is ONE component TCB and its
+re-entrancy is **strictly LIFO**:
+
+```
+executive: win32k_dispatch_wide -> component_pump -> ep_send(W32_DISPATCH_LABEL)
+component: component_main loop  -> recv_req_on -> dispatch_ssn -> ... -> KeUserModeCallback
+component: s_ke_user_mode_callback_rendezvous -> send_done_on(W32_USER_CALLBACK_LABEL)
+executive: pump sees 0x772 -> service_user_callback -> SuspendComponent -> pump RETURNS
+           (callback_suspended; the outer dispatch is still outstanding)
+executive: client redirected into KiUserCallbackDispatcher; its WndProc issues NtUser*/NtGdi*
+executive: each -> win32k_dispatch_wide -> component_pump -> ep_send(W32_DISPATCH_LABEL)
+component: the RENDEZVOUS loop (not component_main) receives it, runs a NESTED dispatch,
+           send_done_on(W32_DISPATCH_LABEL)   <- and may itself call KeUserModeCallback again
+executive: NtCallbackReturn -> complete_controlled_user_callback ->
+           component_pump_resume_user_callback -> ep_send(W32_USER_CALLBACK_RESUME_LABEL)
+component: rendezvous breaks, the OUTER dispatch finishes, component_main writes status + send_done
+```
+
+So dispatch/reply pairs ARE strictly LIFO-nested, and the live boot really nests — measured
+**high-water depth 5**. **Where a stale completion could be mismatched:** `component_pump` accepted
+ANY `dispatch_label` message as the answer to the request it had just sent, and the nested
+completions are indistinguishable from the outer one — same label, same shared frame, and (fatally)
+`SH_REQ_SEQ` is bumped ONLY by `component_main`'s outer loop, never by the rendezvous' nested arm,
+which is exactly why the IRP handshake had to be scoped out of win32k (an unscoped handshake hangs
+the nested dispatch: its `done` never moves the sequence). Pre-existing state: the callback
+continuation stacks (`USER_CALLBACK_CONTINUATIONS` / `USER_CALLBACK_ACTIVE`) correlate the CALLBACK
+plane, but nothing correlated the TRANSPORT.
+
+**THE DESIGN — a per-dispatch TOKEN, not `Call`/`ReplyRecv`.** `Call`/`ReplyRecv` would bind
+reply-to-call structurally in the kernel and eliminate the class rather than detect it, and it was
+the first choice considered. It was rejected here for one concrete reason: this transport already
+had to be a plain **Send/Recv** pair — win32k's fix A. A `Call` consumes the executive's single
+`reply_to` slot, and the executive is mid-`Call` from the csrss/winlogon client whose syscall it is
+forwarding; that is precisely the clobber that once made win32k never run, and the current code only
+survives nested faults by answering them through a per-caller `REPLY_W32` reply cap (fix B). Making
+the DISPATCH a Call would reintroduce fix A's bug, and making the COMPONENT the caller would invert
+the loop (win32k would have to `Call` the executive and receive its next request in the reply), which
+is a rewrite of the shared `component_main` both substrates now run — with the crown-jewel paint
+downstream of it. So: keep the transport, add the binding.
+
+Each request carries a monotonic token in **MR0** (`ep_send_token`, message length 1 — the kernel
+copies `min(length,4)` message registers) and the component **echoes** it in the completion
+(`send_done_on(label, token)` / `recv_req_on() -> (label, token)`). Every pump level matches ONLY its
+own token, so arbitrary nesting is correct by construction; each level's token lives in its own C
+frame on the component side. The one level that never sends a request of its own — the callback
+RESUME — takes its token off an explicit executive-side LIFO stack (depth 32) that a suspending pump
+leaves populated; top-of-stack is exactly the dispatch a resume resumes, because the re-entrancy is
+LIFO. Walls retire the token; overflow fails SAFE (binding off for that dispatch, logged). Switch:
+`main.rs::W32_DISPATCH_TOKEN_BINDING`. Counters: `PUMP_TOKEN_MISMATCHES`,
+`DISPATCH_TOKEN_MAX_DEPTH`. The sequence handshake is evaluated first on the IRP substrate so
+`exec_component_dispatch_in_phase`'s semantics are untouched. See `docs/component-harness.md` §7.
+
+**THE FAULT-INJECTION SPEC — `exec_win32k_dispatch_in_phase_nested`**
+(`win32k_glue::inject_win32k_nested_dispatch_slip`, post-quiesce, expendable winlogon RPC worker,
+`WM_NULL` so no pixel can change; it leaves the victim ALIVE and latches nothing, so the dead-client
+injection still finds a redirectable thread afterwards). Real at every step: a genuine
+`NtUserMessageCall` dispatch parks inside `KeUserModeCallback`; the client is genuinely REDIRECTED
+into `KiUserCallbackDispatcher`; a genuine NESTED dispatch is issued with the injector armed, so
+win32k's callback receive loop publishes a `done` carrying the **SUSPENDED OUTER dispatch's token**
+before running it; the callback then RETURNS for real so the RESUME pump must match the outer token.
+All six proof bits required (parked / redirected / slip-rejected / nested-matched / outer-resumed /
+drained-idle) plus `PUMP_TOKEN_MISMATCHES >= 1` and nesting high-water `>= 2`.
+Observed: `proof=0x3f/0x3f token-mismatches=1 nesting-high-water=5 binding=1`, and
+`[pump] done token=2621 != this dispatch's token=2622 (depth=2) -> re-waiting`.
+
+**BYPASS EXPERIMENT.** `W32_DISPATCH_TOKEN_BINDING = false` → the nested dispatch returns the OUTER
+dispatch's `status=0x00000000` instead of its own `TEST_FAULT_STATUS 0x600D600D`
+(`token-mismatches=0`) **and the boot then HANGS, RUNEXIT=124 with no gate line at all** — the
+injected misordering cascades into exactly the executive/component `Send`/`Send` deadlock. Restored →
+231/99 ZERO FAILs.
+
+**THE LSA ROUTE — turned ON, measured, and re-gated OFF for a NEWLY ISOLATED reason.** With
+`LSA_WORKER_ROUTE_ENABLED = true` the boot advances well past the point that ended the previous
+batch, and **both** earlier suspects are now exonerated by measurement: npfs' 48-byte response write
+completes, and dispatch CORRELATION is clean — the route-ON boot records **ZERO token mismatches,
+ZERO pump walls, and a callback plane that drains to depth 0**. What it stops on is the executive's
+**wake `Send`** for a fresh top-level `csrss -> SSN 0x1002` dispatch never returning. Instrumented
+(sampling win32k's TCB RIP immediately before every wake, 909 wakes): **907** healthy wakes sample
+`driver_launch::send_done_on`+2 (win32k runnable, heading back to `recv_req_on`), **3** sample the
+`recv_req_on` syscall itself, and the **one** wake that never completes is the **only** sample at
+`recv_req_on`+2; the dispatch-endpoint cap is identical (`0x7cb2`) across all 909. So the remaining
+wall is win32k **RENDEZVOUS AVAILABILITY** under the route's extra concurrency — the component is not
+in a position to accept the wake — which is a different problem from "the wrong reply was matched".
+A timing-perturbed route-ON run also diverges much earlier and LOSES the desktop paint (210/99, 21
+FAILs), so the route is not safe to enable. **Nothing is fabricated**: `LsaOpenPolicy` does not
+return, `SampGetAccountDomainInfo`/`SampInitDatabase`/`SamIConnect` are not reached, `Administrator`
+is not validated, `WLX_SAS_ACTION_LOGON` is not returned.
+
+**VERIFY.** Three consecutive foreground boots: **231/99, ZERO FAILs, RUNEXIT=3,
+`microtest sentinel matched`**, PASS-lists `diff`-IDENTICAL across all three (236 PASS lines) and
+equal to `7d0703b`'s plus exactly the one new spec. No regression: `exec_win32k_desktop_painted`
+(768/768 @ `0x003a6ea5`), `exec_win32k_on_shared_harness`, `win32k_dispatch_fault_via_reply_cap`,
+`exec_fsd_on_shared_harness`, `exec_component_dispatch_in_phase`, all 5 npfs/harness specs from
+`7d0703b`, both `exec_user_callback_*`, all 7 `exec_msgina_*`, all 5 `exec_lsa_*`, the SAM/hive specs
+and all 21 `exec_dbgk_*` PASS. Host green + unchanged (executive-only change, no crate logic added):
+`nt-ntdll` 694, `nt-process` 79, `nt-io-manager` 86, `nt-syscall` 42, `nt-user-callback` 41,
+`nt-syscall-abi` 15, `nt-hive-core` 16, `nt-hive-regf` 5. **No `rust-micro/src` change.**
+
+**NEW FRONTIER: win32k rendezvous AVAILABILITY (not correlation).** Both substrates are now
+correlation-safe and gate-protected. The next batch must make the executive's wake unable to block
+against a component that is not receiving — e.g. a pre-drain of orphan completions before the wake, a
+non-blocking wake with an explicit "component busy" state, or an availability handshake — and must
+explain what leaves win32k un-receptive at that single dispatch under the route's extra concurrency.
+Only then can `LSA_WORKER_ROUTE_ENABLED` go back on and the chain continue at `LsaOpenPolicy` →
+`SampInitDatabase` → `SamIConnect` → `SamrLookupNamesInDomain(Administrator)` → `MsvpCheckPassword`
+→ `WLX_SAS_ACTION_LOGON`.

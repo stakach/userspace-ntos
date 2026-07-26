@@ -596,3 +596,95 @@ its thin one-shot `run_once` shape — a test-lifecycle fixture, NOT a general d
 `loader_trace_diag.rs`; per-fault demand-map traces in `component_pump`) are gated behind the
 OFF-by-default `debug-trace` cargo feature. The default build ships clean serial but keeps every
 milestone marker, spec PASS/FAIL line, and the `N/98 ... checks passed` gate summary.
+
+---
+
+## 7. Transport correlation — binding a completion to the request that provoked it
+
+The dispatch transport (§1.2) is a plain **Send/Recv pair on ONE endpoint**, and `component_main`'s
+loop publishes its completion **before** it waits for the next request:
+
+```
+component_main:   send_done(prev) -> recv_req -> dispatch -> write status -> loop
+component_pump:   ep_send(request) -> recv(... dispatch_label => done)
+```
+
+Nothing in that raw shape ties the `dispatch_label` message the pump receives to the request it just
+sent. A `done` the component queued for an **earlier** cycle satisfies the pump's `Recv` just as
+well: the pump returns a completion for work the component has not done yet (reading a stale status
+out of the shared page), the two sides drift one message apart, and one dispatch later BOTH are
+blocked in `Send` on the same endpoint — a deadlock with **no fault, no log line and no driver
+involvement**. That is what ended the LSA self-RPC boot (`7d0703b`), where it masqueraded as an
+"npfs.sys spin" although npfs' write completed correctly.
+
+There are **two** correlation mechanisms, for two structurally different substrates. Both are
+bypass-switchable and both are gate-protected by a fault-injection spec.
+
+### 7.1 IRP substrate — the `SH_REQ_SEQ` sequence handshake
+
+`component_main` bumps `SH_REQ_SEQ` (0x80) after every dispatch it actually ran. The pump samples it
+**before** `ep_send` and accepts only a `done` that carries a NEW sequence; a stale one is consumed,
+counted (`PUMP_STALE_DONES`) and re-waited past, which re-phases the transport — and because the
+executive is then always the side parked in `Recv`, the component's `Send` never has to queue, so the
+deadlock cannot form.
+
+* Switch: `main.rs::FSD_DISPATCH_SEQ_HANDSHAKE`.
+* Gate spec: `exec_component_dispatch_in_phase` (`PUMP_SLIP_INJECT` makes the component publish a
+  premature `done`; the pump must re-wait and still return the READ's real `(0, 11, "PHASE-SLIP!")`).
+* Scope: `kind == Irp` and NOT `usermode_callback`/`nested_reply_cap`.
+
+**Why it cannot be used for win32k.** win32k's dispatch loop legitimately **re-enters**: an outer
+dispatch calls `KeUserModeCallback`, parks in its callback receive loop, and services NESTED
+dispatches from the client's redirected `WndProc` before the outer one ever completes. A
+shared-memory counter cannot say WHICH nesting level a completion belongs to — an unscoped handshake
+hangs the nested-callback dispatch (proven experimentally).
+
+### 7.2 Syscall substrate — the per-dispatch TOKEN binding (nesting-safe)
+
+Each request carries an explicit **correlation token** in **MR0** (message length 1), and the
+component **echoes** it in the completion. Every pump level matches ONLY its own token, so nesting is
+correct at arbitrary depth — the outer dispatch's `done` cannot satisfy the nested dispatch's `Recv`
+and vice versa. A stale or misordered `done` is consumed, counted (`PUMP_TOKEN_MISMATCHES`) and
+re-waited past.
+
+```
+executive:  ep_send_token(ep, dispatch_label, token)      (main.rs::ep_send_token)
+component:  send_done_on(label, token)  /  recv_req_on() -> (label, token)
+                                                            (driver_launch.rs)
+```
+
+The nesting shape is **strictly LIFO** — one component TCB, `syscall → callback → syscall →
+callback → …` unwound innermost-first — so each level's token lives naturally in its own C frame on
+the component side (`component_main`'s loop variable; the rendezvous loop's `nested_token`).
+
+The one level that never sends a request of its own is the **callback resume**: it wakes the
+SUSPENDED outer dispatch, whose token was allocated by the pump that got suspended. Those pumps
+therefore push their token onto an explicit LIFO stack (`DISPATCH_TOKEN_STACK`, depth 32) and leave
+it there while suspended; `component_pump_resume_user_callback` expects the token on TOP. Because the
+re-entrancy is LIFO, top-of-stack is always exactly the dispatch a resume is resuming. A wall retires
+the token too (nobody is waiting for that reply any more); an overflow fails **safe** (binding
+disabled for that dispatch, logged) rather than corrupting.
+
+* Switch: `main.rs::W32_DISPATCH_TOKEN_BINDING`.
+* Gate spec: `exec_win32k_dispatch_in_phase_nested`
+  (`win32k_glue::inject_win32k_nested_dispatch_slip`) — post-quiesce, on an expendable winlogon RPC
+  worker, with `WM_NULL`: a real `NtUserMessageCall` dispatch parks inside `KeUserModeCallback`, the
+  client is really redirected into `KiUserCallbackDispatcher`, and a real NESTED dispatch is issued
+  with the injector armed so win32k's callback receive loop publishes a `done` carrying the
+  **suspended OUTER dispatch's token** first. All six `NESTED_SLIP_*` proof bits must hold: parked /
+  redirected / slip-rejected / nested-matched / outer-resumed / drained-idle, plus
+  `PUMP_TOKEN_MISMATCHES >= 1` and a measured nesting high-water `>= 2`.
+* Applies to both kinds (it is strictly stronger than §7.1); the sequence handshake is evaluated
+  first on the IRP substrate so its counter semantics are unchanged.
+
+**Bypass evidence** (`W32_DISPATCH_TOKEN_BINDING = false`): the nested dispatch returns the OUTER
+dispatch's `status = 0x00000000` instead of its own `0x600D600D`, and the boot then **HANGS,
+RUNEXIT=124** — the injected misordering cascades into exactly the executive/component `Send`/`Send`
+deadlock the binding prevents.
+
+### 7.3 What this does NOT cover
+
+Correlation is not availability. A pump can still block in its **wake `Send`** if the component is
+not in a position to receive (it is running, or blocked as a sender elsewhere). That is a separate
+failure mode from "the wrong reply was matched", and it is the one the LSA-worker route still hits —
+see the `LSA_WORKER_ROUTE_ENABLED` comment in `exec_handler.rs`.

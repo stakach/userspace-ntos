@@ -771,6 +771,15 @@ pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
 /// dispatch endpoint — no fault, no log line, no npfs involvement). See
 /// [`spawn_hosts::component_pump`].
 pub const FSD_DISPATCH_SEQ_HANDSHAKE: bool = true;
+/// **PER-DISPATCH REQUEST↔REPLY TOKEN BINDING switch** (bypass experiment for
+/// `exec_win32k_dispatch_in_phase_nested`). `true` in tree = every dispatch request carries a
+/// correlation token in MR0 which the component ECHOES in its completion, and each pump level
+/// accepts ONLY the `done` carrying its own token. That is what makes the transport correlation-safe
+/// under win32k's usermode-callback RE-ENTRY, where the `SH_REQ_SEQ` handshake cannot be used at all
+/// (a shared-memory counter cannot say WHICH nesting level a completion belongs to). `false`
+/// restores "any `dispatch_label` message ends the pump", so a misordered completion is accepted by
+/// the wrong level — the phase slip that deadlocks the boot. See [`spawn_hosts::component_pump`].
+pub const W32_DISPATCH_TOKEN_BINDING: bool = true;
 /// **`KeBugCheckEx` BINDING switch** (bypass experiment for `exec_kebugcheck_bound_and_reported`).
 /// `true` in tree = a hosted driver's own consistency bugcheck (npfs' `NpBugCheck`) is caught,
 /// reported with its code + 4 parameters + raising component, and the offending dispatch is failed
@@ -3850,6 +3859,22 @@ unsafe fn ep_send(ep: u64, label: u64) {
         in("rdi") ep,
         in("rsi") label << 12,
         in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// [`ep_send`] carrying a PER-DISPATCH CORRELATION TOKEN in MR0 (`r10`), message length 1. The
+/// component echoes the token back in its completion (`driver_launch::send_done_on`), which is what
+/// binds a `done` to the request that provoked it — the nesting-safe replacement for "any
+/// `dispatch_label` message ends the pump". See [`spawn_hosts::component_pump`].
+unsafe fn ep_send_token(ep: u64, label: u64, token: u64) {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") ep,
+        in("rsi") (label << 12) | 1,
+        in("r10") token, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -7459,6 +7484,12 @@ static DBGK_BREAKIN_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
 /// the recovery was observed on the live boot.
 static DEAD_CLIENT_UNWIND_INJECTION: AtomicU64 = AtomicU64::new(0);
+/// NESTED DISPATCH-BINDING fault-injection result (post-quiesce). Proof mask for
+/// `exec_win32k_dispatch_in_phase_nested`; see `win32k_glue::inject_win32k_nested_dispatch_slip` for
+/// what each `NESTED_SLIP_*` bit means. `0x3F` = a misordered completion really was published while
+/// a nested callback dispatch was in flight, the nested pump really rejected it and still matched
+/// its own reply, and the suspended OUTER dispatch really completed through the resume pump.
+static WIN32K_NESTED_SLIP_INJECTION: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -12262,6 +12293,43 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && dead_client_unwinds >= 1
             && dead_client_unwind_redirects >= 1
             && callback_continuation_unwinds == callback_continuation_pushes,
+        &mut passed,
+    );
+
+    // --- ★ THE COMPONENT-DISPATCH TRANSPORT IS IN PHASE **UNDER NESTING** (win32k's Syscall
+    // substrate). `exec_component_dispatch_in_phase` proves the IRP substrate with the `SH_REQ_SEQ`
+    // handshake; that handshake is deliberately scoped OUT of win32k, whose dispatch loop legitimately
+    // RE-ENTERS — an outer dispatch parks inside `KeUserModeCallback` while the client's redirected
+    // `WndProc` issues NESTED `NtUser*`/`NtGdi*` syscalls, each a dispatch of its own, unwound
+    // innermost-first. A shared-memory sequence counter cannot name the LEVEL a completion belongs to,
+    // so the binding here is a PER-DISPATCH TOKEN carried in the request and echoed in the completion.
+    // The injection publishes a `done` carrying the SUSPENDED OUTER dispatch's token while a nested
+    // dispatch is in flight — the exact misordering the counter cannot see — and every step of the
+    // rejection AND of the correct matching (nested level gets its own reply; the outer level's
+    // completion is matched later by the RESUME pump, which never sent a request of its own) must
+    // hold. With `W32_DISPATCH_TOKEN_BINDING = false` the wrong level consumes that completion.
+    let nested_slip = WIN32K_NESTED_SLIP_INJECTION.load(Ordering::Relaxed);
+    let token_mismatches = spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
+    let token_max_depth = spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
+    print_str(b"[harness] win32k nested dispatch-binding injection: proof=0x");
+    print_hex(nested_slip as u32);
+    print_str(b"/0x");
+    print_hex(win32k_glue::NESTED_SLIP_ALL as u32);
+    print_str(b" (parked/redirected/slip-rejected/nested-matched/outer-resumed/drained-idle) token-mismatches=");
+    print_u64(token_mismatches);
+    print_str(b" nesting-high-water=");
+    print_u64(token_max_depth);
+    print_str(b" binding=");
+    print_u64(W32_DISPATCH_TOKEN_BINDING as u64);
+    print_str(b"\n");
+    check(
+        b"exec_win32k_dispatch_in_phase_nested",
+        W32_DISPATCH_TOKEN_BINDING
+            && nested_slip == win32k_glue::NESTED_SLIP_ALL
+            && token_mismatches >= 1
+            // The injection really did run at depth >= 2 (an outer dispatch outstanding while a
+            // nested one was dispatched) — otherwise "nesting-safe" would be untested.
+            && token_max_depth >= 2,
         &mut passed,
     );
 

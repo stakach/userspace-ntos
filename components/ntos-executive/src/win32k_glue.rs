@@ -1254,21 +1254,11 @@ pub(crate) const DEAD_CLIENT_INJECT_ALL: u64 = 0x3f;
 /// requested for winlogon after quiesce.
 ///
 /// Returns the `DEAD_CLIENT_INJECT_*` proof mask.
-pub(crate) unsafe fn inject_dead_client_callback_unwind(
-    client_pid: u64,
-    scratch_base: u64,
-    kill_victim: &mut dyn FnMut(u64) -> bool,
-) -> u64 {
-    const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
-    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
-    const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
-    const WM_NULL: u64 = 0x0000;
-    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
-
-    let mut proof = 0u64;
-    // (0) VICTIM SELECTION — an expendable winlogon (pi 2) worker thread. Both candidates are real
-    // hosted threads with a live TCB, a registered client stack and a TEB alias the callback-window
-    // bridge can write, which is what a redirect needs; neither is winlogon's main thread.
+/// An EXPENDABLE winlogon (pi 2) worker thread usable as a callback-injection client: a real hosted
+/// thread with a live TCB, a registered client stack and a TEB alias the callback-window bridge can
+/// write (what a redirect needs). NEVER winlogon's main thread (the gate still samples that one).
+/// Returns `(badge, tid, teb_va, stack_top)`.
+unsafe fn expendable_winlogon_callback_thread() -> Option<(u64, u64, u64, u64)> {
     let candidates = [
         (
             WINLOGON_WORKER2_BADGE,
@@ -1283,10 +1273,262 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
             WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
         ),
     ];
-    let Some(&(badge, tid, teb, stack_top)) = candidates
+    candidates
         .iter()
         .find(|(_, tid, _, _)| *tid != 0 && callback_client_tcb(*tid).is_some())
-    else {
+        .copied()
+}
+
+// ── FAULT INJECTION: `exec_win32k_dispatch_in_phase_nested` ─────────────────────────────────────
+// Proof bits returned by [`inject_win32k_nested_dispatch_slip`]; ALL set = the spec passes.
+/// win32k really SUSPENDED an outer dispatch inside `KeUserModeCallback` (the nesting precondition).
+pub(crate) const NESTED_SLIP_PARKED: u64 = 0x01;
+/// The client really entered the reverse transition, so a NESTED `NtUser*` from its `WndProc` is a
+/// legitimate re-entry (this is the shape the binding has to survive).
+pub(crate) const NESTED_SLIP_REDIRECTED: u64 = 0x02;
+/// The injected MISORDERED completion (a `done` carrying the SUSPENDED OUTER dispatch's token,
+/// published while the nested dispatch was in flight) was REJECTED by the nested pump.
+pub(crate) const NESTED_SLIP_REJECTED: u64 = 0x04;
+/// …and the nested pump still matched ITS OWN reply: the nested dispatch returned its own real
+/// result, not the outer dispatch's.
+pub(crate) const NESTED_SLIP_MATCHED: u64 = 0x08;
+/// The callback then RETURNED for real and the RESUME pump matched the OUTER dispatch's token — the
+/// level whose completion never travelled with a request of its own.
+pub(crate) const NESTED_SLIP_OUTER_RESUMED: u64 = 0x10;
+/// Everything drained (callback/continuation stacks empty, token nesting depth back to 0) and a
+/// FRESH win32k dispatch completes — win32k is genuinely back in its idle dispatch receive loop.
+pub(crate) const NESTED_SLIP_DRAINED_IDLE: u64 = 0x20;
+pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
+
+/// ★ DELIBERATE FAULT INJECTION for the **nesting-safe request↔reply binding** on win32k's Syscall
+/// substrate — the analogue of `exec_component_dispatch_in_phase` for the substrate the `SH_REQ_SEQ`
+/// handshake is deliberately scoped OUT of.
+///
+/// The bug class is the same and it is REAL (it is what stops the LSA-route boot): the dispatch
+/// transport is a plain Send/Recv pair, the component publishes its completion BEFORE it waits for
+/// the next request, and "any `dispatch_label` message ends the pump" lets one level consume
+/// another level's completion. On win32k the levels are created by genuine RE-ENTRY — an outer
+/// dispatch parks inside `KeUserModeCallback` while the client's `WndProc` issues nested
+/// `NtUser*`/`NtGdi*` syscalls — so a shared-memory sequence counter cannot even name the level a
+/// completion belongs to. Only a per-dispatch token carried in the message can.
+///
+/// This manufactures exactly that condition, for real, POST-QUIESCE (the entire load-bearing boot —
+/// winlogon SAS, the msgina dialog, the authentic desktop/dialog paints — has finished and its
+/// counters are latched), on an EXPENDABLE winlogon RPC worker thread, with `WM_NULL` (the message
+/// defined to do nothing, so no window state and no pixel can change):
+///  1. a genuine `NtUserMessageCall(hwnd, WM_NULL, …)` dispatch reaches the client's window
+///     procedure and win32k calls `KeUserModeCallback` → the OUTER dispatch SUSPENDS, its token left
+///     live on the executive's dispatch-token stack;
+///  2. the client is genuinely REDIRECTED into `KiUserCallbackDispatcher` (the reverse transition
+///     that makes a nested dispatch legitimate);
+///  3. the injector is armed and a genuine NESTED dispatch is issued. Before running it, win32k's
+///     callback receive loop publishes a `done` carrying the OUTER dispatch's token — a completion
+///     for a DIFFERENT, still-outstanding level. The nested pump must reject it and keep waiting;
+///  4. the callback RETURNS for real, so the RESUME pump has to match the outer token off the top of
+///     the stack (the level that never sent a request of its own);
+///  5. everything drains and a fresh dispatch completes.
+///
+/// Unlike the dead-client injection this leaves the victim thread ALIVE and latches nothing, so it
+/// is safe to run BEFORE `inject_dead_client_callback_unwind` on the same worker.
+///
+/// Returns the `NESTED_SLIP_*` proof mask.
+pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch_base: u64) -> u64 {
+    const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
+    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
+    const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
+    const WM_NULL: u64 = 0x0000;
+    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
+    const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
+
+    let mut proof = 0u64;
+    let Some((badge, tid, teb, stack_top)) = expendable_winlogon_callback_thread() else {
+        print_str(b"[w32-slip] no expendable winlogon worker thread available -> skipped\n");
+        return proof;
+    };
+    let Some(tcb) = callback_client_tcb(tid) else {
+        return proof;
+    };
+    // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
+    // the redirect's callout-frame write has guaranteed room, exactly as the dead-client injection
+    // does. `complete_controlled_user_callback` restores the thread's context at the end.
+    let mut saved = [0u64; 20];
+    tcb_read_regs20(tcb, &mut saved);
+    let victim_rip = saved[nt_user_callback::USER_CONTEXT_RIP];
+    let victim_flags = saved[nt_user_callback::USER_CONTEXT_RFLAGS];
+    let victim_rsp = (stack_top - 0x400) & !0xfu64;
+    saved[nt_user_callback::USER_CONTEXT_RSP] = victim_rsp;
+    let write_error = tcb_write_regs20(tcb, &saved, false);
+    print_str(b"[w32-slip] victim winlogon worker badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" write-error=");
+    print_u64(write_error);
+    print_str(b" sas-sequence-active=");
+    print_u64(USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed));
+    print_str(b" token-depth=");
+    print_u64(crate::spawn_hosts::dispatch_token_depth());
+    print_str(b"\n");
+
+    let client = Win32kClientContext {
+        pi: 2,
+        pid: client_pid,
+        badge,
+        tid,
+        teb,
+        peb_mirror: WINLOGON_PEB_MIRROR,
+        scratch_base,
+    };
+
+    // (1) SUSPEND an outer dispatch inside a REAL user-mode callback.
+    let sas_hwnd = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
+    );
+    let targets = [sas_hwnd, last_real_wm_paint_hwnd()];
+    let mut parked = false;
+    for hwnd in targets {
+        if hwnd == 0 || parked {
+            continue;
+        }
+        let (status, completed) = win32k_dispatch_wide(
+            NTUSER_MESSAGE_CALL_SSN,
+            hwnd,
+            WM_NULL,
+            0,
+            0,
+            victim_rsp,
+            NTUSER_MESSAGE_CALL_ARGC,
+            &[0 /* ResultInfo */, FNID_SENDMESSAGE, 0 /* Ansi */],
+            client,
+        );
+        parked = take_user_callback_pump_suspended();
+        print_str(b"[w32-slip] NtUserMessageCall(WM_NULL) hwnd=0x");
+        print_hex(hwnd as u32);
+        print_str(b" -> status=0x");
+        print_hex(status as u32);
+        print_str(b" completed=");
+        print_u64(completed as u64);
+        print_str(b" callback-parked=");
+        print_u64(parked as u64);
+        print_str(b"\n");
+    }
+    if !parked {
+        print_str(b"[w32-slip] win32k issued no user callback -> injection did not arm\n");
+        return proof;
+    }
+    proof |= NESTED_SLIP_PARKED;
+    // The OUTER dispatch's token is now the innermost outstanding one — the value a misordered
+    // completion would carry, and the value the RESUME pump will have to match later.
+    let outer_token = crate::spawn_hosts::suspended_dispatch_token();
+
+    // (2) REDIRECT the client — the real reverse transition that legitimises a nested dispatch.
+    if !begin_controlled_user_callback_redirect(client, victim_rip, victim_rsp, victim_flags) {
+        print_str(b"[w32-slip] redirect failed -> cancelling the parked callback\n");
+        let _ = cancel_suspended_user_callback();
+        return proof;
+    }
+    let (active_depth, continuation_depth) = user_callback_stack_depths();
+    if active_depth >= 1
+        && (*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
+            .top()
+            .is_some_and(|frame| frame.is_redirected())
+    {
+        proof |= NESTED_SLIP_REDIRECTED;
+    }
+    print_str(b"[w32-slip] armed: outer-token=");
+    print_u64(outer_token);
+    print_str(b" callback-depth=");
+    print_u64(active_depth as u64);
+    print_str(b" continuation-depth=");
+    print_u64(continuation_depth as u64);
+    print_str(b"\n");
+
+    // (3) THE INJECTION — a NESTED dispatch that is preceded by a `done` carrying the OUTER token.
+    let mismatches_before = crate::spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
+    let max_depth_before = crate::spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
+    crate::spawn_hosts::W32_SLIP_INJECT_TOKEN.store(outer_token, Ordering::Relaxed);
+    crate::spawn_hosts::W32_SLIP_INJECT.store(1, Ordering::Relaxed);
+    let (nested_status, nested_ok) = win32k_dispatch_wide(
+        win32k_subsystem::SSN_TEST_FAULT,
+        0,
+        0,
+        0,
+        0,
+        victim_rsp,
+        0,
+        &[],
+        client,
+    );
+    // Disarm unconditionally (it is one-shot, but never leave it live if it was not consumed).
+    crate::spawn_hosts::W32_SLIP_INJECT.store(0, Ordering::Relaxed);
+    let mismatches_after = crate::spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
+    let max_depth_after = crate::spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
+    if mismatches_after == mismatches_before + 1 {
+        proof |= NESTED_SLIP_REJECTED;
+    }
+    if nested_ok && nested_status == win32k_subsystem::TEST_FAULT_STATUS {
+        proof |= NESTED_SLIP_MATCHED;
+    }
+    print_str(b"[w32-slip] nested dispatch -> status=0x");
+    print_hex(nested_status as u32);
+    print_str(b" completed=");
+    print_u64(nested_ok as u64);
+    print_str(b" token-mismatches=");
+    print_u64(mismatches_after.saturating_sub(mismatches_before));
+    print_str(b" nesting-depth-high-water=");
+    print_u64(max_depth_after.max(max_depth_before));
+    print_str(b"\n");
+
+    // (4) RETURN the callback for real: the RESUME pump must match the OUTER dispatch's token off
+    // the top of the token stack and drive the suspended dispatch to its own completion.
+    let returned = complete_controlled_user_callback(2, badge, tid, 0, 0, STATUS_UNSUCCESSFUL);
+    if returned.is_some() {
+        proof |= NESTED_SLIP_OUTER_RESUMED;
+    }
+
+    // (5) DRAINED + win32k idle.
+    let (active_after, continuation_after) = user_callback_stack_depths();
+    let token_depth_after = crate::spawn_hosts::dispatch_token_depth();
+    let (probe_status, probe_ok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
+    if active_after == 0
+        && continuation_after == 0
+        && token_depth_after == 0
+        && probe_ok
+        && probe_status == win32k_subsystem::TEST_FAULT_STATUS
+    {
+        proof |= NESTED_SLIP_DRAINED_IDLE;
+    }
+    print_str(b"[w32-slip] outer-resumed=");
+    print_u64(returned.is_some() as u64);
+    print_str(b" active-depth=");
+    print_u64(active_after as u64);
+    print_str(b" continuation-depth=");
+    print_u64(continuation_after as u64);
+    print_str(b" token-depth=");
+    print_u64(token_depth_after);
+    print_str(b" probe=0x");
+    print_hex(probe_status as u32);
+    print_str(b" proof=0x");
+    print_hex(proof as u32);
+    print_str(b"\n");
+    proof
+}
+
+pub(crate) unsafe fn inject_dead_client_callback_unwind(
+    client_pid: u64,
+    scratch_base: u64,
+    kill_victim: &mut dyn FnMut(u64) -> bool,
+) -> u64 {
+    const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
+    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
+    const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
+    const WM_NULL: u64 = 0x0000;
+    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
+
+    let mut proof = 0u64;
+    // (0) VICTIM SELECTION — an expendable winlogon (pi 2) worker thread (see
+    // [`expendable_winlogon_callback_thread`]).
+    let Some((badge, tid, teb, stack_top)) = expendable_winlogon_callback_thread() else {
         print_str(b"[cb-inject] no expendable winlogon worker thread available -> skipped\n");
         return proof;
     };

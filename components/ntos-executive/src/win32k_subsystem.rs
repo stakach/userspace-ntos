@@ -2429,18 +2429,38 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         write_volatile(core::ptr::addr_of_mut!((*frame).header), header);
         let request = header;
 
-        crate::driver_launch::send_done_on(W32_USER_CALLBACK_LABEL);
+        // The callback rendezvous carries NO token: it is an EVENT this component raises, not the
+        // completion of a request, and the executive answers it in place (resume) or suspends this
+        // dispatch. The suspended dispatch's own token stays live on the executive's token stack.
+        crate::driver_launch::send_done_on(W32_USER_CALLBACK_LABEL, 0);
         loop {
-            match crate::driver_launch::recv_req_on() {
+            // ★ THE NESTING SEAM. While this outer dispatch is parked here, the client's redirected
+            // `WndProc` can issue further `NtUser*`/`NtGdi*` syscalls, each arriving as a NESTED
+            // dispatch with its OWN correlation token. Echo THAT token in the nested completion so
+            // the executive's nested pump binds it to the request it sent, never to this outer
+            // dispatch's (still outstanding) one. Nesting is unbounded and strictly LIFO — each
+            // level's token lives in its own C frame.
+            let (label, nested_token) = crate::driver_launch::recv_req_on();
+            match label {
                 W32_USER_CALLBACK_RESUME_LABEL => break,
                 W32_DISPATCH_LABEL => {
+                    // FAULT INJECTION (gate spec `exec_win32k_dispatch_in_phase_nested`): publish a
+                    // `done` carrying the SUSPENDED OUTER dispatch's token before running the nested
+                    // request — the misordered completion a shared-memory sequence counter cannot
+                    // detect. Only a pump that binds reply→request by token rejects it.
+                    if crate::spawn_hosts::W32_SLIP_INJECT.swap(0, Ordering::Relaxed) != 0 {
+                        crate::driver_launch::send_done_on(
+                            W32_DISPATCH_LABEL,
+                            crate::spawn_hosts::W32_SLIP_INJECT_TOKEN.load(Ordering::Relaxed),
+                        );
+                    }
                     let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                         drv: 0,
                     });
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                     let _ = info;
-                    crate::driver_launch::send_done_on(W32_DISPATCH_LABEL);
+                    crate::driver_launch::send_done_on(W32_DISPATCH_LABEL, nested_token);
                 }
                 _ => return 0xC000_0001u32 as i32,
             }

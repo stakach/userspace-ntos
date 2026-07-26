@@ -1553,34 +1553,42 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
 /// Generic (label-parameterised) ready/done signal for the shared [`crate::spawn_hosts::component_main`]
 /// harness: a plain `seL4_Send(CT_FAULT, label)` (Send/Recv, NOT Call — the win32k fix-A rationale).
 /// The FSD dispatch loop (now the harness's) Sends [`FSD_DISPATCH_LABEL`] through this.
+///
+/// ★ `token` is the PER-DISPATCH CORRELATION TOKEN the executive handed us with the request; the
+/// component ECHOES it in the completion so `component_pump` can bind reply→request even when the
+/// substrate is re-entered (win32k's usermode-callback nesting). It rides in MR0 (`r10`), so the
+/// message length is 1 (the kernel copies `min(length,4)` message registers — `endpoint.rs:466`).
+/// The initial ready signal (nobody sent us a request yet) uses token 0, which no pump ever expects.
 #[inline(never)]
-pub(crate) unsafe fn send_done_on(label: u64) {
+pub(crate) unsafe fn send_done_on(label: u64, token: u64) {
     core::arch::asm!(
         "syscall",
         in("rdx") crate::SYS_SEND as u64,
         in("rdi") crate::CT_FAULT,
-        in("rsi") label << 12,
-        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
+        in("rsi") (label << 12) | 1,
+        in("r10") token, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
 }
 
 /// Block for the next dispatch request for the shared [`crate::spawn_hosts::component_main`]
-/// harness: a plain `seL4_Recv(CT_FAULT)`. Returns the received message label so the win32k
-/// callback trampoline can distinguish a nested dispatch from its callback-resume signal.
+/// harness: a plain `seL4_Recv(CT_FAULT)`. Returns `(label, token)`: the label so the win32k
+/// callback trampoline can distinguish a nested dispatch from its callback-resume signal, and the
+/// executive's per-dispatch correlation token (MR0) so the completion for THIS request can echo it.
 #[inline(never)]
-pub(crate) unsafe fn recv_req_on() -> u64 {
+pub(crate) unsafe fn recv_req_on() -> (u64, u64) {
     let message_info: u64;
+    let token: u64;
     core::arch::asm!(
         "syscall",
         in("rdx") crate::SYS_RECV as u64,
         inout("rdi") crate::CT_FAULT => _,
-        lateout("rsi") message_info, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rsi") message_info, lateout("r10") token, lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    message_info >> 12
+    (message_info >> 12, token)
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke the FSD's
