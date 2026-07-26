@@ -418,6 +418,52 @@ pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1075_0000;
 /// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
 pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
 
+// --- lsass' `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread (rpcrt4 `RPCRT4_new_client` →
+// `CreateThread(RPCRT4_io_thread)`, created by lsass' `\lsarpc` `RPCRT4_server_thread` — badge
+// LSASS_LISTENER3 — once `rpcrt4_ncacn_np_handoff` completes on an accepted connection). This is the
+// EXACT analogue of the SCM `\ntsvcs` worker (SCM_WORKER_BADGE) for pi 4, and it is what makes lsass'
+// **SELF-RPC** work: lsass' MAIN thread is the CLIENT (samsrv `SampGetAccountDomainInfo` →
+// `LsaOpenPolicy` → advapi32's `ncacn_np:\pipe\lsarpc` auto-bind) while lsass' own rpcrt4 server
+// answers it. Same VSpace, so the worker needs its OWN target VAs (distinct TEB → distinct GS base).
+//
+// The three lsass listener blocks already consume the SM (0x1044), 0x104C and WL_WORKER3 (0x1052)
+// windows, and 0x1058..0x105B belong to the generic TP worker slot 0, so this window follows
+// TP_WORKER_SLOT1's precedent of a HIGH target VA: 0x13F0, clear of slot 1's 0x13E0..0x13E3.
+pub const LSA_WORKER_REGION_BASE: u64 = 0x0000_0100_13F0_0000; // lsass VSpace (own pml4)
+pub const LSA_WORKER_STACK_BASE: u64 = LSA_WORKER_REGION_BASE;
+pub const LSA_WORKER_STACK_FRAMES: u64 = 8;
+pub const LSA_WORKER_IPCBUF_VA: u64 = LSA_WORKER_REGION_BASE + 0x1_0000;
+pub const LSA_WORKER_TEB_VA: u64 = LSA_WORKER_REGION_BASE + 0x2_0000; // 2 pages
+pub const LSA_WORKER_TRAMP_VA: u64 = LSA_WORKER_REGION_BASE + 0x3_0000;
+/// Executive-side stack mirror for the LSA worker (its RPC-PDU read buffers + syscall out-params land
+/// on its OWN stack). 8 stack pages + 2 TEB pages, inside the already-created 0x1380 mirror PT and
+/// clear of the SCM worker's 0x1398 window.
+pub const LSA_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1399_0000;
+/// Executive scratch (3 pages: TEB / TEB2 / trampoline, +1 for the spawn self-verify read-back).
+/// The FILEBUF PT's 0x1070..0x107F env-scratch slots are ALL taken, so this lives in the mirror PT
+/// just past the LSA worker's own mirror window (0x1399_0000 + 10 pages).
+pub const LSA_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_139A_0000;
+/// The fault-EP badge for lsass' per-connection LSA RPC worker — the loop maps it to (pi 4, worker),
+/// switching ACTIVE_STACK_MIRROR to the worker's own mirror. Next free after the generic TP worker
+/// badges (16..25).
+pub const LSA_WORKER_BADGE: u64 = 26;
+const _: () = {
+    // The worker's target window must not alias the generic TP worker slot-1 window in the SAME
+    // VSpace, and its executive-side mirror + scratch must stay inside the 0x1380 mirror PT and
+    // clear of both the SCM worker's mirror (0x1398) and TP_WORKER_EXEC_BASE (0x13A0).
+    assert!(LSA_WORKER_REGION_BASE >= TP_WORKER_SLOT1_REGION_BASE + 0x4_0000);
+    assert!(
+        LSA_WORKER_STACK_MIRROR_VA >= SCM_WORKER_STACK_MIRROR_VA + SCM_WORKER_STACK_FRAMES * 0x1000
+    );
+    assert!(
+        LSA_WORKER_ENV_SCRATCH_VA
+            >= LSA_WORKER_STACK_MIRROR_VA + (LSA_WORKER_STACK_FRAMES + 2) * 0x1000
+    );
+    assert!(LSA_WORKER_ENV_SCRATCH_VA + 0x4000 <= TP_WORKER_EXEC_BASE);
+    assert!(LSA_WORKER_STACK_MIRROR_VA & !0x1f_ffff == LSA_WORKER_ENV_SCRATCH_VA & !0x1f_ffff);
+    assert!(tp_worker_identity_from_badge(LSA_WORKER_BADGE).is_none());
+};
+
 // --- Bounded generic ntdll thread-pool worker -----------------------------------------------
 // The established SM/CSR/RPC roles retain their specialized layouts. An NtCreateThread whose
 // entrypoint exactly matches ntdll's exported worker gets this generic layout at the same target VAs
@@ -695,6 +741,20 @@ pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
 /// NtSetValueKey — smss writes registry values after CM write-enable. Our regf hive is read-only
 /// and we don't persist, so → no-op success (the write "succeeds" but isn't recorded).
 pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
+/// `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`
+/// (`sysfuncs.lst` line 84 → SSN 83, one argument).
+///
+/// **Why this service is load-bearing, not cosmetic.** rpcrt4's ncacn_np SERVER reaches it on every
+/// accepted connection: `rpcrt4_protseq_np_wait_for_new_connection` → `rpcrt4_spawn_connection` →
+/// `rpcrt4_ncacn_np_handoff` (`rpc_transport.c:599`) → `GetComputerNameA` → kernel32
+/// `GetComputerNameExW(ComputerNameNetBIOS)` (`client/compname.c:236`), which — when the
+/// `ActiveComputerName` key is absent — runs `SetActiveComputerNameToRegistry`
+/// (`compname.c:131`): NtOpenKey / NtCreateKey / NtSetValueKey / **NtFlushKey**
+/// (`compname.c:203`). With SSN 83 unserviced the SERVER THREAD parked inside the handoff, so
+/// `RPCRT4_new_client` never ran and the connection got NO per-connection worker at all.
+pub const SSN_NT_FLUSH_KEY: u64 = 83;
+/// Bypass switch for the `NtFlushKey` gate specs (see the `build_nt_table` row). `true` in tree.
+pub const NT_FLUSH_KEY_SERVICED: bool = true;
 /// NtSetSystemInformation — smss sets system-wide config in SmpInit (priority separation, etc.).
 /// We don't model system-info classes → no-op success so bring-up proceeds.
 pub const SSN_NT_SET_SYSTEM_INFORMATION: u64 = 249;
@@ -2531,6 +2591,68 @@ fn lsa_security_database_specs(passed: &mut u64) {
             && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 0,
         passed,
     );
+    lsa_rpc_handoff_specs(passed);
+}
+
+/// ═══ `NtFlushKey` + the rpcrt4 ncacn_np SERVER handoff ═════════════════════════════════════════
+///
+/// Why these two specs exist: "lsass hosts no per-connection LSA RPC worker" was never a missing
+/// worker — it was a **missing kernel service**. `rpcrt4_protseq_np_wait_for_new_connection`
+/// (`rpc_transport.c:1057`) accepts the connection and calls `rpcrt4_spawn_connection` ->
+/// `rpcrt4_ncacn_np_handoff` (`rpc_transport.c:599`), which (a) creates the next server pipe
+/// instance and (b) calls `GetComputerNameA`. On a fresh boot the `ActiveComputerName` key does not
+/// exist, so kernel32's `GetComputerNameExW(ComputerNameNetBIOS)` (`client/compname.c:236`) falls
+/// back to `SetActiveComputerNameToRegistry` (`compname.c:131`) = NtOpenKey / NtCreateKey /
+/// NtSetValueKey / **NtFlushKey**. `NtFlushKey` (SSN 83) was NOT in the service table, so the SERVER
+/// THREAD parked mid-handoff and `RPCRT4_new_client` — the call that creates the per-connection
+/// worker — was never reached at all.
+fn lsa_rpc_handoff_specs(passed: &mut u64) {
+    let flushes = REG_FLUSH_KEY_CALLS.load(Ordering::Relaxed);
+    let volatile_flushes = REG_FLUSH_KEY_VOLATILE.load(Ordering::Relaxed);
+    let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
+    let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
+    print_str(b"[lsa-rpc] NtFlushKey calls=");
+    print_u64(flushes);
+    print_str(b" volatile=");
+    print_u64(volatile_flushes);
+    print_str(b" ActiveComputerName-created=");
+    print_u64(active_name);
+    print_str(b" RPCRT4_new_client-reached=");
+    print_u64(new_clients);
+    print_str(b" pool-double-frees-rejected=");
+    print_u64(driver_launch::FSD_POOL_DOUBLE_FREES.load(Ordering::Relaxed));
+    print_str(b" pool-list-cycles=");
+    print_u64(driver_launch::FSD_POOL_LIST_CYCLES.load(Ordering::Relaxed));
+    print_str(b"
+");
+    // (1) `NtFlushKey` is a REAL serviced system service, not an unhandled SSN: it is registered in
+    //     the live NT service table at the `sysfuncs.lst`-derived SSN 83 with its one-argument
+    //     contract, it was actually CALLED on this boot, and every call resolved a real key handle
+    //     through `resolve_registry_key` (a bad handle would have returned the real error instead).
+    //     At least one call was on a key that lives in the in-memory write overlay — `HvSyncHive`'s
+    //     `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`), the semantics we implement.
+    //     The counters CANNOT move if the SSN is unserviced: the caller parks instead.
+    let table_ok = nt_syscall_abi::ssn_of("NtFlushKey") == Some(83)
+        && nt_syscall_abi::exact_argc_of("NtFlushKey") == Some(1);
+    check(
+        b"exec_reg_flush_key_serviced",
+        table_ok && flushes >= 1 && volatile_flushes >= 1,
+        passed,
+    );
+    // (2) lsass' `\pipe\lsarpc` rpcrt4 SERVER thread crossed the WHOLE handoff and reached
+    //     `RPCRT4_new_client`. Both halves are asserted, because either alone is weak:
+    //       * `ActiveComputerName` exists  => `SetActiveComputerNameToRegistry` ran to its
+    //         `NtFlushKey` tail, i.e. `GetComputerNameA` RETURNED inside the handoff;
+    //       * `RPCRT4_new_client` reached  => `rpcrt4_ncacn_np_handoff` returned RPC_S_OK, so the
+    //         accepted connection was handed off AND the next server instance created, and rpcrt4
+    //         asked for the per-connection worker thread.
+    //     Before this batch BOTH were 0 — the server thread parked on the unserviced SSN 83, which
+    //     is precisely why the LSA self-RPC had no server side.
+    check(
+        b"exec_lsa_rpc_handoff_reaches_new_client",
+        active_name >= 1 && new_clients >= 1,
+        passed,
+    );
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
@@ -2556,6 +2678,11 @@ static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SVC_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// BATCH 37 DIAG: per-SSN trace counter for the SCM per-connection worker.
 pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// LSA-RPC DIAG: per-SSN trace counter for lsass' `\pipe\lsarpc` rpcrt4 SERVER thread
+/// (`RPCRT4_server_thread`, badge [`LSASS_LISTENER3_BADGE`]). Bounded; reveals exactly what the
+/// server thread does after `rpcrt4_protseq_np_wait_for_new_connection` returns from an accept
+/// (`rpcrt4_spawn_connection` re-listen → `RPCRT4_new_client` → `CreateThread`).
+pub(crate) static LSA_LISTENER3_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// lsass' LSA server thread — same shape as SVC_LISTENER, for pi 4 (the N-threads multiplex).
 static LSASS_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
@@ -2576,6 +2703,60 @@ static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_TID: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// lsass' (pi 4) `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread — spawned DYNAMICALLY by lsass'
+/// `\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3) via `RPCRT4_new_client` →
+/// `CreateThread(RPCRT4_io_thread)` on each accepted connection. Runs into the same service-loop
+/// multiplex keyed by [`LSA_WORKER_BADGE`]. This is the thread that reads the LSA RPC bind PDU and
+/// answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued by lsass' own
+/// main thread from samsrv) complete instead of blocking forever on an unserved pipe.
+static LSA_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
+static LSA_WORKER_TID: AtomicU64 = AtomicU64::new(0);
+static LSA_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Times lsass' `\pipe\lsarpc` rpcrt4 SERVER thread reached `RPCRT4_new_client`
+/// (`rpc_server.c:626`) and asked for a per-connection worker thread. Nonzero ONLY if
+/// `rpcrt4_protseq_np_wait_for_new_connection` -> `rpcrt4_spawn_connection` ->
+/// `rpcrt4_ncacn_np_handoff` ran to completion — which needs the re-listen instance create AND
+/// `GetComputerNameA`, whose `SetActiveComputerNameToRegistry` fallback ends in `NtFlushKey`.
+pub(crate) static LSA_RPC_NEW_CLIENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Set when `SetActiveComputerNameToRegistry` (`kernel32/client/compname.c:131`) created the
+/// `...\Control\ComputerName\ActiveComputerName` key — the tail of the exact NtOpenKey/NtCreateKey/
+/// NtSetValueKey/**NtFlushKey** sequence that used to wall inside the rpcrt4 handoff.
+pub(crate) static ACTIVE_COMPUTER_NAME_KEY_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Bounded per-SSN trace for lsass' generic thread-pool worker (rpcrt4's `RPCRT4_worker_thread`).
+pub(crate) static LSA_TP_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// Total native syscalls serviced, for the `[ssn-heartbeat]` spin diagnostic.
+pub(crate) static NATIVE_SYSCALL_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+/// Bounded per-SSN trace for the LSA per-connection worker (same shape as `[scm-worker-ssn]`).
+pub(crate) static LSA_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// Native syscalls the LSA per-connection worker actually issued (unbounded) — the counter the gate
+/// asserts on: it can only be nonzero if a real per-connection worker thread RAN in lsass' VSpace.
+pub(crate) static LSA_WORKER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+/// RPC PDUs the LSA per-connection worker READ off the accepted `\pipe\lsarpc` connection, and the
+/// PDU type byte (offset 2) of the first one. A real MS-RPC bind is type 0x0b.
+pub(crate) static LSA_WORKER_PDU_READS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_WORKER_FIRST_PDU_TYPE: AtomicU64 = AtomicU64::new(0xFF);
+/// PDUs the worker WROTE back onto the connection, and the first one's PDU type (bind_ack = 0x0c).
+pub(crate) static LSA_WORKER_PDU_WRITES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_WORKER_FIRST_REPLY_TYPE: AtomicU64 = AtomicU64::new(0xFF);
+/// The `\pipe\lsarpc` CLIENT side inside lsass itself (the self-RPC): PDUs written by lsass' main
+/// thread (advapi32's auto-bind + the `LsarOpenPolicy` request) and PDUs it read back.
+pub(crate) static LSA_SELF_RPC_CLIENT_WRITES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_SELF_RPC_CLIENT_READS: AtomicU64 = AtomicU64::new(0);
+/// `pipe_name_hash` of the `\lsarpc` leaf, so the self-RPC instrumentation is NAME-SCOPED (the same
+/// hash the async-listen table + connect re-drive already key on). The leaf carries its leading
+/// backslash exactly as `pipe_leaf16` produces it.
+pub(crate) fn lsarpc_pipe_name_hash() -> u64 {
+    const LEAF: [u16; 7] = [
+        b'\\' as u16,
+        b'l' as u16,
+        b's' as u16,
+        b'a' as u16,
+        b'r' as u16,
+        b'p' as u16,
+        b'c' as u16,
+    ];
+    nt_io_manager::pipe_name_hash(&LEAF)
+}
 /// Multiplex-event counter for winlogon's rpcrt4 server WORKER thread (badge WINLOGON_WORKER_BADGE).
 /// Proves the worker actually RUNS (not suspended) — spec `exec_winlogon_worker_multiplex`.
 static WL_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -5448,6 +5629,13 @@ pub(crate) static SAMSRV_LOADED_SIZE: AtomicU64 = AtomicU64::new(0);
 /// name `SAM` with a NULL RootDirectory, i.e. samsrv's `SamKeyHandle` was never set because
 /// `SamIInitialize` never reached `SampInitDatabase`.
 pub(crate) static SAM_CONNECT_NULL_ROOT_MISS: AtomicU64 = AtomicU64::new(0);
+/// Serviced `NtFlushKey` calls (SSN 83). rpcrt4's ncacn_np server handoff runs one per accepted
+/// connection via kernel32's `SetActiveComputerNameToRegistry`; with the SSN unserviced the server
+/// thread PARKED there and `RPCRT4_new_client` never spawned a per-connection worker.
+pub(crate) static REG_FLUSH_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones whose key lives in the in-memory write overlay — `HvSyncHive`'s
+/// `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`) verbatim.
+pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 /// BATCH 41 — count of winlogon `DefaultPassword` value reads satisfied with an empty REG_SZ (proves
 /// the LSA-RPC-avoidance crossing). During GinaInit, msgina's `GetRegistrySettings` (msgina.c:216)
 /// reads `HKLM\...\Winlogon\DefaultPassword`; ONLY when that read FAILS does it call
@@ -5885,6 +6073,12 @@ struct ExecNtHandler {
     /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
     lsass_listener2_spawn: bool,
     lsass_listener3_spawn: bool,
+    /// Set by lsass' (pi 4) `NtCreateThread` issued FROM its `\lsarpc` `RPCRT4_server_thread`
+    /// (badge LSASS_LISTENER3) — i.e. `RPCRT4_new_client` on an accepted connection — so the LOOP
+    /// spawns + RESUMES the REAL per-connection worker (`spawn_lsa_worker_thread`) into the main
+    /// multiplex at [`LSA_WORKER_BADGE`]. This is the thread that reads the LSA RPC bind PDU and
+    /// answers `LsarOpenPolicy` for lsass' own self-RPC.
+    lsa_worker_spawn: bool,
     /// Encoded generic ntdll worker identity awaiting mechanism construction. Zero means none;
     /// `1 + slot * TP_WORKER_PI_COUNT + pi` identifies the process and worker role.
     tp_worker_spawn_request: u8,
@@ -6252,6 +6446,13 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtDeleteValueKey, SSN_NT_DELETE_VALUE_KEY as u32),
             (NativeService::NtInitializeRegistry, SSN_NT_INITIALIZE_REGISTRY as u32),
             (NativeService::NtSetValueKey, SSN_NT_SET_VALUE_KEY as u32),
+            // BYPASS EXPERIMENT SWITCH: flip `NT_FLUSH_KEY_SERVICED` to `false` and SSN 83 leaves the
+            // service table exactly as it was before this batch -> lsass' `\lsarpc` server thread
+            // parks mid-`rpcrt4_ncacn_np_handoff` again and BOTH new specs must FAIL.
+            (
+                NativeService::NtFlushKey,
+                if NT_FLUSH_KEY_SERVICED { SSN_NT_FLUSH_KEY as u32 } else { u32::MAX },
+            ),
             (NativeService::NtSetSystemInformation, SSN_NT_SET_SYSTEM_INFORMATION as u32),
             (NativeService::NtUnmapViewOfSection, 277),
             (NativeService::NtSetSecurityObject, 246),

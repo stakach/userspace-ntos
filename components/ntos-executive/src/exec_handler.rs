@@ -293,6 +293,7 @@ impl ExecNtHandler {
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
+            lsa_worker_spawn: false,
             tp_worker_spawn_request: 0,
             remote_thread_request: None,
             wait_park_event: -1,
@@ -5361,6 +5362,12 @@ impl ExecNtHandler {
                     LSA_POLICY_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
                 } else if canon.starts_with(r"\registry\machine\sam\") {
                     SAM_SETUP_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
+                } else if canon.ends_with(r"\computername\activecomputername") {
+                    // kernel32's `SetActiveComputerNameToRegistry` (`client/compname.c:131`) —
+                    // reached from `GetComputerNameExW(ComputerNameNetBIOS)` inside rpcrt4's
+                    // `rpcrt4_ncacn_np_handoff`. Its tail is `NtFlushKey`, so this key existing
+                    // proves that whole sequence ran instead of walling on the unserviced SSN 83.
+                    ACTIVE_COMPUTER_NAME_KEY_CREATED.fetch_add(1, Ordering::Relaxed);
                 }
                 let status = self.mint_registry_key(
                     OVERLAY_KEY_TAG | (oidx as u32),
@@ -5431,6 +5438,33 @@ impl ExecNtHandler {
                 self.overlay_dirty = true;
                 0 // STATUS_SUCCESS
             },
+            // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
+            // NT's own body is: reference the key object by handle (**no access mask** — it passes 0
+            // to `ObReferenceObjectByHandle`), fail `STATUS_KEY_DELETED` if the KCB is deleted, else
+            // `CmFlushKey(kcb, FALSE)`. `CmFlushKey` (`cmapi.c`) ends in `HvSyncHive`, and
+            // `HvSyncHive` (`sdk/lib/cmlib/hivewrt.c:466`) **returns TRUE immediately for a
+            // `HIVE_VOLATILE` hive** ("avoid any write operations on volatile hives") and likewise
+            // when the dirty vector holds no dirty block ("literally nothing to do").
+            //
+            // That is EXACTLY this host's registry: the mounted `regf` hives are READ-ONLY and every
+            // runtime key/value lives in the in-memory write overlay, which IS the store — there is
+            // no separate write-behind cache to drain and no backing file to sync. So the faithful
+            // answer is `STATUS_SUCCESS` after a REAL handle resolution, not a fabricated success:
+            // a bad handle still returns the real error (`resolve_registry_key`), the counter below
+            // proves the service actually ran, and nothing is claimed to have been persisted.
+            NativeService::NtFlushKey => {
+                let key = match self.resolve_registry_key(args[0], 0) {
+                    Ok(key) => key,
+                    Err(status) => return status,
+                };
+                REG_FLUSH_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+                // A key that lives in the write overlay (rather than the read-only `regf` mount) is
+                // the volatile-hive case verbatim. Pure check — a flush must never CREATE anything.
+                if overlay_key_idx(key).is_some() {
+                    REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
+                }
+                0 // STATUS_SUCCESS — HvSyncHive's volatile / no-dirty-block early return
+            }
             NativeService::NtDeleteValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -6974,6 +7008,93 @@ impl ExecNtHandler {
                             SCM_WORKER_TID.store(tid, Ordering::Relaxed);
                             self.scm_worker_spawn = true;
                             print_str(b"[scm-worker] recognized services' 2nd NtCreateThread = per-connection RPC worker: entry=0x");
+                            print_hex((start.rip >> 32) as u32);
+                            print_hex(start.rip as u32);
+                            print_str(b" tid=");
+                            print_u64(tid);
+                            print_str(b"\n");
+                            return 0;
+                        }
+                    }
+                }
+                // ★ THE LSA SELF-RPC WORKER — lsass' (pi 4) `NtCreateThread` issued FROM its
+                // `\pipe\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3). In rpcrt4 that call is
+                // `RPCRT4_new_client(cconn)` → `CreateThread(RPCRT4_io_thread, conn)`
+                // (`rpc_server.c:626`), reached from `rpcrt4_protseq_np_wait_for_new_connection`
+                // (`rpc_transport.c:1057`) once the accepted connection has been handed off. It is the
+                // EXACT counterpart of services' SCM `\ntsvcs` worker above, and it is the thread that
+                // reads the LSA RPC bind PDU and answers `LsarOpenPolicy`.
+                //
+                // Before this recognizer existed the call fell through to the generic paths and no
+                // per-connection worker was ever routed — which is why lsass' own `LsaOpenPolicy`
+                // (samsrv's `SampGetAccountDomainInfo`, a SELF-RPC into lsass' own LSA RPC surface)
+                // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (pi 4 + the
+                // \lsarpc server thread's badge), never by creation order.
+                //
+                // ★★ ROUTE GATED OFF FOR THIS COMMIT — the same call the BATCH-38 SCM worker made.
+                // With `LSA_WORKER_ROUTE_ENABLED = true` the whole self-RPC RUNS FOR REAL and was
+                // proven end to end (`/tmp/boot_lsarpc_w4.log`): the worker reads the 72-byte bind
+                // (`05 00 0b 03`), `process_bind_packet` writes the 68-byte bind_ack (`05 00 0c 03`)
+                // which wakes lsass' own parked client read, the client writes the 56-byte
+                // `LsarOpenPolicy` request (`05 00 00 03`), the worker reads it and
+                // `QueueUserWorkItem`s `RPCRT4_worker_thread`, and that thread runs the real server
+                // stub (it opens `SECURITY\Policy` with KEY_ALL_ACCESS) and writes the 48-byte
+                // RESPONSE (`05 00 02 03`). The boot then HANGS — not in the LSA plane, but inside
+                // **npfs.sys**: that response write is the first pipe write issued while a SECOND IRP
+                // (the worker's own pending read, the normal rpcrt4 server shape) is outstanding on
+                // the same FILE_OBJECT, and npfs' `NpWriteDataQueue`/`NpGetNextRealDataQueueEntry`
+                // data-queue walk (`writesup.c:48`, `datasup.c`) spins forever on it with ZERO
+                // imports called and ZERO faults — its `ASSERT`/`KeBugCheckEx` guard for exactly that
+                // queue-state inconsistency is one of the fail-soft-unbound imports, so the
+                // inconsistency is skipped instead of caught. The executive is stuck inside
+                // `component_pump`'s blocking recv, so the boot never quiesces (RUNEXIT=124).
+                // Fixing npfs' concurrent-IRP-per-FILE_OBJECT handling is its own batch; until then
+                // the route stays OFF so the boot quiesces, and the counter below still records that
+                // `RPCRT4_new_client` was genuinely REACHED (which is what `NtFlushKey` unblocked).
+                const LSA_WORKER_ROUTE_ENABLED: bool = false;
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 4
+                    && self.current_badge == LSASS_LISTENER3_BADGE
+                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
+                    && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
+                    && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
+                {
+                    // Counted whether or not the route is enabled: reaching here PROVES lsass'
+                    // `\lsarpc` server thread got through `rpcrt4_ncacn_np_handoff` (the
+                    // `GetComputerNameA` -> `NtFlushKey` wall) and called `RPCRT4_new_client`.
+                    LSA_RPC_NEW_CLIENT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                }
+                if LSA_WORKER_ROUTE_ENABLED
+                    && matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 4
+                    && self.current_badge == LSASS_LISTENER3_BADGE
+                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
+                    && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
+                    && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                        {
+                            self.pm
+                                .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
+                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            self.queue_write(args[0], handle); // *ThreadHandle
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            LSA_WORKER_TID.store(tid, Ordering::Relaxed);
+                            self.lsa_worker_spawn = true;
+                            print_str(b"[lsa-worker] recognized lsass' \\lsarpc server-thread NtCreateThread = per-connection RPC worker: entry=0x");
                             print_hex((start.rip >> 32) as u32);
                             print_hex(start.rip as u32);
                             print_str(b" tid=");
@@ -9965,6 +10086,31 @@ impl ExecNtHandler {
                         self.pipe_write_redrive = true;
                     }
                 }
+                // ★ LSA SELF-RPC instrumentation. Every MS-RPC PDU (`rpc_ver == 5`) written onto lsass'
+                // OWN `\pipe\lsarpc`, split by which side of the self-RPC wrote it: the per-connection
+                // WORKER (badge LSA_WORKER_BADGE — bind_ack / the LsarOpenPolicy response) versus lsass'
+                // main thread acting as the CLIENT (advapi32's auto-bind + the request). Name-scoped via
+                // the fid→pipe-name map, so no other pipe traffic can inflate it.
+                if self.pi == 4
+                    && payload_ok
+                    && len >= 4
+                    && payload.first() == Some(&5)
+                    && crate::pipe_fid_name_hash(self.npfs_file_id_for(fh))
+                        == lsarpc_pipe_name_hash()
+                {
+                    let pdu_type = payload.get(2).copied().unwrap_or(0xFF) as u64;
+                    if self.current_badge == LSA_WORKER_BADGE {
+                        LSA_WORKER_PDU_WRITES.fetch_add(1, Ordering::Relaxed);
+                        let _ = LSA_WORKER_FIRST_REPLY_TYPE.compare_exchange(
+                            0xFF,
+                            pdu_type,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    } else {
+                        LSA_SELF_RPC_CLIENT_WRITES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if trace {
                     print_str(b"[nt-write-file] pi=");
                     print_u64(self.pi as u64);
@@ -10157,6 +10303,31 @@ impl ExecNtHandler {
                                         let copy_len = (completed as usize).min(output.len());
                                         if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
                                             self.xas_write_buf(buffer, &output[..copy_len]);
+                                            // LSA self-RPC: a PDU delivered SYNCHRONOUSLY (npfs had
+                                            // the peer's message already queued). Same attribution as
+                                            // the parked-read re-drive path.
+                                            if self.pi == 4
+                                                && output.first() == Some(&5)
+                                                && crate::pipe_fid_name_hash(file_id)
+                                                    == lsarpc_pipe_name_hash()
+                                            {
+                                                let pdu_type =
+                                                    output.get(2).copied().unwrap_or(0xFF) as u64;
+                                                if self.current_badge == LSA_WORKER_BADGE {
+                                                    LSA_WORKER_PDU_READS
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    let _ = LSA_WORKER_FIRST_PDU_TYPE
+                                                        .compare_exchange(
+                                                            0xFF,
+                                                            pdu_type,
+                                                            Ordering::Relaxed,
+                                                            Ordering::Relaxed,
+                                                        );
+                                                } else {
+                                                    LSA_SELF_RPC_CLIENT_READS
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                            }
                                         }
                                         if driver_status as u32 == 0x0000_0103 {
                                             pending_read_fid = file_id;
@@ -10532,6 +10703,14 @@ impl ExecNtHandler {
                                 // reads the client's PDU. Name-scoped (no spurious cross-server wake).
                                 if status == 0 {
                                     self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
+                                    // Remember the CLIENT end's fid→pipe-name too (the server end is
+                                    // registered at NtCreateNamedPipeFile). This is what lets the LSA
+                                    // self-RPC instrumentation below be NAME-SCOPED to `\lsarpc`
+                                    // rather than "any pi-4 pipe write".
+                                    crate::pipe_fid_name_remember(
+                                        fid,
+                                        nt_io_manager::pipe_name_hash(&leaf),
+                                    );
                                 }
                             }
                             let iosb = get_recv_mr(8);

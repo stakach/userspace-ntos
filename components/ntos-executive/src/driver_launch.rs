@@ -256,15 +256,41 @@ pub(crate) unsafe fn take_completed_write(fid: u64) -> Option<(u32, u64)> {
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
 
+/// Hard bound on a free-list traversal. The pool is 4 MiB with a 16-byte header, so a well-formed
+/// list can never be longer than this; anything past it means the list is CORRUPT (a cycle), and a
+/// cycle must degrade to the bump path rather than spin the whole executive.
+const POOL_FREE_LIST_MAX: u64 = (FSD_POOL_FRAMES * 0x1000) / 16;
+/// Double `pool_free` calls the guard below rejected, and free-list cycles `pool_alloc` broke out of.
+/// Both are counter-backed so a regression is a gate failure rather than a silent 555-second hang.
+pub(crate) static FSD_POOL_DOUBLE_FREES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FSD_POOL_LIST_CYCLES: AtomicU64 = AtomicU64::new(0);
+
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
 /// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` pushes onto the
 /// single free list (head @ [POOL+8]); `pool_alloc` first-fits it before bumping. Counter @ [POOL+0].
+///
+/// ★ The first-fit walk is CYCLE-BOUNDED. A block pushed onto the free list twice has
+/// `next == itself`, so the unbounded walk below used to loop forever *inside the executive* — no
+/// fault, no log line, every hosted thread frozen, the boot simply stopping. That is exactly what
+/// happened once lsass' `\pipe\lsarpc` self-RPC put TWO concurrent IRPs on the SAME npfs
+/// FILE_OBJECT (the per-connection worker's pending read plus the thread-pool worker's response
+/// write): `s_io_complete_request` frees `slot.file_object` per completion, so the second completion
+/// double-freed it. `pool_free` now refuses the double free (the real fix); this bound is the
+/// belt-and-braces so a corrupt list can never again hang the system.
 pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     // first-fit the free list
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
     let mut prev = head_slot;
     let mut cur = read_volatile(head_slot);
+    let mut steps = 0u64;
     while cur != 0 {
+        if steps >= POOL_FREE_LIST_MAX {
+            if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
+                print_str(b"[fsd-host] POOL FREE-LIST CYCLE -> bump path\n");
+            }
+            break;
+        }
+        steps += 1;
         let cap = read_volatile((cur - 16) as *const u64);
         if cap >= size {
             let next = read_volatile((cur - 8) as *const u64);
@@ -296,6 +322,15 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     block
 }
 
+/// Push `p` back onto the single free list — **idempotently**.
+///
+/// ★ DOUBLE-FREE GUARD (the real fix for the LSA-self-RPC hang). Pushing a block that is ALREADY on
+/// the list sets its `next` pointer to itself, and the allocator's first-fit walk then never
+/// terminates. `s_io_complete_request` frees `slot.file_object` on EVERY IRP completion, so as soon
+/// as two IRPs are outstanding on the same FILE_OBJECT — which is the normal rpcrt4 server shape:
+/// `RPCRT4_io_thread` keeps a read pending on the connection while `RPCRT4_worker_thread` writes the
+/// response on it — the second completion double-freed it. A real allocator must reject that rather
+/// than corrupt its own list, so scan (bounded) and drop the redundant push.
 unsafe fn pool_free(p: u64) {
     if p < FSD_POOL_VADDR + POOL_DATA_OFF
         || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
@@ -303,12 +338,36 @@ unsafe fn pool_free(p: u64) {
         return;
     }
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
+    let mut cur = read_volatile(head_slot);
+    let mut steps = 0u64;
+    while cur != 0 && steps < POOL_FREE_LIST_MAX {
+        if cur == p {
+            if FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
+                print_str(b"[fsd-host] rejected DOUBLE pool_free p=0x");
+                print_hex(p as u32);
+                print_str(b" (would cycle the free list)\n");
+            }
+            return;
+        }
+        cur = read_volatile((cur - 8) as *const u64);
+        steps += 1;
+    }
+    if cur != 0 {
+        // Already corrupt (a cycle from before this guard existed) — do not extend it.
+        if FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed) == 0 {
+            print_str(b"[fsd-host] POOL FREE-LIST CYCLE on free -> drop\n");
+        }
+        return;
+    }
     let head = read_volatile(head_slot);
     write_volatile((p - 8) as *mut u64, head);
     write_volatile(head_slot, p);
 }
 
 // --- ntoskrnl trampolines (extern "win64"; args = rcx, rdx, r8, r9, then stack) --------------
+
+/// Bounded count of FSD imports logged as UNBOUND (the auditable fail-soft surface).
+static mut FSD_UNBOUND_LOGGED: u32 = 0;
 
 extern "win64" fn s_zero() -> u64 {
     0
@@ -855,6 +914,18 @@ pub fn fsd_export_addr(name: &str) -> u64 {
         }
         if let Some(va) = (*core::ptr::addr_of!(FSD_EXPORTS)).lookup(name) {
             return va;
+        }
+    }
+    // DIAGNOSTIC: log each import that falls to a fail-soft stub, so the FSD's unbound surface is
+    // auditable (the doc above always claimed this; it was never actually printed).
+    unsafe {
+        if FSD_UNBOUND_LOGGED < 48 {
+            FSD_UNBOUND_LOGGED += 1;
+            print_str(b"[fsd-import] UNBOUND ");
+            for &b in name.as_bytes() {
+                debug_put_char(b);
+            }
+            print_str(b"\n");
         }
     }
     // Genuine no-ops (release resource / lock / free / deref / exit-fs / etc.): return 0.

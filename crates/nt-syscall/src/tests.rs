@@ -125,6 +125,20 @@ fn every_native_service_uses_the_canonical_exact_arity() {
 }
 
 #[test]
+fn flush_key_is_a_single_handle_registry_service() {
+    // `NtFlushKey(IN HANDLE KeyHandle)` — ReactOS `ntoskrnl/config/ntapi.c:1085`, one argument,
+    // SSN 83 (`sysfuncs.lst` line 84). rpcrt4's ncacn_np server handoff reaches it through
+    // kernel32's `SetActiveComputerNameToRegistry` (`compname.c:203`), so it must be a REAL
+    // serviced entry: an unserviced SSN parks the calling thread instead of answering it.
+    assert_eq!(NativeService::NtFlushKey.name(), "NtFlushKey");
+    assert_eq!(NativeService::NtFlushKey.arg_count(), (1, 1));
+    assert_eq!(nt_syscall_abi::ssn_of("NtFlushKey"), Some(83));
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtFlushKey)
+        .is_some());
+}
+
+#[test]
 fn query_directory_file_keeps_native_eleven_argument_contract() {
     assert_eq!(
         NativeService::NtQueryDirectoryFile.name(),

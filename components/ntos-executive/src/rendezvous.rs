@@ -1646,6 +1646,58 @@ pub(crate) unsafe fn spawn_scm_worker_thread(
     })
 }
 
+/// Spawn lsass' `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread (rpcrt4 `RPCRT4_new_client` →
+/// `CreateThread(RPCRT4_io_thread)`, `rpc_server.c:626`) in lsass' VSpace (pi 4) and RESUME it into
+/// the main service-loop multiplex at [`LSA_WORKER_BADGE`]. The exact analogue of
+/// [`spawn_scm_worker_thread`] for lsass, on its OWN target-VSpace window (the three lsass listener
+/// blocks and the generic TP slot-0 block are all taken) and its own executive mirror/scratch.
+///
+/// **This is the self-RPC server half.** lsass' main thread is simultaneously the CLIENT
+/// (samsrv `SampGetAccountDomainInfo` → `LsaOpenPolicy` → advapi32 `ncacn_np:\pipe\lsarpc`), parked
+/// on its overlapped read; this worker is a genuinely separate seL4 thread with its own
+/// TEB/GS/stack/IPC buffer, so the two never share a stack mirror and the client's park is woken by
+/// the worker's write through the ordinary pipe re-drive edge.
+pub(crate) unsafe fn spawn_lsa_worker_thread(
+    lsass_pml4: u64,
+    entry_rip: u64,
+    arg0: u64,
+    arg1: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+    resume: bool,
+) -> u64 {
+    let worker_ep = mint_badged(main_fault_ep, LSA_WORKER_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: lsass_pml4,
+        client_pi: 4,
+        entry_rip,
+        arg0,
+        arg1,
+        loader_context: None,
+        scr: LSA_WORKER_ENV_SCRATCH_VA,
+        teb_va: LSA_WORKER_TEB_VA,
+        stack_base: LSA_WORKER_STACK_BASE,
+        stack_frames: LSA_WORKER_STACK_FRAMES,
+        ipcbuf_va: LSA_WORKER_IPCBUF_VA,
+        tramp_va: LSA_WORKER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: LSA_WORKER_STACK_MIRROR_VA,
+        fault_ep: worker_ep,
+        cid_proc,
+        cid_thread,
+        resume,
+        // Above lsass' main thread and its three listeners so the worker runs as soon as the main
+        // thread parks on its own RPC read — the whole point of the self-RPC.
+        prio: 106,
+        // lsass runs on OUR ntdll's native seL4-Call transport, so its worker must too.
+        native: true,
+        // Surface a silent SYS_SEND alias-map failure for this fresh VA window (the BATCH-36 lesson:
+        // a colliding executive scratch VA leaves the trampoline frame zero-filled → cr2=0 at entry).
+        diag: true,
+    })
+}
+
 /// Spawn lsass' LSA server thread (StartAuthenticationPort / LsapRmServerThread, created by lsass'
 /// LsapInitDatabase via NtCreateThread) in lsass' VSpace (pi 4) and RESUME it into the main service-loop
 /// multiplex — the SERVICE-9 C-c pattern replicated for lsass. Faults to a cap minted at

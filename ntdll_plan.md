@@ -4675,3 +4675,124 @@ and equal to `68c4bf0`'s **plus exactly the three new specs**. No regression:
 `exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip` and all 21
 `exec_dbgk_*` PASS. Host: `nt-ntdll` **694** (+2), `nt-process` 79, `nt-user-callback` 41,
 `nt-syscall` 41, `nt-hive-core` 16, `nt-hive-regf` 5. No `rust-micro/src` change.
+
+### LSA-RPC BATCH (2026-07-26, gate 223 -> **225**, LANDED green) - the "lsass hosts no per-connection LSA RPC worker" wall was a MISSING KERNEL SERVICE (`NtFlushKey`, SSN 83), not a missing worker; with it serviced the real `rpcrt4_ncacn_np_handoff` completes and `RPCRT4_new_client` is REACHED. The worker itself is BUILT + PROVEN end-to-end but GATED OFF (it exposes an npfs.sys concurrent-IRP spin)
+
+**DIAGNOSIS (traced, not guessed - and it inverted the premise of the batch).** The brief assumed we
+needed to *build* a per-connection worker for `\pipe\lsarpc` the way BATCH 35-38 did for services'
+SCM `\ntsvcs`. A bounded per-SSN trace of lsass' `\lsarpc` rpcrt4 server thread (`[lsa-srv-ssn]`,
+badge `LSASS_LISTENER3`) showed the truth: **`RPCRT4_new_client` was never reached at all.** After the
+client connect completed its `FSCTL_PIPE_LISTEN`, the server thread ran
+`rpcrt4_protseq_np_wait_for_new_connection` (`rpc_transport.c:1057`) ->
+`rpcrt4_spawn_connection` -> **`rpcrt4_ncacn_np_handoff`** (`rpc_transport.c:599`), whose three steps
+are (a) hand the pipe handle to the new connection, (b) `rpcrt4_conn_create_pipe(old_conn)` = the
+re-listen instance (seen as SSN 46), and (c) **`GetComputerNameA`**. Step (c) is the wall: on a fresh
+boot `...\Control\ComputerName\ActiveComputerName` does not exist, so kernel32's
+`GetComputerNameExW(ComputerNameNetBIOS)` (`client/compname.c:236`) falls back to
+`SetActiveComputerNameToRegistry` (`compname.c:131`) = NtOpenKey / NtCreateKey / NtSetValueKey /
+**NtFlushKey** - and the traced SSN sequence matched that function line for line, ending on
+`ssn=83` -> `[lsass-listener] blocking server syscall SSN=83 -> PARK thread`. **`NtFlushKey` was not
+in the executive's service table**, so the SERVER THREAD parked mid-handoff and rpcrt4 never got to
+create the per-connection worker. (Why services' SCM `\ntsvcs` handoff never hit this: lsass' accept
+happens FIRST, and its `NtCreateKey`+`NtSetValueKey` *did* succeed before the flush walled - so by the
+time services accepts, `ActiveComputerName` exists and the fallback is not taken.)
+
+**FIX 1 - `NtFlushKey` (SSN 83) is a REAL service now.** `NativeService::NtFlushKey` added to
+`nt-syscall` (enum + name + `ALL`; `nt-syscall` 41 -> **42**, arity 1 from the shared
+`nt-syscall-abi` row that already existed), registered in `build_nt_table` at the
+`sysfuncs.lst`-derived SSN 83, and handled in `exec_handler.rs` exactly as
+`ntoskrnl/config/ntapi.c:1085` does: reference the key by handle with **no access mask**
+(`resolve_registry_key(handle, 0)` - a bad handle returns the real error), then `CmFlushKey`.
+`CmFlushKey` bottoms out in `HvSyncHive`, which **returns TRUE immediately for a `HIVE_VOLATILE` hive**
+("avoid any write operations on volatile hives", `sdk/lib/cmlib/hivewrt.c:477`) and likewise when the
+dirty vector holds no dirty block. That is exactly this host's registry - read-only `regf` mounts plus
+an in-memory write overlay that IS the store, with no write-behind cache to drain and no backing file
+to sync - so `STATUS_SUCCESS` after a real handle resolution is the faithful answer, not a fabricated
+one. Counters `REG_FLUSH_KEY_CALLS` / `REG_FLUSH_KEY_VOLATILE` make it provable.
+
+**FIX 2 - the FSD pool free-list is double-free-proof and cycle-bounded** (`driver_launch.rs`). A
+block pushed onto the FSD pool free list twice has `next == itself`, and `pool_alloc`'s unbounded
+first-fit walk then loops forever *inside the executive* - no fault, no log line, every hosted thread
+frozen, the boot simply stopping. `s_io_complete_request` frees `slot.file_object` on EVERY IRP
+completion, so two concurrent IRPs on one FILE_OBJECT (the normal rpcrt4 server shape) can double-free
+it. `pool_free` now refuses a redundant push (bounded scan) and `pool_alloc` bounds its traversal;
+both are counter-backed (`FSD_POOL_DOUBLE_FREES` / `FSD_POOL_LIST_CYCLES`, 0 on the live boot). Real
+allocator robustness, not a workaround - a latent whole-system hang is gone either way.
+
+**THE PER-CONNECTION WORKER: BUILT, PROVEN, and GATED OFF.** `LSA_WORKER_BADGE = 26` with its own
+target-VSpace window in lsass' pml4 (`LSA_WORKER_REGION_BASE = 0x13F0_0000` - the three lsass listener
+blocks and the generic TP slot-0 block are all taken; follows `TP_WORKER_SLOT1`'s high-VA precedent,
+with `const _:()` assertions pinning it clear of every neighbour), its own executive stack mirror
+(`0x1399_0000`) and env scratch (`0x139A_0000`), `spawn_lsa_worker_thread` (a
+`spawn_scm_worker_thread` sibling at prio 106, `native: true`, `diag: true`), a caller-identity
+recognizer (pi 4 + `LSASS_LISTENER3_BADGE`, never creation order), the loop spawn site, and the full
+N-threads sub-selection (`is_lsa_worker` -> pi 4, its own `ACTIVE_STACK_*`/mirror, `current_tid`,
+`mirror_ctx_for`, `owner_top_badge`, the wall/park prints). Reused verbatim from the SCM precedent:
+`AsyncListen`/`AsyncListenTable` + `pipe_listen_complete_named`, the `PipeWaiter` park + peer-write
+re-drive, npfs message-mode partial reads, the `IofCompleteRequest` binding. Nothing about the
+*self*-RPC needed new machinery: the client is lsass' own main thread (badge 8) parked on its
+overlapped read with a retained reply cap, the server worker is a genuinely separate seL4 thread with
+its own TEB/GS/stack/IPC buffer and mirror, and the ordinary pipe re-drive crosses between them - the
+executive's badge multiplex makes "same process, both ends" structurally identical to two processes.
+
+With `LSA_WORKER_ROUTE_ENABLED = true` the **entire self-RPC RAN FOR REAL** (`/tmp/boot_lsarpc_w4.log`):
+`[lsa-worker] recognized ... = per-connection RPC worker` -> spawned + resumed at badge 26 -> its
+parked read woken by lsass' own 72-byte **bind** (`05 00 0b 03`) -> `process_bind_packet` wrote the
+68-byte **bind_ack** (`05 00 0c 03`), which woke lsass' MAIN thread's parked client read
+(`[pipe-redrive] WOKE reader fid=0x0e8023c0 pi=4 badge=8`) -> the client wrote the 56-byte
+**`LsarOpenPolicy` request** (`05 00 00 03`) -> the worker read it and `QueueUserWorkItem`d
+`RPCRT4_worker_thread` (`rpc_server.c:591`) -> that thread ran the **real server stub** (it opened
+`SECURITY\Policy` with KEY_ALL_ACCESS) and wrote the 48-byte **RESPONSE** (`05 00 02 03`, confirmed
+`p2=0x02`).
+
+**THE NEW WALL - and it is NOT in the LSA plane.** That response write is the first pipe write issued
+while a SECOND IRP (the worker's own pending read - the normal rpcrt4 server shape) is outstanding on
+the same npfs FILE_OBJECT, and **npfs.sys spins forever inside it**. Pinned by phase-tracing the
+`NtWriteFile` handler (A,B,C,E,F,G print, H never) plus per-trampoline call heartbeats and an
+`[fsd-import] UNBOUND` audit: the executive is stuck in `component_pump`'s blocking recv with npfs
+making **zero faults and zero ntoskrnl-import calls** - a pure spin in npfs' own code, i.e. the
+`NpWriteDataQueue` / `NpGetNextRealDataQueueEntry` data-queue walk (`writesup.c:48`, `datasup.c`),
+whose `NpRemoveDataQueueEntry` returns without removing when `QueueState == Empty` while the list is
+non-empty. The `ASSERT`/`KeBugCheckEx` that exists to catch exactly that inconsistency is one of the
+fail-soft-unbound imports, so it is skipped instead of caught. The boot never quiesces (RUNEXIT=124).
+Fixing npfs' concurrent-IRP-per-FILE_OBJECT handling is its own batch, so the route is **GATED OFF**
+for this commit - the identical call BATCH 38 made for the SCM worker. The recognizer still COUNTS
+`RPCRT4_new_client` being reached, which is the load-bearing new fact.
+
+**No logon is fabricated.** With the route off, `LsaOpenPolicy` still does not return,
+`SampInitializeSAM` still never reaches `SampInitDatabase`, `SamKeyHandle` is still unset,
+`SamIConnect` still fails with the NULL-RootDirectory miss, `Administrator` is NOT validated, and
+`WLX_SAS_ACTION_LOGON` is NOT returned. The `[dialog-pump]` MILESTONE park is unchanged.
+
+**Gate specs (+2 -> 225/99, ZERO FAILs).**
+* `exec_reg_flush_key_serviced` - `NtFlushKey` is a REAL serviced service: SSN 83 + arity 1 in the
+  shared ABI table, `>= 1` call that resolved a real key handle, and `>= 1` of those on an overlay
+  (volatile-hive) key. The counters cannot move if the SSN is unserviced - the caller parks instead.
+* `exec_lsa_rpc_handoff_reaches_new_client` - BOTH halves, because either alone is weak:
+  `ActiveComputerName` created (=> `SetActiveComputerNameToRegistry` ran to its `NtFlushKey` tail, so
+  `GetComputerNameA` RETURNED inside the handoff) AND `RPCRT4_new_client` reached (=>
+  `rpcrt4_ncacn_np_handoff` returned RPC_S_OK, connection handed off + next instance created).
+  Observed: `NtFlushKey calls=1 volatile=1 ActiveComputerName-created=1 RPCRT4_new_client-reached=1
+  pool-double-frees-rejected=0 pool-list-cycles=0`.
+
+**BYPASS experiment:** `NT_FLUSH_KEY_SERVICED = false` (main.rs) leaves SSN 83 out of the service
+table -> gate returns to **223/99 with EXACTLY the two new specs FAILing**
+(`NtFlushKey calls=0 ... RPCRT4_new_client-reached=0`). Note `ActiveComputerName-created=1` even in the
+bypass arm (the `NtCreateKey` succeeds; only the flush walls) - which is precisely why spec 2 asserts
+the `new_client` half too. Restored -> **225/99 ZERO FAILs on three consecutive boots** (RUNEXIT=3,
+`microtest sentinel`), boots 1 and 3 PASS-lists `diff`-identical and equal to `db729f8`'s **plus
+exactly the two new specs**. No regression: `exec_win32k_desktop_painted`, all 7 `exec_msgina_*`, all
+5 `exec_lsa_*`, the 3 SAM/hive specs, `exec_user_callback_dead_client_unwind`,
+`exec_user_callback_real_api0_nested_roundtrip` and all 21 `exec_dbgk_*` PASS. Host: `nt-ntdll` 694,
+`nt-process` 79, `nt-syscall` **42** (+1), `nt-io-manager` 86, `nt-user-callback` 41,
+`nt-syscall-abi` 15, `nt-hive-core` 16, `nt-hive-regf` 5. No `rust-micro/src` change.
+
+**NEW FRONTIER: npfs.sys must tolerate two concurrent IRPs on one FILE_OBJECT.** That is the single
+thing standing between here and a served LSA self-RPC (and therefore `SampInitDatabase` ->
+`SamKeyHandle` -> `SamIConnect` -> `SamrLookupNamesInDomain(Administrator)` ->
+`MsvpCheckPassword` -> `WLX_SAS_ACTION_LOGON`). Leads: give the FSD host a real per-FILE_OBJECT IRP
+serialisation queue (what a real FSD's `NpAcquireExclusiveVcb` + IRP queue provides), bind
+`KeBugCheckEx` so npfs' own consistency ASSERTs are *caught* instead of skipped, and re-check
+`s_io_complete_request`'s per-completion `pool_free(slot.file_object)` (a FILE_OBJECT outlives one
+IRP; freeing it per completion is a semantic bug that the new idempotent `pool_free` now merely
+survives).

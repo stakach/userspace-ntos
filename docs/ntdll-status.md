@@ -1,6 +1,6 @@
 # Our Rust `ntdll.dll` — current state
 
-**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `220/99`, ZERO FAILs** (the
+**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `225/99`, ZERO FAILs** (the
 credential-input and LSA-authentication-port batches noted below §5 added 3 specs each and changed no
 ntdll code — the LSA batch is executive/LPC work). This is the *current-state*
 document for the ntdll effort. The blow-by-blow history (BATCH 1..54, §A..§F) lives in
@@ -139,7 +139,7 @@ them**, don't read the last one.
 |---|---|---|
 | `nt-ntdll` | **692** | green |
 | `nt-process` (incl. the Dbgk state machine) | **79** | green |
-| `nt-syscall` | **41** | green |
+| `nt-syscall` | **42** | green |
 | `nt-syscall-abi` | **15** | green |
 | `nt-ntdll-layout` | **12** | green |
 
@@ -391,6 +391,40 @@ batch (message queue: `UserGetMessage 0x1006` / `UserPostMessage 0x100e`, the mo
 > `exec_lsa_security_hive_backed`, `exec_samsrv_hosted`,
 > `exec_msv1_0_account_domain_sid_resolved`. See the SAM/SECURITY BATCH section of `ntdll_plan.md`.
 
+> **Update (2026-07-26, gate 225/99) — the "lsass hosts no per-connection LSA RPC worker" wall was a
+> MISSING KERNEL SERVICE, not a missing worker.** No ntdll change. A bounded per-SSN trace of lsass'
+> `\lsarpc` rpcrt4 server thread showed `RPCRT4_new_client` was **never reached**: after the connect
+> completed its `FSCTL_PIPE_LISTEN`, `rpcrt4_ncacn_np_handoff` (`rpc_transport.c:599`) got as far as
+> `GetComputerNameA`, whose fresh-boot fallback `SetActiveComputerNameToRegistry`
+> (`kernel32/client/compname.c:131`) ends in **`NtFlushKey`** — an SSN (83) the executive did not
+> service, so the SERVER THREAD parked mid-handoff. `NtFlushKey` is now a real service
+> (`nt-syscall` 41 → **42**), implemented exactly as `ntoskrnl/config/ntapi.c:1085` +
+> `HvSyncHive`'s `HIVE_VOLATILE` / no-dirty-block early return (`sdk/lib/cmlib/hivewrt.c:477`) — which
+> is literally this host's registry (read-only `regf` mounts + an in-memory overlay that IS the store).
+> A second real fix went in alongside: the FSD pool free list is now double-free-proof and
+> cycle-bounded, closing a latent *whole-executive* hang (`s_io_complete_request` frees
+> `slot.file_object` per completion, so two concurrent IRPs on one FILE_OBJECT could make
+> `pool_alloc`'s first-fit walk loop forever with no fault and no log).
+>
+> The per-connection worker itself (badge 26, its own lsass-VSpace window + mirror/scratch,
+> `spawn_lsa_worker_thread`, caller-identity recognizer, full N-threads sub-selection) is **built and
+> proven end to end** — with the route enabled the whole self-RPC runs for real: bind (`05 00 0b 03`)
+> → `process_bind_packet` → bind_ack (`05 00 0c 03`, waking lsass' own parked client read) →
+> `LsarOpenPolicy` request (`05 00 00 03`) → `QueueUserWorkItem(RPCRT4_worker_thread)` → the real
+> server stub (it opens `SECURITY\Policy`) → the 48-byte response (`05 00 02 03`). It is **GATED OFF**
+> for the commit (the BATCH-38 precedent) because that response write is the first pipe write issued
+> while a SECOND IRP is outstanding on the same npfs FILE_OBJECT, and **npfs.sys spins forever** in its
+> `NpWriteDataQueue`/`NpGetNextRealDataQueueEntry` data-queue walk (zero faults, zero imports — its own
+> consistency `ASSERT`/`KeBugCheckEx` is a fail-soft-unbound import, so the inconsistency is skipped
+> rather than caught) and the boot never quiesces.
+>
+> **Nothing is fabricated:** `LsaOpenPolicy` still does not return, `SamKeyHandle` is still unset,
+> `SamIConnect` still fails, `Administrator` is NOT validated and `WLX_SAS_ACTION_LOGON` is NOT
+> returned. **Next wall: npfs.sys must tolerate two concurrent IRPs on one FILE_OBJECT** — that single
+> thing is all that stands between here and a served LSA self-RPC. Gate specs:
+> `exec_reg_flush_key_serviced`, `exec_lsa_rpc_handoff_reaches_new_client`. See the LSA-RPC BATCH
+> section of `ntdll_plan.md`.
+
 ---
 
 ## 6. How to work on it
@@ -411,7 +445,7 @@ cd rust-micro && ./scripts/make_image.sh && ./scripts/run_specs.sh
 **The gate** is the serial line
 
 ```
-[ntos-exec summary: 223/99 executive->isolated-service checks passed]
+[ntos-exec summary: 225/99 executive->isolated-service checks passed]
 ```
 
 followed by `[microtest sentinel matched -- exiting QEMU]` and `RUNEXIT=3`. **Zero `FAIL` lines** is
@@ -419,7 +453,8 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 `0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_msgina_credential_keystrokes_delivered`,
 `exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`, `exec_lsa_auth_port_connected`,
 `exec_lsa_logon_user_reached`, `exec_lsa_msv1_0_sam_validation_reached`,
-`exec_lsa_security_hive_backed`, `exec_samsrv_hosted`, `exec_msv1_0_account_domain_sid_resolved`,
+`exec_lsa_security_hive_backed`, `exec_samsrv_hosted`, `exec_msv1_0_account_domain_sid_resolved`, `exec_reg_flush_key_serviced`,
+`exec_lsa_rpc_handoff_reaches_new_client`,
 `exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`, all 21
 `exec_dbgk_*`.
 

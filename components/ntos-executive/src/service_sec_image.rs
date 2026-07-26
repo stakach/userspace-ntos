@@ -879,6 +879,10 @@ pub(crate) unsafe fn service_sec_image(
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
         let is_lsass_listener3 = badge == LSASS_LISTENER3_BADGE;
+        // lsass' `\pipe\lsarpc` PER-CONNECTION RPC worker (pi 4, its OWN stack mirror/TEB) — the
+        // N-threads multiplex generalized to lsass' dynamically-spawned rpcrt4 io_thread. It reads the
+        // LSA RPC bind PDU and answers `LsarOpenPolicy` for lsass' own self-RPC.
+        let is_lsa_worker = badge == LSA_WORKER_BADGE;
         // Generic ntdll workers have one badge per process and role (slot 0: 16..20, slot 1: 21..25).
         // role orthogonal to the listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
@@ -929,6 +933,18 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 3 per-connection worker)\n");
             }
         }
+        if is_lsa_worker {
+            let n = LSA_WORKER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                print_str(b"[lsa-worker] multiplex event #");
+                print_u64(n);
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b" (N-threads sub-select: pi 4 per-connection worker)\n");
+            }
+        }
         if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 {
             let ctr = if is_lsass_listener3 {
                 &LSASS_LISTENER3_FAULTS
@@ -966,6 +982,7 @@ pub(crate) unsafe fn service_sec_image(
             || is_lsass_listener
             || is_lsass_listener2
             || is_lsass_listener3
+            || is_lsa_worker
         {
             4
         } else {
@@ -1011,6 +1028,8 @@ pub(crate) unsafe fn service_sec_image(
             (LSASS_LISTENER2_STACK_BASE, LSASS_LISTENER2_STACK_FRAMES)
         } else if is_lsass_listener3 {
             (LSASS_LISTENER3_STACK_BASE, LSASS_LISTENER3_STACK_FRAMES)
+        } else if is_lsa_worker {
+            (LSA_WORKER_STACK_BASE, LSA_WORKER_STACK_FRAMES)
         } else if is_wl_worker {
             match badge {
                 WINLOGON_WORKER2_BADGE => (WL_WORKER2_STACK_BASE, WL_WORKER2_STACK_FRAMES),
@@ -1040,6 +1059,9 @@ pub(crate) unsafe fn service_sec_image(
                 LSASS_LISTENER2_STACK_MIRROR_VA
             } else if is_lsass_listener3 {
                 LSASS_LISTENER3_STACK_MIRROR_VA
+            } else if is_lsa_worker {
+                // The LSA per-connection worker's OWN mirror (its RPC-PDU read buffers / out-params).
+                LSA_WORKER_STACK_MIRROR_VA
             } else if is_wl_worker {
                 match badge {
                     WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA,
@@ -1603,8 +1625,8 @@ pub(crate) unsafe fn service_sec_image(
                 // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
                 // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
                 // stop — the whole point of the per-thread multiplex.
-                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_scm_worker { b"[scm-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
+                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_lsa_worker || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_scm_worker { b"[scm-worker] wall ip=0x" } else if is_lsa_worker { b"[lsa-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
@@ -2301,6 +2323,73 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
+            // LSA-RPC DIAG: trace lsass' `\pipe\lsarpc` rpcrt4 SERVER thread's native SSNs so the
+            // boot log shows exactly what it does when a client connect completes its listen
+            // (re-listen instance create → `RPCRT4_new_client` → `CreateThread`) and where it walls.
+            // SPIN DIAGNOSTIC: a hosted thread that loops on an un-traced syscall makes the boot look
+            // hung (the executive is just servicing it as fast as it can, with no log line). Print a
+            // heartbeat every 8192 native syscalls with the badge + current SSN so any such loop is
+            // immediately visible and attributable. Costs one increment per syscall.
+            {
+                let n = NATIVE_SYSCALL_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+                if n % 8192 == 8191 {
+                    print_str(b"[ssn-heartbeat] total=");
+                    print_u64(n + 1);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b"\n");
+                }
+            }
+            // lsass' generic ntdll thread-pool worker is where rpcrt4 runs `RPCRT4_worker_thread`
+            // (`QueueUserWorkItem`, rpc_server.c:591) — i.e. the actual `LsarOpenPolicy` server-stub
+            // dispatch. Trace it so the RPC dispatch is visible, not a black box.
+            if is_tp_worker && pi == 4 {
+                let dn = LSA_TP_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 64 {
+                    print_str(b"[lsa-tp-ssn] #");
+                    print_u64(dn);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
+            if is_lsa_worker {
+                LSA_WORKER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+                let dn = LSA_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 48 {
+                    print_str(b"[lsa-worker-ssn] #");
+                    print_u64(dn);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
+            if is_lsass_listener3 {
+                let dn = LSA_LISTENER3_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 40 {
+                    print_str(b"[lsa-srv-ssn] #");
+                    print_u64(dn);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
         }
         if (mi >> 12) == 2 {
             // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
@@ -2331,6 +2420,8 @@ pub(crate) unsafe fn service_sec_image(
                 LSASS_LISTENER2_TID.load(Ordering::Relaxed)
             } else if is_lsass_listener3 {
                 LSASS_LISTENER3_TID.load(Ordering::Relaxed)
+            } else if is_lsa_worker {
+                LSA_WORKER_TID.load(Ordering::Relaxed)
             } else if is_wl_worker {
                 match badge {
                     WINLOGON_WORKER2_BADGE => WL_WORKER2_TID.load(Ordering::Relaxed),
@@ -3702,6 +3793,38 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[lsass-thread3] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 14)\n");
+                }
+                // ★ lsass' `\pipe\lsarpc` PER-CONNECTION RPC WORKER — spawned RESUMED into the main
+                // service loop (badge LSA_WORKER_BADGE) when its `\lsarpc` rpcrt4 server thread runs
+                // `RPCRT4_new_client` on an accepted connection. Same shape as the SCM worker above,
+                // for pi 4: its faults sub-select to (pi 4, lsa-worker) via its OWN stack mirror/TEB,
+                // and its blocking pipe reads park (`pipe_wait_park`) + re-drive on the peer's write.
+                // It is the SERVER half of lsass' self-RPC — the client is lsass' own main thread.
+                if nt_handler.lsa_worker_spawn && LSA_WORKER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
+                    let tid = LSA_WORKER_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    print_str(b"[lsa-worker] spawning + RESUMING REAL per-connection LSA RPC worker: entry=0x");
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_lsa_worker_thread(
+                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        true,
+                    );
+                    LSA_WORKER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler
+                        .pm
+                        .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
+                    print_str(b"[lsa-worker] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 26)\n");
                 }
                 let tp_request = core::mem::replace(&mut nt_handler.tp_worker_spawn_request, 0);
                 if tp_request != 0 {
@@ -5343,8 +5466,8 @@ pub(crate) unsafe fn service_sec_image(
                 // stopping the whole boot. Recv the next event WITHOUT replying → the listener's seL4
                 // thread stays blocked (its ETHREAD/TEB/stack stay mapped), and lsass' main thread + the
                 // rest of the boot keep advancing. Contained per-thread — the point of the multiplex.
-                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_scm_worker { b"[scm-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
+                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_lsa_worker || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_scm_worker { b"[scm-worker] blocking/unserviced server syscall SSN=" } else if is_lsa_worker { b"[lsa-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
                     print_u64(m0);
                     print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
                     // ★ LSA rendezvous safety: never leave the LSA client blocked on a server that
@@ -9188,6 +9311,11 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
                 LSASS_LISTENER3_STACK_FRAMES,
                 LSASS_LISTENER3_STACK_MIRROR_VA,
             ),
+            LSA_WORKER_BADGE => (
+                LSA_WORKER_STACK_BASE,
+                LSA_WORKER_STACK_FRAMES,
+                LSA_WORKER_STACK_MIRROR_VA,
+            ),
             WINLOGON_WORKER2_BADGE => (
                 WL_WORKER2_STACK_BASE,
                 WL_WORKER2_STACK_FRAMES,
@@ -9919,6 +10047,27 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             && w.buffer_va != 0
         {
             nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
+            // ★ LSA SELF-RPC instrumentation: an MS-RPC PDU actually DELIVERED off lsass' own
+            // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the
+            // bind / request it must service) or to lsass' main thread as the CLIENT (the bind_ack /
+            // response that unblocks `LsaOpenPolicy`). Name-scoped via the fid->pipe-name map.
+            if w.pi == 4
+                && output.first() == Some(&5)
+                && pipe_fid_name_hash(w.file_id) == lsarpc_pipe_name_hash()
+            {
+                let pdu_type = output.get(2).copied().unwrap_or(0xFF) as u64;
+                if w.badge == LSA_WORKER_BADGE {
+                    LSA_WORKER_PDU_READS.fetch_add(1, Ordering::Relaxed);
+                    let _ = LSA_WORKER_FIRST_PDU_TYPE.compare_exchange(
+                        0xFF,
+                        pdu_type,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    LSA_SELF_RPC_CLIENT_READS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         if w.iosb_va != 0 {
             nt_handler.xas_write_buf(w.iosb_va, &status.to_le_bytes());
@@ -10155,9 +10304,11 @@ fn owner_top_badge(badge: u64) -> u64 {
             WINLOGON_BADGE
         }
         SERVICES_BADGE | SVC_LISTENER_BADGE | SCM_WORKER_BADGE => SERVICES_BADGE,
-        LSASS_BADGE | LSASS_LISTENER_BADGE | LSASS_LISTENER2_BADGE | LSASS_LISTENER3_BADGE => {
-            LSASS_BADGE
-        }
+        LSASS_BADGE
+        | LSASS_LISTENER_BADGE
+        | LSASS_LISTENER2_BADGE
+        | LSASS_LISTENER3_BADGE
+        | LSA_WORKER_BADGE => LSASS_BADGE,
         _ => 0, // smss (badge 0) + anything else
     }
 }

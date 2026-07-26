@@ -85,6 +85,7 @@ pub enum NativeService {
     NtEnumerateKey,
     NtEnumerateValueKey,
     NtQueryKey,
+    NtFlushKey,
     // Memory / section (§16.4)
     NtAllocateVirtualMemory,
     NtFreeVirtualMemory,
@@ -244,6 +245,7 @@ impl NativeService {
             NtEnumerateKey => "NtEnumerateKey",
             NtEnumerateValueKey => "NtEnumerateValueKey",
             NtQueryKey => "NtQueryKey",
+            NtFlushKey => "NtFlushKey",
             NtAllocateVirtualMemory => "NtAllocateVirtualMemory",
             NtFreeVirtualMemory => "NtFreeVirtualMemory",
             NtReadVirtualMemory => "NtReadVirtualMemory",
@@ -374,6 +376,7 @@ impl NativeService {
         NativeService::NtSetValueKey,
         NativeService::NtEnumerateKey,
         NativeService::NtEnumerateValueKey,
+        NativeService::NtFlushKey,
         NativeService::NtAllocateVirtualMemory,
         NativeService::NtFreeVirtualMemory,
         NativeService::NtCreateSection,
