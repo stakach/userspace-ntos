@@ -1,7 +1,8 @@
 # Our Rust `ntdll.dll` — current state
 
-**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `217/99`, ZERO FAILs** (the
-credential-input batch below §5 added 3 specs and changed no ntdll code). This is the *current-state*
+**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `220/99`, ZERO FAILs** (the
+credential-input and LSA-authentication-port batches noted below §5 added 3 specs each and changed no
+ntdll code — the LSA batch is executive/LPC work). This is the *current-state*
 document for the ntdll effort. The blow-by-blow history (BATCH 1..54, §A..§F) lives in
 `ntdll_plan.md`, which is now a historical log — read this file first, and go there only for the
 diagnosis story behind a specific decision.
@@ -322,6 +323,37 @@ batch (message queue: `UserGetMessage 0x1006` / `UserPostMessage 0x100e`, the mo
 > **The next wall is lsass' LSA authentication port**, not ntdll and not win32k. See the CREDENTIAL
 > BATCH section of `ntdll_plan.md`.
 
+> **Update (2026-07-26, gate 220/99) — the LSA authentication port is REAL.** Still no ntdll change.
+> The diagnosis was *routing*, not a missing port: lsass' lsasrv already created
+> `\LsaAuthenticationPort` in the LPC broker (winlogon's connect returned PENDING with a live
+> connection id), but every pending connect funnelled into `sm_rendezvous` — *smss'* `SmpApiLoop`, the
+> wrong server — while lsass' REAL `AuthPortThreadRoutine` sat in `NtReplyWaitReceivePort` with its
+> reply capability already dropped by the generic listener park.
+>
+> `lsa_rendezvous` is now the third authentic LPC rendezvous (after `sm_` and `csr_`), and the first
+> driven entirely by the MAIN service loop, because that server thread lives in the N-threads multiplex
+> rather than on a private endpoint. It parks the server WAKEABLY (the same reply-capability steal
+> `wait_park_multi`/`pipe_wait_park`/`dbgk_reporter_park` use), delivers winlogon's real
+> `LPC_CONNECTION_REQUEST` + its own 148-byte `LSA_CONNECTION_INFO`, and blocks the connector. The real
+> `LsapHandlePortConnection` then runs verbatim — `NtOpenProcess(ClientId)` → `NtOpenProcessToken` →
+> `NtQueryInformationToken` ×2 → **its own `NtAcceptConnectPort(Accept = TRUE)`** →
+> `NtCompleteConnectPort` — and the connector is woken with the broker's real client comm-port handle
+> plus the server's own `ConnectInfo` (`OperationalMode = 0x43218765`).
+>
+> Over that port: `LsaLookupAuthenticationPackage(MSV1_0)` → **SUCCESS**, then `LsaLogonUser`, whose real
+> `LsapCopyFromClient` made **6 cross-process reads into winlogon's heap** for the typed
+> `MSV1_0_INTERACTIVE_LOGON` and reached MSV1_0's real `LsaApLogonUser2`. One new *kernel* service was
+> needed on the way: **`NtAllocateLocallyUniqueId`** (SSN 15), implemented as the genuine
+> `ExAllocateLocallyUniqueId` (`ExpLuid` seeded `0x3e9`, increment 1).
+>
+> **The wall is now `GetAccountDomainSid` (`msv1_0/sam.c:267`) → `STATUS_OBJECT_NAME_NOT_FOUND`**: the
+> **LSA policy database** (`LsarQueryInformationPolicy(PolicyAccountDomainInformation)`) and behind it
+> the **SAM database** do not exist on this host. That cascade was deliberately NOT forced — no logon
+> success is fabricated, `WLX_SAS_ACTION_LOGON` is still not returned, and winlogon takes msgina's own
+> failure path back to the credential dialog's blocking `GetMessage` (the pre-existing `[dialog-pump]`
+> MILESTONE park). Gate specs: `exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`,
+> `exec_lsa_msv1_0_sam_validation_reached`. See the LSA BATCH section of `ntdll_plan.md`.
+
 ---
 
 ## 6. How to work on it
@@ -342,13 +374,14 @@ cd rust-micro && ./scripts/make_image.sh && ./scripts/run_specs.sh
 **The gate** is the serial line
 
 ```
-[ntos-exec summary: 217/99 executive->isolated-service checks passed]
+[ntos-exec summary: 220/99 executive->isolated-service checks passed]
 ```
 
 followed by `[microtest sentinel matched -- exiting QEMU]` and `RUNEXIT=3`. **Zero `FAIL` lines** is
 the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/768 px @
 `0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_msgina_credential_keystrokes_delivered`,
-`exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`,
+`exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`, `exec_lsa_auth_port_connected`,
+`exec_lsa_logon_user_reached`, `exec_lsa_msv1_0_sam_validation_reached`,
 `exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`, all 21
 `exec_dbgk_*`.
 

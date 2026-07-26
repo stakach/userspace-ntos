@@ -4617,6 +4617,22 @@ impl ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS
             }
+            // NtAllocateLocallyUniqueId(*LocallyUniqueId[R10]) — `ExAllocateLocallyUniqueId`
+            // (`references/reactos/ntoskrnl/ex/uuid.c:335`): atomically post-increment the global
+            // `ExpLuid` (seeded at `0x3e9`, increment 1) and return the PREVIOUS value. This is the
+            // real kernel primitive every logon-session identity is minted from — msgina's
+            // `MyLogonUser` calls it for the interactive logon's `LogonId` before `LsaLogonUser`.
+            NativeService::NtAllocateLocallyUniqueId => {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                if args[0] == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let luid = EXP_LUID.fetch_add(1, Ordering::Relaxed);
+                if unsafe { !self.xas_write_u64(args[0], luid) } {
+                    self.queue_write(args[0], luid);
+                }
+                0
+            }
             NativeService::NtOpenProcess => unsafe {
                 self.nt_open_process(args[0], args[1] as u32, args[2], args[3])
             },
@@ -6328,6 +6344,27 @@ impl ExecNtHandler {
                         self.mint_handle()
                     });
                 self.queue_write(args[0], handle);
+                // ★ LSA RENDEZVOUS (identify the server port). lsass' lsasrv `StartAuthenticationPort`
+                // (`references/reactos/dll/win32/lsasrv/authport.c:364`) creates `\LsaAuthenticationPort`
+                // and hands the handle to its `AuthPortThreadRoutine`, which then blocks in
+                // `NtReplyWaitReceivePort(AuthPortHandle, …)`. Record the broker handle here so the loop
+                // can recognise THAT receive as the LSA server's, park it with its reply capability
+                // retained, and later wake it with winlogon's connection request (`lsa_rendezvous`).
+                {
+                    let mut nb = [0u8; 48];
+                    let nlen = Self::fold_name(&name16, &mut nb);
+                    if self.pi == 4
+                        && nb[..nlen]
+                            .windows(b"lsaauthenticationport".len())
+                            .any(|w| w == b"lsaauthenticationport")
+                    {
+                        LSA_AUTH_PORT_HANDLE.store(handle, Ordering::Relaxed);
+                        print_str(b"[lsa-rdv] lsass NtCreatePort(\\LsaAuthenticationPort) -> broker port handle=0x");
+                        print_hex((handle >> 32) as u32);
+                        print_hex(handle as u32);
+                        print_str(b"\n");
+                    }
+                }
                 0
             },
             // SM/CSR worker threads + semaphores. ★ OUT-PARAM FIX (path-B prep): the fake handle now
@@ -7117,11 +7154,62 @@ impl ExecNtHandler {
                 // (*PortHandle[R10], PortContext[RDX], *ConnReq[R8], Accept[R9], ...). We don't yet
                 // decode the connection id from the received PORT_MESSAGE (path B), so accept the most
                 // recent pending connection is a bulk concern — return success placeholder for now.
+                //
+                // ★ LSA RENDEZVOUS. lsass' REAL `LsapHandlePortConnection`
+                // (`references/reactos/dll/win32/lsasrv/authport.c:196`) reaches this syscall after the
+                // loop woke its `AuthPortThreadRoutine` with winlogon's connection request. The
+                // connection id is the one the loop parked the connector on, so this is a REAL broker
+                // accept carrying the server's OWN Accept decision (R9) and PortContext (RDX = the
+                // LSAP_LOGON_CONTEXT it just built). No override, no fabricated handle.
+                let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
+                if self.pi == 4 && lsa_conn != 0 {
+                    let accept = args[3] != 0;
+                    let port_context = args[1];
+                    let server_handle = lpc_client()
+                        .and_then(|c| c.accept_connect(lsa_conn, accept, port_context).ok())
+                        .unwrap_or(0);
+                    self.queue_write(args[0], server_handle);
+                    LSA_PORT_CONTEXT.store(port_context, Ordering::Relaxed);
+                    LSA_ACCEPT_DECISION.store(1 + u64::from(accept), Ordering::Relaxed);
+                    print_str(b"[lsa-rdv] real LsapHandlePortConnection NtAcceptConnectPort accept=");
+                    print_u64(accept as u64);
+                    print_str(b" server-port=0x");
+                    print_hex(server_handle as u32);
+                    print_str(b" context=0x");
+                    print_hex((port_context >> 32) as u32);
+                    print_hex(port_context as u32);
+                    print_str(b"\n");
+                    if !accept {
+                        // The server REFUSED. Do not fabricate a completion — the loop wakes the
+                        // connector with the refusal status the real server produced.
+                        LSA_COMPLETE_PENDING.store(2, Ordering::Relaxed);
+                    }
+                    return if server_handle != 0 { 0 } else { 0xC000_0001 };
+                }
                 let h = self.mint_handle();
                 self.queue_write(args[0], h);
                 0
             },
-            NativeService::NtCompleteConnectPort => 0,
+            NativeService::NtCompleteConnectPort => unsafe {
+                // ★ LSA RENDEZVOUS: the real server finished its accept — complete through the broker
+                // and hand the LOOP the client comm-port handle to publish into winlogon's *PortHandle.
+                let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
+                if self.pi == 4 && lsa_conn != 0 {
+                    match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
+                        Some((client_handle, _)) => {
+                            LSA_CLIENT_HANDLE.store(client_handle, Ordering::Relaxed);
+                            LSA_COMPLETE_PENDING.store(1, Ordering::Relaxed);
+                            0
+                        }
+                        None => {
+                            LSA_COMPLETE_PENDING.store(2, Ordering::Relaxed);
+                            0xC000_0001
+                        }
+                    }
+                } else {
+                    0
+                }
+            },
             // NtCreateEvent(*EventHandle[R10], ACCESS, *OA, EVENT_TYPE, InitialState). winsrv's
             // UserServerDllInitialization creates ghPowerRequestEvent/ghMediaRequestEvent here and
             // hands them to NtUserInitialize (SSN 0x125a); win32k's IntInitWin32PowerManagement then

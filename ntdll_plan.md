@@ -4481,6 +4481,98 @@ regression: `exec_win32k_desktop_painted`, `exec_msgina_logon_dialog_painted`,
 
 ---
 
+### LSA BATCH (2026-07-26, gate 217 -> **220**, LANDED green) - `\LsaAuthenticationPort` is a REAL rendezvous: lsass' own `AuthPortThreadRoutine` accepts winlogon's connect, and `LsaLookupAuthenticationPackage` + `LsaLogonUser` run over it into the real MSV1_0
+
+**DIAGNOSIS (create vs accept).** The port was NEVER missing. lsass' lsasrv `StartAuthenticationPort`
+(`references/reactos/dll/win32/lsasrv/authport.c:364`) really does `NtCreatePort(\LsaAuthenticationPort)`
+- the executive's generic `NtCreatePort` registers it in the isolated LPC broker under its real name,
+which is why winlogon's connect came back **PENDING with a live connection id** (`[lpc-connect] pending
+pi=2 conn=11 name=\LsaAuthenticationPort`) rather than OBJECT_NAME_NOT_FOUND. The gap was the **ACCEPT,
+and specifically its ROUTING**: every pending connect funnelled into `sm_rendezvous`, which drives
+*smss'* `SmpApiLoop`. That is the wrong server, so it produced no handle -> `[sm-rdv] WALL` -> milestone
+park. Meanwhile lsass' REAL `AuthPortThreadRoutine` (badge 10, the 2nd N-threads listener) had reached
+`NtReplyWaitReceivePort` (SSN 203) and the generic listener park had **dropped its reply capability**,
+stranding it forever.
+
+**THE RENDEZVOUS (precedent followed).** `lsa_rendezvous` is the third authentic LPC rendezvous after
+`sm_rendezvous` and `csr_rendezvous`, but with one structural difference forced by the host: the SM/CSR
+servers run on PRIVATE endpoints (nested receive loops), while lsass' LSA server thread runs in the
+**N-threads multiplex on the MAIN fault endpoint**. So the LSA rendezvous is driven entirely by the main
+service loop, using the same reply-capability steal every other executive wait uses
+(`wait_park_multi`/`pipe_wait_park`/`dbgk_reporter_park`):
+
+1. **Server park (wakeable).** `NtReplyWaitReceivePort` on lsass' own `AuthPortHandle` (recorded at its
+   `NtCreatePort`) parks the thread with its Reply object RETAINED instead of dropped.
+2. **Connect.** winlogon's pending `NtConnectPort` marshals a real `PORT_MESSAGE`
+   (`Type = LPC_CONNECTION_REQUEST`, real `CLIENT_ID`) plus the connector's OWN 148-byte
+   `LSA_CONNECTION_INFO` (`LogonProcessNameBuffer = "MSGINA"`, `CreateContext = TRUE`,
+   `TrustedCaller = CHECK`) into the server's `RequestMsg` and resumes it; the connector BLOCKS.
+3. **The real server runs.** Observed SSNs, exactly `LsapHandlePortConnection`'s code:
+   `128 NtOpenProcess(ClientId)` -> `129 NtOpenProcessToken` -> `163 NtQueryInformationToken` x2
+   (`LsapIsTrustedClient`) -> `27 NtClose` -> **`0 NtAcceptConnectPort` with its OWN `Accept = TRUE`**
+   -> `31 NtCompleteConnectPort`. Both go to the real broker; nothing is overridden (unlike the CSR
+   path, which must force the accept decision).
+4. **Wake the connector** with the broker's real client comm-port handle written to `*PortHandle` and
+   the server's OWN `ConnectInfo` copied back - including `OperationalMode = 0x43218765`, the constant
+   real lsasrv writes (`authport.c:181`). `LsaRegisterLogonProcess` returns SUCCESS with a real handle.
+5. **Data plane.** `NtRequestWaitReplyPort` on that handle relays the whole `LSA_API_MSG` to the parked
+   server and blocks the caller; the server's next `NtReplyWaitReceivePort(ReplyMessage != NULL)` copies
+   its reply back and wakes the caller. Both directions are byte-relays of the peers' own buffers.
+
+**HOW FAR THE LOGON GOT (all real code).**
+* `ConnectToLsa` **SUCCEEDS**: `LsaRegisterLogonProcess` -> real handle `0x1c`, then
+  `LsaLookupAuthenticationPackage(MSV1_0_PACKAGE_NAME)` (ApiNumber **3**) -> real
+  `LsapLookupAuthenticationPackage` -> **`LSA_API_MSG.Status = STATUS_SUCCESS`**: MSV1_0 is loaded and
+  resolvable.
+* `MyLogonUser` then needed **`NtAllocateLocallyUniqueId`** (SSN 15, `AllocateLocallyUniqueId(&LogonId)`),
+  which was unserviced and crash-parked winlogon. Implemented for real as `ExAllocateLocallyUniqueId`
+  (`ntoskrnl/ex/uuid.c:335`: post-increment the global `ExpLuid`, seeded `0x3e9`, increment 1) and
+  registered as a genuine service (`NativeService::NtAllocateLocallyUniqueId`, SSN 15).
+* **`LsaLogonUser` (ApiNumber 2) reached the real server.** It ran `LsapCopyFromClient` -
+  **6 cross-process `NtReadVirtualMemory` (SSN 194) reads INTO winlogon's heap**, unpacking the
+  `MSV1_0_INTERACTIVE_LOGON` (domain / user name / password the dialog was typed with) - then
+  `NtOpenKey`/`NtQueryValueKey`/`NtQuerySystemTime` and into **MSV1_0's real `LsaApLogonUser2`**.
+
+**THE NEW FRONTIER + park.** ReactOS' own error output names it exactly:
+
+```
+(dll\win32\msv1_0\sam.c:270)  GetAccountDomainSid() failed (Status 0xc0000034)
+(dll\win32\msv1_0\sam.c:545)  SamValidateNormalUser() failed (Status 0xc0000034)
+(dll\win32\lsasrv\authpackage.c:1529) LsaApLogonUser/Ex/2 failed (Status 0xc0000034)
+(dll\win32\msgina\lsa.c:220)  LsaLogonUser failed (Status 0xc0000034)
+```
+
+`GetAccountDomainSid` is `LsaIOpenPolicyTrusted` + `LsarQueryInformationPolicy(PolicyAccountDomainInformation)`
+- the **LSA POLICY database**, which we do not host; behind it sits the whole SAM database
+(`SamIConnect` -> `SamrOpenDomain` -> `SamrLookupNamesInDomain` -> `MsvpCheckPassword` OWF compare).
+That is a deep cascade (LSA policy hive + SAM hive + account records + password hashes), so the batch
+**STOPS here rather than forcing it**. No logon success is fabricated: `WLX_SAS_ACTION_LOGON` is still
+NOT returned. winlogon takes msgina's OWN failure path (it re-focuses IDC_LOGON_PASSWORD - visible as
+`NtUserSetFocus -> 0x20096`) and returns to the credential dialog's blocking `GetMessage`, which is the
+PRE-EXISTING `[dialog-pump]` MILESTONE park (never a crash park - a crash park marks winlogon a dead
+win32k callback client and strands the callback plane). The boot quiesces there.
+**Next wall: the LSA policy database + SAM database** - not ntdll, not win32k, not LPC.
+
+**Gate specs (+3 -> 220/99, ZERO FAILs):** `exec_lsa_auth_port_connected` (lsass' own port handle; the
+real server thread genuinely blocked in `NtReplyWaitReceivePort`; 1 connect delivered; **the server's
+OWN accept decision = ACCEPT**; completed; winlogon holds a DISTINCT real client port handle;
+`OperationalMode == 0x43218765`; no server wall), `exec_lsa_logon_user_reached` (2 requests / 2 replies,
+api mask has both LOOKUP_AUTHENTICATION_PACKAGE and LOGON_USER, the lookup reply was SUCCESS, the last
+api was LOGON_USER), and `exec_lsa_msv1_0_sam_validation_reached` (>= 4 cross-process credential reads
+by the real server + the logon reply status is EXACTLY `STATUS_OBJECT_NAME_NOT_FOUND` - the real
+validation wall, which is what makes a fabricated success impossible to pass this spec).
+
+**BYPASS experiment:** `LSA_RENDEZVOUS_ENABLED = false` (main.rs) returns the boot to the `[sm-rdv] WALL`
++ `[cred-frontier]` milestone park and the gate to **217/99 with exactly those three specs FAILing**
+(`server-receive-parks=0 connects-delivered=0 accept-decision=0 completed=0 requests=0 replies=0`);
+restored -> **220/99 ZERO FAILs on three consecutive boots** (RUNEXIT=3, `microtest sentinel`), boots 1
+and 3 PASS-lists `diff`-identical, and that list is `f4a330c`'s **plus exactly the three new specs**.
+No regression: `exec_win32k_desktop_painted`, all 6 `exec_msgina_*`, `exec_user_callback_dead_client_unwind`,
+`exec_user_callback_real_api0_nested_roundtrip` and all 21 `exec_dbgk_*` PASS. Host: `nt-ntdll` **692**,
+`nt-process` **79**, `nt-user-callback` **41**, `nt-syscall` **41**. No `rust-micro/src` change.
+
+---
+
 *Footer (Phase A consolidation complete): this file is a historical batch log. The unified
 component-runtime harness (FSD + win32k on the shared `component_main`/`component_pump`, the
 multi-driver by-path substrate, and what's isolated vs. deliberately in-executive) is documented in

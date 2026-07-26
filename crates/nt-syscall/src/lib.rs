@@ -203,6 +203,9 @@ pub enum NativeService {
     NtDebugContinue,
     NtRemoveProcessDebug,
     NtWaitForDebugEvent,
+    /// `ExAllocateLocallyUniqueId` (`ntoskrnl/ex/uuid.c:335`) — the monotonic LUID allocator every
+    /// logon session identity comes from (`AllocateLocallyUniqueId` in msgina's `MyLogonUser`).
+    NtAllocateLocallyUniqueId,
 }
 
 impl NativeService {
@@ -329,6 +332,7 @@ impl NativeService {
             NtDebugContinue => "NtDebugContinue",
             NtRemoveProcessDebug => "NtRemoveProcessDebug",
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
+            NtAllocateLocallyUniqueId => "NtAllocateLocallyUniqueId",
         }
     }
 
@@ -460,6 +464,7 @@ impl NativeService {
         NativeService::NtDebugContinue,
         NativeService::NtRemoveProcessDebug,
         NativeService::NtWaitForDebugEvent,
+        NativeService::NtAllocateLocallyUniqueId,
     ];
 }
 

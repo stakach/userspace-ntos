@@ -731,6 +731,9 @@ pub const SSN_NT_SECURE_CONNECT_PORT: u64 = 218;
 /// NtRequestWaitReplyPort — the LPC message data plane (CSR API calls: kernel32's CsrClientCallServer
 /// → \Windows\ApiPort). Serviced by the executive's DIRECT cross-badge message plane.
 pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
+/// NtReplyWaitReceivePort — the LPC SERVER receive. lsass' real `AuthPortThreadRoutine` blocks here on
+/// `\LsaAuthenticationPort`; the LSA rendezvous parks it wakeably and resumes it with a real message.
+pub const SSN_NT_REPLY_WAIT_RECEIVE_PORT: u64 = 203;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
 pub const SSN_NT_OPEN_SECTION: u64 = 131;
@@ -825,6 +828,9 @@ pub const SSN_NT_DEBUG_ACTIVE_PROCESS: u64 = 59;
 pub const SSN_NT_DEBUG_CONTINUE: u64 = 60;
 pub const SSN_NT_REMOVE_PROCESS_DEBUG: u64 = 199;
 pub const SSN_NT_WAIT_FOR_DEBUG_EVENT: u64 = 279;
+/// NtAllocateLocallyUniqueId — line 16 of `sysfuncs.lst` (0-based index 15). msgina's `MyLogonUser`
+/// calls it (via `AllocateLocallyUniqueId`) to mint the interactive logon session's LUID.
+pub const SSN_NT_ALLOCATE_LOCALLY_UNIQUE_ID: u64 = 15;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -2324,6 +2330,99 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
         WINLOGON_CRED_LSA_CONNECT.load(Ordering::Relaxed) != 0
             && WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
             && WINLOGON_CRED_ERRORS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
+    lsa_authentication_port_specs(passed);
+}
+
+/// ═══ `\LsaAuthenticationPort` RENDEZVOUS specs ══════════════════════════════════════════════════
+///
+/// Every value below is produced by REAL code running on the real paths: lsass' own `NtCreatePort`,
+/// its `AuthPortThreadRoutine` genuinely blocked in `NtReplyWaitReceivePort`, its
+/// `LsapHandlePortConnection` issuing `NtOpenProcess`/`NtOpenProcessToken`/`NtQueryInformationToken`
+/// and its OWN `NtAcceptConnectPort(Accept)` decision, the broker's real comm-port handles, and the
+/// `LSA_API_MSG`s winlogon's `LsaLookupAuthenticationPackage`/`LsaLogonUser` marshalled.
+fn lsa_authentication_port_specs(passed: &mut u64) {
+    let server_port = LSA_AUTH_PORT_HANDLE.load(Ordering::Relaxed);
+    let client_port = WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed);
+    print_str(b"[lsa] \\LsaAuthenticationPort: server-port=0x");
+    print_hex(server_port as u32);
+    print_str(b" server-receive-parks=");
+    print_u64(LSA_SERVER_PARKS.load(Ordering::Relaxed));
+    print_str(b" connects-delivered=");
+    print_u64(LSA_CONNECT_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" accept-decision=");
+    print_u64(LSA_ACCEPT_DECISION.load(Ordering::Relaxed));
+    print_str(b" completed=");
+    print_u64(LSA_CONNECT_COMPLETED.load(Ordering::Relaxed));
+    print_str(b" winlogon-client-port=0x");
+    print_hex(client_port as u32);
+    print_str(b" OperationalMode=0x");
+    print_hex(LSA_OPERATIONAL_MODE.load(Ordering::Relaxed) as u32);
+    print_str(b" server-wall-ssn=");
+    print_u64(LSA_SERVER_WALL_SSN.load(Ordering::Relaxed));
+    print_str(b"\n");
+    // The connector holds a REAL comm-port handle that lsass' REAL server thread accepted: the port
+    // came from lsass' own NtCreatePort, the server genuinely blocked in NtReplyWaitReceivePort, the
+    // accept decision (Accept = TRUE) was the real `LsapHandlePortConnection`'s, the completion is the
+    // broker's, and `OperationalMode = 0x43218765` is the constant the real server wrote into its own
+    // `ConnectInfo` (`references/reactos/dll/win32/lsasrv/authport.c:181`) and we copied back.
+    check(
+        b"exec_lsa_auth_port_connected",
+        server_port != 0
+            && LSA_SERVER_PARKS.load(Ordering::Relaxed) >= 1
+            && LSA_CONNECT_DELIVERED.load(Ordering::Relaxed) == 1
+            && LSA_ACCEPT_DECISION.load(Ordering::Relaxed) == 2
+            && LSA_CONNECT_COMPLETED.load(Ordering::Relaxed) == 1
+            && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0
+            && client_port != 0
+            && client_port != server_port
+            && LSA_OPERATIONAL_MODE.load(Ordering::Relaxed) == 0x4321_8765
+            && LSA_SERVER_WALL_SSN.load(Ordering::Relaxed) == u64::MAX,
+        passed,
+    );
+    print_str(b"[lsa] data plane: requests=");
+    print_u64(LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" replies=");
+    print_u64(LSA_REPLIES_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" api-mask=0x");
+    print_hex(LSA_API_MASK.load(Ordering::Relaxed) as u32);
+    print_str(b" lookup-status=0x");
+    print_hex(LSA_LOOKUP_REPLY_STATUS.load(Ordering::Relaxed) as u32);
+    print_str(b" logon-status=0x");
+    print_hex(LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) as u32);
+    print_str(b" logon-client-reads=");
+    print_u64(LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    // msgina's `ConnectToLsa` tail: `LsaLookupAuthenticationPackage(MSV1_0_PACKAGE_NAME)` (api 3)
+    // went over the real port to the real server and came back SUCCESS — the auth package is loaded
+    // and resolvable — and `LsaLogonUser` (api 2) was then delivered and answered by that same server.
+    const API_LOGON_USER: u64 = 1 << 2;
+    const API_LOOKUP_PACKAGE: u64 = 1 << 3;
+    check(
+        b"exec_lsa_logon_user_reached",
+        LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed) >= 2
+            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed)
+                == LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed)
+            && LSA_API_MASK.load(Ordering::Relaxed) & API_LOOKUP_PACKAGE != 0
+            && LSA_API_MASK.load(Ordering::Relaxed) & API_LOGON_USER != 0
+            && LSA_LOOKUP_REPLY_STATUS.load(Ordering::Relaxed) == 0
+            && LSA_LAST_API_NUMBER.load(Ordering::Relaxed) == 2,
+        passed,
+    );
+    // ★ HONEST WALL. The real MSV1_0 authentication package ran `SamValidateNormalUser`, which needs
+    // the LSA POLICY database's account-domain SID (`GetAccountDomainSid` →
+    // `LsarQueryInformationPolicy(PolicyAccountDomainInformation)`, `msv1_0/sam.c:267`). We host no
+    // LSA policy / SAM database yet, so it returns STATUS_OBJECT_NAME_NOT_FOUND and the real
+    // `LsaApLogonUser2` fails with it. This spec asserts EXACTLY that: the credentials were copied
+    // into the auth package out of winlogon's own address space (lsasrv's `LsapCopyFromClient`) and
+    // the answer came back as the REAL validation status — never a fabricated logon success.
+    const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
+    check(
+        b"exec_lsa_msv1_0_sam_validation_reached",
+        LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed) >= 4
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == STATUS_OBJECT_NAME_NOT_FOUND
+            && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0,
         passed,
     );
 }
@@ -5999,6 +6098,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtDebugContinue, SSN_NT_DEBUG_CONTINUE as u32),
             (NativeService::NtRemoveProcessDebug, SSN_NT_REMOVE_PROCESS_DEBUG as u32),
             (NativeService::NtWaitForDebugEvent, SSN_NT_WAIT_FOR_DEBUG_EVENT as u32),
+            (
+                NativeService::NtAllocateLocallyUniqueId,
+                SSN_NT_ALLOCATE_LOCALLY_UNIQUE_ID as u32,
+            ),
             // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
             (NativeService::NtAllocateVirtualMemory, SSN_NT_ALLOCATE_VM as u32),
             (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),
@@ -6548,6 +6651,61 @@ static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// — i.e. lsass's LSA init (LsapInitLsa) has resolved lsasrv+samsrv (SERVICE 10 step 2) and is running
 /// its real SRM/LSA-database bring-up. Read by the exec_lsass_lsa_init_running milestone spec.
 static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
+// ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
+// The THIRD authentic LPC rendezvous in this system, after `sm_rendezvous` (smss' real `SmpApiLoop`
+// accepting `\SmApiPort`) and `csr_rendezvous` (csrss' real `CsrApiRequestThread` accepting
+// `\Windows\ApiPort`). Here the server is lsass' REAL `AuthPortThreadRoutine`
+// (`references/reactos/dll/win32/lsasrv/authport.c:227`), which runs in the N-threads multiplex on
+// the MAIN fault endpoint — so unlike the SM/CSR pair (nested loops on a private endpoint) the LSA
+// rendezvous is driven ENTIRELY by the main service loop: the server thread genuinely BLOCKS in
+// `NtReplyWaitReceivePort` with its reply capability retained, the connecting/ requesting client
+// genuinely BLOCKS in `NtConnectPort`/`NtRequestWaitReplyPort`, and each side is woken by the other's
+// real progress. Nothing about the accept decision, the port handles or the reply payload is modelled.
+/// lsass' `AuthPortHandle` — the broker handle its `NtCreatePort(\LsaAuthenticationPort)` returned.
+pub(crate) static LSA_AUTH_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// The broker connection id currently being accepted by the real server (0 = none in flight).
+pub(crate) static LSA_PENDING_CONN: AtomicU64 = AtomicU64::new(0);
+/// `PortContext` the real `NtAcceptConnectPort` passed (its `LSAP_LOGON_CONTEXT`), replayed to the
+/// server as the `*PortContext` out-param of every later `NtReplyWaitReceivePort`.
+pub(crate) static LSA_PORT_CONTEXT: AtomicU64 = AtomicU64::new(0);
+/// The server's OWN accept decision: 0 = none yet, 1 = REFUSED (Accept=FALSE), 2 = ACCEPTED.
+pub(crate) static LSA_ACCEPT_DECISION: AtomicU64 = AtomicU64::new(0);
+/// Handshake from the handler to the loop: 1 = `NtCompleteConnectPort` succeeded (wake the connector
+/// with SUCCESS + the client handle), 2 = the connection was refused/failed (wake it with the error).
+pub(crate) static LSA_COMPLETE_PENDING: AtomicU64 = AtomicU64::new(0);
+/// The client comm-port handle the broker produced for winlogon's LSA connection.
+pub(crate) static LSA_CLIENT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Proof counters (read by the gate specs).
+pub(crate) static LSA_SERVER_PARKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_CONNECT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_CONNECT_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_REQUESTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_REPLIES_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// The LSA `ApiNumber` of the last request the real server received (see `LSA_API_NUMBER`).
+pub(crate) static LSA_LAST_API_NUMBER: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `LSA_API_MSG.Status` the real server put in its reply to `LSASS_REQUEST_LOOKUP_AUTHENTICATION_PACKAGE`
+/// (api 3) and `LSASS_REQUEST_LOGON_USER` (api 2). `u64::MAX` = that request never completed.
+pub(crate) static LSA_LOOKUP_REPLY_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static LSA_LOGON_REPLY_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Cross-process `NtReadVirtualMemory` calls the real LSA server made INTO the client while it was
+/// servicing `LSASS_REQUEST_LOGON_USER` — lsasrv's `LsapCopyFromClient` unpacking the caller's
+/// `MSV1_0_INTERACTIVE_LOGON` (domain / user name / password) out of winlogon's heap.
+pub(crate) static LSA_LOGON_CLIENT_READS: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of LSA `ApiNumber`s the real server received (bit N = api N).
+pub(crate) static LSA_API_MASK: AtomicU64 = AtomicU64::new(0);
+/// `ExpLuid` — the kernel's global locally-unique-id counter (`ntoskrnl/ex/uuid.c:43`), seeded at
+/// `0x3e9` with `ExpLuidIncrement = 1`. `NtAllocateLocallyUniqueId` post-increments it.
+pub(crate) static EXP_LUID: AtomicU64 = AtomicU64::new(0x3e9);
+/// The `*LsaHandle` winlogon's `LsaRegisterLogonProcess` ended up holding (0 = none).
+pub(crate) static WINLOGON_LSA_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Set when winlogon's blocked `NtConnectPort(\LsaAuthenticationPort)` was woken with SUCCESS.
+pub(crate) static WINLOGON_LSA_CONNECTED: AtomicU64 = AtomicU64::new(0);
+/// The `OperationalMode` the real server wrote into its own `ConnectInfo` (NT's `0x43218765`).
+pub(crate) static LSA_OPERATIONAL_MODE: AtomicU64 = AtomicU64::new(0);
+/// ★ BYPASS SWITCH. Setting this to `false` disables the whole LSA rendezvous: winlogon's connect
+/// falls back to the pre-batch `sm_rendezvous` WALL + milestone park and every `exec_lsa_*` spec
+/// FAILs. Used for the batch's bypass experiment; must ship `true`.
+pub(crate) const LSA_RENDEZVOUS_ENABLED: bool = true;
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
