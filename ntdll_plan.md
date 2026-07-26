@@ -4411,6 +4411,74 @@ names, **none of which is imported by anything we host**) — **there are no stu
 > returns"). They are correct implementations of their contract, not stubs, and E.0's classification
 > never counted them in that bucket.
 
+### CREDENTIAL BATCH (2026-07-26, gate 214 -> **217**, LANDED green) - the msgina IDD_LOGON dialog is TYPED INTO through the real keyboard path and msgina's own `DoLogon` carries the credentials to `\LsaAuthenticationPort`
+
+**Frontier before:** the credential dialog was created, correlated and PAINTED, and winlogon was
+parked in the dialog's blocking `GetMessage` (`user32+0x9f0ca`) - the login box was on screen and
+nothing typed into it.
+
+**What now runs (all of it real code):**
+
+1. **The control handles come from the real window tree.** `winlogon_dialog_control_hwnd(id)`
+   (`main.rs`) is `GetDlgItem`'s own rule applied to win32k's LIVE desktop heap: walk the dialog
+   PWND's `spwndChild`/`spwndNext` list and match `WND.IDMenu` (== `GWLP_ID`), accepting a child only
+   if its handle round-trips through win32k's own handle table. The boot prints the whole list:
+   `1007:0x2008a 1008:0x2008c -1:0x2008e 1201:0x20090 -1:0x20094 1202:0x20096 -1:0x2009a 1203:0x2009c
+   1:0x200a0 2:0x200a2 1204:0x200a4` - i.e. IDC_LOGON_USERNAME = **0x20090**, IDC_LOGON_PASSWORD =
+   0x20096, IDC_LOGON_DOMAIN (combo) = 0x2009c, IDOK = 0x200a0. No handle is fabricated.
+2. **The keystrokes go through the REAL `NtUserPostMessage` (SSN 0x100e)** - the same shim that posts
+   the simulated Ctrl-Alt-Del. 13 genuine `WM_CHAR`s (`"Administrator"`, ReactOS' own default
+   interactive account; its password is empty, which `DoLogon` accepts) then one
+   `WM_KEYDOWN`/`VK_RETURN` (lParam `0x001c0001` - repeat 1, ENTER scan code), released in **two
+   phases** so a real user's order is preserved: type, let the control repaint, then press RETURN.
+3. **Everything downstream is untouched ReactOS code.** win32k's queue delivers each message; the
+   dialog's own `DIALOG_DoDialogBox` pump retrieves them (`[wl-diag] GetMessage retrieved MSG
+   hwnd=0x20090 message=0x102 ...`); `IsDialogMessageW` classifies them - `WM_CHAR` hits
+   `DLGC_WANTCHARS` so it falls through to `TranslateMessage`/`DispatchMessageW` into the real
+   user32 edit control, and `VK_RETURN` takes the `DM_GETDEFID` -> `WM_COMMAND(IDOK, BN_CLICKED)`
+   branch into the real `LogonDialogProc`.
+4. **The text is read back through the real GDI path.** A single-line edit renders itself with
+   `EDIT_PaintText -> TextOutW -> NtGdiExtTextOutW(hdc, x, y, opts, lprc, es->text + col, count, ...)`.
+   The executive matches that call's string argument (a win64 stack-tail arg) against the injected
+   user name: `[cred-inject] IDD_LOGON edit control RENDERED the injected user name (13 chars via
+   NtGdiExtTextOutW)`. The control genuinely holds the typed text.
+5. **msgina validates for real.** After the RETURN, winlogon's native SSNs are
+   `120, 281, 27, 33`: `DoLogon` -> `DoLoginTasks` -> `ConnectToLsa` -> `LsaRegisterLogonProcess`
+   waits on the (already signalled) `lsa_authentication_initialized` event and then issues
+   `NtConnectPort("\LsaAuthenticationPort")`. `DoLogon` only gets there when its OWN
+   `GetTextboxText` reads of IDC_LOGON_USERNAME **and** IDC_LOGON_DOMAIN came back non-empty - so
+   reaching LSA is independent proof that the real controls held the credentials.
+
+**THE NEW FRONTIER + park:** nothing on this boot publishes `\LsaAuthenticationPort`, so the LPC
+rendezvous produces no client handle and winlogon would block forever waiting for lsass' LSA server.
+That is a COOPERATIVE wait, so it is now a **MILESTONE park** (`[cred-frontier] msgina DoLogon
+reached ConnectToLsa(\LsaAuthenticationPort) with the typed credentials -> MILESTONE park`) and the
+boot quiesces there. This also matters mechanically: a crash-park (`unhandled-syscall`) marks the
+process a DEAD win32k callback client, which stranded the callback plane and failed
+`exec_user_callback_dead_client_unwind` - the milestone park keeps winlogon's TCB live and that spec
+green. **The next batch is lsass' LSA authentication port** (publish `\LsaAuthenticationPort` +
+accept, then `LsaLogonUser` -> MSV1_0 -> SAM), not a win32k or ntdll item. `LogonDialogProc` has NOT
+yet returned an action (`WLX_SAS_ACTION_LOGON` needs `DoLoginTasks` to succeed first), and
+`userinit.exe` is two walls further out; the gate asserts exactly what runs and no more.
+
+**Gate specs (+3 -> 217/99, ZERO FAILs):** `exec_msgina_credential_keystrokes_delivered` (the
+resolved username control is a real child of the correlated dialog; 13 chars + RETURN posted through
+the real `NtUserPostMessage` and every one of them came back out of the real queue),
+`exec_msgina_credentials_entered` (the GDI render read-back matched), and
+`exec_msgina_logon_validation_reached_lsa` (msgina's own `DoLogon` reached
+`\LsaAuthenticationPort`). Pure sequencing rules live in
+`nt_user_callback::CredentialInjectionSequence` with 3 host tests (`nt-user-callback` 38 -> **41**).
+
+**BYPASS experiment:** flipping `CREDENTIAL_INJECTION_ENABLED` (main.rs) to `false` returns the boot
+to the painted-and-parked dialog and the gate to **214/99 with exactly those three specs FAILing**;
+restored -> 217/99 ZERO FAILs on three consecutive boots (RUNEXIT=3, `microtest sentinel`), boots 1
+and 3 PASS-list identical, and that list is `1f82108`'s **plus exactly the three new specs**. No
+regression: `exec_win32k_desktop_painted`, `exec_msgina_logon_dialog_painted`,
+`exec_msgina_modal_paint_prefix`, `exec_msgina_idd_logon_correlated`,
+`exec_msgina_logon_dialog_created`, `exec_user_callback_dead_client_unwind`,
+`exec_user_callback_real_api0_nested_roundtrip` and all 21 `exec_dbgk_*` PASS. Host: `nt-ntdll`
+**692**, `nt-process` **79**, `nt-user-callback` **41**. No `rust-micro/src` change.
+
 ---
 
 *Footer (Phase A consolidation complete): this file is a historical batch log. The unified

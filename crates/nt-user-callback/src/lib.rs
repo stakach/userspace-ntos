@@ -251,6 +251,13 @@ pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
 pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
 pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
 pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
+/// `w32ksvc64.h`: `SVC_(UserPostMessage, 4)` — the REAL keyboard/message post path. Used both for
+/// the simulated Ctrl-Alt-Del SAS and for the credential keystrokes injected into the logon dialog.
+pub const NTUSER_POST_MESSAGE_SSN: u64 = 0x100e;
+/// `w32ksvc64.h`: `SVC_(GdiExtTextOutW, 9)` — every single-line edit control's text render
+/// (`EDIT_PaintText` → `TextOutW` → `NtGdiExtTextOutW`) carries `es->text + col` + a character
+/// count, so the drawn string is the control's genuine contents read back through the GDI path.
+pub const NTGDI_EXT_TEXT_OUT_W_SSN: u64 = 0x1037;
 pub const WM_PAINT: u32 = 0x000f;
 pub const WLX_WM_SAS: u32 = 0x0659;
 pub const WLX_SAS_TYPE_CTRL_ALT_DEL: u64 = 1;
@@ -264,6 +271,36 @@ pub const IDD_LOGON_CAPTION: [u16; 5] = [
     b'n' as u16,
 ];
 pub const MAX_DIALOG_CAPTION_CODE_UNITS: usize = 64;
+
+/// `references/reactos/dll/win32/msgina/resource.h`: the IDD_LOGON credential-dialog control ids.
+pub const IDC_LOGON_USERNAME: u64 = 1201;
+pub const IDC_LOGON_PASSWORD: u64 = 1202;
+pub const IDC_LOGON_DOMAIN: u64 = 1203;
+/// `IDOK` — the dialog's DEFPUSHBUTTON (`lang/en-US.rc`: `DEFPUSHBUTTON "OK", IDOK`).
+pub const IDOK: u64 = 1;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_CHAR: u32 = 0x0102;
+pub const VK_RETURN: u64 = 0x000d;
+/// The credential the headless keystroke shim types into `IDC_LOGON_USERNAME`. ReactOS' own
+/// default interactive account; the matching password is the empty string, so only the user name
+/// needs keystrokes (`DoLogon` rejects an EMPTY user name, accepts an empty password).
+pub const LOGON_USERNAME: [u16; 13] = [
+    b'A' as u16,
+    b'd' as u16,
+    b'm' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'i' as u16,
+    b's' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b't' as u16,
+    b'o' as u16,
+    b'r' as u16,
+];
+/// `winwlx.h` — the action `LogonDialogProc` returns from `EndDialog` on a successful `DoLogon`.
+pub const WLX_SAS_ACTION_LOGON: i32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LargeUnicodeStringDescriptor {
@@ -519,6 +556,163 @@ impl DialogModalPumpSequence {
 }
 
 impl Default for DialogModalPumpSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The headless keystroke shim for the msgina IDD_LOGON credential dialog.
+///
+/// A real console types into the logon box; we have no keyboard, so — exactly as the simulated
+/// Ctrl-Alt-Del is posted through the REAL `NtUserPostMessage` — the user name is typed as one
+/// genuine `WM_CHAR` per character posted to the REAL `IDC_LOGON_USERNAME` edit control, followed
+/// by a `WM_KEYDOWN`/`VK_RETURN`. Everything downstream is the real code: win32k's message queue
+/// delivers them, `DIALOG_DoDialogBox`'s pump retrieves them, `IsDialogMessageW` classifies them
+/// (`WM_CHAR` → `DLGC_WANTCHARS` → `TranslateMessage`/`DispatchMessageW` → the real edit control;
+/// `VK_RETURN` → `DM_GETDEFID` → `WM_COMMAND(IDOK)` → the real `LogonDialogProc`).
+///
+/// This type owns only the *ordering* rules; the executive owns the mechanics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialInjectionSequence {
+    username_hwnd: u64,
+    posted_chars: u16,
+    posted_return: bool,
+    retrieved_chars: u16,
+    retrieved_return: bool,
+    routed_get_messages: u16,
+    text_readbacks: u16,
+}
+
+impl CredentialInjectionSequence {
+    pub const fn new() -> Self {
+        Self {
+            username_hwnd: 0,
+            posted_chars: 0,
+            posted_return: false,
+            retrieved_chars: 0,
+            retrieved_return: false,
+            routed_get_messages: 0,
+            text_readbacks: 0,
+        }
+    }
+
+    /// Latch the REAL edit-control window handle resolved from the dialog's child window list
+    /// (the `GetDlgItem` rule: the child whose `WND.IDMenu` is the control id).
+    pub fn begin(&mut self, username_hwnd: u64, dialog_hwnd: u64) -> Result<(), ValidationError> {
+        if username_hwnd == 0
+            || dialog_hwnd == 0
+            || username_hwnd == dialog_hwnd
+            || self.username_hwnd != 0
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.username_hwnd = username_hwnd;
+        Ok(())
+    }
+
+    /// Record one posted `WM_CHAR`. `index` must advance strictly by one and stay inside
+    /// [`LOGON_USERNAME`]; the post must target the latched edit control.
+    pub fn record_char_post(&mut self, hwnd: u64, index: usize) -> Result<(), ValidationError> {
+        if self.username_hwnd == 0
+            || hwnd != self.username_hwnd
+            || self.posted_return
+            || index != self.posted_chars as usize
+            || index >= LOGON_USERNAME.len()
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.posted_chars += 1;
+        Ok(())
+    }
+
+    /// Record the posted `WM_KEYDOWN`/`VK_RETURN` that drives the dialog to its decision. Valid
+    /// only once the whole user name has been typed AND every one of those characters has come
+    /// back out of the real queue — i.e. the real edit control has actually received them.
+    pub fn record_return_post(&mut self, hwnd: u64) -> Result<(), ValidationError> {
+        if self.username_hwnd == 0
+            || hwnd != self.username_hwnd
+            || self.posted_return
+            || self.posted_chars as usize != LOGON_USERNAME.len()
+            || self.retrieved_chars as usize != LOGON_USERNAME.len()
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.posted_return = true;
+        Ok(())
+    }
+
+    /// A `MSG` the REAL `GetMessageW`/`PeekMessageW` just returned to winlogon. Counts the injected
+    /// keystrokes that genuinely came back out of win32k's queue.
+    pub fn observe_retrieved(&mut self, hwnd: u64, message: u32, wparam: u64) -> bool {
+        if self.username_hwnd == 0 || hwnd != self.username_hwnd {
+            return false;
+        }
+        if message == WM_CHAR && (self.retrieved_chars as usize) < LOGON_USERNAME.len() {
+            self.retrieved_chars += 1;
+            return true;
+        }
+        if message == WM_KEYDOWN && wparam == VK_RETURN {
+            self.retrieved_return = true;
+            return true;
+        }
+        false
+    }
+
+    /// The credential text read back out of the control through the real GDI render path.
+    pub fn record_text_readback(&mut self) {
+        self.text_readbacks = self.text_readbacks.saturating_add(1);
+    }
+
+    /// Keystrokes are injected in two phases — the typed user name, then the RETURN key — each
+    /// released when the dialog's pump next reports its queue empty. A blocking `GetMessageW` may
+    /// be routed into win32k exactly ONCE per phase: right after a phase is posted the queue is
+    /// provably non-empty, so the call returns instead of blocking win32k (and the executive with
+    /// it). Every other blocking `GetMessage` means the queue drained and MUST be parked.
+    pub const fn may_route_get_message(self) -> bool {
+        (self.routed_get_messages as usize) < self.posted_phases()
+    }
+
+    const fn posted_phases(self) -> usize {
+        (self.posted_chars as usize == LOGON_USERNAME.len()) as usize + self.posted_return as usize
+    }
+
+    pub fn record_routed_get_message(&mut self) {
+        self.routed_get_messages = self.routed_get_messages.saturating_add(1);
+    }
+
+    pub const fn username_hwnd(self) -> u64 {
+        self.username_hwnd
+    }
+
+    pub const fn is_injected(self) -> bool {
+        self.posted_return
+    }
+
+    pub const fn posted_chars(self) -> u16 {
+        self.posted_chars
+    }
+
+    pub const fn retrieved_chars(self) -> u16 {
+        self.retrieved_chars
+    }
+
+    pub const fn retrieved_return(self) -> bool {
+        self.retrieved_return
+    }
+
+    pub const fn text_readbacks(self) -> u16 {
+        self.text_readbacks
+    }
+
+    /// Every injected keystroke was posted AND came back out of the real queue.
+    pub const fn keystrokes_delivered(self) -> bool {
+        self.posted_return
+            && self.retrieved_return
+            && self.retrieved_chars as usize == LOGON_USERNAME.len()
+    }
+}
+
+impl Default for CredentialInjectionSequence {
     fn default() -> Self {
         Self::new()
     }
@@ -1583,6 +1777,97 @@ mod tests {
         assert_eq!(sequence.paint_dispatches(), 2);
         assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
         assert!(sequence.is_drained());
+    }
+
+    #[test]
+    fn credential_injection_types_the_user_name_then_the_return_key() {
+        let mut injection = CredentialInjectionSequence::new();
+        assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
+        // Re-latching, a null control and the dialog itself are all rejected.
+        assert_eq!(
+            injection.begin(0x2008e, 0x20088),
+            Err(ValidationError::Sequence)
+        );
+        // The RETURN key may not be posted before the whole user name is typed.
+        assert_eq!(
+            injection.record_return_post(0x2008c),
+            Err(ValidationError::Sequence)
+        );
+        for index in 0..LOGON_USERNAME.len() {
+            assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
+        }
+        // Out-of-order / foreign-window posts are rejected.
+        assert_eq!(
+            injection.record_char_post(0x2008c, LOGON_USERNAME.len()),
+            Err(ValidationError::Sequence)
+        );
+        // ...and RETURN still may not be pressed until the real queue delivered every character.
+        assert_eq!(
+            injection.record_return_post(0x2008c),
+            Err(ValidationError::Sequence)
+        );
+        for _ in 0..LOGON_USERNAME.len() {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        }
+        assert_eq!(
+            injection.record_return_post(0x20088),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(injection.record_return_post(0x2008c), Ok(()));
+        assert!(injection.is_injected());
+        assert_eq!(injection.posted_chars() as usize, LOGON_USERNAME.len());
+        assert!(!injection.keystrokes_delivered());
+    }
+
+    #[test]
+    fn credential_injection_counts_only_the_real_queue_retrievals() {
+        let mut injection = CredentialInjectionSequence::new();
+        assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
+        for index in 0..LOGON_USERNAME.len() {
+            assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
+        }
+        // A paint for another control is not a keystroke; a WM_CHAR for another window is not ours.
+        assert!(!injection.observe_retrieved(0x2008c, WM_PAINT, 0));
+        assert!(!injection.observe_retrieved(0x2008e, WM_CHAR, b'A' as u64));
+        for _ in 0..LOGON_USERNAME.len() {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        }
+        // The queue can never hand back more characters than were typed.
+        assert!(!injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert_eq!(injection.record_return_post(0x2008c), Ok(()));
+        assert!(!injection.keystrokes_delivered());
+        assert!(injection.observe_retrieved(0x2008c, WM_KEYDOWN, VK_RETURN));
+        assert!(injection.keystrokes_delivered());
+        assert_eq!(injection.retrieved_chars() as usize, LOGON_USERNAME.len());
+    }
+
+    #[test]
+    fn credential_injection_routes_one_blocking_get_message_per_phase() {
+        let mut injection = CredentialInjectionSequence::new();
+        assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
+        // Nothing queued yet -> routing a blocking GetMessage would block win32k.
+        assert!(!injection.may_route_get_message());
+        for index in 0..LOGON_USERNAME.len() - 1 {
+            assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
+            assert!(!injection.may_route_get_message());
+        }
+        assert_eq!(
+            injection.record_char_post(0x2008c, LOGON_USERNAME.len() - 1),
+            Ok(())
+        );
+        // Phase 1 (the typed user name) is queued -> exactly one blocking GetMessage may run.
+        assert!(injection.may_route_get_message());
+        injection.record_routed_get_message();
+        assert!(!injection.may_route_get_message());
+        for _ in 0..LOGON_USERNAME.len() {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        }
+        assert!(!injection.may_route_get_message());
+        // Phase 2 (RETURN) buys exactly one more.
+        assert_eq!(injection.record_return_post(0x2008c), Ok(()));
+        assert!(injection.may_route_get_message());
+        injection.record_routed_get_message();
+        assert!(!injection.may_route_get_message());
     }
 
     #[test]

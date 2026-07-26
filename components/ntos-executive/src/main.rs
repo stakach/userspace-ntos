@@ -1655,6 +1655,211 @@ static WINLOGON_DIALOG_FB_PIXELS: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DIALOG_FB_NON_DESKTOP: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DIALOG_FB_COLORS: AtomicU64 = AtomicU64::new(0);
 
+/// ★ BYPASS SWITCH for the headless credential keystrokes. Set to `false` and the logon dialog is
+/// left exactly as it was before this batch (painted, parked in its blocking `GetMessage`) — the
+/// `exec_msgina_credential_*` specs then FAIL, which is the proof they assert a REAL advance.
+const CREDENTIAL_INJECTION_ENABLED: bool = true;
+static mut WINLOGON_CREDENTIAL_INJECTION: nt_user_callback::CredentialInjectionSequence =
+    nt_user_callback::CredentialInjectionSequence::new();
+pub(crate) static WINLOGON_CRED_USERNAME_HWND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_PASSWORD_HWND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_OK_HWND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_POSTED_CHARS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_POSTED_RETURN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_RETRIEVED_CHARS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_RETRIEVED_RETURN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_TEXT_READBACKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_ROUTED_GET_MESSAGES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_CRED_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Native (non-win32k) syscalls winlogon issued AFTER the RETURN key was delivered — the
+/// `WM_COMMAND(IDOK)` → `LogonDialogProc` → `DoLogon` → `DoLoginTasks` tail.
+pub(crate) static WINLOGON_CRED_POST_RETURN_SSNS: AtomicU64 = AtomicU64::new(0);
+/// Set when winlogon's post-credential `NtConnectPort` names `\LsaAuthenticationPort` — msgina's
+/// `DoLogon → DoLoginTasks → ConnectToLsa → LsaRegisterLogonProcess`, i.e. the REAL credential
+/// validation reaching lsass. Only reachable if `DoLogon`'s own `GetTextboxText` reads found a
+/// non-empty user name and domain in the real controls.
+pub(crate) static WINLOGON_CRED_LSA_CONNECT: AtomicU64 = AtomicU64::new(0);
+
+/// Did the real message queue deliver the injected RETURN key to the dialog?
+pub(crate) fn winlogon_credential_return_delivered() -> bool {
+    WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
+}
+
+/// Case-sensitive compare of an NT object-name (UTF-16) against an ASCII literal.
+pub(crate) fn lpc_name_is(name16: &[u16], ascii: &[u8]) -> bool {
+    name16.len() == ascii.len()
+        && name16
+            .iter()
+            .zip(ascii.iter())
+            .all(|(unit, byte)| *unit == *byte as u16)
+}
+
+unsafe fn winlogon_credential_load() -> nt_user_callback::CredentialInjectionSequence {
+    core::ptr::read(core::ptr::addr_of!(WINLOGON_CREDENTIAL_INJECTION))
+}
+
+unsafe fn winlogon_credential_store(state: nt_user_callback::CredentialInjectionSequence) {
+    core::ptr::write(
+        core::ptr::addr_of_mut!(WINLOGON_CREDENTIAL_INJECTION),
+        state,
+    );
+    WINLOGON_CRED_USERNAME_HWND.store(state.username_hwnd(), Ordering::Relaxed);
+    WINLOGON_CRED_POSTED_CHARS.store(state.posted_chars() as u64, Ordering::Relaxed);
+    WINLOGON_CRED_POSTED_RETURN.store(state.is_injected() as u64, Ordering::Relaxed);
+    WINLOGON_CRED_RETRIEVED_CHARS.store(state.retrieved_chars() as u64, Ordering::Relaxed);
+    WINLOGON_CRED_RETRIEVED_RETURN.store(state.retrieved_return() as u64, Ordering::Relaxed);
+    WINLOGON_CRED_TEXT_READBACKS.store(state.text_readbacks() as u64, Ordering::Relaxed);
+}
+
+/// Has the credential shim already started typing? (Gates the "dialog destroyed" branch: once the
+/// RETURN key has been delivered, a destroyed IDD_LOGON is `EndDialog` — success, not an error.)
+pub(crate) unsafe fn winlogon_credential_started() -> bool {
+    winlogon_credential_load().username_hwnd() != 0
+}
+
+/// A `MSG` the REAL `GetMessageW`/`PeekMessageW` just handed to winlogon — count the injected
+/// keystrokes that genuinely came back out of win32k's queue.
+pub(crate) unsafe fn winlogon_credential_observe_retrieved(hwnd: u64, message: u32, wparam: u64) {
+    let mut state = winlogon_credential_load();
+    if state.observe_retrieved(hwnd, message, wparam) {
+        winlogon_credential_store(state);
+        if message == nt_user_callback::WM_KEYDOWN {
+            print_str(b"[cred-inject] real queue delivered VK_RETURN to the IDD_LOGON edit control\n");
+        } else if state.retrieved_chars() as usize == nt_user_callback::LOGON_USERNAME.len() {
+            print_str(b"[cred-inject] real queue delivered all ");
+            print_u64(state.retrieved_chars() as u64);
+            print_str(b" injected WM_CHARs\n");
+        }
+    }
+}
+
+/// The credential text READ BACK through the real GDI render path: the single-line edit control
+/// paints itself with `EDIT_PaintText → TextOutW → NtGdiExtTextOutW(hdc, x, y, opts, rc, es->text,
+/// count, …)`. Seeing our exact user name in that call's string argument is proof the REAL edit
+/// control's REAL text buffer holds what the injected keystrokes typed.
+pub(crate) unsafe fn winlogon_credential_observe_text_out(string: u64, count: u64) {
+    let expected = &nt_user_callback::LOGON_USERNAME;
+    if string == 0 || count as usize != expected.len() {
+        return;
+    }
+    let mut bytes = [0u8; 2 * nt_user_callback::LOGON_USERNAME.len()];
+    if !img_spawn::smss_copyin(string, &mut bytes) {
+        return;
+    }
+    for (index, unit) in expected.iter().enumerate() {
+        if u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]) != *unit {
+            return;
+        }
+    }
+    let mut state = winlogon_credential_load();
+    if state.text_readbacks() == 0 {
+        print_str(b"[cred-inject] IDD_LOGON edit control RENDERED the injected user name (");
+        print_u64(count);
+        print_str(b" chars via NtGdiExtTextOutW)\n");
+    }
+    state.record_text_readback();
+    winlogon_credential_store(state);
+}
+
+/// Drive the headless credential keystrokes at the dialog's blocking `GetMessageW`.
+///
+/// Returns `true` when that `GetMessage` may be ROUTED into win32k (the queue is provably
+/// non-empty because keystrokes were just posted), `false` when it must be parked.
+pub(crate) unsafe fn winlogon_credential_injection_route(
+    client: win32k_glue::Win32kClientContext,
+) -> bool {
+    if !CREDENTIAL_INJECTION_ENABLED {
+        return false;
+    }
+    let dialog = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    let mut state = winlogon_credential_load();
+    if state.username_hwnd() == 0 {
+        // ── PHASE 1: resolve the REAL controls (GetDlgItem over win32k's live child list) and
+        // type the user name as genuine WM_CHARs through the REAL NtUserPostMessage.
+        print_logon_dialog_children();
+        let username = winlogon_dialog_control_hwnd(nt_user_callback::IDC_LOGON_USERNAME);
+        WINLOGON_CRED_PASSWORD_HWND.store(
+            winlogon_dialog_control_hwnd(nt_user_callback::IDC_LOGON_PASSWORD),
+            Ordering::Relaxed,
+        );
+        WINLOGON_CRED_OK_HWND.store(
+            winlogon_dialog_control_hwnd(nt_user_callback::IDOK),
+            Ordering::Relaxed,
+        );
+        if state.begin(username, dialog).is_err() {
+            print_str(b"[cred-inject] could not resolve IDC_LOGON_USERNAME in the real child list\n");
+            WINLOGON_CRED_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        winlogon_credential_store(state);
+        print_str(b"[cred-inject] typing the user name into the real edit control hwnd=0x");
+        print_hex(username as u32);
+        print_str(b" through NtUserPostMessage(WM_CHAR)\n");
+        for (index, unit) in nt_user_callback::LOGON_USERNAME.iter().enumerate() {
+            let post = win32k_glue::win32k_dispatch_wide(
+                nt_user_callback::NTUSER_POST_MESSAGE_SSN,
+                username,
+                nt_user_callback::WM_CHAR as u64,
+                *unit as u64,
+                1, // lParam: repeat count 1, exactly as TranslateMessage synthesizes it
+                0,
+                4,
+                &[],
+                client,
+            );
+            if !post.1 || post.0 == 0 || state.record_char_post(username, index).is_err() {
+                print_str(b"[cred-inject] WM_CHAR post rejected at index ");
+                print_u64(index as u64);
+                print_str(b" ret=0x");
+                print_hex(post.0 as u32);
+                print_str(b"\n");
+                WINLOGON_CRED_ERRORS.fetch_add(1, Ordering::Relaxed);
+                winlogon_credential_store(state);
+                return false;
+            }
+        }
+        winlogon_credential_store(state);
+    } else if !state.is_injected() {
+        // ── PHASE 2: the typed characters have all been delivered and the control repainted —
+        // press RETURN so the REAL IsDialogMessageW drives WM_COMMAND(IDOK) into LogonDialogProc.
+        let username = state.username_hwnd();
+        let post = win32k_glue::win32k_dispatch_wide(
+            nt_user_callback::NTUSER_POST_MESSAGE_SSN,
+            username,
+            nt_user_callback::WM_KEYDOWN as u64,
+            nt_user_callback::VK_RETURN,
+            0x001c_0001, // lParam: repeat count 1, scan code 0x1c (ENTER)
+            0,
+            4,
+            &[],
+            client,
+        );
+        if !post.1 || post.0 == 0 || state.record_return_post(username).is_err() {
+            print_str(b"[cred-inject] VK_RETURN post rejected ret=0x");
+            print_hex(post.0 as u32);
+            print_str(b" retrieved-chars=");
+            print_u64(state.retrieved_chars() as u64);
+            print_str(b"\n");
+            WINLOGON_CRED_ERRORS.fetch_add(1, Ordering::Relaxed);
+            winlogon_credential_store(state);
+            return false;
+        }
+        print_str(b"[cred-inject] pressed RETURN on the real IDD_LOGON edit control hwnd=0x");
+        print_hex(username as u32);
+        print_str(b" (readbacks=");
+        print_u64(state.text_readbacks() as u64);
+        print_str(b")\n");
+        winlogon_credential_store(state);
+    }
+    if state.may_route_get_message() {
+        state.record_routed_get_message();
+        winlogon_credential_store(state);
+        WINLOGON_CRED_ROUTED_GET_MESSAGES.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
 unsafe fn winlogon_dialog_correlation_load() -> nt_user_callback::WinlogonDialogCorrelation {
     core::ptr::read(core::ptr::addr_of!(WINLOGON_DIALOG_CORRELATION))
 }
@@ -1816,6 +2021,72 @@ pub(crate) unsafe fn winlogon_dialog_contains_hwnd(hwnd: u64) -> bool {
         pwnd = core::ptr::read_volatile((pwnd + WND_PARENT_OFFSET) as *const u64);
     }
     false
+}
+
+/// `GetDlgItem` against win32k's LIVE window tree.
+///
+/// user32's `GetDlgItem` enumerates the dialog's child windows (`WIN_ListChildren`) and returns the
+/// one whose `GWLP_ID` matches — and `GWLP_ID` *is* `WND.IDMenu`. This walks exactly that list in
+/// the desktop heap (`spwndChild` then `spwndNext`), so the handle it returns is the real control's
+/// real handle, minted by the real `CreateWindowExW` inside `DIALOG_CreateIndirect`. Offsets are
+/// x64 `_WND` (`references/reactos/win32ss/include/ntuser.h:693`); three of them (`state` 0x28,
+/// `spwndParent` 0x58, `rcWindow` 0x70) are already cross-checked by the correlation/paint gates.
+pub(crate) unsafe fn winlogon_dialog_control_hwnd(control_id: u64) -> u64 {
+    const WND_CHILD_OFFSET: u64 = 0x60;
+    const WND_NEXT_OFFSET: u64 = 0x48;
+    const WND_IDMENU_OFFSET: u64 = 0xd0;
+    let dialog = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    let dialog_pwnd = winlogon_pwnd_for_hwnd(dialog);
+    if dialog_pwnd == 0 {
+        return 0;
+    }
+    let mut child = core::ptr::read_volatile((dialog_pwnd + WND_CHILD_OFFSET) as *const u64);
+    for _ in 0..64 {
+        if child == 0 {
+            break;
+        }
+        let hwnd = core::ptr::read_volatile(child as *const u64);
+        // Only trust a child whose handle round-trips through win32k's OWN handle table.
+        if hwnd != 0
+            && winlogon_pwnd_for_hwnd(hwnd) == child
+            && core::ptr::read_volatile((child + WND_IDMENU_OFFSET) as *const u64) == control_id
+        {
+            return hwnd;
+        }
+        child = core::ptr::read_volatile((child + WND_NEXT_OFFSET) as *const u64);
+    }
+    0
+}
+
+/// One-shot diagnostic: the dialog's real child list (control id -> real HWND), the same walk
+/// `winlogon_dialog_control_hwnd` uses. Printed once, when the credential keystrokes are injected.
+unsafe fn print_logon_dialog_children() {
+    const WND_CHILD_OFFSET: u64 = 0x60;
+    const WND_NEXT_OFFSET: u64 = 0x48;
+    const WND_IDMENU_OFFSET: u64 = 0xd0;
+    let dialog = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    let dialog_pwnd = winlogon_pwnd_for_hwnd(dialog);
+    print_str(b"[cred-inject] IDD_LOGON hwnd=0x");
+    print_hex(dialog as u32);
+    print_str(b" children (id:hwnd):");
+    if dialog_pwnd == 0 {
+        print_str(b" <no PWND>\n");
+        return;
+    }
+    let mut child = core::ptr::read_volatile((dialog_pwnd + WND_CHILD_OFFSET) as *const u64);
+    for _ in 0..64 {
+        if child == 0 {
+            break;
+        }
+        print_str(b" ");
+        print_u64(core::ptr::read_volatile(
+            (child + WND_IDMENU_OFFSET) as *const u64,
+        ));
+        print_str(b":0x");
+        print_hex(core::ptr::read_volatile(child as *const u64) as u32);
+        child = core::ptr::read_volatile((child + WND_NEXT_OFFSET) as *const u64);
+    }
+    print_str(b"\n");
 }
 
 pub(crate) unsafe fn winlogon_dialog_modal_target_alive() -> bool {
@@ -1998,6 +2269,61 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
     check(
         b"exec_msgina_logon_dialog_painted",
         verify_logon_dialog_framebuffer(),
+        passed,
+    );
+    print_str(b"[winlogon] IDD_LOGON credential input: username-hwnd=0x");
+    print_hex(WINLOGON_CRED_USERNAME_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" password-hwnd=0x");
+    print_hex(WINLOGON_CRED_PASSWORD_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" ok-hwnd=0x");
+    print_hex(WINLOGON_CRED_OK_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" posted-chars=");
+    print_u64(WINLOGON_CRED_POSTED_CHARS.load(Ordering::Relaxed));
+    print_str(b" retrieved-chars=");
+    print_u64(WINLOGON_CRED_RETRIEVED_CHARS.load(Ordering::Relaxed));
+    print_str(b" return posted/retrieved=");
+    print_u64(WINLOGON_CRED_POSTED_RETURN.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed));
+    print_str(b" gdi-readbacks=");
+    print_u64(WINLOGON_CRED_TEXT_READBACKS.load(Ordering::Relaxed));
+    print_str(b" routed-getmessages=");
+    print_u64(WINLOGON_CRED_ROUTED_GET_MESSAGES.load(Ordering::Relaxed));
+    print_str(b" post-return-native-ssns=");
+    print_u64(WINLOGON_CRED_POST_RETURN_SSNS.load(Ordering::Relaxed));
+    print_str(b" errors=");
+    print_u64(WINLOGON_CRED_ERRORS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    let username_hwnd = WINLOGON_CRED_USERNAME_HWND.load(Ordering::Relaxed);
+    check(
+        b"exec_msgina_credential_keystrokes_delivered",
+        username_hwnd != 0
+            && username_hwnd != WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed)
+            && winlogon_dialog_contains_hwnd(username_hwnd)
+            && WINLOGON_CRED_POSTED_CHARS.load(Ordering::Relaxed)
+                == nt_user_callback::LOGON_USERNAME.len() as u64
+            && WINLOGON_CRED_RETRIEVED_CHARS.load(Ordering::Relaxed)
+                == nt_user_callback::LOGON_USERNAME.len() as u64
+            && WINLOGON_CRED_POSTED_RETURN.load(Ordering::Relaxed) != 0
+            && WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
+            && WINLOGON_CRED_ERRORS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
+    check(
+        b"exec_msgina_credentials_entered",
+        WINLOGON_CRED_TEXT_READBACKS.load(Ordering::Relaxed) != 0
+            && WINLOGON_CRED_ERRORS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
+    // msgina's OWN `DoLogon` read the controls (`GetTextboxText` on IDC_LOGON_USERNAME /
+    // IDC_LOGON_DOMAIN / IDC_LOGON_PASSWORD) and only calls `DoLoginTasks → ConnectToLsa` when the
+    // user name and domain came back NON-EMPTY — so reaching `\LsaAuthenticationPort` is proof the
+    // real `LogonDialogProc` ran its real validation path over the injected credentials.
+    check(
+        b"exec_msgina_logon_validation_reached_lsa",
+        WINLOGON_CRED_LSA_CONNECT.load(Ordering::Relaxed) != 0
+            && WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
+            && WINLOGON_CRED_ERRORS.load(Ordering::Relaxed) == 0,
         passed,
     );
 }

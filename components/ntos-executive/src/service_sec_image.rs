@@ -2381,6 +2381,18 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
+            // DIAG (credential frontier): once the injected VK_RETURN has been delivered, trace
+            // winlogon's NATIVE (non-win32k) syscalls — that is the WM_COMMAND(IDOK) ->
+            // LogonDialogProc -> DoLogon -> DoLoginTasks -> ConnectToLsa/LsaLogonUser tail.
+            if pi == 2 && m0 < 0x1000 && WINLOGON_CRED_RETRIEVED_RETURN.load(Ordering::Relaxed) != 0
+            {
+                let n = WINLOGON_CRED_POST_RETURN_SSNS.fetch_add(1, Ordering::Relaxed);
+                if n < 192 {
+                    print_str(b"[cred-tail] winlogon native SSN=");
+                    print_u64(m0);
+                    print_str(b"\n");
+                }
+            }
             let mut handled = true;
             // BATCH 43: set when winlogon reaches its win32k SAS-window creation milestone (0x1077 OK) →
             // park it (recv-next-without-reply) so the boot quiesces + the gate runs (see the !handled block).
@@ -3602,6 +3614,23 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[sm-rdv] WALL: rendezvous produced no client handle\n");
                         handled = false;
                         result = 0xC0000001;
+                        // ★ CREDENTIAL FRONTIER MILESTONE PARK. winlogon arriving here after the
+                        // logon dialog took the injected credentials is msgina's
+                        // `DoLogon → DoLoginTasks → ConnectToLsa → LsaRegisterLogonProcess`
+                        // connecting to `\LsaAuthenticationPort`. Nothing on this boot ACCEPTS that
+                        // port (lsass never publishes it), so winlogon would block forever waiting
+                        // for the LSA server — a COOPERATIVE wait, not a crash. Park it as a
+                        // milestone so its TCB stays live (a crash-park marks the process a dead
+                        // win32k callback client and strands the callback plane) and the boot
+                        // quiesces at the furthest proven point of the logon.
+                        if pi == 2 && winlogon_credential_return_delivered() {
+                            let name16 = nt_handler.read_lpc_name(m3);
+                            if lpc_name_is(&name16, b"\\LsaAuthenticationPort") {
+                                print_str(b"[cred-frontier] msgina DoLogon reached ConnectToLsa(\\LsaAuthenticationPort) with the typed credentials -> MILESTONE park\n");
+                                WINLOGON_CRED_LSA_CONNECT.store(1, Ordering::Relaxed);
+                                wl_milestone_park = true;
+                            }
+                        }
                     }
                 }
                 if nt_handler.sm_request_port != 0 {
@@ -3983,7 +4012,12 @@ pub(crate) unsafe fn service_sec_image(
                         modal_message_buffer,
                     )
                 {
-                    WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    // A destroyed IDD_LOGON is only an ERROR while nobody has typed into it. Once
+                    // the credential keystrokes went in, `EndDialog` destroying it is the dialog
+                    // reaching its DECISION — the intended outcome, not a fault.
+                    if !winlogon_credential_started() {
+                        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    }
                     print_str(b"[dialog-pump] correlated IDD_LOGON was destroyed; parking modal GetMessage\n");
                     handled = false;
                     wl_milestone_park = true;
@@ -3996,9 +4030,34 @@ pub(crate) unsafe fn service_sec_image(
                         modal_message_buffer,
                     )
                 {
-                    print_str(b"[dialog-pump] real IDD_LOGON queue drained; parking its blocking GetMessage\n");
-                    handled = false;
-                    wl_milestone_park = true;
+                    // ★ HEADLESS CREDENTIAL INPUT. The dialog is painted and its pump is about to
+                    // block for a keystroke nobody can type. Post real WM_CHARs / VK_RETURN into
+                    // its real edit control through the REAL NtUserPostMessage (exactly the shim
+                    // that stands in for Ctrl-Alt-Del), then let this GetMessage run — the queue is
+                    // non-empty, so it returns instead of blocking win32k. When there is nothing
+                    // left to type the blocking GetMessage is parked as before.
+                    let peb_mirror = 0x0000_0100_107C_1000u64;
+                    let client_teb = nt_handler
+                        .pm
+                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .filter(|teb| *teb != 0)
+                        .unwrap_or(SMSS_TEB_VA);
+                    let route = winlogon_credential_injection_route(
+                        win32k_glue::Win32kClientContext {
+                            pi: pi as u32,
+                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                            badge,
+                            tid: nt_handler.current_tid,
+                            teb: client_teb,
+                            peb_mirror,
+                            scratch_base,
+                        },
+                    );
+                    if !route {
+                        print_str(b"[dialog-pump] real IDD_LOGON queue drained; parking its blocking GetMessage\n");
+                        handled = false;
+                        wl_milestone_park = true;
+                    }
                 } else if pi == 2
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && sas_hwnd != 0
@@ -4046,7 +4105,13 @@ pub(crate) unsafe fn service_sec_image(
                     const W32_RESOURCE_CALLBACK_LIMIT: u64 = 1536;
                     const W32_POST_SAS_DIALOG_LIMIT: u64 = 2048;
                     const W32_IDD_LOGON_LIMIT: u64 = 4096;
-                    let limit = if pi == 2
+                    // Typing credentials into the painted dialog is a second bounded burst: every
+                    // character runs the real edit control's caret/invalidate/repaint cycle on top
+                    // of the dialog's own pump. Grant the headroom only once keystrokes are in.
+                    const W32_CREDENTIAL_LIMIT: u64 = 12288;
+                    let limit = if pi == 2 && winlogon_credential_started() {
+                        W32_CREDENTIAL_LIMIT
+                    } else if pi == 2
                         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
                     {
                         W32_IDD_LOGON_LIMIT
@@ -4519,6 +4584,17 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         },
                     );
+                    // The credential READ-BACK. A single-line edit control renders itself with
+                    // `EDIT_PaintText -> TextOutW -> NtGdiExtTextOutW(hdc, x, y, opts, lprc,
+                    // es->text + col, count, …)` (args 5..9 ride the win64 stack tail). The string
+                    // it hands GDI IS the control's live text buffer, so matching our injected user
+                    // name there proves the real edit control holds what was typed into it.
+                    if pi == 2
+                        && m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
+                        && stack_arg_count >= 3
+                    {
+                        winlogon_credential_observe_text_out(stack_args[1], stack_args[2]);
+                    }
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
                     // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.
@@ -4535,6 +4611,11 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" (ret=0x");
                         print_hex(r.0 as u32);
                         print_str(b")\n");
+                        if r.0 == 1 {
+                            // Count the injected credential keystrokes that genuinely came back
+                            // out of win32k's real message queue into the dialog's real pump.
+                            winlogon_credential_observe_retrieved(hwnd, message as u32, wparam);
+                        }
                         if r.0 == 1
                             && message as u32 == nt_user_callback::WLX_WM_SAS
                             && wparam == nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL

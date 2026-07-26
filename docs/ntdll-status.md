@@ -1,6 +1,7 @@
 # Our Rust `ntdll.dll` — current state
 
-**Status as of `6dee67e` (2026-07-26), gate `214/99`, ZERO FAILs.** This is the *current-state*
+**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `217/99`, ZERO FAILs** (the
+credential-input batch below §5 added 3 specs and changed no ntdll code). This is the *current-state*
 document for the ntdll effort. The blow-by-blow history (BATCH 1..54, §A..§F) lives in
 `ntdll_plan.md`, which is now a historical log — read this file first, and go there only for the
 diagnosis story behind a specific decision.
@@ -309,6 +310,18 @@ fidelity**; nothing here is a missing import or an unconditional stub.
 batch (message queue: `UserGetMessage 0x1006` / `UserPostMessage 0x100e`, the modal pump and the
 `WM_PAINT` `KeUserModeCallback` cycle in `win32k_subsystem.rs`). No ntdll export blocks it.
 
+> **Update (2026-07-26, gate 217/99).** That frontier moved twice more, still with no ntdll change.
+> The msgina IDD_LOGON dialog is now **typed into**: the credential controls are resolved by
+> `GetDlgItem`'s own rule over win32k's live PWND child list (`WND.IDMenu`), 13 real `WM_CHAR`s plus
+> a `WM_KEYDOWN`/`VK_RETURN` are posted through the REAL `NtUserPostMessage` (SSN `0x100e`, the same
+> shim as the simulated Ctrl-Alt-Del), the real `DIALOG_DoDialogBox`/`IsDialogMessageW`/edit-control
+> code consumes them, the control's own `NtGdiExtTextOutW` render reads the text back, and the real
+> `LogonDialogProc` -> `DoLogon` -> `DoLoginTasks` -> `ConnectToLsa` reaches
+> `NtConnectPort("\LsaAuthenticationPort")`. Nothing publishes that port, so winlogon MILESTONE-parks
+> there (a crash-park would mark it a dead win32k callback client and strand the callback plane).
+> **The next wall is lsass' LSA authentication port**, not ntdll and not win32k. See the CREDENTIAL
+> BATCH section of `ntdll_plan.md`.
+
 ---
 
 ## 6. How to work on it
@@ -329,13 +342,15 @@ cd rust-micro && ./scripts/make_image.sh && ./scripts/run_specs.sh
 **The gate** is the serial line
 
 ```
-[ntos-exec summary: 214/99 executive->isolated-service checks passed]
+[ntos-exec summary: 217/99 executive->isolated-service checks passed]
 ```
 
 followed by `[microtest sentinel matched -- exiting QEMU]` and `RUNEXIT=3`. **Zero `FAIL` lines** is
 the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/768 px @
-`0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_user_callback_dead_client_unwind`,
-`exec_user_callback_real_api0_nested_roundtrip`, all 21 `exec_dbgk_*`.
+`0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_msgina_credential_keystrokes_delivered`,
+`exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`,
+`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`, all 21
+`exec_dbgk_*`.
 
 ### Boot discipline (this has burned us repeatedly)
 
