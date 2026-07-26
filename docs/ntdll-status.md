@@ -354,6 +354,43 @@ batch (message queue: `UserGetMessage 0x1006` / `UserPostMessage 0x100e`, the mo
 > MILESTONE park). Gate specs: `exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`,
 > `exec_lsa_msv1_0_sam_validation_reached`. See the LSA BATCH section of `ntdll_plan.md`.
 
+> **Update (2026-07-26, gate 223/99) — the SECURITY + SAM hives are REAL, and the LSA policy database
+> is lsasrv's own.** This one DID need an ntdll change — a genuine bug. `RtlpNtOpenKey` /
+> `RtlpNtCreateKey` stripped `OBJ_PERMANENT|OBJ_EXCLUSIVE` from `OBJECT_ATTRIBUTES.Attributes` at
+> **+0x10**, the *32-bit* offset; on x64 that is the `ObjectName` **pointer**, so every such call
+> silently cleared two bits of its own name pointer and the callee read a garbage `UNICODE_STRING`.
+> That — not a missing policy database — is why lsasrv's first LSA-init call,
+> `LsapOpenServiceKey(L"\Registry\Machine\SECURITY")`, returned `0xC0000034`
+> (`database.c:548`). Fixed against host-tested offsets (`nt_ntdll::rtl::registry::
+> OA_OFFSET_ATTRIBUTES` + `sanitize_key_object_attributes`); `nt-ntdll` 692 → **694**.
+>
+> `\Registry\Machine\SECURITY` and `\Registry\Machine\SAM` are now REAL read-only `regf`
+> mounts, read BY PATH off `\reactos\system32\config\{security,sam}` by the isolated storage host
+> — the same mechanism as the SYSTEM hive. There is a general **3-hive mount** (a `KeyRef`'s top
+> nibble selects the hive; one `base_hive()` accessor feeds every registry helper), not per-key
+> special-casing. Both staged hives are the genuine post-setup ones: **8192 B, root key only, zero
+> subkeys** — and that emptiness is load-bearing. The old "auto-create any SECURITY/SAM path in the
+> overlay" hack was deleted: it made lsasrv's `LsapIsDatabaseInstalled()` answer TRUE, so the real
+> first-boot install was skipped. With a real empty hive the probe MISSES honestly and lsasrv runs
+> **`LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` for real** — 17 keys, with `PolAcDmS`
+> holding a SID it minted itself in `LsapCreateRandomDomainSid` (24 B, rev 1, 4 sub-authorities, NT
+> authority). **On the live logon path `GetAccountDomainSid` now SUCCEEDS** (4 real attribute reads
+> while `LsaLogonUser` is in flight); its `msv1_0/sam.c:270` error is gone. **samsrv.dll is genuinely
+> hosted** (293376 B, demand-loaded by path) and its own `SampInitializeSAM`/`SampSetupCreateServer`
+> created `SAM\SAM` + `SAM\SAM\Domains` in the real SAM mount.
+>
+> **The wall moved one step, and no logon is fabricated.** `SamValidateNormalUser` now fails in
+> **`SamIConnect`**: `SampOpenDbObject(NULL, NULL, L"SAM", …)` opens the leaf `SAM` with a NULL
+> RootDirectory because `SamKeyHandle` was never set — `SamIInitialize` never reached
+> `SampInitDatabase`, having blocked forever in `SampInitializeSAM` → `SampGetAccountDomainInfo` →
+> **`LsaOpenPolicy`**, an ncacn_np `\pipe\lsarpc` **self-RPC** that lsass hosts no per-connection
+> worker for (a cooperative wait park, so the boot still quiesces). `Administrator` is NOT validated
+> and `WLX_SAS_ACTION_LOGON` is still NOT returned. **Next wall: an LSA RPC worker for lsass' own
+> `\pipe\lsarpc`** (services' SCM `\ntsvcs` worker is the precedent) — only then can
+> `SampInitializeSAM` finish and mint the Administrator account. Gate specs:
+> `exec_lsa_security_hive_backed`, `exec_samsrv_hosted`,
+> `exec_msv1_0_account_domain_sid_resolved`. See the SAM/SECURITY BATCH section of `ntdll_plan.md`.
+
 ---
 
 ## 6. How to work on it
@@ -374,7 +411,7 @@ cd rust-micro && ./scripts/make_image.sh && ./scripts/run_specs.sh
 **The gate** is the serial line
 
 ```
-[ntos-exec summary: 220/99 executive->isolated-service checks passed]
+[ntos-exec summary: 223/99 executive->isolated-service checks passed]
 ```
 
 followed by `[microtest sentinel matched -- exiting QEMU]` and `RUNEXIT=3`. **Zero `FAIL` lines** is
@@ -382,6 +419,7 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 `0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_msgina_credential_keystrokes_delivered`,
 `exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`, `exec_lsa_auth_port_connected`,
 `exec_lsa_logon_user_reached`, `exec_lsa_msv1_0_sam_validation_reached`,
+`exec_lsa_security_hive_backed`, `exec_samsrv_hosted`, `exec_msv1_0_account_domain_sid_resolved`,
 `exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip`, all 21
 `exec_dbgk_*`.
 

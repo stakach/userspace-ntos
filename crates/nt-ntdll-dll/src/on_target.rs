@@ -7771,13 +7771,23 @@ pub unsafe extern "system" fn rtlp_nt_open_key(
     object_attributes: u64,
     _unused: u64,
 ) -> u32 {
-    // OBJECT_ATTRIBUTES.Attributes @ +0x10 (ULONG). Clear OBJ_PERMANENT(0x10)|OBJ_EXCLUSIVE(0x20).
+    // x64 OBJECT_ATTRIBUTES.Attributes is a ULONG at **+0x18** (`Length`+pad, `RootDirectory`
+    // @0x08, `ObjectName` @0x10, `Attributes` @0x18). Clear OBJ_PERMANENT|OBJ_EXCLUSIVE. The
+    // 32-bit offset (+0x10) used here before wrote the masked flags over the LOW DWORD OF THE
+    // `ObjectName` POINTER, so the callee read a garbage `UNICODE_STRING` -- that is exactly how
+    // lsasrv's `LsapOpenServiceKey(\Registry\Machine\SECURITY)` came back
+    // STATUS_OBJECT_NAME_NOT_FOUND and the whole LSA policy database failed to initialise. The
+    // offsets + the mask are host-tested in `nt_ntdll::rtl::registry`.
     if object_attributes != 0 {
-        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x10.
+        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x18 (x64).
         unsafe {
-            let attr_ptr = (object_attributes + 0x10) as *mut u32;
+            let attr_ptr =
+                (object_attributes + nt_ntdll::rtl::registry::OA_OFFSET_ATTRIBUTES) as *mut u32;
             let a = core::ptr::read_unaligned(attr_ptr);
-            core::ptr::write_unaligned(attr_ptr, a & !(0x10 | 0x20));
+            core::ptr::write_unaligned(
+                attr_ptr,
+                nt_ntdll::rtl::registry::sanitize_key_object_attributes(a),
+            );
         }
     }
     // SAFETY: NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes) — SSN 125, 3 args.
@@ -7911,13 +7921,23 @@ pub unsafe extern "system" fn rtlp_nt_create_key(
     _class: u64,
     disposition: u64,
 ) -> u32 {
-    // OBJECT_ATTRIBUTES.Attributes @ +0x10 (ULONG). Clear OBJ_PERMANENT(0x10)|OBJ_EXCLUSIVE(0x20).
+    // x64 OBJECT_ATTRIBUTES.Attributes is a ULONG at **+0x18** (`Length`+pad, `RootDirectory`
+    // @0x08, `ObjectName` @0x10, `Attributes` @0x18). Clear OBJ_PERMANENT|OBJ_EXCLUSIVE. The
+    // 32-bit offset (+0x10) used here before wrote the masked flags over the LOW DWORD OF THE
+    // `ObjectName` POINTER, so the callee read a garbage `UNICODE_STRING` -- that is exactly how
+    // lsasrv's `LsapOpenServiceKey(\Registry\Machine\SECURITY)` came back
+    // STATUS_OBJECT_NAME_NOT_FOUND and the whole LSA policy database failed to initialise. The
+    // offsets + the mask are host-tested in `nt_ntdll::rtl::registry`.
     if object_attributes != 0 {
-        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x10.
+        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x18 (x64).
         unsafe {
-            let attr_ptr = (object_attributes + 0x10) as *mut u32;
+            let attr_ptr =
+                (object_attributes + nt_ntdll::rtl::registry::OA_OFFSET_ATTRIBUTES) as *mut u32;
             let a = core::ptr::read_unaligned(attr_ptr);
-            core::ptr::write_unaligned(attr_ptr, a & !(0x10 | 0x20));
+            core::ptr::write_unaligned(
+                attr_ptr,
+                nt_ntdll::rtl::registry::sanitize_key_object_attributes(a),
+            );
         }
     }
     // SAFETY: NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex=0, Class=NULL,

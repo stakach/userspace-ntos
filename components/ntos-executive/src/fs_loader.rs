@@ -545,6 +545,12 @@ pub(crate) unsafe fn demand_load_dll(
     core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
     *store.add(slot) = Some(pe);
     crate::bump_progress(); // (B) a NEW DLL loaded = unambiguous forward progress (resets stall)
+    // samsrv.dll — lsass' SAM server. lsasrv/lsass resolve it at runtime; nothing in the executive
+    // names it, so a genuine by-path demand-load is the ONLY way it can appear. Recorded for the
+    // `exec_samsrv_hosted` gate spec (with its real on-disk byte size).
+    if stem == b"samsrv" {
+        crate::SAMSRV_LOADED_SIZE.store(sz as u64, core::sync::atomic::Ordering::Relaxed);
+    }
     print_str(b"[ntos-exec] DEMAND-LOAD ");
     print_str(stem);
     print_str(b" (");

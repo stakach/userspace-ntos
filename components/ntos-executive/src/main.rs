@@ -1051,6 +1051,18 @@ pub const NLS_20127_FRAMES: u64 = 20;
 /// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
 pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
 pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
+/// The real ReactOS **SECURITY** hive (`\reactos\system32\config\security`, 8 KiB regf) — the LSA
+/// policy database's on-disk backing store. Read BY PATH off the image by the isolated storage
+/// host, exactly like the SYSTEM hive, and mounted read-only at `\Registry\Machine\SECURITY`.
+/// Shares the 0xA0-0xC0 input page table (placed past NLS_20127).
+pub const SECHIVEBUF_VADDR: u64 = 0x0000_0100_10BB_0000;
+pub const SECHIVEBUF_FRAMES: u64 = 8; // 32 KiB (the staged hive is 8 KiB)
+/// The real ReactOS **SAM** hive (`\reactos\system32\config\sam`, 8 KiB regf), mounted read-only at
+/// `\Registry\Machine\SAM`. Same by-path staging as SECURITY.
+pub const SAMHIVEBUF_VADDR: u64 = 0x0000_0100_10BB_8000;
+pub const SAMHIVEBUF_FRAMES: u64 = 8; // 32 KiB
+const _: () = assert!(SECHIVEBUF_VADDR + SECHIVEBUF_FRAMES * 0x1000 <= SAMHIVEBUF_VADDR);
+const _: () = assert!(SAMHIVEBUF_VADDR + SAMHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10BC_0000);
 const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
 /// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
@@ -2410,19 +2422,113 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
             && LSA_LAST_API_NUMBER.load(Ordering::Relaxed) == 2,
         passed,
     );
-    // ★ HONEST WALL. The real MSV1_0 authentication package ran `SamValidateNormalUser`, which needs
-    // the LSA POLICY database's account-domain SID (`GetAccountDomainSid` →
-    // `LsarQueryInformationPolicy(PolicyAccountDomainInformation)`, `msv1_0/sam.c:267`). We host no
-    // LSA policy / SAM database yet, so it returns STATUS_OBJECT_NAME_NOT_FOUND and the real
-    // `LsaApLogonUser2` fails with it. This spec asserts EXACTLY that: the credentials were copied
-    // into the auth package out of winlogon's own address space (lsasrv's `LsapCopyFromClient`) and
-    // the answer came back as the REAL validation status — never a fabricated logon success.
+    // ★ HONEST WALL. The real MSV1_0 authentication package ran `SamValidateNormalUser`. Its FIRST
+    // step, `GetAccountDomainSid` (`msv1_0/sam.c:267`), now SUCCEEDS against the real LSA policy
+    // database (see `exec_lsa_security_hive_backed`); the call then fails one step later in
+    // `SamIConnect` (`samsrv!SampOpenDbObject(NULL, NULL, L"SAM")` with a NULL `SamKeyHandle`), so
+    // the status is still STATUS_OBJECT_NAME_NOT_FOUND. This spec asserts EXACTLY that: the
+    // credentials were copied into the auth package out of winlogon's own address space (lsasrv's
+    // `LsapCopyFromClient`) and the answer came back as the REAL validation status — never a
+    // fabricated logon success.
     const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
     check(
         b"exec_lsa_msv1_0_sam_validation_reached",
         LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed) >= 4
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == STATUS_OBJECT_NAME_NOT_FOUND
             && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0,
+        passed,
+    );
+    lsa_security_database_specs(passed);
+}
+
+/// ═══ REAL SECURITY / SAM hive mount + the LSA policy database ══════════════════════════════════
+///
+/// `\Registry\Machine\SECURITY` and `\Registry\Machine\SAM` are REAL read-only `regf` mounts, read
+/// BY PATH off `\reactos\system32\config\{security,sam}` by the isolated storage host (the same
+/// mechanism as the SYSTEM hive). Both staged hives are the genuine post-setup ReactOS ones: 8192
+/// bytes, root key only, ZERO subkeys. That emptiness is load-bearing — it is what makes lsasrv's
+/// `LsapIsDatabaseInstalled()` answer FALSE and run its real first-boot install.
+fn lsa_security_database_specs(passed: &mut u64) {
+    let sid_len = LSA_ACCT_DOMAIN_SID_LEN.load(Ordering::Relaxed);
+    let sid_head = LSA_ACCT_DOMAIN_SID_HEAD.load(Ordering::Relaxed).to_le_bytes();
+    print_str(b"[lsa-db] SECURITY hive=");
+    print_u64(SECURITY_HIVE_SIZE.load(Ordering::Relaxed));
+    print_str(b"B SAM hive=");
+    print_u64(SAM_HIVE_SIZE.load(Ordering::Relaxed));
+    print_str(b"B real-hive-opens=");
+    print_u64(LSA_HIVE_ROOT_OPENED.load(Ordering::Relaxed));
+    print_str(b" honest-misses=");
+    print_u64(LSA_HIVE_OPEN_MISS.load(Ordering::Relaxed));
+    print_str(b" policy-keys-created=");
+    print_u64(LSA_POLICY_KEYS_CREATED.load(Ordering::Relaxed));
+    print_str(b" PolAcDmS len=");
+    print_u64(sid_len);
+    print_str(b" rev=");
+    print_u64(sid_head[0] as u64);
+    print_str(b" subauth=");
+    print_u64(sid_head[1] as u64);
+    print_str(b" authority=");
+    print_u64(sid_head[7] as u64);
+    print_str(b" attr-reads=");
+    print_u64(LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed));
+    print_str(b" attr-reads-in-logon=");
+    print_u64(LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.load(Ordering::Relaxed));
+    print_str(b"\n");
+    // (1) The SECURITY hive is the REAL staged file AND lsasrv installed its own policy database
+    //     into it. `LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` create Policy / Accounts /
+    //     Domains / Secrets plus one key per policy attribute (>= 15 in total), and the `PolAcDmS`
+    //     attribute holds a SID lsasrv minted itself in `LsapCreateRandomDomainSid`: revision 1,
+    //     4 sub-authorities (S-1-5-21-x-y-z), NT authority (5), so RtlLengthSid == 8 + 4*4 == 24.
+    //     None of that can be produced without that real code running.
+    check(
+        b"exec_lsa_security_hive_backed",
+        SECURITY_HIVE_SIZE.load(Ordering::Relaxed) == 8192
+            && LSA_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
+            && LSA_HIVE_OPEN_MISS.load(Ordering::Relaxed) >= 1
+            && LSA_POLICY_KEYS_CREATED.load(Ordering::Relaxed) >= 15
+            && sid_len == 24
+            && sid_head[0] == 1 // SID_REVISION
+            && sid_head[1] == 4 // SubAuthorityCount (SECURITY_NT_NON_UNIQUE + 3 randoms)
+            && sid_head[7] == 5, // IdentifierAuthority = SECURITY_NT_AUTHORITY
+        passed,
+    );
+    // (2) samsrv.dll is GENUINELY hosted: demand-loaded BY PATH off the real \reactos tree (nothing
+    //     in the executive names it — lsass resolves it at runtime), the real SAM hive is mounted,
+    //     and samsrv's OWN `SampSetupCreateServer` created its database keys (`SAM`, `SAM\Domains`)
+    //     under that mount.
+    print_str(b"[lsa-db] samsrv.dll loaded=");
+    print_u64(SAMSRV_LOADED_SIZE.load(Ordering::Relaxed));
+    print_str(b"B sam-setup-keys=");
+    print_u64(SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed));
+    print_str(b" sam-mount-opens=");
+    print_u64(SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed));
+    print_str(b" SamIConnect-null-root-miss=");
+    print_u64(SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_samsrv_hosted",
+        SAMSRV_LOADED_SIZE.load(Ordering::Relaxed) >= 200_000
+            && SAM_HIVE_SIZE.load(Ordering::Relaxed) == 8192
+            && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 1
+            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 2,
+        passed,
+    );
+    // (3) ★ The credential-validation advance + the NEW honest wall. During the REAL `LsaLogonUser`
+    //     (ApiNumber 2) in flight, msv1_0's `GetAccountDomainSid` read the account-domain policy
+    //     attributes back out of the database lsasrv installed — so `GetAccountDomainSid` now
+    //     SUCCEEDS (its `msv1_0/sam.c:270` error is gone). `SamValidateNormalUser` then fails ONE
+    //     STEP LATER, in `SamIConnect`: `SampOpenDbObject(NULL, NULL, L"SAM", …)` opens the leaf
+    //     name `SAM` with a NULL RootDirectory because samsrv's `SamKeyHandle` was never set —
+    //     `SamIInitialize` never reached `SampInitDatabase`, having blocked forever inside
+    //     `SampInitializeSAM` → `SampGetAccountDomainInfo` → `LsaOpenPolicy`, an ncacn_np
+    //     `\pipe\lsarpc` SELF-RPC that lsass hosts no per-connection worker for. Asserting the NULL
+    //     RootDirectory miss pins that exact wall, so no fabricated SAM can pass this spec.
+    check(
+        b"exec_msv1_0_account_domain_sid_resolved",
+        LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed) >= 4
+            && LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.load(Ordering::Relaxed) >= 2
+            && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) >= 1
+            && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 0,
         passed,
     );
 }
@@ -5165,6 +5271,41 @@ const OVERLAY_KEY_MAX: u32 = 0x1000;
 fn is_synth_key(kr: KeyRef) -> bool {
     kr >= OVERLAY_KEY_TAG
 }
+/// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
+/// Three REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
+/// ~204 KiB), SECURITY and SAM (8 KiB each, read BY PATH off `\reactos\system32\config`). A
+/// `KeyRef` is a cell offset inside ONE of them, so the top nibble SELECTS the hive. Real cell
+/// offsets are far below 0x4000_0000 (the largest hive is 204 KiB), and the tags stay below
+/// `OVERLAY_KEY_TAG` so `is_synth_key` is unchanged.
+/// **BYPASS SWITCH** for the SECURITY/SAM hive mount. Set to `false` to leave both hives unmounted
+/// (the pre-batch state): `\Registry\Machine\SECURITY` then fails to open, lsasrv's
+/// `LsapOpenServiceKey` returns STATUS_OBJECT_NAME_NOT_FOUND, no LSA policy database is installed
+/// and samsrv never reaches its SAM keys — `exec_lsa_security_hive_backed`,
+/// `exec_samsrv_hosted` and `exec_msv1_0_account_domain_sid_resolved` all FAIL. Verified.
+pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
+pub(crate) const HIVE_SEL_MASK: u32 = 0xE000_0000;
+/// Hive selector 0 — the SYSTEM hive (untagged, so every pre-existing SYSTEM `KeyRef` is unchanged).
+pub(crate) const HIVE_SEL_SYSTEM: u32 = 0x0000_0000;
+/// Hive selector for `\Registry\Machine\SECURITY`.
+pub(crate) const HIVE_SEL_SECURITY: u32 = 0x4000_0000;
+/// Hive selector for `\Registry\Machine\SAM`.
+pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
+/// The hive selector bits of a `KeyRef` (meaningful only for a non-synth key).
+pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
+    kr & HIVE_SEL_MASK
+}
+/// The in-hive cell offset of a `KeyRef` (strips the selector).
+pub(crate) fn hive_cell(kr: KeyRef) -> KeyRef {
+    kr & !HIVE_SEL_MASK
+}
+/// The NT mount path of a hive selector (the prefix its `key_path` results hang off).
+pub(crate) fn hive_mount(sel: u32) -> &'static str {
+    match sel {
+        HIVE_SEL_SECURITY => r"\Registry\Machine\SECURITY",
+        HIVE_SEL_SAM => r"\Registry\Machine\SAM",
+        _ => r"\Registry\Machine\System",
+    }
+}
 /// If a `KeyRef` names an overlay (created) key, return its overlay index.
 fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
     if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
@@ -5268,6 +5409,45 @@ static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// SYNTH_WINLOGON_KEY (BATCH 40 — msgina's GetRegistrySettings). Proves winlogon crossed the msgina
 /// GINA-init wall (WlxInitialize wrote a non-NULL context instead of GinaInit-fail → WlxShutdown(NULL)).
 pub(crate) static WINLOGON_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+/// Count of `\Registry\Machine\{SECURITY,SAM}[\...]` opens RESOLVED against the REAL mounted regf
+/// hive (not the overlay). Proves lsass/samsrv reached genuine hive-backed keys.
+pub(crate) static LSA_HIVE_ROOT_OPENED: AtomicU64 = AtomicU64::new(0);
+/// As above, but counting ONLY opens that landed in the real **SAM** mount (samsrv's
+/// `\Registry\Machine\SAM`). Zero if the SAM hive isn't mounted.
+pub(crate) static SAM_HIVE_ROOT_OPENED: AtomicU64 = AtomicU64::new(0);
+/// Count of `\Registry\Machine\{SECURITY,SAM}\...` opens that honestly MISSED (the key is in
+/// neither the real hive nor the overlay). lsasrv's `LsapIsDatabaseInstalled()` probe of
+/// `SECURITY\Policy` MUST land here on a fresh boot — that miss is what triggers its real
+/// first-boot database install.
+pub(crate) static LSA_HIVE_OPEN_MISS: AtomicU64 = AtomicU64::new(0);
+/// Keys lsasrv's OWN `LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` created under
+/// `\Registry\Machine\SECURITY\Policy` (Policy/Accounts/Domains/Secrets + one key per policy
+/// attribute). Nonzero ONLY if the real first-boot LSA database install ran.
+pub(crate) static LSA_POLICY_KEYS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Keys samsrv's OWN `SampSetupCreateServer`/`SampInitializeSAM` created under
+/// `\Registry\Machine\SAM` (`SAM`, `SAM\Domains`, …).
+pub(crate) static SAM_SETUP_KEYS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// The `PolAcDmS` (account-domain SID) attribute lsasrv wrote: byte length + the SID's first 8
+/// bytes (Revision, SubAuthorityCount, IdentifierAuthority[6]). Written by lsasrv's own
+/// `LsapSetObjectAttribute(PolicyObject, L"PolAcDmS", AccountDomainSid, RtlLengthSid(...))` from a
+/// SID it minted in `LsapCreateRandomDomainSid` — impossible to produce without that code running.
+pub(crate) static LSA_ACCT_DOMAIN_SID_LEN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LSA_ACCT_DOMAIN_SID_HEAD: AtomicU64 = AtomicU64::new(0);
+/// Times a `PolAcDm[NS]` policy attribute value was READ BACK through `NtQueryValueKey`
+/// (`LsapGetObjectAttribute`) — lsasrv's `LsapGetDomainInfo` at init, then msv1_0's
+/// `GetAccountDomainSid` on the real logon path.
+pub(crate) static LSA_ACCT_DOMAIN_ATTR_READS: AtomicU64 = AtomicU64::new(0);
+/// As above but counted ONLY while an `LsaLogonUser` request is in flight on the real
+/// `\LsaAuthenticationPort` — i.e. `GetAccountDomainSid` served DURING the credential validation.
+pub(crate) static LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON: AtomicU64 = AtomicU64::new(0);
+/// Set while a real `LsaLogonUser` (`LSA_API_MSG` ApiNumber 2) request is being serviced.
+pub(crate) static LSA_LOGON_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+/// samsrv.dll's on-disk byte size, recorded when the by-path demand-loader actually loaded it.
+pub(crate) static SAMSRV_LOADED_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The honest SAM wall: `SamIConnect` → `SampOpenDbObject(NULL, NULL, L"SAM", …)` opened the leaf
+/// name `SAM` with a NULL RootDirectory, i.e. samsrv's `SamKeyHandle` was never set because
+/// `SamIInitialize` never reached `SampInitDatabase`.
+pub(crate) static SAM_CONNECT_NULL_ROOT_MISS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 41 — count of winlogon `DefaultPassword` value reads satisfied with an empty REG_SZ (proves
 /// the LSA-RPC-avoidance crossing). During GinaInit, msgina's `GetRegistrySettings` (msgina.c:216)
 /// reads `HKLM\...\Winlogon\DefaultPassword`; ONLY when that read FAILS does it call
@@ -5586,6 +5766,15 @@ struct ExecNtHandler {
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
     /// the executive heap is small). None if the hive wasn't staged on the disk.
     hive: Option<RegfHive<'static>>,
+    /// The REAL ReactOS **SECURITY** hive (root = `\Registry\Machine\SECURITY`) — the LSA policy
+    /// database's backing store, read BY PATH off `\reactos\system32\config\security`. The staged
+    /// hive is the genuine post-setup one: 8 KiB, root key only, NO `Policy` subkey. That emptiness
+    /// is load-bearing — it is exactly what makes lsasrv's `LsapIsDatabaseInstalled()` answer FALSE
+    /// and run its real first-boot `LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` install
+    /// (which mints the account-domain SID). Writes land in the overlay, as for any base hive.
+    pub(crate) security_hive: Option<RegfHive<'static>>,
+    /// The REAL ReactOS **SAM** hive (root = `\Registry\Machine\SAM`), same by-path staging.
+    pub(crate) sam_hive: Option<RegfHive<'static>>,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
@@ -6613,6 +6802,12 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SYSTEM hive the storage host read into HIVEBUF.
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
+/// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
+pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SECURITY_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SAMHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SAM_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw winlogon.exe the storage host staged into WINLOGONBUF (3rd process).
@@ -9085,6 +9280,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(copy_cap(hivebuf_start + i), HIVEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             HIVEBUF_START.store(hivebuf_start, Ordering::Relaxed);
+            // The real SECURITY + SAM hive buffers (8 frames each, same 0xA0-0xC0 PT as HIVEBUF).
+            for (frames, vaddr, slot) in [
+                (SECHIVEBUF_FRAMES, SECHIVEBUF_VADDR, &SECHIVEBUF_START),
+                (SAMHIVEBUF_FRAMES, SAMHIVEBUF_VADDR, &SAMHIVEBUF_START),
+            ] {
+                let start = alloc_frame();
+                for _ in 1..frames {
+                    let _ = alloc_frame();
+                }
+                for i in 0..frames {
+                    let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+                slot.store(start, Ordering::Relaxed);
+            }
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -9130,6 +9339,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The real SYSTEM hive size the storage host read into HIVEBUF (reported @+0x38).
             REAL_HIVE_SIZE.store(
                 core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x38) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            // The real SECURITY / SAM hive sizes (reported @+0x98 / +0x9C).
+            SECURITY_HIVE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x98) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            SAM_HIVE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9C) as *const u32) as u64,
                 Ordering::Relaxed,
             );
             let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);

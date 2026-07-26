@@ -2515,6 +2515,11 @@ pub(crate) unsafe fn service_sec_image(
                         if delivered {
                             LSA_REQUESTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
                             LSA_LAST_API_NUMBER.store(api_number, Ordering::Relaxed);
+                            // ApiNumber 2 = LsaLogonUser: mark the credential validation IN FLIGHT
+                            // so registry reads the real MSV1_0/lsasrv code makes while servicing it
+                            // (notably `GetAccountDomainSid`'s `PolAcDm*` reads) are attributable to
+                            // the logon rather than to LSA init.
+                            LSA_LOGON_IN_FLIGHT.store(u64::from(api_number == 2), Ordering::Relaxed);
                             if api_number < 64 {
                                 LSA_API_MASK.fetch_or(1u64 << api_number, Ordering::Relaxed);
                             }
@@ -9742,6 +9747,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         3 => LSA_LOOKUP_REPLY_STATUS.store(api_status as u64, Ordering::Relaxed),
         _ => {}
     }
+    LSA_LOGON_IN_FLIGHT.store(0, Ordering::Relaxed);
     print_str(b"[lsa-rdv] REPLY delivered: api=");
     print_u64(LSA_LAST_API_NUMBER.load(Ordering::Relaxed));
     print_str(b" LSA_API_MSG.Status=0x");

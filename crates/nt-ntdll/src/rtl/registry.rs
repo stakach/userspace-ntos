@@ -24,6 +24,34 @@ pub const REG_EXPAND_SZ: u32 = 2;
 pub const REG_BINARY: u32 = 3;
 pub const REG_MULTI_SZ: u32 = 7;
 
+/// `OBJ_PERMANENT` / `OBJ_EXCLUSIVE` — the two attribute bits `RtlpNtOpenKey`/`RtlpNtCreateKey`
+/// strip before issuing the syscall (`references/reactos/sdk/lib/rtl/registry.c:913`).
+pub const OBJ_PERMANENT: u32 = 0x0000_0010;
+pub const OBJ_EXCLUSIVE: u32 = 0x0000_0020;
+
+/// **x64** `OBJECT_ATTRIBUTES` field byte offsets. The struct is
+/// `{ ULONG Length; HANDLE RootDirectory; PUNICODE_STRING ObjectName; ULONG Attributes;
+/// PVOID SecurityDescriptor; PVOID SecurityQualityOfService; }` — with 8-byte pointer alignment
+/// `Length` is followed by 4 bytes of padding, so `RootDirectory` is at 0x08, `ObjectName` at
+/// 0x10 and **`Attributes` at 0x18** (the 32-bit layout's 0x0C/0x10 do NOT apply). Getting this
+/// wrong writes the masked flags over the low half of the `ObjectName` POINTER, which silently
+/// corrupts every name the callee then reads.
+pub const OA_OFFSET_LENGTH: u64 = 0x00;
+pub const OA_OFFSET_ROOT_DIRECTORY: u64 = 0x08;
+pub const OA_OFFSET_OBJECT_NAME: u64 = 0x10;
+pub const OA_OFFSET_ATTRIBUTES: u64 = 0x18;
+pub const OA_OFFSET_SECURITY_DESCRIPTOR: u64 = 0x20;
+pub const OA_OFFSET_SECURITY_QOS: u64 = 0x28;
+/// `sizeof(OBJECT_ATTRIBUTES)` on x64.
+pub const OA_SIZE: u64 = 0x30;
+
+/// The `RtlpNt*Key` attribute sanitiser: drop `OBJ_PERMANENT | OBJ_EXCLUSIVE`, keep the rest
+/// (`references/reactos/sdk/lib/rtl/registry.c:913`, `:947`).
+#[must_use]
+pub const fn sanitize_key_object_attributes(attributes: u32) -> u32 {
+    attributes & !(OBJ_PERMANENT | OBJ_EXCLUSIVE)
+}
+
 const MAX_PATH_UNITS_WITH_NUL: usize = 260;
 
 const SERVICES: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
@@ -461,5 +489,77 @@ mod tests {
             parse_key_value_full_information(&[0; 19]),
             Err(STATUS_INFO_LENGTH_MISMATCH)
         );
+    }
+
+    /// The x64 `OBJECT_ATTRIBUTES` field offsets must match the C struct's natural layout. The
+    /// `Attributes` ULONG sits at 0x18 — NOT 0x10, which is the `ObjectName` POINTER. (The
+    /// `RtlpNt*Key` shims used 0x10 and so masked the low dword of the name pointer, which made
+    /// lsasrv's `\Registry\Machine\SECURITY` open read a garbage `UNICODE_STRING`.)
+    #[test]
+    fn x64_object_attributes_field_offsets() {
+        #[repr(C)]
+        struct ObjectAttributes {
+            length: u32,
+            root_directory: u64,
+            object_name: u64,
+            attributes: u32,
+            security_descriptor: u64,
+            security_qos: u64,
+        }
+        let oa = ObjectAttributes {
+            length: 0,
+            root_directory: 0,
+            object_name: 0,
+            attributes: 0,
+            security_descriptor: 0,
+            security_qos: 0,
+        };
+        let base = core::ptr::addr_of!(oa) as u64;
+        let at = |field: u64| field - base;
+        assert_eq!(at(core::ptr::addr_of!(oa.length) as u64), OA_OFFSET_LENGTH);
+        assert_eq!(
+            at(core::ptr::addr_of!(oa.root_directory) as u64),
+            OA_OFFSET_ROOT_DIRECTORY
+        );
+        assert_eq!(
+            at(core::ptr::addr_of!(oa.object_name) as u64),
+            OA_OFFSET_OBJECT_NAME
+        );
+        assert_eq!(
+            at(core::ptr::addr_of!(oa.attributes) as u64),
+            OA_OFFSET_ATTRIBUTES
+        );
+        assert_eq!(
+            at(core::ptr::addr_of!(oa.security_descriptor) as u64),
+            OA_OFFSET_SECURITY_DESCRIPTOR
+        );
+        assert_eq!(
+            at(core::ptr::addr_of!(oa.security_qos) as u64),
+            OA_OFFSET_SECURITY_QOS
+        );
+        assert_eq!(core::mem::size_of::<ObjectAttributes>() as u64, OA_SIZE);
+        assert_ne!(OA_OFFSET_ATTRIBUTES, OA_OFFSET_OBJECT_NAME);
+    }
+
+    /// The sanitiser drops only `OBJ_PERMANENT|OBJ_EXCLUSIVE`, never any other attribute bit.
+    #[test]
+    fn key_object_attributes_sanitiser_drops_only_permanent_and_exclusive() {
+        const OBJ_INHERIT: u32 = 0x0000_0002;
+        const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+        const OBJ_OPENIF: u32 = 0x0000_0080;
+        assert_eq!(sanitize_key_object_attributes(0), 0);
+        assert_eq!(sanitize_key_object_attributes(OBJ_PERMANENT), 0);
+        assert_eq!(sanitize_key_object_attributes(OBJ_EXCLUSIVE), 0);
+        assert_eq!(
+            sanitize_key_object_attributes(OBJ_PERMANENT | OBJ_EXCLUSIVE),
+            0
+        );
+        assert_eq!(
+            sanitize_key_object_attributes(
+                OBJ_INHERIT | OBJ_PERMANENT | OBJ_CASE_INSENSITIVE | OBJ_EXCLUSIVE | OBJ_OPENIF
+            ),
+            OBJ_INHERIT | OBJ_CASE_INSENSITIVE | OBJ_OPENIF
+        );
+        assert_eq!(sanitize_key_object_attributes(0xFFFF_FFFF), 0xFFFF_FFCF);
     }
 }

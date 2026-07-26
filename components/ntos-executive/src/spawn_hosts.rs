@@ -371,6 +371,8 @@ pub(crate) unsafe fn spawn_storage_host(
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
         (nls20127_start, NLS_20127_VADDR, NLS_20127_FRAMES),
         (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
+        (SECHIVEBUF_START.load(Ordering::Relaxed), SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES),
+        (SAMHIVEBUF_START.load(Ordering::Relaxed), SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES),
     ].into_iter().enumerate() {
         regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: u64::from(index == 0) };
         n += 1;

@@ -4577,3 +4577,101 @@ No regression: `exec_win32k_desktop_painted`, all 6 `exec_msgina_*`, `exec_user_
 component-runtime harness (FSD + win32k on the shared `component_main`/`component_pump`, the
 multi-driver by-path substrate, and what's isolated vs. deliberately in-executive) is documented in
 `docs/component-harness.md` §6.*
+
+---
+
+### SAM/SECURITY BATCH (2026-07-26, gate 220 -> **223**, LANDED green) - `\Registry\Machine\{SECURITY,SAM}` are REAL regf mounts, lsasrv installs its OWN LSA policy database, and `GetAccountDomainSid` SUCCEEDS on the live logon path
+
+**DIAGNOSIS (policy-query vs SamIConnect - traced, not guessed).** Neither. The first thing that
+failed was one step EARLIER than the LSA policy database: lsasrv's very first LSA-init call,
+`LsapOpenServiceKey()` -> `RtlpNtOpenKey(L"\Registry\Machine\SECURITY")`
+(`references/reactos/dll/win32/lsasrv/database.c:31`), came back `0xC0000034` and printed
+`database.c:548 Failed to open the service key`. A pi==4 `NtOpenKey` trace showed WHY: the executive
+received the object name as **68 characters of garbage** (`'   ...   0   . /  '`) instead of
+`\Registry\Machine\SECURITY`.
+
+**★ ROOT CAUSE: a real bug in OUR ntdll.** `RtlpNtOpenKey`/`RtlpNtCreateKey`
+(`crates/nt-ntdll-dll/src/on_target.rs`) masked `OBJ_PERMANENT|OBJ_EXCLUSIVE` out of
+`OBJECT_ATTRIBUTES.Attributes` at **+0x10** - the **32-bit** offset. On x64 `Attributes` is at
+**+0x18**; +0x10 is the `ObjectName` **POINTER**. So every `RtlpNt*Key` call silently cleared bits 4
+and 5 of the low dword of its own name pointer, and the callee then read a `UNICODE_STRING` from
+garbage. Fixed by using host-tested constants (`nt_ntdll::rtl::registry::OA_OFFSET_ATTRIBUTES` +
+`sanitize_key_object_attributes`, with a field-offset test that pins `Attributes != ObjectName`).
+`nt-ntdll` 692 -> **694**. This is the only ntdll change in the batch.
+
+**THE HIVES ARE REAL - AND REALLY EMPTY (that emptiness is load-bearing).** The staged
+`\reactos\system32\config\{security,sam}` are the genuine post-setup ReactOS hives: **8192 bytes
+each, regf, root key only, ZERO subkeys**. They are now mounted read-only through the SAME by-path
+mechanism as the SYSTEM hive - the isolated storage host `fat_open_path`s them into two new shared
+buffers (`SECHIVEBUF`/`SAMHIVEBUF`, sizes at `STORAGE_SHARED+0x98/+0x9C`), the executive borrows the
+bytes and parses them with `nt-hive-regf`. There is now a general **3-hive mount**: a `KeyRef`'s top
+nibble selects SYSTEM (0, untagged) / SECURITY (`0x4000_0000`) / SAM (`0x6000_0000`), and
+`resolve_key` / `registry_target_path` / `registry_value(s)` / `registry_subkeys` / the relative-open
+and relative-create arms all go through one `base_hive(KeyRef) -> (&RegfHive, cell)` accessor. No
+per-key special-casing was added.
+
+**WHAT THE MOUNT DELETED.** The pi==4 "auto-create any `\Registry\Machine\{SECURITY,SAM}` path in the
+overlay" hack is GONE. It was not merely a fabrication, it was **actively breaking the bring-up**:
+lsasrv's `LsapIsDatabaseInstalled()` probes `SECURITY\Policy` with a plain open, so the auto-create
+made it answer TRUE, the real first-boot install was SKIPPED, and `LsapGetDomainInfo` then failed
+reading a `PolAcDmS` that nobody had written. With a real (empty) hive the probe MISSES honestly.
+
+**WHAT NOW RUNS FOR REAL (all ReactOS code, measured on the boot).**
+* `LsapOpenServiceKey` opens the REAL SECURITY hive root (`KeyRef 0x4000_0020`).
+* `LsapIsDatabaseInstalled()` -> `Policy` MISS -> **`LsapCreateDatabaseKeys()`** creates
+  `Policy`/`Accounts`/`Domains`/`Secrets`, then **`LsapCreateDatabaseObjects()`** creates and fills
+  all 13 policy attributes - **17 keys** in total, in the overlay over the real hive.
+* The account-domain SID is lsasrv's OWN `LsapCreateRandomDomainSid()` output, persisted as the
+  `PolAcDmS` attribute's default value: **24 bytes, Revision 1, 4 sub-authorities, NT authority 5**
+  (an S-1-5-21-x-y-z). `LsapGetDomainInfo` reads `PolAcDmN`+`PolAcDmS` back (4 reads).
+* **On the LIVE logon path** (`LsaLogonUser` in flight over the real `\LsaAuthenticationPort`),
+  msv1_0's `GetAccountDomainSid` -> `LsaIOpenPolicyTrusted` + `LsarQueryInformationPolicy(
+  PolicyAccountDomainInformation)` performs **4 more real attribute reads and SUCCEEDS**. The
+  `msv1_0/sam.c:270 GetAccountDomainSid() failed` error line is GONE.
+* **samsrv.dll is genuinely hosted** - 293376 B, demand-loaded BY PATH (nothing in the executive
+  names it). `SamIInitialize` -> `SampIsSetupRunning()` reads the real `HKLM\SYSTEM\Setup\SetupType`
+  (= 1, a fresh install) -> `SampInitializeSAM()` opens the REAL SAM hive root (`0x6000_0020`) and
+  its own `SampSetupCreateServer` creates `SAM\SAM` + `SAM\SAM\Domains`.
+
+**★ THE NEW HONEST WALL (no logon is fabricated).** `SamValidateNormalUser` now fails ONE STEP LATER,
+in **`SamIConnect`**: `SampOpenDbObject(NULL, NULL, L"SAM", ...)` opens the leaf name `SAM` with a
+**NULL RootDirectory**, because samsrv's `SamKeyHandle` was never set - `SamIInitialize` never
+reached `SampInitDatabase`. It is blocked forever inside `SampInitializeSAM` ->
+`SampGetAccountDomainInfo` (`samsrv/setup.c:866`) -> **`LsaOpenPolicy`**, which is advapi32's
+**ncacn_np `\pipe\lsarpc` RPC** - a SELF-RPC into lsass, which hosts no per-connection LSA RPC worker
+(unlike services' SCM `\ntsvcs` worker, BATCH 35). The boot shows it exactly:
+`[nt-create-file-frontier] pi=4 ... "\??\pipe\lsarpc"` then
+`[wait] pi=4 NtWaitForSingleObject(dispatcher #66) UNSIGNALLED -> PARK caller (reply-cap park)` - a
+cooperative wait park, not a crash park; the boot quiesces. So `Administrator` is NOT validated and
+**`WLX_SAS_ACTION_LOGON` is still NOT returned**; winlogon takes msgina's own failure path back to
+the pre-existing `[dialog-pump]` MILESTONE park. The logon reply status is still
+`STATUS_OBJECT_NAME_NOT_FOUND`, now from `SamIConnect` rather than `GetAccountDomainSid`.
+**Next wall: an LSA RPC worker for lsass' own `\pipe\lsarpc`** (the SCM `\ntsvcs` worker is the
+precedent) - only then can `SampInitializeSAM` finish and mint the Administrator account.
+
+**Gate specs (+3 -> 223/99, ZERO FAILs).**
+* `exec_lsa_security_hive_backed` - SECURITY hive is exactly 8192 B, >= 2 opens resolved against the
+  REAL mounts, >= 1 honest miss (the `Policy` probe), >= 15 policy keys created by lsasrv's own
+  install, and `PolAcDmS` is a structurally REAL SID (len 24 / rev 1 / 4 sub-authorities / NT
+  authority) - unproducible without `LsapCreateDatabaseObjects` running.
+* `exec_samsrv_hosted` - samsrv.dll >= 200 KB actually demand-loaded, the SAM hive is 8192 B, >= 1
+  open resolved against the real **SAM mount**, and >= 2 keys created by samsrv's own
+  `SampSetupCreateServer`.
+* `exec_msv1_0_account_domain_sid_resolved` - >= 4 `PolAcDm*` attribute reads overall and **>= 2 while
+  an `LsaLogonUser` was in flight** (so `GetAccountDomainSid` succeeded inside the real credential
+  validation), plus the `SamIConnect` NULL-RootDirectory miss that pins the new wall.
+
+Observed: `real-hive-opens=2 honest-misses=1 policy-keys-created=17 PolAcDmS len=24 rev=1 subauth=4
+authority=5 attr-reads=8 attr-reads-in-logon=4`, `samsrv.dll loaded=293376B sam-setup-keys=2
+sam-mount-opens=1 SamIConnect-null-root-miss=1`.
+
+**BYPASS experiment:** `SECURITY_SAM_HIVES_MOUNTED = false` (main.rs) leaves both hives unmounted and
+restores the old overlay auto-create for the bypass arm only -> the gate returns to **220/99 with
+EXACTLY the three new specs FAILing** (`real-hive-opens=0 policy-keys-created=0 PolAcDmS len=0
+attr-reads=0 sam-mount-opens=0 SamIConnect-null-root-miss=0`); restored -> **223/99 ZERO FAILs on
+three consecutive boots** (RUNEXIT=3, `microtest sentinel`), boots 1 and 3 PASS-lists `diff`-identical
+and equal to `68c4bf0`'s **plus exactly the three new specs**. No regression:
+`exec_win32k_desktop_painted`, all `exec_msgina_*`, all 3 `exec_lsa_*`,
+`exec_user_callback_dead_client_unwind`, `exec_user_callback_real_api0_nested_roundtrip` and all 21
+`exec_dbgk_*` PASS. Host: `nt-ntdll` **694** (+2), `nt-process` 79, `nt-user-callback` 41,
+`nt-syscall` 41, `nt-hive-core` 16, `nt-hive-regf` 5. No `rust-micro/src` change.

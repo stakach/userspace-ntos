@@ -414,6 +414,31 @@ pub(crate) unsafe fn storage_probe(
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x38) as *mut u32, sz);
             }
         }
+        // The real ReactOS SECURITY + SAM registry hives (`\reactos\system32\config\{security,sam}`,
+        // 8 KiB regf each) — the LSA policy database's and the SAM database's on-disk backing
+        // stores. Read BY PATH exactly like the SYSTEM hive above (no flat ::NAME fallback exists,
+        // so the short name is only a formality); sizes reported at STORAGE_SHARED+0x98 / +0x9C so
+        // the executive can mount them with nt-hive-regf at \Registry\Machine\{SECURITY,SAM}.
+        for (path, short, dest, cap_frames, off) in [
+            (b"reactos\\system32\\config\\security".as_slice(), b"SECURITY   ", SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES, 0x98u64),
+            (b"reactos\\system32\\config\\sam".as_slice(), b"SAM        ", SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES, 0x9Cu64),
+        ] {
+            if let Some((c, sz, _)) = open_or_path!(path, short) {
+                let cap = (cap_frames * 0x1000) as u32;
+                let want = if sz < cap { sz } else { cap };
+                let got = fat_read_file(&fs, c, want, dest);
+                print_str(b"[storage-host] ");
+                print_str(short);
+                print_str(b" hive size=");
+                print_u64(sz as u64);
+                print_str(b" read=");
+                print_u64(got as u64);
+                print_str(b"\n");
+                if got == want && sz > 0 {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + off) as *mut u32, sz);
+                }
+            }
+        }
         // P7-A proof: publish the by-path hit/miss tally. verdict 0x200 = the WHOLE ReactOS stack
         // (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32 client stack + NLS + win32k/dxg/ftfd/
         // framebuf/arial/winlogon + the SYSTEM hive) was sourced BY PATH from the real \reactos tree

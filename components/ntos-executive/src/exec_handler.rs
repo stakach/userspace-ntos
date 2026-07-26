@@ -187,10 +187,51 @@ impl ExecNtHandler {
                 RegfHive::new(bytes)
             }
         };
+        // The REAL SECURITY + SAM hives the storage host read BY PATH off
+        // `\reactos\system32\config\{security,sam}`. Same mechanism as the SYSTEM hive: borrow the
+        // staged bytes (no copy) and parse them read-only with nt-hive-regf.
+        // SAFETY: fixed executive-lifetime mappings; the sizes are what the storage host reported
+        // (0 if the file wasn't staged → None → the mount is simply absent).
+        let (security_hive, sam_hive) = unsafe {
+            let mount = |base: u64, size: u64| -> Option<RegfHive<'static>> {
+                let n = size as usize;
+                if n == 0 || !SECURITY_SAM_HIVES_MOUNTED {
+                    return None;
+                }
+                RegfHive::new(core::slice::from_raw_parts(base as *const u8, n))
+            };
+            (
+                mount(SECHIVEBUF_VADDR, SECURITY_HIVE_SIZE.load(Ordering::Relaxed)),
+                mount(SAMHIVEBUF_VADDR, SAM_HIVE_SIZE.load(Ordering::Relaxed)),
+            )
+        };
+        unsafe {
+            print_str(b"[cm-hive] mounted base hives: SYSTEM=");
+            print_u64(REAL_HIVE_SIZE.load(Ordering::Relaxed));
+            print_str(b"B SECURITY=");
+            print_u64(SECURITY_HIVE_SIZE.load(Ordering::Relaxed));
+            print_str(b"B(root=");
+            print_u64(security_hive.as_ref().map_or(0, |h| u64::from(h.root())));
+            print_str(b" subkeys=");
+            print_u64(
+                security_hive
+                    .as_ref()
+                    .map_or(0, |h| h.subkeys(h.root()).len() as u64),
+            );
+            print_str(b") SAM=");
+            print_u64(SAM_HIVE_SIZE.load(Ordering::Relaxed));
+            print_str(b"B(root=");
+            print_u64(sam_hive.as_ref().map_or(0, |h| u64::from(h.root())));
+            print_str(b" subkeys=");
+            print_u64(sam_hive.as_ref().map_or(0, |h| h.subkeys(h.root()).len() as u64));
+            print_str(b")\n");
+        }
         let time_zone_information = seed_time_zone(hive.as_ref());
         unsafe { publish_time_zone(time_zone_information, nt_system_time_100ns()) };
         let mut handler = ExecNtHandler {
             hive,
+            security_hive,
+            sam_hive,
             time_zone_information,
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
@@ -504,6 +545,20 @@ impl ExecNtHandler {
         nt_hive_core::canon_path(&apply_ccs_alias(full))
     }
 
+    /// The mounted base hive a non-synth `KeyRef` belongs to, plus its in-hive cell offset. The
+    /// top nibble of the `KeyRef` selects SYSTEM (0) / SECURITY / SAM — see [`hive_sel`].
+    pub(crate) fn base_hive(&self, target: KeyRef) -> Option<(&RegfHive<'static>, KeyRef)> {
+        if is_synth_key(target) {
+            return None;
+        }
+        let hive = match hive_sel(target) {
+            HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
+            HIVE_SEL_SAM => self.sam_hive.as_ref()?,
+            _ => self.hive.as_ref()?,
+        };
+        Some((hive, hive_cell(target)))
+    }
+
     fn registry_target_path(&self, target: KeyRef) -> Option<alloc::string::String> {
         if target == MACHINE_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\machine"));
@@ -511,11 +566,9 @@ impl ExecNtHandler {
         if let Some(index) = overlay_key_idx(target) {
             return self.overlay.path(index).map(alloc::string::String::from);
         }
-        if is_synth_key(target) {
-            return None;
-        }
-        let relative = self.hive.as_ref()?.key_path(target)?;
-        let mut full = alloc::string::String::from(r"\Registry\Machine\System");
+        let (hive, cell) = self.base_hive(target)?;
+        let relative = hive.key_path(cell)?;
+        let mut full = alloc::string::String::from(hive_mount(hive_sel(target)));
         if !relative.is_empty() {
             full.push('\\');
             full.push_str(&relative);
@@ -567,14 +620,13 @@ impl ExecNtHandler {
                 return Some((ty, data.to_vec()));
             }
             let path = self.overlay.path(index)?;
-            return self
-                .resolve_key(path)
-                .and_then(|key| self.hive.as_ref()?.value(key, name));
+            return self.resolve_key(path).and_then(|key| {
+                let (hive, cell) = self.base_hive(key)?;
+                hive.value(cell, name)
+            });
         }
-        if is_synth_key(target) {
-            return None;
-        }
-        self.hive.as_ref()?.value(target, name)
+        let (hive, cell) = self.base_hive(target)?;
+        hive.value(cell, name)
     }
 
     fn registry_values(
@@ -592,7 +644,7 @@ impl ExecNtHandler {
         } else {
             None
         };
-        if let (Some(hive), Some(base)) = (self.hive.as_ref(), base_key) {
+        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             let count = hive.values(base).len();
             for index in 0..count {
                 let Some((name, ty, data)) = hive.value_by_index(base, index) else {
@@ -617,7 +669,10 @@ impl ExecNtHandler {
                     continue;
                 };
                 let exists_in_base = base_key
-                    .and_then(|base| self.hive.as_ref()?.value(base, name))
+                    .and_then(|key| {
+                        let (hive, base) = self.base_hive(key)?;
+                        hive.value(base, name)
+                    })
                     .is_some();
                 if !exists_in_base {
                     values.push((alloc::string::String::from(name), ty, data.to_vec()));
@@ -639,7 +694,7 @@ impl ExecNtHandler {
         } else {
             None
         };
-        if let (Some(hive), Some(base)) = (self.hive.as_ref(), base_key) {
+        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             subkeys.extend(hive.subkeys(base).into_iter().map(|(name, _)| name));
         }
         if let Some(path) = path.as_deref() {
@@ -4511,8 +4566,19 @@ impl ExecNtHandler {
         {
             return None;
         }
+        // The three REAL mounted regf hives. SYSTEM is untagged (its cell offsets ARE the KeyRef);
+        // SECURITY and SAM carry a hive-selector tag in the top nibble so a later
+        // handle→hive resolution can't confuse them (see `hive_sel`/`base_hive`).
         if comps[2].eq_ignore_ascii_case("System") {
             return self.hive.as_ref()?.open_key(&comps[3..].join("\\"));
+        }
+        if comps[2].eq_ignore_ascii_case("SECURITY") {
+            let cell = self.security_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
+            return Some(HIVE_SEL_SECURITY | cell);
+        }
+        if comps[2].eq_ignore_ascii_case("SAM") {
+            let cell = self.sam_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
+            return Some(HIVE_SEL_SAM | cell);
         }
         // The kernel's volatile HARDWARE hive isn't on disk. Synthesize the one key smss's SmpInit
         // reads: \Registry\Machine\Hardware\Description\System\CentralProcessor\0 (CPU identifier).
@@ -5105,20 +5171,32 @@ impl ExecNtHandler {
                         .as_ref()
                         .and_then(|full| self.resolve_key(full));
                     if let Some(cell) = cell {
+                        if hive_sel(cell) != HIVE_SEL_SYSTEM {
+                            LSA_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+                            if hive_sel(cell) == HIVE_SEL_SAM {
+                                SAM_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         return self.mint_registry_key(cell, args[1] as u32, args[0]);
                     }
-                    // lsass (pi 4): the SECURITY + SAM hives (\Registry\Machine\{SECURITY,SAM}) don't
-                    // exist in our staged SYSTEM hive, but real ReactOS creates them at setup. lsass'
-                    // LsapOpenServiceKey (\Registry\Machine\SECURITY, KEY_CREATE_SUB_KEY) + samsrv's
-                    // SampInitDatabase (\Registry\Machine\SAM) do a plain OPEN that would fail c0000034
-                    // → lsass bails at LsapInitDatabase / SamIInitialize. Model these hives as EMPTY
-                    // overlay roots: on a pi==4 open of a path under SECURITY/SAM that isn't in the base
-                    // or overlay yet, auto-create it in the overlay so the open succeeds (lsass then
-                    // creates its Policy/database subkeys under them via NtCreateKey → overlay). Scoped to
-                    // pi==4 so services (pi 3) / paint reads are unchanged.
-                    if self.pi == 4 {
-                        if let Some(ref full) = full_opt {
-                            if is_lsa_hive_path(full) {
+                    // NOTE (SAM/SECURITY batch): `\Registry\Machine\{SECURITY,SAM}` used to be
+                    // AUTO-CREATED in the overlay here on any pi==4 open. That was a fabrication and
+                    // it actively BROKE the LSA bring-up: lsasrv's `LsapIsDatabaseInstalled()` probes
+                    // `SECURITY\Policy` with a plain open, so an auto-create made it answer TRUE, the
+                    // real first-boot `LsapCreateDatabaseKeys`/`LsapCreateDatabaseObjects` install was
+                    // SKIPPED, and `LsapGetDomainInfo` then failed reading a `PolAcDmS` nobody wrote.
+                    // Both hives are now REAL read-only regf mounts (see `resolve_key`), so their root
+                    // resolves above and a missing subkey MISSES honestly - which is precisely what
+                    // makes lsasrv install its own database.
+                    if let Some(ref full) = full_opt {
+                        if is_lsa_hive_path(full) {
+                            LSA_HIVE_OPEN_MISS.fetch_add(1, Ordering::Relaxed);
+                            // BYPASS ARM ONLY (`SECURITY_SAM_HIVES_MOUNTED == false`): the PRE-BATCH
+                            // behaviour — fabricate an empty overlay hive root on any pi==4
+                            // SECURITY/SAM open. Kept solely so the bypass experiment reproduces the
+                            // old steady state (gate 220) instead of diverging into a hang; the live
+                            // path never takes it.
+                            if !SECURITY_SAM_HIVES_MOUNTED && self.pi == 4 {
                                 let canon = self.overlay_canon(full);
                                 let (oidx, _) = self.overlay.create(&canon);
                                 self.overlay_dirty = true;
@@ -5128,6 +5206,13 @@ impl ExecNtHandler {
                                     args[0],
                                 );
                             }
+                        }
+                        // samsrv's `SamIConnect` → `SampOpenDbObject(NULL, NULL, L"SAM", …)`: the
+                        // bare leaf `SAM` opened with a NULL RootDirectory means its `SamKeyHandle`
+                        // is NULL — `SamIInitialize` never reached `SampInitDatabase`. That is the
+                        // batch's honest wall; count it so the gate can assert it EXACTLY.
+                        if root_dir == 0 && full.eq_ignore_ascii_case("SAM") {
+                            SAM_CONNECT_NULL_ROOT_MISS.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
@@ -5166,10 +5251,12 @@ impl ExecNtHandler {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 let cell = if let Some(parent) = root_target {
-                    match self.hive.as_ref() {
-                        Some(h) => h.open_key_from(parent, &path),
-                        _ => None,
-                    }
+                    // Relative open against a real base-hive handle: stay in the SAME mounted hive
+                    // (re-apply its selector to the resolved cell).
+                    self.base_hive(parent).and_then(|(hive, base)| {
+                        hive.open_key_from(base, &path)
+                            .map(|cell| hive_sel(parent) | cell)
+                    })
                 } else {
                     self.resolve_key(&path)
                 };
@@ -5226,13 +5313,13 @@ impl ExecNtHandler {
                         }
                         f
                     })
-                } else if let (Some(hive), Some(parent)) = (self.hive.as_ref(), root_target) {
-                    hive.key_path(parent).map(|relative| {
-                        let mut f = alloc::string::String::from(r"\Registry\Machine\System");
-                        if !relative.is_empty() {
-                            f.push('\\');
-                            f.push_str(&relative);
-                        }
+                } else if let Some(parent) = root_target {
+                    // A create relative to a REAL base-hive handle (SYSTEM / SECURITY / SAM): build
+                    // the full NT path from that hive's own mount point. lsasrv's
+                    // `LsapCreateDatabaseKeys` creates `Policy`/`Accounts`/`Domains`/`Secrets`
+                    // relative to its `\Registry\Machine\SECURITY` handle through exactly this arm.
+                    self.registry_target_path(parent).map(|base| {
+                        let mut f = base;
                         if !name.is_empty() {
                             f.push('\\');
                             f.push_str(&name);
@@ -5267,6 +5354,14 @@ impl ExecNtHandler {
                 }
                 let (oidx, _) = self.overlay.create(&canon);
                 self.overlay_dirty = true;
+                // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's OWN
+                // `LsapCreateDatabaseKeys`/`LsapCreateDatabaseObjects` under SECURITY\Policy, and by
+                // samsrv's OWN `SampSetupCreateServer` under SAM.
+                if canon.starts_with(r"\registry\machine\security\policy") {
+                    LSA_POLICY_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
+                } else if canon.starts_with(r"\registry\machine\sam\") {
+                    SAM_SETUP_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
+                }
                 let status = self.mint_registry_key(
                     OVERLAY_KEY_TAG | (oidx as u32),
                     args[1] as u32,
@@ -5318,6 +5413,19 @@ impl ExecNtHandler {
                 data.resize(data_size, 0);
                 if data_size != 0 && !self.xas_read(data_ptr, &mut data) {
                     return 0xC000_0005;
+                }
+                // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
+                // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
+                // the gate can assert real SID structure (Revision 1, 4 sub-authorities, NT
+                // authority 5) rather than "a write happened".
+                if name.is_empty()
+                    && self.overlay.path(oidx) == Some(r"\registry\machine\security\policy\polacdms")
+                {
+                    LSA_ACCT_DOMAIN_SID_LEN.store(data.len() as u64, Ordering::Relaxed);
+                    let mut head = [0u8; 8];
+                    let n = data.len().min(8);
+                    head[..n].copy_from_slice(&data[..n]);
+                    LSA_ACCT_DOMAIN_SID_HEAD.store(u64::from_le_bytes(head), Ordering::Relaxed);
                 }
                 self.overlay.set_value(oidx, &name, ty, &data);
                 self.overlay_dirty = true;
@@ -5858,6 +5966,20 @@ impl ExecNtHandler {
                     }
                     self.registry_value(key, &name_lc)
                 };
+                // A `PolAcDm[NS]` account-domain attribute served back through
+                // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and msv1_0's
+                // `GetAccountDomainSid` on the real logon path (counted separately while an
+                // `LsaLogonUser` is in flight, which is the credential-validation proof).
+                if val.is_some()
+                    && self
+                        .registry_target_path(key)
+                        .is_some_and(|p| p.starts_with(r"\registry\machine\security\policy\polacdm"))
+                {
+                    LSA_ACCT_DOMAIN_ATTR_READS.fetch_add(1, Ordering::Relaxed);
+                    if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
+                        LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 match val {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                     Some((ty, data)) => {
