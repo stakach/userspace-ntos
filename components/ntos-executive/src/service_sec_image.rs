@@ -3698,6 +3698,13 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     tcb_cell.store(tcb, Ordering::Relaxed);
+                    if slot == 0 {
+                        // A LATCH of the seL4 TCB the general `NtCreateThread` service minted for
+                        // this thread. `WL_LISTENER_TCB` is the LIVE cell — the thread-termination
+                        // mechanism zeroes it — so it cannot witness what was created once the
+                        // thread legitimately goes away. See `exec_general_nt_create_thread`.
+                        WL_LISTENER_TCB_MINTED.store(tcb, Ordering::Relaxed);
+                    }
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                     if !suspended {

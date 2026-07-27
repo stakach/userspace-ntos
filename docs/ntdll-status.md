@@ -688,6 +688,80 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 > a crash park latches the whole process as a dead win32k callback client, which is wrong when only
 > one thread is stuck). `WLX_SAS_ACTION_LOGON` reaching `userinit.exe` is downstream of that fix.
 
+> **Update (batch 54, gate 241/99) — the post-logon path RUNS: `WLX_SAS_ACTION_LOGON` really comes
+> back and winlogon reaches `LoadUserProfileW`. Two real defects fixed, NEITHER of them ntdll.**
+> Three consecutive foreground boots, all RUNEXIT=3, `microtest sentinel`, **ZERO FAILs**, gate
+> **241/99**, `diff`-identical 241-line PASS lists, paint **768/768 changed @ `0x003a6ea5`**. No
+> kernel change (`rust-micro` untouched). **`RtlQueryInformationActivationContext` was CORRECT all
+> along** — the batch-52 fault was a memory-ownership bug in the executive, not an ntdll bug.
+>
+> **(1) A thread's `ACTIVATION_CONTEXT_STACK` now has its OWN PRIVATE PAGE.** `TEB+0x2C8` pointed at
+> `TEB+0x1800` — inside the TEB's *second page*. Both TEB pages are deliberately
+> `csrss_frame_put`-registered as CLIENT FRAMES, because hosted win32k dereferences the caller's TEB
+> directly under the KeStackAttachProcess model, so a win32k fault at either TEB VA is answered with
+> the client's own frame. win32k's USER server-side writes therefore landed in the client's real TEB
+> and scribbled the ACS: the page was dumped live holding RECT-shaped values, `0xffff` sentinels and
+> `0x00c8d0d4` (`COLOR_BTNFACE`) repeatedly, spanning `TEB+0x1000..0x18B8`, with the non-pointer
+> `ActiveFrame = 0x0000_0006_0010_0000` that batch 52 faulted on. `TEB+0x2C8` itself was always
+> right; the memory under it was not. Real NT never puts this structure in the TEB either — it is a
+> heap allocation (`RtlAllocateActivationContextStack`) reachable ONLY through `TEB+0x2C8`. It now
+> gets its own page on BOTH spawn paths (`img_spawn::spawn_sec_image` for a process' main thread,
+> `spawn_hosted_thread` for every hosted thread), deliberately **not** client-frame-registered, with
+> the layout asserts tightened (`teb_va + 0x3000 <= tramp_va`, 5 scratch pages per worker env).
+> Spec `exec_ntdll_activation_context_valid` reads winlogon's live mapping at gate time: the pointer
+> targets the private page, the structure is the empty one the spawn wrote, **every byte past it is
+> still zero**, the page is absent from the client-frame registry *while both TEB pages are in it*.
+> **BYPASS** (move the ACS back to `TEB+0x1800`): 241/99 ZERO FAILs → **239/99 with 2 FAILs**,
+> `exec_ntdll_activation_context_valid` and `exec_winlogon_logon_action_returned` both red, the
+> post-logon path never reaching `HandleLogon` (ProfileList opens 1 → **0**).
+>
+> **(2) The user-callback nesting invariant is PER-CLIENT-THREAD.** Fixing (1) exposed a second, older
+> defect immediately. `USER_CALLBACK_ACTIVE`/`USER_CALLBACK_CONTINUATIONS` were single GLOBAL LIFO
+> stacks and the nesting test compared the incoming client identity against the stack's **global
+> top** — sound only while one client thread ever has win32k work outstanding. Post-logon winlogon is
+> genuinely multi-threaded, and it was measured twice on one boot: main (`badge 4/tid 6`) issuing
+> `NtGdiGetTextMetricsW` (`0x1076`) while worker `badge 13/tid 21` sat redirected in
+> `WM_WINDOWPOSCHANGING` from `NtUserSetFocus` (`0x1050`), and worker `badge 12/tid 20` issuing
+> `0x1082` while main was redirected in `WM_NCCREATE`. Each was rejected as a "client identity
+> mismatch", walled `0xC000000D`, and killed winlogon as a **dead callback client**. In NT a callback
+> runs on the thread that entered win32k, so a call from a *different* thread is a **concurrent root**
+> dispatch, not a nested one. Both stacks now hold the interleaved union of every thread's chain and
+> every lookup is identity-scoped; "no frame for this identity" means root dispatch, not error. This
+> is strictly stronger, not laxer — a nested frame's parent is *selected by* identity, so cross-thread
+> misrouting is unrepresentable. The two glue-side arrays that were indexed in lockstep with the
+> callback stack (the suspended `DispatchContext`, the bridged `CallbackWnd` triple) moved onto the
+> frame, which is what makes removing a non-top frame safe. `nt-user-callback` 42 → **44** tests. Live
+> boot: 1598 nested dispatches, nesting high-water 5, **zero** rejections, both injection proofs full.
+> See `docs/user-callback-dispatch.md` §7b.
+>
+> **DESKTOP FRONTIER — where the logon now stands.** winlogon's own state machine runs on for real:
+> `WlxLoggedOutSAS` → **`WLX_SAS_ACTION_LOGON`** → `DoGenericAction` (`sas.c:1214`) → `HandleLogon`
+> (`sas.c:571`) → `LoadUserProfileW` (`sas.c:626`) → `userenv!GetProfilesDirectoryW`
+> (`profile.c:1592`). Spec `exec_winlogon_logon_action_returned` pins it on the ProfileList key open,
+> which is reachable from nowhere else in winlogon; the recogniser is **count-only** and changes no
+> outcome. **`userinit.exe` was NOT spawned and nothing is fabricated.** The wall is
+> `RegOpenKeyExW(HKLM, "Software\Microsoft\Windows NT\CurrentVersion\ProfileList")` →
+> **`ERROR_FILE_NOT_FOUND`**, because **this host mounts no SOFTWARE hive** (SYSTEM, SECURITY and SAM
+> only). `GetProfilesDirectoryW` fails → `LoadUserProfileW` fails → `HandleLogon` takes
+> `goto cleanup` (`sas.c:628-629`) → `WlxDisplaySASNotice` and back to the logon screen, and the boot
+> quiesces at its normal SAS milestone (no crash park). **Next frontier: mount the real SOFTWARE hive
+> as a 4th `regf` mount.** The genuine 471 KiB ReactOS `software` hive is already in the fetched tree
+> and does contain `ProfileList\ProfilesDirectory`; `userinit.exe` (300544 B) is already staged and
+> resolvable at `\reactos\system32\userinit.exe` via the recursive full-FS copy. Downstream of that
+> hive: `CreateUserEnvironment` → `SetDefaultLanguage` → `AllowAccessOnSession` →
+> `StartUserShell` → `CreateProcessAsUserW(userinit.exe)` as a real 6th hosted process under the
+> logon token.
+>
+> **One spec re-pointed, honestly.** `exec_general_nt_create_thread` sampled the LIVE `WL_LISTENER_TCB`
+> cell. That cell is zeroed by the real thread-termination mechanism, and it now legitimately is:
+> past the logon winlogon's two transient workers (tids 20/21) run to completion and self-terminate,
+> so the post-quiesce dead-client injection — which deliberately kills an *expendable* winlogon worker
+> — reaches its last candidate, the RPC listener, and reclaims its TCB before the gate. The liveness
+> clause was measuring the injection's victim choice, not the service. It now reads the **write-once
+> mint latch** of the TCB the service created (`WL_LISTENER_TCB_MINTED`) and **adds** a clause that
+> the created thread actually RAN (`WL_WORKER_FAULTS >= 1`), which the old form never asserted. Same
+> precedent as `exec_svc_rpc_listener_multiplex`.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

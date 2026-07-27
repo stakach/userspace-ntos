@@ -3212,6 +3212,18 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // which is where the logon-dialog teardown reaches it) must therefore see the same `t` through
     // the thread object as through the slot. Idempotent, and the only writer of this field.
     write_volatile((PH_ETHREAD + KTHREAD_WIN32THREAD_OFF) as *mut u64, t);
+    // ★ THE OTHER HALF OF THE SAME BINDING: `THREADINFO.pEThread` (offset 0 — `W32THREAD`'s first
+    // member, `win32ss/user/ntuser/win32.h:59`). Real win32k sets it in `InitThreadCallback`
+    // (`pti->pEThread = PsGetCurrentThread()`), and handlers walk BACK through it to the thread
+    // object: `IntSetTimer` does `pTmr->pti = Window->head.pti->pEThread->Tcb.Win32Thread`
+    // (`win32ss/user/ntuser/timer.c:251`). With `pEThread` NULL that is a read of `[0 + 0x250]` —
+    // measured on winlogon's post-logon `SetTimer` (SSN 0x1017): `#PF cr2 = 0x250`, which WALLED and
+    // RETIRED the whole hosted win32k. Bind it to the same ETHREAD `PsGetCurrentThread` returns, so
+    // the round trip pti → pEThread → Tcb.Win32Thread closes back onto `t`. Only ever fills a NULL:
+    // a `pEThread` win32k set itself is left alone.
+    if read_volatile(t as *const u64) == 0 {
+        write_volatile(t as *mut u64, PH_ETHREAD);
+    }
     if top_level
         && client_pi == 2
         && ssn == SSN_NT_USER_SET_THREAD_DESKTOP

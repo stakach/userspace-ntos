@@ -852,12 +852,19 @@ pub enum ContinuationError {
     Correlation,
 }
 
-/// Pointer-free, bounded model of one client thread's alternating continuation chain.
+/// Pointer-free, bounded model of the alternating continuation chains of every client thread with
+/// win32k work outstanding.
 ///
-/// The expected order is `dispatch -> callback -> nested dispatch -> callback ...`. Pushing a child
-/// suspends its parent; completing the child makes that exact parent runnable again. Correlation is
-/// checked before mutation, so stale `NtCallbackReturn`s and cross-thread nested syscalls cannot pop
-/// another client's continuation.
+/// Within ONE client thread the expected order is `dispatch -> callback -> nested dispatch -> …`:
+/// pushing a child suspends its parent, and completing the child makes that exact parent runnable
+/// again. **The chains of different client threads INTERLEAVE.** A hosted process is
+/// multi-threaded, and while thread A sits redirected inside a user-mode callback, thread B can
+/// issue a win32k syscall of its own — in real NT that is a *concurrent* dispatch on B's own kernel
+/// stack, not a nested one on A's. So the array below holds the union of the chains, and **every
+/// lookup is scoped to one [`ClientThreadIdentity`]**: a frame's parent is the innermost frame *of
+/// the same client thread*, and "no frame for this identity" means "this is a fresh root dispatch",
+/// not an error. Correlation is still checked before mutation, so stale `NtCallbackReturn`s cannot
+/// pop another thread's continuation, and within one identity the frames remain strictly LIFO.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContinuationStack<const DEPTH: usize = MAX_CONTINUATION_DEPTH> {
     frames: [Option<ContinuationFrame>; DEPTH],
@@ -888,6 +895,33 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
         }
     }
 
+    /// Index of the INNERMOST frame belonging to `client` — the top of that client thread's own
+    /// chain. `None` means the thread holds no continuation at all, which is exactly the "this is a
+    /// fresh root dispatch" case (see the type's doc comment).
+    fn top_index_for(&self, client: &ClientThreadIdentity) -> Option<usize> {
+        (0..self.len).rev().find(|&index| {
+            self.frames[index].is_some_and(|frame| frame.client == *client)
+        })
+    }
+
+    /// The innermost continuation of one client thread's chain.
+    pub fn top_for(&self, client: &ClientThreadIdentity) -> Option<&ContinuationFrame> {
+        self.top_index_for(client)
+            .and_then(|index| self.frames[index].as_ref())
+    }
+
+    /// How deep `client`'s OWN chain is (the global [`Self::len`] is the union of every chain).
+    pub fn len_for(&self, client: &ClientThreadIdentity) -> usize {
+        (0..self.len)
+            .filter(|&index| self.frames[index].is_some_and(|frame| frame.client == *client))
+            .count()
+    }
+
+    /// Does this client thread hold NO continuation? (The next dispatch it issues is a root one.)
+    pub fn is_empty_for(&self, client: &ClientThreadIdentity) -> bool {
+        self.top_index_for(client).is_none()
+    }
+
     pub fn push_dispatch(
         &mut self,
         client: ClientThreadIdentity,
@@ -899,8 +933,10 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
         if self.len == DEPTH {
             return Err(ContinuationError::Overflow);
         }
-        if self.len != 0 {
-            let parent = self.frames[self.len - 1]
+        // The parent is THIS client thread's innermost frame, never simply the array's top: another
+        // thread's frames may sit above it. No frame for this identity => a root dispatch.
+        if let Some(index) = self.top_index_for(&client) {
+            let parent = self.frames[index]
                 .as_mut()
                 .ok_or(ContinuationError::Underflow)?;
             if parent.kind != ContinuationKind::UserCallback {
@@ -908,9 +944,6 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
             }
             if parent.state != ContinuationState::Running {
                 return Err(ContinuationError::State);
-            }
-            if parent.client != client {
-                return Err(ContinuationError::Client);
             }
             parent.state = ContinuationState::Suspended;
         }
@@ -929,14 +962,16 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
         if self.len == DEPTH {
             return Err(ContinuationError::Overflow);
         }
-        let parent = self
-            .frames
-            .get_mut(
-                self.len
-                    .checked_sub(1)
-                    .ok_or(ContinuationError::Underflow)?,
-            )
-            .and_then(Option::as_mut)
+        let client = ClientThreadIdentity::new(
+            correlation.client_pi,
+            correlation.client_tid,
+            correlation.client_badge,
+        );
+        let index = self
+            .top_index_for(&client)
+            .ok_or(ContinuationError::Underflow)?;
+        let parent = self.frames[index]
+            .as_mut()
             .ok_or(ContinuationError::Underflow)?;
         if parent.kind != ContinuationKind::Win32kDispatch {
             return Err(ContinuationError::Kind);
@@ -944,9 +979,7 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
         if parent.state != ContinuationState::Running {
             return Err(ContinuationError::State);
         }
-        if parent.dispatch_id != correlation.dispatch_id
-            || !parent.client.matches_correlation(&correlation)
-        {
+        if parent.dispatch_id != correlation.dispatch_id {
             return Err(ContinuationError::Correlation);
         }
         parent.state = ContinuationState::Suspended;
@@ -960,50 +993,72 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
         client: ClientThreadIdentity,
         dispatch_id: u64,
     ) -> Result<(), ContinuationError> {
-        let top = self.top().copied().ok_or(ContinuationError::Underflow)?;
+        let index = self
+            .top_index_for(&client)
+            .ok_or(ContinuationError::Underflow)?;
+        let top = self.frames[index].ok_or(ContinuationError::Underflow)?;
         if top.kind != ContinuationKind::Win32kDispatch {
             return Err(ContinuationError::Kind);
         }
         if top.state != ContinuationState::Running {
             return Err(ContinuationError::State);
         }
-        if top.client != client || top.dispatch_id != dispatch_id {
+        if top.dispatch_id != dispatch_id {
             return Err(ContinuationError::Correlation);
         }
-        self.pop_and_resume_parent(ContinuationKind::UserCallback)
+        self.remove_and_resume_parent(index, &client, ContinuationKind::UserCallback)
     }
 
     pub fn return_callback(
         &mut self,
         correlation: CallbackCorrelation,
     ) -> Result<(), ContinuationError> {
-        let top = self.top().copied().ok_or(ContinuationError::Underflow)?;
+        let client = ClientThreadIdentity::new(
+            correlation.client_pi,
+            correlation.client_tid,
+            correlation.client_badge,
+        );
+        let index = self
+            .top_index_for(&client)
+            .ok_or(ContinuationError::Underflow)?;
+        let top = self.frames[index].ok_or(ContinuationError::Underflow)?;
         if top.kind != ContinuationKind::UserCallback {
             return Err(ContinuationError::Kind);
         }
         if top.state != ContinuationState::Running {
             return Err(ContinuationError::State);
         }
-        if top.dispatch_id != correlation.dispatch_id
-            || top.callback_id != correlation.callback_id
-            || !top.client.matches_correlation(&correlation)
+        if top.dispatch_id != correlation.dispatch_id || top.callback_id != correlation.callback_id
         {
             return Err(ContinuationError::Correlation);
         }
-        self.pop_and_resume_parent(ContinuationKind::Win32kDispatch)
+        self.remove_and_resume_parent(index, &client, ContinuationKind::Win32kDispatch)
     }
 
-    fn pop_and_resume_parent(
+    /// Remove one frame (the top of `client`'s chain, not necessarily the array's top) and make that
+    /// chain's next-innermost frame runnable again. Closing the gap preserves the relative order of
+    /// every other thread's frames, so each chain stays LIFO on its own.
+    fn remove_and_resume_parent(
         &mut self,
+        index: usize,
+        client: &ClientThreadIdentity,
         expected_parent: ContinuationKind,
     ) -> Result<(), ContinuationError> {
+        if index >= self.len {
+            return Err(ContinuationError::Underflow);
+        }
+        let mut slot = index;
+        while slot + 1 < self.len {
+            self.frames[slot] = self.frames[slot + 1];
+            slot += 1;
+        }
         self.len = self
             .len
             .checked_sub(1)
             .ok_or(ContinuationError::Underflow)?;
         self.frames[self.len] = None;
-        if self.len != 0 {
-            let parent = self.frames[self.len - 1]
+        if let Some(parent_index) = self.top_index_for(client) {
+            let parent = self.frames[parent_index]
                 .as_mut()
                 .ok_or(ContinuationError::Underflow)?;
             if parent.kind != expected_parent {
@@ -1044,6 +1099,26 @@ impl ClientCallbackWindowState {
     }
 }
 
+/// The win32k dispatch a callback frame suspended: everything needed to resume + re-answer the
+/// client's original syscall. Frame-owned (it used to be a glue-side array indexed in lockstep with
+/// the callback stack, which only works while frames are removed strictly top-first).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchContext {
+    pub dispatch_id: u64,
+    pub ssn: u64,
+    pub args: [u64; 4],
+    pub caller_sp: u64,
+}
+
+impl DispatchContext {
+    pub const EMPTY: Self = Self {
+        dispatch_id: 0,
+        ssn: 0,
+        args: [0; 4],
+        caller_sp: 0,
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
@@ -1051,6 +1126,10 @@ pub struct ActiveCallbackFrame {
     outer_resume_ip: u64,
     redirected: bool,
     callback_window: Option<ClientCallbackWindowState>,
+    dispatch_context: DispatchContext,
+    /// The executive-bridged `CLIENTINFO.CallbackWnd` triple published for THIS frame
+    /// (`hWnd`, client `PWND`, `pActCtx`); `[0]  == 0` means nothing was bridged.
+    bridged_window: [u64; 3],
 }
 
 impl ActiveCallbackFrame {
@@ -1061,11 +1140,21 @@ impl ActiveCallbackFrame {
             outer_resume_ip: 0,
             redirected: false,
             callback_window: None,
+            dispatch_context: DispatchContext::EMPTY,
+            bridged_window: [0; 3],
         }
     }
 
     pub const fn request(&self) -> &CallbackHeader {
         &self.request
+    }
+
+    pub const fn dispatch_context(&self) -> &DispatchContext {
+        &self.dispatch_context
+    }
+
+    pub const fn bridged_window(&self) -> &[u64; 3] {
+        &self.bridged_window
     }
 
     pub const fn saved_user_context(&self) -> &[u64; 20] {
@@ -1127,6 +1216,50 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         }
     }
 
+    /// Index of the INNERMOST frame owned by `client`. Like [`ContinuationStack`], this array holds
+    /// the interleaved frames of every client thread that has a callback outstanding, so "the top"
+    /// is only ever meaningful per identity.
+    fn top_index_for(&self, client: &ClientThreadIdentity) -> Option<usize> {
+        (0..self.len).rev().find(|&index| {
+            let request = &self.frames[index].request;
+            request.client_pi == client.client_pi
+                && request.client_tid == client.client_tid
+                && request.client_badge == client.client_badge
+        })
+    }
+
+    /// The innermost callback frame of ONE client thread.
+    pub fn top_for(&self, client: &ClientThreadIdentity) -> Option<&ActiveCallbackFrame> {
+        self.top_index_for(client).map(|index| &self.frames[index])
+    }
+
+    /// The innermost frame owned by ANY thread of `client_pi`. Because a process' threads all share
+    /// the `pi`, the innermost such frame is necessarily the top of ITS OWN thread's chain — which
+    /// is what lets the dead-client unwind tear a whole process down innermost-first.
+    pub fn top_for_pi(&self, client_pi: u32) -> Option<&ActiveCallbackFrame> {
+        (0..self.len)
+            .rev()
+            .find(|&index| self.frames[index].request.client_pi == client_pi)
+            .map(|index| &self.frames[index])
+    }
+
+    /// The frame a correlation names: it must BE the innermost frame of that correlation's client
+    /// thread, and match the correlation exactly. Together those two conditions are strictly
+    /// stronger than the old "must be the array's top", and they are what make an interleaved array
+    /// safe: a stale or cross-thread correlation resolves to nothing.
+    fn correlated_index(&self, correlation: &CallbackCorrelation) -> Result<usize, ValidationError> {
+        let client = ClientThreadIdentity::new(
+            correlation.client_pi,
+            correlation.client_tid,
+            correlation.client_badge,
+        );
+        let index = self.top_index_for(&client).ok_or(ValidationError::State)?;
+        if !correlation.matches_request(&self.frames[index].request) {
+            return Err(ValidationError::Correlation);
+        }
+        Ok(index)
+    }
+
     pub fn push(&mut self, request: CallbackHeader) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if self.len == DEPTH {
@@ -1138,6 +1271,8 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             outer_resume_ip: 0,
             redirected: false,
             callback_window: None,
+            dispatch_context: DispatchContext::EMPTY,
+            bridged_window: [0; 3],
         };
         self.len += 1;
         Ok(())
@@ -1149,14 +1284,8 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         saved_user_context: [u64; 20],
         outer_resume_ip: u64,
     ) -> Result<(), ValidationError> {
-        let frame = self
-            .len
-            .checked_sub(1)
-            .map(|index| &mut self.frames[index])
-            .ok_or(ValidationError::State)?;
-        if !correlation.matches_request(&frame.request) {
-            return Err(ValidationError::Correlation);
-        }
+        let index = self.correlated_index(&correlation)?;
+        let frame = &mut self.frames[index];
         if frame.redirected || outer_resume_ip == 0 {
             return Err(ValidationError::State);
         }
@@ -1171,14 +1300,8 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         correlation: CallbackCorrelation,
         state: ClientCallbackWindowState,
     ) -> Result<(), ValidationError> {
-        let frame = self
-            .len
-            .checked_sub(1)
-            .map(|index| &mut self.frames[index])
-            .ok_or(ValidationError::State)?;
-        if !correlation.matches_request(&frame.request) {
-            return Err(ValidationError::Correlation);
-        }
+        let index = self.correlated_index(&correlation)?;
+        let frame = &mut self.frames[index];
         if frame.redirected || frame.callback_window.is_some() || state.teb_alias == 0 {
             return Err(ValidationError::State);
         }
@@ -1186,38 +1309,65 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(())
     }
 
+    /// Attach the win32k dispatch this callback suspended. Refuses a context from a different
+    /// dispatch than the one the callback was raised inside.
+    pub fn record_dispatch_context(
+        &mut self,
+        correlation: CallbackCorrelation,
+        context: DispatchContext,
+    ) -> Result<(), ValidationError> {
+        let index = self.correlated_index(&correlation)?;
+        if context.dispatch_id == 0 || context.dispatch_id != correlation.dispatch_id {
+            return Err(ValidationError::Correlation);
+        }
+        self.frames[index].dispatch_context = context;
+        Ok(())
+    }
+
+    /// Record the `CLIENTINFO.CallbackWnd` triple the executive bridged for this frame.
+    pub fn record_bridged_window(
+        &mut self,
+        correlation: CallbackCorrelation,
+        bridged: [u64; 3],
+    ) -> Result<(), ValidationError> {
+        let index = self.correlated_index(&correlation)?;
+        self.frames[index].bridged_window = bridged;
+        Ok(())
+    }
+
     pub fn pop(
         &mut self,
         correlation: CallbackCorrelation,
     ) -> Result<ActiveCallbackFrame, ValidationError> {
-        let index = self.len.checked_sub(1).ok_or(ValidationError::State)?;
-        let frame = self.frames[index];
-        if !frame.redirected {
+        let index = self.correlated_index(&correlation)?;
+        if !self.frames[index].redirected {
             return Err(ValidationError::State);
         }
-        if !correlation.matches_request(&frame.request) {
-            return Err(ValidationError::Correlation);
-        }
-        self.frames[index] = ActiveCallbackFrame::empty();
-        self.len = index;
-        Ok(frame)
+        Ok(self.remove(index))
     }
 
     pub fn cancel_pending(
         &mut self,
         correlation: CallbackCorrelation,
     ) -> Result<ActiveCallbackFrame, ValidationError> {
-        let index = self.len.checked_sub(1).ok_or(ValidationError::State)?;
-        let frame = self.frames[index];
-        if frame.redirected {
+        let index = self.correlated_index(&correlation)?;
+        if self.frames[index].redirected {
             return Err(ValidationError::State);
         }
-        if !correlation.matches_request(&frame.request) {
-            return Err(ValidationError::Correlation);
+        Ok(self.remove(index))
+    }
+
+    /// Remove one frame and close the gap, preserving every other thread's relative frame order.
+    fn remove(&mut self, index: usize) -> ActiveCallbackFrame {
+        let frame = self.frames[index];
+        let mut slot = index;
+        while slot + 1 < self.len {
+            self.frames[slot] = self.frames[slot + 1];
+            slot += 1;
         }
-        self.frames[index] = ActiveCallbackFrame::empty();
-        self.len = index;
-        Ok(frame)
+        self.len -= 1;
+        self.frames[self.len] = ActiveCallbackFrame::empty();
+        frame
     }
 
     pub fn discard_top(&mut self) -> Option<ActiveCallbackFrame> {
@@ -2338,14 +2488,131 @@ mod tests {
         );
         assert_eq!(stack.len(), 2);
 
+        // A return from a DIFFERENT client thread resolves against that thread's OWN chain, which is
+        // empty — so it is rejected as `Underflow` (it cannot even see, let alone pop, this thread's
+        // frames). Same guarantee as before the chains were split per thread: nothing is mutated.
         let mut wrong_thread = correlation;
         wrong_thread.client_tid += 1;
         assert_eq!(
             stack.return_callback(wrong_thread),
-            Err(ContinuationError::Correlation)
+            Err(ContinuationError::Underflow)
         );
         assert_eq!(stack.len(), 2);
         assert_eq!(stack.return_callback(correlation), Ok(()));
+    }
+
+    /// ★ THE WALL-B INVARIANT. Two threads of ONE process each run their own dispatch/callback
+    /// chain, interleaved in the single array. A dispatch from thread B while thread A sits inside a
+    /// callback is a CONCURRENT ROOT dispatch — it must neither be refused nor suspend A's callback,
+    /// and each thread must still unwind its own chain in LIFO order whichever order they finish in.
+    #[test]
+    fn continuation_chains_of_two_threads_of_one_process_interleave() {
+        let a = ClientThreadIdentity::new(2, 6, 4);
+        let b = ClientThreadIdentity::new(2, 21, 13);
+        let a_callback = CallbackCorrelation {
+            dispatch_id: 10,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 6,
+            client_badge: 4,
+        };
+        let b_callback = CallbackCorrelation {
+            dispatch_id: 20,
+            callback_id: 2,
+            client_pi: 2,
+            client_tid: 21,
+            client_badge: 13,
+        };
+        let mut stack = ContinuationStack::<8>::new();
+        // A: root dispatch -> callback (A is now redirected into user mode).
+        stack.push_dispatch(a, a_callback.dispatch_id).unwrap();
+        stack.push_callback(a_callback).unwrap();
+        // B's win32k call arrives. It is B's ROOT dispatch, not a nested one on A.
+        stack.push_dispatch(b, b_callback.dispatch_id).unwrap();
+        assert_eq!(stack.len_for(&a), 2);
+        assert_eq!(stack.len_for(&b), 1);
+        // A's callback is STILL RUNNING — B's dispatch must not have suspended it.
+        assert_eq!(
+            stack.top_for(&a).unwrap().state,
+            ContinuationState::Running
+        );
+        // A nested syscall from A, on top of A's own callback, still nests correctly.
+        stack.push_dispatch(a, 11).unwrap();
+        assert_eq!(
+            stack.top_for(&a).unwrap().kind,
+            ContinuationKind::Win32kDispatch
+        );
+        assert_eq!(stack.complete_dispatch(a, 11), Ok(()));
+        assert_eq!(
+            stack.top_for(&a).unwrap().state,
+            ContinuationState::Running
+        );
+        // B raises a callback of its own, returns it, and completes — OUT of global LIFO order.
+        stack.push_callback(b_callback).unwrap();
+        assert_eq!(stack.return_callback(b_callback), Ok(()));
+        assert_eq!(stack.complete_dispatch(b, b_callback.dispatch_id), Ok(()));
+        assert!(stack.is_empty_for(&b));
+        // A's chain survived intact and unwinds normally.
+        assert_eq!(stack.len_for(&a), 2);
+        assert_eq!(stack.return_callback(a_callback), Ok(()));
+        assert_eq!(stack.complete_dispatch(a, a_callback.dispatch_id), Ok(()));
+        assert!(stack.is_empty());
+    }
+
+    /// The interleaved ACTIVE stack: two threads redirected at once, each `NtCallbackReturn`
+    /// resolving to its OWN frame and carrying its OWN suspended dispatch.
+    #[test]
+    fn active_callback_frames_of_two_threads_pop_by_identity() {
+        let mut stack = ActiveCallbackStack::<4>::new();
+        let mut a = CallbackHeader::idle(10, 2, 6, 4);
+        a.state = CallbackState::Request as u32;
+        a.callback_id = 1;
+        a.api_index = USER32_CALLBACK_WINDOWPROC;
+        a.output_capacity = 0x40;
+        let mut b = a;
+        b.dispatch_id = 20;
+        b.callback_id = 2;
+        b.client_tid = 21;
+        b.client_badge = 13;
+        stack.push(a).unwrap();
+        stack.push(b).unwrap();
+        let ca = CallbackCorrelation::from_request(&a);
+        let cb = CallbackCorrelation::from_request(&b);
+        stack
+            .record_dispatch_context(
+                ca,
+                DispatchContext {
+                    dispatch_id: 10,
+                    ssn: 0x1050,
+                    args: [1, 2, 3, 4],
+                    caller_sp: 0x1000,
+                },
+            )
+            .unwrap();
+        stack
+            .record_dispatch_context(
+                cb,
+                DispatchContext {
+                    dispatch_id: 20,
+                    ssn: 0x1076,
+                    args: [5, 6, 7, 8],
+                    caller_sp: 0x2000,
+                },
+            )
+            .unwrap();
+        stack.record_redirect(ca, [7; 20], 0xdead).unwrap();
+        stack.record_redirect(cb, [9; 20], 0xbeef).unwrap();
+        // A returns FIRST, from underneath B's frame.
+        let popped_a = stack.pop(ca).unwrap();
+        assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
+        assert_eq!(popped_a.outer_resume_ip(), 0xdead);
+        assert_eq!(stack.len(), 1);
+        // B's frame survived the middle-removal with its own context intact.
+        let identity_b = ClientThreadIdentity::new(2, 21, 13);
+        assert_eq!(stack.top_for(&identity_b).unwrap().dispatch_context().ssn, 0x1076);
+        let popped_b = stack.pop(cb).unwrap();
+        assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
+        assert!(stack.is_empty());
     }
 
     #[test]

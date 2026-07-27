@@ -5326,6 +5326,13 @@ impl ExecNtHandler {
                         WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
                         return self.mint_registry_key(SYNTH_WINLOGON_KEY, args[1] as u32, args[0]);
                     }
+                    // COUNT ONLY — no `return`, no synthesized key, no outcome change. See
+                    // `is_profile_list_key`: this open is the structural witness that the real
+                    // `WLX_SAS_ACTION_LOGON` was returned and `HandleLogon` ran. It must still MISS
+                    // (the SOFTWARE hive is not mounted here), so the profile load fails honestly.
+                    if is_profile_list_key(&eff_name) {
+                        WINLOGON_PROFILE_LIST_OPENS.fetch_add(1, Ordering::Relaxed);
+                    }
                     // Exact `\Registry\Machine` predefined-HKLM open (rd absolute) → sentinel handle.
                     if root_target.is_none() {
                         let comps: alloc::vec::Vec<&str> =

@@ -510,6 +510,64 @@ success.
      (`window-bridge-reasserts` / `window-bridge-repairs` in the gate line); live boots repair the
      field twice per boot, and that repair is what lets the modal paint pump drain.
 
+## 7b. ★ THE NESTING INVARIANT IS PER-CLIENT-THREAD (batch 54)
+
+> The single most load-bearing rule in this document. Get it wrong and a healthy multi-threaded
+> client is killed as a "dead callback client".
+
+**Rule.** A `KeUserModeCallback` in NT runs on the very thread that entered win32k. Therefore:
+
+* a win32k syscall arriving from a thread that **is** redirected inside a callback is a **NESTED**
+  dispatch, pushed onto *that thread's* chain;
+* a win32k syscall arriving from **any other thread** — including another thread of the *same
+  process* — is a **CONCURRENT ROOT** dispatch. It is not nested, it must not suspend anyone else's
+  callback, and it is **not an error**.
+
+**What was wrong.** `USER_CALLBACK_ACTIVE` / `USER_CALLBACK_CONTINUATIONS` were single global LIFO
+stacks and `begin_nested_user_callback_dispatch` compared the incoming
+`(client_pi, client_badge, client_tid)` against the stack's **global `top()`**. That is only correct
+while exactly one client thread ever has win32k work outstanding. Past the interactive logon winlogon
+is genuinely multi-threaded, and the mismatch was measured twice on one boot:
+
+```
+[wallb-diag] parent pi=2 badge=4  tid=6  | incoming pi=2 badge=12 tid=20 ssn=0x1082 depth=1
+[wallb-diag] parent pi=2 badge=13 tid=21 | incoming pi=2 badge=4  tid=6  ssn=0x1076 depth=1
+```
+
+Same process (`pi 2` = winlogon), **different threads**: main (`badge 4`/`tid 6`) and the two real
+multiplexed workers (`badge 12`/`tid 20`, `badge 13`/`tid 21`). Each was rejected
+`ContinuationError::Client` → the dispatch walled `0xC000000D` → winlogon crash-parked as a dead
+callback client, which then stranded the `exec_user_callback_dead_client_unwind`,
+`exec_win32k_transport_call_nested` and `exec_lsa_worker_route` harnesses (they need a live,
+redirectable winlogon worker post-quiesce). The parent identity was recorded **correctly** — the
+*lookup* was applied to the wrong thing.
+
+**What is true now.** Both stacks hold the **interleaved union** of every client thread's chain, and
+**every lookup is scoped to one `ClientThreadIdentity`**:
+
+| operation | selects |
+|---|---|
+| `ContinuationStack::push_dispatch` | the innermost frame *of this identity*; **none ⇒ root push**, and no parent is suspended |
+| `ContinuationStack::push_callback` / `complete_dispatch` / `return_callback` | the innermost frame of the correlation's identity, correlation-checked before mutation |
+| `ActiveCallbackStack::top_for(identity)` | that thread's innermost callback frame |
+| `ActiveCallbackStack::record_*` / `pop` / `cancel_pending` | `correlated_index` — the frame must **be** the innermost frame of its own client thread **and** match the correlation exactly |
+| `ActiveCallbackStack::top_for_pi(pi)` | the innermost frame of any thread of a **process** (the dead-client unwind; same-`pi` ⇒ it is always the top of its own thread's chain, so teardown stays innermost-first) |
+
+Removal closes the gap in the array, which preserves each other chain's relative order, so **each
+chain is still strictly LIFO on its own**.
+
+**This does not weaken anything.** Cross-thread misrouting became *unrepresentable* rather than
+merely rejected: the parent of a nested dispatch is now selected *by* identity, so a nested frame can
+only ever be pushed onto its own thread's chain, and a stale or cross-thread `NtCallbackReturn`
+resolves against an empty chain (`Underflow`) instead of being compared against a stranger's frame.
+The per-frame data that used to live in glue-side arrays indexed *in lockstep with the stack* — the
+suspended `DispatchContext` and the bridged `CallbackWnd` triple — now lives **on the frame**, which
+is what makes middle-removal safe. Host-tested (`nt-user-callback` 42 → **44**):
+`continuation_chains_of_two_threads_of_one_process_interleave` and
+`active_callback_frames_of_two_threads_pop_by_identity`. On the live boot: 1598 real nested
+dispatches, nesting high-water **5**, **zero** rejections, and both injection proofs full
+(`0x3f/0x3f`).
+
 ## 8. Risks / notes
 
 - **Context save/restore correctness.** A wrong register/RSP on the redirect or restore

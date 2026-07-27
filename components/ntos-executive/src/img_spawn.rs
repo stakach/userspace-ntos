@@ -516,21 +516,36 @@ pub(crate) unsafe fn spawn_sec_image(
         // ACTIVATION_CONTEXT_STACK laid out in the 2nd TEB page: ActiveFrame@0x00=NULL,
         // FrameListCache@0x08 = a self-referential empty LIST_ENTRY, Flags@0x18=0,
         // NextCookieSequenceNumber@0x1C=1, StackId@0x20=1.
-        let acs_va = SMSS_TEB_VA + 0x1800; // in the 2nd TEB page
+        // ★ THE ACTIVATION-CONTEXT STACK GETS ITS OWN PRIVATE PAGE — it must NOT live inside the
+        // TEB's own pages. The two TEB pages are deliberately REGISTERED as client frames
+        // (`csrss_frame_put`) because win32k dereferences the caller's TEB directly under the
+        // KeStackAttachProcess model, so a win32k fault at either TEB page is answered with THIS
+        // client's frame. Measured (batch 53): winlogon's whole 2nd TEB page was overwritten with
+        // USER server-side data (system metrics + `0x00c8d0d4` = COLOR_BTNFACE, spanning
+        // TEB+0x1000..0x18B8) during a win32k dispatch, so the ACS that used to sit at TEB+0x1800
+        // came back with the non-pointer `ActiveFrame = 0x0000_0006_0010_0000` and kernel32's
+        // `CreateRemoteThread` → `RtlQueryInformationActivationContext(USE_ACTIVE)` faulted at
+        // `[ActiveFrame+8]`. Real NT never puts this structure in the TEB either — it is a heap
+        // allocation (`RtlAllocateActivationContextStack`), reachable ONLY through TEB+0x2C8.
+        // Its own page is NOT registered as a client frame, so win32k can never be handed it.
+        let acs_va = ACS_PAGE_VA; // private page, one past the two TEB pages
         core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
         let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
         csrss_frame_put(pi, SMSS_TEB_VA, teb);
-        // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second page holding the
-        // ACTIVATION_CONTEXT_STACK (written via scratch, then shared into smss).
+        // The x64 TEB is ~0x1818 bytes (TLS slots, ActiveFrame, FlsData …) — map a second page for
+        // the TEB tail (StaticUnicodeString/Buffer), shared into the process like the first.
         let teb2 = alloc_frame();
         let _ = page_map(teb2, scr + 0x5000, RW_NX, CAP_INIT_THREAD_VSPACE);
-        let acs = scr + 0x5000 + 0x800; // matches acs_va's page offset (0x1800 & 0xFFF = 0x800)
+        let acs_frame = alloc_frame();
+        let _ = page_map(acs_frame, scr + 0x8000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let acs = scr + 0x8000; // ACS at offset 0 of its own page
         core::ptr::write_volatile((acs + 0x00) as *mut u64, 0); // ActiveFrame = NULL
         core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08); // FrameListCache.Flink = self
         core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08); // FrameListCache.Blink = self
         core::ptr::write_volatile((acs + 0x18) as *mut u32, 0); // Flags
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
+        let _ = page_map(copy_cap(acs_frame), acs_va, RW_NX, pml4);
                                                                 // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
                                                                 // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
                                                                 // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,

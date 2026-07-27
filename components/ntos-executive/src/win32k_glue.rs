@@ -63,37 +63,19 @@ pub(crate) struct CompletedUserCallback {
     pub outer_dispatch: Option<CompletedWin32kDispatch>,
 }
 
-#[derive(Clone, Copy)]
-struct UserCallbackDispatchContext {
-    dispatch_id: u64,
-    ssn: u64,
-    args: [u64; 4],
-    caller_sp: u64,
-}
-
-impl UserCallbackDispatchContext {
-    const EMPTY: Self = Self {
-        dispatch_id: 0,
-        ssn: 0,
-        args: [0; 4],
-        caller_sp: 0,
-    };
-}
+/// The win32k dispatch currently being serviced. The dispatch a SUSPENDED callback belongs to is
+/// carried by that callback's own frame ([`nt_user_callback::ActiveCallbackFrame::dispatch_context`])
+/// — it used to live in a glue-side array indexed in lockstep with the callback stack, which is only
+/// sound while frames are removed strictly top-first (they are not: the stack interleaves the
+/// chains of several client threads).
+type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
-/// The executive-BRIDGED `CLIENTINFO.CallbackWnd` triple (`hWnd`, client `PWND`, `pActCtx`) written
-/// for each active callback frame — parallel to `USER_CALLBACK_ACTIVE`, same index (the
-/// `USER_CALLBACK_ACTIVE_DISPATCHES` pattern). See [`reassert_top_client_callback_window`].
-static mut USER_CALLBACK_BRIDGED_WINDOW: [[u64; 3]; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH] =
-    [[0; 3]; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH];
 /// Times the bridge invariant was re-asserted, and times it had actually been CLOBBERED (a foreign
 /// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
 static USER_CALLBACK_WINDOW_REASSERTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINDOW_REPAIRS: AtomicU64 = AtomicU64::new(0);
-static mut USER_CALLBACK_ACTIVE_DISPATCHES: [UserCallbackDispatchContext;
-    nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH] =
-    [UserCallbackDispatchContext::EMPTY; nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH];
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum UserCallbackDisposition {
@@ -180,25 +162,33 @@ fn user_callback_client_dead(client_pi: u32) -> bool {
     client_pi < 64 && USER_CALLBACK_DEAD_CLIENTS.load(Ordering::Relaxed) & (1u64 << client_pi) != 0
 }
 
+/// Is this incoming win32k dispatch NESTED inside a user-mode callback of the SAME client thread?
+///
+/// ★ THE NESTING QUESTION IS PER-CLIENT-THREAD. In NT a `KeUserModeCallback` runs on the very
+/// thread that entered win32k, so only a syscall from THAT thread is nested inside it. A hosted
+/// process is multi-threaded (winlogon runs its main thread plus real RPC/logon workers), and a
+/// win32k call arriving from a DIFFERENT thread while another thread sits redirected in a callback
+/// is a *concurrent root* dispatch, not a nested one. This used to compare the incoming identity
+/// against the callback stack's GLOBAL top and reject a mismatch as
+/// `ContinuationError::Client` — measured on the post-logon path as winlogon's main thread
+/// (`badge 4/tid 6`) issuing `NtGdiGetTextMetricsW` while worker `badge 13/tid 21` was redirected in
+/// `WM_WINDOWPOSCHANGING`, walled `0xC000000D`, and killed winlogon as a dead callback client. The
+/// lookup is now scoped to the incoming thread's own chain: "no callback frame for THIS thread"
+/// means root dispatch, not error. Cross-thread misrouting is still impossible — the parent is
+/// selected BY identity, so a nested dispatch can only ever be pushed onto its own thread's chain.
 pub(crate) unsafe fn begin_nested_user_callback_dispatch(
     client: Win32kClientContext,
     dispatch_id: u64,
     ssn: u64,
 ) -> Result<bool, nt_user_callback::ContinuationError> {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-    let Some(parent) = active.top() else {
+    let Some(parent) = active.top_for(&identity) else {
         return Ok(false);
     };
     if !parent.is_redirected() {
         return Err(nt_user_callback::ContinuationError::State);
     }
-    if parent.request().client_pi != client.pi
-        || parent.request().client_badge != client.badge
-        || parent.request().client_tid != client.tid
-    {
-        return Err(nt_user_callback::ContinuationError::Client);
-    }
-    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
     stack.push_dispatch(identity, dispatch_id)?;
     if USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed) != 0 {
@@ -235,7 +225,7 @@ pub(crate) unsafe fn complete_nested_user_callback_dispatch(
     USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
     // The client is about to resume inside its callback thunk with this syscall's result — win32k may
     // have rewritten CLIENTINFO.CallbackWnd during the nested dispatch, so restate the bridge.
-    reassert_top_client_callback_window();
+    reassert_top_client_callback_window(&identity);
     true
 }
 
@@ -264,7 +254,10 @@ unsafe fn begin_controlled_continuation(request: nt_user_callback::CallbackHeade
     if active.len() >= nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH {
         return false;
     }
-    let root = stack.is_empty();
+    // "Root" is per client thread: this thread holds no continuation yet, so the win32k dispatch
+    // this callback was raised inside has to be recorded first. Another thread's chain being live
+    // is irrelevant.
+    let root = stack.is_empty_for(&client);
     if (root && stack.push_dispatch(client, request.dispatch_id).is_err())
         || stack.push_callback(correlation).is_err()
         || active.push(request).is_err()
@@ -316,32 +309,16 @@ pub(crate) fn last_real_wm_paint_hwnd() -> u64 {
     USER_CALLBACK_LAST_REAL_WM_PAINT_HWND.load(Ordering::Relaxed)
 }
 
+/// Attach the win32k dispatch this callback suspended to the callback's OWN frame, so it travels
+/// with the frame however the interleaved stack is later unwound.
 unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -> bool {
-    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-    let index = match active.len().checked_sub(1) {
-        Some(index) => index,
-        None => return false,
-    };
     let context = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    if context.dispatch_id == 0 || context.dispatch_id != request.dispatch_id {
-        return false;
-    }
-    core::ptr::write(
-        (core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE_DISPATCHES)
-            as *mut UserCallbackDispatchContext)
-            .add(index),
-        context,
-    );
-    true
-}
-
-unsafe fn take_active_dispatch(index: usize) -> UserCallbackDispatchContext {
-    let slot = (core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE_DISPATCHES)
-        as *mut UserCallbackDispatchContext)
-        .add(index);
-    let context = core::ptr::read(slot);
-    core::ptr::write(slot, UserCallbackDispatchContext::EMPTY);
-    context
+    (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
+        .record_dispatch_context(
+            nt_user_callback::CallbackCorrelation::from_request(request),
+            context,
+        )
+        .is_ok()
 }
 
 fn winlogon_callback_teb_alias(
@@ -421,12 +398,8 @@ unsafe fn bind_client_callback_window(
     core::ptr::write_volatile((cache + 16) as *mut u64, activation_context);
     // Remember exactly what the bridge published for THIS frame, so the invariant can be re-asserted
     // every time control comes back to the client (see `reassert_top_client_callback_window`).
-    if let Some(index) = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len().checked_sub(1) {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(USER_CALLBACK_BRIDGED_WINDOW) as *mut [u64; 3]).add(index),
-            [hwnd, client_pwnd, activation_context],
-        );
-    }
+    let _ = (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
+        .record_bridged_window(correlation, [hwnd, client_pwnd, activation_context]);
     if message == 0x0081 {
         print_str(b"[callback-wnd] WM_NCCREATE hwnd=0x");
         print_hex(hwnd as u32);
@@ -475,13 +448,14 @@ unsafe fn restore_client_callback_window(frame: nt_user_callback::ActiveCallback
 /// client then dereferences it and dies. Re-assert the invariant at every point where control returns
 /// to the client while a callback is still in flight.
 ///
-/// Idempotent, allocation-free, and a no-op when nothing clobbered the field.
-pub(crate) unsafe fn reassert_top_client_callback_window() {
+/// Idempotent, allocation-free, and a no-op when nothing clobbered the field. Scoped to ONE client
+/// thread: the `CallbackWnd` cache lives in that thread's TEB, so the frame to restate is the top of
+/// that thread's own chain, never whichever frame happens to be innermost across all threads.
+pub(crate) unsafe fn reassert_top_client_callback_window(
+    identity: &nt_user_callback::ClientThreadIdentity,
+) {
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-    let Some(index) = active.len().checked_sub(1) else {
-        return;
-    };
-    let Some(frame) = active.top() else {
+    let Some(frame) = active.top_for(identity) else {
         return;
     };
     if !frame.is_redirected() {
@@ -490,9 +464,7 @@ pub(crate) unsafe fn reassert_top_client_callback_window() {
     let Some(state) = frame.callback_window() else {
         return;
     };
-    let bridged = core::ptr::read(
-        (core::ptr::addr_of!(USER_CALLBACK_BRIDGED_WINDOW) as *const [u64; 3]).add(index),
-    );
+    let bridged = *frame.bridged_window();
     if bridged[0] == 0 {
         return; // nothing was bridged for this frame (no window binding)
     }
@@ -514,10 +486,7 @@ pub(crate) unsafe fn reassert_top_client_callback_window() {
 
 unsafe fn restore_all_client_callback_windows() {
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-    while !active.is_empty() {
-        let index = active.len() - 1;
-        let frame = active.discard_top().unwrap();
-        let _ = take_active_dispatch(index);
+    while let Some(frame) = active.discard_top() {
         restore_client_callback_window(frame);
     }
 }
@@ -672,10 +641,7 @@ pub(crate) unsafe fn service_user_callback(
                     window_message,
                 )
             {
-                let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-                if let Some(index) = active.len().checked_sub(1) {
-                    let _ = take_active_dispatch(index);
-                }
+                // The dispatch context travels with the frame `abort_…` is about to discard.
                 abort_controlled_user_callbacks();
                 return None;
             }
@@ -827,16 +793,15 @@ unsafe fn redirect_pending_user_callback(
     outer_rsp: u64,
     outer_flags: u64,
 ) -> bool {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-    let Some(active_frame) = active.top().copied() else {
+    // The frame to redirect is the innermost one of THIS client thread — another thread's frame may
+    // sit above it in the interleaved stack.
+    let Some(active_frame) = active.top_for(&identity).copied() else {
         return false;
     };
     let request = *active_frame.request();
-    if active_frame.is_redirected()
-        || request.client_pi != client.pi
-        || request.client_badge != client.badge
-        || request.client_tid != client.tid
-    {
+    if active_frame.is_redirected() {
         return false;
     }
     let Some(tcb) = callback_client_tcb(client.tid) else {
@@ -1007,6 +972,9 @@ unsafe fn resume_suspended_user_callback_component(
     pr
 }
 
+/// Cancel the callback that is PENDING (parked, not yet redirected into its client). A pending frame
+/// is necessarily the array's top whichever threads have chains open: it was pushed by the callback
+/// request the executive is still servicing, so no other client event has been able to run since.
 pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
     let Some(active_frame) = active.top().copied() else {
@@ -1017,8 +985,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     }
     let request = *active_frame.request();
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
-    let active_index = active.len() - 1;
-    let dispatch_context = take_active_dispatch(active_index);
+    let dispatch_context = *active_frame.dispatch_context();
     write_callback_failure_reply(request, 0xc000_0001u32 as i32);
     let unwind_ok = unwind_controlled_callback(request);
     let cancelled = active.cancel_pending(correlation);
@@ -1163,21 +1130,17 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
     let mut unwound = 0u64;
     loop {
         let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-        let Some(frame) = active.top().copied() else {
+        // The INNERMOST frame of the dead process, across all of its threads. Frames of OTHER
+        // processes are LIVE and are stepped over, not torn down: the stack interleaves several
+        // client threads' chains, so "not mine" no longer means "stop". Because every thread of this
+        // process shares `client_pi`, the innermost matching frame is always the top of its own
+        // thread's chain, which is what keeps each teardown innermost-first.
+        let Some(frame) = active.top_for_pi(client_pi).copied() else {
             break;
         };
         let request = *frame.request();
-        if request.client_pi != client_pi {
-            // Another client still owns the top of the (strictly LIFO) stack — its frames are LIVE
-            // and must not be torn down here. Leave the rest intact; this client's frames, buried
-            // below, unwind when that client's own frames do.
-            print_str(b"[user-callback] dead-client unwind stopped: top frame owned by pi=");
-            print_u64(request.client_pi as u64);
-            print_str(b"\n");
-            break;
-        }
         let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
-        let dispatch_context = take_active_dispatch(active.len() - 1);
+        let dispatch_context = *frame.dispatch_context();
         // (1) Fail the withheld KeUserModeCallback.
         write_callback_failure_reply(request, STATUS_THREAD_IS_TERMINATING);
         // (2) Unwind the callback continuation + pop the active frame (same order as a real return).
@@ -1762,8 +1725,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     result_length: u64,
     callback_status: u64,
 ) -> Option<CompletedUserCallback> {
+    // `NtCallbackReturn` returns the callback that is innermost ON THE CALLING THREAD — the caller's
+    // own identity selects the frame, never the interleaved stack's global top.
+    let identity =
+        nt_user_callback::ClientThreadIdentity::new(client_pi, client_tid, client_badge);
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-    let Some(active_frame) = active.top().copied() else {
+    let Some(active_frame) = active.top_for(&identity).copied() else {
         return None;
     };
     let request = *active_frame.request();
@@ -1783,11 +1750,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     } else {
         0
     };
-    if !active_frame.is_redirected()
-        || request.client_pi != client_pi
-        || request.client_badge != client_badge
-        || request.client_tid != client_tid
-    {
+    // (The frame's client identity is the caller's by construction — `top_for` selected it.)
+    if !active_frame.is_redirected() {
         return None;
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
@@ -1941,7 +1905,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     };
     restore_client_callback_window(completed_frame);
-    let dispatch_context = take_active_dispatch(active.len());
+    let dispatch_context = *completed_frame.dispatch_context();
     if dispatch_context.dispatch_id != request.dispatch_id {
         abort_controlled_user_callbacks();
         return None;
@@ -2004,7 +1968,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // callback's teardown — our own `restore_client_callback_window` above plus win32k's
     // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
     // so restate the enclosing frame's bridged triple before the client runs again.
-    reassert_top_client_callback_window();
+    reassert_top_client_callback_window(&identity);
     let Some(tcb) = callback_client_tcb(client_tid) else {
         return None;
     };

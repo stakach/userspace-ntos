@@ -175,6 +175,13 @@ pub const SMSS_DESKINFO_VA: u64 = 0x0000_0100_0054_0000;
 pub const SMSS_PEB_VA: u64 = 0x0000_0100_0053_0000;
 pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0052_0000;
 pub const SMSS_TEB_VA: u64 = 0x0000_0100_0051_0000;
+/// A hosted process's MAIN thread's private `ACTIVATION_CONTEXT_STACK` page (`TEB+0x2C8` points
+/// here). It is one page past the two TEB pages and is deliberately NOT registered as a client
+/// frame: the TEB pages ARE registered (win32k dereferences the caller's TEB under the
+/// KeStackAttachProcess model) and a win32k dispatch was measured overwriting the whole 2nd TEB
+/// page, which is what corrupted the ACS while it lived at `TEB+0x1800`.
+pub const ACS_PAGE_VA: u64 = SMSS_TEB_VA + 0x2000;
+const _: () = assert!(ACS_PAGE_VA + 0x1000 <= SMSS_PARAMS_VA);
 /// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
 /// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
@@ -569,7 +576,8 @@ const fn hosted_thread_layout_is_disjoint(
 ) -> bool {
     stack_base + stack_frames * 0x1000 <= ipcbuf_va
         && ipcbuf_va + 0x1000 <= teb_va
-        && teb_va + 0x2000 <= tramp_va
+        // TEB page 1 + TEB page 2 + the thread's PRIVATE ACTIVATION_CONTEXT_STACK page.
+        && teb_va + 0x3000 <= tramp_va
 }
 
 const _: () = {
@@ -649,9 +657,10 @@ const _: () = {
     assert!(TP_WORKER_CONTEXT_RSP >= TP_WORKER_STACK_BASE);
     assert!(TP_WORKER_CONTEXT_RSP < TP_WORKER_STACK_TOP);
     assert!(TP_WORKER_CONTEXT_RSP & 15 == 8);
-    assert!(TP_WORKER_EXEC_STRIDE >= TP_WORKER_ENV_SCRATCH_OFFSET + 0x4000);
+    // 5 scratch pages: TEB p1, TEB p2, trampoline, verify, the private ACS page.
+    assert!(TP_WORKER_EXEC_STRIDE >= TP_WORKER_ENV_SCRATCH_OFFSET + 0x5000);
     assert!(
-        tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 0) + 0x4000
+        tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 0) + 0x5000
             <= TP_WORKER_EXEC_BASE + 0x20_0000
     );
     assert!(TP_WORKER_SLOT1_REGION_BASE & 0x1f_ffff == 0);
@@ -1679,7 +1688,12 @@ static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
 /// listener fault never lands in the SM/CSR rendezvous receivers.
 static WL_LISTENER_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 /// The winlogon RPC-listener thread's TCB (0 until winlogon's first NtCreateThread spawns it).
+/// LIVE cell: zeroed again when the thread is torn down (`terminate_hosted_thread_mechanism`).
 static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+/// …and the WRITE-ONCE latch of the same value: the seL4 TCB the general `NtCreateThread` service
+/// actually minted for that thread. Never cleared, so a later legitimate teardown cannot erase the
+/// proof that the service created a real thread. See `exec_general_nt_create_thread`.
+static WL_LISTENER_TCB_MINTED: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER2_TCB: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
 /// Slot-0's caller-created stack reservation. The fixed 0x1044 bootstrap stack is used only until
@@ -2671,6 +2685,139 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     );
     se_create_token_specs(passed);
     lsa_security_database_specs(passed);
+    unsafe { activation_context_stack_spec(passed) };
+    winlogon_logon_action_spec(passed);
+}
+
+/// ═══ `WLX_SAS_ACTION_LOGON` REALLY CAME BACK — winlogon is running its POST-LOGON path ══════════
+///
+/// The previous batch could observe the logon SUCCEED inside lsass (`LsaLogonUser` →
+/// `STATUS_SUCCESS`, a real Administrator token duplicated into winlogon) but could NOT observe
+/// what winlogon did with it: the post-logon path faulted in
+/// `RtlQueryInformationActivationContext` on a scribbled `ACTIVATION_CONTEXT_STACK`, and the
+/// per-thread callback misattribution then walled `NtGdiGetTextMetricsW` and killed winlogon as a
+/// dead callback client. With both fixed, winlogon's own state machine runs on:
+/// `WlxLoggedOutSAS` returns `WLX_SAS_ACTION_LOGON` → `DoGenericAction`'s `case
+/// WLX_SAS_ACTION_LOGON` (`sas.c:1214`) → `HandleLogon` (`sas.c:571`) → `LoadUserProfileW`
+/// (`sas.c:626`) → `userenv!GetProfilesDirectoryW` (`profile.c:1592`), which opens
+/// `HKLM\Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
+///
+/// That open is the witness — reachable from nowhere else in winlogon (see `is_profile_list_key`) —
+/// and it is COUNTED ONLY: it still misses, because this host mounts no SOFTWARE hive. So
+/// `LoadUserProfileW` fails, `HandleLogon` takes `goto cleanup`, and **the user shell is NOT
+/// started**. Nothing here claims otherwise; `userinit.exe` has NOT been spawned.
+fn winlogon_logon_action_spec(passed: &mut u64) {
+    let profile_opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
+    print_str(b"[wl-logon] post-logon: ProfileList opens=");
+    print_u64(profile_opens);
+    print_str(b" (HandleLogon reached; SOFTWARE hive unmounted -> LoadUserProfileW fails honestly)");
+    print_str(b" logon-reply-status=0x");
+    print_hex(LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) as u32);
+    print_str(b" token-duplicates=");
+    print_u64(WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_logon_action_returned",
+        // The post-logon path RAN (only `WLX_SAS_ACTION_LOGON` gets here) …
+        profile_opens >= 1
+            // … off a logon that really SUCCEEDED, with the real token in winlogon's hands.
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
+            && WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1,
+        passed,
+    );
+}
+
+/// ═══ A thread's `ACTIVATION_CONTEXT_STACK` IS PRIVATE ══════════════════════════════════════════
+///
+/// `TEB+0x2C8` (`ActivationContextStackPointer`) is what `RtlQueryInformationActivationContext`,
+/// `RtlGetActiveActivationContext` and `RtlActivateActivationContextUnsafeFast` all dereference. It
+/// used to point at `TEB+0x1800` — INSIDE the TEB's second page. Both TEB pages are deliberately
+/// `csrss_frame_put`-registered as CLIENT FRAMES, because hosted win32k dereferences the caller's
+/// TEB directly under the KeStackAttachProcess model and a win32k fault at either TEB VA is answered
+/// with this client's own frame. So win32k's USER server-side writes landed in the client's real TEB
+/// and scribbled the structure: the page came back holding RECT-shaped values, `0xffff` sentinels
+/// and `0x00c8d0d4` (`COLOR_BTNFACE`) repeatedly, with the non-pointer `ActiveFrame =
+/// 0x0000_0006_0010_0000` — and winlogon's post-logon `CreateRemoteThread` faulted reading
+/// `[ActiveFrame+8]`. Real NT never puts this structure in the TEB either: it is a heap allocation
+/// (`RtlAllocateActivationContextStack`) reachable ONLY through `TEB+0x2C8`.
+///
+/// The structure now gets its OWN page, one past the two TEB pages, on BOTH spawn paths
+/// (`img_spawn::spawn_sec_image` for a process' main thread, `spawn_hosted_thread` for every
+/// hosted thread). This spec reads winlogon's LIVE mapping of it and asserts, at gate time:
+///  * `TEB+0x2C8` points at that private page, not into the TEB;
+///  * the page still holds the empty `ACTIVATION_CONTEXT_STACK` the spawn wrote — `ActiveFrame`
+///    NULL, a self-referential `FrameListCache`, `Flags = 0`, `NextCookieSequenceNumber = 1`,
+///    `StackId = 1`;
+///  * **every byte past the structure is still ZERO** — the direct refutation of the scribble;
+///  * the page is NOT in the client-frame registry (so a win32k fault at that VA can never be
+///    answered with it), while BOTH TEB pages ARE — the contrast is what makes the first clause
+///    mean something.
+unsafe fn activation_context_stack_spec(passed: &mut u64) {
+    // winlogon (pi 2) spawned with `scr_base == WINLOGON_MAIN_TEB_MIRROR_VA`; those executive-side
+    // scratch aliases are never unmapped, so +0x0000 is its live TEB page and +0x8000 its live ACS.
+    let teb_mirror = WINLOGON_MAIN_TEB_MIRROR_VA;
+    let acs_mirror = teb_mirror + 0x8000;
+    let pointer = core::ptr::read_volatile((teb_mirror + 0x2c8) as *const u64);
+    let active_frame = core::ptr::read_volatile(acs_mirror as *const u64);
+    let flink = core::ptr::read_volatile((acs_mirror + 0x08) as *const u64);
+    let blink = core::ptr::read_volatile((acs_mirror + 0x10) as *const u64);
+    let flags = core::ptr::read_volatile((acs_mirror + 0x18) as *const u32);
+    let cookie = core::ptr::read_volatile((acs_mirror + 0x1c) as *const u32);
+    let stack_id = core::ptr::read_volatile((acs_mirror + 0x20) as *const u32);
+    let mut tail_nonzero = 0u64;
+    let mut offset = 0x24u64;
+    while offset < 0x1000 {
+        tail_nonzero += (core::ptr::read_volatile((acs_mirror + offset) as *const u8) != 0) as u64;
+        offset += 1;
+    }
+    let acs_registered = csrss_frame_get_exact(2, ACS_PAGE_VA).0;
+    let teb_registered = csrss_frame_get_exact(2, SMSS_TEB_VA).0;
+    let teb2_registered = csrss_frame_get_exact(2, SMSS_TEB_VA + 0x1000).0;
+    print_str(b"[actctx] winlogon TEB+0x2c8=0x");
+    print_hex((pointer >> 32) as u32);
+    print_hex(pointer as u32);
+    print_str(b" expected=0x");
+    print_hex((ACS_PAGE_VA >> 32) as u32);
+    print_hex(ACS_PAGE_VA as u32);
+    print_str(b" ActiveFrame=0x");
+    print_hex((active_frame >> 32) as u32);
+    print_hex(active_frame as u32);
+    print_str(b" flink/blink=0x");
+    print_hex(flink as u32);
+    print_str(b"/0x");
+    print_hex(blink as u32);
+    print_str(b" flags=");
+    print_u64(flags as u64);
+    print_str(b" cookie=");
+    print_u64(cookie as u64);
+    print_str(b" stack-id=");
+    print_u64(stack_id as u64);
+    print_str(b" tail-nonzero-bytes=");
+    print_u64(tail_nonzero);
+    print_str(b" client-frame: acs=");
+    print_u64(acs_registered);
+    print_str(b" teb-p1=");
+    print_u64((teb_registered != 0) as u64);
+    print_str(b" teb-p2=");
+    print_u64((teb2_registered != 0) as u64);
+    print_str(b"\n");
+    check(
+        b"exec_ntdll_activation_context_valid",
+        pointer == ACS_PAGE_VA
+            && active_frame == 0
+            && flink == ACS_PAGE_VA + 0x08
+            && blink == ACS_PAGE_VA + 0x08
+            && flags == 0
+            && cookie == 1
+            && stack_id == 1
+            && tail_nonzero == 0
+            // The page is unreachable through the win32k client-frame path...
+            && acs_registered == 0
+            // ...precisely BECAUSE registration is what the two TEB pages have and it does not.
+            && teb_registered != 0
+            && teb2_registered != 0,
+        passed,
+    );
 }
 
 /// ═══ `NtCreateToken` (SSN 57) — the REAL logon-token mint ══════════════════════════════════════
@@ -6418,6 +6565,36 @@ pub(crate) fn is_winlogon_key(path: &str) -> bool {
         && comps[1].eq_ignore_ascii_case("Machine")
         && is_winlogon_key_comps(&comps[2..])
 }
+/// True if `path` names `Software\Microsoft\Windows NT\CurrentVersion\ProfileList` (HKLM-relative or
+/// with the absolute `\Registry\Machine\` prefix). Matched EXACTLY, in order, like the Winlogon key.
+///
+/// ★ THE POST-LOGON WITNESS. `userenv!GetProfilesDirectoryW` (`profile.c:1592`) is the FIRST thing
+/// `LoadUserProfileW` does, `LoadUserProfileW` is called from exactly one place in winlogon —
+/// `HandleLogon` (`sas.c:626`) — and `HandleLogon` runs under exactly one switch arm,
+/// `case WLX_SAS_ACTION_LOGON` (`sas.c:1214`, and only from `STATE_LOGGED_OFF_SAS`). So winlogon
+/// opening this key IS the structural proof that `WlxLoggedOutSAS` returned `WLX_SAS_ACTION_LOGON`
+/// for the real logon. Recognised for COUNTING ONLY — the open still misses honestly (the SOFTWARE
+/// hive is not mounted on this host), which is why `LoadUserProfileW` fails and the shell is not
+/// started. Nothing about the outcome is changed.
+pub(crate) fn is_profile_list_key(path: &str) -> bool {
+    fn comps_match(comps: &[&str]) -> bool {
+        comps.len() == 5
+            && comps[0].eq_ignore_ascii_case("Software")
+            && comps[1].eq_ignore_ascii_case("Microsoft")
+            && comps[2].eq_ignore_ascii_case("Windows NT")
+            && comps[3].eq_ignore_ascii_case("CurrentVersion")
+            && comps[4].eq_ignore_ascii_case("ProfileList")
+    }
+    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+    comps_match(&comps)
+        || (comps.len() == 7
+            && comps[0].eq_ignore_ascii_case("Registry")
+            && comps[1].eq_ignore_ascii_case("Machine")
+            && comps_match(&comps[2..]))
+}
+/// Times winlogon opened the ProfileList key — see [`is_profile_list_key`]. Drives
+/// `exec_winlogon_logon_action_returned`.
+pub(crate) static WINLOGON_PROFILE_LIST_OPENS: AtomicU64 = AtomicU64::new(0);
 /// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or
 /// `\Registry\Machine\SAM[...]`) — lsass' LsapOpenServiceKey / samsrv's SampInitDatabase open these,
 /// which our staged SYSTEM hive doesn't contain (real ReactOS creates them at setup). The executive
@@ -7644,9 +7821,16 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     };
     core::ptr::write_volatile((scr + 0x08) as *mut u64, teb_stack_base);
     core::ptr::write_volatile((scr + 0x10) as *mut u64, teb_stack_limit);
-    let acs_va = t.teb_va + 0x1800;
+    // ★ The ACTIVATION_CONTEXT_STACK gets its OWN private page, one past the two TEB pages — it
+    // must not share a page with the TEB. Both TEB pages are registered as client frames
+    // (`csrss_frame_put`) so a win32k fault at either is answered with THIS client's frame (the
+    // KeStackAttachProcess model); anything win32k writes at those VAs lands in the client's real
+    // TEB. Measured (batch 53) on winlogon's main thread: the whole 2nd TEB page came back
+    // overwritten with USER server-side data, so the ACS that used to live at TEB+0x1800 held the
+    // non-pointer `ActiveFrame = 0x0000_0006_0010_0000`. Real NT keeps this structure on the heap.
+    let acs_va = t.teb_va + 0x2000;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
-    // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
+    // TEB page 2: StaticUnicodeString (MaximumLength=522, Buffer in TEB) + DeallocationStack.
     let teb2 = alloc_frame();
     let teb2_scratch = copy_cap(teb2);
     let teb2_live_mirror = copy_cap(teb2);
@@ -7667,13 +7851,27 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     } else {
         0
     };
-    let acs = scr + 0x1000 + 0x800;
+    // The private ACS page: written through its own scratch alias, then mapped at `acs_va` in the
+    // target VSpace. Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
+    // thread's activation-context stack, and not registering it means a win32k fault at that VA can
+    // never be answered with this page.
+    let acs_frame = alloc_frame();
+    let acs_scratch_map = page_map(acs_frame, scr + 0x4000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let acs = scr + 0x4000;
     core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
     core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
     core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
     core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
     core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
     core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
+    let acs_target_map = page_map(copy_cap(acs_frame), acs_va, RW_NX, t.pml4);
+    if acs_scratch_map != 0 || acs_target_map != 0 {
+        print_str(b"[thread-life] ACS map failure scratch/target=");
+        print_u64(acs_scratch_map);
+        print_str(b"/");
+        print_u64(acs_target_map);
+        print_str(b"\n");
+    }
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
     if teb_target_map != 0
@@ -12159,11 +12357,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // real TEB/ClientId via NtQueryInformationThread(ThreadBasicInformation), so
                     // kernel32's RPC listener setup no longer NULL-derefs an absent TEB
                     // (`exec_rpc_listener_thread_real`) → StartRpcServer runs past the wall.
+                    // ★ RE-POINTED (batch 54), and strictly stronger. This used to sample the LIVE
+                    // `WL_LISTENER_TCB` cell, which the thread-termination mechanism zeroes. That was
+                    // sound only while this thread outlived the whole boot. It no longer does: past
+                    // the interactive logon winlogon's two transient workers (badges 12/13, tids
+                    // 20/21) now really do run to completion and self-terminate through the real
+                    // `NtTerminateThread` path, so the post-quiesce dead-client injection —
+                    // which deliberately kills an EXPENDABLE winlogon worker — reaches its last
+                    // candidate, this listener, and reclaims its TCB before the gate runs. The
+                    // liveness clause was therefore measuring the injection's victim choice, not the
+                    // service. What it MEANT — "the general NtCreateThread service minted a real
+                    // seL4 TCB for a real ETHREAD" — is now read off the write-once mint latch, and
+                    // a clause is ADDED that the created thread actually RAN (its multiplexed faults
+                    // were serviced), which the old form never asserted at all.
                     check(
                         b"exec_general_nt_create_thread",
                         PM_GENERAL_THREADS_CREATED.load(Ordering::Relaxed) >= 1
-                            && WL_LISTENER_TCB.load(Ordering::Relaxed) > 1
-                            && PM_LISTENER_TID.load(Ordering::Relaxed) != 0,
+                            && WL_LISTENER_TCB_MINTED.load(Ordering::Relaxed) > 1
+                            && PM_LISTENER_TID.load(Ordering::Relaxed) != 0
+                            && WL_WORKER_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     check(
