@@ -7040,18 +7040,20 @@ impl ExecNtHandler {
                 // `RPCRT4_worker_thread`, and that thread runs the real server stub (it opens
                 // `SECURITY\Policy` with KEY_ALL_ACCESS) and writes the 48-byte RESPONSE
                 // (`05 00 02 03`). npfs is exonerated (its write completes: `[fsd-ret] ret=0`,
-                // `[fsd-done] st=0 info=48`), and so is the dispatch CORRELATION: the IRP substrate
-                // has the `SH_REQ_SEQ` handshake and the win32k Syscall substrate now has the
-                // per-dispatch TOKEN binding (`W32_DISPATCH_TOKEN_BINDING`) — a route-ON boot
-                // records ZERO token mismatches, ZERO pump walls, and a callback plane that drains
-                // to depth 0.
+                // `[fsd-done] st=0 info=48`), and so is the dispatch CORRELATION: BOTH substrates
+                // now speak seL4 `Call` ⇄ MCS reply objects (`docs/transport-migration.md` Phases
+                // 1-2), so a misordered completion is unrepresentable and the executive's answer is
+                // a non-blocking `reply_on`. The userspace correlation planes this comment used to
+                // name (the `SH_REQ_SEQ` handshake, the per-dispatch token binding) are DELETED.
                 //
-                // What it stops on now (measured, instrumented): the executive's WAKE `Send` for a
+                // ★ THIS IS THE WALL PHASE 4 RE-TESTS. What it stopped on (measured, instrumented,
+                // on the pre-migration transport): the executive's WAKE `Send` for a
                 // fresh top-level win32k dispatch (`csrss -> SSN 0x1002`) never returns. The
                 // instrumented boot sampled win32k's TCB RIP immediately before every wake: 907 of
-                // 908 healthy wakes sample `driver_launch::send_done_on`+2 (win32k runnable, on its
-                // way back to `recv_req_on`), 3 sample the `recv_req_on` syscall itself — and the
-                // ONE wake that never completes is the only sample at `recv_req_on`+2. The
+                // 908 healthy wakes sample the component's completion-`Send`+2 (win32k runnable, on
+                // its way back to its receive), 3 sample the receive syscall itself — and the ONE
+                // wake that never completes is the only sample at that receive+2. That wake `Send`
+                // NO LONGER EXISTS (the executive replies on a reply object instead). The
                 // dispatch-endpoint cap is stable across all 909 wakes (no cap clobber). So the
                 // remaining wall is win32k RENDEZVOUS AVAILABILITY under the route's extra
                 // concurrency, not reply correlation — a different, newly-separated problem. A

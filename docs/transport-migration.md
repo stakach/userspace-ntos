@@ -1,9 +1,11 @@
 # Component-Dispatch Transport Migration — hand-rolled Send/Recv → seL4 `Call` + MCS reply objects
 
-**Status:** **Phase 0 DONE. Phase 1 DONE** (gate **231/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
-`0x003a6ea5`). Phases 2-4 are still plan-only. Baseline `1141349` → Phase 0 `d287c48` → Phase 1.
+**Status:** **Phases 0, 1 and 2 DONE** (gate **231/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
+`0x003a6ea5`). **There is now exactly ONE dispatch transport: seL4 `Call` ⇄ MCS reply objects, on
+BOTH substrates.** Phases 3-4 remain. Baseline `1141349` → Phase 0 `d287c48` → Phase 1 `01d0423` →
+Phase 2.
 
-> ### ★ WHAT THE PLAN GOT WRONG — read this before Phase 2
+> ### ★ WHAT THE PLAN GOT WRONG — corrections 1-3 found in Phase 1, 4-6 in Phase 2
 >
 > Three corrections, all found by running it. They are folded into §3.5, §4 and §6 below, and each
 > is documented at the code that carries it.
@@ -41,6 +43,30 @@
 > 3. **`seL4_InvalidCapability` is 2, not 6** (§Phase-1 step 5 said 6; 6 is `seL4_FailedLookup`).
 >    See `rust-micro/src/types.rs:114`.
 >
+> 4. **★ `client_attach` was hiding a SECOND, unrelated property: PAGE-TABLE DEPTH.** §3.4 step 3
+>    says win32k's DriverEntry-init loop "migrates onto the shared pump", full stop. But the pump
+>    picks its demand-fault paging by `caps.client_attach`: true ⇒ `ensure_w32_client_paging`
+>    (builds PDPT→PD→PT), false ⇒ `driver_launch::ensure_paging` (a PT only, assuming the PDPT/PD
+>    already exist). win32k's init needs the DEEP walk (its windows straddle several 512 GiB / 1 GiB
+>    regions) but must NOT do client-frame sharing (there is no client yet, and `client_pi = 0` is a
+>    REAL client — smss — so it cannot double as a sentinel). Setting `client_attach: true` there
+>    would have let a low-VA init fault map **smss's** frame into win32k. Fix: split the two ideas —
+>    a new `HostCaps::sparse_vspace` selects the paging discipline, `client_attach` keeps meaning
+>    only "share the client's frames". Net flag count unchanged (`nested_reply_cap` deleted).
+>
+> 5. **`SH_REQ_SEQ` had two readers the kill-list did not name** (R14 said "all executive-side", which
+>    is true but incomplete): `win32k_dispatch_loop_roundtrip` and `win32k_dispatch_fault_via_reply_cap`
+>    (`main.rs`) both asserted `seq >= 1` as their evidence that the dispatch loop really ran. They now
+>    read `pump_call_dispatches(ReqKind::Syscall)` — the KERNEL-attested count of completions that
+>    arrived as the return value of win32k's own `Call`, which is strictly stronger than a counter the
+>    component wrote into a shared page.
+>
+> 6. **`PUMP_CALL_REQUESTS`/`PUMP_CALL_DISPATCHES` had to become PER-KIND.** `exec_irp_transport_call_bound`
+>    asserts `call_dispatches == HARNESS_IRP_DISPATCHES`; the moment win32k joined the transport a single
+>    global counter broke that equality. Both are now `[AtomicU64; 2]` indexed by `ReqKind`, read through
+>    `pump_call_requests(kind)` / `pump_call_dispatches(kind)`, and BOTH specs now assert the equality
+>    for their own substrate.
+>
 > Two smaller deviations, deliberate:
 >
 > * `REPLY_FSD_SLOT` is sized at `MAX_DRIVER_INSTANCES` (4), not the plan's 2, so a third
@@ -61,7 +87,7 @@ tolerated mid-phase; every phase ENDS green.
 |---|--------|-------------|--------|
 | 1 | **IRP correlation.** `component_main` publishes its completion BEFORE waiting for the next request; `component_pump` accepted ANY `dispatch_label` message as its answer → phase slip → both sides block in `Send` → deadlock with no fault and no log line. | `SH_REQ_SEQ` sequence handshake, scoped to the IRP substrate | `7d0703b` |
 | 2 | **Syscall correlation under nesting.** Same class, but the seq handshake is unusable: `SH_REQ_SEQ` is bumped only by `component_main`'s outer loop, never by the rendezvous' nested arm. | per-dispatch **token** in MR0 echoed by the component + an executive-side LIFO token stack for the callback-resume level | `1141349` |
-| 3 | **Availability (OPEN).** The executive's wake `Send` blocks against a component that is not receiving. RIP-sampled over 909 wakes: 907 at `send_done_on`+2, 3 at the `recv_req_on` syscall, and the ONE wake that never completes is the only sample at `recv_req_on`+2. | none — this is the current wall (`LSA_WORKER_ROUTE_ENABLED`, `exec_handler.rs:7062`) | open |
+| 3 | **Availability.** The executive's wake `Send` blocks against a component that is not receiving. RIP-sampled over 909 wakes: 907 at the component's completion-`Send`+2, 3 at the receive syscall, and the ONE wake that never completes is the only sample at that receive+2. | **the wake `Send` NO LONGER EXISTS** — the executive answers with `reply_on` (`decode_reply`), which cannot block. Whether that closes the LSA route is Phase 4's falsifiable prediction, not a claim. | mechanism removed (Phases 1-2); route still `false` |
 
 All three are consequences of the SAME root: **the transport carries no kernel-enforced binding
 between a request and its answer, and both halves are blocking `Send`s on one endpoint.** seL4's
@@ -539,42 +565,95 @@ stated constraint.
 
 ---
 
-### Phase 2 — convert the win32k Syscall substrate (the crux)
+### Phase 2 — convert the win32k Syscall substrate (the crux) — **DONE**
 
-**Changes**
-1. `s_ke_user_mode_callback_rendezvous` (`win32k_subsystem.rs:2374–2470`): the
-   `send_done_on(CALLBACK,0)` + `recv_req_on()` loop → the `call_on` loop of §3.4. Delete the
-   `W32_SLIP_INJECT` block (2450–2456).
-2. `component_pump_inner`:
-   * the callback arm (781–808): `ReplyImmediately` ⇒ `reply_on(R_w32, RESUME<<12)` +
-     `recv_full_r12`; `SuspendComponent` ⇒ break **without replying** (R stays bound).
-   * `component_pump_resume_user_callback` (620–679): becomes
-     `initial: ReplyRequest { label: W32_USER_CALLBACK_RESUME_LABEL }`; the bespoke resume preamble
-     and its `use_reply_cap` guard disappear.
-   * the assert-skip arm (926–954) and the demand-fault arm (907–924) already use
-     `send_on_reply`/`recv_full_r12` — switch `send_on_reply` → `reply_on` and check the label.
-3. `main.rs:10127–10190`: win32k's bespoke DriverEntry-init loop → `component_pump` with
-   `initial: RecvFirst`.
-4. Delete the token machinery (`spawn_hosts.rs:534–588`, 656–658, 753–778, 976–982) and
-   `W32_DISPATCH_TOKEN_BINDING`.
-5. Delete `HostCaps::nested_reply_cap` and the `use_reply_cap` branching (635, 717–721, 741–745,
-   767–771, 909–924) — there is now exactly ONE transport.
-6. Replace `exec_win32k_dispatch_in_phase_nested` with **`exec_win32k_transport_call_nested`**,
-   reusing the SAME real scenario (`inject_win32k_nested_dispatch_slip`, post-quiesce, expendable
-   winlogon RPC worker, `WM_NULL`) but asserting the new invariants:
-   * the five *behavioural* proof bits survive unchanged — parked / redirected / nested-matched /
-     outer-resumed / drained-idle (`NESTED_SLIP_REJECTED` has no meaning any more: a stale
-     completion is **unrepresentable**, so it is replaced by…);
-   * `R_w32` remained bound to the component for the whole suspension (sampled before and after the
-     client redirect) — i.e. the outer dispatch's reply really did survive the callback;
-   * measured nesting high-water ≥ 2 via a *dispatch-depth* counter kept for observability only
-     (not for correlation);
-   * `PUMP_REPLY_ERRORS == 0`.
+Landed as planned, plus corrections 4-6 above. Result: gate **231/99 ZERO FAILs**
+(`exec_win32k_dispatch_in_phase_nested` deleted, `exec_win32k_transport_call_nested` added — net 0),
+RUNEXIT=3, `microtest sentinel`, paint **768/768 @ `0x003a6ea5`**, three consecutive boots with
+`diff`-identical PASS lists.
 
-**Must stay green:** `exec_win32k_desktop_painted` (**768/768 @ `0x003a6ea5`** — non-negotiable),
-`exec_win32k_on_shared_harness` (≥4), `win32k_dispatch_fault_via_reply_cap`,
-`exec_user_callback_*` (both), `exec_user_callback_dead_client_unwind`, all 7 `exec_msgina_*`, all
-5 `exec_lsa_*`, all 21 `exec_dbgk_*`, `exec_win32k_load_contract`.
+**Measured on a green boot:** 2557 win32k dispatches, **all 2557** completed as the return of the
+component's own `Call`; 2829 request replies (dispatches + callback RESUMEs); **0 reply errors**;
+**live nesting high-water 5**; suspended-outstanding **0** at quiesce; **0** walls. The IRP substrate
+is unchanged at 71/71 with 0 reply errors.
+
+**What the code looks like now**
+
+* `component_main`'s loop is ONE `call_on` and nothing else. `Transport::{Legacy, Call}` and the
+  whole legacy arm are gone.
+* `s_ke_user_mode_callback_rendezvous` is the `call_on` loop of §3.4: the first Call raises the
+  callback, each subsequent Call publishes a nested completion AND receives the next request, and it
+  breaks on the RESUME **MR0 tag** (correction 1 — it cannot be a label).
+* `component_pump_inner` has exactly one shape. `initial: ReplyRequest` ⇒ one `reply_on`; the request
+  tag is `dispatch_label`, or `W32_USER_CALLBACK_RESUME_LABEL` when the pump is a resume — which is
+  the entirety of what `component_pump_resume_user_callback`'s bespoke preamble used to be.
+* **Callback suspend = return without replying.** `R_win32k` stays bound to win32k's callback `Call`
+  across the client redirect, every nested dispatch, and the `NtCallbackReturn`. That kernel binding
+  IS the suspended-dispatch state; we keep none.
+* win32k's bespoke DriverEntry-init loop (`main.rs`) is gone — it is a `RecvFirst` pump on
+  `R_win32k`, so after DriverEntry win32k ends up BLOCKED IN A `Call` (the steady state every later
+  dispatch answers) instead of parked in a bare `Recv`.
+
+**The `reply_to` clobber (correction 2): the legacy path was KEPT, deliberately.** The brief invited
+retiring it early. It is not needed and it is not free:
+
+* the guard is **already sound, not an approximation that needs widening**. `reply_to` can only be
+  clobbered by a message the executive RECEIVES, every component message is received in
+  `pump_recv`, and `pump_recv` unconditionally sets `COMPONENT_CALL_CLOBBERED_REPLY_TO`. There is no
+  longer a `transport == Call` condition on that store — with one transport, the flag is set on
+  every component recv, so the main loop's fast path is taken only when no component spoke at all
+  during that syscall;
+* retiring it turns every non-routed client-syscall reply from ONE `SysReplyRecv` into TWO syscalls
+  (`send_on_reply` + `recv_full_r12`) on the hottest path in the boot. The paint has been lost to
+  timing perturbation before (`1141349`), and Phase 2 already perturbs win32k's whole rendezvous.
+  Doing both in one batch would make a lost paint un-attributable.
+
+So it stays for Phase 3, which is a pure-deletion batch with no other moving parts — the right place
+to take a measurable timing change.
+
+**R2 (walls)** — win32k's equivalent of Phase 1's instance retirement is `win32k_glue::WIN32K_RETIRED`:
+the pump `TCB_Suspend`s the component, `retire_win32k_on_wall` latches the flag, and
+`win32k_dispatch_wide` refuses every later dispatch, so nothing can ever `reply_on` a binding held by
+a thread that will never run again. Zero walls occur on a green boot (the gate asserts `walled == 0`),
+so this path is defensive.
+
+**R6 (three resume sites)** — all three (`win32k_glue.rs` normal `NtCallbackReturn`, dead-client
+unwind, cancel) funnel through the single `resume_suspended_user_callback_component`, so converting
+that ONE function converted all three. `SUSPENDED_COMPONENT_OUTSTANDING` (incremented on suspend,
+decremented on resume) is asserted **0** at quiesce.
+
+**The new spec: `exec_win32k_transport_call_nested`.** It reuses the SAME real scenario
+(`inject_win32k_nested_dispatch_slip` — post-quiesce, expendable winlogon RPC worker, `WM_NULL`) and
+asserts: `PUMP_REPLY_ERRORS == 0`, call-bound completions == `HARNESS_SYSCALL_DISPATCHES` (2557/2557),
+requests >= 4, nesting high-water >= 2, suspended-outstanding == 0, not walled, and all six
+`NESTED_SLIP_*` bits. `NESTED_SLIP_REJECTED` is replaced by **`NESTED_SLIP_R_HELD`**: the reply object
+stayed outstanding across the client redirect (sampled before and after), which is the property that
+used to require a token stack. `NESTED_SLIP_MATCHED` additionally requires
+`dispatch_depth() >= 1` at the instant the nested dispatch is issued — the DIRECT measurement that
+the nested level really was nested, since the boot-wide high-water (5) is reached long before.
+
+**Bypass vs negative control.** There is no bypass switch and there cannot be one:
+`W32_DISPATCH_TOKEN_BINDING` was flippable because the binding was OUR code, whereas "a stale
+completion is unrepresentable" is structural — there is no mechanism left to disable, only the
+kernel's `bound_tcb`. The honest substitute is the same NEGATIVE CONTROL Phase 1 used, which
+falsifies the kernel-level premise rather than a flag of ours: `reply_on` on a known-unbound object
+returns `seL4_InvalidCapability` (**2**) immediately and without blocking (measured every boot by
+`exec_irp_transport_call_bound`). If that were false, "label 0" would mean nothing and the
+executive's answer could block — the two properties the whole migration buys.
+
+**Changes (as executed)**
+1. `s_ke_user_mode_callback_rendezvous` → the `call_on` loop; `W32_SLIP_INJECT` block deleted.
+2. `component_pump_inner`: one transport, MR0 request tag, callback arm replies RESUME via
+   `pump_resume_recv`, suspend = no reply, `pump_recv`/`pump_resume_recv` lost their
+   `call_transport`/`use_reply_cap` parameters.
+3. `main.rs` win32k DriverEntry-init loop → `component_pump` with `initial: RecvFirst`.
+4. Deleted: the token machinery (`DISPATCH_TOKEN_NEXT/_STACK/_DEPTH/_MAX_DEPTH`, `PUMP_TOKEN_MISMATCHES`,
+   `dispatch_token_push/_top/_pop/_depth`, `suspended_dispatch_token`), `W32_SLIP_INJECT(_TOKEN)`,
+   `W32_DISPATCH_TOKEN_BINDING`, `Transport` + both arms, `PumpChannel::wake_first`,
+   `HostCaps::nested_reply_cap`, `SH_REQ_SEQ` (both copies), `send_done_on`, `recv_req_on`, `ep_send`,
+   `ep_send_token`.
+5. Added: `HostCaps::sparse_vspace` (correction 4), `PUMP_DISPATCH_DEPTH`/`PUMP_MAX_DISPATCH_DEPTH`/
+   `SUSPENDED_COMPONENT_OUTSTANDING` (observability only), `WIN32K_RETIRED` (R2).
 
 **Rollback:** the Phase-1 commit.
 
@@ -638,6 +717,9 @@ becomes its own follow-up batch — Phases 0–3 stand on their own merits.
 ## 7. Kill-list — what gets deleted (the checkable outcome)
 
 **34 items.** After Phase 3, `grep` for each of these must return **zero** hits outside this document.
+**Items 1-2, 4-33 are ALREADY DELETED (Phases 1-2)**; item 3 (`send_on_reply`) and the legacy
+`reply_to` reply are what Phase 3 still owes. A few *comments* in unrelated files still narrate the
+retired planes — prose, not code.
 
 ### Executive IPC helpers (`components/ntos-executive/src/main.rs`)
 1. `ep_send` (3855)

@@ -5953,7 +5953,7 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
         let client_pid = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
         let scratch_base = procs[2].scratch_base;
-        // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_dispatch_in_phase_nested`).
+        // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
         // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
         // dead-client injection below still finds a live, redirectable thread. Order matters: the
         // dead-client injection latches winlogon's pi as DEAD, after which no further callback can

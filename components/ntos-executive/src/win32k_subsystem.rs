@@ -184,7 +184,6 @@ pub const SH_REQ_A1: u64 = 0x60; // in:  handler arg1 (rdx)
 pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
 pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
 pub const SH_REQ_STATUS: u64 = 0x78; // out: handler NTSTATUS (i32)
-pub const SH_REQ_SEQ: u64 = 0x80; // out: completed-request counter (u64) — observability
 pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
 // ★ BATCH 44 — STACK-ARG TAIL for WIDE win32k SSNs. The x64 win64 ABI passes args 1-4 in rcx/rdx/r8/r9
 // and args 5+ on the caller's stack. `dispatch_ssn` originally forwarded ONLY the 4 register args, so a
@@ -2429,38 +2428,36 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         write_volatile(core::ptr::addr_of_mut!((*frame).header), header);
         let request = header;
 
-        // The callback rendezvous carries NO token: it is an EVENT this component raises, not the
-        // completion of a request, and the executive answers it in place (resume) or suspends this
-        // dispatch. The suspended dispatch's own token stays live on the executive's token stack.
-        crate::driver_launch::send_done_on(W32_USER_CALLBACK_LABEL, 0);
+        // ★ THE NESTING SEAM, on the `Call` transport (`docs/transport-migration.md` §3.4).
+        //
+        // The FIRST Call raises the callback as an EVENT: it is not the completion of a request, and
+        // the executive answers it in place (RESUME) or SUSPENDS this dispatch by simply not
+        // replying — which leaves the executive's reply object bound to THIS Call for the whole
+        // callback excursion. That kernel binding is the entirety of the "suspended outer dispatch"
+        // state; there is no token, no stack, and no depth bookkeeping on either side.
+        //
+        // While this outer dispatch is parked here, the client's redirected `WndProc` can issue
+        // further `NtUser*`/`NtGdi*` syscalls, each arriving as a NESTED dispatch — replied onto the
+        // SAME reply object, because this component has one TCB and is blocked in exactly one Call.
+        // Each nested completion and the next receive are the SAME syscall, so no level can publish
+        // a completion the executive has not asked for: the phase slip is UNREPRESENTABLE, at any
+        // depth. Nesting is bounded only by this component's own C stack.
+        let mut out = W32_USER_CALLBACK_LABEL << 12;
         loop {
-            // ★ THE NESTING SEAM. While this outer dispatch is parked here, the client's redirected
-            // `WndProc` can issue further `NtUser*`/`NtGdi*` syscalls, each arriving as a NESTED
-            // dispatch with its OWN correlation token. Echo THAT token in the nested completion so
-            // the executive's nested pump binds it to the request it sent, never to this outer
-            // dispatch's (still outstanding) one. Nesting is unbounded and strictly LIFO — each
-            // level's token lives in its own C frame.
-            let (label, nested_token) = crate::driver_launch::recv_req_on();
-            match label {
+            // The reply's message label is always 0 (`spawn_hosts::REQUEST_TAG_LEN`); the request
+            // TAG rides in MR0.
+            let (_label, tag, _, _, _) = crate::driver_launch::call_on(out);
+            match tag {
                 W32_USER_CALLBACK_RESUME_LABEL => break,
                 W32_DISPATCH_LABEL => {
-                    // FAULT INJECTION (gate spec `exec_win32k_dispatch_in_phase_nested`): publish a
-                    // `done` carrying the SUSPENDED OUTER dispatch's token before running the nested
-                    // request — the misordered completion a shared-memory sequence counter cannot
-                    // detect. Only a pump that binds reply→request by token rejects it.
-                    if crate::spawn_hosts::W32_SLIP_INJECT.swap(0, Ordering::Relaxed) != 0 {
-                        crate::driver_launch::send_done_on(
-                            W32_DISPATCH_LABEL,
-                            crate::spawn_hosts::W32_SLIP_INJECT_TOKEN.load(Ordering::Relaxed),
-                        );
-                    }
                     let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                         drv: 0,
                     });
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                     let _ = info;
-                    crate::driver_launch::send_done_on(W32_DISPATCH_LABEL, nested_token);
+                    // The nested completion IS the next receive.
+                    out = W32_DISPATCH_LABEL << 12;
                 }
                 _ => return 0xC000_0001u32 as i32,
             }
@@ -3096,10 +3093,6 @@ pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
         W32_DISPATCH_LABEL, // 0x770
         win32k_dispatch,    // ssn → per-dispatch pre/post + dispatch_ssn
         win32k_post_driver_entry,
-        // Phase 1 keeps win32k on the LEGACY Send/Recv rendezvous — its callback re-entry
-        // (`s_ke_user_mode_callback_rendezvous`) still speaks that protocol. Phase 2 converts both
-        // and deletes `Transport` entirely.
-        crate::spawn_hosts::Transport::Legacy,
     )
 }
 
@@ -3529,8 +3522,8 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
 }
 
 /// The retired inline `send_done`/`recv_req`/`dispatch_loop` (win32k's bespoke Send/Recv handshake +
-/// per-request loop) are now the SHARED harness's implementation (`send_done_on`/`recv_req_on` +
-/// `component_main`'s loop, Phase B Step 4b). win32k's per-dispatch body lives in [`win32k_dispatch`]
+/// per-request loop) are now the SHARED harness's implementation (one `call_on` per dispatch in
+/// `component_main`'s loop). win32k's per-dispatch body lives in [`win32k_dispatch`]
 /// and its context seed in [`setup_dispatch_context`] (called from `win32k_post_driver_entry`).
 ///
 /// Build the "current process/thread" context win32k's INLINED accessors read during a dispatch —

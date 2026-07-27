@@ -927,6 +927,28 @@ unsafe fn redirect_pending_user_callback(
     true
 }
 
+/// ★ RISK R2 (`docs/transport-migration.md`) — a WALLED win32k is DEAD, and the transport now says
+/// so. On a wall the component is left blocked in a fault `Call` with `R_win32k` STILL BOUND to it;
+/// a later `reply_on(R, request)` would be delivered as a FAULT reply (`apply_fault_reply` returns
+/// `restart = true` unconditionally for VMFault/CapFault), resuming win32k at the faulting
+/// instruction carrying a request it never asked for. The pump has already `TCB_Suspend`ed it; this
+/// is the win32k analogue of `dispatch_irp`'s `register_instance_ready(inst, false)` — retire the
+/// component so nothing can ever reply on that stale binding. Zero walls occur on a green boot, so
+/// this is defensive; if it ever fires, the boot says so loudly and every later win32k call fails
+/// cleanly instead of corrupting.
+pub(crate) static WIN32K_RETIRED: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
+    if pr.completed || pr.callback_suspended {
+        return;
+    }
+    if WIN32K_RETIRED.swap(1, Ordering::Relaxed) == 0 {
+        print_str(b"[w32disp] win32k WALLED (label=");
+        print_u64(pr.wall_label);
+        print_str(b") -> component RETIRED; its reply object stays bound to a suspended thread\n");
+    }
+}
+
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
 ) -> crate::spawn_hosts::PumpResult {
@@ -946,10 +968,12 @@ unsafe fn resume_suspended_user_callback_component(
         dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
         demand_cap: 8192,
         trace_faults: false,
-        wake_first: false,
-        initial: crate::spawn_hosts::InitialAction::RecvFirst,
-        transport: crate::spawn_hosts::Transport::Legacy,
-        tcb: 0,
+        // ★ THE RESUME IS A REPLY ON THE STILL-BOUND OBJECT. win32k has been sitting in its callback
+        // `Call` since the pump that suspended it returned WITHOUT replying, so `R_win32k` is still
+        // bound to exactly that Call — the resume is one `reply_on` carrying the RESUME tag. The
+        // bespoke `ep_send(RESUME)` preamble and its `use_reply_cap` guard are gone.
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
         client_pi: client.pi as u64,
         callback_client: Some(client),
@@ -960,10 +984,12 @@ unsafe fn resume_suspended_user_callback_component(
             usermode_callback: true,
             wide_arg_marshal: true,
             assert_skip: true,
-            nested_reply_cap: true,
+            sparse_vspace: true,
         },
     };
-    crate::spawn_hosts::component_pump_resume_user_callback(&channel)
+    let pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
+    retire_win32k_on_wall(&pr);
+    pr
 }
 
 pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
@@ -1282,54 +1308,58 @@ unsafe fn expendable_winlogon_callback_thread() -> Option<(u64, u64, u64, u64)> 
         .copied()
 }
 
-// ── FAULT INJECTION: `exec_win32k_dispatch_in_phase_nested` ─────────────────────────────────────
+// ── SCENARIO INJECTION: `exec_win32k_transport_call_nested` ─────────────────────────────────────
 // Proof bits returned by [`inject_win32k_nested_dispatch_slip`]; ALL set = the spec passes.
 /// win32k really SUSPENDED an outer dispatch inside `KeUserModeCallback` (the nesting precondition).
 pub(crate) const NESTED_SLIP_PARKED: u64 = 0x01;
 /// The client really entered the reverse transition, so a NESTED `NtUser*` from its `WndProc` is a
 /// legitimate re-entry (this is the shape the binding has to survive).
 pub(crate) const NESTED_SLIP_REDIRECTED: u64 = 0x02;
-/// The injected MISORDERED completion (a `done` carrying the SUSPENDED OUTER dispatch's token,
-/// published while the nested dispatch was in flight) was REJECTED by the nested pump.
-pub(crate) const NESTED_SLIP_REJECTED: u64 = 0x04;
-/// …and the nested pump still matched ITS OWN reply: the nested dispatch returned its own real
-/// result, not the outer dispatch's.
+/// ★ THE REPLY OBJECT STAYED BOUND ACROSS THE WHOLE SUSPENSION. `R_win32k` was OUTSTANDING (exactly
+/// one dispatch level suspended, i.e. the pump returned without replying) both BEFORE and AFTER the
+/// client redirect — the outer dispatch's reply really did survive the callback excursion as KERNEL
+/// state, not as bookkeeping of ours. This bit replaces the token-transport's `NESTED_SLIP_REJECTED`
+/// (a stale completion is now UNREPRESENTABLE, so there is nothing left to reject).
+pub(crate) const NESTED_SLIP_R_HELD: u64 = 0x04;
+/// …and the NESTED dispatch — replied onto that SAME still-bound object, one level deeper —
+/// returned ITS OWN real result, at a measured nesting depth of >= 2.
 pub(crate) const NESTED_SLIP_MATCHED: u64 = 0x08;
-/// The callback then RETURNED for real and the RESUME pump matched the OUTER dispatch's token — the
-/// level whose completion never travelled with a request of its own.
+/// The callback then RETURNED for real and the RESUME reply (on the same object again) drove the
+/// SUSPENDED OUTER dispatch to its own completion — the level whose completion never travelled with
+/// a request of its own.
 pub(crate) const NESTED_SLIP_OUTER_RESUMED: u64 = 0x10;
-/// Everything drained (callback/continuation stacks empty, token nesting depth back to 0) and a
-/// FRESH win32k dispatch completes — win32k is genuinely back in its idle dispatch receive loop.
+/// Everything drained (callback/continuation stacks empty, dispatch depth + suspended-outstanding
+/// back to 0) and a FRESH win32k dispatch completes — win32k is genuinely back in its idle loop.
 pub(crate) const NESTED_SLIP_DRAINED_IDLE: u64 = 0x20;
 pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 
-/// ★ DELIBERATE FAULT INJECTION for the **nesting-safe request↔reply binding** on win32k's Syscall
-/// substrate — the LEGACY transport's correlation gate, for the substrate the (now-deleted)
-/// `SH_REQ_SEQ` handshake was deliberately scoped OUT of. The IRP substrate has moved to the
-/// `Call`/reply-object transport (`exec_irp_transport_call_bound`); win32k follows in Phase 2.
+/// ★ DELIBERATE SCENARIO INJECTION for the **nesting-safe request↔reply binding** on win32k's
+/// Syscall substrate — now the KERNEL'S binding (`docs/transport-migration.md` Phase 2), not ours.
 ///
-/// The bug class is the same and it is REAL (it is what stops the LSA-route boot): the dispatch
-/// transport is a plain Send/Recv pair, the component publishes its completion BEFORE it waits for
-/// the next request, and "any `dispatch_label` message ends the pump" lets one level consume
-/// another level's completion. On win32k the levels are created by genuine RE-ENTRY — an outer
-/// dispatch parks inside `KeUserModeCallback` while the client's `WndProc` issues nested
-/// `NtUser*`/`NtGdi*` syscalls — so a shared-memory sequence counter cannot even name the level a
-/// completion belongs to. Only a per-dispatch token carried in the message can.
+/// The scenario is unchanged and it is REAL: win32k's dispatch loop legitimately RE-ENTERS — an
+/// outer dispatch parks inside `KeUserModeCallback` while the client's redirected `WndProc` issues
+/// nested `NtUser*`/`NtGdi*` syscalls, unwound innermost-first. What changed is the *claim* being
+/// tested. The old transport was a plain Send/Recv pair in which one level could consume another
+/// level's completion, so it needed a per-dispatch token and this injection published a MISORDERED
+/// completion to prove the token rejected it. Under `Call` ⇄ reply-object that misordering is
+/// UNREPRESENTABLE — the component cannot speak until we reply, and our reply reaches only the
+/// thread the kernel bound — so there is nothing to inject and nothing to reject. The injection now
+/// proves the STRUCTURE instead: ONE reply object, held bound across an entire callback excursion,
+/// carries an outer dispatch, an arbitrarily deep nested dispatch and the resume.
 ///
-/// This manufactures exactly that condition, for real, POST-QUIESCE (the entire load-bearing boot —
-/// winlogon SAS, the msgina dialog, the authentic desktop/dialog paints — has finished and its
-/// counters are latched), on an EXPENDABLE winlogon RPC worker thread, with `WM_NULL` (the message
-/// defined to do nothing, so no window state and no pixel can change):
+/// It runs for real, POST-QUIESCE (the entire load-bearing boot — winlogon SAS, the msgina dialog,
+/// the authentic desktop/dialog paints — has finished and its counters are latched), on an
+/// EXPENDABLE winlogon RPC worker thread, with `WM_NULL` (the message defined to do nothing, so no
+/// window state and no pixel can change):
 ///  1. a genuine `NtUserMessageCall(hwnd, WM_NULL, …)` dispatch reaches the client's window
-///     procedure and win32k calls `KeUserModeCallback` → the OUTER dispatch SUSPENDS, its token left
-///     live on the executive's dispatch-token stack;
+///     procedure and win32k calls `KeUserModeCallback` → the OUTER dispatch SUSPENDS, i.e. the pump
+///     returns WITHOUT replying and `R_win32k` stays bound to win32k's callback `Call`;
 ///  2. the client is genuinely REDIRECTED into `KiUserCallbackDispatcher` (the reverse transition
-///     that makes a nested dispatch legitimate);
-///  3. the injector is armed and a genuine NESTED dispatch is issued. Before running it, win32k's
-///     callback receive loop publishes a `done` carrying the OUTER dispatch's token — a completion
-///     for a DIFFERENT, still-outstanding level. The nested pump must reject it and keep waiting;
-///  4. the callback RETURNS for real, so the RESUME pump has to match the outer token off the top of
-///     the stack (the level that never sent a request of its own);
+///     that makes a nested dispatch legitimate) — and the binding is sampled BEFORE and AFTER it;
+///  3. a genuine NESTED dispatch is issued: a reply on that SAME object one level deeper. It must
+///     return ITS OWN result, with the measured nesting depth >= 2;
+///  4. the callback RETURNS for real, so the RESUME reply — on the same object again — drives the
+///     suspended OUTER dispatch to its own completion (a level that never sent a request);
 ///  5. everything drains and a fresh dispatch completes.
 ///
 /// Unlike the dead-client injection this leaves the victim thread ALIVE and latches nothing, so it
@@ -1370,8 +1400,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     print_u64(write_error);
     print_str(b" sas-sequence-active=");
     print_u64(USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed));
-    print_str(b" token-depth=");
-    print_u64(crate::spawn_hosts::dispatch_token_depth());
+    print_str(b" dispatch-depth=");
+    print_u64(crate::spawn_hosts::dispatch_depth());
     print_str(b"\n");
 
     let client = Win32kClientContext {
@@ -1421,9 +1451,9 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         return proof;
     }
     proof |= NESTED_SLIP_PARKED;
-    // The OUTER dispatch's token is now the innermost outstanding one — the value a misordered
-    // completion would carry, and the value the RESUME pump will have to match later.
-    let outer_token = crate::spawn_hosts::suspended_dispatch_token();
+    // ★ `R_win32k` is now BOUND to win32k's callback `Call` — the pump returned WITHOUT replying.
+    // Exactly one dispatch level is suspended holding it. Sample it BEFORE the client redirect.
+    let held_before = crate::spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
 
     // (2) REDIRECT the client — the real reverse transition that legitimises a nested dispatch.
     if !begin_controlled_user_callback_redirect(client, victim_rip, victim_rsp, victim_flags) {
@@ -1439,19 +1469,28 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     {
         proof |= NESTED_SLIP_REDIRECTED;
     }
-    print_str(b"[w32-slip] armed: outer-token=");
-    print_u64(outer_token);
+    print_str(b"[w32-slip] armed: R-held=");
+    print_u64(held_before);
     print_str(b" callback-depth=");
     print_u64(active_depth as u64);
     print_str(b" continuation-depth=");
     print_u64(continuation_depth as u64);
     print_str(b"\n");
 
-    // (3) THE INJECTION — a NESTED dispatch that is preceded by a `done` carrying the OUTER token.
-    let mismatches_before = crate::spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
-    let max_depth_before = crate::spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
-    crate::spawn_hosts::W32_SLIP_INJECT_TOKEN.store(outer_token, Ordering::Relaxed);
-    crate::spawn_hosts::W32_SLIP_INJECT.store(1, Ordering::Relaxed);
+    // ★ The binding SURVIVED the client redirect: still exactly one suspended level holding `R`.
+    let held_after = crate::spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
+    if held_before >= 1 && held_after == held_before {
+        proof |= NESTED_SLIP_R_HELD;
+    }
+
+    // (3) THE NESTED DISPATCH — a reply on that SAME still-bound object, one level deeper.
+    // `depth_before_nested >= 1` is the DIRECT measurement that the level about to be entered is a
+    // NESTED one: an outer dispatch is outstanding on `R_win32k` at this instant, so the dispatch
+    // below necessarily runs at depth >= 2 (the boot-wide high-water is a weaker statement, since
+    // live GUI nesting already reaches 5 long before this injection runs).
+    let depth_before_nested = crate::spawn_hosts::dispatch_depth();
+    let reply_errors_before = crate::spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
+    let max_depth_before = crate::spawn_hosts::PUMP_MAX_DISPATCH_DEPTH.load(Ordering::Relaxed);
     let (nested_status, nested_ok) = win32k_dispatch_wide(
         win32k_subsystem::SSN_TEST_FAULT,
         0,
@@ -1463,40 +1502,52 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         &[],
         client,
     );
-    // Disarm unconditionally (it is one-shot, but never leave it live if it was not consumed).
-    crate::spawn_hosts::W32_SLIP_INJECT.store(0, Ordering::Relaxed);
-    let mismatches_after = crate::spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
-    let max_depth_after = crate::spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
-    if mismatches_after == mismatches_before + 1 {
-        proof |= NESTED_SLIP_REJECTED;
-    }
-    if nested_ok && nested_status == win32k_subsystem::TEST_FAULT_STATUS {
+    let reply_errors_after = crate::spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
+    let max_depth_after = crate::spawn_hosts::PUMP_MAX_DISPATCH_DEPTH.load(Ordering::Relaxed);
+    // The nested level returned ITS OWN result, the nesting really was >= 2 levels deep on ONE
+    // reply object, and no reply along the way found that object unbound.
+    if nested_ok
+        && nested_status == win32k_subsystem::TEST_FAULT_STATUS
+        && depth_before_nested >= 1
+        && max_depth_after >= 2
+        && reply_errors_after == reply_errors_before
+    {
         proof |= NESTED_SLIP_MATCHED;
     }
     print_str(b"[w32-slip] nested dispatch -> status=0x");
     print_hex(nested_status as u32);
     print_str(b" completed=");
     print_u64(nested_ok as u64);
-    print_str(b" token-mismatches=");
-    print_u64(mismatches_after.saturating_sub(mismatches_before));
+    print_str(b" R-held-before/after=");
+    print_u64(held_before);
+    print_str(b"/");
+    print_u64(held_after);
+    print_str(b" reply-errors=");
+    print_u64(reply_errors_after.saturating_sub(reply_errors_before));
+    print_str(b" outer-levels-outstanding-at-nest=");
+    print_u64(depth_before_nested);
     print_str(b" nesting-depth-high-water=");
     print_u64(max_depth_after.max(max_depth_before));
     print_str(b"\n");
 
-    // (4) RETURN the callback for real: the RESUME pump must match the OUTER dispatch's token off
-    // the top of the token stack and drive the suspended dispatch to its own completion.
+    // (4) RETURN the callback for real: the RESUME reply goes onto that same still-bound object and
+    // must drive the suspended OUTER dispatch to its own completion.
     let returned = complete_controlled_user_callback(2, badge, tid, 0, 0, STATUS_UNSUCCESSFUL);
     if returned.is_some() {
         proof |= NESTED_SLIP_OUTER_RESUMED;
     }
 
-    // (5) DRAINED + win32k idle.
+    // (5) DRAINED + win32k idle. `SUSPENDED_COMPONENT_OUTSTANDING == 0` is risk R6's assertion:
+    // every suspension that took `R` gave it back.
     let (active_after, continuation_after) = user_callback_stack_depths();
-    let token_depth_after = crate::spawn_hosts::dispatch_token_depth();
+    let depth_after = crate::spawn_hosts::dispatch_depth();
+    let suspended_after =
+        crate::spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
     let (probe_status, probe_ok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
     if active_after == 0
         && continuation_after == 0
-        && token_depth_after == 0
+        && depth_after == 0
+        && suspended_after == 0
         && probe_ok
         && probe_status == win32k_subsystem::TEST_FAULT_STATUS
     {
@@ -1508,8 +1559,10 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     print_u64(active_after as u64);
     print_str(b" continuation-depth=");
     print_u64(continuation_after as u64);
-    print_str(b" token-depth=");
-    print_u64(token_depth_after);
+    print_str(b" dispatch-depth=");
+    print_u64(depth_after);
+    print_str(b" suspended-outstanding=");
+    print_u64(suspended_after);
     print_str(b" probe=0x");
     print_hex(probe_status as u32);
     print_str(b" proof=0x");
@@ -2537,7 +2590,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
 ) -> (i32, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
-    if w_fault == 0 {
+    if w_fault == 0 || WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
         return (0xC000_0001u32 as i32, false);
     }
     // A suspended callback only carries the compact pump identity. Latch the full dispatch's TEB
@@ -2641,10 +2694,10 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         // many pages and trips many checked-build asserts; allow generous headroom (still bounded).
         demand_cap: 8192,
         trace_faults: false,
-        wake_first: true, // win32k is parked in `recv_req` → wake it with a leading plain Send
+        // ★ win32k is blocked in its dispatch `Call` bound to `R_win32k`; we hand it the request by
+        // ANSWERING that Call. There is no wake `Send` any more — `reply_on` cannot block.
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        transport: crate::spawn_hosts::Transport::Legacy,
-        tcb: 0,
+        tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: rw,
         client_pi,
         callback_client: Some(crate::spawn_hosts::UserCallbackClient {
@@ -2661,7 +2714,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
             usermode_callback: true,
             wide_arg_marshal: true,
             assert_skip: true,
-            nested_reply_cap: true,
+            sparse_vspace: true,
         },
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
@@ -2669,6 +2722,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
     );
+    retire_win32k_on_wall(&pr);
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
     if nested_user_callback {
         if pr.callback_suspended {

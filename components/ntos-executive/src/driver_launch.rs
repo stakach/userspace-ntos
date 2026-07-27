@@ -1481,7 +1481,7 @@ pub fn fsd_export_addr(name: &str) -> u64 {
 /// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
 /// [`fsd_post_driver_entry`], and the FSD [`DriverObjectSpec`] (size 0x150, ext ptr @0x68, ext size
 /// 0x50, MajorFunction @0x70). The bespoke inline `dispatch_loop`/`send_done`/`recv_req` are retired
-/// in favour of the harness's shared implementation (`send_done_on`/`recv_req_on`). This is the
+/// in favour of the harness's shared implementation (one [`call_on`] per dispatch). This is the
 /// component-side leg of the FSD's migration onto the unified harness (Phase B, Step 2). Both the
 /// npfs instance and the 2nd `IrpFsdTest.sys` instance share this entry, so BOTH now run on the harness.
 /// Runs in the isolated component's VSpace (executive image mapped RWX-shared).
@@ -1512,7 +1512,6 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
         FSD_DISPATCH_LABEL, // 0x771
         fsd_dispatch,       // major → MajorFunction[major] → run_irp
         fsd_post_driver_entry,
-        crate::spawn_hosts::Transport::Call,
     )
 }
 
@@ -1551,53 +1550,12 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     }
 }
 
-/// Generic (label-parameterised) ready/done signal for the shared [`crate::spawn_hosts::component_main`]
-/// harness: a plain `seL4_Send(CT_FAULT, label)` (Send/Recv, NOT Call — the win32k fix-A rationale).
-/// The FSD dispatch loop (now the harness's) Sends [`FSD_DISPATCH_LABEL`] through this.
-///
-/// ★ `token` is the PER-DISPATCH CORRELATION TOKEN the executive handed us with the request; the
-/// component ECHOES it in the completion so `component_pump` can bind reply→request even when the
-/// substrate is re-entered (win32k's usermode-callback nesting). It rides in MR0 (`r10`), so the
-/// message length is 1 (the kernel copies `min(length,4)` message registers — `endpoint.rs:466`).
-/// The initial ready signal (nobody sent us a request yet) uses token 0, which no pump ever expects.
-#[inline(never)]
-pub(crate) unsafe fn send_done_on(label: u64, token: u64) {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_SEND as u64,
-        in("rdi") crate::CT_FAULT,
-        in("rsi") (label << 12) | 1,
-        in("r10") token, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// Block for the next dispatch request for the shared [`crate::spawn_hosts::component_main`]
-/// harness: a plain `seL4_Recv(CT_FAULT)`. Returns `(label, token)`: the label so the win32k
-/// callback trampoline can distinguish a nested dispatch from its callback-resume signal, and the
-/// executive's per-dispatch correlation token (MR0) so the completion for THIS request can echo it.
-#[inline(never)]
-pub(crate) unsafe fn recv_req_on() -> (u64, u64) {
-    let message_info: u64;
-    let token: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_RECV as u64,
-        inout("rdi") crate::CT_FAULT => _,
-        lateout("rsi") message_info, lateout("r10") token, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    (message_info >> 12, token)
-}
-
 /// ★ The COMPONENT half of the `Call`/reply-object dispatch transport
 /// (`docs/transport-migration.md` §3.1): ONE `seL4_Call(CT_FAULT, msginfo)` that **publishes this
 /// dispatch's completion AND returns the next request as its reply value**.
 ///
-/// It replaces the [`send_done_on`] + [`recv_req_on`] pair, and with it the whole class of defects
-/// that pair had:
+/// It REPLACED the hand-rolled `send_done_on` + `recv_req_on` Send/Recv pair (both deleted), and
+/// with them the whole class of defects that pair had:
 /// * there is no gap between "completion published" and "ready to receive" in which the executive's
 ///   wake could block — after a `Call` the component is `BlockedOnReply` from the instant the kernel
 ///   pairs it, with no user-visible window;
@@ -1608,7 +1566,6 @@ pub(crate) unsafe fn recv_req_on() -> (u64, u64) {
 /// Returns `(label, mr0..mr3)` of the executive's reply — the label distinguishes a dispatch request
 /// from win32k's callback-resume signal. Outgoing message length is whatever `msginfo` encodes (we
 /// only ever send a bare label, length 0).
-#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
 #[inline(never)]
 pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
     let reply_info: u64;
@@ -1901,7 +1858,7 @@ pub(crate) enum DriverClass {
     #[allow(dead_code)]
     Device,
     /// The GUI syscall server (**win32k ONLY** — a unique privileged class). Its caps
-    /// (`client_attach`/`usermode_callback`/`wide_arg_marshal`/`assert_skip`/`nested_reply_cap`) are
+    /// (`client_attach`/`usermode_callback`/`wide_arg_marshal`/`assert_skip`/`sparse_vspace`) are
     /// NEVER set for a normal user driver. win32k keeps its own Syscall substrate + paint-loop
     /// protocol (migrated onto the shared harness LAST — not routed through `load_driver`'s IRP
     /// builder). See [`crate::win32k_subsystem`] (`win32k_subsystem_entry`).
@@ -2263,9 +2220,8 @@ pub(crate) unsafe fn load_driver(
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
     //    signal (FSD_DISPATCH_LABEL). Faults report addresses in the COMPONENT's VSpace (image runs at
     //    run_va), so the in-image wall bounds are `[run_va, run_va + img_frames*0x1000)`.
-    // `wake_first=false`: the component is mid-DriverEntry (a blocked SENDER on its fault EP, or about
-    // to Send its ready signal), NOT parked at a recv — so the pump must start by RECEIVING, exactly
-    // as the old inline `ep_recv_full(fault_ep)` did. Trace on for init-time observability.
+    // `InitialAction::RecvFirst`: the component is mid-DriverEntry (blocked in a fault `Call`, or about
+    // to issue its ready `Call`), so the pump must start by RECEIVING. Trace on for observability.
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep,
         pml4,
@@ -2275,13 +2231,11 @@ pub(crate) unsafe fn load_driver(
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 512,
         trace_faults: true,
-        wake_first: false,
         // ★ The component is mid-DriverEntry: it is either blocked in a fault Call or about to issue
         // its post-DriverEntry ready Call. Either way we must RECEIVE first — and when the ready Call
         // arrives the component is left BLOCKED IN IT (the steady state the per-IRP pump replies to),
-        // instead of racing on to a bare `recv_req_on` the executive could miss.
+        // instead of racing on to a bare receive the executive could miss.
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
-        transport: crate::spawn_hosts::Transport::Call,
         tcb,
         reply_cap,
         client_pi: 0,
@@ -2552,12 +2506,10 @@ pub(crate) unsafe fn dispatch_irp(
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
         trace_faults: false,
-        wake_first: true,
         // ★ The component is blocked in its dispatch `Call`, bound to this instance's reply object;
         // we hand it the request by ANSWERING that Call. `reply_on` is `decode_reply` — it cannot
         // block, so the executive can never wedge on a component that is not receiving.
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        transport: crate::spawn_hosts::Transport::Call,
         tcb: d.tcb,
         reply_cap: d.reply_cap,
         client_pi: 0,

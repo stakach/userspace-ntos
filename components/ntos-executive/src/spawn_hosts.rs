@@ -98,8 +98,6 @@ impl Default for ReqKind {
 /// appropriate to `caps.kind`; these do NOT unify (design §2.2 status-offset note).
 pub(crate) const SH_REQ_STATUS_IRP: u64 = 0x70;
 pub(crate) const SH_REQ_STATUS_SYSCALL: u64 = 0x78;
-/// Out: monotonic completed-request counter — SHARED (both frames already agree at 0x80).
-pub(crate) const SH_REQ_SEQ: u64 = 0x80;
 
 /// Capability flags on a component descriptor. ALL DEFAULT FALSE → a component with
 /// `HostCaps::default()` is byte-identical to today (Family B + the FSD). The flags are consumed on
@@ -124,9 +122,14 @@ pub(crate) struct HostCaps {
     pub wide_arg_marshal: bool,
     /// win32k: skip checked-build int-0x2c NT_ASSERTs (resume IP+2) on a label-3 UserException.
     pub assert_skip: bool,
-    /// win32k: answer nested demand-page faults through a per-caller reply cap (REPLY_W32) rather
-    /// than the fault EP's reply_recv, so an outer caller's reply binding survives.
-    pub nested_reply_cap: bool,
+    /// The component's VSpace is SPARSE: a demand fault may need the whole PDPT→PD→PT walk built,
+    /// not just a leaf page table. win32k's windows (image / pool / FreeType / user-VM / session
+    /// heap / staged font) straddle several 512 GiB + 1 GiB regions that were never pre-created, so
+    /// its faults resolve through `ensure_w32_client_paging`; the FSD's windows are pre-built and
+    /// only ever need the 2 MiB PT (`driver_launch::ensure_paging`). This is orthogonal to
+    /// [`Self::client_attach`] (which is about SHARING A CLIENT'S FRAMES, not about page tables) —
+    /// win32k's DriverEntry-init pump needs the paging discipline WITHOUT the client sharing.
+    pub sparse_vspace: bool,
 }
 
 /// Fully declarative description of an isolated component to spawn. DATA only — the POLICY
@@ -400,7 +403,7 @@ pub(crate) unsafe fn spawn_storage_host(
 // See `docs/component-harness.md` §2.4-2.5.
 // =============================================================================================
 
-/// ★ What a pump does FIRST — the `Call`-transport successor of [`PumpChannel::wake_first`]
+/// ★ What a pump does FIRST — the `Call`-transport successor of the deleted `wake_first` flag
 /// (`docs/transport-migration.md` §3.3).
 ///
 /// `wake_first` had to encode "is the component parked at a recv, or is it a blocked sender?" — a
@@ -418,27 +421,10 @@ pub(crate) enum InitialAction {
     RecvFirst,
 }
 
-/// ★ TEMPORARY (Phase 1 only — DELETED in Phase 2). Which rendezvous the SHARED `component_main`
-/// dispatch loop and its executive-side pump speak.
-///
-/// `component_main` is shared by the IRP substrate (npfs + any by-path IRP driver) and the win32k
-/// Syscall substrate, so converting one without the other needs an explicit seam rather than a
-/// broken boundary (`docs/transport-migration.md` R1). Phase 2 converts win32k's callback
-/// rendezvous and this enum, `Transport::Legacy` and everything it gates all go away.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Transport {
-    /// The hand-rolled Send/Recv pair (`send_done_on` + `recv_req_on`, executive-side
-    /// `ep_send_token` + `ep_recv_full`/`reply_recv_full`). win32k, until Phase 2.
-    Legacy,
-    /// seL4 `Call` ⇄ MCS reply object: ONE component syscall publishes the completion and returns
-    /// the next request; the executive answers with a non-blocking `reply_on` on a `Cap::Reply`.
-    Call,
-}
-
 /// The executive-side channel to one Family-A dispatch server. Carries the fault/dispatch EP, the
 /// component VSpace (for demand-map), the in-image wall bounds, the shared frame base, the DONE
-/// label, and the per-server demand budget. `reply_cap`/`client_pi`/`caps` gate win32k's specifics
-/// (Step 4); for the FSD they are 0/0/all-false and the pump degenerates to today's
+/// label, the component's MCS reply object and the per-server demand budget. `client_pi`/`caps`
+/// gate win32k's specifics; for the FSD they are 0/all-false and the pump degenerates to today's
 /// `npfs_dispatch_irp`/`load_driver` inner loop EXACTLY.
 #[derive(Clone, Copy)]
 pub(crate) struct PumpChannel {
@@ -459,26 +445,18 @@ pub(crate) struct PumpChannel {
     pub demand_cap: u64,
     /// Emit `[svc] fault #N ...` trace lines for the first 40 faults (init-loop observability).
     pub trace_faults: bool,
-    /// Whether to WAKE the server with a leading `ep_send(dispatch_label)` before receiving.
-    /// `true` = the PER-REQUEST shape: the server is parked in `recv_req_on` (a blocked receiver),
-    /// so the executive Sends to hand it the request (the win32k / per-IRP loops). `false` = the
-    /// DRIVER-ENTRY-INIT shape: the component is NOT yet at a recv — it is mid-DriverEntry and will
-    /// fault (a blocked SENDER on the fault EP) or Send its ready signal, so the executive must start
-    /// by RECEIVING (a leading Send would deadlock against the faulting sender). See `load_driver`.
-    pub wake_first: bool,
-    /// The `Call`-transport successor of `wake_first` (see [`InitialAction`]). Derived from
-    /// `wake_first` at every call site so the two agree; the legacy transport still reads
-    /// `wake_first`.
+    /// What the pump does FIRST (see [`InitialAction`]): ANSWER the component's outstanding dispatch
+    /// `Call` with the request, or (mid-DriverEntry) start by RECEIVING.
     pub initial: InitialAction,
-    /// Which rendezvous this channel speaks (see [`Transport`]). `Call` for the IRP substrate,
-    /// `Legacy` for win32k until Phase 2.
-    pub transport: Transport,
-    /// The component host's TCB. Needed ONLY to `TCB_Suspend` it on a WALL under the `Call`
-    /// transport (risk R2 — see the wall tail of [`component_pump_inner`]). 0 = cannot suspend.
+    /// The component host's TCB. Needed ONLY to `TCB_Suspend` it on a WALL (risk R2 — see the wall
+    /// tail of [`component_pump_inner`]). 0 = cannot suspend.
     pub tcb: u64,
-    /// win32k Step-4 fields (0 for the FSD): the per-caller reply cap (REPLY_W32) and the client
-    /// process-index for `client_attach`/foreign-frame sharing.
+    /// ★ This component's DEDICATED MCS reply object — the server side of the `Call` transport, and
+    /// now MANDATORY (a zero here means the channel has no transport at all). `R_win32k`
+    /// (`REPLY_W32`) and `R_fsd[inst]` (`REPLY_FSD`) are DISTINCT objects that are never pooled,
+    /// never stolen and never rotated (risk R5/R7).
     pub reply_cap: u64,
+    /// win32k only (0 for the FSD): the client process-index for `client_attach`/foreign-frame sharing.
     pub client_pi: u64,
     /// Explicit identity of the user thread whose win32k syscall is currently forwarded. This is
     /// carried with the pump invocation so callback diagnostics never consult stale global identity.
@@ -568,14 +546,23 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 // attesting the invariant held on every single request.
 // =============================================================================================
 
-/// Requests answered on a component's reply object (`reply_on(R, dispatch_label<<12)`) under the
-/// `Call` transport. Every one of them returned label 0, i.e. the kernel confirmed `R` was BOUND —
-/// which is only true if the component had issued exactly one `Call` since our last reply.
-pub(crate) static PUMP_CALL_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Requests answered on a component's reply object (`reply_on(R, tag)`), BY KIND. Every one of them
+/// returned label 0, i.e. the kernel confirmed `R` was BOUND — which is only true if the component
+/// had issued exactly one `Call` since our last reply.
+static PUMP_CALL_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Dispatches whose completion arrived as the return value of the COMPONENT'S OWN `Call` on the
-/// bound reply object. Must equal [`HARNESS_IRP_DISPATCHES`] once the IRP substrate is fully on the
-/// `Call` transport.
-pub(crate) static PUMP_CALL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+/// bound reply object, BY KIND. Must equal [`HARNESS_IRP_DISPATCHES`] /
+/// [`HARNESS_SYSCALL_DISPATCHES`] — every substrate is on the `Call` transport.
+static PUMP_CALL_DISPATCHES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Requests handed over as a reply on a bound reply object, for `kind`.
+pub(crate) fn pump_call_requests(kind: ReqKind) -> u64 {
+    PUMP_CALL_REQUESTS[kind as usize].load(Ordering::Relaxed)
+}
+/// Dispatches completed as the return value of the component's own `Call`, for `kind`.
+pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
+    PUMP_CALL_DISPATCHES[kind as usize].load(Ordering::Relaxed)
+}
 /// ★ Non-zero `reply_on` invocation labels. MUST be **0** for the whole boot: a non-zero label means
 /// we replied to an UNBOUND reply object, i.e. our belief "the component is blocked in a Call" was
 /// wrong — an invariant break. Risk R3: reply-object rebinding is silent in the kernel, so this
@@ -584,6 +571,40 @@ pub(crate) static PUMP_CALL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
+
+// ── ★ NESTING OBSERVABILITY (Phase 2). These counters are NOT correlation state — nothing reads
+// them to decide where a message goes. That is the whole point: the 32-deep `DISPATCH_TOKEN_STACK`
+// they replace WAS load-bearing, and now the kernel's `bound_tcb` is the only binding there is.
+// They exist so `exec_win32k_transport_call_nested` can SAY at what depth the property was proven.
+/// Outstanding win32k dispatch levels (a level is outstanding from the moment its request is replied
+/// until its completion Call arrives; a level suspended inside a usermode callback stays counted).
+static PUMP_DISPATCH_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// High-water of [`PUMP_DISPATCH_DEPTH`] over the boot. >= 2 means a nested dispatch really ran with
+/// an outer dispatch still outstanding on the SAME single reply object.
+pub(crate) static PUMP_MAX_DISPATCH_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// ★ RISK R6 — dispatches currently SUSPENDED inside a usermode callback, i.e. pumps that returned
+/// while deliberately NOT replying, leaving `R` bound to the component's callback `Call`. Every one
+/// of them MUST eventually be resumed by one of the three resume sites (`NtCallbackReturn`,
+/// dead-client unwind, cancel); a non-zero value at quiesce is a component wedged holding `R`.
+pub(crate) static SUSPENDED_COMPONENT_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
+
+/// Current outstanding win32k dispatch nesting depth (0 = win32k holds no outstanding dispatch).
+pub(crate) fn dispatch_depth() -> u64 {
+    PUMP_DISPATCH_DEPTH.load(Ordering::Relaxed)
+}
+
+fn dispatch_depth_enter() {
+    let depth = PUMP_DISPATCH_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+    if depth > PUMP_MAX_DISPATCH_DEPTH.load(Ordering::Relaxed) {
+        PUMP_MAX_DISPATCH_DEPTH.store(depth, Ordering::Relaxed);
+    }
+}
+
+fn dispatch_depth_leave() {
+    let _ = PUMP_DISPATCH_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+        Some(d.saturating_sub(1))
+    });
+}
 
 /// ★ PLAN CORRECTION (`docs/transport-migration.md` §2.3 got this half-right and half-wrong).
 ///
@@ -642,23 +663,16 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
     e
 }
 
-/// Receive the component's next message. Under the `Call` transport (and win32k's nested-reply
-/// path) the recv REGISTERS the channel's reply object in r12, so the kernel binds it to whichever
-/// Call — dispatch completion, demand-page fault or callback — pairs with us.
+/// Receive the component's next message. The recv REGISTERS the channel's reply object in r12, so
+/// the kernel binds it to whichever Call — dispatch completion, demand-page fault or callback —
+/// pairs with us. This is the ONLY correlation state the transport has, and it is the kernel's.
 #[inline]
-unsafe fn pump_recv(ch: &PumpChannel, use_reply_cap: bool) -> (u64, u64, u64, u64, u64) {
-    if ch.transport == Transport::Call {
-        // The kernel just wrote `executive.reply_to = component` (`finish_call`). Any client reply
-        // still owed on the legacy path is now mis-addressed — see the flag's doc comment.
-        COMPONENT_CALL_CLOBBERED_REPLY_TO.store(true, Ordering::Relaxed);
-    }
-    if use_reply_cap {
-        let (_b, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
-        (mi, m0, m1, m2, m3)
-    } else {
-        let (_b, mi, m0, m1, m2, m3) = crate::ep_recv_full(ch.fault_ep);
-        (mi, m0, m1, m2, m3)
-    }
+unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
+    // The kernel just wrote `executive.reply_to = component` (`finish_call`). Any client reply
+    // still owed on the legacy path is now mis-addressed — see the flag's doc comment.
+    COMPONENT_CALL_CLOBBERED_REPLY_TO.store(true, Ordering::Relaxed);
+    let (_b, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+    (mi, m0, m1, m2, m3)
 }
 
 /// Resume the component (a fault reply, or the int-0x2c assert-skip reply) and receive its next
@@ -667,111 +681,9 @@ unsafe fn pump_recv(ch: &PumpChannel, use_reply_cap: bool) -> (u64, u64, u64, u6
 /// UserException: MR0 = the resume FaultIP). It NEVER emits the len-18 UnknownSyscall shape; those
 /// are client-syscall replies on REPLY_MAIN, a different plane entirely (risk R4).
 #[inline]
-unsafe fn pump_resume_recv(
-    ch: &PumpChannel,
-    call_transport: bool,
-    use_reply_cap: bool,
-    len: u64,
-    r0: u64,
-) -> (u64, u64, u64, u64, u64) {
-    if call_transport {
-        pump_reply_on(ch, len, r0);
-        pump_recv(ch, true)
-    } else if use_reply_cap {
-        crate::send_on_reply(ch.reply_cap, len, r0, 0, 0, 0);
-        pump_recv(ch, true)
-    } else {
-        crate::reply_recv_full(ch.fault_ep, len, r0, 0, 0, 0)
-    }
-}
-
-// =============================================================================================
-// ★ PER-DISPATCH REQUEST↔REPLY BINDING (the nesting-safe correlation token). LEGACY — win32k only
-// until Phase 2; the IRP substrate no longer uses any of it.
-//
-// The dispatch transport is a plain Send/Recv pair on ONE endpoint. `component_main` publishes its
-// completion BEFORE it waits for the next request, so nothing in the raw shape ties a received
-// `dispatch_label` message to the request THIS pump just sent — a `done` queued for an earlier
-// cycle satisfies the recv just as well, the two sides drift one message apart, and one dispatch
-// later BOTH block in `Send` on the same endpoint (a deadlock with no fault and no log line).
-//
-// The IRP substrate repairs that with the `SH_REQ_SEQ` handshake. That handshake CANNOT be used on
-// win32k's Syscall substrate, because win32k's dispatch loop legitimately RE-ENTERS: an outer
-// dispatch calls `KeUserModeCallback`, parks in its callback receive loop, and services NESTED
-// dispatches from the client's `WndProc` before the outer one ever completes. A shared-memory
-// counter cannot say WHICH level a completion belongs to.
-//
-// So each request now carries an EXPLICIT token in MR0 and the component ECHOES it in its
-// completion (`driver_launch::send_done_on`). Every pump level matches ONLY its own token, so
-// nesting is naturally correct at arbitrary depth: the outer dispatch's `done` cannot satisfy the
-// nested dispatch's recv (different tokens) and vice versa. A stale or misordered `done` is
-// consumed, counted, and re-waited past instead of being mistaken for the current one.
-//
-// The one level that does not send its own request is the CALLBACK RESUME: it wakes the SUSPENDED
-// outer dispatch, whose token was allocated by the pump that got suspended. Those pumps therefore
-// push their token onto an explicit LIFO stack and leave it there while suspended, and the resume
-// pump expects the token on TOP. Because win32k's re-entrancy is strictly LIFO (one component TCB;
-// syscall→callback→syscall→callback→… unwinds innermost-first), top-of-stack is always exactly the
-// dispatch a resume is resuming. See `docs/component-harness.md` §7.
-// =============================================================================================
-
-/// Monotonic per-dispatch token allocator. Never hands out 0 — 0 is reserved for the component's
-/// INITIAL ready signal (sent before any request exists), which no pump ever matches against.
-static DISPATCH_TOKEN_NEXT: AtomicU64 = AtomicU64::new(1);
-
-/// Max concurrently-suspended dispatch levels (syscall→callback→syscall→…). win32k's own callback
-/// machinery bounds nesting well below this (`nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH`); the
-/// stack fails SAFE (falls back to today's unbound accept) rather than corrupting on overflow.
-const DISPATCH_TOKEN_STACK_MAX: usize = 32;
-static mut DISPATCH_TOKEN_STACK: [u64; DISPATCH_TOKEN_STACK_MAX] = [0; DISPATCH_TOKEN_STACK_MAX];
-static DISPATCH_TOKEN_DEPTH: AtomicU64 = AtomicU64::new(0);
-/// High-water nesting depth actually observed (observability for the nested-binding gate spec).
-pub(crate) static DISPATCH_TOKEN_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
-/// `done` messages rejected because their echoed token belonged to a DIFFERENT dispatch level (or
-/// to a dispatch already completed) — the LEGACY (win32k-only) analogue of the binding the `Call`
-/// transport now gets from the kernel.
-pub(crate) static PUMP_TOKEN_MISMATCHES: AtomicU64 = AtomicU64::new(0);
-
-unsafe fn dispatch_token_push(token: u64) -> bool {
-    let depth = DISPATCH_TOKEN_DEPTH.load(Ordering::Relaxed) as usize;
-    if depth >= DISPATCH_TOKEN_STACK_MAX {
-        return false;
-    }
-    (*core::ptr::addr_of_mut!(DISPATCH_TOKEN_STACK))[depth] = token;
-    let new_depth = depth as u64 + 1;
-    DISPATCH_TOKEN_DEPTH.store(new_depth, Ordering::Relaxed);
-    if new_depth > DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed) {
-        DISPATCH_TOKEN_MAX_DEPTH.store(new_depth, Ordering::Relaxed);
-    }
-    true
-}
-
-unsafe fn dispatch_token_top() -> Option<u64> {
-    let depth = DISPATCH_TOKEN_DEPTH.load(Ordering::Relaxed) as usize;
-    depth
-        .checked_sub(1)
-        .map(|index| (*core::ptr::addr_of!(DISPATCH_TOKEN_STACK))[index])
-}
-
-unsafe fn dispatch_token_pop(token: u64) {
-    let depth = DISPATCH_TOKEN_DEPTH.load(Ordering::Relaxed) as usize;
-    if let Some(index) = depth.checked_sub(1) {
-        if (*core::ptr::addr_of!(DISPATCH_TOKEN_STACK))[index] == token {
-            DISPATCH_TOKEN_DEPTH.store(index as u64, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Current suspended-dispatch nesting depth (0 = win32k holds no suspended dispatch).
-pub(crate) fn dispatch_token_depth() -> u64 {
-    DISPATCH_TOKEN_DEPTH.load(Ordering::Relaxed)
-}
-
-/// The token of the INNERMOST outstanding dispatch (the one a callback-resume would complete), or 0
-/// when none is outstanding. Read by the nested fault injection so it can publish a `done` carrying
-/// exactly the SUSPENDED OUTER dispatch's token — the realistic misordering.
-pub(crate) fn suspended_dispatch_token() -> u64 {
-    unsafe { dispatch_token_top().unwrap_or(0) }
+unsafe fn pump_resume_recv(ch: &PumpChannel, len: u64, r0: u64) -> (u64, u64, u64, u64, u64) {
+    pump_reply_on(ch, len, r0);
+    pump_recv(ch)
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
@@ -815,77 +727,46 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // `caps.client_attach` here gates only the DEMAND-FAULT foreign-frame sharing (pump step 4); the
     // initial attach is the caller's, matching the design's caller-owns-fill split.
 
-    // The nested-reply transport (win32k Fix B): when `nested_reply_cap` and a REPLY_W32 cap is bound,
-    // recv/resume through it (recv_full_r12 / send_on_reply) so the outer csrss caller's reply binding
-    // survives across win32k's nested demand-page faults; else use the legacy ep_recv/reply_recv on the
-    // fault EP (the FSD path). This is the LOAD-BEARING nesting fix — kept strictly gated (never merged).
-    // ★ THE `Call` TRANSPORT (the IRP substrate). The component is blocked in a `Call` bound to
+    // ★ THE `Call` TRANSPORT — now the ONLY one. The component is blocked in a `Call` bound to
     // `reply_cap`; we ANSWER it with the request (`InitialAction::ReplyRequest`) or, mid-DriverEntry,
     // start by RECEIVING its ready/fault Call (`RecvFirst`). Every recv re-registers `reply_cap`, so
-    // the kernel — not us — is what binds a completion to the request that provoked it.
-    let call_transport = ch.transport == Transport::Call;
-    let use_reply_cap = call_transport || (ch.caps.nested_reply_cap && ch.reply_cap != 0);
-
-    // ★ Per-dispatch token (see the block comment above). A pump that SENDS a request allocates one
-    // and (on the nesting-capable substrate) pushes it, so a callback suspension leaves it live for
-    // the eventual resume. A RESUME pump inherits the suspended dispatch's token from the top of the
-    // stack. The DriverEntry-init shape sends nothing and matches nothing (the component's ready
-    // signal carries token 0 by construction).
-    let nesting = ch.caps.usermode_callback && !call_transport;
-    let expected_token: Option<u64> = if call_transport {
-        None // the kernel's `bound_tcb` IS the correlation state; no userspace token exists
-    } else if resume_user_callback {
-        dispatch_token_top()
-    } else if ch.wake_first {
-        let token = DISPATCH_TOKEN_NEXT.fetch_add(1, Ordering::Relaxed);
-        if nesting && !dispatch_token_push(token) {
-            crate::print_str(b"[pump] dispatch-token stack overflow -> binding disabled for this dispatch\n");
-            None
-        } else {
-            Some(token)
-        }
+    // the kernel — not us — is what binds a completion to the request that provoked it. ONE reply
+    // object per component suffices at ANY nesting depth: the component host has ONE TCB, so it is
+    // blocked in at most one Call, and the "stack" of suspended levels is its own C stack.
+    //
+    // The request TAG rides in MR0, NOT in the message label — `reply_on` is a `SYS_CALL` on a
+    // non-endpoint cap, so a non-zero label is parsed as an `InvocationLabel` and rejected before it
+    // ever reaches `decode_reply` (see [`REQUEST_TAG_LEN`]). A fresh dispatch hands over
+    // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
+    // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
+    let request_tag = if resume_user_callback {
+        crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
     } else {
-        None
+        ch.dispatch_label
     };
-    // We own the top of the token stack iff we pushed it (fresh dispatch) or inherited it (resume).
-    let owns_token_stack_top = nesting && expected_token.is_some();
-    let token_binding = crate::W32_DISPATCH_TOKEN_BINDING && expected_token.is_some();
 
-    // Wake the server (per-request shape), then pump its faults until it re-parks or walls. The
-    // DriverEntry-init shape (`wake_first=false`) starts by RECEIVING — the component is a blocked
-    // sender (mid-init fault / ready-Send), so a leading Send would deadlock against it.
-    if call_transport {
-        // ★ ONE non-blocking reply hands over the request. There is no wake `Send` any more, so
-        // there is no window in which the executive can block against a component that is running
-        // rather than receiving (defect 3). `RecvFirst` means the component has not yet issued the
-        // Call we would be answering (mid-DriverEntry), so we just receive.
-        if ch.initial == InitialAction::ReplyRequest {
-            // ★ The request TAG rides in MR0, NOT in the message label — see [`REQUEST_TAG_LEN`].
-            if pump_reply_on(ch, REQUEST_TAG_LEN, ch.dispatch_label) == 0 {
-                PUMP_CALL_REQUESTS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    } else if resume_user_callback {
-        if !use_reply_cap {
-            return PumpResult {
-                status: 0xC000_0001u32 as i32,
-                completed: false,
-                callback_suspended: false,
-                wall_ip: 0,
-                wall_addr: 0,
-                wall_label: crate::win32k_subsystem::W32_USER_CALLBACK_LABEL,
-                faults: 0,
-                demand: 0,
-            };
-        }
-        crate::ep_send(
-            ch.fault_ep,
-            crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
-        );
-    } else if ch.wake_first {
-        crate::ep_send_token(ch.fault_ep, ch.dispatch_label, expected_token.unwrap_or(0));
+    // Nesting OBSERVABILITY only (no correlation depends on it): a pump that hands over a request
+    // owns one outstanding dispatch level; a RESUME pump inherits the level its suspension left
+    // outstanding. The `RecvFirst` DriverEntry-init shape owns none (the component's ready Call is a
+    // completion that answers no request).
+    let owns_depth = ch.caps.usermode_callback
+        && (resume_user_callback || ch.initial == InitialAction::ReplyRequest);
+    if resume_user_callback {
+        SUSPENDED_COMPONENT_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    } else if owns_depth {
+        dispatch_depth_enter();
     }
-    let (mut mi, mut m0, mut m1, mut _m2, mut _m3) = pump_recv(ch, use_reply_cap);
+
+    // ★ ONE non-blocking reply hands over the request. There is no wake `Send` any more, so there is
+    // no window in which the executive can block against a component that is running rather than
+    // receiving (defect 3). `RecvFirst` means the component has not yet issued the Call we would be
+    // answering (mid-DriverEntry), so we just receive.
+    if ch.initial == InitialAction::ReplyRequest
+        && pump_reply_on(ch, REQUEST_TAG_LEN, request_tag) == 0
+    {
+        PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    let (mut mi, mut m0, mut m1, mut _m2, mut _m3) = pump_recv(ch);
     let mut faults = 0u64;
     let mut demand = 0u64;
     let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded → a looping assert walls)
@@ -895,44 +776,16 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     loop {
         let label = mi >> 12;
         if label == ch.dispatch_label {
-            // ★ Under the `Call` transport there is nothing to check. This message is the return
-            // half of the component's OWN `Call`, the kernel bound our reply object to that exact
-            // caller when it paired, and the component could not have spoken at all without first
-            // being replied to. A stale or misdirected completion is UNREPRESENTABLE — which is why
-            // the sequence handshake and the token stack are gone from this path.
-            if call_transport {
-                PUMP_CALL_DISPATCHES.fetch_add(1, Ordering::Relaxed);
-                completed = true;
-                break;
-            }
-            // ★ THE PER-DISPATCH BINDING (LEGACY, win32k only until Phase 2). `m0` is the token the
-            // component echoed from the request it actually ran. A different token means this `done`
-            // answers a DIFFERENT dispatch level (a stale completion, or one that raced past us) —
-            // it is NOT ours. Consume it and keep waiting, so the transport stays in phase and no
-            // level ever reads another's result.
-            if token_binding && m0 != expected_token.unwrap_or(0) {
-                if PUMP_TOKEN_MISMATCHES.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::print_str(b"[pump] done token=");
-                    crate::print_u64(m0);
-                    crate::print_str(b" != this dispatch's token=");
-                    crate::print_u64(expected_token.unwrap_or(0));
-                    crate::print_str(b" (depth=");
-                    crate::print_u64(dispatch_token_depth());
-                    crate::print_str(b") -> re-waiting\n");
-                }
-                let (nmi, nm0, nm1, nm2, nm3) = pump_recv(ch, use_reply_cap);
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                _m2 = nm2;
-                _m3 = nm3;
-                continue;
-            }
+            // ★ There is nothing to check. This message is the return half of the component's OWN
+            // `Call`, the kernel bound our reply object to that exact caller when it paired, and the
+            // component could not have spoken at all without first being replied to. A stale or
+            // misdirected completion is UNREPRESENTABLE — which is why the sequence handshake and
+            // the per-dispatch token stack are gone.
+            PUMP_CALL_DISPATCHES[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
             completed = true;
             break;
         } else if label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL
             && ch.caps.usermode_callback
-            && use_reply_cap
         {
             let disposition = ch
                 .callback_client
@@ -944,14 +797,19 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 break;
             };
             if disposition == crate::win32k_glue::UserCallbackDisposition::SuspendComponent {
+                // ★ THE SUSPENSION IS A NON-REPLY. We simply RETURN without answering, so `R` stays
+                // BOUND to the component's callback `Call` for the whole callback excursion (client
+                // redirect → arbitrarily deep nested dispatches → `NtCallbackReturn`). That kernel
+                // binding IS the "suspended outer dispatch" state; we keep none of our own.
                 callback_suspended = true;
                 break;
             }
-            crate::ep_send(
-                ch.fault_ep,
+            // Answer the callback in place: the RESUME tag on the component's outstanding Call.
+            let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(
+                ch,
+                REQUEST_TAG_LEN,
                 crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
             );
-            let (nmi, nm0, nm1, nm2, nm3) = pump_recv(ch, use_reply_cap);
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -1051,18 +909,21 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                     break;
                 }
                 let page = addr & !0xFFF;
-                crate::driver_launch::ensure_paging(page, ch.pml4);
+                if ch.caps.sparse_vspace {
+                    crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                } else {
+                    crate::driver_launch::ensure_paging(page, ch.pml4);
+                }
                 let f = crate::alloc_frame();
                 let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
                 demand += 1;
             }
-            // Resume the server + recv the next fault/DONE. Under the `Call` transport this is
-            // `reply_on(R, len 0)` — a VMFault reply, which `apply_fault_reply` restarts
-            // unconditionally (`fault.rs`) — followed by a recv that re-registers `R`. The legacy
-            // paths are unchanged: win32k (nested_reply_cap) resumes through the bound REPLY_W32 cap,
-            // the pre-migration FSD used `reply_recv_full`.
-            let (nmi, nm0, nm1, nm2, nm3) =
-                pump_resume_recv(ch, call_transport, use_reply_cap, 0, 0);
+            // Resume the server + recv the next fault/DONE: `reply_on(R, len 0)` — a VMFault reply,
+            // which `apply_fault_reply` restarts unconditionally (`fault.rs`) — followed by a recv
+            // that re-registers `R`. A nested demand fault therefore rides the SAME reply object as
+            // the dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
+            // REPLY_MAIN binding is untouched) with no second transport to keep gated.
+            let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 0, 0);
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -1078,7 +939,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             let is_int2c = in_win32k
                 && core::ptr::read_volatile(ip as *const u8) == 0xCD
                 && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
-            if is_int2c && ch.reply_cap != 0 && skips < W32_ASSERT_SKIP_BOUND {
+            // Gated on `caps.assert_skip` (win32k only) — NOT on `reply_cap != 0`, which is now
+            // mandatory on every channel and would silently widen this arm to the FSD (risk R10).
+            if is_int2c && skips < W32_ASSERT_SKIP_BOUND {
                 // Verbose grind-era trace: the per-skip int-0x2c diagnostic (bounded to 40). Gated
                 // behind `debug-trace` — pure noise once the boot is stable, not load-bearing.
                 if crate::DEBUG_TRACE
@@ -1092,7 +955,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 // UserException(3) reply: len 1, MR0 = the resume FaultIP (past `CD 2C`). This is
                 // the ONLY non-zero-length reply the component pump ever emits (risk R4).
                 let (nmi, nm0, nm1, nm2, nm3) =
-                    pump_resume_recv(ch, call_transport, use_reply_cap, 1, ip + 2);
+                    pump_resume_recv(ch, 1, ip + 2);
                 mi = nmi;
                 m0 = nm0;
                 m1 = nm1;
@@ -1121,12 +984,14 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             break;
         }
     }
-    // ★ Retire this level's token UNLESS the dispatch is now SUSPENDED inside a usermode callback —
-    // in that case it stays live on the stack, because the eventual callback-resume pump is the one
-    // that will match its completion. A wall retires it too: nobody is waiting for that reply any
-    // more, so a late `done` carrying it must be rejected by the next pump (which it will be).
-    if owns_token_stack_top && !callback_suspended {
-        dispatch_token_pop(expected_token.unwrap_or(0));
+    // Retire this level from the depth GAUGE unless it is now suspended inside a usermode callback
+    // (in which case it stays outstanding until a resume pump completes it). Observability only.
+    if owns_depth {
+        if callback_suspended {
+            SUSPENDED_COMPONENT_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+        } else {
+            dispatch_depth_leave();
+        }
     }
     // ★ RISK R2 — WALL HANDLING UNDER THE `Call` TRANSPORT.
     //
@@ -1139,9 +1004,11 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // option and no kernel invocation to unbind a reply object.
     //
     // So we take the honest one: SUSPEND the component's TCB. It stops running, its reply object is
-    // left bound to a thread that will never run again, and the caller (`dispatch_irp`) retires the
-    // instance so nothing ever pumps it a second time. A walled driver is dead, and it now says so.
-    if call_transport && !completed && !callback_suspended {
+    // left bound to a thread that will never run again, and the caller retires it so nothing ever
+    // pumps it a second time (`dispatch_irp` → `register_instance_ready(inst,false)`;
+    // `win32k_dispatch_wide` → `WIN32K_RETIRED`). A walled component is dead, and it now says so.
+    // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
+    if !completed && !callback_suspended {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         let e = if ch.tcb != 0 { crate::tcb_suspend_r(ch.tcb) } else { 0xFFFF };
         crate::print_str(b"[pump] WALL label=");
@@ -1219,8 +1086,8 @@ pub(crate) struct DispatchReq {
 /// The component-side shared entry (Family A): read the DriverEntry RVA from the shared frame, build
 /// a `DriverObjectSpec`-shaped DRIVER_OBJECT + a zero-length RegistryPath from the pool, mark
 /// `V_ENTERED`, call `DriverEntry`, record the verdict/status, run `post_driver_entry` (win32k:
-/// establish-client; FSD: no-op — MUST run between DriverEntry and the FIRST send_done), then loop
-/// `send_done → recv_req → dispatch(req) → write SH_REQ_STATUS + bump SH_REQ_SEQ`.
+/// establish-client; FSD: no-op — MUST run between DriverEntry and the FIRST completion `Call`),
+/// then loop `call_on(completion) → dispatch(request) → write SH_REQ_STATUS`.
 ///
 /// `code_va` is the loaded image base (DriverEntry = code_va + entry_rva). `dispatch` is the KIND
 /// router (FSD: major→run_irp; win32k: ssn→dispatch_ssn). This is the shape both
@@ -1233,7 +1100,6 @@ pub(crate) unsafe fn component_main(
     dispatch_label: u64,
     dispatch: unsafe fn(&DispatchReq) -> (i32, u64),
     post_driver_entry: unsafe fn(status: i32, drv: u64),
-    transport: Transport,
 ) -> ! {
     let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
 
@@ -1288,66 +1154,36 @@ pub(crate) unsafe fn component_main(
 
     post_driver_entry(status, drv);
 
-    // ★ THE PERSISTENT DISPATCH LOOP.
+    // ★ THE PERSISTENT DISPATCH LOOP — ONE syscall.
     //
-    // Under [`Transport::Call`] it is ONE syscall: `call_on` publishes this dispatch's completion
-    // (the status/info are already in the shared frame) AND returns the next request as its reply
-    // value. The very first Call is the post-DriverEntry READY signal — no request has been
-    // received yet, which is exactly why the executive's init pump starts with `RecvFirst`.
+    // `call_on` publishes this dispatch's completion (the status/info are already in the shared
+    // frame) AND returns the next request as its reply value. The very first Call is the
+    // post-DriverEntry READY signal — no request has been received yet, which is exactly why the
+    // executive's init pump starts with `RecvFirst`.
     //
-    // Everything the legacy loop needed to reconstruct the request↔completion binding in userspace
-    // — the correlation token, the `SH_REQ_SEQ` counter, the slip injector — is GONE: the component
-    // is `BlockedOnReply` between the Call and the executive's reply, so it cannot publish a second
-    // completion, and the executive's reply cannot reach any thread but this one.
-    if transport == Transport::Call {
-        loop {
-            // The reply's message LABEL is always 0 (see `REQUEST_TAG_LEN`); the request tag is in
-            // MR0. The IRP substrate has exactly one request kind, so it is only checked in Phase 2.
-            let (_label, _tag, _, _, _) = crate::driver_launch::call_on(dispatch_label << 12);
-            let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
-            let (st, info) = dispatch(&DispatchReq { sel, drv });
-            // Write info FIRST, then status LAST — see the legacy arm below for why the order matters
-            // on win32k's aliased status/info offset.
-            core::ptr::write_volatile((shared_va + SH_REQ_INFO_H) as *mut u64, info);
-            core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
-        }
-    }
-
-    // ── LEGACY Send/Recv transport (win32k only, deleted in Phase 2). `token` is the executive's
-    // per-dispatch correlation token for the request whose completion the NEXT `send_done_on`
-    // publishes; 0 for the very first send, which is the DriverEntry ready signal.
-    let mut seq = 0u64;
-    let mut token = 0u64;
+    // Everything the hand-rolled loop needed to reconstruct the request↔completion binding in
+    // userspace — the correlation token, the `SH_REQ_SEQ` counter, the slip injectors — is GONE: the
+    // component is `BlockedOnReply` between the Call and the executive's reply, so it cannot publish
+    // a second completion, and the executive's reply cannot reach any thread but this one.
+    //
+    // The reply's message LABEL is always 0 (`REQUEST_TAG_LEN`); the request tag is in MR0. This
+    // OUTER loop only ever receives `dispatch_label` — the callback-RESUME tag is answered to the
+    // rendezvous loop's own Call, deeper in this same component's C stack.
     loop {
-        crate::driver_launch::send_done_on(dispatch_label, token);
-        let (_label, request_token) = crate::driver_launch::recv_req_on();
-        token = request_token;
+        let (_label, _tag, _, _, _) = crate::driver_launch::call_on(dispatch_label << 12);
         let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
         let (st, info) = dispatch(&DispatchReq { sel, drv });
-        // Write info FIRST, then status LAST: the FSD has distinct offsets (status@0x70, info@0x78) so
-        // order is irrelevant; win32k's status@0x78 ALIASES info@0x78, so writing info(0) first and
-        // status last means the status is what survives at 0x78 (win32k's closure returns info=0). This
-        // ordering is byte-behaviour-identical for the FSD and correct for the win32k status/info alias.
+        // Write info FIRST, then status LAST: the FSD has distinct offsets (status@0x70, info@0x78)
+        // so order is irrelevant; win32k's status@0x78 ALIASES info@0x78, so writing info(0) first
+        // and status last means the status is what survives at 0x78 (win32k's closure returns
+        // info=0). Byte-behaviour-identical for the FSD and correct for the win32k alias.
         core::ptr::write_volatile((shared_va + SH_REQ_INFO_H) as *mut u64, info);
         core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
-        seq += 1;
-        core::ptr::write_volatile((shared_va + SH_REQ_SEQ) as *mut u64, seq);
         let _ = CM_TRACE;
     }
 }
 
 static mut CM_TRACE: u32 = 0;
-/// ★ NESTED (win32k Syscall substrate) slip injector — gate spec
-/// `exec_win32k_dispatch_in_phase_nested`. Set to 1 with [`W32_SLIP_INJECT_TOKEN`] holding the
-/// SUSPENDED OUTER dispatch's token; the next NESTED dispatch win32k services from inside its
-/// usermode-callback receive loop then publishes a `done` carrying that OUTER token BEFORE it runs.
-/// That is precisely the misordering a sequence counter cannot see (the outer dispatch's completion
-/// arriving while a deeper level is in flight), and the per-dispatch token binding must reject it.
-/// One-shot: the component clears it as it consumes it.
-pub(crate) static W32_SLIP_INJECT: AtomicU64 = AtomicU64::new(0);
-/// The (stale) token [`W32_SLIP_INJECT`] makes the component echo. Written by the injector.
-pub(crate) static W32_SLIP_INJECT_TOKEN: AtomicU64 = AtomicU64::new(0);
-
 // Header-prefix offsets shared by both Family-A frames (design §1.2 "the header prefix (0x00-0x30)
 // is the same shape"). These name the SAME bytes the FSD/win32k modules already use under their own
 // const names; `component_main` uses these generic names.

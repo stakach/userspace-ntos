@@ -768,15 +768,6 @@ pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
 /// `FSD_DISPATCH_SEQ_HANDSHAKE` bypass switch this replaces is GONE: under the `Call` transport a
 /// stale completion is unrepresentable, so there is no workaround left to switch off.
 static TRANSPORT_IRP_ROUNDTRIP: AtomicBool = AtomicBool::new(false);
-/// **PER-DISPATCH REQUEST↔REPLY TOKEN BINDING switch** (bypass experiment for
-/// `exec_win32k_dispatch_in_phase_nested`). `true` in tree = every dispatch request carries a
-/// correlation token in MR0 which the component ECHOES in its completion, and each pump level
-/// accepts ONLY the `done` carrying its own token. That is what makes the transport correlation-safe
-/// under win32k's usermode-callback RE-ENTRY, where the `SH_REQ_SEQ` handshake cannot be used at all
-/// (a shared-memory counter cannot say WHICH nesting level a completion belongs to). `false`
-/// restores "any `dispatch_label` message ends the pump", so a misordered completion is accepted by
-/// the wrong level — the phase slip that deadlocks the boot. See [`spawn_hosts::component_pump`].
-pub const W32_DISPATCH_TOKEN_BINDING: bool = true;
 /// **`KeBugCheckEx` BINDING switch** (bypass experiment for `exec_kebugcheck_bound_and_reported`).
 /// `true` in tree = a hosted driver's own consistency bugcheck (npfs' `NpBugCheck`) is caught,
 /// reported with its code + 4 parameters + raising component, and the offending dispatch is failed
@@ -3872,37 +3863,6 @@ unsafe fn nb_recv(ntfn: u64) -> u64 {
         options(nostack),
     );
     badge
-}
-
-/// A plain, blocking `seL4_Send(ep, label)` with a length-0 message — used to wake the win32k
-/// dispatch component (fix A: Send/Recv handshake, no reply cap → the kernel's single `reply_to`
-/// slot is untouched, so a csrss syscall reply in flight on the same executive thread survives).
-unsafe fn ep_send(ep: u64, label: u64) {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") ep,
-        in("rsi") label << 12,
-        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// [`ep_send`] carrying a PER-DISPATCH CORRELATION TOKEN in MR0 (`r10`), message length 1. The
-/// component echoes the token back in its completion (`driver_launch::send_done_on`), which is what
-/// binds a `done` to the request that provoked it — the nesting-safe replacement for "any
-/// `dispatch_label` message ends the pump". See [`spawn_hosts::component_pump`].
-unsafe fn ep_send_token(ep: u64, label: u64, token: u64) {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") ep,
-        in("rsi") (label << 12) | 1,
-        in("r10") token, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
 }
 
 unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
@@ -7544,10 +7504,11 @@ static DBGK_BREAKIN_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// the recovery was observed on the live boot.
 static DEAD_CLIENT_UNWIND_INJECTION: AtomicU64 = AtomicU64::new(0);
 /// NESTED DISPATCH-BINDING fault-injection result (post-quiesce). Proof mask for
-/// `exec_win32k_dispatch_in_phase_nested`; see `win32k_glue::inject_win32k_nested_dispatch_slip` for
-/// what each `NESTED_SLIP_*` bit means. `0x3F` = a misordered completion really was published while
-/// a nested callback dispatch was in flight, the nested pump really rejected it and still matched
-/// its own reply, and the suspended OUTER dispatch really completed through the resume pump.
+/// `exec_win32k_transport_call_nested`; see `win32k_glue::inject_win32k_nested_dispatch_slip` for
+/// what each `NESTED_SLIP_*` bit means. `0x3F` = the outer dispatch really was suspended holding the
+/// component's ONE reply object, the object really stayed bound across the client redirect, a nested
+/// dispatch really ran on it at depth >= 2 and returned its own result, and the suspended OUTER
+/// dispatch really completed through the resume reply on that same object.
 static WIN32K_NESTED_SLIP_INJECTION: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
@@ -10195,71 +10156,48 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 sc.pml4
             };
 
-            const DEMAND_CAP: u64 = 512;
+            // ★ THE DRIVER-ENTRY INIT LOOP IS NOW THE SHARED PUMP (`docs/transport-migration.md`
+            // Phase 2 step 3). It used to be a bespoke `ep_recv_full` + `reply_recv_full` pair right
+            // here, riding the LEGACY per-TCB `reply_to`. Two reasons it had to migrate:
+            //   * after DriverEntry the component must end up BLOCKED IN A `Call` (the steady state
+            //     every later dispatch answers), not parked in a bare `Recv`;
+            //   * its demand-page faults are Calls too, and answering them through `reply_to`
+            //     instead of `R_win32k` is precisely the clobber this migration removes.
+            // `RecvFirst`: the component is mid-DriverEntry — a blocked SENDER (fault Call) or about
+            // to issue its ready Call — so the pump starts by RECEIVING, exactly as the old loop did.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
-            let mut faults = 0u64;
-            let mut demand = 0u64;
-            let mut finished = false;
-            let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
-            let (mut _bdg, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(w_fault);
-            loop {
-                let label = mi >> 12;
-                if label == 6 {
-                    // VMFault: MR0 = fault IP, MR1 = fault address.
-                    let ip = m0;
-                    let addr = m1;
-                    faults += 1;
-                    if faults <= 40 {
-                        print_str(b"[win32k-svc] fault #");
-                        print_u64(faults);
-                        print_str(b" ip=0x");
-                        print_hex((ip >> 32) as u32);
-                        print_hex(ip as u32);
-                        print_str(b" RVA=0x");
-                        print_hex(ip.wrapping_sub(code_va) as u32);
-                        print_str(b" addr=0x");
-                        print_hex((addr >> 32) as u32);
-                        print_hex(addr as u32);
-                        print_str(b"\n");
-                    }
-                    // A null-region deref (missing/too-shallow placeholder), a W^X write into the
-                    // RX image, or a runaway is a real wall — stop and report. Otherwise demand-map
-                    // a zero page and resume.
-                    let in_image = addr >= code_va
-                        && addr < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
-                    if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
-                        wall_ip = ip;
-                        wall_addr = addr;
-                        wall_label = label;
-                        break;
-                    }
-                    // Ensure the page's table exists (SYS_SEND page_map can't report a missing-PT
-                    // error to drive a retry — critical for the demand-mapped pool at 0x0A00 whose
-                    // 2 MiB PTs aren't pre-created), then zero-fill.
-                    let page = addr & !0xFFF;
-                    ensure_w32_client_paging(page, host_pml4);
-                    let f = alloc_frame();
-                    let _ = page_map(f, page, RW_NX, host_pml4);
-                    demand += 1;
-                    let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
-                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-                    continue;
-                } else if label == win32k_subsystem::W32_DISPATCH_LABEL {
-                    // DriverEntry+attach complete: the component reached its dispatch loop and sent
-                    // its ready signal (fix A: a plain `send_done` on the fault EP). It is now blocked
-                    // in `recv_req` awaiting a request — `win32k_dispatch` wakes it with a plain Send.
-                    let _ = (m2, m3);
-                    finished = true;
-                    break;
-                } else {
-                    // UnknownSyscall(2)/UserException(3)/CapFault(1): win32k hit a fail-loud
-                    // trap import, a bad IAT slot, or an invalid instruction. Record + stop.
-                    wall_ip = m0;
-                    wall_addr = m1;
-                    wall_label = label;
-                    break;
-                }
-            }
+            let init_ch = spawn_hosts::PumpChannel {
+                fault_ep: w_fault,
+                pml4: host_pml4,
+                code_va,
+                image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+                shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
+                dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+                demand_cap: 512,
+                trace_faults: true,
+                initial: spawn_hosts::InitialAction::RecvFirst,
+                tcb: WIN32K_TCB.load(Ordering::Relaxed),
+                reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
+                client_pi: 0,
+                callback_client: None,
+                // DriverEntry runs before any client exists: no client_attach (its faults are its
+                // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
+                // bespoke loop implemented inline.
+                caps: spawn_hosts::HostCaps {
+                    dispatch_server: true,
+                    kind: spawn_hosts::ReqKind::Syscall,
+                    // win32k's VSpace is sparse — its init faults need the whole PDPT/PD/PT walk
+                    // built (what the bespoke loop's inline `ensure_w32_client_paging` did).
+                    sparse_vspace: true,
+                    ..spawn_hosts::HostCaps::default()
+                },
+            };
+            let init_pr = spawn_hosts::component_pump(&init_ch);
+            let faults = init_pr.faults;
+            let demand = init_pr.demand;
+            let finished = init_pr.completed;
+            let (wall_ip, wall_addr, wall_label) =
+                (init_pr.wall_ip, init_pr.wall_addr, init_pr.wall_label);
 
             // If DriverEntry+attach parked the component at the dispatch sentinel (`finished`), it is
             // now blocked awaiting reply — record its fault EP + host PML4 so `win32k_dispatch` can
@@ -10422,12 +10360,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     0x240,
                     0,
                 );
-                let seq = core::ptr::read_volatile(
-                    (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_REQ_SEQ) as *const u64,
-                );
+                // The component-written `SH_REQ_SEQ` counter is gone with the hand-rolled transport;
+                // the KERNEL-attested count of completions that arrived as the return value of
+                // win32k's own `Call` is the stronger evidence that replaces it.
+                let seq = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
                 print_str(b"[win32k-svc] DISPATCH-LOOP round-trip: SSN 0x10FA -> status=0x");
                 print_hex(st as u32);
-                print_str(if ok { b" (serviced, seq=" } else { b" (WALL, seq=" });
+                print_str(if ok { b" (serviced, call-bound completions=" } else { b" (WALL, call-bound completions=" });
                 print_u64(seq);
                 print_str(b")\n");
                 check(b"win32k_dispatch_loop_roundtrip", ok && seq >= 1, &mut passed);
@@ -10439,12 +10378,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // sentinel. A clean round-trip means the dispatch fault path no longer depends on
                 // reply_to — so a nested faulting SSN can't clobber an outer caller's pending reply.
                 let (fst, fok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
-                let fseq = core::ptr::read_volatile(
-                    (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_REQ_SEQ) as *const u64,
-                );
+                let fseq = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
                 print_str(b"[win32k-svc] FAULTING dispatch (reply-cap path): status=0x");
                 print_hex(fst as u32);
-                print_str(if fok { b" (serviced, seq=" } else { b" (WALL, seq=" });
+                print_str(if fok { b" (serviced, call-bound completions=" } else { b" (WALL, call-bound completions=" });
                 print_u64(fseq);
                 print_str(b")\n");
                 check(
@@ -12270,8 +12207,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // NOTE: `call_requests` is legitimately 2 LOWER than `call_dispatches` — the two
     // `InitialAction::RecvFirst` DriverEntry-init pumps (npfs + IrpFsdTest) complete a dispatch
     // without ever issuing a request reply, because the component's ready Call IS the completion.
-    let call_requests = spawn_hosts::PUMP_CALL_REQUESTS.load(Ordering::Relaxed);
-    let call_dispatches = spawn_hosts::PUMP_CALL_DISPATCHES.load(Ordering::Relaxed);
+    let call_requests = spawn_hosts::pump_call_requests(spawn_hosts::ReqKind::Irp);
+    let call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Irp);
     let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
     // (3) The unbound-reply probe. `REPLY_FSD_SLOT` is sized at MAX_DRIVER_INSTANCES but only the
@@ -12415,41 +12352,90 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
-    // --- ★ THE COMPONENT-DISPATCH TRANSPORT IS IN PHASE **UNDER NESTING** (win32k's Syscall
-    // substrate). The IRP substrate has moved to the kernel-bound `Call`/reply-object transport
-    // (`exec_irp_transport_call_bound`); win32k is still on the LEGACY Send/Recv rendezvous until
-    // Phase 2, and its correlation is a per-dispatch token because its dispatch loop legitimately
-    // RE-ENTERS — an outer dispatch parks inside `KeUserModeCallback` while the client's redirected
-    // `WndProc` issues NESTED `NtUser*`/`NtGdi*` syscalls, each a dispatch of its own, unwound
-    // innermost-first. A shared-memory sequence counter cannot name the LEVEL a completion belongs to,
-    // so the binding here is a PER-DISPATCH TOKEN carried in the request and echoed in the completion.
-    // The injection publishes a `done` carrying the SUSPENDED OUTER dispatch's token while a nested
-    // dispatch is in flight — the exact misordering the counter cannot see — and every step of the
-    // rejection AND of the correct matching (nested level gets its own reply; the outer level's
-    // completion is matched later by the RESUME pump, which never sent a request of its own) must
-    // hold. With `W32_DISPATCH_TOKEN_BINDING = false` the wrong level consumes that completion.
+    // --- ★ THE WIN32K DISPATCH TRANSPORT IS THE KERNEL'S, **UNDER REAL NESTING**.
+    //
+    // win32k's Syscall substrate is the hard case: its dispatch loop legitimately RE-ENTERS. An
+    // outer dispatch parks inside `KeUserModeCallback`, the client's redirected `WndProc` issues
+    // NESTED `NtUser*`/`NtGdi*` syscalls, and the levels unwind innermost-first — live nesting on
+    // this boot reaches depth 5. That is what made the old transport need a 32-deep LIFO token
+    // stack: a shared-memory sequence counter cannot even NAME the level a completion belongs to.
+    //
+    // Under `Call` ⇄ MCS reply object the whole plane collapses to ONE object and ZERO bookkeeping,
+    // because a component host has ONE TCB and can therefore be blocked in at most ONE `Call`:
+    //
+    //   * a dispatch = `reply_on(R_w32, tag)` on the Call win32k is blocked in; its completion is
+    //     the return value of win32k's OWN next `Call`, which the kernel bound to `R_w32` when it
+    //     paired (`endpoint.rs::finish_call` → `replies[i].bound_tcb = sender`);
+    //   * a callback SUSPEND is literally "return from the pump WITHOUT replying", so `R_w32` stays
+    //     bound to win32k's callback Call for the entire excursion — the suspended outer dispatch's
+    //     reply survives as KERNEL state;
+    //   * a NESTED dispatch is a reply on that SAME object one level deeper, and the RESUME is a
+    //     reply on it again. The "stack" of levels is win32k's own C stack.
+    //
+    // Four independent facts say the binding really is the kernel's, under real nesting:
+    //
+    //  (1) `PUMP_REPLY_ERRORS == 0` for the WHOLE boot — every reply the pump ever issued, on either
+    //      substrate, found its object BOUND. A label-0 result is the kernel attesting that the
+    //      component had issued exactly one Call since our previous reply. Measured on every single
+    //      request, not sampled.
+    //  (2) call-bound completions == `HARNESS_SYSCALL_DISPATCHES` — every serviced win32k dispatch
+    //      completed as the return value of win32k's own Call, not as "some message with the right
+    //      label" (which is all the old transport could check).
+    //  (3) The SCENARIO (`inject_win32k_nested_dispatch_slip`, post-quiesce, expendable winlogon RPC
+    //      worker, `WM_NULL`): parked → redirected → **`R_w32` still held across the redirect** →
+    //      nested dispatch returned ITS OWN result at depth >= 2 → outer dispatch resumed → drained
+    //      idle. `NESTED_SLIP_REJECTED` is GONE from that mask and `NESTED_SLIP_R_HELD` took its
+    //      place: a misordered completion is no longer something to reject, it is unrepresentable.
+    //  (4) Risk R6: `SUSPENDED_COMPONENT_OUTSTANDING == 0` at quiesce — every suspension that took
+    //      `R_w32` gave it back through one of the three resume sites (`NtCallbackReturn`,
+    //      dead-client unwind, cancel). A non-zero value is a component wedged holding the object.
+    //
+    // ★ WHY NO BYPASS SWITCH (and what stands in for one). `W32_DISPATCH_TOKEN_BINDING` could be
+    // flipped because the token binding was OUR code; "a stale completion cannot exist" is
+    // STRUCTURAL — there is no flag to turn off, because there is no mechanism left, only the
+    // kernel's `bound_tcb`. The honest substitute is the same negative control `exec_irp_transport_
+    // call_bound` uses, and it falsifies the premise this structure rests on rather than a flag of
+    // ours: replying on a reply object we KNOW is unbound returns `seL4_InvalidCapability` (2)
+    // IMMEDIATELY and without blocking. If that were not so, "label 0" would mean nothing and the
+    // executive's answer could block — the two properties the whole migration buys.
     let nested_slip = WIN32K_NESTED_SLIP_INJECTION.load(Ordering::Relaxed);
-    let token_mismatches = spawn_hosts::PUMP_TOKEN_MISMATCHES.load(Ordering::Relaxed);
-    let token_max_depth = spawn_hosts::DISPATCH_TOKEN_MAX_DEPTH.load(Ordering::Relaxed);
-    print_str(b"[harness] win32k nested dispatch-binding injection: proof=0x");
+    let w32_call_requests = spawn_hosts::pump_call_requests(spawn_hosts::ReqKind::Syscall);
+    let w32_call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
+    let w32_reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
+    let w32_max_depth = spawn_hosts::PUMP_MAX_DISPATCH_DEPTH.load(Ordering::Relaxed);
+    let w32_suspended_outstanding =
+        spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
+    let w32_retired = win32k_glue::WIN32K_RETIRED.load(Ordering::Relaxed);
+    print_str(b"[harness] win32k transport=Call requests=");
+    print_u64(w32_call_requests);
+    print_str(b" call-bound completions=");
+    print_u64(w32_call_dispatches);
+    print_str(b"/");
+    print_u64(harness_syscall);
+    print_str(b" reply-errors=");
+    print_u64(w32_reply_errors);
+    print_str(b" nesting-high-water=");
+    print_u64(w32_max_depth);
+    print_str(b" suspended-outstanding=");
+    print_u64(w32_suspended_outstanding);
+    print_str(b" walled=");
+    print_u64(w32_retired);
+    print_str(b" nested-scenario proof=0x");
     print_hex(nested_slip as u32);
     print_str(b"/0x");
     print_hex(win32k_glue::NESTED_SLIP_ALL as u32);
-    print_str(b" (parked/redirected/slip-rejected/nested-matched/outer-resumed/drained-idle) token-mismatches=");
-    print_u64(token_mismatches);
-    print_str(b" nesting-high-water=");
-    print_u64(token_max_depth);
-    print_str(b" binding=");
-    print_u64(W32_DISPATCH_TOKEN_BINDING as u64);
-    print_str(b"\n");
+    print_str(b" (parked/redirected/R-held/nested-matched/outer-resumed/drained-idle)\n");
     check(
-        b"exec_win32k_dispatch_in_phase_nested",
-        W32_DISPATCH_TOKEN_BINDING
-            && nested_slip == win32k_glue::NESTED_SLIP_ALL
-            && token_mismatches >= 1
-            // The injection really did run at depth >= 2 (an outer dispatch outstanding while a
-            // nested one was dispatched) — otherwise "nesting-safe" would be untested.
-            && token_max_depth >= 2,
+        b"exec_win32k_transport_call_nested",
+        w32_reply_errors == 0
+            && w32_call_dispatches == harness_syscall
+            && w32_call_requests >= 4
+            // The property was demonstrated at depth >= 2 (a nested dispatch really ran on the same
+            // reply object while an outer dispatch was still outstanding on it).
+            && w32_max_depth >= 2
+            && w32_suspended_outstanding == 0
+            && w32_retired == 0
+            && nested_slip == win32k_glue::NESTED_SLIP_ALL,
         &mut passed,
     );
 
