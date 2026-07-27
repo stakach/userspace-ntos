@@ -1156,6 +1156,18 @@ pub const SAMHIVEBUF_FRAMES: u64 = 8; // 32 KiB
 const _: () = assert!(SECHIVEBUF_VADDR + SECHIVEBUF_FRAMES * 0x1000 <= SAMHIVEBUF_VADDR);
 const _: () = assert!(SAMHIVEBUF_VADDR + SAMHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10BC_0000);
 const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
+/// The real ReactOS **SOFTWARE** hive (`\reactos\system32\config\software`, **471040 B** regf) —
+/// the HKLM\Software backing store, mounted read-only at `\Registry\Machine\SOFTWARE`. Same by-path
+/// staging as SECURITY/SAM, but it is ~57x their size (115 pages), so it does NOT fit in the
+/// leftover of the shared 0xA0-0xC0 input page table: it gets its OWN 2 MiB window + dedicated PT
+/// in the free gap above DMA_VADDR (0x10C0_0000, itself one dedicated 2 MiB window) and below the
+/// process-mirror region (0x1200_0000).
+pub const SWHIVEBUF_VADDR: u64 = 0x0000_0100_10E0_0000;
+pub const SWHIVEBUF_FRAMES: u64 = 128; // 512 KiB (the staged hive is 471040 B = 115 pages)
+const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 >= 471_040);
+const _: () = assert!(SWHIVEBUF_VADDR & 0x1F_FFFF == 0); // 2 MiB aligned -> exactly one PT window
+const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
+const _: () = assert!(SWHIVEBUF_VADDR >= DMA_VADDR + 0x20_0000);
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
 /// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
 pub const NLS_SMSS_ANSI_VA: u64 = 0x0000_0100_00E0_0000;
@@ -2687,6 +2699,151 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     lsa_security_database_specs(passed);
     unsafe { activation_context_stack_spec(passed) };
     winlogon_logon_action_spec(passed);
+    unsafe { software_hive_mount_spec(passed) };
+}
+
+/// ═══ THE 4TH `regf` MOUNT — `\Registry\Machine\SOFTWARE` IS REAL ═══════════════════════════════
+///
+/// The genuine ReactOS `\reactos\system32\config\software` hive (471040 B — ~57x the SECURITY/SAM
+/// hives, so it needs its own 2 MiB window + dedicated page table, not the shared input PT) is read
+/// BY PATH by the isolated storage host into SWHIVEBUF and mounted read-only through the SAME
+/// general mechanism as the other three: a `HIVE_SEL_SOFTWARE` top-nibble tag on the `KeyRef`, so
+/// `base_hive` / `registry_target_path` / `registry_value(s)` / `registry_subkeys` and the relative
+/// open/create arms all serve it with no special-casing.
+///
+/// The proof is by CONTENT, not by non-failure: this reads the LIVE mapped bytes back through the
+/// same `nt-hive-regf` parser the mount uses and asserts
+/// `Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory` really is
+/// `REG_EXPAND_SZ "%SystemDrive%\Profiles"` — the value `userenv!GetProfilesDirectoryW`
+/// (`profile.c:1592`) reads, whose absence was the `ERROR_FILE_NOT_FOUND` that made winlogon's
+/// `LoadUserProfileW` fail. Plus the live counters: winlogon really opened keys out of this mount,
+/// and its ProfileList open was really SATISFIED from it (0 with `SOFTWARE_HIVE_MOUNTED == false`).
+unsafe fn software_hive_mount_spec(passed: &mut u64) {
+    let size = SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed);
+    let opens = SOFTWARE_HIVE_KEY_OPENED.load(Ordering::Relaxed);
+    let pl_hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
+    // Re-parse the LIVE mapped bytes (not a copy) and read the real value back.
+    let mut root_subkeys = 0u64;
+    let mut val_type = 0u64;
+    let mut val_len = 0u64;
+    let mut val_ok = false;
+    if size != 0 {
+        let bytes: &'static [u8] = core::slice::from_raw_parts(SWHIVEBUF_VADDR as *const u8, size as usize);
+        if let Some(h) = RegfHive::new(bytes) {
+            root_subkeys = h.subkeys(h.root()).len() as u64;
+            if let Some(cell) = h.open_key(r"Microsoft\Windows NT\CurrentVersion\ProfileList") {
+                if let Some((ty, data)) = h.value(cell, "ProfilesDirectory") {
+                    val_type = ty as u64;
+                    val_len = data.len() as u64;
+                    // REG_EXPAND_SZ `%SystemDrive%\Profiles` + NUL, UTF-16LE = 46 bytes.
+                    const EXPECT: &[u8] = b"%SystemDrive%\\Profiles";
+                    val_ok = ty == 2
+                        && data.len() == (EXPECT.len() + 1) * 2
+                        && data
+                            .chunks(2)
+                            .zip(EXPECT.iter().map(|&c| c as u16).chain(core::iter::once(0)))
+                            .all(|(got, want)| got.len() == 2 && u16::from_le_bytes([got[0], got[1]]) == want);
+                    print_str(b"[sw-hive] ProfileList\\ProfilesDirectory = \"");
+                    for pair in data.chunks(2) {
+                        if pair.len() == 2 {
+                            let w = u16::from_le_bytes([pair[0], pair[1]]);
+                            if w != 0 && w < 128 {
+                                print_str(&[w as u8]);
+                            }
+                        }
+                    }
+                    print_str(b"\"\n");
+                }
+            }
+        }
+    }
+    print_str(b"[sw-hive] SOFTWARE mount size=");
+    print_u64(size);
+    print_str(b"B root-subkeys=");
+    print_u64(root_subkeys);
+    print_str(b" value-type=");
+    print_u64(val_type);
+    print_str(b" value-bytes=");
+    print_u64(val_len);
+    print_str(b" content-ok=");
+    print_u64(val_ok as u64);
+    print_str(b" live-key-opens=");
+    print_u64(opens);
+    print_str(b" ProfileList-hits=");
+    print_u64(pl_hits);
+    print_str(b"\n");
+    check(
+        b"exec_software_hive_mounted",
+        // The genuine 471040 B regf is staged + mapped, parses, and has its four real top-level
+        // subkeys (Classes / Clients / Microsoft / ReactOS) …
+        size == 471_040
+            && root_subkeys == 4
+            // … the ProfilesDirectory value reads back with the EXACT expected content …
+            && val_ok
+            // … and the LIVE registry served real keys out of this mount, including the
+            // ProfileList open that used to be ERROR_FILE_NOT_FOUND.
+            && opens >= 1
+            && pl_hits >= 1,
+        passed,
+    );
+    winlogon_profile_directory_spec(passed);
+}
+
+/// ═══ `GetProfilesDirectoryW` SUCCEEDS — the post-logon path is PAST its old wall ═══════════════
+///
+/// Before this batch: `HandleLogon` (`sas.c:571`) → `LoadUserProfileW` (`sas.c:626`) →
+/// `userenv!GetProfilesDirectoryW` (`profile.c:1592`) →
+/// `RegOpenKeyExW(HKLM, "Software\Microsoft\Windows NT\CurrentVersion\ProfileList")` →
+/// **`ERROR_FILE_NOT_FOUND`** → `misc.c:451` → `goto cleanup` (`sas.c:628`) → back to the logon
+/// screen. Live log: `[dbg] GetProfilesDirectoryW() failed (Error 2)`.
+///
+/// With the 4th mount that open is SATISFIED from the genuine regf and `ProfilesDirectory` is
+/// COPIED OUT to winlogon in full, so `GetProfilesDirectoryW` returns TRUE. `LoadUserProfileW`
+/// proceeds into `CreateUserProfileW` — which reaches the profile SID
+/// (`profile.c:2056  Loading profile S-1-5-21-…-500`, the REAL logon SID from the token lsass
+/// minted) and opens ProfileList a SECOND time, from a different call site. Both opens are counted
+/// and both must have been served by the mount.
+///
+/// **THE NEW, HONEST WALL — and it is NOT a registry wall.** `CreateUserProfileW` then calls
+/// `CreateDirectoryW(szProfilesPath)` (`profile.c:929`, `C:\Profiles` after
+/// `ExpandEnvironmentStringsW`). This host has NO writable filesystem and no general disk-file /
+/// directory service, so that `NtCreateFile` is answered STATUS_NOT_IMPLEMENTED → `GetLastError()`
+/// == 1 → `profile.c:933  Error: 1` → `CreateUserProfileW() failed` (`profile.c:2117`) →
+/// `LoadUserProfileW` fails → `goto cleanup`. So `StartUserShell` /
+/// `WlxActivateUserShell(userinit.exe)` are NOT reached and **`userinit.exe` has NOT been spawned**;
+/// nothing here claims otherwise. Creating a user profile means WRITING a directory tree, which is
+/// a whole filesystem capability, not a registry one.
+fn winlogon_profile_directory_spec(passed: &mut u64) {
+    let opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
+    let hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
+    let reads = WINLOGON_PROFILES_DIR_READS.load(Ordering::Relaxed);
+    print_str(b"[wl-profile] GetProfilesDirectoryW: ProfileList opens=");
+    print_u64(opens);
+    print_str(b" served-from-mount=");
+    print_u64(hits);
+    print_str(b" ProfilesDirectory value-reads=");
+    print_u64(reads);
+    print_str(b" SOFTWARE value-reads=");
+    print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
+    print_str(b" unsupported-file-opens=");
+    print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
+    print_str(b" (next wall: CreateDirectoryW -> no writable FS; userinit.exe NOT spawned)\n");
+    check(
+        b"exec_winlogon_profile_directory_resolved",
+        // BOTH ProfileList opens — GetProfilesDirectoryW's and CreateUserProfileW's — were served
+        // by the REAL mount (not synthesized, not overlaid) …
+        opens >= 2
+            && hits >= 2
+            && hits == opens
+            // … and the ProfilesDirectory value was really copied out to winlogon, which is the
+            // only way GetProfilesDirectoryW can return TRUE and the only way CreateUserProfileW
+            // is reachable at all.
+            && reads >= 1
+            // … off the same real logon this batch inherits (unchanged clauses).
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
+            && WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1,
+        passed,
+    );
 }
 
 /// ═══ `WLX_SAS_ACTION_LOGON` REALLY CAME BACK — winlogon is running its POST-LOGON path ══════════
@@ -2710,7 +2867,7 @@ fn winlogon_logon_action_spec(passed: &mut u64) {
     let profile_opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
     print_str(b"[wl-logon] post-logon: ProfileList opens=");
     print_u64(profile_opens);
-    print_str(b" (HandleLogon reached; SOFTWARE hive unmounted -> LoadUserProfileW fails honestly)");
+    print_str(b" (HandleLogon reached; served from the real SOFTWARE mount)");
     print_str(b" logon-reply-status=0x");
     print_hex(LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) as u32);
     print_str(b" token-duplicates=");
@@ -6443,20 +6600,29 @@ fn is_synth_key(kr: KeyRef) -> bool {
     kr >= OVERLAY_KEY_TAG
 }
 /// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
-/// Three REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
-/// ~204 KiB), SECURITY and SAM (8 KiB each, read BY PATH off `\reactos\system32\config`). A
-/// `KeyRef` is a cell offset inside ONE of them, so the top nibble SELECTS the hive. Real cell
-/// offsets are far below 0x4000_0000 (the largest hive is 204 KiB), and the tags stay below
-/// `OVERLAY_KEY_TAG` so `is_synth_key` is unchanged.
+/// FOUR REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
+/// ~204 KiB), SOFTWARE (460 KiB), SECURITY and SAM (8 KiB each) — all read BY PATH off
+/// `\reactos\system32\config`. A `KeyRef` is a cell offset inside ONE of them, so the top nibble
+/// SELECTS the hive. Real cell offsets are far below 0x2000_0000 (the largest hive is 460 KiB), and
+/// the tags stay below `OVERLAY_KEY_TAG` so `is_synth_key` is unchanged.
 /// **BYPASS SWITCH** for the SECURITY/SAM hive mount. Set to `false` to leave both hives unmounted
 /// (the pre-batch state): `\Registry\Machine\SECURITY` then fails to open, lsasrv's
 /// `LsapOpenServiceKey` returns STATUS_OBJECT_NAME_NOT_FOUND, no LSA policy database is installed
 /// and samsrv never reaches its SAM keys — `exec_lsa_security_hive_backed`,
 /// `exec_samsrv_hosted` and `exec_msv1_0_account_domain_sid_resolved` all FAIL. Verified.
 pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
+/// **BYPASS SWITCH** for the SOFTWARE hive mount (the 4th slot). Set to `false` to leave it
+/// unmounted (the pre-batch state): `\Registry\Machine\SOFTWARE` stops resolving,
+/// `RegOpenKeyExW(HKLM, "Software\Microsoft\Windows NT\CurrentVersion\ProfileList")` goes back to
+/// `ERROR_FILE_NOT_FOUND`, `userenv!GetProfilesDirectoryW` fails (Error 2) and winlogon's
+/// `HandleLogon` takes `goto cleanup` instead of reaching `StartUserShell`.
+pub(crate) const SOFTWARE_HIVE_MOUNTED: bool = true;
 pub(crate) const HIVE_SEL_MASK: u32 = 0xE000_0000;
 /// Hive selector 0 — the SYSTEM hive (untagged, so every pre-existing SYSTEM `KeyRef` is unchanged).
 pub(crate) const HIVE_SEL_SYSTEM: u32 = 0x0000_0000;
+/// Hive selector for `\Registry\Machine\SOFTWARE` (the 4th mount; 460 KiB, so its cell offsets stay
+/// far below the 0x2000_0000 tag).
+pub(crate) const HIVE_SEL_SOFTWARE: u32 = 0x2000_0000;
 /// Hive selector for `\Registry\Machine\SECURITY`.
 pub(crate) const HIVE_SEL_SECURITY: u32 = 0x4000_0000;
 /// Hive selector for `\Registry\Machine\SAM`.
@@ -6472,6 +6638,7 @@ pub(crate) fn hive_cell(kr: KeyRef) -> KeyRef {
 /// The NT mount path of a hive selector (the prefix its `key_path` results hang off).
 pub(crate) fn hive_mount(sel: u32) -> &'static str {
     match sel {
+        HIVE_SEL_SOFTWARE => r"\Registry\Machine\SOFTWARE",
         HIVE_SEL_SECURITY => r"\Registry\Machine\SECURITY",
         HIVE_SEL_SAM => r"\Registry\Machine\SAM",
         _ => r"\Registry\Machine\System",
@@ -6595,6 +6762,15 @@ pub(crate) fn is_profile_list_key(path: &str) -> bool {
 /// Times winlogon opened the ProfileList key — see [`is_profile_list_key`]. Drives
 /// `exec_winlogon_logon_action_returned`.
 pub(crate) static WINLOGON_PROFILE_LIST_OPENS: AtomicU64 = AtomicU64::new(0);
+/// Times a ProfileList open was SATISFIED out of the real SOFTWARE mount (a subset of
+/// `WINLOGON_PROFILE_LIST_OPENS`, which counts every attempt). 0 with the mount bypassed.
+pub(crate) static WINLOGON_PROFILE_LIST_HITS: AtomicU64 = AtomicU64::new(0);
+/// Times ANY key was opened out of the 4th mount, `\Registry\Machine\SOFTWARE`.
+pub(crate) static SOFTWARE_HIVE_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+/// Times a value was COPIED OUT of the SOFTWARE mount to a hosted process, in full (SUCCESS).
+pub(crate) static SOFTWARE_HIVE_VALUE_READS: AtomicU64 = AtomicU64::new(0);
+/// …of which: winlogon reading `ProfileList\ProfilesDirectory` — `userenv!GetProfilesDirectoryW`.
+pub(crate) static WINLOGON_PROFILES_DIR_READS: AtomicU64 = AtomicU64::new(0);
 /// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or
 /// `\Registry\Machine\SAM[...]`) — lsass' LsapOpenServiceKey / samsrv's SampInitDatabase open these,
 /// which our staged SYSTEM hive doesn't contain (real ReactOS creates them at setup). The executive
@@ -6777,6 +6953,10 @@ const LSA_LSARPC_CREATE_CAP: u64 = 6;
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 /// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
+/// One-shot trace + running count for `NtCreateFile` on a file namespace this host has no service
+/// for (a plain disk file). Answered STATUS_NOT_IMPLEMENTED — honestly, without parking the caller.
+pub(crate) static NT_CREATE_FILE_UNSUPPORTED_TRACED: AtomicBool = AtomicBool::new(false);
+pub(crate) static NT_CREATE_FILE_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_IO_COMPLETION_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_REMOVE_IO_COMPLETION_WAIT_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7026,6 +7206,12 @@ struct ExecNtHandler {
     pub(crate) security_hive: Option<RegfHive<'static>>,
     /// The REAL ReactOS **SAM** hive (root = `\Registry\Machine\SAM`), same by-path staging.
     pub(crate) sam_hive: Option<RegfHive<'static>>,
+    /// The REAL ReactOS **SOFTWARE** hive (root = `\Registry\Machine\SOFTWARE`) — HKLM\Software's
+    /// backing store, read BY PATH off `\reactos\system32\config\software`. 471040 B (~57x the
+    /// SECURITY/SAM hives), borrowed from SWHIVEBUF read-only like every other mount. It carries
+    /// `Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory`, which is what
+    /// `userenv!GetProfilesDirectoryW` — the first thing winlogon's `LoadUserProfileW` does — reads.
+    pub(crate) software_hive: Option<RegfHive<'static>>,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
@@ -8094,6 +8280,10 @@ pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECURITY_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAMHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAM_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base + byte size of the real SOFTWARE hive the storage host read BY PATH off
+/// `\reactos\system32\config\software` into SWHIVEBUF (the 4th mounted regf).
+pub(crate) static SWHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SOFTWARE_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw winlogon.exe the storage host staged into WINLOGONBUF (3rd process).
@@ -10604,6 +10794,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
                 slot.store(start, Ordering::Relaxed);
             }
+            // The real SOFTWARE hive buffer — 471040 B, far too big for the leftover of the shared
+            // 0xA0-0xC0 input PT, so it gets its OWN 2 MiB window + dedicated page table.
+            {
+                let pt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, SWHIVEBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+                let start = alloc_frame();
+                for _ in 1..SWHIVEBUF_FRAMES {
+                    let _ = alloc_frame();
+                }
+                for i in 0..SWHIVEBUF_FRAMES {
+                    let _ = page_map(copy_cap(start + i), SWHIVEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+                SWHIVEBUF_START.store(start, Ordering::Relaxed);
+            }
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -10658,6 +10863,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             SAM_HIVE_SIZE.store(
                 core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9C) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            // The real SOFTWARE hive size (reported @+0xA8).
+            SOFTWARE_HIVE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA8) as *const u32) as u64,
                 Ordering::Relaxed,
             );
             let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);

@@ -380,6 +380,10 @@ pub(crate) unsafe fn spawn_storage_host(
         regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: u64::from(index == 0) };
         n += 1;
     }
+    // The SOFTWARE hive buffer (471040 B) — its own 2 MiB window + dedicated PT, mirroring the
+    // executive-side mapping (it does not fit in the shared 0xA0-0xC0 input page table).
+    regions[n] = Region { source: FrameSource::Alias(SWHIVEBUF_START.load(Ordering::Relaxed)), base_va: SWHIVEBUF_VADDR, count: SWHIVEBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 };
+    n += 1;
     let d = ComponentDescriptor {
         entry,
         image_rights: Rights::Uniform(2), // RO — the storage path writes no statics

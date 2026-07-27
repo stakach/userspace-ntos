@@ -233,6 +233,18 @@ impl ExecNtHandler {
                 mount(SAMHIVEBUF_VADDR, SAM_HIVE_SIZE.load(Ordering::Relaxed)),
             )
         };
+        // The 4th mount: the REAL 471040 B SOFTWARE hive the storage host read BY PATH off
+        // `\reactos\system32\config\software` into SWHIVEBUF. Same borrow-no-copy mechanism.
+        // SAFETY: a fixed executive-lifetime mapping; the size is what the storage host reported
+        // (0 if the file wasn't staged → None → the mount is simply absent).
+        let software_hive = unsafe {
+            let n = SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed) as usize;
+            if n == 0 || !SOFTWARE_HIVE_MOUNTED {
+                None
+            } else {
+                RegfHive::new(core::slice::from_raw_parts(SWHIVEBUF_VADDR as *const u8, n))
+            }
+        };
         unsafe {
             print_str(b"[cm-hive] mounted base hives: SYSTEM=");
             print_u64(REAL_HIVE_SIZE.load(Ordering::Relaxed));
@@ -252,6 +264,16 @@ impl ExecNtHandler {
             print_u64(sam_hive.as_ref().map_or(0, |h| u64::from(h.root())));
             print_str(b" subkeys=");
             print_u64(sam_hive.as_ref().map_or(0, |h| h.subkeys(h.root()).len() as u64));
+            print_str(b") SOFTWARE=");
+            print_u64(SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed));
+            print_str(b"B(root=");
+            print_u64(software_hive.as_ref().map_or(0, |h| u64::from(h.root())));
+            print_str(b" subkeys=");
+            print_u64(
+                software_hive
+                    .as_ref()
+                    .map_or(0, |h| h.subkeys(h.root()).len() as u64),
+            );
             print_str(b")\n");
         }
         let time_zone_information = seed_time_zone(hive.as_ref());
@@ -260,6 +282,7 @@ impl ExecNtHandler {
             hive,
             security_hive,
             sam_hive,
+            software_hive,
             time_zone_information,
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
@@ -575,12 +598,13 @@ impl ExecNtHandler {
     }
 
     /// The mounted base hive a non-synth `KeyRef` belongs to, plus its in-hive cell offset. The
-    /// top nibble of the `KeyRef` selects SYSTEM (0) / SECURITY / SAM — see [`hive_sel`].
+    /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`].
     pub(crate) fn base_hive(&self, target: KeyRef) -> Option<(&RegfHive<'static>, KeyRef)> {
         if is_synth_key(target) {
             return None;
         }
         let hive = match hive_sel(target) {
+            HIVE_SEL_SOFTWARE => self.software_hive.as_ref()?,
             HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
             HIVE_SEL_SAM => self.sam_hive.as_ref()?,
             _ => self.hive.as_ref()?,
@@ -4812,8 +4836,8 @@ impl ExecNtHandler {
         {
             return None;
         }
-        // The three REAL mounted regf hives. SYSTEM is untagged (its cell offsets ARE the KeyRef);
-        // SECURITY and SAM carry a hive-selector tag in the top nibble so a later
+        // The FOUR REAL mounted regf hives. SYSTEM is untagged (its cell offsets ARE the KeyRef);
+        // SOFTWARE, SECURITY and SAM carry a hive-selector tag in the top nibble so a later
         // handle→hive resolution can't confuse them (see `hive_sel`/`base_hive`).
         if comps[2].eq_ignore_ascii_case("System") {
             return self.hive.as_ref()?.open_key(&comps[3..].join("\\"));
@@ -4838,11 +4862,20 @@ impl ExecNtHandler {
         {
             return Some(SYNTH_CPU_KEY);
         }
-        // \Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Winlogon — the SOFTWARE
-        // hive isn't on the image; back this one key's EXISTENCE (msgina GetRegistrySettings). See
-        // SYNTH_WINLOGON_KEY.
+        // \Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Winlogon — back this ONE
+        // key's EXISTENCE synthetically (msgina GetRegistrySettings). This check deliberately
+        // stays AHEAD of the SOFTWARE mount below: msgina wants its value reads to MISS so it
+        // applies its documented registry defaults, and that is what produced the desktop paint.
+        // Every OTHER Software key comes from the real hive. See SYNTH_WINLOGON_KEY.
         if is_winlogon_key_comps(&comps[2..]) {
             return Some(SYNTH_WINLOGON_KEY);
+        }
+        // The 4th mount — the REAL 471040 B SOFTWARE hive at `\Registry\Machine\SOFTWARE`. Placed
+        // last so no pre-existing resolution changes: before it, every non-Winlogon Software key
+        // fell out of this function as `None`.
+        if comps[2].eq_ignore_ascii_case("SOFTWARE") {
+            let cell = self.software_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
+            return Some(HIVE_SEL_SOFTWARE | cell);
         }
         None
     }
@@ -5363,6 +5396,38 @@ impl ExecNtHandler {
                             return self.mint_registry_key(kr, args[1] as u32, args[0]);
                         }
                     }
+                    // ★ THE 4TH MOUNT'S ROUTE for winlogon — `ProfileList`, resolved for real
+                    // against the newly mounted SOFTWARE hive. winlogon's HKLM subkey opens arrive
+                    // with RootDirectory == the machine-root sentinel, and the arm further down
+                    // answers every such open NOT_FOUND: that is exactly why
+                    // `Software\Microsoft\Windows NT\CurrentVersion\ProfileList` was Error 2 and
+                    // `GetProfilesDirectoryW` failed. Same shape, and the same reason, as the
+                    // `is_nls_language_key` route immediately above.
+                    //
+                    // ★ EXACT-NAME scoped, and MEASURED to need to be. The general form — "accept
+                    // any pi==2 open that resolves into the SOFTWARE hive" — was tried and it
+                    // REGRESSED THE DESKTOP PAINT (gate 241 -> 218/99, 23 FAILs incl.
+                    // `exec_win32k_desktop_painted`, `exec_winlogon_sas_window`, all 7
+                    // `exec_msgina_*`): `Microsoft\Windows NT\CurrentVersion\Drivers32` then
+                    // resolved for the first time, winmm's DllMain took its real legacy-driver path
+                    // (beepmidi/msacm32.drv/msacm32 + a `system.ini` probe), and the SAS window's
+                    // `WM_NCCREATE` ended in a win32k `#PF` at `cr2=0xb0` —
+                    // "WL: Failed to create SAS window" -> "WL: Failed to initialize SAS". This is
+                    // the SAME hazard the keyboard-layout and Winlogon-key notes above record:
+                    // broadly succeeding HKLM opens regress the paint. So this stays exact-name, in
+                    // the established pattern, and the general 4-slot mechanism serves SOFTWARE
+                    // everywhere else (absolute opens, pi 3/4, relative opens off a SOFTWARE handle,
+                    // `registry_value(s)`, `registry_subkeys`, the overlay).
+                    if is_profile_list_key(&eff_name) {
+                        let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
+                        if let Some(kr) = self.resolve_key(&full) {
+                            if hive_sel(kr) == HIVE_SEL_SOFTWARE {
+                                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                                WINLOGON_PROFILE_LIST_HITS.fetch_add(1, Ordering::Relaxed);
+                                return self.mint_registry_key(kr, args[1] as u32, args[0]);
+                            }
+                        }
+                    }
                 }
                 // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
                 // the real SYSTEM hive (::ROSSYS.HIV). A predefined `\Registry\Machine` open → the
@@ -5424,11 +5489,20 @@ impl ExecNtHandler {
                         .as_ref()
                         .and_then(|full| self.resolve_key(full));
                     if let Some(cell) = cell {
-                        if hive_sel(cell) != HIVE_SEL_SYSTEM {
+                        // `LSA_HIVE_ROOT_OPENED` means what its name says — an open resolved
+                        // against the real SECURITY or SAM mount. Test those two selectors
+                        // EXPLICITLY rather than "not SYSTEM": since the SOFTWARE hive became the
+                        // 4th mount, "not SYSTEM" also catches services'/lsass' HKLM\Software opens
+                        // and the counter drifted 3 -> 15 with no LSA meaning. SOFTWARE opens are
+                        // counted by `SOFTWARE_HIVE_KEY_OPENED` instead.
+                        if hive_sel(cell) == HIVE_SEL_SECURITY || hive_sel(cell) == HIVE_SEL_SAM {
                             LSA_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
                             if hive_sel(cell) == HIVE_SEL_SAM {
                                 SAM_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
                             }
+                        }
+                        if hive_sel(cell) == HIVE_SEL_SOFTWARE {
+                            SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
                         }
                         return self.mint_registry_key(cell, args[1] as u32, args[0]);
                     }
@@ -6239,15 +6313,20 @@ impl ExecNtHandler {
                     WINLOGON_DEFPWD_EMPTY.fetch_add(1, Ordering::Relaxed);
                     Some((1u32 /* REG_SZ */, alloc::vec![0u8, 0u8]))
                 } else {
-                    if self.pi == 2 && name_lc == "default" && !is_synth_key(key) {
-                    // winlogon (pi 2): SetDefaultLanguage(NULL) reads the `Default` value of the real
-                    // SYSTEM-hive key `...\Control\Nls\Language` (opened above via is_nls_language_key,
-                    // so `key` is a genuine hive KeyRef, NOT a synth handle). Read it for real so
-                    // SetDefaultLanguage succeeds (was: pi 0-2 → None → NOT_FOUND → SetDefaultLanguage
-                    // FALSE → InitializeSAS FALSE → ExitProcess(2)). Tightly scoped: pi==2 + value name
-                    // exactly "Default" + a real hive key, so no paint-time msgina value read changes
-                    // (those hit SYNTH_WINLOGON_KEY / synth handles, excluded by is_synth_key). Its
-                    // out-params are advapi heap/stack the plain mirror can't reach → cross-AS write.
+                    if self.pi == 2 && !is_synth_key(key) {
+                    // winlogon (pi 2) reading a value out of a REAL MOUNTED HIVE (not a synth handle):
+                    // its out-params are advapi/userenv heap or stack the plain mirror can't reach, so
+                    // the copyout below must go cross-AS. Two live cases:
+                    //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
+                    //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was: pi 0-2 →
+                    //     None → NOT_FOUND → SetDefaultLanguage FALSE → InitializeSAS FALSE →
+                    //     ExitProcess(2).
+                    //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
+                    //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
+                    // Scoped by `!is_synth_key`, so every paint-time msgina value read is unchanged
+                    // (those hit SYNTH_WINLOGON_KEY / SYNTH_KBD_KEY, excluded here). Before the
+                    // SOFTWARE mount the ONLY non-synth pi==2 key was the Nls one, so widening the
+                    // name test from `"default"` to "any name" changes nothing that already existed.
                         use_xas_write = true;
                     }
                     self.registry_value(key, &name_lc)
@@ -6311,6 +6390,16 @@ impl ExecNtHandler {
                             };
                             if !written {
                                 return 0xC000_0005;
+                            }
+                            // ★ A value COPIED OUT of the 4th mount, in full, to a hosted process.
+                            // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
+                            // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
+                            // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
+                            if !is_synth_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE {
+                                SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
+                                if self.pi == 2 && name_lc == "profilesdirectory" {
+                                    WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             0 // STATUS_SUCCESS
                         }
@@ -10146,8 +10235,34 @@ impl ExecNtHandler {
                         status = nt_fs::STATUS_OBJECT_PATH_NOT_FOUND;
                     }
                 } else {
-                    self.stop = true;
-                    status = 0xC000_0002;
+                    // A file namespace this host has no service for (a plain disk file — the live
+                    // case is `\??\C:\Windows\system.ini`). Answer HONESTLY with
+                    // STATUS_NOT_IMPLEMENTED: no fabricated handle, and the CALLER decides what to
+                    // do. This used to also set `self.stop`, which PARKED the calling process as
+                    // unrecoverable — a development tripwire, not a correctness requirement, and
+                    // one that NO boot before this batch ever tripped (every prior NtCreateFile on
+                    // this host is a named pipe or the boot-status file, so this is behaviour-
+                    // preserving for everything that already ran).
+                    //
+                    // Mounting the real SOFTWARE hive is what made it reachable: winmm's DllMain
+                    // now finds `Microsoft\Windows NT\CurrentVersion\Drivers32` and takes its REAL
+                    // legacy-driver path (beepmidi/msacm32.drv/msacm32 load), which ends in a
+                    // `GetPrivateProfileStringW` probe of `system.ini`. Parking winlogon/services/
+                    // lsass for that one failed probe killed them mid-boot. A returned error is
+                    // exactly what the profile API is written to cope with (it falls back to its
+                    // documented defaults); an unrecoverable park is not. Traced once + counted so
+                    // the frontier stays visible rather than silent.
+                    if !NT_CREATE_FILE_UNSUPPORTED_TRACED.swap(true, Ordering::Relaxed) {
+                        print_str(b"[nt-create-file] pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" unsupported file namespace -> STATUS_NOT_IMPLEMENTED (honest miss, no park) name=\"");
+                        for &unit in name16.iter().take(96) {
+                            debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+                        }
+                        print_str(b"\"\n");
+                    }
+                    NT_CREATE_FILE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+                    status = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
                 }
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());

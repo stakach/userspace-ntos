@@ -414,14 +414,16 @@ pub(crate) unsafe fn storage_probe(
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x38) as *mut u32, sz);
             }
         }
-        // The real ReactOS SECURITY + SAM registry hives (`\reactos\system32\config\{security,sam}`,
-        // 8 KiB regf each) — the LSA policy database's and the SAM database's on-disk backing
-        // stores. Read BY PATH exactly like the SYSTEM hive above (no flat ::NAME fallback exists,
-        // so the short name is only a formality); sizes reported at STORAGE_SHARED+0x98 / +0x9C so
-        // the executive can mount them with nt-hive-regf at \Registry\Machine\{SECURITY,SAM}.
+        // The real ReactOS SECURITY + SAM + SOFTWARE registry hives
+        // (`\reactos\system32\config\{security,sam,software}`) — the LSA policy database's, the SAM
+        // database's and HKLM\Software's on-disk backing stores. Read BY PATH exactly like the
+        // SYSTEM hive above (no flat ::NAME fallback exists, so the short name is only a
+        // formality); sizes reported at STORAGE_SHARED+0x98 / +0x9C / +0xA8 so the executive can
+        // mount them with nt-hive-regf at \Registry\Machine\{SECURITY,SAM,SOFTWARE}.
         for (path, short, dest, cap_frames, off) in [
             (b"reactos\\system32\\config\\security".as_slice(), b"SECURITY   ", SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES, 0x98u64),
             (b"reactos\\system32\\config\\sam".as_slice(), b"SAM        ", SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES, 0x9Cu64),
+            (b"reactos\\system32\\config\\software".as_slice(), b"SOFTWARE   ", SWHIVEBUF_VADDR, SWHIVEBUF_FRAMES, 0xA8u64),
         ] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;

@@ -5228,3 +5228,86 @@ candidate, the RPC listener, and reclaims its TCB before the gate. That clause w
 injection's victim choice, not the service. It now reads the **write-once mint latch** of the TCB the
 service created and **adds** a clause that the thread actually RAN (`WL_WORKER_FAULTS >= 1`) — the
 same move `exec_svc_rpc_listener_multiplex` already made, and strictly stronger overall.
+
+---
+
+# BATCH 55 — the SOFTWARE hive is the 4th `regf` mount; `GetProfilesDirectoryW` SUCCEEDS
+
+Gate **241 -> 243/99, ZERO FAILs**, RUNEXIT=3, `microtest sentinel`, paint **768/768 @ 0x003a6ea5**,
+`diff`-identical 243-line PASS lists across 4 consecutive foreground boots. No `rust-micro/src`
+change. Host targets green (nt-ntdll 694, nt-security 47, nt-process 79, nt-syscall 43,
+nt-user-callback 44, nt-hive-core 16, nt-hive-regf 5).
+
+## The 4th slot (general mechanism, no special-casing)
+
+`HIVE_SEL_SOFTWARE = 0x2000_0000` joins SYSTEM (0) / SECURITY (`0x4000_0000`) / SAM (`0x6000_0000`)
+in the `KeyRef` top-nibble scheme, so `base_hive()`, `hive_mount()`, `registry_target_path`,
+`registry_value(s)`, `registry_subkeys`, the relative open/create arms and the overlay all serve
+`\Registry\Machine\SOFTWARE` with **no new code paths**. `resolve_key` gains one arm, placed AFTER
+the CPU/Winlogon synthetic checks so no pre-existing resolution changes.
+
+## The frame budget it needed (471040 B = 115 pages)
+
+The SECURITY/SAM hives (8 KiB) fit in the leftover of the shared 0xA0-0xC0 input page table; the
+SOFTWARE hive is ~57x that and does **not**. It got its OWN 2 MiB window + **dedicated page table**
+at `SWHIVEBUF_VADDR = 0x0000_0100_10E0_0000`, `SWHIVEBUF_FRAMES = 128` (512 KiB), in the free gap
+above `DMA_VADDR` and below the process-mirror region — mirrored into the isolated storage host as a
+`pts: 1` region. **+128 frames, +1 PT, +~257 root CSpace slots**; nothing else had to be raised
+(`NEXT_SLOT` 7947 -> 7955 at the sec-stop mark; no untyped or CSpace exhaustion). The storage host
+`fat_open_path`s `\reactos\system32\config\software` by path like the other three and reports the
+size at `STORAGE_SHARED+0xA8`. FS-by-path hits 33 -> 34, **fallbacks still 0**.
+
+## The value that unblocks the logon
+
+`Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory` =
+**`REG_EXPAND_SZ "%SystemDrive%\Profiles"`** (46 bytes) — asserted by CONTENT in
+`exec_software_hive_mounted`, read back through `nt-hive-regf` off the LIVE mapping.
+
+## ★ Broad HKLM\Software success REGRESSES THE PAINT — measured, twice
+
+The first cut accepted **any** pi==2 open resolving into the SOFTWARE hive. Result:
+`Microsoft\Windows NT\CurrentVersion\Drivers32` resolved for the first time, winmm's DllMain took
+its REAL legacy-driver path (beepmidi + msacm32.drv + msacm32 load, then a `system.ini` probe), and
+the SAS window's `WM_NCCREATE` ended in a hosted-win32k `#PF` at `cr2=0xb0` →
+`co_UserCreateWindowEx failed` → **"WL: Failed to create SAS window"** → "WL: Failed to initialize
+SAS". Gate **218/99 with 23 FAILs** (`exec_win32k_desktop_painted`, `exec_winlogon_sas_window`, all
+7 `exec_msgina_*`, both `exec_user_callback_*`, …). This is the SAME hazard the keyboard-layout and
+Winlogon-key notes already record. The winlogon route is therefore **exact-name scoped** on the
+existing `is_profile_list_key` recogniser, in the established pattern (`is_nls_language_key`,
+`is_keyboard_layout_key`, `is_winlogon_key`); the general 4-slot mechanism serves SOFTWARE
+everywhere else (absolute opens, pi 3/4, handle-relative opens, values, subkeys, overlay).
+
+## One pre-existing tripwire removed, honestly
+
+`NtCreateFile` on an unsupported file namespace used to set `self.stop` — an **unrecoverable process
+park**. The SOFTWARE mount made it reachable for the first time (services/lsass also find `Drivers32`
+now, so winmm probes `\??\C:\Windows\system.ini`) and it killed pi 3 and pi 4 mid-boot. It now
+returns **STATUS_NOT_IMPLEMENTED** — no fabricated handle, the caller decides, which is exactly what
+the profile API is written to cope with. Behaviour-preserving for every earlier boot: the branch was
+never taken before (every prior `NtCreateFile` here is a named pipe or the boot-status file).
+
+## Where the post-logon chain now stands, and the NEW frontier
+
+`HandleLogon` -> `LoadUserProfileW` -> `GetProfilesDirectoryW` **SUCCEEDS** -> `CreateUserProfileW`,
+which reaches the real profile SID (`profile.c:2056  Loading profile S-1-5-21-…-500`, the token
+lsass minted) and opens ProfileList a SECOND time — both opens served from the mount, both
+`ProfilesDirectory` reads copied out. It then calls `CreateDirectoryW("C:\Profiles")`
+(`profile.c:929`), and **this host has no writable filesystem**: `NtCreateFile` answers
+STATUS_NOT_IMPLEMENTED -> `GetLastError() == 1` -> `profile.c:933  Error: 1` ->
+`CreateUserProfileW() failed` (`profile.c:2117`) -> `LoadUserProfileW` fails -> `goto cleanup`.
+
+**`userinit.exe` was NOT spawned. `StartUserShell` / `WlxActivateUserShell` are NOT reached.** The
+boot quiesces at its normal SAS milestone (no crash park). **NEXT FRONTIER: a WRITABLE filesystem
+(directory create + file write) for hosted processes** — not a registry item. Note also that
+`WlxActivateUserShell` (`msgina.c:487-510`) reads `Userinit` from the Winlogon key, which is still
+answered by `SYNTH_WINLOGON_KEY`; the real hive has `Userinit = "%SystemRoot%\system32\userinit.exe"`
+but ALSO `AutoAdminLogon = "1"`, which would change the logon flow that currently produces the paint,
+so routing that one key to the real hive is a deliberate, separate decision.
+
+## BYPASS
+
+`SOFTWARE_HIVE_MOUNTED = false`: **243 -> 241/99 with exactly 2 FAILs**
+(`exec_software_hive_mounted`, `exec_winlogon_profile_directory_resolved`),
+`[dbg] GetProfilesDirectoryW() failed (Error 2)` returns, ProfileList opens 2 -> 1, served-from-mount
+2 -> 0, `ProfilesDirectory` value-reads 2 -> 0, unsupported-file-opens 3 -> 0. Paint stays 768/768
+and every other spec stays green — the mount is exactly what the two new specs measure.

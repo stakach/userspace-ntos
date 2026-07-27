@@ -784,3 +784,58 @@ authoritative values.
 
 Anything in `ntdll_plan.md` not listed here was either verified or not re-checked; when in doubt,
 **re-measure** with the recipes in §2 rather than trusting the prose.
+
+> **Update (batch 55, gate 243/99) — the SOFTWARE hive is a REAL 4th `regf` mount and
+> `GetProfilesDirectoryW` SUCCEEDS. Neither change is an ntdll change.** Four consecutive
+> foreground boots, all RUNEXIT=3, `microtest sentinel`, **ZERO FAILs**, gate **243/99**,
+> `diff`-identical 243-line PASS lists, paint **768/768 changed @ `0x003a6ea5`**. No kernel change
+> (`rust-micro` untouched).
+>
+> **(1) The 4th slot is the SAME general mechanism.** `HIVE_SEL_SOFTWARE = 0x2000_0000` joins
+> SYSTEM (0) / SECURITY (`0x4000_0000`) / SAM (`0x6000_0000`) in the `KeyRef` top-nibble scheme, so
+> `base_hive()`, `hive_mount()`, `registry_target_path`, `registry_value(s)`, `registry_subkeys`,
+> the relative open/create arms and the overlay all serve `\Registry\Machine\SOFTWARE` with no new
+> code paths; `resolve_key` gains one arm, placed AFTER the CPU/Winlogon synthetic checks so no
+> pre-existing resolution changes. **Budget:** the genuine 471040 B hive is ~57x the 8 KiB
+> SECURITY/SAM hives and does NOT fit in the leftover of the shared 0xA0-0xC0 input page table, so
+> it got its own 2 MiB window + **dedicated PT** at `0x0000_0100_10E0_0000` (128 frames = 512 KiB),
+> mirrored into the isolated storage host — **+128 frames, +1 PT, ~+257 root CSpace slots**, and
+> nothing else had to be raised. FS-by-path hits 33 → 34, **fallbacks still 0**.
+> `ProfileList\ProfilesDirectory` reads back as `REG_EXPAND_SZ "%SystemDrive%\Profiles"`, asserted
+> by content in `exec_software_hive_mounted`.
+>
+> **(2) ★ Broad `HKLM\Software` success REGRESSES THE PAINT — measured.** The first cut accepted any
+> winlogon open that resolved into the SOFTWARE hive. `…\CurrentVersion\Drivers32` then resolved for
+> the first time, winmm's DllMain took its REAL legacy-driver path (beepmidi/msacm32.drv/msacm32 +
+> a `system.ini` probe), and the SAS window's `WM_NCCREATE` died in a hosted-win32k `#PF` at
+> `cr2=0xb0` → **"WL: Failed to create SAS window"** → "WL: Failed to initialize SAS": gate
+> **218/99, 23 FAILs**. Same hazard the keyboard-layout and Winlogon-key notes already record. The
+> winlogon route is therefore EXACT-NAME scoped on the existing `is_profile_list_key` recogniser, in
+> the established pattern; the general mechanism serves SOFTWARE everywhere else.
+>
+> **(3) One pre-existing tripwire removed, honestly.** `NtCreateFile` on an unsupported file
+> namespace used to set `self.stop` — an unrecoverable **process park**. The mount made it reachable
+> for the first time (services/lsass find `Drivers32` too) and it killed pi 3 and pi 4 mid-boot. It
+> now returns **STATUS_NOT_IMPLEMENTED**: no fabricated handle, the caller decides. Behaviour-
+> preserving for every earlier boot — the branch was never taken before.
+>
+> **DESKTOP FRONTIER — and it is no longer a registry frontier.** `HandleLogon` →
+> `LoadUserProfileW` → `GetProfilesDirectoryW` **SUCCEEDS** → `CreateUserProfileW`, which reaches
+> the real profile SID (`profile.c:2056  Loading profile S-1-5-21-…-500` — the token lsass minted)
+> and opens ProfileList a SECOND time; both opens are served by the mount and both
+> `ProfilesDirectory` reads are copied out (`exec_winlogon_profile_directory_resolved`). It then
+> calls `CreateDirectoryW("C:\Profiles")` (`profile.c:929`) and **this host has no writable
+> filesystem** → `GetLastError() == 1` → `profile.c:933  Error: 1` → `CreateUserProfileW() failed`
+> → `LoadUserProfileW` fails → `goto cleanup`. **`userinit.exe` was NOT spawned; `StartUserShell` /
+> `WlxActivateUserShell` are NOT reached, and nothing is fabricated.** The boot quiesces at its
+> normal SAS milestone (no crash park). **Next frontier: a WRITABLE filesystem — directory create +
+> file write — for hosted processes.** Note also that `WlxActivateUserShell` (`msgina.c:487-510`)
+> reads `Userinit` from the Winlogon key, still answered by `SYNTH_WINLOGON_KEY`; the real hive has
+> `Userinit = "%SystemRoot%\system32\userinit.exe"` but ALSO `AutoAdminLogon = "1"`, which would
+> change the logon flow that currently produces the paint — routing that one key to the real hive is
+> a deliberate, separate decision.
+>
+> **BYPASS** (`SOFTWARE_HIVE_MOUNTED = false`): 243/99 ZERO FAILs → **241/99 with exactly 2 FAILs**,
+> `exec_software_hive_mounted` and `exec_winlogon_profile_directory_resolved` both red,
+> `[dbg] GetProfilesDirectoryW() failed (Error 2)` back, ProfileList opens 2 → 1, served-from-mount
+> 2 → 0, `ProfilesDirectory` value-reads 2 → 0. Paint stays 768/768; every other spec stays green.
