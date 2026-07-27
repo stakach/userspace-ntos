@@ -606,33 +606,22 @@ fn dispatch_depth_leave() {
     });
 }
 
-/// ★ PLAN CORRECTION (`docs/transport-migration.md` §2.3 got this half-right and half-wrong).
+/// ★ PLAN CORRECTION (`docs/transport-migration.md` §2.3 got this half-right and half-wrong),
+/// and its consequence, now RESOLVED by Phase 3.
 ///
 /// The plan said "a Call consumes the executive's single `reply_to` slot" is WRONG because
 /// `endpoint.rs::finish_call` writes the **receiver's** slot, not the sender's. That is true — and
-/// it is exactly why making the COMPONENT the caller reintroduces the hazard from the other side:
+/// it is exactly why making the COMPONENT the caller reintroduced the hazard from the other side:
 /// the executive is the RECEIVER, so every component `Call` it takes writes
-/// `executive.reply_to = component`.
+/// `executive.reply_to = component`, and a DISPATCH COMPLETION leaves the component deliberately
+/// blocked there — so `reply_to` keeps naming it long after the pump returns.
 ///
-/// For a demand-page fault that is self-correcting (the pump answers it immediately, and
-/// `decode_reply` clears `reply_to` when it names the caller being replied to). But the DISPATCH
-/// COMPLETION is different: the component is deliberately LEFT blocked in that Call, so
-/// `reply_to` stays pointing at the component for as long as the component is parked — i.e. past
-/// the end of the pump, into whatever the executive does next.
-///
-/// The main service loop's fast path replies to a client syscall through that legacy `reply_to`
-/// (`service_sec_image.rs`, the `else` arm: *"Non-routed path: reply_to names this caller (never
-/// clobbered) — legacy reply"*). Once an IRP is dispatched while servicing a client syscall, that
-/// comment is false: the reply resumed **npfs** with a length-18 syscall result, npfs re-ran a
-/// dispatch off a stale shared frame, and the client never woke — a silent hang. Observed, not
-/// theorised (first Phase-1 boot, RUNEXIT=124 right after the `\lsarpc` CREATE IRP).
-///
-/// The fix is the mechanism that already exists for the same hazard on win32k's plane (Fix B):
-/// reply through the caller's BOUND reply object instead. This flag tells the main loop when it
-/// must. It is a conservative over-approximation — replying via the bound object is always correct,
-/// it is only more syscalls — so a spurious `true` costs nothing.
-pub(crate) static COMPONENT_CALL_CLOBBERED_REPLY_TO: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Phase 1 dodged that with a `COMPONENT_CALL_CLOBBERED_REPLY_TO` flag: the main service loop asked
+/// "did a component speak while I serviced this syscall?" and, if so, replied through the caller's
+/// BOUND reply object instead of the legacy slot. **Phase 3 deleted both the flag and the question.**
+/// The main loop never replies through `reply_to` any more (`main.rs::reply_recv_badge` is now
+/// `client_reply_on` + `recv_full_r12`), so a clobbered `reply_to` cannot mis-address anything: the
+/// executive simply has no consumer for it left. Nothing here needs to announce the clobber.
 
 /// ★ PLAN CORRECTION (`docs/transport-migration.md` §3.5 was WRONG about this).
 ///
@@ -668,9 +657,8 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
 /// pairs with us. This is the ONLY correlation state the transport has, and it is the kernel's.
 #[inline]
 unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
-    // The kernel just wrote `executive.reply_to = component` (`finish_call`). Any client reply
-    // still owed on the legacy path is now mis-addressed — see the flag's doc comment.
-    COMPONENT_CALL_CLOBBERED_REPLY_TO.store(true, Ordering::Relaxed);
+    // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
+    // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
     let (_b, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
     (mi, m0, m1, m2, m3)
 }

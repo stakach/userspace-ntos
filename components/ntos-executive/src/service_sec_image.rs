@@ -2647,17 +2647,11 @@ pub(crate) unsafe fn service_sec_image(
             // BATCH 43: set when winlogon reaches its win32k SAS-window creation milestone (0x1077 OK) →
             // park it (recv-next-without-reply) so the boot quiesces + the gate runs (see the !handled block).
             let mut wl_milestone_park = false;
-            // Fix (B): set when this syscall was routed to the win32k component. win32k faults
-            // during the nested dispatch clobber the executive's `reply_to` (finish_call), so this
-            // caller's reply must go back through its bound reply cap (REPLY_MAIN) rather than the
-            // legacy reply_to path — see the tail below.
-            let mut routed_win32k = false;
-            // Set when csrss's NtConnectPort was completed via the nested SM rendezvous (like
-            // routed_win32k, the SM-loop thread's faults clobbered `reply_to`, so reply via REPLY_MAIN).
-            let mut routed_lpc = false;
-            // Set when winlogon's NtSecureConnectPort was completed via the nested CSR rendezvous
-            // (like routed_lpc, the CSR thread's faults clobbered reply_to → reply via REPLY_MAIN).
-            let mut routed_csr = false;
+            // (Phase 3: the `routed_win32k` / `routed_lpc` / `routed_csr` flags that used to live
+            // here are GONE. They existed solely to steer this syscall's reply away from the legacy
+            // `reply_to` — which a nested win32k / SM-loop / CSR-thread fault had clobbered — and
+            // onto the caller's bound `REPLY_MAIN`. Every reply takes the bound object now, so there
+            // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
             // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
             // by withholding a reply. Self-termination does not use this flag: its explicit post
@@ -2867,9 +2861,6 @@ pub(crate) unsafe fn service_sec_image(
                 // Execute it immediately after dispatch, while the main CSRSS Call is still bound to
                 // REPLY_MAIN and therefore cannot race this worker on the shared native IPC frame.
                 if nt_handler.csr_start_request != 0 {
-                    // The nested CSR endpoint receive replaces the kernel's implicit reply_to.
-                    // Preserve the main caller by forcing the tail through its bound REPLY_MAIN cap.
-                    routed_csr = true;
                     print_str(b"[csr-thread] outer start role=");
                     print_u64(nt_handler.csr_start_request as u64);
                     print_str(b"\n");
@@ -3994,7 +3985,6 @@ pub(crate) unsafe fn service_sec_image(
                             let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName
                             nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
                             result = 0; // STATUS_SUCCESS
-                            routed_lpc = true;
                             print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
                             print_hex((client_handle >> 32) as u32);
                             print_hex(client_handle as u32);
@@ -4048,7 +4038,6 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if completed {
                         result = 0;
-                        routed_lpc = true;
                     } else {
                         print_str(b"[sm-api] WALL: synchronous SM request did not complete\n");
                         result = 0xC0000001;
@@ -4116,7 +4105,6 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base, &reg, &dll_pes, pml4);
                     }
                     result = 0; // STATUS_SUCCESS (winlogon's connect always succeeds)
-                    routed_csr = true;
                 }
             } else if m0 == 223 {
                 // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
@@ -4365,7 +4353,6 @@ pub(crate) unsafe fn service_sec_image(
                     || badge == LSASS_BADGE
                     || (is_tp_worker && pi != 0))
             {
-                routed_win32k = true;
                 let dialog_modal_expected_ssn = if pi == 2 {
                     winlogon_dialog_modal_expected_ssn()
                 } else {
@@ -4474,9 +4461,8 @@ pub(crate) unsafe fn service_sec_image(
                 // resolve to SERVICES' frames, not the stale csrss/winlogon frame at the same VA).
                 // The w32_client_attach / csrss_frame_get / map_win32k_heap_into_csrss machinery is
                 // fully pi-keyed (bit `1<<pi`), so a 3rd GUI client needs no new state — same recipe
-                // that made winlogon the 2nd client. The reply routing (routed_win32k ->
-                // send_on_reply(REPLY_MAIN)) is caller-agnostic: REPLY_MAIN is bound to THIS caller at
-                // its recv, so the routed reply resumes exactly services (no reply-spin).
+                // that made winlogon the 2nd client. The reply is caller-agnostic: REPLY_MAIN is
+                // bound to THIS caller at its recv, so it resumes exactly services (no reply-spin).
                 W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
                 // ★ (B) SPIN WATCHDOG. A GUI client can live-lock a run of win32k calls that never
                 // terminates — either all WALLing (csrss's user32 RegisterSystemClasses hammering
@@ -5893,31 +5879,32 @@ pub(crate) unsafe fn service_sec_image(
                 // block) — fall through to the ordinary reply: post-and-continue, never a hang.
                 print_str(b"[dbgk] reporter block unavailable -> post-and-continue\n");
             }
-            // ★ Did servicing this syscall take a component `Call` (an IRP dispatch completion or
-            // one of its demand-page faults)? If so the kernel overwrote the executive's single
-            // legacy `reply_to` with the COMPONENT, and the fast path below would resume npfs
-            // instead of this client. Reply through the bound reply object instead — the same fix
-            // the win32k plane already uses. See `spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO`.
-            let component_clobbered_reply_to = crate::spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO
-                .swap(false, Ordering::Relaxed);
-            let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
-                recv_full_r12(fault_ep, reply_main)
-            } else if redirected_user_callback && reply_main != 0 {
-                send_on_reply(reply_main, 0, 0, 0, 0, 0);
-                recv_full_r12(fault_ep, reply_main)
-            } else if (routed_win32k || routed_lpc || routed_csr || component_clobbered_reply_to)
-                && reply_main != 0
-            {
-                // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
-                // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
-                // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,
-                // then recv the next event (re-binding REPLY_MAIN). Split reply+recv is equivalent to
-                // the atomic reply_recv_badge — the executive is the sole replier.
-                send_on_reply(reply_main, 18, result, m1, 0, m3);
+            // ★ PHASE 3 — ONE reply shape for every serviced client syscall: resume the caller
+            // through the reply object the KERNEL bound to it at its recv (`decode_reply` →
+            // `replies[idx].bound_tcb`), then recv the next event re-registering that same object.
+            //
+            // What used to be here was a four-way fork whose only purpose was deciding whether the
+            // executive's single legacy `reply_to` slot could still be trusted: it is written on the
+            // RECEIVER by every incoming `Call`, so a component dispatch (or one of its demand-page
+            // faults) serviced during this syscall silently re-pointed it at the COMPONENT, and the
+            // "fast path" would then resume npfs with a length-18 syscall result while the real
+            // client slept forever (the hang that ended the first Phase-1 boot). `routed_win32k`,
+            // `routed_lpc`, `routed_csr` and `COMPONENT_CALL_CLOBBERED_REPLY_TO` were four ways of
+            // asking "did anything clobber it?". With the legacy reply retired the question is moot:
+            // nothing can re-point a bound reply object, so the answer is always the same reply.
+            let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
+                // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
+                reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
+            } else if park_caller {
+                // The caller's binding was STOLEN into a park slot — do not reply, just recv.
                 recv_full_r12(fault_ep, reply_main)
             } else {
-                // Non-routed path: `reply_to` names this caller (never clobbered) — legacy reply.
-                reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
+                // A client redirected into a win32k user-mode callback resumes with the length-0
+                // fault reply the redirect staged, not with a syscall result.
+                let len = if redirected_user_callback { 0 } else { 18 };
+                let (r0, r1, r3) = if redirected_user_callback { (0, 0, 0) } else { (result, m1, m3) };
+                client_reply_on(reply_main, len, r0, r1, 0, r3);
+                recv_full_r12(fault_ep, reply_main)
             };
             badge = nb;
             mi = nmi;

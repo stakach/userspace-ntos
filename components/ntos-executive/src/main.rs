@@ -3910,37 +3910,50 @@ unsafe fn reply_recv_full(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u6
     (msginfo, mr0, mr1, mr2, mr3)
 }
 
-/// Like [`reply_recv_full`] but also returns the RECEIVED cap's badge (rdi on return). The
-/// 2-process service loop mints each hosted thread's fault-endpoint cap with a distinct badge
-/// (smss=0, csrss=CSRSS_BADGE) so it can tell whose fault/syscall this is and select that
-/// process's VSpace/image/scratch state.
+/// Resume the current caller and receive the next event, ALWAYS through the caller's **bound MCS
+/// reply object** (`REPLY_MAIN`) — never through the legacy per-TCB `reply_to`. Also returns the
+/// RECEIVED cap's badge (rdi on return): the service loop mints each hosted thread's fault-endpoint
+/// cap with a distinct badge (smss=0, csrss=CSRSS_BADGE) so it can tell whose fault/syscall this is
+/// and select that process's VSpace/image/scratch state.
+///
+/// ★ PHASE 3 (`docs/transport-migration.md` §7 item "the legacy `reply_to` reply"). This used to be
+/// ONE `SYS_REPLY_RECV`, whose reply half targets `current.reply_to` (`syscall_handler.rs` →
+/// `handle_reply`). That single per-TCB slot is written on the RECEIVER by every incoming `Call`, so
+/// any component `Call` serviced while this client's syscall was in flight (an IRP/win32k dispatch
+/// completion or one of its demand-page faults) silently re-pointed it at the COMPONENT — the
+/// clobber that hung the first Phase-1 boot and that `COMPONENT_CALL_CLOBBERED_REPLY_TO` existed to
+/// dodge. It is now two syscalls: `reply_on` on the object the kernel BOUND to this caller
+/// (`decode_reply` → `replies[idx].bound_tcb`, which nothing else can re-point), then
+/// `recv_full_r12` re-registering the same object for the next caller. Equivalent because the
+/// executive is the sole replier, and correct by construction rather than by guard.
 unsafe fn reply_recv_badge(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let badge: u64;
-    let msginfo: u64;
-    let mr0: u64;
-    let mr1: u64;
-    let mr2: u64;
-    let mr3: u64;
-    // Fix (B): the RECV half registers REPLY_MAIN in the MCS reply register (r12) so the kernel
-    // binds the next caller's Call to REPLY_MAIN (finish_call -> replies[idx].bound_tcb = caller).
-    // The REPLY half still targets the legacy `reply_to` (unchanged behavior); only the win32k-
-    // routed syscall arm reads back through Send-on-REPLY_MAIN so its reply survives a nested
-    // win32k-fault `reply_to` clobber. cptr 0 (pre-retype) = no cap, legacy path only.
     let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_REPLY_RECV as u64,
-        inout("rdi") recv_ep => badge,
-        inout("rsi") reply_len => msginfo,
-        inout("r10") r0 => mr0,
-        inout("r8") r1 => mr1,
-        inout("r9") r2 => mr2,
-        inout("r15") r3 => mr3,
-        in("r12") reply_cptr,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    (badge, msginfo, mr0, mr1, mr2, mr3)
+    if reply_cptr == 0 {
+        // Pre-retype (the demo/no-ntdll path reaches the loop before the reply objects exist):
+        // fall back to the legacy `reply_to` reply. No component can have run yet, so `reply_to`
+        // still names this caller.
+        let badge: u64;
+        let msginfo: u64;
+        let mr0: u64;
+        let mr1: u64;
+        let mr2: u64;
+        let mr3: u64;
+        core::arch::asm!(
+            "syscall",
+            in("rdx") SYS_REPLY_RECV as u64,
+            inout("rdi") recv_ep => badge,
+            inout("rsi") reply_len => msginfo,
+            inout("r10") r0 => mr0,
+            inout("r8") r1 => mr1,
+            inout("r9") r2 => mr2,
+            inout("r15") r3 => mr3,
+            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        return (badge, msginfo, mr0, mr1, mr2, mr3);
+    }
+    client_reply_on(reply_cptr, reply_len, r0, r1, r2, r3);
+    recv_full_r12(recv_ep, reply_cptr)
 }
 
 /// `seL4_Recv(ep)` that ALSO registers a reply capability via the MCS `replyRegister` (r12): the
@@ -4005,7 +4018,6 @@ unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64
 /// `fault::apply_fault_reply` when that caller is fault-blocked, else a full message transfer) or
 /// fails immediately. That non-blocking property is the whole point — it is what replaces the
 /// executive's blocking wake `Send`.
-#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
 unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
@@ -4021,6 +4033,37 @@ unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3:
         options(nostack),
     );
     reply >> 12
+}
+
+/// ★ Non-zero `reply_on` labels on the **client** plane (`REPLY_MAIN` + the stolen/parked reply
+/// objects), the counterpart of `spawn_hosts::PUMP_REPLY_ERRORS` for the component plane. A non-zero
+/// label means we replied to an UNBOUND object — we believed a hosted thread was blocked awaiting
+/// this reply and it was not. Reported by `exec_client_reply_bound`.
+pub(crate) static CLIENT_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Client-plane replies issued through a bound reply object (`decode_reply`). Post-Phase-3 this is
+/// EVERY reply the service loop makes: the legacy `reply_to` reply is retired.
+pub(crate) static CLIENT_REPLY_BOUND: AtomicU64 = AtomicU64::new(0);
+
+/// ★ THE ONE client-plane reply primitive (`docs/transport-migration.md` §7 item 3). Replaces the
+/// error-SWALLOWING `send_on_reply` (a `SYS_SEND`, whose invocation errors vanish) with the
+/// error-RETURNING [`reply_on`], counting any non-zero label into [`CLIENT_REPLY_ERRORS`] and
+/// logging the first few. Identical register layout and identical kernel path
+/// (`decode_invocation` → `decode_reply`); only the syscall number and the error visibility differ.
+/// Every call site replies with message LABEL 0 (`msginfo` carries a length only) — a non-zero label
+/// would be parsed as an `InvocationLabel` by `decode_invocation` and rejected before reaching
+/// `decode_reply` (migration correction 1).
+unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
+    let label = reply_on(reply_cptr, msginfo, r0, r1, r2, r3);
+    CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
+    if label != 0 && CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
+        print_str(b"[client-reply] UNBOUND reply object cptr=");
+        print_u64(reply_cptr);
+        print_str(b" label=");
+        print_u64(label);
+        print_str(b" mi=");
+        print_u64(msginfo);
+        print_str(b"\n");
+    }
 }
 
 fn monotonic_time_100ns() -> u64 {
@@ -12238,6 +12281,40 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && call_dispatches == harness_irp
             && unbound_label == 2
             && roundtrip_ok,
+        &mut passed,
+    );
+
+    // ═══ ★ THE CLIENT PLANE REPLIES THROUGH BOUND REPLY OBJECTS TOO (Phase 3) ═══
+    //
+    // The component plane above proves the DISPATCH transport is the kernel's. This proves the other
+    // half of the same claim for the hosted-CLIENT transport: the executive's single legacy per-TCB
+    // `reply_to` slot is no longer used to answer anybody.
+    //
+    // Why that slot had to go. `reply_to` is written on the RECEIVER by every incoming `Call`
+    // (`endpoint.rs::finish_call`), and since Phase 1 the components are the callers — a dispatch
+    // completion leaves one of them blocked in a Call, so `executive.reply_to` keeps naming the
+    // COMPONENT after the pump returns. The main loop's old fast path (`SYS_REPLY_RECV`) replied
+    // through exactly that slot, so a client syscall that happened to touch an FSD resumed **npfs**
+    // with a length-18 syscall result while the real client slept forever (first Phase-1 boot,
+    // RUNEXIT=124). Phase 1 dodged it with a four-way "was it clobbered?" fork; Phase 3 deleted the
+    // question by deleting the legacy reply.
+    //
+    // `CLIENT_REPLY_BOUND` counts every reply the service loop made through the caller's BOUND reply
+    // object — post-retirement that is ALL of them (fault resumes, syscall results, callback
+    // redirects), several thousand per boot. `CLIENT_REPLY_ERRORS` counts non-zero invocation labels
+    // from those replies: a reply object that was NOT bound, i.e. we believed a hosted thread was
+    // waiting on us and it was not. It must be 0. The same unbound-reply negative control as (3)
+    // above establishes that a 0 label is not vacuous.
+    let client_bound = CLIENT_REPLY_BOUND.load(Ordering::Relaxed);
+    let client_errors = CLIENT_REPLY_ERRORS.load(Ordering::Relaxed);
+    print_str(b"[client] replies via BOUND reply object=");
+    print_u64(client_bound);
+    print_str(b" unbound-errors=");
+    print_u64(client_errors);
+    print_str(b" (legacy reply_to reply RETIRED)\n");
+    check(
+        b"exec_client_reply_bound",
+        client_errors == 0 && client_bound >= 1000 && unbound_label == 2,
         &mut passed,
     );
 
