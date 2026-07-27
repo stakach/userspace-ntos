@@ -5893,12 +5893,21 @@ pub(crate) unsafe fn service_sec_image(
                 // block) — fall through to the ordinary reply: post-and-continue, never a hang.
                 print_str(b"[dbgk] reporter block unavailable -> post-and-continue\n");
             }
+            // ★ Did servicing this syscall take a component `Call` (an IRP dispatch completion or
+            // one of its demand-page faults)? If so the kernel overwrote the executive's single
+            // legacy `reply_to` with the COMPONENT, and the fast path below would resume npfs
+            // instead of this client. Reply through the bound reply object instead — the same fix
+            // the win32k plane already uses. See `spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO`.
+            let component_clobbered_reply_to = crate::spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO
+                .swap(false, Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 recv_full_r12(fault_ep, reply_main)
             } else if redirected_user_callback && reply_main != 0 {
                 send_on_reply(reply_main, 0, 0, 0, 0, 0);
                 recv_full_r12(fault_ep, reply_main)
-            } else if (routed_win32k || routed_lpc || routed_csr) && reply_main != 0 {
+            } else if (routed_win32k || routed_lpc || routed_csr || component_clobbered_reply_to)
+                && reply_main != 0
+            {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
                 // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
                 // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,

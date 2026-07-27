@@ -1512,6 +1512,7 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
         FSD_DISPATCH_LABEL, // 0x771
         fsd_dispatch,       // major → MajorFunction[major] → run_irp
         fsd_post_driver_entry,
+        crate::spawn_hosts::Transport::Call,
     )
 }
 
@@ -1955,6 +1956,10 @@ pub(crate) struct DriverComponent {
     pub exec_arg_va: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
     pub instance: usize,
+    /// The component host's TCB — used to `TCB_Suspend` it if its pump WALLS (transport risk R2).
+    pub tcb: u64,
+    /// The DEDICATED MCS reply object backing this component's `Call` dispatch transport.
+    pub reply_cap: u64,
 }
 
 /// Copy `n` bytes from `src` to `dst` (both mapped in the executive). HEAP-FREE, byte-wise-safe
@@ -2249,7 +2254,10 @@ pub(crate) unsafe fn load_driver(
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
-    let pml4 = spawn_fsd_component(code_base, pool_base, data_base, shared, arg_base, fault_ep, &rights[..img_frames as usize]);
+    let (pml4, tcb) = spawn_fsd_component(code_base, pool_base, data_base, shared, arg_base, fault_ep, &rights[..img_frames as usize]);
+    // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
+    // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
+    let reply_cap = crate::fsd_reply_slot(instance);
 
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
@@ -2268,8 +2276,14 @@ pub(crate) unsafe fn load_driver(
         demand_cap: 512,
         trace_faults: true,
         wake_first: false,
+        // ★ The component is mid-DriverEntry: it is either blocked in a fault Call or about to issue
+        // its post-DriverEntry ready Call. Either way we must RECEIVE first — and when the ready Call
+        // arrives the component is left BLOCKED IN IT (the steady state the per-IRP pump replies to),
+        // instead of racing on to a bare `recv_req_on` the executive could miss.
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
-        reply_cap: 0,
+        transport: crate::spawn_hosts::Transport::Call,
+        tcb,
+        reply_cap,
         client_pi: 0,
         callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
@@ -2322,6 +2336,8 @@ pub(crate) unsafe fn load_driver(
         exec_shared_va: win.shared_va,
         exec_arg_va: win.arg_va,
         instance,
+        tcb,
+        reply_cap,
     };
     // Record the live instance so `dispatch_irp(instance, ...)` can route to it from anywhere.
     register_instance(&dc);
@@ -2338,7 +2354,7 @@ unsafe fn spawn_fsd_component(
     arg_base: u64,
     fault_ep: u64,
     rights: &[u64],
-) -> u64 {
+) -> (u64, u64) {
     // SAFETY: rights lives in FSD_RIGHTS (a 'static); re-borrow as 'static for Rights::PerFrame.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
@@ -2368,7 +2384,8 @@ unsafe fn spawn_fsd_component(
         gs_base: Some(FSD_KPCR_VA),
         caps: HostCaps::default(),
     };
-    spawn_component(&d).pml4
+    let sc = spawn_component(&d);
+    (sc.pml4, sc.tcb)
 }
 
 /// Ensure the page table covering `page` exists in `pml4` (SYS_SEND page_map can't report a
@@ -2398,6 +2415,8 @@ pub(crate) struct DriverInstance {
     pub pml4: u64,
     pub exec_shared_va: u64,
     pub exec_arg_va: u64,
+    pub tcb: u64,
+    pub reply_cap: u64,
     pub ready: bool,
     pub used: bool,
 }
@@ -2407,6 +2426,8 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     pml4: 0,
     exec_shared_va: 0,
     exec_arg_va: 0,
+    tcb: 0,
+    reply_cap: 0,
     ready: false,
     used: false,
 };
@@ -2427,6 +2448,8 @@ fn register_instance(dc: &DriverComponent) {
             pml4: dc.pml4,
             exec_shared_va: dc.exec_shared_va,
             exec_arg_va: dc.exec_arg_va,
+            tcb: dc.tcb,
+            reply_cap: dc.reply_cap,
             // Default readiness = npfs's historic rule (parked + a control device object). A
             // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
             // is marked ready explicitly by the caller via `register_instance_ready`.
@@ -2529,9 +2552,14 @@ pub(crate) unsafe fn dispatch_irp(
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
         trace_faults: false,
-        wake_first: true, // per-IRP: the component is parked in recv_req_on → Send wakes it
+        wake_first: true,
+        // ★ The component is blocked in its dispatch `Call`, bound to this instance's reply object;
+        // we hand it the request by ANSWERING that Call. `reply_on` is `decode_reply` — it cannot
+        // block, so the executive can never wedge on a component that is not receiving.
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        reply_cap: 0,
+        transport: crate::spawn_hosts::Transport::Call,
+        tcb: d.tcb,
+        reply_cap: d.reply_cap,
         client_pi: 0,
         callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
@@ -2579,7 +2607,11 @@ pub(crate) unsafe fn dispatch_irp(
         print_u64(inst as u64);
         print_str(b" addr=0x");
         print_hex(pr.wall_addr as u32);
-        print_str(b"\n");
+        print_str(b" -> instance RETIRED (component suspended by the pump)\n");
+        // ★ Transport risk R2: the pump has SUSPENDED this component's TCB, and its reply object is
+        // left bound to a thread that will never run again. Retire the instance so no later dispatch
+        // can `reply_on` that stale binding (which the kernel would deliver as a FAULT reply).
+        register_instance_ready(inst, false);
         return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
     }
     let st = pr.status;

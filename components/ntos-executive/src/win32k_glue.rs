@@ -948,6 +948,8 @@ unsafe fn resume_suspended_user_callback_component(
         trace_faults: false,
         wake_first: false,
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
+        transport: crate::spawn_hosts::Transport::Legacy,
+        tcb: 0,
         reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
         client_pi: client.pi as u64,
         callback_client: Some(client),
@@ -1302,8 +1304,9 @@ pub(crate) const NESTED_SLIP_DRAINED_IDLE: u64 = 0x20;
 pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 
 /// ★ DELIBERATE FAULT INJECTION for the **nesting-safe request↔reply binding** on win32k's Syscall
-/// substrate — the analogue of `exec_component_dispatch_in_phase` for the substrate the `SH_REQ_SEQ`
-/// handshake is deliberately scoped OUT of.
+/// substrate — the LEGACY transport's correlation gate, for the substrate the (now-deleted)
+/// `SH_REQ_SEQ` handshake was deliberately scoped OUT of. The IRP substrate has moved to the
+/// `Call`/reply-object transport (`exec_irp_transport_call_bound`); win32k follows in Phase 2.
 ///
 /// The bug class is the same and it is REAL (it is what stops the LSA-route boot): the dispatch
 /// transport is a plain Send/Recv pair, the component publishes its completion BEFORE it waits for
@@ -2640,6 +2643,8 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         trace_faults: false,
         wake_first: true, // win32k is parked in `recv_req` → wake it with a leading plain Send
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        transport: crate::spawn_hosts::Transport::Legacy,
+        tcb: 0,
         reply_cap: rw,
         client_pi,
         callback_client: Some(crate::spawn_hosts::UserCallbackClient {

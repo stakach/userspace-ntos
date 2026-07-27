@@ -1,6 +1,53 @@
 # Component-Dispatch Transport Migration — hand-rolled Send/Recv → seL4 `Call` + MCS reply objects
 
-**Status:** PLAN ONLY. Nothing here is implemented. Baseline `1141349`, gate **231/99 ZERO FAILs**.
+**Status:** **Phase 0 DONE. Phase 1 DONE** (gate **231/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
+`0x003a6ea5`). Phases 2-4 are still plan-only. Baseline `1141349` → Phase 0 `d287c48` → Phase 1.
+
+> ### ★ WHAT THE PLAN GOT WRONG — read this before Phase 2
+>
+> Three corrections, all found by running it. They are folded into §3.5, §4 and §6 below, and each
+> is documented at the code that carries it.
+>
+> 1. **`reply_on` CANNOT carry an arbitrary message LABEL** (§3.5 said it could). `reply_on` is a
+>    `SYS_CALL` on a non-endpoint cap, so the kernel routes it through
+>    `invocation.rs::decode_invocation`, which parses the msginfo label as an `InvocationLabel`
+>    **before** dispatching on the cap type. `InvocationLabel::from_u64(0x771)` is `None`, so
+>    `reply_on(R, DISPATCH_LABEL<<12)` fails `seL4_InvalidArgument` and never reaches `decode_reply`.
+>    Only label **0** (`InvalidInvocation`) survives that gate. **The request tag must ride in MR0**
+>    (`spawn_hosts::REQUEST_TAG_LEN`, a length-1 reply). Phase 2 needs exactly this to distinguish a
+>    nested DISPATCH from a callback RESUME — the `RESUME`/`DISPATCH` labels in §3.4 must become MR0
+>    tags. *(The component→executive direction is unaffected: the component Calls an **Endpoint**
+>    cap, so its `dispatch_label` still rides in the message label, which is what the pump's DONE
+>    arm matches on.)*
+>
+> 2. **★★ THE COMPONENT'S `Call` CLOBBERS THE EXECUTIVE'S LEGACY `reply_to`.** §2.3 declared the
+>    recorded objection "wrong" because `finish_call` writes the **receiver's** `reply_to`, not the
+>    sender's. That is true — and it is precisely why inverting the direction reintroduces the same
+>    hazard from the other side: the executive is now the RECEIVER, so every component `Call` writes
+>    `executive.reply_to = component`. For a demand-page fault this is self-correcting (the pump
+>    answers it at once, and `decode_reply` clears `reply_to` when it names that caller). The
+>    DISPATCH COMPLETION is not: the component is deliberately LEFT blocked in that Call, so
+>    `reply_to` keeps pointing at it after the pump returns. The main service loop's fast path replies
+>    to a client syscall through that `reply_to` (`service_sec_image.rs`, the `else` arm commented
+>    *"Non-routed path: reply_to names this caller (never clobbered)"*). Once an IRP is dispatched
+>    while servicing a client syscall, that comment is FALSE — the reply resumed **npfs** with a
+>    length-18 syscall result, npfs re-ran a dispatch off a stale shared frame, and the client never
+>    woke. **Silent hang, RUNEXIT=124, observed on the first Phase-1 boot.** Fix: the same mechanism
+>    the win32k plane already uses (Fix B) — reply through the caller's BOUND reply object, gated on
+>    `spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO`. **Phase 2 must assume win32k's conversion will
+>    make this flag true far more often, and Phase 3 should retire the legacy `reply_to` reply from
+>    the main loop entirely rather than keep widening the guard.**
+>
+> 3. **`seL4_InvalidCapability` is 2, not 6** (§Phase-1 step 5 said 6; 6 is `seL4_FailedLookup`).
+>    See `rust-micro/src/types.rs:114`.
+>
+> Two smaller deviations, deliberate:
+>
+> * `REPLY_FSD_SLOT` is sized at `MAX_DRIVER_INSTANCES` (4), not the plan's 2, so a third
+>   `DriverSpec` cannot silently get cptr 0 and therefore no transport at all. Cost: 2 extra objects
+>   out of `MAX_REPLIES = 384`.
+> * `PumpChannel` also carries `tcb`, needed for the R2 wall handling.
+
 
 **Decision (user, explicit):** replace the hand-rolled Send/Recv component-dispatch transport with
 proper seL4 `Call` + MCS reply objects, then **delete** the hand-rolled machinery. Breakage is
@@ -404,7 +451,12 @@ Every phase ends with a **foreground** boot (`./run.sh`), the gate line, and the
 background subagents, no concurrent git ops while QEMU runs (`feedback_verify_and_agent_hygiene`).
 Each phase is one commit = one rollback point.
 
-### Phase 0 — prerequisites (purely additive, wired to nothing)
+### Phase 0 — prerequisites (purely additive, wired to nothing) — **DONE (`d287c48`)**
+
+Landed exactly as written (`call_on`, error-returning `reply_on`, `REPLY_FSD_SLOT[..]`,
+`PumpChannel.initial`), plus the `MAX_DRIVER_INSTANCES` sizing noted above. Behaviour-neutral:
+gate **231/99 ZERO FAILs**, RUNEXIT=3, paint 768/768, PASS list byte-identical to the baseline.
+
 
 **Changes**
 * Add `call_on` (component side, `driver_launch.rs`) and `reply_on` (executive side, `main.rs`).
@@ -424,7 +476,24 @@ Each phase is one commit = one rollback point.
 
 ---
 
-### Phase 1 — convert the IRP substrate (npfs / FSD)
+### Phase 1 — convert the IRP substrate (npfs / FSD) — **DONE**
+
+Landed as planned, with the three corrections above. Result: gate **231/99 ZERO FAILs**
+(`exec_component_dispatch_in_phase` deleted, `exec_irp_transport_call_bound` added), RUNEXIT=3,
+`microtest sentinel`, paint **768/768 @ `0x003a6ea5`**, three consecutive boots with identical PASS
+lists. Measured: 71 IRP dispatches, all 71 completed as the return of the component's own `Call`;
+69 request replies (the 2-dispatch shortfall is the two `RecvFirst` DriverEntry-init pumps, whose
+ready `Call` *is* the completion); **0 reply errors**; 0 wall-suspends; unbound-probe label 2.
+
+**R2 (walls)** was handled with option (a) as the plan directed: `TCB_Suspend` on a wall, plus
+`register_instance_ready(inst, false)` so a walled driver is retired and never pumped again (its
+reply object stays bound to a thread that will never run — which is safe precisely because nothing
+will ever reply on it). Zero walls occur on a green boot, so this path is defensive.
+
+**`Transport::{Legacy, Call}`** is the temporary parameter R1 called for. It is threaded through
+exactly two places — `component_main`'s dispatch loop and `PumpChannel` — and every win32k site
+passes `Legacy`. Phase 2 deletes the enum and both arms.
+
 
 Chosen first because it is non-nested, has two independent instances, and is protected by
 `exec_npfs_concurrent_irp_read_and_write`, `exec_npfs_file_object_lifetime`,

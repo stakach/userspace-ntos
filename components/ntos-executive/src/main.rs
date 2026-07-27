@@ -763,14 +763,11 @@ pub const NT_FLUSH_KEY_SERVICED: bool = true;
 /// (`NpSetFileObject(…, NULL, NULL, …)` on disconnect), corrupting its own data-queue bookkeeping.
 /// See [`driver_launch::FILE_OBJECTS`].
 pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
-/// **COMPONENT-DISPATCH SEQUENCE HANDSHAKE switch** (bypass experiment for
-/// `exec_component_dispatch_in_phase`). `true` in tree = `component_pump` accepts only the `done`
-/// message whose `SH_REQ_SEQ` proves the component ran THIS dispatch. `false` restores the old
-/// "any `dispatch_label` message ends the pump" rule, which lets the Send/Recv transport slip a
-/// message out of phase and then DEADLOCK (executive and component both blocked in `Send` on the
-/// dispatch endpoint — no fault, no log line, no npfs involvement). See
-/// [`spawn_hosts::component_pump`].
-pub const FSD_DISPATCH_SEQ_HANDSHAKE: bool = true;
+/// The npfs C-i round-trip verdict (three IRPs with mutually distinguishable completions, each of
+/// which returned its OWN result) — the behavioural leg of `exec_irp_transport_call_bound`. The
+/// `FSD_DISPATCH_SEQ_HANDSHAKE` bypass switch this replaces is GONE: under the `Call` transport a
+/// stale completion is unrepresentable, so there is no workaround left to switch off.
+static TRANSPORT_IRP_ROUNDTRIP: AtomicBool = AtomicBool::new(false);
 /// **PER-DISPATCH REQUEST↔REPLY TOKEN BINDING switch** (bypass experiment for
 /// `exec_win32k_dispatch_in_phase_nested`). `true` in tree = every dispatch request carries a
 /// correlation token in MR0 which the component ECHOES in its completion, and each pump level
@@ -10840,19 +10837,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 &mut passed,
                             );
 
-                            // ★ C-i: THE DISPATCH PHASE-SLIP, fault-injected. `component_main`
-                            // publishes its completion BEFORE it waits for the next request, so a
-                            // `done` queued for an EARLIER cycle satisfies the pump's `Recv` just as
-                            // well as the one it is waiting for — and then the executive and the
-                            // component drift a message apart until BOTH block in `Send` on the
-                            // dispatch endpoint (no fault, no log line, no driver involvement).
-                            // Inject that slip deterministically: (1) queue an 11-byte payload the
-                            // client has not read, (2) run a dispatch whose result is
-                            // DISTINGUISHABLE (SET_INFORMATION → status 0, information 0), (3) arm
-                            // the injector so the next dispatch publishes a premature `done`, (4)
-                            // read. Only a pump that re-waits past the stale `done` returns the READ's
-                            // real (0, 11, payload); a pump that accepts it returns the previous
-                            // dispatch's (0, 0).
+                            // ★ C-i: THE RESULT A DISPATCH RETURNS IS ITS OWN — the behavioural leg
+                            // of `exec_irp_transport_call_bound`. Run three IRPs whose results are
+                            // mutually DISTINGUISHABLE: (1) queue an 11-byte payload the client has
+                            // not read, (2) a SET_INFORMATION whose completion is (0, 0), (3) a READ
+                            // whose completion is (0, 11, payload). Under the old Send/Recv transport
+                            // a `done` queued for an earlier cycle could satisfy the pump's Recv, so
+                            // the READ could return the SET's (0, 0); a fault injector had to
+                            // manufacture that slip to prove the sequence handshake caught it. Under
+                            // the `Call` transport the component is BlockedOnReply between its Call
+                            // and our reply, so it cannot publish a second completion at all — the
+                            // misordering is unrepresentable and needs no injector, only this proof
+                            // that each completion is the one its own request provoked.
                             let slip_payload = *b"PHASE-SLIP!";
                             let mut snone = [];
                             let slip_write = npfs_dispatch_irp(
@@ -10865,23 +10861,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 &[1u8, 0, 0, 0, 0, 0, 0, 0],
                                 &mut set_out2,
                             );
-                            let stale_before =
-                                spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
-                            spawn_hosts::PUMP_SLIP_INJECT.store(1, Ordering::Relaxed);
                             let mut slip_in = [0u8; 32];
                             let slip_read = npfs_dispatch_irp(
                                 3 /* READ */, 0, cli_fid, &[], &mut slip_in);
-                            let stale_after =
-                                spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
                             let slip_ok = matches!(slip_write, Some((0, 11)))
                                 && matches!(slip_set, Some((0, 0)))
                                 && matches!(slip_read, Some((0, 11)))
                                 && slip_in[..11] == slip_payload[..];
-                            print_str(b"[npfs-svc] C-i PHASE-SLIP stale-before=");
-                            print_u64(stale_before);
-                            print_str(b" stale-after=");
-                            print_u64(stale_after);
-                            print_str(b" read=");
+                            TRANSPORT_IRP_ROUNDTRIP.store(slip_ok, Ordering::Relaxed);
+                            print_str(b"[npfs-svc] C-i per-request completions distinct: read=");
                             print_hex(match slip_read {
                                 Some((st, _)) => st as u32,
                                 None => 0xFFFF_FFFF,
@@ -10894,13 +10882,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_str(b" bytes_ok=");
                             print_u64((slip_in[..11] == slip_payload[..]) as u64);
                             print_str(b"\n");
-                            check(
-                                b"exec_component_dispatch_in_phase",
-                                FSD_DISPATCH_SEQ_HANDSHAKE
-                                    && stale_after == stale_before + 1
-                                    && slip_ok,
-                                &mut passed,
-                            );
 
                             let bug_file = bug_p1 >> 16;
                             check(
@@ -12247,22 +12228,81 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(b"exec_fsd_on_shared_harness", harness_irp >= 8, &mut passed);
 
-    // --- THE COMPONENT-DISPATCH TRANSPORT IS IN PHASE. `component_main` publishes its completion
-    // (`send_done`) BEFORE it waits for the next request, so a `done` the component queued for an
-    // EARLIER cycle satisfies the pump's `Recv` just as well as the one it is waiting for. When that
-    // happens the pump returns a completion for work the component has not done yet, and one dispatch
-    // later the executive and the component are BOTH blocked in `Send` on the dispatch endpoint — an
-    // unbreakable deadlock with no fault and no log line (this is what actually ended the LSA
-    // self-RPC boot; npfs' 48-byte `\pipe\lsarpc` response write itself completed correctly).
-    // `component_pump` now accepts only the `done` whose `SH_REQ_SEQ` proves the component ran THIS
-    // dispatch, and counts every stale one it re-waited past. The slip is REAL on a live boot, so the
-    // counter must be non-zero — a zero would mean the handshake is not actually engaged.
-    let stale_dones = spawn_hosts::PUMP_STALE_DONES.load(Ordering::Relaxed);
-    print_str(b"[harness] component-dispatch stale `done` messages re-waited past: ");
-    print_u64(stale_dones);
-    print_str(b" (handshake=");
-    print_u64(FSD_DISPATCH_SEQ_HANDSHAKE as u64);
-    print_str(b")\n");
+    // ═══ ★ THE IRP DISPATCH TRANSPORT IS THE KERNEL'S, NOT OURS ═══
+    //
+    // The IRP substrate no longer runs a hand-rolled Send/Recv pair. The component is the CALLER
+    // (`call_on`: one syscall publishes its completion and returns the next request) and the
+    // executive is the SERVER (`reply_on`: a Send on a `Cap::Reply`, which cannot block). What used
+    // to be reconstructed in userspace — the `SH_REQ_SEQ` sequence handshake, the stale-`done`
+    // re-wait, the fault injector that manufactured a phase slip — is DELETED, because the property
+    // it approximated is now enforced by the kernel:
+    //
+    //   * `recv_full_r12(ep, R)` makes the kernel bind `R` to whichever thread's Call pairs with us
+    //     (`endpoint.rs::finish_call` → `replies[i].bound_tcb = sender`);
+    //   * `reply_on(R, …)` (`invocation.rs::decode_reply`) resumes exactly `bound_tcb` and clears
+    //     the binding, or returns `seL4_InvalidCapability` if there is no binding;
+    //   * a thread blocked in `Call` is `BlockedOnReply` and CANNOT publish a second completion.
+    //
+    // Four independent facts, together, say the transport really is bound:
+    //
+    //  (1) `PUMP_REPLY_ERRORS == 0` — EVERY reply the pump ever issued found its object BOUND. Since
+    //      the binding is created only by a Call pairing with our recv and destroyed by our reply,
+    //      a label-0 result on request N+1 is the KERNEL ATTESTING that the component issued exactly
+    //      one Call between request N and request N+1. That is the request↔completion binding, and
+    //      it is measured on every single request, not sampled.
+    //  (2) `PUMP_CALL_DISPATCHES == HARNESS_IRP_DISPATCHES` — every serviced IRP dispatch completed
+    //      as the return value of the component's OWN Call, not as "some message with the right
+    //      label" (which is all the old transport could check).
+    //  (3) The NEGATIVE control, and the reason (1) is not vacuous: replying to a reply object we
+    //      KNOW is unbound (a spare `REPLY_FSD` slot no driver instance ever used) must come back
+    //      `seL4_InvalidCapability` — which is **2** (`rust-micro/src/types.rs:114`), NOT the 6 the
+    //      plan claimed (6 is `seL4_FailedLookup`) — IMMEDIATELY, and the boot must continue. That is both halves
+    //      of the claim in one probe — the kernel really does reject an unbound reply (so label 0
+    //      means something), and answering is NON-BLOCKING even when it fails, which is precisely the
+    //      availability property the executive's old wake `Send` lacked.
+    //  (4) The behavioural leg (`TRANSPORT_IRP_ROUNDTRIP`, npfs C-i above): three IRPs with mutually
+    //      distinguishable completions each returned its own result.
+    //
+    // There is no bypass switch to flip here, and that is the point: the old spec could only be
+    // proved by DISABLING a userspace workaround, whereas "a stale completion is unrepresentable" is
+    // structural — there is no code path left to turn off. Probe (3) is the honest substitute: it
+    // falsifies the kernel-level premise the structure rests on, rather than a flag of ours.
+    // NOTE: `call_requests` is legitimately 2 LOWER than `call_dispatches` — the two
+    // `InitialAction::RecvFirst` DriverEntry-init pumps (npfs + IrpFsdTest) complete a dispatch
+    // without ever issuing a request reply, because the component's ready Call IS the completion.
+    let call_requests = spawn_hosts::PUMP_CALL_REQUESTS.load(Ordering::Relaxed);
+    let call_dispatches = spawn_hosts::PUMP_CALL_DISPATCHES.load(Ordering::Relaxed);
+    let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
+    let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
+    // (3) The unbound-reply probe. `REPLY_FSD_SLOT` is sized at MAX_DRIVER_INSTANCES but only the
+    // launched instances (npfs = 0, IrpFsdTest = 1) ever bind one, so the last slot is a retyped,
+    // never-bound reply object — exactly the "component is known runnable / not blocked in a Call"
+    // condition. This reply MUST fail loudly and MUST NOT block.
+    let spare_reply = fsd_reply_slot(driver_launch::MAX_DRIVER_INSTANCES - 1);
+    let unbound_label = if spare_reply != 0 { reply_on(spare_reply, 0, 0, 0, 0, 0) } else { 0 };
+    let roundtrip_ok = TRANSPORT_IRP_ROUNDTRIP.load(Ordering::Relaxed);
+    print_str(b"[harness] IRP transport=Call requests=");
+    print_u64(call_requests);
+    print_str(b" call-bound completions=");
+    print_u64(call_dispatches);
+    print_str(b" reply-errors=");
+    print_u64(reply_errors);
+    print_str(b" wall-suspends=");
+    print_u64(wall_suspends);
+    print_str(b" unbound-probe-label=");
+    print_u64(unbound_label);
+    print_str(b" (2=seL4_InvalidCapability, returned WITHOUT blocking) roundtrip=");
+    print_u64(roundtrip_ok as u64);
+    print_str(b"\n");
+    check(
+        b"exec_irp_transport_call_bound",
+        reply_errors == 0
+            && call_requests >= 8
+            && call_dispatches == harness_irp
+            && unbound_label == 2
+            && roundtrip_ok,
+        &mut passed,
+    );
 
     // --- PROOF win32k GENUINELY runs on the SAME SHARED HARNESS (Phase B Step 4b). `component_pump`
     // increments `HARNESS_SYSCALL_DISPATCHES` per serviced win32k SSN dispatch (kind=Syscall). By this
@@ -12376,8 +12416,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     );
 
     // --- ★ THE COMPONENT-DISPATCH TRANSPORT IS IN PHASE **UNDER NESTING** (win32k's Syscall
-    // substrate). `exec_component_dispatch_in_phase` proves the IRP substrate with the `SH_REQ_SEQ`
-    // handshake; that handshake is deliberately scoped OUT of win32k, whose dispatch loop legitimately
+    // substrate). The IRP substrate has moved to the kernel-bound `Call`/reply-object transport
+    // (`exec_irp_transport_call_bound`); win32k is still on the LEGACY Send/Recv rendezvous until
+    // Phase 2, and its correlation is a per-dispatch token because its dispatch loop legitimately
     // RE-ENTERS — an outer dispatch parks inside `KeUserModeCallback` while the client's redirected
     // `WndProc` issues NESTED `NtUser*`/`NtGdi*` syscalls, each a dispatch of its own, unwound
     // innermost-first. A shared-memory sequence counter cannot name the LEVEL a completion belongs to,

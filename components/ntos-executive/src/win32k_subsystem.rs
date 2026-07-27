@@ -3096,6 +3096,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
         W32_DISPATCH_LABEL, // 0x770
         win32k_dispatch,    // ssn → per-dispatch pre/post + dispatch_ssn
         win32k_post_driver_entry,
+        // Phase 1 keeps win32k on the LEGACY Send/Recv rendezvous — its callback re-entry
+        // (`s_ke_user_mode_callback_rendezvous`) still speaks that protocol. Phase 2 converts both
+        // and deletes `Transport` entirely.
+        crate::spawn_hosts::Transport::Legacy,
     )
 }
 
