@@ -1338,6 +1338,34 @@ static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
 static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 
+/// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): ONE dedicated MCS reply object
+/// per launched Family-A IRP driver instance. These back the `Call`(component) ⇄ `reply_on`
+/// (executive) transport that replaces the hand-rolled Send/Recv dispatch pair.
+///
+/// **One object per component is sufficient at ANY nesting depth**: a component host has one TCB,
+/// so it is blocked in at most one `Call` at a time (dispatch-done / demand-page fault / callback);
+/// the kernel's `replies[i].bound_tcb` IS the correlation state and the "nesting stack" is the
+/// component's own C stack.
+///
+/// ★ R7 — these are DEDICATED. They are never entered into [`WAIT_REPLY_POOL`], never rotated, and
+/// never stolen by `wait_park`/`pipe_wait_park`/`dbgk_reporter_park`/`io_completion_park`, so a park
+/// can never steal a component's binding.
+///
+/// (The plan sized this at 2 — one per live instance. It is sized at
+/// [`driver_launch::MAX_DRIVER_INSTANCES`] instead so that adding a third `DriverSpec` cannot
+/// silently leave a component with cptr 0 and therefore no transport at all.)
+static REPLY_FSD_SLOT: [AtomicU64; driver_launch::MAX_DRIVER_INSTANCES] =
+    [const { AtomicU64::new(0) }; driver_launch::MAX_DRIVER_INSTANCES];
+
+/// The dedicated reply object backing driver instance `i`'s dispatch transport (0 = none).
+#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
+pub(crate) fn fsd_reply_slot(i: usize) -> u64 {
+    REPLY_FSD_SLOT
+        .get(i)
+        .map(|s| s.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// ═══ Checkpoint B: real reply-cap parking for NtWaitForSingleObject on unsignaled events ═══
 /// A parked waiter = a hosted thread that issued `NtWaitForSingleObject` on an event whose
 /// `signalled` flag is 0. Instead of returning STATUS_WAIT_0 with the thread still runnable (the
@@ -4002,6 +4030,40 @@ unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+}
+
+/// ★ The ERROR-RETURNING reply on a `Cap::Reply` — the successor of [`send_on_reply`] and the
+/// executive's half of the `Call`/reply-object component-dispatch transport
+/// (`docs/transport-migration.md` §3.5).
+///
+/// Identical register layout to [`send_on_reply`], but issued as **`SYS_CALL`** so the kernel's
+/// non-endpoint invocation arm (`syscall_handler.rs` `handle_send`'s `other =>` →
+/// `decode_invocation` → `invocation.rs::decode_reply`) writes the invocation's error label into
+/// `rsi`. `tasks/lessons.md`: *"seL4 SYS_SEND invocations HIDE ALL errors — use SYS_CALL when a
+/// failure would be silent."* Replying to an UNBOUND reply object is exactly such a failure: it
+/// means we believed a component was blocked in a Call when it was not, i.e. an invariant break.
+/// This form returns `seL4_InvalidCapability` (6) for it instead of vanishing.
+///
+/// It NEVER blocks: `decode_reply` either wakes the reply object's bound caller (applying
+/// `fault::apply_fault_reply` when that caller is fault-blocked, else a full message transfer) or
+/// fails immediately. That non-blocking property is the whole point — it is what replaces the
+/// executive's blocking wake `Send`.
+#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
+unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") reply_cptr => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") r0 => _,
+        inout("r8") r1 => _,
+        inout("r9") r2 => _,
+        inout("r15") r3 => _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
 }
 
 fn monotonic_time_100ns() -> u64 {
@@ -8277,6 +8339,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
     }
+    // ★ Component-dispatch transport: one DEDICATED reply object per launched IRP-driver instance
+    // (see [`REPLY_FSD_SLOT`]). NOT part of WAIT_REPLY_POOL — never stolen, never rotated.
+    let mut e_fsd = 0u64;
+    for i in 0..driver_launch::MAX_DRIVER_INSTANCES {
+        let rf = alloc_slot();
+        let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rf);
+        e_fsd |= e;
+        if e == 0 && rf != 0 {
+            REPLY_FSD_SLOT[i].store(rf, Ordering::Relaxed);
+        }
+    }
     // Path B: a dedicated fault endpoint + reply object for the real SM-loop thread's rendezvous.
     let sm_ep = make_object(OBJ_ENDPOINT);
     SM_FAULT_EP.store(sm_ep, Ordering::Relaxed);
@@ -8314,6 +8387,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_hex(REPLY_W32_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
     print_hex(e_rw as u32);
+    print_str(b") REPLY_FSD[0] cptr=0x");
+    print_hex(fsd_reply_slot(0) as u32);
+    print_str(b" REPLY_FSD[1] cptr=0x");
+    print_hex(fsd_reply_slot(1) as u32);
+    print_str(b" (retype e=0x");
+    print_hex(e_fsd as u32);
     print_str(b")\n");
 
     print_str(b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n");

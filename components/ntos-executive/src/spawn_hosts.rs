@@ -400,6 +400,27 @@ pub(crate) unsafe fn spawn_storage_host(
 // See `docs/component-harness.md` §2.4-2.5.
 // =============================================================================================
 
+/// ★ What a pump does FIRST — the `Call`-transport successor of [`PumpChannel::wake_first`]
+/// (`docs/transport-migration.md` §3.3).
+///
+/// `wake_first` had to encode "is the component parked at a recv, or is it a blocked sender?" — a
+/// question that only exists because the hand-rolled transport is an unpaired Send/Recv. Under the
+/// `Call` transport the question becomes a statement about the reply object:
+///
+/// * [`InitialAction::ReplyRequest`] — the component is blocked in a `Call` bound to this channel's
+///   reply object, so the pump ANSWERS that Call with the request (`reply_on`, which cannot block).
+/// * [`InitialAction::RecvFirst`] — the component is not yet blocked in a dispatch `Call` (it is
+///   mid-DriverEntry: either blocked in a fault Call or about to issue its ready Call), so the pump
+///   starts by RECEIVING.
+// Phase 0 of the transport migration is purely ADDITIVE: `initial` is derived at every call site
+// but not yet read (the legacy transport still reads `wake_first`). Phase 1 wires it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialAction {
+    ReplyRequest,
+    RecvFirst,
+}
+
 /// The executive-side channel to one Family-A dispatch server. Carries the fault/dispatch EP, the
 /// component VSpace (for demand-map), the in-image wall bounds, the shared frame base, the DONE
 /// label, and the per-server demand budget. `reply_cap`/`client_pi`/`caps` gate win32k's specifics
@@ -431,6 +452,11 @@ pub(crate) struct PumpChannel {
     /// fault (a blocked SENDER on the fault EP) or Send its ready signal, so the executive must start
     /// by RECEIVING (a leading Send would deadlock against the faulting sender). See `load_driver`.
     pub wake_first: bool,
+    /// The `Call`-transport successor of `wake_first` (see [`InitialAction`]). Derived from
+    /// `wake_first` at every call site so the two agree; the legacy transport still reads
+    /// `wake_first`.
+    #[allow(dead_code)]
+    pub initial: InitialAction,
     /// win32k Step-4 fields (0 for the FSD): the per-caller reply cap (REPLY_W32) and the client
     /// process-index for `client_attach`/foreign-frame sharing.
     pub reply_cap: u64,

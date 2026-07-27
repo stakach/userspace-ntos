@@ -1591,6 +1591,45 @@ pub(crate) unsafe fn recv_req_on() -> (u64, u64) {
     (message_info >> 12, token)
 }
 
+/// ★ The COMPONENT half of the `Call`/reply-object dispatch transport
+/// (`docs/transport-migration.md` §3.1): ONE `seL4_Call(CT_FAULT, msginfo)` that **publishes this
+/// dispatch's completion AND returns the next request as its reply value**.
+///
+/// It replaces the [`send_done_on`] + [`recv_req_on`] pair, and with it the whole class of defects
+/// that pair had:
+/// * there is no gap between "completion published" and "ready to receive" in which the executive's
+///   wake could block — after a `Call` the component is `BlockedOnReply` from the instant the kernel
+///   pairs it, with no user-visible window;
+/// * the answer cannot be someone else's: the kernel binds the executive's reply object to THIS
+///   caller (`endpoint.rs::finish_call` → `replies[i].bound_tcb = Some(sender)`), and the component
+///   physically cannot publish a second completion before being replied to.
+///
+/// Returns `(label, mr0..mr3)` of the executive's reply — the label distinguishes a dispatch request
+/// from win32k's callback-resume signal. Outgoing message length is whatever `msginfo` encodes (we
+/// only ever send a bare label, length 0).
+#[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
+#[inline(never)]
+pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
+    let reply_info: u64;
+    let m0: u64;
+    let m1: u64;
+    let m2: u64;
+    let m3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_CALL as u64,
+        inout("rdi") crate::CT_FAULT => _,
+        inout("rsi") msginfo => reply_info,
+        inout("r10") 0u64 => m0,
+        inout("r8") 0u64 => m1,
+        inout("r9") 0u64 => m2,
+        inout("r15") 0u64 => m3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (reply_info >> 12, m0, m1, m2, m3)
+}
+
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke the FSD's
 /// `MajorFunction[major]` handler. The pipe/file name (UTF-16) rides in the ARG frame ([SH_REQ_INLEN]
 /// bytes); the FILE_OBJECT's FileName points at it. Returns (status, information).
@@ -2229,6 +2268,7 @@ pub(crate) unsafe fn load_driver(
         demand_cap: 512,
         trace_faults: true,
         wake_first: false,
+        initial: crate::spawn_hosts::InitialAction::RecvFirst,
         reply_cap: 0,
         client_pi: 0,
         callback_client: None,
@@ -2490,6 +2530,7 @@ pub(crate) unsafe fn dispatch_irp(
         demand_cap: 256,
         trace_faults: false,
         wake_first: true, // per-IRP: the component is parked in recv_req_on → Send wakes it
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         reply_cap: 0,
         client_pi: 0,
         callback_client: None,

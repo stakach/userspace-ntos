@@ -947,6 +947,7 @@ unsafe fn resume_suspended_user_callback_component(
         demand_cap: 8192,
         trace_faults: false,
         wake_first: false,
+        initial: crate::spawn_hosts::InitialAction::RecvFirst,
         reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
         client_pi: client.pi as u64,
         callback_client: Some(client),
@@ -2638,6 +2639,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         demand_cap: 8192,
         trace_faults: false,
         wake_first: true, // win32k is parked in `recv_req` → wake it with a leading plain Send
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         reply_cap: rw,
         client_pi,
         callback_client: Some(crate::spawn_hosts::UserCallbackClient {
