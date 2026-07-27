@@ -708,3 +708,41 @@ fn user_probe_copyin_ranges() {
     ); // crosses end
     assert_eq!(p.probe_for_read(0x9_0000, 1), Err(STATUS_ACCESS_VIOLATION)); // unmapped
 }
+
+#[test]
+fn create_token_is_the_thirteen_argument_service_and_dispatch_preserves_every_slot() {
+    // The ABI table's arity IS what the executive's marshaller uses to decide how many slots to
+    // read off the CALLER'S STACK ([rsp+0x28 + 8*i] for i >= 4). A wrong arity here is a silently
+    // truncated `NtCreateToken`: args 5..13 are exactly the six structure pointers plus the LUID,
+    // the expiration time and the token source.
+    assert_eq!(NativeService::NtCreateToken.name(), "NtCreateToken");
+    assert_eq!(NativeService::NtCreateToken.arg_count(), (13, 13));
+    assert_eq!(nt_syscall_abi::exact_argc_of("NtCreateToken"), Some(13));
+    assert_eq!(nt_syscall_abi::ssn_of("NtCreateToken"), Some(57));
+
+    struct Capture(Vec<u64>);
+    impl NativeSyscallHandler for Capture {
+        fn handle(&mut self, _: &NativeCallContext, args: &[u64], _: &mut Vec<u8>) -> u32 {
+            self.0.extend_from_slice(args);
+            STATUS_SUCCESS
+        }
+    }
+
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtCreateToken, 57)],
+    );
+    let dispatcher = NativeSyscallDispatcher::new(table);
+    let args: [u64; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    let mut capture = Capture(Vec::new());
+    let result = dispatcher.dispatch(57, &args, &origin(ProcessorMode::UserMode), &mut capture);
+    assert_eq!(result.status, STATUS_SUCCESS);
+    assert_eq!(capture.0, args);
+
+    // A SHORT argument vector (a failed client-stack copy-in) never reaches the handler: the
+    // dispatcher rejects it on the arity bound.
+    let mut capture = Capture(Vec::new());
+    let short = dispatcher.dispatch(57, &args[..9], &origin(ProcessorMode::UserMode), &mut capture);
+    assert_eq!(short.status, STATUS_INVALID_PARAMETER);
+    assert!(capture.0.is_empty());
+}

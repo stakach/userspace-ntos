@@ -160,6 +160,21 @@ pub(crate) fn client_callback_window_bridge_proofs() -> (u64, u64) {
     )
 }
 
+/// Does this client currently own ANY outstanding user-mode callback frame?
+///
+/// A thread that faults OUTSIDE a callback strands nothing: win32k is not suspended in
+/// `KeUserModeCallback` on its behalf, so there is nothing to unwind — and latching the whole `pi`
+/// as a dead callback client would be actively wrong, because a hosted process' OTHER threads are
+/// still live callback clients. Park sites use this to tell the two cases apart.
+pub(crate) unsafe fn client_has_active_callback_frames(client_pi: u32) -> bool {
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    (0..active.len()).any(|index| {
+        active
+            .frame(index)
+            .is_some_and(|frame| frame.request().client_pi == client_pi)
+    })
+}
+
 /// Has this client's callback thread died? (Latched by [`unwind_dead_client_user_callbacks`].)
 fn user_callback_client_dead(client_pi: u32) -> bool {
     client_pi < 64 && USER_CALLBACK_DEAD_CLIENTS.load(Ordering::Relaxed) & (1u64 << client_pi) != 0

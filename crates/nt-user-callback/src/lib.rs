@@ -1115,6 +1115,18 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         }
     }
 
+    /// The frame at `index` (0 = outermost), or `None` past the live depth. Lets a caller ask
+    /// whether a given client owns ANY outstanding frame, not just the innermost one — the
+    /// distinction a per-thread park site needs before it declares a whole process a dead callback
+    /// client.
+    pub const fn frame(&self, index: usize) -> Option<&ActiveCallbackFrame> {
+        if index >= self.len {
+            None
+        } else {
+            Some(&self.frames[index])
+        }
+    }
+
     pub fn push(&mut self, request: CallbackHeader) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if self.len == DEPTH {
@@ -2423,6 +2435,32 @@ mod tests {
             Some(&ClientCallbackWindowState::new(0xaaaa, [0x11, 0x12, 0x13]))
         );
         assert!(stack.is_empty());
+    }
+
+    /// `frame(index)` must see EVERY level, not just the innermost — a park site asks "does this
+    /// client own ANY outstanding frame?" before deciding whether the whole process is a dead
+    /// callback client, and a buried frame is exactly the case `top()` alone would miss.
+    #[test]
+    fn active_callback_stack_frame_index_sees_every_level() {
+        let mut outer = CallbackHeader::idle(7, 2, 44, 4); // client_pi 2
+        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let mut inner = CallbackHeader::idle(8, 3, 55, 5); // a DIFFERENT client_pi
+        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let mut stack = ActiveCallbackStack::<2>::new();
+
+        assert!(stack.frame(0).is_none());
+        stack.push(outer).unwrap();
+        stack.push(inner).unwrap();
+
+        assert_eq!(stack.frame(0).unwrap().request().client_pi, 2);
+        assert_eq!(stack.frame(1).unwrap().request().client_pi, 3);
+        assert!(stack.frame(2).is_none(), "no read past the live depth");
+        // The buried pi-2 frame is invisible to `top()` but must be visible to `frame()`.
+        assert_eq!(stack.top().unwrap().request().client_pi, 3);
+        let owned_by_two = (0..stack.len())
+            .filter(|i| stack.frame(*i).unwrap().request().client_pi == 2)
+            .count();
+        assert_eq!(owned_by_two, 1);
     }
 
     #[test]

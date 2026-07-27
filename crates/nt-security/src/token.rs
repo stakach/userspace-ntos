@@ -133,6 +133,39 @@ pub const SE_SYSTEM_ENVIRONMENT: &str = "SeSystemEnvironmentPrivilege";
 pub const SE_UNDOCK: &str = "SeUndockPrivilege";
 pub const SE_MANAGE_VOLUME: &str = "SeManageVolumePrivilege";
 pub const SE_CREATE_GLOBAL: &str = "SeCreateGlobalPrivilege";
+// The remaining well-known privileges (`sdk/include/ndk/setypes.h:36`). None is in a default token
+// built by this kernel, but `NtCreateToken` accepts any well-known LUID, so the LUID→name table
+// must cover the whole `SE_MIN_WELL_KNOWN_PRIVILEGE..=SE_MAX_WELL_KNOWN_PRIVILEGE` range.
+pub const SE_MACHINE_ACCOUNT: &str = "SeMachineAccountPrivilege";
+pub const SE_SYSTEM_PROFILE: &str = "SeSystemProfilePrivilege";
+pub const SE_REMOTE_SHUTDOWN: &str = "SeRemoteShutdownPrivilege";
+pub const SE_SYNC_AGENT: &str = "SeSyncAgentPrivilege";
+pub const SE_ENABLE_DELEGATION: &str = "SeEnableDelegationPrivilege";
+
+/// Native `TOKEN_SOURCE` — the 8-character origin name plus its LUID, recorded on the token object
+/// (`ntoskrnl/se/tokenlif.c:226`). Purely descriptive: nothing in the access check consults it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TokenSource {
+    /// `CHAR SourceName[8]` — NOT null-terminated when all 8 bytes are used.
+    pub name: [u8; 8],
+    pub identifier: Luid,
+}
+
+impl TokenSource {
+    /// The source stamped on the kernel-built system tokens (`"*SYSTEM*"`).
+    pub const fn system() -> Self {
+        TokenSource {
+            name: *b"*SYSTEM*",
+            identifier: Luid { low: 0, high: 0 },
+        }
+    }
+}
+
+impl Default for TokenSource {
+    fn default() -> Self {
+        Self::system()
+    }
+}
 
 /// An access token — the subject's security identity (spec §7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -431,6 +464,7 @@ struct TokenObject {
     modified_luid: Luid,
     expiration_time: i64,
     dynamic_charged: u32,
+    source: TokenSource,
 }
 
 /// The fixed native fields returned for `TokenStatistics`.
@@ -478,8 +512,19 @@ impl TokenStore {
         }
     }
 
-    /// Insert a token with one owning reference.
+    /// Insert a token with one owning reference, never expiring, sourced `"*SYSTEM*"`.
     pub fn insert(&mut self, token: AccessToken) -> TokenId {
+        self.insert_created(token, -1, TokenSource::system())
+    }
+
+    /// Insert a token with one owning reference, carrying the object-level fields a caller-built
+    /// token owns: its `ExpirationTime` and its `TOKEN_SOURCE` (`NtCreateToken`).
+    pub fn insert_created(
+        &mut self,
+        token: AccessToken,
+        expiration_time: i64,
+        source: TokenSource,
+    ) -> TokenId {
         let token_luid = self.allocate_luid();
         let modified_luid = self.allocate_luid();
         let dynamic_charged = dynamic_usage(&token).max(500) as u32;
@@ -488,10 +533,22 @@ impl TokenStore {
             references: 1,
             token_luid,
             modified_luid,
-            expiration_time: -1,
+            expiration_time,
             dynamic_charged,
+            source,
         }));
         TokenId(self.objects.len() as u32)
+    }
+
+    /// The `TOKEN_SOURCE` recorded when the token object was created. A duplicate inherits its
+    /// source from the token it was made from (`ntoskrnl/se/tokenlif.c:537`).
+    pub fn source(&self, id: TokenId) -> Option<TokenSource> {
+        Some(self.objects.get(id.slot())?.as_ref()?.source)
+    }
+
+    /// The token object's `ExpirationTime` (`-1` = never).
+    pub fn expiration_time(&self, id: TokenId) -> Option<i64> {
+        Some(self.objects.get(id.slot())?.as_ref()?.expiration_time)
     }
 
     pub fn get(&self, id: TokenId) -> Option<&AccessToken> {
@@ -545,7 +602,7 @@ impl TokenStore {
         impersonation_level: SecurityImpersonationLevel,
         effective_only: bool,
     ) -> Result<TokenId, u32> {
-        let (duplicate, modified_luid, expiration_time, dynamic_charged) = {
+        let (duplicate, modified_luid, expiration_time, dynamic_charged, token_source) = {
             let source = self
                 .objects
                 .get(source.slot())
@@ -558,6 +615,7 @@ impl TokenStore {
                 source.modified_luid,
                 source.expiration_time,
                 source.dynamic_charged,
+                source.source,
             )
         };
         let token_luid = self.allocate_luid();
@@ -568,6 +626,7 @@ impl TokenStore {
             modified_luid,
             expiration_time,
             dynamic_charged,
+            source: token_source,
         }));
         Ok(TokenId(self.objects.len() as u32))
     }

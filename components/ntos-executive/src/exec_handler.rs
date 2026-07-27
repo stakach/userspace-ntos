@@ -15,6 +15,34 @@ static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
+/// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
+/// cross-address-space copy-in behind the pure `nt_security::ClientMemory` capture contract.
+/// `xas_read` resolves the stack/heap/image mirrors, the persistent frame aliases, and finally the
+/// backing PE, and returns `false` for anything it cannot reach — which the capture turns into
+/// `STATUS_ACCESS_VIOLATION` rather than reading garbage.
+struct ExecClientMemory<'a> {
+    handler: &'a ExecNtHandler,
+}
+
+impl nt_security::ClientMemory for ExecClientMemory<'_> {
+    fn read(&self, va: u64, dst: &mut [u8]) -> bool {
+        // SAFETY: `xas_read` only reads through the executive's own mirrors/aliases for the
+        // handler's current process index; `dst` is a live local slice.
+        unsafe { self.handler.xas_read(va, dst) }
+    }
+}
+
+/// Render a `TOKEN_SOURCE::SourceName` (8 raw bytes, not NUL-terminated) printably.
+fn captured_source_bytes(packed: u64) -> [u8; 8] {
+    let mut name = packed.to_le_bytes();
+    for byte in name.iter_mut() {
+        if !(0x20..0x7f).contains(byte) {
+            *byte = b'.';
+        }
+    }
+    name
+}
+
 pub(crate) fn native_processor_information(
 ) -> nt_syscall::system_information::SystemProcessorInformation {
     use core::arch::x86_64::__cpuid;
@@ -2945,6 +2973,18 @@ impl ExecNtHandler {
             let _ = self.pm.take_handle(target_pid, handle);
             return Err(status);
         }
+        // ★ Record the logon token crossing into winlogon: `LsapLogonUser`'s closing
+        // `NtDuplicateObject(NtCurrentProcess(), TokenHandle, ClientProcessHandle, &Reply.Token, …)`
+        // (authpackage.c:1712). Only the token the `NtCreateToken` service minted counts.
+        if let nt_process::HandleObject::TokenObject(token) = object {
+            if token.raw() as u64 == SE_CREATE_TOKEN_ID.load(Ordering::Relaxed)
+                && SE_CREATE_TOKEN_ID.load(Ordering::Relaxed) != 0
+                && self.pi_for_pid(target_pid) == Some(2)
+            {
+                WINLOGON_LOGON_TOKEN_HANDLE.store(handle as u64, Ordering::Relaxed);
+                WINLOGON_LOGON_TOKEN_DUPLICATES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         Ok(handle)
     }
 
@@ -3091,6 +3131,211 @@ impl ExecNtHandler {
             self.token_dirty = true;
         }
         status
+    }
+
+    /// `NtCreateToken(TokenHandle, DesiredAccess, ObjectAttributes, TokenType, AuthenticationId,`
+    /// `ExpirationTime, TokenUser, TokenGroups, TokenPrivileges, TokenOwner, TokenPrimaryGroup,`
+    /// `TokenDefaultDacl, TokenSource)` — `ntoskrnl/se/tokenlif.c:1559`.
+    ///
+    /// The **widest** service the executive hosts by argument-*meaning*: thirteen arguments, of
+    /// which the first four ride in `r10/rdx/r8/r9` and args 5..13 come off the caller's stack. The
+    /// dispatcher's generic marshaller already gathers them (arity 13 from the shared
+    /// `nt_syscall_abi` table, read at `[rsp+0x28 + 8*i]` through the client mirror), so this
+    /// handler receives a flat `args[0..13]` — but it must NOT assume it: a short vector means the
+    /// stack copy-in failed and the call fails closed.
+    ///
+    /// Six of the thirteen arguments point at **variable-length structures in the caller's address
+    /// space**, several of which are themselves arrays of pointers to SIDs. That capture is the
+    /// pure, host-tested `nt_security::create_token` walk; everything here is the kernel-side
+    /// policy around it: probe the output handle, check the token type, enforce
+    /// `SeCreateTokenPrivilege`, capture the QoS impersonation level out of `ObjectAttributes`, and
+    /// insert the resulting token object + a handle to it in the caller's own handle table.
+    unsafe fn nt_create_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
+
+        SE_CREATE_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        SE_CREATE_TOKEN_ARGC.store(args.len() as u64, Ordering::Relaxed);
+        // ★ WIDE-ARGUMENT GUARD. Args 5..13 are the nine stack slots; if the dispatcher could not
+        // read them all it hands a short vector, and every structure pointer we need lives THERE.
+        if args.len() < 13 {
+            SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u64, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        }
+        SE_CREATE_TOKEN_STACK_ARGS.store(
+            args[4..13].iter().filter(|value| **value != 0).count() as u64,
+            Ordering::Relaxed,
+        );
+
+        let out = args[0];
+        let desired_access = args[1] as u32;
+        let object_attributes = args[2];
+        if !self.probe_user_output(out, 8) {
+            SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_ACCESS_VIOLATION as u64, Ordering::Relaxed);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        // ReactOS checks the token type BEFORE the privilege check, so a garbage type is reported
+        // as STATUS_BAD_TOKEN_TYPE even to an unprivileged caller (tokenlif.c:1686).
+        if args[3] as u32 != 1 && args[3] as u32 != 2 {
+            SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_BAD_TOKEN_TYPE as u64, Ordering::Relaxed);
+            return STATUS_BAD_TOKEN_TYPE;
+        }
+        // ★ `SeSinglePrivilegeCheck(SeCreateTokenPrivilege, PreviousMode)` (tokenlif.c:1695). The
+        // caller's EFFECTIVE token (impersonation token if one is set, else the process primary
+        // token) must hold the privilege ENABLED. lsass' LocalSystem token has it present-but-
+        // disabled by default and enables it itself in `LsapRmInitializeServer` ->
+        // `RtlAdjustPrivilege(SE_CREATE_TOKEN_PRIVILEGE, TRUE, FALSE, ...)` (lsasrv.c:314), which
+        // runs through the real `NtAdjustPrivilegesToken` service.
+        if !self.current_token_has_privilege(nt_security::SE_CREATE_TOKEN) {
+            SE_CREATE_TOKEN_PRIV_DENIED.fetch_add(1, Ordering::Relaxed);
+            SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_PRIVILEGE_NOT_HELD as u64, Ordering::Relaxed);
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+
+        // `ObjectAttributes->SecurityQualityOfService->ImpersonationLevel`, captured exactly as
+        // `nt_duplicate_token` does. An absent OA / QoS leaves the level Anonymous.
+        let mut level = nt_security::SecurityImpersonationLevel::Anonymous;
+        if object_attributes != 0 {
+            let mut oa = [0u8; 48];
+            if !self.xas_read(object_attributes, &mut oa) {
+                SE_CREATE_TOKEN_LAST_STATUS
+                    .store(STATUS_ACCESS_VIOLATION as u64, Ordering::Relaxed);
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if u32::from_le_bytes(oa[0..4].try_into().unwrap()) != 48 {
+                SE_CREATE_TOKEN_LAST_STATUS
+                    .store(STATUS_INVALID_PARAMETER as u64, Ordering::Relaxed);
+                return STATUS_INVALID_PARAMETER;
+            }
+            let qos = u64::from_le_bytes(oa[40..48].try_into().unwrap());
+            if qos != 0 {
+                let mut captured = [0u8; 12];
+                if !self.xas_read(qos, &mut captured) {
+                    SE_CREATE_TOKEN_LAST_STATUS
+                        .store(STATUS_ACCESS_VIOLATION as u64, Ordering::Relaxed);
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                level = match nt_security::SecurityImpersonationLevel::try_from(u32::from_le_bytes(
+                    captured[4..8].try_into().unwrap(),
+                )) {
+                    Ok(level) => level,
+                    Err(status) => {
+                        SE_CREATE_TOKEN_LAST_STATUS.store(status as u64, Ordering::Relaxed);
+                        return status;
+                    }
+                };
+            }
+        }
+
+        let request = nt_security::CreateTokenArgs {
+            token_type: args[3] as u32,
+            authentication_id: args[4],
+            expiration_time: args[5],
+            token_user: args[6],
+            token_groups: args[7],
+            token_privileges: args[8],
+            token_owner: args[9],
+            token_primary_group: args[10],
+            token_default_dacl: args[11],
+            token_source: args[12],
+        };
+        // The bounded cross-address-space capture. Scoped so the immutable borrow of `self` ends
+        // before the token store is mutated.
+        let captured = {
+            let memory = ExecClientMemory { handler: &*self };
+            nt_security::capture_token(&memory, &request, level)
+        };
+        let captured = match captured {
+            Ok(captured) => captured,
+            Err(status) => {
+                SE_CREATE_TOKEN_CAPTURE_FAILS.fetch_add(1, Ordering::Relaxed);
+                SE_CREATE_TOKEN_LAST_STATUS.store(status as u64, Ordering::Relaxed);
+                return status;
+            }
+        };
+
+        let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
+            SE_CREATE_TOKEN_LAST_STATUS
+                .store(nt_process::STATUS_INVALID_HANDLE as u64, Ordering::Relaxed);
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let user_rid = captured.token.user.sub_authorities.last().copied();
+        let user_subauths = captured.token.user.sub_authorities.len() as u64;
+        let group_count = captured.token.groups.len() as u64;
+        let privilege_count = captured.token.privileges.len() as u64;
+        let authentication_id = captured.token.authentication_id;
+        let token_type = captured.token.token_type;
+        let source_name = u64::from_le_bytes(captured.source.name);
+
+        let token = self.token_store.insert_created(
+            captured.token,
+            captured.expiration_time,
+            captured.source,
+        );
+        let status = self.insert_owned_token_handle(caller_pid, token, desired_access, out);
+        SE_CREATE_TOKEN_LAST_STATUS.store(status as u64, Ordering::Relaxed);
+        if status != 0 {
+            // `insert_owned_token_handle` already released the token on every failure path.
+            return status;
+        }
+        // The token body was allocated ABOVE this iteration's bump-heap mark; pin the mark past it
+        // so the minted token survives the per-syscall reset (same contract as NtDuplicateToken).
+        self.token_dirty = true;
+        SE_CREATE_TOKEN_MINTED.fetch_add(1, Ordering::Relaxed);
+        if SE_CREATE_TOKEN_PI.load(Ordering::Relaxed) == u64::MAX {
+            // Read the shape back OUT OF THE STORE, not out of the captured value, so the recorded
+            // evidence is what the token object actually holds.
+            let stored = self.token_store.get(token);
+            SE_CREATE_TOKEN_PI.store(self.pi as u64, Ordering::Relaxed);
+            SE_CREATE_TOKEN_ID.store(token.raw() as u64, Ordering::Relaxed);
+            SE_CREATE_TOKEN_USER_RID.store(user_rid.unwrap_or(u32::MAX) as u64, Ordering::Relaxed);
+            SE_CREATE_TOKEN_USER_SUBAUTHS.store(user_subauths, Ordering::Relaxed);
+            SE_CREATE_TOKEN_GROUPS.store(
+                stored.map(|t| t.groups.len() as u64).unwrap_or(group_count),
+                Ordering::Relaxed,
+            );
+            SE_CREATE_TOKEN_PRIVS.store(
+                stored
+                    .map(|t| t.privileges.len() as u64)
+                    .unwrap_or(privilege_count),
+                Ordering::Relaxed,
+            );
+            SE_CREATE_TOKEN_AUTH_LUID.store(
+                (authentication_id.high as u32 as u64) << 32 | authentication_id.low as u64,
+                Ordering::Relaxed,
+            );
+            SE_CREATE_TOKEN_TYPE.store(token_type as u64, Ordering::Relaxed);
+            SE_CREATE_TOKEN_SOURCE_NAME.store(source_name, Ordering::Relaxed);
+            let mut handle_out = [0u8; 8];
+            if self.xas_read(out, &mut handle_out) {
+                SE_CREATE_TOKEN_HANDLE.store(u64::from_le_bytes(handle_out), Ordering::Relaxed);
+            }
+            print_str(b"[se-token] NtCreateToken minted pi=");
+            print_u64(self.pi as u64);
+            print_str(b" id=");
+            print_u64(token.raw() as u64);
+            print_str(b" type=");
+            print_u64(token_type as u64);
+            print_str(b" user-rid=");
+            print_u64(user_rid.unwrap_or(u32::MAX) as u64);
+            print_str(b" subauths=");
+            print_u64(user_subauths);
+            print_str(b" groups=");
+            print_u64(group_count);
+            print_str(b" privs=");
+            print_u64(privilege_count);
+            print_str(b" authid=0x");
+            print_hex(authentication_id.high as u32);
+            print_hex(authentication_id.low);
+            print_str(b" source=");
+            print_str(&captured_source_bytes(source_name));
+            print_str(b" stack-args=");
+            print_u64(SE_CREATE_TOKEN_STACK_ARGS.load(Ordering::Relaxed));
+            print_str(b"/9\n");
+        }
+        0
     }
 
     unsafe fn nt_open_thread_token(&mut self, args: &[u64], extended: bool) -> u32 {
@@ -8027,6 +8272,8 @@ impl ExecNtHandler {
                 self.nt_open_process_token(args[0], args[1] as u32, args[3])
             },
             NativeService::NtDuplicateToken => unsafe { self.nt_duplicate_token(args) },
+            // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
+            NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtResumeThread => unsafe {
                 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
                 print_str(b"[thread-life] NtResumeThread pi=");
@@ -8487,6 +8734,17 @@ impl ExecNtHandler {
                     Ok(token) => token,
                     Err(status) => return status,
                 };
+                // ★ The LOGON TOKEN round trip. `LsapLogonUser` ends by duplicating the token it
+                // minted into the CLIENT process (`NtDuplicateObject(..., ClientProcessHandle, ...,
+                // DUPLICATE_CLOSE_SOURCE)`, authpackage.c:1712). Count winlogon (pi 2) querying THAT
+                // token object — proof the handle crossed processes and resolves to the same object
+                // the `NtCreateToken` service inserted, not to winlogon's own primary token.
+                if self.pi == 2
+                    && token_id.raw() as u64 == SE_CREATE_TOKEN_ID.load(Ordering::Relaxed)
+                    && SE_CREATE_TOKEN_ID.load(Ordering::Relaxed) != 0
+                {
+                    WINLOGON_LOGON_TOKEN_QUERIES.fetch_add(1, Ordering::Relaxed);
+                }
                 let token = match self.token_store.get(token_id) {
                     Some(token) => token,
                     None => return 0xC000_0008,

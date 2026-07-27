@@ -634,6 +634,60 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 > Four specs that pinned the OLD wall were re-pointed at the new one, each strictly stronger — see
 > `docs/transport-migration.md` §Phase 5.5.
 
+> **Update (batch 52, gate 239/99) — `NtCreateToken` IS SERVICED AND THE INTERACTIVE LOGON
+> COMPLETES.** `LsaLogonUser` returns **STATUS_SUCCESS**. Three consecutive foreground boots, all
+> RUNEXIT=3, `microtest sentinel`, **ZERO FAILs**, gate **239/99**, `diff`-identical 239-line PASS
+> lists, paint **768/768 changed @ `0x003a6ea5`**. No kernel change (`rust-micro` untouched).
+>
+> **The service.** `NtCreateToken` is a **13-argument** system service: four arguments in
+> `r10/rdx/r8/r9`, **nine off the caller's stack** at `[rsp+0x28 .. rsp+0x60]`. No new marshalling
+> machinery was needed — the arity was already in `nt_syscall_abi::NT_ARGC` and the executive's
+> dispatcher reads exactly `entry.max_args` slots through the client mirror; the handler asserts it
+> received all 13 and fails closed otherwise (measured: `argc = 13`, **9/9** stack slots non-zero,
+> including `TokenSource` at the very last slot). Six of the thirteen point at **variable-length
+> structures in lsass' address space**, several of them arrays of pointers to SIDs; that walk is the
+> pure, host-tested `nt_security::create_token` capture behind a `ClientMemory` trait (the executive
+> plugs in `xas_read`). It fails closed at every step: the SID header is validated *before* its
+> sub-authority tail is read, `GroupCount`/`PrivilegeCount` are bounded, the ACL is read exactly
+> `AclSize` bytes and structurally validated, and every allocation goes through `try_reserve_exact`.
+> **`SeCreateTokenPrivilege` is enforced** (ReactOS' order: token type first, then
+> `SeSinglePrivilegeCheck`), and lsass really does hold it — its own
+> `RtlAdjustPrivilege(SE_CREATE_TOKEN_PRIVILEGE, TRUE, …)` (`lsasrv.c:314`) enables the
+> present-but-disabled privilege in the LocalSystem token through the real `NtAdjustPrivilegesToken`.
+>
+> **What the real chain produced.** `SamValidateNormalUser` validates **`Administrator`** against the
+> real `SampInitDatabase`; `LsapSetPrivileges` honestly fails `LsapOpenDbObject(Accounts/S…)` on the
+> fresh database, so the token carries **0 privileges** — that is the truth, not a gap we filled. The
+> minted token, read back **out of the token store**: user SID with **5 sub-authorities, RID 500**,
+> **8 groups**, `AuthenticationId = 0x3eb` (msgina's real `NtAllocateLocallyUniqueId`),
+> `TOKEN_SOURCE = "User32  "`, `TokenPrimary`. `LSA_API_MSG.Status` = **STATUS_SUCCESS**, lsass
+> duplicates the token into winlogon (`NtDuplicateObject … DUPLICATE_CLOSE_SOURCE`, handle `0x2a0`)
+> and winlogon queries that same token object. New specs: `exec_se_create_token_serviced`,
+> `exec_se_create_token_logon_token_shape`, `exec_winlogon_logon_token_received`. Four LSA specs that
+> pinned the old wall were re-pointed at the completion, each strictly stronger (wall SSN → **no wall
+> at all**; `replies + 1 == requests` → **`replies == requests`**; reply status **unset** → **0**;
+> logon **in flight** → **completed**).
+>
+> **A real win32k defect the success exposed, and fixed.** `PsSetThreadWin32Thread` wrote only the
+> executive's side cell; real NT writes `Thread->Tcb.Win32Thread` (`ntoskrnl/ps/thread.c:909`) and the
+> MSVC win32k build **inlines** that read — `NtUserCallNoParam(NOPARAM_ROUTINE_DESTROY_CARET)`
+> compiles to `call PsGetCurrentThread; mov rcx,[rax+0x250]; call co_IntDestroyCaret`. The first
+> thing a SUCCESSFUL logon does is `EndDialog(WLX_SAS_ACTION_LOGON)` → dialog teardown → that path,
+> so hosted win32k took a `#PF` at `cr2 = 0x60` (`pti->MessageQueue`) and the pump RETIRED it. Fixed
+> by storing the pointer in the thread object (moved to its own DATA page, since `+0x250` overlapped
+> the `SE_EXPORTS` placeholder) and publishing the dispatch THREADINFO there before every dispatch.
+>
+> **NEW FRONTIER — winlogon's post-logon path, and it is an ntdll item.** winlogon proceeds past the
+> logon (spawns a real worker, allocates) and then faults **in our own ntdll**:
+> `RtlQueryInformationActivationContext` (`nt-ntdll.dll` RVA `0x1d1d0+0xbd`) walks
+> `gs:[0x30] → TEB+0x2C8 (ActivationContextStackPointer) → [0] (ActiveFrame) → [+8]` and finds the
+> **non-pointer** value `0x0000_0006_0010_0000` in `ActiveFrame` (`cr2 = 0x6_0010_0008`,
+> `rip = 0x1_0081_d28d`). `RtlAllocateActivationContextStack` is idempotent and zeroes `ActiveFrame`,
+> so either `TEB+0x2C8` does not point at an `ACTIVATION_CONTEXT_STACK` for this thread or that field
+> was overwritten. The thread takes a **MILESTONE park** at the achieved logon (never a crash park —
+> a crash park latches the whole process as a dead win32k callback client, which is wrong when only
+> one thread is stuck). `WLX_SAS_ACTION_LOGON` reaching `userinit.exe` is downstream of that fix.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

@@ -2015,6 +2015,55 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
+                // ★ WINLOGON POST-LOGON MILESTONE PARK. winlogon's main thread has, by this point,
+                // COMPLETED the interactive logon for real: `LsaLogonUser` returned SUCCESS, lsass
+                // duplicated the `NtCreateToken` token into winlogon's handle table and winlogon
+                // queried it (`WINLOGON_LOGON_TOKEN_QUERIES`). Its post-logon path (profile load →
+                // `userinit.exe`) is the NEXT frontier and it faults there — measured: our own
+                // ntdll's `RtlQueryInformationActivationContext` reads
+                // `TEB.ActivationContextStackPointer->ActiveFrame` and finds a NON-POINTER value.
+                //
+                // Park at the achieved milestone instead of crash-parking. The difference is not
+                // cosmetic: `park_and_log!` calls `unwind_dead_client_user_callbacks(pi)`, which
+                // latches the WHOLE process as a dead win32k callback client — wrong here, because
+                // this is ONE thread and winlogon's worker threads are alive, hold no callback
+                // frames (asserted, not assumed) and are still valid callback clients. The faulting
+                // thread is left blocked at its fault exactly as any other park leaves its thread.
+                if pi == 2
+                    && badge == WINLOGON_BADGE
+                    && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                    && !win32k_glue::client_has_active_callback_frames(2)
+                {
+                    print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON (LsaLogonUser SUCCESS + logon token received/queried); its POST-LOGON path faults at ip=0x");
+                    print_hex((m0 >> 32) as u32);
+                    print_hex(m0 as u32);
+                    print_str(b" cr2=0x");
+                    print_hex((addr >> 32) as u32);
+                    print_hex(addr as u32);
+                    print_str(b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n");
+                    crash_parked |= 1u64 << owner_top_badge(badge);
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    WINLOGON_POST_LOGON_MILESTONE_PARK.store(m0, Ordering::Relaxed);
+                    WINLOGON_POST_LOGON_MILESTONE_CR2.store(addr, Ordering::Relaxed);
+                    // Same terminal rule `park_and_log!` applies to a parked winlogon: once the LSA
+                    // server has signalled, services/lsass are idle RPC servers with no live client
+                    // left, so a parked winlogon leaves NO runnable signaler and the next `recv`
+                    // would block forever (measured: RUNEXIT=124 without this clause).
+                    if (live_top_badges() & !(crash_parked | wait_parked)) == 0
+                        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
+                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 // Unrecoverable fault outside every mapped image/DLL/scratch/stack (a truncated code
                 // pointer / bad address the diagnostics above symbolized) — a real crash. Park+log.
                 // park_and_log! diverges (type `!`) so this arm yields no value — match type is satisfied.
@@ -9937,6 +9986,15 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         _ => {}
     }
     LSA_LOGON_IN_FLIGHT.store(0, Ordering::Relaxed);
+    // ★ LAST INSTANT THE LOGON DIALOG IS GUARANTEED ALIVE. A SUCCESSFUL `LsaLogonUser` makes msgina
+    // return `WLX_SAS_ACTION_LOGON`, and `EndDialog` then legitimately DESTROYS the IDD_LOGON dialog
+    // and its controls — after which the gate can no longer resolve their HWNDs or sample their
+    // framebuffer rectangle. Latch those three measurements here, unchanged, so the gate asserts the
+    // same properties measured while they hold. (Before the token service existed the reply was a
+    // failure and the dialog stayed up, which is the only reason a gate-time sample ever worked.)
+    if LSA_LAST_API_NUMBER.load(Ordering::Relaxed) == 2 {
+        unsafe { crate::latch_logon_dialog_evidence() };
+    }
     print_str(b"[lsa-rdv] REPLY delivered: api=");
     print_u64(LSA_LAST_API_NUMBER.load(Ordering::Relaxed));
     print_str(b" LSA_API_MSG.Status=0x");

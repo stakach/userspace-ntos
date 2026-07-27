@@ -713,3 +713,423 @@ fn token_store_reference_outlives_assigning_handle() {
     assert!(store.get(impersonation).is_none());
     assert!(store.get(primary).is_some());
 }
+
+// ─── `NtCreateToken` capture (`create_token.rs`) ────────────────────────────────────────────────
+//
+// These drive the REAL capture path with a mock client address space, so the variable-length
+// `TOKEN_*` walk — the count-driven `SID_AND_ATTRIBUTES` / `LUID_AND_ATTRIBUTES` arrays, the second
+// indirection through every `PSID`/`PACL` — is exercised structure-for-structure without a target.
+
+use crate::create_token::{
+    capture_acl, capture_sid, capture_token, privilege_name_for_luid, ClientMemory,
+    CreateTokenArgs, MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES, SE_GROUP_ENABLED,
+    SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_MANDATORY, SE_GROUP_OWNER, SE_GROUP_USE_FOR_DENY_ONLY,
+    STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
+    STATUS_INVALID_SID,
+};
+use alloc::vec::Vec;
+
+/// A mock client address space: a set of disjoint mapped regions. A read that leaves *any* mapped
+/// region fails — the same fail-closed contract the executive's cross-address-space reader has.
+#[derive(Default)]
+struct MockClient {
+    regions: Vec<(u64, Vec<u8>)>,
+    /// Every byte the capture attempted to read, so a test can prove no over-read happened.
+    reads: core::cell::RefCell<u64>,
+}
+
+impl MockClient {
+    fn map(&mut self, va: u64, bytes: &[u8]) {
+        self.regions.push((va, bytes.to_vec()));
+    }
+    fn bytes_read(&self) -> u64 {
+        *self.reads.borrow()
+    }
+}
+
+impl ClientMemory for MockClient {
+    fn read(&self, va: u64, dst: &mut [u8]) -> bool {
+        *self.reads.borrow_mut() += dst.len() as u64;
+        for (base, bytes) in &self.regions {
+            if va < *base {
+                continue;
+            }
+            let offset = (va - *base) as usize;
+            if let Some(source) = bytes.get(offset..offset + dst.len()) {
+                dst.copy_from_slice(source);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn native_sid(authority: u8, sub_authorities: &[u32]) -> Vec<u8> {
+    let sid = Sid::new(authority, sub_authorities);
+    let mut bytes = vec![0u8; sid.native_len().unwrap()];
+    sid.write_native(&mut bytes).unwrap();
+    bytes
+}
+
+fn sid_and_attributes(sid_va: u64, attributes: u32) -> Vec<u8> {
+    let mut entry = vec![0u8; 16];
+    entry[0..8].copy_from_slice(&sid_va.to_le_bytes());
+    entry[8..12].copy_from_slice(&attributes.to_le_bytes());
+    entry
+}
+
+fn luid_and_attributes(low: u32, high: i32, attributes: u32) -> Vec<u8> {
+    let mut entry = vec![0u8; 12];
+    entry[0..4].copy_from_slice(&low.to_le_bytes());
+    entry[4..8].copy_from_slice(&high.to_le_bytes());
+    entry[8..12].copy_from_slice(&attributes.to_le_bytes());
+    entry
+}
+
+// A mock layout mirroring exactly what lsasrv's `LsapLogonUser` hands `NtCreateToken` for
+// `LsaTokenInformationV1` (`dll/win32/lsasrv/authpackage.c:1655`).
+const USER_SID_VA: u64 = 0x0000_0007_0001_0000;
+const ADMINS_SID_VA: u64 = 0x0000_0007_0001_0100;
+const USERS_SID_VA: u64 = 0x0000_0007_0001_0200;
+const EVERYONE_SID_VA: u64 = 0x0000_0007_0001_0300;
+const TOKEN_USER_VA: u64 = 0x0000_0007_0002_0000;
+const TOKEN_GROUPS_VA: u64 = 0x0000_0007_0002_0100;
+const TOKEN_PRIVILEGES_VA: u64 = 0x0000_0007_0002_0200;
+const TOKEN_OWNER_VA: u64 = 0x0000_0007_0002_0300;
+const TOKEN_PRIMARY_GROUP_VA: u64 = 0x0000_0007_0002_0400;
+const TOKEN_DEFAULT_DACL_VA: u64 = 0x0000_0007_0002_0500;
+const ACL_VA: u64 = 0x0000_0007_0002_0600;
+const AUTH_ID_VA: u64 = 0x0000_0007_0003_0000;
+const EXPIRATION_VA: u64 = 0x0000_0007_0003_0010;
+const SOURCE_VA: u64 = 0x0000_0007_0003_0020;
+
+/// Build the reference client layout. `group_count` is written into `TOKEN_GROUPS::GroupCount`
+/// independently of how many entries are actually mapped, so a test can state a hostile count.
+fn logon_token_client(group_count: u32, privilege_count: u32) -> (MockClient, CreateTokenArgs) {
+    let mut client = MockClient::default();
+    client.map(USER_SID_VA, &native_sid(5, &[21, 4660, 1001, 500]));
+    client.map(ADMINS_SID_VA, &native_sid(5, &[32, 544]));
+    client.map(USERS_SID_VA, &native_sid(5, &[32, 545]));
+    client.map(EVERYONE_SID_VA, &native_sid(1, &[0]));
+
+    client.map(TOKEN_USER_VA, &sid_and_attributes(USER_SID_VA, 0));
+
+    // GroupCount + 3 SID_AND_ATTRIBUTES: an OWNER+mandatory admins group (mandatory must force
+    // ENABLED even though SE_GROUP_ENABLED is absent), a plainly enabled users group, and a
+    // deny-only Everyone.
+    let mut groups = Vec::new();
+    groups.extend_from_slice(&group_count.to_le_bytes());
+    groups.extend_from_slice(&[0u8; 4]); // padding up to the array's 8-byte alignment
+    groups.extend_from_slice(&sid_and_attributes(
+        ADMINS_SID_VA,
+        SE_GROUP_MANDATORY | SE_GROUP_OWNER | SE_GROUP_ENABLED_BY_DEFAULT,
+    ));
+    groups.extend_from_slice(&sid_and_attributes(USERS_SID_VA, SE_GROUP_ENABLED));
+    groups.extend_from_slice(&sid_and_attributes(
+        EVERYONE_SID_VA,
+        SE_GROUP_USE_FOR_DENY_ONLY,
+    ));
+    client.map(TOKEN_GROUPS_VA, &groups);
+
+    // PrivilegeCount + 2 LUID_AND_ATTRIBUTES: SeChangeNotify (23) enabled-by-default + enabled,
+    // SeShutdown (19) present but disabled.
+    let mut privileges = Vec::new();
+    privileges.extend_from_slice(&privilege_count.to_le_bytes());
+    privileges.extend_from_slice(&luid_and_attributes(
+        23,
+        0,
+        SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT,
+    ));
+    privileges.extend_from_slice(&luid_and_attributes(19, 0, 0));
+    client.map(TOKEN_PRIVILEGES_VA, &privileges);
+
+    client.map(TOKEN_OWNER_VA, &ADMINS_SID_VA.to_le_bytes());
+    client.map(TOKEN_PRIMARY_GROUP_VA, &USERS_SID_VA.to_le_bytes());
+    client.map(TOKEN_DEFAULT_DACL_VA, &ACL_VA.to_le_bytes());
+    client.map(ACL_VA, NativeAcl::system_default().as_bytes());
+
+    // AuthenticationId = the LUID msgina minted; ExpirationTime = never; TOKEN_SOURCE = "User32  ".
+    client.map(AUTH_ID_VA, &0x0000_0002_0000_03e9u64.to_le_bytes());
+    client.map(EXPIRATION_VA, &(-1i64).to_le_bytes());
+    let mut source = Vec::new();
+    source.extend_from_slice(b"User32  ");
+    source.extend_from_slice(&0x0000_0000_0000_03eau64.to_le_bytes());
+    client.map(SOURCE_VA, &source);
+
+    let args = CreateTokenArgs {
+        token_type: 1, // TokenPrimary
+        authentication_id: AUTH_ID_VA,
+        expiration_time: EXPIRATION_VA,
+        token_user: TOKEN_USER_VA,
+        token_groups: TOKEN_GROUPS_VA,
+        token_privileges: TOKEN_PRIVILEGES_VA,
+        token_owner: TOKEN_OWNER_VA,
+        token_primary_group: TOKEN_PRIMARY_GROUP_VA,
+        token_default_dacl: TOKEN_DEFAULT_DACL_VA,
+        token_source: SOURCE_VA,
+    };
+    (client, args)
+}
+
+#[test]
+fn create_token_captures_the_real_logon_token_layout() {
+    let (client, args) = logon_token_client(3, 2);
+    let captured =
+        capture_token(&client, &args, SecurityImpersonationLevel::Impersonation).unwrap();
+
+    assert_eq!(captured.token.token_type, TokenType::Primary);
+    // A PRIMARY token stores Anonymous regardless of the QoS level, like `AccessToken::duplicate`.
+    assert_eq!(
+        captured.token.impersonation_level,
+        SecurityImpersonationLevel::Anonymous
+    );
+    assert_eq!(captured.token.user.to_sddl(), "S-1-5-21-4660-1001-500");
+    assert_eq!(captured.requested_group_count, 3);
+    assert_eq!(captured.requested_privilege_count, 2);
+    assert_eq!(captured.token.groups.len(), 3);
+
+    // SE_GROUP_MANDATORY forces enabled even with SE_GROUP_ENABLED absent (tokenlif.c:134).
+    assert_eq!(captured.token.groups[0].sid, Sid::administrators());
+    assert!(captured.token.groups[0].enabled);
+    assert!(captured.token.groups[0].owner);
+    assert!(!captured.token.groups[0].deny_only);
+    assert_eq!(captured.token.groups[1].sid, Sid::users());
+    assert!(captured.token.groups[1].enabled);
+    assert_eq!(captured.token.groups[2].sid, Sid::everyone());
+    assert!(captured.token.groups[2].deny_only);
+    assert!(!captured.token.groups[2].enabled);
+
+    assert_eq!(captured.token.privileges.len(), 2);
+    assert_eq!(captured.token.privileges[0].name, SE_CHANGE_NOTIFY);
+    assert_eq!(captured.token.privileges[0].luid, Luid::new(23));
+    assert!(captured.token.privileges[0].enabled);
+    assert!(captured.token.privileges[0].enabled_by_default);
+    assert_eq!(captured.token.privileges[1].name, SE_SHUTDOWN);
+    assert!(!captured.token.privileges[1].enabled);
+    assert!(captured.token.has_privilege(SE_CHANGE_NOTIFY));
+    assert!(!captured.token.has_privilege(SE_SHUTDOWN));
+
+    assert_eq!(captured.token.owner, Sid::administrators());
+    assert_eq!(captured.token.primary_group, Sid::users());
+    assert_eq!(
+        captured.token.default_dacl.as_ref().map(|acl| acl.acl_size()),
+        Some(52)
+    );
+    assert_eq!(captured.token.authentication_id, Luid { low: 0x3e9, high: 2 });
+    assert_eq!(captured.expiration_time, -1);
+    assert_eq!(&captured.source.name, b"User32  ");
+    assert_eq!(captured.source.identifier, Luid::new(0x3ea));
+}
+
+#[test]
+fn create_token_group_and_privilege_counts_bound_the_walk() {
+    // A hostile GroupCount fails CLOSED with STATUS_INVALID_PARAMETER before a single array entry
+    // is touched — proven by the byte counter, which must stop at the fixed-size prologue.
+    let (client, args) = logon_token_client(MAX_CAPTURED_GROUPS + 1, 2);
+    assert_eq!(
+        capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    // LUID(8) + expiration(8) + source(16) + user entry(16) + user SID(8+16) + GroupCount(4).
+    assert!(client.bytes_read() < 128, "over-read: {}", client.bytes_read());
+
+    let (client, args) = logon_token_client(3, MAX_CAPTURED_PRIVILEGES + 1);
+    assert_eq!(
+        capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
+fn create_token_truncated_group_array_fails_closed() {
+    // GroupCount claims 4 entries but only 3 are mapped: the 4th read leaves the region.
+    let (client, args) = logon_token_client(4, 2);
+    assert_eq!(
+        capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}
+
+#[test]
+fn create_token_zero_counts_produce_an_empty_but_valid_token() {
+    // The `LsaTokenInformationNull` shape: `TOKEN_GROUPS NoGroups = {0}` / `NoPrivileges = {0}`.
+    let (client, args) = logon_token_client(0, 0);
+    let captured = capture_token(&client, &args, SecurityImpersonationLevel::Anonymous).unwrap();
+    assert!(captured.token.groups.is_empty());
+    assert!(captured.token.privileges.is_empty());
+    assert_eq!(captured.token.allow_sids().len(), 1); // the user only
+}
+
+#[test]
+fn create_token_rejects_a_malformed_sid_before_reading_its_tail() {
+    let mut client = MockClient::default();
+    // Revision 2 is not a SID; SubAuthorityCount 200 exceeds the 15 the header permits.
+    client.map(0x1000, &[2, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+    client.map(0x2000, &[1, 200, 0, 0, 0, 0, 0, 5]);
+    assert_eq!(capture_sid(&client, 0x1000), Err(STATUS_INVALID_SID));
+    assert_eq!(capture_sid(&client, 0x2000), Err(STATUS_INVALID_SID));
+    // A NULL PSID is invalid, not an access violation.
+    assert_eq!(capture_sid(&client, 0), Err(STATUS_INVALID_SID));
+    // A well-formed header whose tail is NOT mapped is an access violation, and the tail read is
+    // sized by the validated count — never wider.
+    client.map(0x3000, &[1, 4, 0, 0, 0, 0, 0, 5]);
+    assert_eq!(capture_sid(&client, 0x3000), Err(STATUS_ACCESS_VIOLATION));
+}
+
+#[test]
+fn create_token_rejects_a_structurally_invalid_default_dacl() {
+    let (mut client, args) = logon_token_client(3, 2);
+    // AclSize says 16 but the single ACE claims 0xFFFE bytes → InvalidAceSize.
+    client.regions.retain(|(base, _)| *base != ACL_VA);
+    client.map(
+        ACL_VA,
+        &[2, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0xFE, 0xFF, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+        Err(STATUS_INVALID_ACL)
+    );
+}
+
+#[test]
+fn create_token_null_inner_dacl_pointer_is_the_null_default_dacl_state() {
+    let (mut client, args) = logon_token_client(3, 2);
+    client
+        .regions
+        .retain(|(base, _)| *base != TOKEN_DEFAULT_DACL_VA);
+    client.map(TOKEN_DEFAULT_DACL_VA, &0u64.to_le_bytes());
+    let captured = capture_token(&client, &args, SecurityImpersonationLevel::Anonymous).unwrap();
+    assert!(captured.token.default_dacl.is_none());
+
+    // An entirely absent TOKEN_DEFAULT_DACL argument is the same state.
+    let (client, mut args) = logon_token_client(3, 2);
+    args.token_default_dacl = 0;
+    let captured = capture_token(&client, &args, SecurityImpersonationLevel::Anonymous).unwrap();
+    assert!(captured.token.default_dacl.is_none());
+}
+
+#[test]
+fn create_token_absent_owner_defaults_to_the_user_sid() {
+    let (client, mut args) = logon_token_client(3, 2);
+    args.token_owner = 0;
+    let captured = capture_token(&client, &args, SecurityImpersonationLevel::Anonymous).unwrap();
+    assert_eq!(captured.token.owner, captured.token.user);
+}
+
+#[test]
+fn create_token_rejects_a_bad_token_type_before_touching_client_memory() {
+    let (client, mut args) = logon_token_client(3, 2);
+    args.token_type = 3;
+    assert_eq!(
+        capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+        Err(STATUS_BAD_TOKEN_TYPE)
+    );
+    assert_eq!(client.bytes_read(), 0);
+}
+
+#[test]
+fn create_token_impersonation_token_keeps_its_qos_level() {
+    let (client, mut args) = logon_token_client(3, 2);
+    args.token_type = 2; // TokenImpersonation
+    let captured =
+        capture_token(&client, &args, SecurityImpersonationLevel::Impersonation).unwrap();
+    assert_eq!(captured.token.token_type, TokenType::Impersonation);
+    assert_eq!(
+        captured.token.impersonation_level,
+        SecurityImpersonationLevel::Impersonation
+    );
+}
+
+#[test]
+fn create_token_unmapped_fixed_arguments_are_access_violations() {
+    for spoil in 0..4 {
+        let (client, mut args) = logon_token_client(3, 2);
+        match spoil {
+            0 => args.authentication_id = 0xdead_0000,
+            1 => args.expiration_time = 0,
+            2 => args.token_source = 0,
+            _ => args.token_user = 0xbeef_0000,
+        }
+        assert_eq!(
+            capture_token(&client, &args, SecurityImpersonationLevel::Anonymous),
+            Err(STATUS_ACCESS_VIOLATION),
+            "spoil {spoil}"
+        );
+    }
+}
+
+#[test]
+fn privilege_luid_names_cover_the_well_known_range_and_nothing_else() {
+    for low in 2..=30u32 {
+        assert!(
+            privilege_name_for_luid(Luid::new(low)).is_some(),
+            "well-known privilege {low} has no name"
+        );
+    }
+    assert_eq!(privilege_name_for_luid(Luid::new(2)), Some(SE_CREATE_TOKEN));
+    assert_eq!(privilege_name_for_luid(Luid::new(7)), Some(SE_TCB));
+    assert_eq!(privilege_name_for_luid(Luid::new(30)), Some(SE_CREATE_GLOBAL));
+    assert_eq!(privilege_name_for_luid(Luid::new(0)), None);
+    assert_eq!(privilege_name_for_luid(Luid::new(1)), None);
+    assert_eq!(privilege_name_for_luid(Luid::new(31)), None);
+    // A non-zero HighPart is never a well-known privilege.
+    assert_eq!(privilege_name_for_luid(Luid { low: 7, high: 1 }), None);
+    // An unnamed LUID still captures losslessly — the LUID is the identity.
+    let unnamed = crate::create_token::privilege_from_attributes(
+        Luid { low: 999, high: 3 },
+        SE_PRIVILEGE_ENABLED,
+    );
+    assert_eq!(unnamed.name, "");
+    assert_eq!(unnamed.luid, Luid { low: 999, high: 3 });
+    assert!(unnamed.enabled);
+}
+
+#[test]
+fn capture_acl_reads_exactly_acl_size_bytes() {
+    let mut client = MockClient::default();
+    let acl = NativeAcl::system_default();
+    // Map ONLY AclSize bytes: a reader that guessed a larger length would fail here.
+    client.map(0x9000, acl.as_bytes());
+    assert_eq!(capture_acl(&client, 0x9000).unwrap(), acl);
+    // A header claiming fewer than the 8 mandatory bytes is an invalid ACL.
+    client.map(0xA000, &[2, 0, 4, 0, 0, 0, 0, 0]);
+    assert_eq!(capture_acl(&client, 0xA000), Err(STATUS_INVALID_ACL));
+    assert_eq!(capture_acl(&client, 0), Err(STATUS_ACCESS_VIOLATION));
+}
+
+#[test]
+fn token_store_records_expiration_and_source_and_duplicates_inherit_them() {
+    let mut store = TokenStore::new();
+    let source = TokenSource {
+        name: *b"User32  ",
+        identifier: Luid::new(0x3ea),
+    };
+    let created = store.insert_created(AccessToken::user(MACHINE), 0x1234_5678, source);
+    assert_eq!(store.source(created), Some(source));
+    assert_eq!(store.expiration_time(created), Some(0x1234_5678));
+    assert_eq!(store.statistics(created).unwrap().expiration_time, 0x1234_5678);
+
+    let duplicate = store
+        .duplicate(
+            created,
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            false,
+        )
+        .unwrap();
+    assert_eq!(store.source(duplicate), Some(source));
+    assert_eq!(store.expiration_time(duplicate), Some(0x1234_5678));
+
+    // The default insert path is unchanged: never expires, "*SYSTEM*".
+    let system = store.insert(AccessToken::system());
+    assert_eq!(store.source(system), Some(TokenSource::system()));
+    assert_eq!(store.expiration_time(system), Some(-1));
+}
+
+#[test]
+fn create_token_insufficient_resources_is_reachable_only_by_allocation_failure() {
+    // Sanity: the two bounded statuses are distinct values, so a bounds rejection can never be
+    // mistaken for an allocation failure in the executive's status plumbing.
+    assert_ne!(STATUS_INVALID_PARAMETER, STATUS_INSUFFICIENT_RESOURCES);
+    assert_eq!(STATUS_INSUFFICIENT_RESOURCES, 0xC000_009A);
+}

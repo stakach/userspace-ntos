@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod access;
+pub mod create_token;
 mod native_acl;
 pub mod se_exports;
 mod sid;
@@ -25,11 +26,15 @@ pub use access::{
     STATUS_ACCESS_DENIED, STATUS_PRIVILEGE_NOT_HELD, STATUS_SUCCESS, SYNCHRONIZE, WRITE_DAC,
     WRITE_OWNER,
 };
+pub use create_token::{
+    capture_token, ClientMemory, CapturedToken, CreateTokenArgs, MAX_CAPTURED_GROUPS,
+    MAX_CAPTURED_PRIVILEGES,
+};
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use sid::{Luid, Sid};
 pub use token::{
     AccessToken, PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityImpersonationLevel,
-    TokenGroup, TokenId, TokenPrivilege, TokenStatistics, TokenStore, TokenType,
+    TokenGroup, TokenId, TokenPrivilege, TokenSource, TokenStatistics, TokenStore, TokenType,
     SE_ASSIGN_PRIMARY_TOKEN, SE_AUDIT, SE_BACKUP, SE_CHANGE_NOTIFY, SE_CREATE_GLOBAL,
     SE_CREATE_PAGEFILE, SE_CREATE_PERMANENT, SE_CREATE_TOKEN, SE_DEBUG, SE_IMPERSONATE,
     SE_INCREASE_BASE_PRIORITY, SE_INCREASE_QUOTA, SE_LOAD_DRIVER, SE_LOCK_MEMORY, SE_MANAGE_VOLUME,

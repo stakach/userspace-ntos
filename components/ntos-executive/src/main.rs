@@ -832,6 +832,10 @@ pub const SSN_NT_CLOSE: u64 = 27;
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
+/// NtCreateToken — lsasrv's `LsapLogonUser` mints the interactive logon token here
+/// (`references/reactos/dll/win32/lsasrv/authpackage.c:1655`). THIRTEEN arguments: 4 in registers,
+/// nine off the caller's stack, and six of them point at variable-length `TOKEN_*` structures.
+pub const SSN_NT_CREATE_TOKEN: u64 = 57;
 pub const SSN_NT_OPEN_THREAD: u64 = 134;
 pub const SSN_NT_QUERY_INFORMATION_THREAD: u64 = 162;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
@@ -2388,6 +2392,51 @@ unsafe fn verify_logon_dialog_framebuffer() -> bool {
         && WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed) != hwnd
 }
 
+/// ═══ Logon-dialog evidence LATCH ═══════════════════════════════════════════════════════════════
+///
+/// Three of the msgina gates resolve LIVE window state: the modal window's membership in winlogon's
+/// window list, the username edit control's membership, and the framebuffer rectangle of the
+/// IDD_LOGON window itself. All three are only resolvable **while the dialog exists** — and a
+/// SUCCESSFUL logon destroys it (`EndDialog(WLX_SAS_ACTION_LOGON)`).
+///
+/// So they are measured at the last instant they are guaranteed to hold: the delivery of the real
+/// `LsaLogonUser` reply, after every keystroke, readback and paint the gates assert. The measurement
+/// functions are unchanged; only *when* they run moved. If the latch never fires (a boot where the
+/// logon does not complete) the gates fall back to the live sample exactly as before.
+pub(crate) static WINLOGON_DIALOG_EVIDENCE_LATCHED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_HWND_LIVE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_USERNAME_HWND_LIVE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_FB_VERIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// Take the three live-window measurements once. Idempotent.
+pub(crate) unsafe fn latch_logon_dialog_evidence() {
+    if WINLOGON_DIALOG_EVIDENCE_LATCHED.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    let modal = winlogon_dialog_contains_hwnd(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed));
+    let username = winlogon_dialog_contains_hwnd(WINLOGON_CRED_USERNAME_HWND.load(Ordering::Relaxed));
+    let framebuffer = verify_logon_dialog_framebuffer();
+    WINLOGON_DIALOG_MODAL_HWND_LIVE.store(modal as u64, Ordering::Relaxed);
+    WINLOGON_DIALOG_USERNAME_HWND_LIVE.store(username as u64, Ordering::Relaxed);
+    WINLOGON_DIALOG_FB_VERIFIED.store(framebuffer as u64, Ordering::Relaxed);
+    print_str(b"[winlogon] IDD_LOGON evidence LATCHED at the LsaLogonUser reply: modal-hwnd-live=");
+    print_u64(modal as u64);
+    print_str(b" username-hwnd-live=");
+    print_u64(username as u64);
+    print_str(b" framebuffer-verified=");
+    print_u64(framebuffer as u64);
+    print_str(b"\n");
+}
+
+/// Return the latched measurement when the latch fired, else take it live.
+unsafe fn latched_or_live(latched: &AtomicU64, live: impl FnOnce() -> bool) -> bool {
+    if WINLOGON_DIALOG_EVIDENCE_LATCHED.load(Ordering::Relaxed) != 0 {
+        latched.load(Ordering::Relaxed) != 0
+    } else {
+        live()
+    }
+}
+
 #[inline(never)]
 unsafe fn check_logon_dialog_gates(passed: &mut u64) {
     print_str(b"[winlogon] msgina dialog windows created (post-SAS-notify #32770): ");
@@ -2435,7 +2484,9 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
         WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
             && WINLOGON_DIALOG_MODAL_PAINTS.load(Ordering::Relaxed) != 0
             && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
-            && winlogon_dialog_contains_hwnd(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed))
+            && latched_or_live(&WINLOGON_DIALOG_MODAL_HWND_LIVE, || {
+                winlogon_dialog_contains_hwnd(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed))
+            })
             && WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed)
                 == nt_user_callback::WM_PAINT as u64
             && WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed) == 0,
@@ -2443,7 +2494,9 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
     );
     check(
         b"exec_msgina_logon_dialog_painted",
-        verify_logon_dialog_framebuffer(),
+        latched_or_live(&WINLOGON_DIALOG_FB_VERIFIED, || {
+            verify_logon_dialog_framebuffer()
+        }),
         passed,
     );
     print_str(b"[winlogon] IDD_LOGON credential input: username-hwnd=0x");
@@ -2474,7 +2527,9 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
         b"exec_msgina_credential_keystrokes_delivered",
         username_hwnd != 0
             && username_hwnd != WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed)
-            && winlogon_dialog_contains_hwnd(username_hwnd)
+            && latched_or_live(&WINLOGON_DIALOG_USERNAME_HWND_LIVE, || {
+                winlogon_dialog_contains_hwnd(username_hwnd)
+            })
             && WINLOGON_CRED_POSTED_CHARS.load(Ordering::Relaxed)
                 == nt_user_callback::LOGON_USERNAME.len() as u64
             && WINLOGON_CRED_RETRIEVED_CHARS.load(Ordering::Relaxed)
@@ -2547,15 +2602,12 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
             && client_port != 0
             && client_port != server_port
             && LSA_OPERATIONAL_MODE.load(Ordering::Relaxed) == 0x4321_8765
-            // ★ THE WALL MOVED (batch 51, `LSA_WORKER_ROUTE_ENABLED = true`). This used to assert
-            // "the server never walled", which was true only because `LsaLogonUser` gave up early
-            // at `SamIConnect`. With the self-RPC route on, the real LSA server runs the WHOLE
-            // `LsapLogonUser` → MSV1_0 → `SamValidateNormalUser` chain and stops at the last step
-            // before it can answer: **`NtCreateToken`**, which the executive does not service yet.
-            // Asserting the EXACT SSN — resolved from the ABI table, not a magic number — is
-            // strictly more specific than "no wall": an unexpected wall anywhere else fails this.
-            && Some(LSA_SERVER_WALL_SSN.load(Ordering::Relaxed))
-                == nt_syscall_abi::ssn_of("NtCreateToken").map(|ssn| ssn as u64),
+            // ★ THE WALL IS GONE (this batch). The previous form asserted the wall was EXACTLY
+            // `NtCreateToken` — the last step the LSA server could not take. With SSN 57 serviced
+            // the server runs `LsapLogonUser` to completion and walls NOWHERE, so the assertion is
+            // the strictly stronger `u64::MAX` sentinel: ANY wall, at `NtCreateToken` or anywhere
+            // else, now fails this spec.
+            && LSA_SERVER_WALL_SSN.load(Ordering::Relaxed) == u64::MAX,
         passed,
     );
     print_str(b"[lsa] data plane: requests=");
@@ -2576,17 +2628,15 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     // and resolvable — and `LsaLogonUser` (api 2) was then delivered and answered by that same server.
     const API_LOGON_USER: u64 = 1 << 2;
     const API_LOOKUP_PACKAGE: u64 = 1 << 3;
-    // `LsaLookupAuthenticationPackage` (api 3) still round-trips COMPLETELY — request and reply,
-    // SUCCESS. `LsaLogonUser` (api 2) is delivered and the server runs it for real, but it now runs
-    // FURTHER than it can finish: it reaches `NtCreateToken` and walls, so exactly ONE request is
-    // outstanding at the gate and the connector is released by `lsa_release_client_on_server_wall`
-    // (msgina logs the real `LsaLogonUser failed (Status 0xc0000001)`). The relation asserted is
-    // therefore `replies + 1 == requests`, which is exact: a SECOND outstanding request, or a
-    // silently-dropped one, both fail it.
+    // `LsaLookupAuthenticationPackage` (api 3) round-trips COMPLETELY — request and reply, SUCCESS —
+    // and so, now, does `LsaLogonUser` (api 2). The previous form asserted `replies + 1 == requests`
+    // because the api-2 request was permanently outstanding at the `NtCreateToken` wall; with the
+    // service in place EVERY request is answered, so the relation is the strictly stronger
+    // `replies == requests`. A dropped reply, or a second outstanding request, both fail it.
     check(
         b"exec_lsa_logon_user_reached",
         LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed) >= 2
-            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed) + 1
+            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed)
                 == LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed)
             && LSA_API_MASK.load(Ordering::Relaxed) & API_LOOKUP_PACKAGE != 0
             && LSA_API_MASK.load(Ordering::Relaxed) & API_LOGON_USER != 0
@@ -2603,19 +2653,143 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     // `\pipe\lsarpc` SELF-RPC lsass hosted no worker for) and return
     // STATUS_OBJECT_NAME_NOT_FOUND. `LSA_WORKER_ROUTE_ENABLED` supplies that worker, so
     // `SampInitDatabase` now runs and `SamIConnect` SUCCEEDS — asserted as the null-root miss being
-    // GONE, which the old spec asserted the presence of. The chain therefore no longer produces a
-    // validation status at all: it runs on to `NtCreateToken` and walls there
-    // (`exec_lsa_auth_port_connected` pins the SSN), leaving the reply status unset.
-    // **Nothing is fabricated**: `Administrator` is still not validated and no token is minted.
+    // GONE, which the OLDEST form of this spec asserted the presence of.
+    //
+    // ★ AND THE CHAIN NOW FINISHES. The previous form asserted the reply status was UNSET
+    // (`u64::MAX`) because the server walled at `NtCreateToken` before it could answer. With the
+    // service in place `SamValidateNormalUser` validates `Administrator` against the real
+    // `SampInitDatabase`, `LsapLogonUser` mints the token, and the real `LSA_API_MSG.Status` comes
+    // back **STATUS_SUCCESS** — the strictly stronger assertion, and the one that says the
+    // credential validation actually SUCCEEDED rather than merely being reached.
     check(
         b"exec_lsa_msv1_0_sam_validation_reached",
         LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed) >= 4
-            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == u64::MAX
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
             && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
             && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0,
         passed,
     );
+    se_create_token_specs(passed);
     lsa_security_database_specs(passed);
+}
+
+/// ═══ `NtCreateToken` (SSN 57) — the REAL logon-token mint ══════════════════════════════════════
+///
+/// Nothing below is seeded by the executive. `SE_CREATE_TOKEN_*` are written by the service handler
+/// out of what it captured from **lsass' own address space**: the user SID, group and privilege
+/// arrays lsasrv assembled from MSV1_0's `LSA_TOKEN_INFORMATION_V1` after `SamValidateNormalUser`,
+/// the `AuthenticationId` LUID msgina minted with `NtAllocateLocallyUniqueId`, and the
+/// `TOKEN_SOURCE` msgina stamps (`"User32  "`, `dll/win32/msgina/lsa.c:51`). The shape is read back
+/// **out of the token store** after insertion, so it is what the token object holds, not what the
+/// capture returned.
+fn se_create_token_specs(passed: &mut u64) {
+    let calls = SE_CREATE_TOKEN_CALLS.load(Ordering::Relaxed);
+    let minted = SE_CREATE_TOKEN_MINTED.load(Ordering::Relaxed);
+    let source = SE_CREATE_TOKEN_SOURCE_NAME.load(Ordering::Relaxed).to_le_bytes();
+    print_str(b"[se-token] NtCreateToken calls=");
+    print_u64(calls);
+    print_str(b" minted=");
+    print_u64(minted);
+    print_str(b" priv-denied=");
+    print_u64(SE_CREATE_TOKEN_PRIV_DENIED.load(Ordering::Relaxed));
+    print_str(b" capture-fails=");
+    print_u64(SE_CREATE_TOKEN_CAPTURE_FAILS.load(Ordering::Relaxed));
+    print_str(b" last-status=0x");
+    print_hex(SE_CREATE_TOKEN_LAST_STATUS.load(Ordering::Relaxed) as u32);
+    print_str(b" argc=");
+    print_u64(SE_CREATE_TOKEN_ARGC.load(Ordering::Relaxed));
+    print_str(b" nonzero-stack-args=");
+    print_u64(SE_CREATE_TOKEN_STACK_ARGS.load(Ordering::Relaxed));
+    print_str(b" pi=");
+    print_u64(SE_CREATE_TOKEN_PI.load(Ordering::Relaxed));
+    print_str(b" id=");
+    print_u64(SE_CREATE_TOKEN_ID.load(Ordering::Relaxed));
+    print_str(b" handle=0x");
+    print_hex(SE_CREATE_TOKEN_HANDLE.load(Ordering::Relaxed) as u32);
+    print_str(b" type=");
+    print_u64(SE_CREATE_TOKEN_TYPE.load(Ordering::Relaxed));
+    print_str(b" user-subauths=");
+    print_u64(SE_CREATE_TOKEN_USER_SUBAUTHS.load(Ordering::Relaxed));
+    print_str(b" user-rid=");
+    print_u64(SE_CREATE_TOKEN_USER_RID.load(Ordering::Relaxed));
+    print_str(b" groups=");
+    print_u64(SE_CREATE_TOKEN_GROUPS.load(Ordering::Relaxed));
+    print_str(b" privs=");
+    print_u64(SE_CREATE_TOKEN_PRIVS.load(Ordering::Relaxed));
+    print_str(b" auth-luid=0x");
+    print_hex((SE_CREATE_TOKEN_AUTH_LUID.load(Ordering::Relaxed) >> 32) as u32);
+    print_hex(SE_CREATE_TOKEN_AUTH_LUID.load(Ordering::Relaxed) as u32);
+    print_str(b" source=");
+    print_str(&source);
+    print_str(b"\n");
+    // (1) The service RAN, on the WIDE argument path, for lsass, and minted a real token.
+    //     - `argc == 13` is the dispatcher's marshalled arity: four register args plus NINE read
+    //       off lsass' own stack at `[rsp+0x28 .. rsp+0x60]`. A short marshal cannot pass.
+    //     - `nonzero-stack-args >= 8` means at least eight of those nine stack slots carried a real
+    //       pointer/value — `TokenSource` (the LAST slot, arg 13) among them, since the capture
+    //       could not have produced a source name otherwise.
+    //     - The privilege check was ENFORCED and SATISFIED: zero denials on a boot that minted.
+    //     - `capture-fails == 0`: every variable-length structure walked cleanly.
+    check(
+        b"exec_se_create_token_serviced",
+        calls >= 1
+            && minted >= 1
+            && SE_CREATE_TOKEN_PRIV_DENIED.load(Ordering::Relaxed) == 0
+            && SE_CREATE_TOKEN_CAPTURE_FAILS.load(Ordering::Relaxed) == 0
+            && SE_CREATE_TOKEN_LAST_STATUS.load(Ordering::Relaxed) == 0
+            && SE_CREATE_TOKEN_ARGC.load(Ordering::Relaxed) == 13
+            && SE_CREATE_TOKEN_STACK_ARGS.load(Ordering::Relaxed) >= 8
+            // pi 4 == lsass: the only process with `SeCreateTokenPrivilege` enabled, and the only
+            // one that has any reason to call this.
+            && SE_CREATE_TOKEN_PI.load(Ordering::Relaxed) == 4
+            && SE_CREATE_TOKEN_ID.load(Ordering::Relaxed) != 0
+            && SE_CREATE_TOKEN_HANDLE.load(Ordering::Relaxed) != 0,
+        passed,
+    );
+    // (2) WHAT the token contains, read back out of the token store. Each clause is something only
+    //     the real chain can produce:
+    //     - the user SID has FIVE sub-authorities (`S-1-5-21-x-y-z-RID`) — a domain-qualified
+    //       account SID built from the account-domain SID lsasrv minted in
+    //       `LsapCreateRandomDomainSid` plus the RID samsrv returned;
+    //     - `TOKEN_SOURCE::SourceName` is msgina's `"User32  "`, which lives at the LAST of the
+    //       nine stack arguments — proof the wide marshalling reached the end of the frame;
+    //     - a non-zero `AuthenticationId`, i.e. the LUID msgina got from the real
+    //       `NtAllocateLocallyUniqueId` and passed through `LsaLogonUser`.
+    check(
+        b"exec_se_create_token_logon_token_shape",
+        SE_CREATE_TOKEN_USER_SUBAUTHS.load(Ordering::Relaxed) == 5
+            && SE_CREATE_TOKEN_USER_RID.load(Ordering::Relaxed) != u64::MAX
+            && SE_CREATE_TOKEN_GROUPS.load(Ordering::Relaxed) != u64::MAX
+            && SE_CREATE_TOKEN_PRIVS.load(Ordering::Relaxed) != u64::MAX
+            && SE_CREATE_TOKEN_AUTH_LUID.load(Ordering::Relaxed) != 0
+            && &source == b"User32  "
+            // TokenPrimary(1) or TokenImpersonation(2) — never anything else.
+            && matches!(SE_CREATE_TOKEN_TYPE.load(Ordering::Relaxed), 1 | 2),
+        passed,
+    );
+    // (3) The token went BACK TO THE CLIENT and winlogon used it. `LsapLogonUser`'s last act is
+    //     `NtDuplicateObject(NtCurrentProcess(), TokenHandle, LogonContext->ClientProcessHandle,
+    //     &RequestMsg->LogonUser.Reply.Token, 0, 0, DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES
+    //     | DUPLICATE_CLOSE_SOURCE)` (`authpackage.c:1712`). We count that duplication ONLY when the
+    //     duplicated object IS the token this service minted and the target IS winlogon (pi 2), then
+    //     count winlogon's own `NtQueryInformationToken` calls that resolve to the SAME token object.
+    //     A fabricated reply cannot pass this: the query has to resolve through winlogon's real
+    //     handle table to the token store entry `NtCreateToken` created in lsass.
+    print_str(b"[se-token] logon token -> client: duplicates-into-winlogon=");
+    print_u64(WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed));
+    print_str(b" winlogon-handle=0x");
+    print_hex(WINLOGON_LOGON_TOKEN_HANDLE.load(Ordering::Relaxed) as u32);
+    print_str(b" winlogon-queries=");
+    print_u64(WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_logon_token_received",
+        WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1
+            && WINLOGON_LOGON_TOKEN_HANDLE.load(Ordering::Relaxed) != 0
+            && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) >= 1
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
 }
 
 /// ═══ REAL SECURITY / SAM hive mount + the LSA policy database ══════════════════════════════════
@@ -2713,10 +2887,11 @@ fn lsa_security_database_specs(passed: &mut u64) {
             && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 16
             && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
-            // The `LsaLogonUser` (api 2) that drove all of the above is STILL IN FLIGHT at the
-            // gate — cleared only by a delivered reply, which the `NtCreateToken` wall prevents.
-            // This is the counterpart of `exec_lsa_logon_user_reached`'s `replies + 1 == requests`.
-            && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 1,
+            // The `LsaLogonUser` (api 2) that drove all of the above has COMPLETED — the in-flight
+            // flag is cleared only by a delivered reply, which the `NtCreateToken` wall used to
+            // prevent forever (the previous form asserted it was still `1`). This is the
+            // counterpart of `exec_lsa_logon_user_reached`'s `replies == requests`.
+            && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 0,
         passed,
     );
     lsa_rpc_handoff_specs(passed);
@@ -6293,6 +6468,49 @@ pub(crate) static LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON: AtomicU64 = AtomicU64::ne
 pub(crate) static LSA_LOGON_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 /// samsrv.dll's on-disk byte size, recorded when the by-path demand-loader actually loaded it.
 pub(crate) static SAMSRV_LOADED_SIZE: AtomicU64 = AtomicU64::new(0);
+/// ═══ `NtCreateToken` (SSN 57) — the real logon-token mint ══════════════════════════════════════
+/// Serviced calls, and how each one ended. Every value below is written by the handler out of what
+/// it ACTUALLY captured from the caller's address space — nothing is seeded or defaulted.
+pub(crate) static SE_CREATE_TOKEN_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Calls rejected because the caller's effective token did not hold `SeCreateTokenPrivilege`.
+pub(crate) static SE_CREATE_TOKEN_PRIV_DENIED: AtomicU64 = AtomicU64::new(0);
+/// Calls that failed the bounded capture of the variable-length `TOKEN_*` structures (bad SID,
+/// hostile count, unreadable array, invalid ACL). The last such status, for the log.
+pub(crate) static SE_CREATE_TOKEN_CAPTURE_FAILS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_LAST_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Tokens actually minted (inserted into the token store with a handle in the caller's table).
+pub(crate) static SE_CREATE_TOKEN_MINTED: AtomicU64 = AtomicU64::new(0);
+/// The FIRST minted token's shape, read back out of the token store after insertion: the caller's
+/// process index, the `TokenId`, the returned handle, the user SID's last sub-authority (the RID),
+/// its sub-authority count, the group + privilege counts, the `AuthenticationId` LUID, the token
+/// type, and the first 8 bytes of `TOKEN_SOURCE::SourceName`.
+pub(crate) static SE_CREATE_TOKEN_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static SE_CREATE_TOKEN_ID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_HANDLE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_USER_RID: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static SE_CREATE_TOKEN_USER_SUBAUTHS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_GROUPS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static SE_CREATE_TOKEN_PRIVS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static SE_CREATE_TOKEN_AUTH_LUID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_TYPE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_SOURCE_NAME: AtomicU64 = AtomicU64::new(0);
+/// The two WIDE-ARGUMENT witnesses. `NtCreateToken` takes 13 arguments, so args 5..13 come off the
+/// caller's stack at `[rsp+0x28 .. rsp+0x60]`. `SE_CREATE_TOKEN_STACK_ARGS` counts how many of the
+/// nine stack arguments arrived NON-ZERO, and `SE_CREATE_TOKEN_ARGC` records the arity the
+/// dispatcher actually marshalled — a short marshal would show up as both a smaller argc and a
+/// zeroed `TokenSource`/`TokenPrimaryGroup` (the last stack slots).
+pub(crate) static SE_CREATE_TOKEN_STACK_ARGS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SE_CREATE_TOKEN_ARGC: AtomicU64 = AtomicU64::new(0);
+/// The minted logon token's trip back to the CLIENT: `LsapLogonUser`'s closing `NtDuplicateObject`
+/// into winlogon's process, the handle it landed on, and winlogon's own queries of that same token
+/// object afterwards (msgina's `MyLogonUser` tail).
+pub(crate) static WINLOGON_LOGON_TOKEN_DUPLICATES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_LOGON_TOKEN_HANDLE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_LOGON_TOKEN_QUERIES: AtomicU64 = AtomicU64::new(0);
+/// Where winlogon's main thread parked AFTER completing the interactive logon — the new frontier's
+/// exact instruction pointer + faulting address. Zero when it never got that far.
+pub(crate) static WINLOGON_POST_LOGON_MILESTONE_PARK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_POST_LOGON_MILESTONE_CR2: AtomicU64 = AtomicU64::new(0);
 /// The honest SAM wall: `SamIConnect` → `SampOpenDbObject(NULL, NULL, L"SAM", …)` opened the leaf
 /// name `SAM` with a NULL RootDirectory, i.e. samsrv's `SamKeyHandle` was never set because
 /// `SamIInitialize` never reached `SampInitDatabase`.
@@ -7099,6 +7317,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),
+            (NativeService::NtCreateToken, SSN_NT_CREATE_TOKEN as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
             (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),

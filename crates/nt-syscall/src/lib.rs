@@ -108,6 +108,8 @@ pub enum NativeService {
     NtOpenProcessToken,
     NtOpenProcessTokenEx,
     NtDuplicateToken,
+    /// `NtCreateToken` — the 13-argument service lsass' `LsapLogonUser` mints a logon token with.
+    NtCreateToken,
     NtAccessCheck,
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
@@ -265,6 +267,7 @@ impl NativeService {
             NtOpenProcessToken => "NtOpenProcessToken",
             NtOpenProcessTokenEx => "NtOpenProcessTokenEx",
             NtDuplicateToken => "NtDuplicateToken",
+            NtCreateToken => "NtCreateToken",
             NtAccessCheck => "NtAccessCheck",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
@@ -468,6 +471,7 @@ impl NativeService {
         NativeService::NtRemoveProcessDebug,
         NativeService::NtWaitForDebugEvent,
         NativeService::NtAllocateLocallyUniqueId,
+        NativeService::NtCreateToken,
     ];
 }
 

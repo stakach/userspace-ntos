@@ -64,9 +64,9 @@ pub const WIN32K_STACK_VADDR: u64 = 0x0000_0100_0D00_0000;
 pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// Data-export region: placeholder structs (page 0) + import cells (page 1) + KPCR (page 2) +
 /// HEAP handle (page 3) + per-process slots/callout table (page 4) + EPROCESS (page 5) +
-/// W32PROCESS (page 6) + W32THREAD (page 7). 8 frames.
+/// W32PROCESS (page 6) + W32THREAD (page 7) + ETHREAD (page 8). 9 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
-pub const WIN32K_DATA_FRAMES: u64 = 8;
+pub const WIN32K_DATA_FRAMES: u64 = 9;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
 /// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
 pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
@@ -732,7 +732,24 @@ extern "win64" fn s_se_privilege_check(required: *const u8, _ctx: u64, access_mo
     ok as i32
 }
 
-const PH_ETHREAD: u64 = WIN32K_DATA_VADDR + 0x600;
+/// The current-thread ETHREAD placeholder — **its own page (8)**, because win32k dereferences real
+/// `KTHREAD` fields off it (see [`KTHREAD_WIN32THREAD_OFF`]) and a sub-page placeholder would land
+/// those writes on the neighbouring `SE_EXPORTS`/device-object placeholders.
+const PH_ETHREAD: u64 = WIN32K_DATA_VADDR + 0x8000;
+
+/// `KTHREAD::Win32Thread` — the per-thread win32k state pointer, which real NT stores **in the
+/// thread object** (`PsSetThreadWin32Thread` = `InterlockedExchangePointer(&Thread->Tcb.Win32Thread,
+/// …)`, `ntoskrnl/ps/thread.c:909`) and which `PsGetCurrentThreadWin32Thread()` reads back.
+///
+/// The MSVC win32k build **inlines that read**: `NtUserCallNoParam(NOPARAM_ROUTINE_DESTROY_CARET)`
+/// compiles to `call PsGetCurrentThread; mov rcx,[rax+0x250]; call co_IntDestroyCaret`
+/// (win32k RVA `0xd3a25`), and `co_IntDestroyCaret` immediately does `pti->MessageQueue` (+0x60).
+/// With the slot written ONLY to the executive's side cell, that inline read returned NULL and the
+/// hosted win32k took a `#PF` at `cr2 = 0x60` the moment the logon dialog tore down — the first
+/// thing the real `EndDialog(WLX_SAS_ACTION_LOGON)` path does after a SUCCESSFUL logon. Three other
+/// `[reg+0x250]` reads exist in the image and none of them stores, confirming the field is written
+/// by the kernel side alone.
+const KTHREAD_WIN32THREAD_OFF: u64 = 0x250;
 
 /// `PEPROCESS IoGetCurrentProcess()` / `PsGetCurrentProcess()` — the current (only) hosted client's
 /// EPROCESS. A fuller placeholder (page 5) so win32k's process-attach callout finds its asserted
@@ -772,9 +789,26 @@ extern "win64" fn s_set_win32process(_process: u64, w32process: u64, _old: u64) 
     unsafe { write_volatile(SLOT_W32PROCESS as *mut u64, w32process) };
     0
 }
-extern "win64" fn s_set_win32thread(_thread: u64, w32thread: u64, _old: u64) -> i32 {
-    unsafe { write_volatile(SLOT_W32THREAD as *mut u64, w32thread) };
-    0
+/// `PVOID PsSetThreadWin32Thread(PETHREAD Thread, PVOID Win32Thread, PVOID OldWin32Thread)` —
+/// `ntoskrnl/ps/thread.c:909`. Stores the pointer in **the thread object** (`Thread->Tcb.Win32Thread`
+/// at [`KTHREAD_WIN32THREAD_OFF`]) and returns the previous value; a NULL `Win32Thread` is the RESET
+/// form, which only takes effect when the current value matches `OldWin32Thread`.
+///
+/// The executive's side cell ([`SLOT_W32THREAD`]) is kept in lockstep because
+/// `PsGetCurrentThreadWin32Thread` is bound to it, but the *thread-object* store is the load-bearing
+/// half: win32k inlines `PsGetCurrentThread()->Tcb.Win32Thread` and never goes through the export.
+/// `Thread` is honoured when it is a real pointer (single hosted client → always `PH_ETHREAD`).
+extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u64 {
+    let thread = if thread == 0 { PH_ETHREAD } else { thread };
+    unsafe {
+        let field = (thread + KTHREAD_WIN32THREAD_OFF) as *mut u64;
+        let previous = read_volatile(field);
+        if w32thread != 0 || previous == old {
+            write_volatile(field, w32thread);
+            write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
+        }
+        previous
+    }
 }
 
 /// `PsEstablishWin32Callouts(PWIN32_CALLOUTS_FG CalloutData)` — record win32k's callout table
@@ -3171,6 +3205,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // performed by co_UserFreeWindow.
     let t = read_volatile(SLOT_W32THREAD as *const u64);
     let t = if t == 0 { PH_W32THREAD_VA } else { t };
+    // ★ Publish the dispatch THREADINFO into the CURRENT-THREAD OBJECT (`Thread->Tcb.Win32Thread`).
+    // `PsGetCurrentThreadWin32Thread()` is an EXPORT we bind, but the MSVC win32k build also inlines
+    // it as `PsGetCurrentThread(); mov rcx,[rax+0x250]` — and that inline read is the one
+    // `NtUserCallNoParam(NOPARAM_ROUTINE_DESTROY_CARET)` uses. Every dispatch (top-level AND nested,
+    // which is where the logon-dialog teardown reaches it) must therefore see the same `t` through
+    // the thread object as through the slot. Idempotent, and the only writer of this field.
+    write_volatile((PH_ETHREAD + KTHREAD_WIN32THREAD_OFF) as *mut u64, t);
     if top_level
         && client_pi == 2
         && ssn == SSN_NT_USER_SET_THREAD_DESKTOP
