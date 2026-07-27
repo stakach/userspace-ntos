@@ -749,6 +749,26 @@ impl<const N: usize> PipeWaiterTable<N> {
             .iter()
             .any(|s| s.map(|w| w.file_id) == Some(file_id))
     }
+
+    /// Whether `file_id` already has a parked waiter **in this DIRECTION** (`is_write`).
+    ///
+    /// ★ Why direction matters. `parked_on` alone says "this connection already has an outstanding
+    /// operation", and using it to gate a new park makes a connection strictly half-duplex. That is
+    /// wrong for the one shape every rpcrt4 ncacn_np SERVER has: `RPCRT4_io_thread` keeps a READ
+    /// pending on the connection for the next PDU while `RPCRT4_worker_thread` writes the RESPONSE
+    /// on the SAME connection. Refusing the write there is not a hang but a silent functional
+    /// degrade — the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that should merely have
+    /// completed later. That is precisely how the LSA self-RPC lost its 48-byte `LsarOpenPolicy`
+    /// RESPONSE, so `LsaOpenPolicy` never returned to samsrv.
+    ///
+    /// One pending read AND one pending write per connection is exactly what the re-drive already
+    /// supports: `pipe_write_redrive` completes a parked waiter from a per-DIRECTION stash
+    /// (`take_completed_write` vs `take_completed_read`), so the two never collide.
+    pub fn parked_on_dir(&self, file_id: u64, is_write: bool) -> bool {
+        self.slots.iter().any(|s| {
+            s.is_some_and(|w| w.file_id == file_id && w.is_write == is_write)
+        })
+    }
 }
 
 // ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
@@ -1621,6 +1641,44 @@ mod tests {
         assert!(t.park(wtr(0xCC, 2, 4)).is_some());
         assert!(t.park(wtr(0xDD, 2, 4)).is_some());
         assert!(t.park(wtr(0xEE, 2, 4)).is_none(), "still bounded at N=2");
+    }
+
+    #[test]
+    fn pipe_waiter_parked_on_dir_is_full_duplex_per_connection() {
+        // ★ THE rpcrt4 ncacn_np SERVER SHAPE. `RPCRT4_io_thread` keeps a READ pending on the
+        // connection while `RPCRT4_worker_thread` writes the RESPONSE on the SAME connection. The
+        // executive gates a park on "does this connection already have one of these outstanding?" —
+        // which must be asked PER DIRECTION, or the write is refused with
+        // STATUS_INSUFFICIENT_RESOURCES and the response is silently lost (the wall that stopped
+        // `LsaOpenPolicy` from returning).
+        let mut t = PipeWaiterTable::<4>::new();
+        let mut read = wtr(0xAA, 4, 26);
+        read.is_write = false;
+        t.park(read).unwrap();
+
+        // Same connection, same direction: already outstanding.
+        assert!(t.parked_on_dir(0xAA, false));
+        // Same connection, OTHER direction: free — this is the case `parked_on` got wrong.
+        assert!(!t.parked_on_dir(0xAA, true));
+        // The direction-blind predicate cannot tell the two apart.
+        assert!(t.parked_on(0xAA));
+
+        let mut write = wtr(0xAA, 4, 25);
+        write.is_write = true;
+        t.park(write).unwrap();
+        assert!(t.parked_on_dir(0xAA, true));
+        assert!(t.parked_on_dir(0xAA, false));
+        assert_eq!(t.len(), 2, "one read + one write on ONE connection");
+
+        // A different connection is unaffected in both directions.
+        assert!(!t.parked_on_dir(0xBB, false));
+        assert!(!t.parked_on_dir(0xBB, true));
+
+        // Completing the write frees only the write direction.
+        let (slot, _) = t.drain_all().find(|(_, w)| w.is_write).unwrap();
+        t.complete(slot).unwrap();
+        assert!(!t.parked_on_dir(0xAA, true));
+        assert!(t.parked_on_dir(0xAA, false), "the pending read survives");
     }
 
     #[test]

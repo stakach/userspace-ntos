@@ -551,6 +551,46 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 > `SamIConnect` is not reached, `Administrator` is not validated, `WLX_SAS_ACTION_LOGON` is not
 > returned.
 
+> **Update (gate 234/99) — the component-dispatch transport MIGRATION IS COMPLETE, and the LSA
+> route's wall has MOVED.** `docs/transport-migration.md` Phases 0-4: both substrates (npfs/FSD and
+> win32k) now speak seL4 `Call` ⇄ **MCS reply objects**, the executive's legacy per-TCB `reply_to`
+> reply is retired so `Cap::Reply` is its ONLY reply mechanism on every plane, and the whole 34-item
+> kill-list — the `SH_REQ_SEQ` sequence handshake, the 32-deep dispatch-token stack, the two bypass
+> switches, the two fault injectors, the duplicated transport fork, the wake `Send` itself — is
+> DELETED. **Everything the two updates above describe as the live mechanism is GONE**; they are
+> retained as the record of why.
+>
+> **The availability defect those updates end on is structurally gone, and it was measured, not
+> assumed.** With `LSA_WORKER_ROUTE_ENABLED = true` the boot NO LONGER HANGS: it reaches the gate
+> with `RUNEXIT=3` on every run, with zero pump walls and zero reply errors, and the self-RPC
+> completes a real MS-RPC handshake inside lsass (the routed per-connection worker reads the ncacn
+> **bind** `0x0b` off npfs and writes the **bind_ack** `0x0c`). Two route-ON boots were fully green
+> at 232/99 with the paint intact. There is no wake `Send` left to block in: the component is the
+> CALLER, and the executive answers with `reply_on` (`decode_reply`), which cannot block.
+>
+> **Turning it on root-caused two further REAL defects.** (1) `component_pump` did not screen
+> BOUND-NOTIFICATION deliveries: the executive's root TCB has the HPET notification bound to it, so a
+> tick can satisfy any blocking `Recv` including a pump's — the kernel returns `rdi = badge`,
+> `rsi = 0` and leaves the message registers untouched, and the pump read that as a component message
+> with label 0 and WALLED npfs (`[pump] WALL label=0 ip=0x771`). Fixed unconditionally and proven by
+> `exec_pump_screens_bound_notification` (a real injected delivery on a real dispatch, with a bypass
+> experiment that reproduces the wall). (2) Pipe parking was per-CONNECTION rather than
+> per-DIRECTION, so an rpcrt4 server's pending READ refused its own response WRITE with
+> `STATUS_INSUFFICIENT_RESOURCES` — which is how the 48-byte `LsarOpenPolicy` RESPONSE was silently
+> lost. Fixed + host-tested (`PipeWaiterTable::parked_on_dir`), gated behind `PIPE_FULL_DUPLEX_PARK`.
+>
+> **DESKTOP FRONTIER — where the logon now stands.** With both fixes and the route on, the chain
+> advances for real: the `LsarOpenPolicy` responses are DELIVERED (status 0, 48 bytes),
+> `SamIConnect-null-root-miss` goes 1 → 0, `sam-setup-keys` 2 → 36, `sam-mount-opens` 1 → 2, and
+> lsass reaches `NtCreateNamedPipeFile(\samr)` — samsrv publishes its own RPC endpoint. It does NOT
+> reach a logon: `Administrator` is not validated and `WLX_SAS_ACTION_LOGON` is not returned.
+> **Nothing is fabricated.** The route is re-gated OFF because the paint is not deterministic with it
+> on — across five route-ON boots the desktop paint survived twice and was lost three times (no crash,
+> no hang; winlogon starves while the self-RPC churns and the 45 s no-progress watchdog quiesces
+> before the SAS window). **The remaining wall is FORWARD-PROGRESS SCHEDULING, not availability and
+> not correlation** — a materially better-isolated problem than the one this section started with,
+> and the next frontier.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

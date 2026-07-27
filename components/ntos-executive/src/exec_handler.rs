@@ -7061,7 +7061,6 @@ impl ExecNtHandler {
                 // so the route is NOT safe to enable yet. The counter below still records that
                 // `RPCRT4_new_client` was genuinely REACHED. No logon, token or RPC reply is
                 // fabricated.
-                const LSA_WORKER_ROUTE_ENABLED: bool = false;
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 4
                     && self.current_badge == LSASS_LISTENER3_BADGE
@@ -7074,7 +7073,7 @@ impl ExecNtHandler {
                     // `GetComputerNameA` -> `NtFlushKey` wall) and called `RPCRT4_new_client`.
                     LSA_RPC_NEW_CLIENT_REQUESTS.fetch_add(1, Ordering::Relaxed);
                 }
-                if LSA_WORKER_ROUTE_ENABLED
+                if crate::LSA_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 4
                     && self.current_badge == LSASS_LISTENER3_BADGE
@@ -9973,8 +9972,38 @@ impl ExecNtHandler {
                                 self.file_completion.is_synchronous(file_id).unwrap_or(true);
                             let waiter_table =
                                 unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
-                            let waiter_capacity =
-                                waiter_table.has_capacity() && !waiter_table.parked_on(file_id);
+                            // ★★ PER-DIRECTION PIPE PARKING — MEASURED, GATED OFF (Phase 4).
+                            //
+                            // The direction-BLIND predicate makes a connection half-duplex: an
+                            // already-pending READ refuses this WRITE with
+                            // STATUS_INSUFFICIENT_RESOURCES. That is a silent functional degrade,
+                            // and it is the EXACT reason the LSA self-RPC's 48-byte `LsarOpenPolicy`
+                            // RESPONSE is lost, so `LsaOpenPolicy` never returns to samsrv —
+                            // rpcrt4's ncacn_np server keeps a read pending on the connection while
+                            // `RPCRT4_worker_thread` writes the response on the SAME connection. The
+                            // re-drive already completes the two from separate per-direction stashes
+                            // (`take_completed_write` / `take_completed_read`), so allowing one
+                            // pending read AND one pending write per connection is well-formed
+                            // (`PipeWaiterTable::parked_on_dir`, host-tested).
+                            //
+                            // MEASURED WITH IT ON, one foreground boot: the response writes SUCCEED
+                            // (status=0 info=48, repeatedly), `SamIConnect-null-root-miss` goes
+                            // 1 -> 0, `sam-setup-keys` 2 -> 36, `sam-mount-opens` 1 -> 2, and lsass
+                            // reaches `NtCreateNamedPipeFile(\samr)` — i.e. `SamIConnect` succeeds
+                            // and samsrv publishes its own RPC endpoint. It is a REAL advance.
+                            //
+                            // BUT the boot then spends its whole budget cycling that self-RPC and
+                            // never reaches winlogon's SAS window: the 45 s no-progress watchdog
+                            // quiesces first and the desktop paint is LOST (gate 211/99, 21 FAILs,
+                            // paint 0/768). No crash, no hang — a forward-progress/starvation
+                            // problem, not a correctness one. The paint is a hard safety invariant,
+                            // so this stays OFF until the starvation is addressed on its own batch.
+                            // Flip it to `true` to reproduce the advance exactly.
+                            const PIPE_FULL_DUPLEX_PARK: bool = false;
+                            let waiter_capacity = waiter_table.has_capacity()
+                                && !waiter_table.parked_on_dir(file_id, true)
+                                && (PIPE_FULL_DUPLEX_PARK
+                                    || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
                                 let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
                                 (0..WAIT_REPLY_POOL_N).any(|index| {
@@ -10064,6 +10093,15 @@ impl ExecNtHandler {
                         {
                             if async_file_retained {
                                 self.release_file_reference(pending_write_fid);
+                            }
+                            // ★ A full table is a SILENT FUNCTIONAL DEGRADE, not a hang: this write
+                            // would have completed on the peer's read, and instead fails. This is
+                            // exactly how the LSA self-RPC's 48-byte `LsarOpenPolicy` RESPONSE was
+                            // lost. Count + log it (see `PIPE_WAITER_N`).
+                            if crate::PIPE_WAITERS_FULL.fetch_add(1, Ordering::Relaxed) < 8 {
+                                print_str(b"[pipe-park] table FULL -> async WRITE degraded to STATUS_INSUFFICIENT_RESOURCES fid=0x");
+                                print_hex(pending_write_fid as u32);
+                                print_str(b"\n");
                             }
                             status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                             pending_write_fid = 0;
@@ -10276,8 +10314,14 @@ impl ExecNtHandler {
                                 self.file_completion.is_synchronous(file_id).unwrap_or(true);
                             let waiter_table =
                                 unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
-                            let waiter_capacity =
-                                waiter_table.has_capacity() && !waiter_table.parked_on(file_id);
+                            // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
+                            // pre-check, which carries the full rationale + measurements). Gated OFF
+                            // for the same reason, so this is the direction-blind check today.
+                            const PIPE_FULL_DUPLEX_PARK: bool = false;
+                            let waiter_capacity = waiter_table.has_capacity()
+                                && !waiter_table.parked_on_dir(file_id, false)
+                                && (PIPE_FULL_DUPLEX_PARK
+                                    || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
                                 let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
                                 (0..WAIT_REPLY_POOL_N).any(|index| {
@@ -10395,6 +10439,11 @@ impl ExecNtHandler {
                         if parked.is_none() {
                             if async_file_retained {
                                 self.release_file_reference(pending_read_fid);
+                            }
+                            if crate::PIPE_WAITERS_FULL.fetch_add(1, Ordering::Relaxed) < 8 {
+                                print_str(b"[pipe-park] table FULL -> async READ degraded to STATUS_INSUFFICIENT_RESOURCES fid=0x");
+                                print_hex(pending_read_fid as u32);
+                                print_str(b"\n");
                             }
                             status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                             pending_read_fid = 0;

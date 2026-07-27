@@ -1461,10 +1461,24 @@ static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
 /// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
 /// — and re-driven when the peer writes. `.bss`-resident (no heap), single-threaded executive (no
-/// races). Cap 16 = ample for the SCM/LSA/CSR RPC listeners + their clients parked concurrently.
+/// races).
+///
+/// ★ PHASE 4 left this at 16 and MEASURED it instead. The LSA worker route adds a whole second
+/// rpcrt4 connection on top of the SCM/CSR listeners already parked, so exhaustion was the first
+/// suspect for the route's lost `LsarOpenPolicy` response — and it was WRONG: `PIPE_WAITERS_FULL` is
+/// **0** on every route-ON boot (the real cause was per-connection park exclusivity, see
+/// `PIPE_FULL_DUPLEX_PARK` in `exec_handler.rs`). Raising it to 32 was tried and reverted: it is
+/// unneeded, and this boot is timing-sensitive enough that an unnecessary `.bss` change is not free.
+/// What DID change is that a full table is no longer SILENT — it is a functional degrade (the park
+/// site returns `STATUS_INSUFFICIENT_RESOURCES` for an I/O that should merely have completed later)
+/// and it is now counted by `PIPE_WAITERS_FULL`, asserted 0 by `exec_lsa_worker_route`.
 const PIPE_WAITER_N: usize = 16;
 static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_N> =
     nt_io_manager::PipeWaiterTable::new();
+/// ★ Times an async pipe read/write park was REFUSED because [`PIPE_WAITERS`] was full. A refusal is
+/// a silent functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
+/// should have completed later), so this must be **0**. See `PIPE_WAITER_N`.
+pub(crate) static PIPE_WAITERS_FULL: AtomicU64 = AtomicU64::new(0);
 /// Proof/diagnostic counters (specs + boot log): pipe reads parked, and woken by a peer write.
 static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1539,7 +1553,34 @@ pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
     0
 }
 const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
-const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
+pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
+/// ★ A bound-notification TICK that the COMPONENT PUMP absorbed, deferred to the main service loop.
+///
+/// The executive's ROOT TCB has the HPET one-shot notification BOUND to it
+/// (`LBL_TCB_BIND_NOTIFICATION`, `delay_timer_init`), so a timer signal can cancel ANY blocking
+/// `Recv` the executive makes — that is the whole point, it is how `NtDelayExecution` wakes a parked
+/// waiter while the loop sits in `recv`. The kernel's bound-notification pre-check
+/// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
+/// message registers untouched**.
+///
+/// The main service loop has always handled that (`badge == DELAY_TIMER_BADGE` →
+/// `delay_timer_interrupt` → re-recv). `component_pump` did NOT: it discarded the badge, so a tick
+/// that landed on a pump's recv was read as a component message with label 0 and MR0 = the stale
+/// request tag — and walled the component. That is exactly what killed the LSA route's npfs READ
+/// (`[pump] WALL label=0 ip=0x771`): the route is the first thing that arms an HPET one-shot
+/// (`NtDelayExecution` from the RPC worker) WHILE an IRP dispatch is in flight.
+///
+/// The pump now recognises the tick, LATCHES it here and re-receives. The main service loop drains
+/// the latch at the top of its next iteration — `delay_timer_interrupt` wakes the due waiters,
+/// re-arms the comparator and Acks the IRQ. Deferring is safe and cannot storm: the IOAPIC line
+/// stays masked until that Ack, so no second tick can arrive while the latch is set, and the pump
+/// returns to the service loop within one component dispatch.
+pub(crate) static DELAY_TIMER_TICK_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Timer ticks absorbed by a component pump's recv and deferred (reported by `exec_lsa_worker_route`).
+pub(crate) static PUMP_TIMER_TICKS_ABSORBED: AtomicU64 = AtomicU64::new(0);
+/// Latched ticks actually drained + serviced by the main service loop.
+pub(crate) static PUMP_TIMER_TICKS_DRAINED: AtomicU64 = AtomicU64::new(0);
 const DELAY_TIMER_IRQ: u64 = 12;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
@@ -2700,6 +2741,114 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
         active_name >= 1 && new_clients >= 1,
         passed,
     );
+    lsa_worker_route_spec(passed);
+}
+
+/// ═══ ★ THE LSA SELF-RPC WORKER ROUTE — MEASURED, THEN RE-GATED (`transport-migration.md` §4) ════
+///
+/// The full finding is on [`LSA_WORKER_ROUTE_ENABLED`]. This spec reports the route's state and
+/// asserts the shape that must hold FOR THAT STATE — the handshake invariants when it is on, and
+/// "nothing was fabricated" when it is off — together with the transport invariants that must hold
+/// either way (no pump walls, no reply errors, no silently-degraded pipe I/O, every absorbed
+/// bound-notification tick accounted for).
+///
+/// `LSA_WORKER_ROUTE_ENABLED` was gated OFF for two batches. The recorded reason was an
+/// AVAILABILITY defect of the hand-rolled component-dispatch transport: the executive's wake `Send`
+/// blocked against a component that was not yet receiving. RIP-sampled over 909 wakes, 907 landed at
+/// the component's completion-`Send`+2 and the ONE wake that never returned was the only sample at
+/// the receive syscall+2 — the transport had a window in which the component was runnable but not
+/// receiving, and the executive's wake could wedge in it.
+///
+/// **That defect is structurally gone.** Under the `Call` transport
+/// the component is the CALLER: it is `BlockedOnReply` from the instant the kernel pairs it, with no
+/// user-visible gap, and the executive answers with `reply_on` (`decode_reply`), which wakes the
+/// bound caller or fails immediately and **cannot block**. There is no `Send` to an endpoint left to
+/// wedge in. With the route ON the boot no longer HANGS: it runs the self-RPC and reaches the gate
+/// with `RUNEXIT=3` on every run. What kept the route off is now a different problem — forward-
+/// progress starvation costing the paint on ~60% of runs — not availability. See the const.
+///
+/// It also exposed a SECOND, unrelated availability defect that the route is simply the first thing
+/// to reach — and which had nothing to do with correlation. The executive's ROOT TCB has the HPET
+/// one-shot notification BOUND to it, so a timer tick can satisfy ANY blocking `Recv` it makes,
+/// including `component_pump`'s. The kernel returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and leaves
+/// the message registers untouched; the pump discarded the badge, read the stale registers as a
+/// component message with label 0, and WALLED the component (`[pump] WALL label=0 ip=0x771`, npfs
+/// retired mid-boot). The route is the first thing that arms an HPET one-shot
+/// (`NtDelayExecution` from the RPC worker) WHILE a component dispatch is in flight. `pump_recv` now
+/// screens the badge and defers the tick to the service loop.
+fn lsa_worker_route_spec(passed: &mut u64) {
+    let worker_reads = LSA_WORKER_PDU_READS.load(Ordering::Relaxed);
+    let worker_writes = LSA_WORKER_PDU_WRITES.load(Ordering::Relaxed);
+    let first_pdu = LSA_WORKER_FIRST_PDU_TYPE.load(Ordering::Relaxed);
+    let first_reply = LSA_WORKER_FIRST_REPLY_TYPE.load(Ordering::Relaxed);
+    let client_writes = LSA_SELF_RPC_CLIENT_WRITES.load(Ordering::Relaxed);
+    let ticks_absorbed = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
+    let ticks_drained = PUMP_TIMER_TICKS_DRAINED.load(Ordering::Relaxed);
+    let pipe_full = PIPE_WAITERS_FULL.load(Ordering::Relaxed);
+    let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
+    let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
+    print_str(b"[lsa-route] worker PDUs read=");
+    print_u64(worker_reads);
+    print_str(b" first-read-type=");
+    print_u64(first_pdu);
+    print_str(b" written=");
+    print_u64(worker_writes);
+    print_str(b" first-write-type=");
+    print_u64(first_reply);
+    print_str(b" (11=bind 12=bind_ack 255=none) client-writes=");
+    print_u64(client_writes);
+    print_str(b" | HPET ticks absorbed-by-pump=");
+    print_u64(ticks_absorbed);
+    print_str(b" drained=");
+    print_u64(ticks_drained);
+    print_str(b" pipe-waiters-full=");
+    print_u64(pipe_full);
+    print_str(b" pump-walls=");
+    print_u64(wall_suspends);
+    print_str(b"\n");
+    // The route really RAN (not merely "was enabled"), and it ran on a transport that neither
+    // wedged nor mis-delivered:
+    //  * the per-connection WORKER read PDUs off lsass' own `\lsarpc` and its FIRST was the
+    //    ncacn bind (**11**), and it WROTE a reply whose first was the bind_ack (**12**) — i.e. a
+    //    real MS-RPC server handshake completed inside lsass, over npfs, driven by a worker thread
+    //    the executive routed. Before the route these were all 0 and the boot hung;
+    //  * lsass' own main thread wrote as the CLIENT (advapi32's auto-bind). NOTE the thresholds are
+    //    deliberately the INVARIANTS (>= 1 each, and the FIRST PDU type of each direction), not the
+    //    depth: how far the self-RPC gets before the boot quiesces varies run to run (measured
+    //    2..8 worker reads), because the route is a large timing perturbation. What does NOT vary is
+    //    that the handshake happens and in the right order;
+    //  * ZERO pump walls and ZERO reply errors over the whole boot — the availability defect the
+    //    route used to hit does not recur, and every request found its reply object BOUND;
+    //  * every HPET tick a pump absorbed was DRAINED by the service loop (none dropped);
+    //  * ZERO pipe-waiter-table refusals, so no async pipe I/O was silently degraded.
+    let route_shape = if LSA_WORKER_ROUTE_ENABLED {
+        // Route ON: the handshake really happened, in the right order. Thresholds are the
+        // INVARIANTS (>= 1 each + the FIRST PDU type of each direction), not the depth — how far
+        // the self-RPC gets before the boot quiesces varies run to run (measured 2..8 worker reads)
+        // because the route is a large timing perturbation. That it happens, and in this order,
+        // does not vary.
+        worker_reads >= 1
+            && first_pdu == 11
+            && worker_writes >= 1
+            && first_reply == 12
+            && client_writes >= 1
+    } else {
+        // Route OFF: NOTHING is fabricated. No worker was routed, so no PDU can have been read or
+        // written on lsass' own `\lsarpc` by one, and no first-PDU type can have been recorded.
+        // `LSA_RPC_NEW_CLIENT_REQUESTS` (asserted >= 1 by `exec_lsa_rpc_handoff_reaches_new_client`
+        // above) still proves rpcrt4 ASKED for the worker — the route decision is ours, not a
+        // failure to get there.
+        worker_reads == 0 && worker_writes == 0 && first_pdu == 0xFF && first_reply == 0xFF
+    };
+    check(
+        b"exec_lsa_worker_route",
+        route_shape
+            && wall_suspends == 0
+            && reply_errors == 0
+            && ticks_drained + 1 >= ticks_absorbed
+            && pipe_full == 0,
+        passed,
+    );
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
@@ -2757,6 +2906,46 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued by lsass' own
 /// main thread from samsrv) complete instead of blocking forever on an unserved pipe.
 static LSA_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
+/// ★★ THE LSA SELF-RPC WORKER ROUTE — **MEASURED WITH IT ON, THEN RE-GATED OFF** (Phase 4).
+///
+/// Turning this on routes lsass' `\pipe\lsarpc` per-connection RPC worker (`RPCRT4_new_client` →
+/// `RPCRT4_io_thread`) for real, which is the thread that answers lsass' OWN `LsaOpenPolicy`
+/// self-RPC — the chain samsrv needs for `SampGetAccountDomainInfo` → `SamIConnect` →
+/// `SamrLookupNamesInDomain(Administrator)` → `WLX_SAS_ACTION_LOGON`.
+///
+/// **The defect that used to gate it is GONE.** It was an AVAILABILITY defect of the hand-rolled
+/// component-dispatch transport: the executive's wake `Send` blocked against a component that was
+/// not yet receiving (RIP-sampled: 907/909 wakes healthy at the completion-`Send`+2, and the one
+/// wake that never returned was the only sample at the receive syscall+2). Under the `Call`
+/// transport there is no wake `Send` at all — the component is the caller and is `BlockedOnReply`
+/// with no user-visible gap, and the executive answers with `reply_on` (`decode_reply`), which
+/// cannot block. Measured with the route ON: the boot NO LONGER HANGS. It reaches the gate with
+/// `RUNEXIT=3` every time, ZERO pump walls and ZERO reply errors, and the self-RPC completes a real
+/// MS-RPC handshake inside lsass (worker reads the bind PDU 0x0b off npfs, writes the bind_ack
+/// 0x0c). Two route-ON boots were **fully green, 232/99, paint 768/768**.
+///
+/// **It is nevertheless OFF, for a different and honest reason: it is not DETERMINISTIC.** Across
+/// five route-ON boots of the same binaries the desktop paint survived twice and was lost three
+/// times (gate 211-213/99, ~20 FAILs, paint 0/768) — no crash and no hang, but winlogon starved
+/// while lsass' self-RPC churned and the 45 s no-progress watchdog quiesced before the SAS window.
+/// The paint is a hard safety invariant, so a route that keeps it only ~40% of the time cannot land.
+///
+/// Two REAL defects were root-caused by turning it on, and BOTH fixes are landed:
+///   1. **The pump did not screen bound-notification deliveries** — see
+///      `inject_bound_notification_tick` / `exec_pump_screens_bound_notification`. This one WALLED
+///      npfs mid-boot and is fixed unconditionally.
+///   2. **Pipe parking was per-connection, not per-direction**, so an rpcrt4 server's pending READ
+///      refused its own response WRITE with `STATUS_INSUFFICIENT_RESOURCES` — see
+///      `PIPE_FULL_DUPLEX_PARK` in `exec_handler.rs` (fix written + host-tested in
+///      `nt_io_manager::PipeWaiterTable::parked_on_dir`, gated off). With BOTH fixes on, the chain
+///      advances much further — the `LsarOpenPolicy` responses are delivered (status 0, 48 bytes),
+///      `SamIConnect-null-root-miss` goes 1 → 0, `sam-setup-keys` 2 → 36, and lsass reaches
+///      `NtCreateNamedPipeFile(\samr)`, i.e. samsrv publishes its own RPC endpoint — but the paint
+///      is then lost every time, so that combination is the next batch's problem, not this one's.
+///
+/// **Nothing is fabricated.** With the route off, `LsaOpenPolicy` does not return over RPC,
+/// `Administrator` is not validated and `WLX_SAS_ACTION_LOGON` is not returned.
+pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = false;
 static LSA_WORKER_TID: AtomicU64 = AtomicU64::new(0);
 static LSA_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Times lsass' `\pipe\lsarpc` rpcrt4 SERVER thread reached `RPCRT4_new_client`
@@ -4097,6 +4286,56 @@ fn release_reply_pool_cap(cap: u64) {
             break;
         }
     }
+}
+
+/// ★ NEGATIVE CONTROL for `spawn_hosts::pump_recv`'s bound-notification screening (Phase 4).
+///
+/// Reproduce, deterministically and without touching the HPET, the delivery that WALLED npfs on the
+/// first LSA-route boot: a notification BOUND to the executive's root TCB cancelling a
+/// `component_pump` recv. The kernel's bound-notification pre-check
+/// (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0` and leaves the message
+/// registers untouched, so an unscreened pump reads `label = 0` with MR0 still holding the request
+/// tag it just replied with — and suspends + retires the component.
+///
+/// Mint a notification badged **`DELAY_TIMER_BADGE`** (the pump screens on exactly that badge, so
+/// this exercises the production path, not a test-only one), bind it to the root TCB, signal it, and
+/// return. The caller then runs a REAL component dispatch, whose first `pump_recv` takes the
+/// delivery. We unbind immediately: the notification is now Active-and-consumed by that recv, and
+/// leaving a stray binding would let it interact with `delay_timer_init`'s own later bind.
+///
+/// Deliberately does NOT use the HPET: no comparator is armed, no IOAPIC route is claimed and no IRQ
+/// is left needing an Ack, so the injection cannot perturb the real delay-timer plane (which, with
+/// `LSA_WORKER_ROUTE_ENABLED` off, is never initialised on this boot at all).
+unsafe fn inject_bound_notification_tick() -> bool {
+    let notification = make_object(OBJ_NOTIFICATION);
+    if notification == 0 {
+        return false;
+    }
+    let badged = alloc_slot();
+    if badged == 0 {
+        return false;
+    }
+    let mint = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        badged,
+        notification,
+        DELAY_TIMER_BADGE,
+    );
+    // The initial root TCB cap is slot 1 (same constant `delay_timer_init` uses).
+    let bind = syscall5(SYS_SEND, 1, LBL_TCB_BIND_NOTIFICATION << 12, notification, 0, 0);
+    // Send on a Notification cap IS `signal()` (`syscall_handler.rs::handle_send`), so the object
+    // becomes Active with our badge and the next blocking Recv on ANY endpoint returns it.
+    let signal = syscall5(SYS_SEND, badged, 0, 0, 0, 0);
+    let _ = (mint, bind, signal);
+    true
+}
+
+/// Undo [`inject_bound_notification_tick`]'s binding once the dispatch under test has consumed the
+/// delivery, so nothing else on the boot can be interrupted by it.
+unsafe fn retract_bound_notification_tick() {
+    let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
 }
 
 unsafe fn delay_timer_init() -> bool {
@@ -10906,9 +11145,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // to the 2nd driver's own instance; its handler sets STATUS_SUCCESS + Information =
                 // 0x5A5A. Prove the completion propagated back through the shared dispatch engine.
                 let mut out = [0u8; 16];
+                // ★★ NEGATIVE-CONTROL INJECTION (Phase 4): make a BOUND-NOTIFICATION delivery land
+                // on this dispatch's pump recv, deliberately. See `inject_bound_notification_tick`.
+                let tick_absorbed_before = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
+                let tick_armed = inject_bound_notification_tick();
                 let rt = driver_launch::dispatch_irp(
                     dc.instance, 0 /* IRP_MJ_CREATE */, 0, 0, &[], &mut out,
                 );
+                let tick_absorbed = PUMP_TIMER_TICKS_ABSORBED
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(tick_absorbed_before);
+                // The injected tick is SYNTHETIC — there is no HPET IRQ to Ack and no delay queue to
+                // service — so consume the latch here instead of leaving the service loop a
+                // spurious `delay_timer_interrupt`.
+                DELAY_TIMER_TICK_PENDING.store(false, Ordering::Relaxed);
+                retract_bound_notification_tick();
                 let mut irp_ok = false;
                 if let Some((st, info)) = rt {
                     print_str(b"[driver-launch] 2nd-driver instance=");
@@ -10930,6 +11181,51 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         && distinct_pml4
                         && irp_ready
                         && irp_ok,
+                    &mut passed,
+                );
+
+                // ═══ ★ THE PUMP SCREENS A BOUND-NOTIFICATION DELIVERY ═══
+                //
+                // A second availability defect of the component pump, root-caused by Phase 4's
+                // LSA-route experiment (`docs/transport-migration.md` Phase 4). The executive's ROOT
+                // TCB has a notification BOUND to it whenever anything has called
+                // `NtDelayExecution` (`delay_timer_init` → `LBL_TCB_BIND_NOTIFICATION`), and that is
+                // the whole point of binding: a signal CANCELS any blocking `Recv` the executive is
+                // in, so a parked delay can be woken while the service loop sits in `recv`. But
+                // `component_pump`'s recv is one of those, and the kernel's bound-notification
+                // pre-check (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0`
+                // and **leaves the message registers untouched**. The pump discarded the badge, so
+                // it read `label = 0` with MR0 still holding the request tag `pump_reply_on` had
+                // just left there, took its "any other fault" arm, and SUSPENDED + RETIRED the
+                // component. Observed exactly so on the first LSA-route boot: `[pump] WALL label=0
+                // ip=0x771`, npfs dead mid-boot, the route's `\lsarpc` READ failing ever after.
+                //
+                // THE INJECTION IS THE NEGATIVE CONTROL. It mints a notification badged
+                // `DELAY_TIMER_BADGE`, binds it to the root TCB, signals it, and THEN runs the real
+                // 2nd-driver IRP dispatch above — so the delivery lands on that dispatch's very
+                // first `pump_recv`, which is precisely the shape that walled npfs. Two things must
+                // both hold, and neither can hold without the screening:
+                //   * the pump SAW it (`PUMP_TIMER_TICKS_ABSORBED` moved) — otherwise the injection
+                //     did not reproduce the condition and the spec would be vacuous;
+                //   * the dispatch nevertheless COMPLETED with the driver's own answer
+                //     (`status = 0`, `Information = 0x5A5A`, asserted just above as `irp_ok`) —
+                //     i.e. the component was not walled and not retired.
+                // BYPASS EXPERIMENT (run, then reverted): with the one-line screen in `pump_recv`
+                // disabled, this boot reproduces the original signature EXACTLY — `[pump] WALL
+                // label=0 ip=0x771` → `[fsd-svc] IRP fault wall inst=1 -> instance RETIRED` — and
+                // BOTH `exec_pump_screens_bound_notification` (absorbed=0, completed=0) and
+                // `exec_second_irp_driver_via_harness` FAIL (gate 234 → 231/99, 3 FAILs). So the
+                // injection reproduces the real defect, and the spec is not vacuous.
+                print_str(b"[pump-ntfn] injected bound-notification tick: armed=");
+                print_u64(tick_armed as u64);
+                print_str(b" absorbed-by-pump=");
+                print_u64(tick_absorbed);
+                print_str(b" dispatch-still-completed=");
+                print_u64(irp_ok as u64);
+                print_str(b"\n");
+                check(
+                    b"exec_pump_screens_bound_notification",
+                    tick_armed && tick_absorbed >= 1 && irp_ok,
                     &mut passed,
                 );
             } else {

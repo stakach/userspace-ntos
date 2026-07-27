@@ -655,12 +655,40 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
 /// Receive the component's next message. The recv REGISTERS the channel's reply object in r12, so
 /// the kernel binds it to whichever Call — dispatch completion, demand-page fault or callback —
 /// pairs with us. This is the ONLY correlation state the transport has, and it is the kernel's.
+///
+/// ★ THE BADGE IS LOAD-BEARING (Phase 4). The executive's root TCB has the HPET one-shot
+/// notification BOUND to it, so this `Recv` has a SECOND thing that can satisfy it besides a
+/// component `Call`: a timer tick. The kernel's bound-notification pre-check
+/// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
+/// message registers untouched**, so a tick absorbed here reads as `label = 0` with MR0 still
+/// holding whatever `pump_reply_on` left there — the request tag. That is a WALL, and it is exactly
+/// what killed the LSA route's npfs READ (`[pump] WALL label=0 ip=0x771`): the route is the first
+/// thing in the boot that arms an HPET one-shot (`NtDelayExecution` from the RPC worker) WHILE a
+/// component dispatch is in flight. The main service loop has always screened this badge; the pump
+/// did not, because before the route nothing ticked during a dispatch.
+///
+/// So: recognise the tick, LATCH it for the main service loop (`DELAY_TIMER_TICK_PENDING`) and go
+/// back to receiving. No spin is possible — the IOAPIC line stays masked until `delay_timer_interrupt`
+/// Acks it, so at most one tick can be outstanding, and the pump reaches the service loop within one
+/// dispatch.
 #[inline]
 unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
-    // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
-    // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
-    let (_b, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
-    (mi, m0, m1, m2, m3)
+    loop {
+        // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
+        // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
+        let (badge, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+        if badge == crate::DELAY_TIMER_BADGE {
+            crate::DELAY_TIMER_TICK_PENDING.store(true, Ordering::Relaxed);
+            let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                crate::print_str(
+                    b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
+                );
+            }
+            continue;
+        }
+        return (mi, m0, m1, m2, m3);
+    }
 }
 
 /// Resume the component (a fault reply, or the int-0x2c assert-skip reply) and receive its next

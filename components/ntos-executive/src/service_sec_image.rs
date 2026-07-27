@@ -793,6 +793,15 @@ pub(crate) unsafe fn service_sec_image(
                 break;
             }
         }
+        // ★ DRAIN a timer tick a COMPONENT PUMP absorbed. The HPET notification is bound to the root
+        // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
+        // which cannot service it (the delay queue lives here). The pump latches it instead; this
+        // runs the same `delay_timer_interrupt` the badge arm below would have, one dispatch later.
+        // Until this Ack the IOAPIC line stays masked, so no tick can be lost behind another.
+        if DELAY_TIMER_TICK_PENDING.swap(false, Ordering::Relaxed) {
+            PUMP_TIMER_TICKS_DRAINED.fetch_add(1, Ordering::Relaxed);
+            delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
+        }
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
                 let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);

@@ -1,11 +1,14 @@
 # Component-Dispatch Transport Migration — hand-rolled Send/Recv → seL4 `Call` + MCS reply objects
 
-**Status:** **Phases 0-3 DONE** (gate **232/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
+**Status:** **ALL PHASES (0-4) DONE** (gate **234/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
 `0x003a6ea5`). **There is now exactly ONE dispatch transport — seL4 `Call` ⇄ MCS reply objects, on
 BOTH substrates — and exactly ONE reply mechanism anywhere in the executive: `Cap::Reply`.** The
 34-item kill-list is EXHAUSTED (§7); the legacy per-TCB `reply_to` reply is retired.
+Phase 4 CONFIRMED the migration's falsifiable prediction — the availability defect that gated the
+LSA worker route is structurally gone — and root-caused two further real defects; the route itself
+stays gated for a newly-isolated, different reason (§Phase 4).
 Baseline `1141349` → Phase 0 `d287c48` → Phase 1 `01d0423` → Phase 2 `cc46342` → Phase 3a `e49e8b0`
-→ Phase 3b.
+→ Phase 3b `c587b8f` → Phase 4.
 
 > ### ★ WHAT THE PLAN GOT WRONG — corrections 1-3 found in Phase 1, 4-6 in Phase 2
 >
@@ -720,24 +723,105 @@ sentinel`, **ZERO FAILs**, gate **232/99**, `diff`-identical PASS lists, paint *
 
 ---
 
-### Phase 4 — re-enable `LSA_WORKER_ROUTE_ENABLED`
+### Phase 4 — re-enable `LSA_WORKER_ROUTE_ENABLED` — **DONE: prediction CONFIRMED, route re-gated**
 
-Flip `exec_handler.rs:7062` to `true` and boot. The expectation, stated as a falsifiable
-prediction rather than a hope: the route previously died on a wake `Send` that never returned, at a
-point where correlation was already measured clean (zero token mismatches, zero pump walls, callback
-plane drained to depth 0). With the wake replaced by a non-blocking `reply_on`, that specific wall
-cannot recur.
+Gate **234/99 ZERO FAILs**, RUNEXIT=3, paint **768/768 @ `0x003a6ea5`**, three consecutive boots with
+`diff`-identical PASS lists. `LSA_WORKER_ROUTE_ENABLED` ends this phase **`false`** — for a
+completely different reason than it started it.
 
-**Watch for:** `LsaOpenPolicy` returning → `SampGetAccountDomainInfo` / `SampInitDatabase` →
-`SamIConnect` → `Administrator` validated → `WLX_SAS_ACTION_LOGON`.
+#### 4.1 The prediction was RIGHT: the availability defect is structurally gone
 
-**If it stops somewhere else** — record exactly where, do **not** fabricate progress, and leave the
-switch `false` with the new evidence written down (that is what `1141349` and `7d0703b` did, and it
-is why this migration is well-targeted).
+The falsifiable claim was "the route previously died on a wake `Send` that never returned; with the
+wake replaced by a non-blocking `reply_on`, that specific wall cannot recur". **Measured with the
+route ON, five boots:** the boot **never hangs**. It reaches the gate with `RUNEXIT=3` every single
+time, with **zero pump walls** and **zero reply errors** over the whole boot, and the self-RPC
+completes a real MS-RPC handshake inside lsass — the routed per-connection worker reads the ncacn
+**bind** (PDU type `0x0b`) off npfs and writes the **bind_ack** (`0x0c`). Before the migration this
+configuration was a silent wedge. **Two of the five route-ON boots were fully green: 232/99, ZERO
+FAILs, paint 768/768.**
 
-**Must stay green:** the paint and the full gate must survive with the route ON. If a
-timing-perturbed run loses the paint (as it did at `1141349`), the route goes back off and Phase 4
-becomes its own follow-up batch — Phases 0–3 stand on their own merits.
+That is the payoff Phases 0-3 were justified by, and it is confirmed.
+
+#### 4.2 Turning it on root-caused TWO real defects. Both are fixed; one is landed live
+
+**(a) `component_pump` did not screen bound-notification deliveries. LANDED, unconditional.**
+
+The executive's ROOT TCB has a notification BOUND to it (`delay_timer_init` →
+`LBL_TCB_BIND_NOTIFICATION`) so an HPET tick can cancel a blocking `Recv` and wake a parked
+`NtDelayExecution`. That is the point of binding — but `component_pump`'s recv is one of those
+`Recv`s. The kernel's bound-notification pre-check (`syscall_handler.rs::handle_recv`) returns
+`rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the message registers untouched**. The pump
+discarded the badge, so it read `label = 0` with MR0 still holding the request tag `pump_reply_on`
+had just left there, fell into its "any other fault" arm, and **suspended + retired the component**:
+`[pump] WALL label=0 ip=0x771`, npfs dead mid-boot. The LSA route is simply the first thing in the
+boot that arms an HPET one-shot (`NtDelayExecution` from the RPC worker) WHILE a component dispatch
+is in flight.
+
+`pump_recv` now recognises the badge, latches `DELAY_TIMER_TICK_PENDING` and re-receives; the service
+loop drains it into `delay_timer_interrupt` on its next iteration. No spin is possible — the IOAPIC
+line stays masked until that Ack, so at most one tick is outstanding.
+
+Proven live and route-independently by **`exec_pump_screens_bound_notification`**: an injection
+(`inject_bound_notification_tick`) mints a notification badged `DELAY_TIMER_BADGE`, binds it to the
+root TCB, signals it, and then runs the REAL 2nd-driver IRP dispatch, so the delivery lands on that
+dispatch's first `pump_recv`. The spec asserts the pump SAW it (`absorbed >= 1`, else the injection
+would be vacuous) AND the dispatch still returned the driver's own answer (`status 0`,
+`Information 0x5A5A`). **Bypass experiment** (screen disabled, one boot): reproduces the original
+signature exactly — `[pump] WALL label=0 ip=0x771` → `instance RETIRED` — and both that spec and
+`exec_second_irp_driver_via_harness` FAIL (234 → 231/99, 3 FAILs).
+
+**(b) Pipe parking was per-CONNECTION, not per-DIRECTION. Fixed, host-tested, GATED OFF.**
+
+The async pipe park pre-checks gated on `PipeWaiterTable::parked_on(file_id)`, making a connection
+half-duplex. Every rpcrt4 ncacn_np SERVER violates that: `RPCRT4_io_thread` keeps a READ pending on
+the connection while `RPCRT4_worker_thread` writes the RESPONSE on the SAME connection. The write was
+refused with `STATUS_INSUFFICIENT_RESOURCES` — not a hang, a **silent functional degrade** — which is
+exactly how the 48-byte `LsarOpenPolicy` RESPONSE was lost, so lsass' parked client read never woke
+and `LsaOpenPolicy` never returned. (The first suspect, table exhaustion, was WRONG: `PIPE_WAITERS_FULL`
+is 0 on every boot. It is counted now rather than silent, and `PIPE_WAITER_N` stays 16.)
+
+`PipeWaiterTable::parked_on_dir(file_id, is_write)` + a host test
+(`pipe_waiter_parked_on_dir_is_full_duplex_per_connection`, nt-io-manager 86 → 87) allow one pending
+read AND one pending write per connection, which the re-drive already supports (it completes the two
+from separate per-direction stashes, `take_completed_write` / `take_completed_read`). It is wired in
+behind `PIPE_FULL_DUPLEX_PARK`, **`false`** — see §4.3.
+
+#### 4.3 How far the logon got, and why the route is OFF anyway
+
+With BOTH fixes on and the route ON, one measured boot:
+
+| evidence | route OFF | route ON + both fixes |
+|---|---|---|
+| routed per-connection worker PDUs | 0 | bind read, **bind_ack written** |
+| 48-byte `LsarOpenPolicy` RESPONSE write | — | **status 0, info 48** (repeatedly) |
+| `SamIConnect-null-root-miss` | 1 | **0** |
+| `sam-setup-keys` / `sam-mount-opens` | 2 / 1 | **36 / 2** |
+| lsass creates `\pipe\samr` | no | **yes** (samsrv publishes its own RPC endpoint) |
+
+So the chain really does advance: the LSA self-RPC completes, `SamIConnect` succeeds and
+`SampInitDatabase` runs against the real SAM hive. **It does not reach a logon.** `Administrator` is
+not validated and `WLX_SAS_ACTION_LOGON` is not returned — nothing is fabricated.
+
+**And the paint is lost.** Across five route-ON boots of the same binaries the desktop paint survived
+**twice** and was lost **three times** (gate 211-213/99, ~20 FAILs, paint 0/768) — no crash, no hang,
+`RUNEXIT=3` every time. What happens is forward-progress starvation: winlogon does not reach its SAS
+window because lsass' self-RPC churns until the 45 s no-progress watchdog quiesces. With
+`PIPE_FULL_DUPLEX_PARK` also on (the chain gets *further*), the paint was lost every time.
+
+The paint is a hard safety invariant, and a route that keeps it ~40% of the time cannot land. So the
+route is re-gated `false` with the evidence recorded on the const itself
+(`main.rs::LSA_WORKER_ROUTE_ENABLED`), exactly as `1141349` and `7d0703b` did. **The wall is now a
+SCHEDULING/forward-progress problem, not an availability or correlation one** — which is a materially
+better-isolated place to be, and it is the next batch's problem.
+
+#### 4.4 What the gate says with the route off
+
+`exec_lsa_worker_route` is route-AWARE: with the route on it asserts the handshake invariants (first
+read PDU = bind, first write PDU = bind_ack); with it off it asserts the worker counters are **0**,
+i.e. nothing was fabricated — while `exec_lsa_rpc_handoff_reaches_new_client` still proves rpcrt4
+ASKED for the worker, so the route decision is ours and not a failure to get there. Either way it
+asserts the transport invariants: **0** pump walls, **0** reply errors, **0** pipe-waiter refusals,
+and every absorbed bound-notification tick accounted for.
 
 ---
 
