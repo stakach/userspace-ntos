@@ -839,3 +839,65 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > `exec_software_hive_mounted` and `exec_winlogon_profile_directory_resolved` both red,
 > `[dbg] GetProfilesDirectoryW() failed (Error 2)` back, ProfileList opens 2 → 1, served-from-mount
 > 2 → 0, `ProfilesDirectory` value-reads 2 → 0. Paint stays 768/768; every other spec stays green.
+
+> **Update (batch 56, gate 245/99) — a REAL WRITABLE FILESYSTEM is mounted, and
+> `CreateDirectoryW("C:\Profiles")` SUCCEEDS.** Not an ntdll change (executive + `nt-fs`), and no
+> kernel change (`rust-micro` untouched). Four consecutive foreground boots, all RUNEXIT=3,
+> `microtest sentinel`, **ZERO FAILs**, gate **245/99**, `diff`-identical 245-line PASS lists, paint
+> **768/768 changed @ `0x003a6ea5`**.
+>
+> **(1) A general "writable mount at prefix P", not a per-call fake.** A path belongs to the writable
+> volume iff its canonical volume-relative form — the SAME `nt_path_to_volume_relative`
+> canonicalisation the read-only FAT reader uses — is at or under one of
+> `writable_fs::WRITABLE_PREFIXES` (today one entry, `profiles` = `%SystemDrive%\Profiles`). The test
+> is `nt_fs::writable_mount_relative` / `is_under_prefix`, component-wise (`profiles2` is not under
+> `profiles`) and still `..`-escape-rejecting. Adding a writable subtree is ONE table entry.
+> `\reactos\…` is outside every prefix and keeps resolving through the read-only reader untouched.
+>
+> **(2) The backing REUSES `nt-fs`'s `MemFs`** behind its `FileSystem` `Zw*` facade — no new
+> filesystem was written. `MemFs` gained the pieces a writable volume owes a caller: DOS attributes,
+> a parent link, `.`/`..`-first enumeration through the SAME `nt_fs::query_directory` encoder the FAT
+> volume uses, `FileBasic`/`FileDisposition`/`FilePosition`/`FileEndOfFile`/`FileAllocation`
+> set-information, delete-on-close that really unlinks, and file-object reference counting. Routed
+> syscalls: `NtCreateFile`, `NtOpenFile`, `NtQueryAttributesFile`, `NtRead/WriteFile`,
+> `NtQuery/SetInformationFile`, `NtQueryDirectoryFile`, `NtFlushBuffersFile`,
+> `NtQueryVolumeInformationFile`, `NtClose`, `NtDuplicateObject`. Handles are real per-process
+> `nt-process` handles (`HandleObject::OverlayFile`). The volume survives the service loop's
+> per-syscall bump reset via a `writable_fs_dirty` mark pin — the exact `overlay_dirty` contract the
+> CM write plane already uses.
+>
+> **(3) It is REAL, proven two ways.** A mount-time self-test runs the whole surface on a scratch
+> subtree outside every writable prefix (so `\profiles` is left pristine): directory create; the SAME
+> create COLLIDING; file create; write; read-back of the same bytes; metadata agreeing; enumeration
+> finding `.`, `..` and the file; delete-on-close really unlinking both so the by-path attribute
+> queries MISS; and a volume left with exactly its root. All 9 bits set (`selftest=0x1FF`). Plus the
+> live syscall counters: winlogon really created 2 directories through `NtCreateFile` and really
+> missed 1 by-path attribute query through `NtQueryAttributesFile`.
+>
+> **DESKTOP FRONTIER — the profile TREE is built; the profile SOURCE and the user HIVE are not.**
+> `CreateUserProfileW` now creates `C:\Profiles` (`profile.c:929` — the old `Error: 1`) and
+> `C:\Profiles\Administrator` (`profile.c:963`), then calls `CopyDirectory(…, "C:\Profiles\Default
+> User")` (`profile.c:1000`) and fails at **`profile.c:1002  Error: 3`** (ERROR_PATH_NOT_FOUND): our
+> media is a LIVECD extract with no profile tree, because ReactOS SETUP is what creates one. So
+> `LoadUserProfileW` still fails and **`userinit.exe` was NOT spawned; `StartUserShell` /
+> `WlxActivateUserShell` are NOT reached.** Behind that sits a second, larger wall:
+> `RegLoadKeyW(HKEY_USERS, <SID>, "…\ntuser.dat")` — **`NtLoadKey` (102) / `NtUnloadKey` (272) are
+> not serviced**, and an unserviced SSN PARKS the caller, so a real `ntuser.dat` + those two services
+> + an `HKEY_USERS` namespace is the next milestone. Provisioning the `Default User` skeleton was
+> measured for one boot and is NOT a clean advance (`Error: 998` from the enumeration, and the boot
+> hung, `RUNEXIT=124`); it stays off behind `PROVISION_DEFAULT_USER_PROFILE`.
+> **`Userinit`/`AutoAdminLogon`: nothing was changed** — `WlxActivateUserShell` was never reached, the
+> Winlogon key is still `SYNTH_WINLOGON_KEY`, and `AutoAdminLogon` cannot leak because winlogon's
+> SOFTWARE route stays exact-name scoped on `is_profile_list_key`.
+>
+> **★ TRACKED FOLLOW-UP — persistent FAT32 write-through.** The volume is RAM-backed; everything
+> written is gone at the next boot. That is a deliberate, user-approved staging step. Making it
+> persist is a separate milestone: the seam is already in place (every caller is above `nt-fs`'s
+> `Zw*` surface and `writable_fs` is the only module that knows what backs the volume), and the work
+> is FAT cluster allocation + FAT-chain update, directory-entry creation (8.3 + LFN write), size /
+> timestamp update on close, and write ordering through the isolated storage host.
+>
+> **BYPASS** (`WRITABLE_OVERLAY_MOUNTED = false`): 245/99 ZERO FAILs → **243/99 with exactly 2
+> FAILs**, `exec_writable_overlay_mounted` and `exec_winlogon_profile_directories_created` both red,
+> `profile.c:933  Error: 1` back, every overlay counter 0. Paint stays 768/768; every other spec
+> stays green.

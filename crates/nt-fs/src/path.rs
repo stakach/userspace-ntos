@@ -195,6 +195,38 @@ pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Ve
     Some(normalized)
 }
 
+/// Whether `volume_relative` (the output of [`nt_path_to_volume_relative`] — lowercase, no leading
+/// separator) is AT or UNDER one of `prefixes` (each itself a lowercase volume-relative path).
+///
+/// This is the general "writable mount at prefix P" test (spec §13.4): a namespace subtree is
+/// declared writable, and every path inside it — at any depth — belongs to the writable volume.
+/// Component-wise, so `profiles2` is NOT under `profiles`.
+pub fn is_under_prefix(volume_relative: &[u8], prefixes: &[&[u8]]) -> bool {
+    prefixes.iter().any(|prefix| {
+        !prefix.is_empty()
+            && volume_relative.len() >= prefix.len()
+            && volume_relative[..prefix.len()] == **prefix
+            && volume_relative
+                .get(prefix.len())
+                .is_none_or(|byte| *byte == b'\\')
+    })
+}
+
+/// Resolve an NT path to the WRITABLE volume's relative path, or `None` when the path is outside
+/// every writable mount prefix (in which case the caller's read-only namespace still owns it).
+///
+/// The writable volume shares the read-only volume's namespace convention — the same
+/// [`nt_path_to_volume_relative`] canonicalisation — so swapping the backing store (RAM today,
+/// FAT write-through later) needs no change above this seam.
+pub fn writable_mount_relative(
+    path: &[u16],
+    system_root: &[u8],
+    prefixes: &[&[u8]],
+) -> Option<Vec<u8>> {
+    let relative = nt_path_to_volume_relative(path, system_root)?;
+    is_under_prefix(&relative, prefixes).then_some(relative)
+}
+
 /// Case-insensitive component-wise prefix test.
 fn path_has_prefix(path: &str, prefix: &str) -> bool {
     let p: Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();

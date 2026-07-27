@@ -8,15 +8,20 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::directory::{query_directory, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState};
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::status::*;
 
-/// A MemFs node (spec §12.3). v0.1 stores only what the read/write/create paths use; `parent`,
-/// timestamps, and attributes are deferred until directory enumeration lands.
+/// A MemFs node (spec §12.3). Carries the node's DOS attributes and its parent link so the volume
+/// can serve directory enumeration (`.`/`..` + children) and unlink, exactly like a real FSD.
 struct MemFsNode {
     is_dir: bool,
+    attributes: u32,
+    parent: u64,
     data: Vec<u8>,
-    children: Vec<(String, u64)>, // (folded name, node id)
+    /// (folded name, as-created name, node id) — the folded name is the lookup key, the
+    /// as-created name is what directory enumeration reports (NT preserves creation case).
+    children: Vec<(String, String, u64)>,
 }
 
 /// An in-memory file system (spec §12) — the v0.1 `NtFileSystemRuntime`.
@@ -40,6 +45,8 @@ impl MemFs {
         let mut fs = MemFs { nodes: Vec::new() };
         fs.nodes.push(Some(MemFsNode {
             is_dir: true,
+            attributes: FILE_ATTRIBUTE_DIRECTORY,
+            parent: 0,
             data: Vec::new(),
             children: Vec::new(),
         }));
@@ -70,22 +77,45 @@ impl MemFs {
         self.node(dir)?
             .children
             .iter()
-            .find(|(n, _)| *n == folded)
-            .map(|(_, id)| *id)
+            .find(|(n, _, _)| *n == folded)
+            .map(|(_, _, id)| *id)
     }
 
     fn create_child(&mut self, parent: u64, name: &str, is_dir: bool) -> u64 {
         let id = self.nodes.len() as u64;
         self.nodes.push(Some(MemFsNode {
             is_dir,
+            attributes: if is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_ARCHIVE
+            },
+            parent,
             data: Vec::new(),
             children: Vec::new(),
         }));
         self.node_mut(parent)
             .unwrap()
             .children
-            .push((fold(name), id));
+            .push((fold(name), String::from(name), id));
         id
+    }
+
+    /// Unlink `id` from `parent` and free the node (spec §12.6 — delete-on-close). A non-empty
+    /// directory is refused, exactly as `IRP_MJ_SET_INFORMATION`/`FileDispositionInformation` does.
+    fn unlink(&mut self, parent: u64, id: u64) -> Result<(), u32> {
+        let node = self.node(id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if node.is_dir && !node.children.is_empty() {
+            return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        let parent_node = self.node_mut(parent).ok_or(STATUS_OBJECT_PATH_NOT_FOUND)?;
+        let before = parent_node.children.len();
+        parent_node.children.retain(|(_, _, child)| *child != id);
+        if parent_node.children.len() == before {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        self.nodes[id as usize] = None;
+        Ok(())
     }
 
     /// Create every missing directory along `path`, returning the leaf directory's id.
@@ -123,6 +153,7 @@ impl MemFs {
         rel_path: &str,
         disposition: u32,
         options: u32,
+        file_attributes: u32,
     ) -> Result<(u64, u32), u32> {
         let want_dir = options & FILE_DIRECTORY_FILE != 0;
         let existing = self.lookup(rel_path);
@@ -164,6 +195,18 @@ impl MemFs {
                         return Err(STATUS_OBJECT_PATH_NOT_FOUND);
                     }
                     let id = self.create_child(parent, leaf, want_dir);
+                    // The caller's FileAttributes are honoured for a newly created file; a
+                    // directory always carries FILE_ATTRIBUTE_DIRECTORY (NT sets it, not the
+                    // caller). Zero means "defaults", which `create_child` already applied.
+                    let requested = file_attributes & FILE_ATTRIBUTE_SETTABLE;
+                    if requested != 0 {
+                        let node = self.node_mut(id).unwrap();
+                        node.attributes = if want_dir {
+                            requested | FILE_ATTRIBUTE_DIRECTORY
+                        } else {
+                            requested
+                        };
+                    }
                     Ok((id, FILE_CREATED))
                 }
                 _ => Err(STATUS_INVALID_PARAMETER),
@@ -179,11 +222,63 @@ impl MemFs {
         Some(StandardInformation {
             end_of_file: self.size(id),
             is_directory: self.is_dir(id),
+            attributes: self.attributes(id),
         })
     }
 
     fn is_dir(&self, id: u64) -> bool {
         self.node(id).map(|n| n.is_dir).unwrap_or(false)
+    }
+    fn attributes(&self, id: u64) -> u32 {
+        self.node(id).map(|n| n.attributes).unwrap_or(0)
+    }
+    fn parent(&self, id: u64) -> u64 {
+        self.node(id).map(|n| n.parent).unwrap_or(0)
+    }
+    fn set_end_of_file(&mut self, id: u64, length: u64) -> u32 {
+        let Some(n) = self.node_mut(id) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if n.is_dir {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let Ok(length) = usize::try_from(length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        n.data.resize(length, 0);
+        STATUS_SUCCESS
+    }
+
+    /// The directory's contents as native `DirectoryEntry` records — `.`, `..`, then the children
+    /// in creation order, exactly like the FAT enumerator the read-only volume uses.
+    fn entries(&self, id: u64) -> Option<Vec<DirectoryEntry>> {
+        let node = self.node(id)?;
+        if !node.is_dir {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut push = |index: usize, name: &str, target: &MemFsNode| {
+            let mut entry = DirectoryEntry {
+                file_index: index as u32,
+                attributes: target.attributes,
+                end_of_file: target.data.len() as u64,
+                allocation_size: (target.data.len() as u64).div_ceil(0x1000) * 0x1000,
+                ..DirectoryEntry::default()
+            };
+            let wide: Vec<u16> = name.encode_utf16().collect();
+            if entry.set_name(&wide) {
+                out.push(entry);
+            }
+        };
+        push(0, ".", node);
+        let parent = self.node(node.parent).unwrap_or(node);
+        push(1, "..", parent);
+        for (index, (_, name, child)) in node.children.iter().enumerate() {
+            if let Some(target) = self.node(*child) {
+                push(index + 2, name, target);
+            }
+        }
+        Some(out)
     }
     fn size(&self, id: u64) -> u64 {
         self.node(id).map(|n| n.data.len() as u64).unwrap_or(0)
@@ -211,6 +306,14 @@ impl MemFs {
 struct FileObject {
     node_id: u64,
     current_offset: u64,
+    /// Handles referring to this file object. `NtDuplicateObject` adds one, `ZwClose` removes one;
+    /// the object (and any pending delete) is actioned when the last one goes.
+    references: u32,
+    /// `FCB->DeletePending` — set by `FileDispositionInformation`, actioned by `ZwClose`.
+    delete_pending: bool,
+    /// Per-`FILE_OBJECT` directory-enumeration cursor (spec §17): `NtQueryDirectoryFile` resumes
+    /// from it, `RestartScan` rewinds it. Shared by handles duplicated from this file object.
+    query: DirectoryQueryState,
 }
 
 /// File information classes (spec §18) supported in v0.1.
@@ -218,6 +321,7 @@ struct FileObject {
 pub struct StandardInformation {
     pub end_of_file: u64,
     pub is_directory: bool,
+    pub attributes: u32,
 }
 
 /// The I/O-Manager-facing file system: the volume + mount manager + file-object/handle table,
@@ -269,7 +373,7 @@ impl FileSystem {
         &mut self,
         path: &str,
         _desired_access: u32,
-        _file_attributes: u32,
+        file_attributes: u32,
         _share_access: u32,
         disposition: u32,
         options: u32,
@@ -282,14 +386,26 @@ impl FileSystem {
         let Some(rel) = self.to_relative(&normalize_separators(path)) else {
             return fail(STATUS_OBJECT_PATH_NOT_FOUND);
         };
-        match self.volume.create(&rel, disposition, options) {
+        match self
+            .volume
+            .create(&rel, disposition, options, file_attributes)
+        {
             Ok((node_id, information)) => {
                 // Directory/non-directory intent already validated in create().
-                let handle = self.handles.len() as u64;
-                self.handles.push(Some(FileObject {
+                let handle = match self.handles.iter().position(|slot| slot.is_none()) {
+                    Some(free) => free as u64,
+                    None => {
+                        self.handles.push(None);
+                        (self.handles.len() - 1) as u64
+                    }
+                };
+                self.handles[handle as usize] = Some(FileObject {
                     node_id,
                     current_offset: 0,
-                }));
+                    references: 1,
+                    delete_pending: options & FILE_DELETE_ON_CLOSE != 0,
+                    query: DirectoryQueryState::new(),
+                });
                 CreateResult {
                     status: STATUS_SUCCESS,
                     handle,
@@ -364,7 +480,121 @@ impl FileSystem {
         Some(StandardInformation {
             end_of_file: self.volume.size(obj.node_id),
             is_directory: self.volume.is_dir(obj.node_id),
+            attributes: self.volume.attributes(obj.node_id),
         })
+    }
+
+    /// `ZwQueryDirectoryFile` (spec §17): enumerate the directory this file object is open on,
+    /// resuming from (and advancing) the file object's own cursor. `RestartScan` rewinds it. The
+    /// record encoding is [`query_directory`] — the same encoder the read-only FAT volume uses.
+    pub fn zw_query_directory_file(
+        &mut self,
+        handle: u64,
+        information_class: u32,
+        return_single_entry: bool,
+        pattern: Option<&[u16]>,
+        restart_scan: bool,
+        output: &mut [u8],
+    ) -> DirectoryQueryResult {
+        let Some(obj) = self.obj(handle) else {
+            return DirectoryQueryResult {
+                status: STATUS_INVALID_HANDLE,
+                information: 0,
+            };
+        };
+        let Some(entries) = self.volume.entries(obj.node_id) else {
+            return DirectoryQueryResult {
+                status: STATUS_INVALID_PARAMETER,
+                information: 0,
+            };
+        };
+        let mut state = obj.query;
+        let result = query_directory(
+            &mut state,
+            &entries,
+            information_class,
+            return_single_entry,
+            pattern,
+            restart_scan,
+            output,
+        );
+        self.obj_mut(handle).unwrap().query = state;
+        result
+    }
+
+    /// `ZwSetInformationFile` (spec §19) for the classes a writable volume must serve:
+    /// `FileBasicInformation` (attributes), `FileDispositionInformation` (delete-on-close),
+    /// `FilePositionInformation`, and `FileEndOfFileInformation` / `FileAllocationInformation`
+    /// (truncate/extend). Returns the NTSTATUS; unhandled classes are reported honestly.
+    pub fn zw_set_information_file(&mut self, handle: u64, class: u32, data: &[u8]) -> u32 {
+        let Some(obj) = self.obj(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let node_id = obj.node_id;
+        match class {
+            FILE_BASIC_INFORMATION => {
+                if data.len() < 40 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let attributes = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let requested = attributes & FILE_ATTRIBUTE_SETTABLE;
+                if requested != 0 {
+                    let is_dir = self.volume.is_dir(node_id);
+                    if let Some(node) = self.volume.node_mut(node_id) {
+                        node.attributes = if is_dir {
+                            requested | FILE_ATTRIBUTE_DIRECTORY
+                        } else {
+                            requested
+                        };
+                    }
+                }
+                STATUS_SUCCESS
+            }
+            FILE_DISPOSITION_INFORMATION => {
+                if data.is_empty() {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                self.obj_mut(handle).unwrap().delete_pending = data[0] != 0;
+                STATUS_SUCCESS
+            }
+            FILE_POSITION_INFORMATION => {
+                if data.len() < 8 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let offset = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                self.obj_mut(handle).unwrap().current_offset = offset;
+                STATUS_SUCCESS
+            }
+            FILE_END_OF_FILE_INFORMATION | FILE_ALLOCATION_INFORMATION => {
+                if data.len() < 8 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                self.volume.set_end_of_file(node_id, length)
+            }
+            _ => STATUS_NOT_IMPLEMENTED,
+        }
+    }
+
+    /// The file object's current byte offset — `FilePositionInformation`'s read side.
+    pub fn current_offset(&self, handle: u64) -> Option<u64> {
+        self.obj(handle).map(|obj| obj.current_offset)
+    }
+
+    /// Create every missing directory along `path`, and return whether the leaf is a directory.
+    /// This is volume PROVISIONING (the content a formatted/installed volume already carries), not
+    /// a syscall path: hosted processes only ever reach the `Zw*` surface above.
+    pub fn provision_directory(&mut self, path: &str) -> bool {
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return false;
+        };
+        let id = self.volume.ensure_dir(&rel);
+        self.volume.is_dir(id)
+    }
+
+    /// Total live node count (root included) — the volume's occupancy, for diagnostics.
+    pub fn node_count(&self) -> usize {
+        self.volume.nodes.iter().filter(|n| n.is_some()).count()
     }
 
     /// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` (spec §8.6): query a file's attributes
@@ -376,12 +606,33 @@ impl FileSystem {
         self.volume.query(&rel)
     }
 
-    /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object.
+    /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object. A file object
+    /// with `DeletePending` set unlinks its node at cleanup, exactly like an FSD's `IRP_MJ_CLEANUP`.
     pub fn zw_close(&mut self, handle: u64) -> u32 {
-        match self.handles.get(handle as usize).and_then(|h| h.as_ref()) {
-            Some(_) => {
+        match self.handles.get_mut(handle as usize).and_then(|h| h.as_mut()) {
+            Some(obj) => {
+                obj.references = obj.references.saturating_sub(1);
+                if obj.references != 0 {
+                    return STATUS_SUCCESS;
+                }
+                let (node_id, delete_pending) = (obj.node_id, obj.delete_pending);
                 // IRP_MJ_CLEANUP (last handle) then IRP_MJ_CLOSE → free the FILE_OBJECT.
                 self.handles[handle as usize] = None;
+                if delete_pending && node_id != 0 {
+                    let parent = self.volume.parent(node_id);
+                    let _ = self.volume.unlink(parent, node_id);
+                }
+                STATUS_SUCCESS
+            }
+            None => STATUS_INVALID_HANDLE,
+        }
+    }
+
+    /// `ObDuplicateObject` on a file object: one more handle now names it (spec §6.2).
+    pub fn zw_retain(&mut self, handle: u64) -> u32 {
+        match self.obj_mut(handle) {
+            Some(obj) => {
+                obj.references = obj.references.saturating_add(1);
                 STATUS_SUCCESS
             }
             None => STATUS_INVALID_HANDLE,

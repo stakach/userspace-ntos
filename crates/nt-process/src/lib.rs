@@ -356,6 +356,9 @@ pub enum HandleObject {
         first_cluster: u32,
         object_id: u32,
     },
+    /// A file OR directory on the executive's WRITABLE overlay volume (`nt-fs` `MemFs`, mounted
+    /// over the writable namespace prefixes). The `u64` is that volume's own file-object id.
+    OverlayFile(u64),
     /// The executive-reserved `\SystemRoot\bootstat.dat` file used by RTL boot-status APIs.
     BootStatusFile,
     /// An executive I/O completion-port object, indexed in the executive's fixed object table.

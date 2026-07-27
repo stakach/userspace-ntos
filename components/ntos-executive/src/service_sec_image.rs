@@ -3113,6 +3113,17 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.token_dirty = false;
                     heap_mark = allocator::mark();
                 }
+                // WRITABLE FILESYSTEM plane: a handler that touched the writable overlay
+                // (`writable_fs`) — its lazy mount, or a create/write/set-information/close — grew
+                // the volume's `Vec`/`String` state ABOVE `heap_mark`. Pin the mark PAST it so the
+                // directories and files a hosted process created SURVIVE the next per-syscall
+                // reset. Exactly the `overlay_dirty` contract, for the file system instead of the
+                // registry; bounded (the profile tree is a handful of nodes) and only on the
+                // iterations that actually touched the volume.
+                if nt_handler.writable_fs_dirty {
+                    nt_handler.writable_fs_dirty = false;
+                    heap_mark = allocator::mark();
+                }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
                 // need a persistent image-page alias; other hosted processes can also return values
                 // to DLL globals. Use the handler's common cross-address-space writer for both.

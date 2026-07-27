@@ -40,6 +40,7 @@ pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod fs_loader;
 pub(crate) use fs_loader::*;
+mod writable_fs;
 mod rendezvous;
 pub(crate) use rendezvous::*;
 mod spawn_hosts;
@@ -2700,6 +2701,140 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     unsafe { activation_context_stack_spec(passed) };
     winlogon_logon_action_spec(passed);
     unsafe { software_hive_mount_spec(passed) };
+    unsafe { writable_overlay_spec(passed) };
+}
+
+/// ═══ THE WRITABLE FILESYSTEM OVERLAY IS A REAL FILE SYSTEM ═════════════════════════════════════
+///
+/// The host booted for 55 batches with a READ-ONLY filesystem: `fs_loader`'s FAT32 reader resolves
+/// any `\reactos\…` path to bytes and nothing more. The instant the interactive logon completed,
+/// that became the wall — `userenv!CreateUserProfileW` calls `CreateDirectoryW("C:\Profiles")`
+/// (`profile.c:929`), and with no writable filesystem the `NtCreateFile` behind it was answered
+/// `STATUS_NOT_IMPLEMENTED` ⇒ `GetLastError() == 1` ⇒ `profile.c:933  Error: 1`.
+///
+/// A writable volume is now MOUNTED over the declared writable namespace prefixes
+/// (`writable_fs::WRITABLE_PREFIXES`, today `%SystemDrive%\Profiles`), backed by `nt-fs`'s `MemFs`
+/// behind its `Zw*` facade. **It is a real file system, not a "return SUCCESS" fake**, and this
+/// spec proves that two independent ways:
+///
+///  1. **The mount-time self-test** (`writable_fs::selftest`), which runs the whole surface on a
+///     scratch subtree — directory create; the SAME create again COLLIDING (so the volume has real
+///     state, it is not saying yes to everything); a file create; a write; a read-back of the same
+///     bytes; metadata that agrees with what was written; a directory ENUMERATION through the
+///     native record encoder that finds `.`, `..` and the file; delete-on-close that really
+///     unlinks both and makes the by-path attribute queries MISS; and a volume left with exactly
+///     its root, so nothing was left behind. All nine bits must be set.
+///  2. **The live counters** — real directories created, bytes written and read back by REAL
+///     hosted-process syscalls during the boot.
+///
+/// Read-only `\reactos\…` is untouched: it is outside every writable prefix, so it still resolves
+/// through the FAT reader that carries the entire boot.
+///
+/// **NOT PERSISTENT.** The backing is RAM: everything written is gone at the next boot. That is a
+/// deliberate staging step — persistent FAT32 write-through is a separate, tracked milestone, and
+/// when it lands only the backing behind `writable_fs` changes because every caller is above the
+/// `Zw*` seam.
+unsafe fn writable_overlay_spec(passed: &mut u64) {
+    use crate::writable_fs::*;
+    let selftest = OVERLAY_SELFTEST.load(Ordering::Relaxed);
+    let dirs = OVERLAY_DIRS_CREATED.load(Ordering::Relaxed);
+    let creates = OVERLAY_CREATES.load(Ordering::Relaxed);
+    let writes = OVERLAY_WRITES.load(Ordering::Relaxed);
+    let bytes_written = OVERLAY_BYTES_WRITTEN.load(Ordering::Relaxed);
+    let bytes_read = OVERLAY_BYTES_READ.load(Ordering::Relaxed);
+    let dir_queries = OVERLAY_DIR_QUERIES.load(Ordering::Relaxed);
+    let attr_queries = OVERLAY_ATTR_QUERIES.load(Ordering::Relaxed);
+    print_str(b"[writable-fs] mounted=");
+    print_u64(writable_fs_mounted() as u64);
+    print_str(b" selftest=0x");
+    print_hex(selftest as u32);
+    print_str(b"/0x");
+    print_hex(OVERLAY_SELFTEST_ALL as u32);
+    print_str(b" live: creates=");
+    print_u64(creates);
+    print_str(b" dirs=");
+    print_u64(dirs);
+    print_str(b" opens=");
+    print_u64(OVERLAY_OPENS.load(Ordering::Relaxed));
+    print_str(b" writes=");
+    print_u64(writes);
+    print_str(b" bytes-written=");
+    print_u64(bytes_written);
+    print_str(b" reads=");
+    print_u64(OVERLAY_READS.load(Ordering::Relaxed));
+    print_str(b" bytes-read=");
+    print_u64(bytes_read);
+    print_str(b" dir-queries=");
+    print_u64(dir_queries);
+    print_str(b" attr-queries=");
+    print_u64(attr_queries);
+    print_str(b" attr-hits=");
+    print_u64(OVERLAY_ATTR_HITS.load(Ordering::Relaxed));
+    print_str(b" set-info=");
+    print_u64(OVERLAY_SET_INFO.load(Ordering::Relaxed));
+    print_str(b" closes=");
+    print_u64(OVERLAY_CLOSES.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_writable_overlay_mounted",
+        // The volume was really mounted — i.e. a real syscall path resolved into it …
+        writable_fs_mounted()
+            // … every one of the nine real-filesystem checks passed on the live volume …
+            && selftest == OVERLAY_SELFTEST_ALL
+            // … and a REAL hosted process really created a directory on it through NtCreateFile.
+            && dirs >= 1
+            && creates >= dirs,
+        passed,
+    );
+    winlogon_profile_directories_spec(passed);
+}
+
+/// ═══ winlogon REALLY BUILT THE USER PROFILE TREE — `CreateDirectoryW` no longer returns `Error: 1`
+///
+/// This is the batch's user-visible advance, and it is named for exactly what was MEASURED — not
+/// for what would be nicer to claim.
+///
+/// `HandleLogon` → `LoadUserProfileW` → (`GetFileAttributesW("C:\Profiles\<user>\ntuser.dat")`
+/// MISSES, honestly, on the writable volume) → `CreateUserProfileW`, under the REAL profile SID the
+/// `NtCreateToken` service minted (`profile.c:2056  Loading profile S-1-5-21-…-500`), which now:
+///   1. creates `C:\Profiles` — `CreateDirectoryW(szProfilesPath)`, `profile.c:929`. THIS is the
+///      call that returned `Error: 1` (`STATUS_NOT_IMPLEMENTED` ⇒ ERROR_INVALID_FUNCTION) for every
+///      boot before this batch and ended the logon. It now returns TRUE against a real file system.
+///   2. reads `ProfileList\DefaultUserProfile` out of the real SOFTWARE mount, and
+///   3. creates `C:\Profiles\<UserName>` — `CreateDirectoryW(szUserProfilePath)`, `profile.c:963`.
+/// Step 3 is only reachable if step 1 really succeeded, so the pair is a structural witness.
+///
+/// **THE NEW, HONEST WALL, and `CreateUserProfileW` still returns FALSE.** Next it calls
+/// `CopyDirectory(szUserProfilePath, szDefaultUserPath)` (`profile.c:1000`) to seed the new profile
+/// from `C:\Profiles\Default User`. Our media is a LIVECD extract and carries NO profile tree —
+/// ReactOS SETUP is what creates one — so `FindFirstFileW` misses and `profile.c:1002  Error: 3`
+/// (ERROR_PATH_NOT_FOUND) follows. So `LoadUserProfileW` fails, `HandleLogon` takes `goto cleanup`,
+/// `StartUserShell` / `WlxActivateUserShell` are NOT reached, and **`userinit.exe` has NOT been
+/// spawned.** Nothing here claims otherwise. Behind that wall sits a second one already identified:
+/// `RegLoadKeyW(HKEY_USERS, <SID>, "…\ntuser.dat")` needs `NtLoadKey` + a real user hive, neither of
+/// which this host has.
+fn winlogon_profile_directories_spec(passed: &mut u64) {
+    let root = crate::writable_fs::PROFILE_ROOT_CREATED.load(Ordering::Relaxed);
+    let user_dir = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed);
+    print_str(b"[wl-profile-dirs] winlogon created: C:\\Profiles=");
+    print_u64(root);
+    print_str(b" C:\\Profiles\\<user>=");
+    print_u64(user_dir);
+    print_str(b" (CreateUserProfileW then fails at profile.c:1002 CopyDirectory ");
+    print_str(b"-> no `Default User` profile on this media; userinit.exe NOT spawned)\n");
+    check(
+        b"exec_winlogon_profile_directories_created",
+        // Both directories were REALLY created by winlogon (pi 2) on the writable volume …
+        root >= 1
+            && user_dir >= 1
+            // … off the real interactive logon this batch inherits: lsass returned SUCCESS and the
+            // token it minted really crossed into winlogon (the SID the profile is being made for).
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
+            && WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1
+            // … and the profile flow reached them through the REAL SOFTWARE mount, not a synthetic.
+            && WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed) >= 2,
+        passed,
+    );
 }
 
 /// ═══ THE 4TH `regf` MOUNT — `\Registry\Machine\SOFTWARE` IS REAL ═══════════════════════════════
@@ -2804,15 +2939,13 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
 /// minted) and opens ProfileList a SECOND time, from a different call site. Both opens are counted
 /// and both must have been served by the mount.
 ///
-/// **THE NEW, HONEST WALL — and it is NOT a registry wall.** `CreateUserProfileW` then calls
-/// `CreateDirectoryW(szProfilesPath)` (`profile.c:929`, `C:\Profiles` after
-/// `ExpandEnvironmentStringsW`). This host has NO writable filesystem and no general disk-file /
-/// directory service, so that `NtCreateFile` is answered STATUS_NOT_IMPLEMENTED → `GetLastError()`
-/// == 1 → `profile.c:933  Error: 1` → `CreateUserProfileW() failed` (`profile.c:2117`) →
-/// `LoadUserProfileW` fails → `goto cleanup`. So `StartUserShell` /
-/// `WlxActivateUserShell(userinit.exe)` are NOT reached and **`userinit.exe` has NOT been spawned**;
-/// nothing here claims otherwise. Creating a user profile means WRITING a directory tree, which is
-/// a whole filesystem capability, not a registry one.
+/// `CreateUserProfileW` then calls `CreateDirectoryW(szProfilesPath)` (`profile.c:929`,
+/// `C:\Profiles` after `ExpandEnvironmentStringsW`). That used to be answered
+/// STATUS_NOT_IMPLEMENTED (no writable filesystem existed) → `GetLastError() == 1` →
+/// `profile.c:933  Error: 1`. As of the WRITABLE FILESYSTEM OVERLAY it SUCCEEDS against a real file
+/// system — see `exec_writable_overlay_mounted` + `exec_winlogon_profile_directories_created`,
+/// which carry that claim and its new, honest wall (`CopyDirectory` of a `Default User` profile
+/// this livecd media does not have). `userinit.exe` is still NOT spawned; nothing claims otherwise.
 fn winlogon_profile_directory_spec(passed: &mut u64) {
     let opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
     let hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
@@ -2827,7 +2960,8 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
     print_str(b" unsupported-file-opens=");
     print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
-    print_str(b" (next wall: CreateDirectoryW -> no writable FS; userinit.exe NOT spawned)\n");
+    print_str(b" (CreateDirectoryW now SUCCEEDS on the writable overlay; next wall: CopyDirectory ");
+    print_str(b"of `Default User`; userinit.exe NOT spawned)\n");
     check(
         b"exec_winlogon_profile_directory_resolved",
         // BOTH ProfileList opens — GetProfilesDirectoryW's and CreateUserProfileW's — were served
@@ -7474,6 +7608,13 @@ struct ExecNtHandler {
     /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
     /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
     dll_loaded_dirty: bool,
+    /// Set by any handler that touched the WRITABLE FILESYSTEM OVERLAY (`writable_fs`) — its mount,
+    /// a create/write/set-information/close, or a read (whose transient buffer is harmless but whose
+    /// lazily-mounted volume is not). Exactly the same contract as `overlay_dirty`: the service loop
+    /// advances the heap high-water mark past the volume's `Vec`/`String` growth so the files and
+    /// directories a hosted process created SURVIVE the next per-syscall bump reset. Without it the
+    /// volume would be handed back to the allocator the instant the syscall returned.
+    writable_fs_dirty: bool,
 }
 
 /// Exclusive pointer to the serialized executive's fixed directory-open table.

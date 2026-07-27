@@ -513,6 +513,7 @@ impl ExecNtHandler {
             overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
             overlay_dirty: false,
             dll_loaded_dirty: false,
+            writable_fs_dirty: false,
         };
         for pi in 0..5 {
             let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
@@ -914,6 +915,42 @@ impl ExecNtHandler {
                 Ok(Some((first_cluster, size)))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Mint a process-local handle for a file or directory on the WRITABLE overlay volume.
+    /// `file_id` is that volume's own file-object id (see `writable_fs`).
+    pub(crate) fn mint_overlay_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            unsafe { crate::writable_fs::close(file_id) };
+            return None;
+        };
+        let handle = match self
+            .pm
+            .insert_handle(pid, nt_process::HandleObject::OverlayFile(file_id), access)
+        {
+            Ok(handle) => handle,
+            Err(_) => {
+                // The volume owns the file object until a handle takes it; give it back.
+                unsafe { crate::writable_fs::close(file_id) };
+                return None;
+            }
+        };
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    /// The writable-overlay file-object id behind `handle`, or `None` when the handle names some
+    /// other kind of object (so the caller falls through to its existing routing).
+    pub(crate) fn overlay_file_id_for(&self, handle: u64) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::OverlayFile(file_id)) => Some(file_id),
+            _ => None,
         }
     }
 
@@ -2925,6 +2962,12 @@ impl ExecNtHandler {
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
             }
+            // The last handle on a writable-overlay file object: run the volume's cleanup/close
+            // (which actions a pending delete) and free the FILE_OBJECT.
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                unsafe { crate::writable_fs::close(file_id) };
+                self.writable_fs_dirty = true;
+            }
             // DbgkpCloseObject: the debugger's handle went away — mark the object inactive, detach
             // every debuggee, and drop it. (Debug-object handles are never duplicated on this path,
             // so a single close is the last reference.)
@@ -2989,6 +3032,10 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 self.directory_opens.retain(object_id)
+            }
+            nt_process::HandleObject::OverlayFile(file_id) => {
+                self.writable_fs_dirty = true;
+                unsafe { crate::writable_fs::retain(file_id) }
             }
             _ => Ok(()),
         };
@@ -9359,6 +9406,7 @@ impl ExecNtHandler {
                             nt_process::HandleObject::Directory { .. }
                                 | nt_process::HandleObject::DiskFile { .. }
                                 | nt_process::HandleObject::File(_)
+                                | nt_process::HandleObject::OverlayFile(_)
                                 | nt_process::HandleObject::BootStatusFile
                                 | nt_process::HandleObject::Opaque(_)
                         )
@@ -9431,6 +9479,51 @@ impl ExecNtHandler {
                         first_cluster,
                         object_id,
                     }) => (first_cluster, object_id),
+                    // ★ THE WRITABLE FILESYSTEM OVERLAY: enumerate what is really on the volume.
+                    // The cursor lives in the volume's own FILE_OBJECT, so a resumed scan and a
+                    // RestartScan behave exactly as they do for the read-only FAT directories.
+                    Some(nt_process::HandleObject::OverlayFile(file_id)) => {
+                        let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
+                        if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
+                            return nt_fs::STATUS_ACCESS_DENIED;
+                        }
+                        let mut pattern = [0u16; nt_fs::MAX_DIRECTORY_NAME];
+                        let pattern_len = match self.read_directory_pattern(args[9], &mut pattern) {
+                            Ok(length) => length,
+                            Err(status) => return status,
+                        };
+                        let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
+                        let mut encoded = alloc::vec::Vec::new();
+                        if encoded.try_reserve_exact(length).is_err() {
+                            return STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                        encoded.resize(length, 0);
+                        self.writable_fs_dirty = true;
+                        let result = crate::writable_fs::query_directory(
+                            file_id,
+                            args[7] as u32,
+                            args[8] != 0,
+                            pattern,
+                            args[10] != 0,
+                            &mut encoded,
+                        );
+                        let mut iosb_bytes = [0u8; 16];
+                        iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
+                        iosb_bytes[8..]
+                            .copy_from_slice(&(result.information as u64).to_le_bytes());
+                        if !self.xas_try_write_buf(output, &encoded[..result.information])
+                            || !self.xas_try_write_buf(iosb, &iosb_bytes)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if let Some(index) = event_index {
+                            if self.events.set_existing(index as u64).is_none() {
+                                return nt_fs::STATUS_INVALID_HANDLE;
+                            }
+                            let _ = wait_wake_dispatcher(self, None);
+                        }
+                        return result.status;
+                    }
                     Some(_) => return STATUS_OBJECT_TYPE_MISMATCH,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
@@ -9549,6 +9642,11 @@ impl ExecNtHandler {
                 let size_and_directory = match object {
                     nt_process::HandleObject::DiskFile { size, .. } => Some((size as u64, false)),
                     nt_process::HandleObject::Directory { .. } => Some((0, true)),
+                    // ★ THE WRITABLE FILESYSTEM OVERLAY: the size/kind the volume really holds.
+                    nt_process::HandleObject::OverlayFile(file_id) => {
+                        crate::writable_fs::standard_information(file_id)
+                            .map(|info| (info.end_of_file, info.is_directory))
+                    }
                     nt_process::HandleObject::BootStatusFile => {
                         Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false))
                     }
@@ -9860,6 +9958,21 @@ impl ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
                 let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
+                // ★ THE WRITABLE FILESYSTEM OVERLAY answers by-path attribute queries for its own
+                // namespace — `GetFileAttributesW` is how `LoadUserProfileW` (profile.c:2085) asks
+                // whether the user's hive already exists, and how `CreateDirectoryPath` probes.
+                // A miss here is a REAL miss (the file is not on the volume), never a fake EXISTS.
+                if let Some(relative) = crate::writable_fs::writable_path(&name16) {
+                    self.writable_fs_dirty = true;
+                    return match crate::writable_fs::query_attributes(&relative) {
+                        Some(info) => {
+                            // FILE_BASIC_INFORMATION: 4×8-byte times, FileAttributes(u32) @ +0x20.
+                            smss_stack_write32(args[1] + 0x20, info.attributes);
+                            nt_fs::STATUS_SUCCESS
+                        }
+                        None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+                    };
+                }
                 let mut nb = [0u8; 96];
                 let mut nlen = 0;
                 for &w in &name16 {
@@ -10234,6 +10347,40 @@ impl ExecNtHandler {
                     } else {
                         status = nt_fs::STATUS_OBJECT_PATH_NOT_FOUND;
                     }
+                } else if let Some(relative) = crate::writable_fs::writable_path(&name16) {
+                    // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
+                    // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the seam the
+                    // previous batch's STATUS_NOT_IMPLEMENTED miss left open, and it is where
+                    // `CreateDirectoryW("C:\Profiles")` (userenv/profile.c:929) now lands. The
+                    // disposition, `FILE_DIRECTORY_FILE`, and `FileAttributes` are passed straight
+                    // through to a REAL file system: a create that cannot be satisfied still fails
+                    // with the correct NTSTATUS, and no handle is fabricated.
+                    self.writable_fs_dirty = true;
+                    let (st, file_id, information) = crate::writable_fs::create(
+                        &relative,
+                        args[1] as u32,
+                        args[5] as u32,
+                        args[6] as u32,
+                        args[7] as u32,
+                        args[8] as u32,
+                    );
+                    status = st;
+                    info = information;
+                    if status == nt_fs::STATUS_SUCCESS
+                        && info == nt_fs::FILE_CREATED as u64
+                        && args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0
+                    {
+                        crate::writable_fs::note_directory_created(self.pi, &relative);
+                    }
+                    if let Some(file_id) = file_id {
+                        match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                            Some(handle) => self.queue_write(args[0], handle),
+                            None => {
+                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                info = 0;
+                            }
+                        }
+                    }
                 } else {
                     // A file namespace this host has no service for (a plain disk file — the live
                     // case is `\??\C:\Windows\system.ini`). Answer HONESTLY with
@@ -10343,6 +10490,18 @@ impl ExecNtHandler {
                         }
                         Err(status) => status,
                     }
+                } else if let Some(file_id) = self.overlay_file_id_for(fh) {
+                    // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
+                    // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
+                    // advances the file object's own position, exactly like an FSD.
+                    self.writable_fs_dirty = true;
+                    let explicit = (byte_offset != 0 && offset_ok)
+                        .then_some(offset_value)
+                        .filter(|value| *value != u64::MAX);
+                    let (status, written) =
+                        crate::writable_fs::write(file_id, explicit, &payload[..len]);
+                    information = written as u64;
+                    status
                 } else {
                     match self.npfs_write_file_id_for(fh) {
                         Err(handle_status) => handle_status,
@@ -10679,6 +10838,36 @@ impl ExecNtHandler {
                             }
                         }
                     }
+                } else if let Some(file_id) = self.overlay_file_id_for(fh) {
+                    // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
+                    self.writable_fs_dirty = true;
+                    let mut explicit = None;
+                    let mut bad_offset = false;
+                    if byte_offset != 0 {
+                        let mut offset_bytes = [0u8; 8];
+                        if self.xas_read(byte_offset, &mut offset_bytes) {
+                            let value = u64::from_le_bytes(offset_bytes);
+                            if value != u64::MAX {
+                                explicit = Some(value);
+                            }
+                        } else {
+                            bad_offset = true;
+                        }
+                    }
+                    if bad_offset {
+                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                    } else {
+                        let (status, bytes) = crate::writable_fs::read(file_id, explicit, len);
+                        if status == nt_fs::STATUS_SUCCESS
+                            && !bytes.is_empty()
+                            && !self.xas_try_write_buf(buffer, &bytes)
+                        {
+                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                        } else {
+                            information = bytes.len() as u64;
+                            status
+                        }
+                    }
                 } else if self.boot_status_handle_access(fh).is_ok() {
                     match self.boot_status_read_file(fh, buffer, len, byte_offset) {
                         Ok(read) => {
@@ -10903,6 +11092,24 @@ impl ExecNtHandler {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
                 let mut information = 0u64;
+                // ★ THE WRITABLE FILESYSTEM OVERLAY owns its own file objects' information classes
+                // (position / end-of-file / disposition / basic). Checked first so an overlay handle
+                // never falls into the pipe-only classes below.
+                if let Some(file_id) = self.overlay_file_id_for(args[0]) {
+                    self.writable_fs_dirty = true;
+                    let status = if !payload_ok {
+                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                    } else {
+                        crate::writable_fs::set_information(
+                            file_id,
+                            information_class,
+                            &payload[..payload_len],
+                        )
+                    };
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return status;
+                }
                 let status = match information_class {
                     23 => {
                         let file_id = self.npfs_file_id_for(args[0]);
@@ -11010,6 +11217,11 @@ impl ExecNtHandler {
                         Ok(()) => nt_fs::STATUS_SUCCESS,
                         Err(status) => status,
                     }
+                } else if self.overlay_file_id_for(handle).is_some() {
+                    // The writable volume is coherent by construction (RAM-backed) — a flush has
+                    // nothing to push. When the backing becomes FAT write-through this is the seam
+                    // that has to push it.
+                    nt_fs::STATUS_SUCCESS
                 } else {
                     match self.npfs_flush_file_id_for(handle) {
                         Err(handle_status) => handle_status,
@@ -11187,6 +11399,52 @@ impl ExecNtHandler {
                     }
                     n
                 };
+                // ★ THE WRITABLE FILESYSTEM OVERLAY (see the same route in NtCreateFile). An open
+                // inside a declared writable mount prefix is served by the writable volume — never
+                // by the read-only FAT reader or the DLL/System32 existence fakes below, which is
+                // why this is placed BEFORE all of them. `NtOpenFile` is `NtCreateFile` with
+                // disposition FILE_OPEN, so a missing path misses honestly.
+                if let Some(relative) = crate::writable_fs::writable_path(&name16) {
+                    self.writable_fs_dirty = true;
+                    let (mut status, file_id, information) = crate::writable_fs::create(
+                        &relative,
+                        args[1] as u32,                      // DesiredAccess (RDX)
+                        0,                                   // FileAttributes: N/A to an open
+                        smss_stack_read(sp + 0x28) as u32,   // ShareAccess
+                        nt_fs::FILE_OPEN,
+                        smss_stack_read(sp + 0x30) as u32,   // OpenOptions
+                    );
+                    let mut opened_handle = 0u64;
+                    if let Some(file_id) = file_id {
+                        match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                            Some(handle) => {
+                                opened_handle = handle;
+                                self.queue_write(get_recv_mr(9), handle);
+                            }
+                            None => status = 0xC000_009A, // STATUS_INSUFFICIENT_RESOURCES
+                        }
+                    }
+                    let iosb = get_recv_mr(8);
+                    if iosb != 0 {
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        let info = if status == nt_fs::STATUS_SUCCESS {
+                            information
+                        } else {
+                            0
+                        };
+                        self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        status,
+                        None,
+                        0,
+                        opened_handle,
+                        &nb[..nlen],
+                    );
+                    return status;
+                }
                 // Classify SxS/activation-context paths without admitting them to image loading.
                 let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")

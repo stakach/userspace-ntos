@@ -26,8 +26,8 @@ pub use fat_directory::*;
 pub use fs::{CreateResult, FileSystem, MemFs, StandardInformation, INVALID_HANDLE};
 pub use hive_provider::NtFileHiveIoProvider;
 pub use path::{
-    is_named_pipe_path, normalize_separators, nt_path_to_volume_relative, MountManager,
-    MEMFS_VOLUME,
+    is_named_pipe_path, is_under_prefix, normalize_separators, nt_path_to_volume_relative,
+    writable_mount_relative, MountManager, MEMFS_VOLUME,
 };
 pub use query::*;
 pub use status::*;

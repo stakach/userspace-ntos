@@ -356,3 +356,162 @@ fn cache_manager_over_memfs_file() {
         assert_eq!((n, &buf[..]), (20, &b"cached through memfs"[..]));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The WRITABLE OVERLAY seam (spec §13.4): a general "writable mount at prefix P"
+// namespace test, plus the volume operations a real writable file system owes a
+// caller — directory create, write, read back, enumerate, set-information, delete.
+// ---------------------------------------------------------------------------
+
+fn wide(s: &str) -> alloc::vec::Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+#[test]
+fn writable_mount_covers_a_prefix_subtree_only() {
+    const PREFIXES: &[&[u8]] = &[b"profiles"];
+    // At the prefix, and under it at any depth.
+    assert_eq!(
+        writable_mount_relative(&wide(r"\??\C:\Profiles"), b"reactos", PREFIXES).as_deref(),
+        Some(&b"profiles"[..])
+    );
+    assert_eq!(
+        writable_mount_relative(&wide(r"\??\C:\Profiles\Administrator\ntuser.dat"), b"reactos", PREFIXES)
+            .as_deref(),
+        Some(&b"profiles\\administrator\\ntuser.dat"[..])
+    );
+    // The DosDevices and bare-drive spellings resolve to the same relative path.
+    assert_eq!(
+        writable_mount_relative(&wide(r"\DosDevices\C:\PROFILES\x"), b"reactos", PREFIXES).as_deref(),
+        Some(&b"profiles\\x"[..])
+    );
+    // OUTSIDE the prefix: the read-only namespace keeps them.
+    assert!(writable_mount_relative(&wide(r"\??\C:\Windows\system.ini"), b"reactos", PREFIXES).is_none());
+    assert!(writable_mount_relative(&wide(r"\SystemRoot\system32\ntdll.dll"), b"reactos", PREFIXES).is_none());
+    // Component-wise: a longer sibling name is NOT under the prefix.
+    assert!(writable_mount_relative(&wide(r"\??\C:\Profiles2\x"), b"reactos", PREFIXES).is_none());
+    // Escapes are still rejected by the shared canonicaliser.
+    assert!(writable_mount_relative(&wide(r"\??\C:\Profiles\..\Windows"), b"reactos", PREFIXES).is_none());
+}
+
+#[test]
+fn writable_volume_creates_writes_reads_and_enumerates() {
+    let mut fs = FileSystem::new(MemFs::new());
+    // CreateDirectoryW's syscall: FILE_CREATE + FILE_DIRECTORY_FILE.
+    let dir = fs.zw_create_file(
+        r"\??\C:\profiles",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!((dir.status, dir.information), (STATUS_SUCCESS, FILE_CREATED));
+    // A second CreateDirectoryW on the same name collides (ERROR_ALREADY_EXISTS).
+    let again = fs.zw_create_file(
+        r"\??\C:\profiles",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(again.status, STATUS_OBJECT_NAME_COLLISION);
+    // A file inside it: create, write, read back at an explicit offset.
+    let file = fs.zw_create_file(
+        r"\??\C:\profiles\ntuser.dat",
+        FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!((file.status, file.information), (STATUS_SUCCESS, FILE_CREATED));
+    assert_eq!(fs.zw_write_file(file.handle, None, b"regf"), (STATUS_SUCCESS, 4));
+    assert_eq!(fs.current_offset(file.handle), Some(4));
+    let (status, bytes) = fs.zw_read_file(file.handle, Some(0), 16);
+    assert_eq!((status, &bytes[..]), (STATUS_SUCCESS, &b"regf"[..]));
+    let info = fs.zw_query_standard_information(file.handle).unwrap();
+    assert_eq!((info.end_of_file, info.is_directory), (4, false));
+    assert_eq!(info.attributes, FILE_ATTRIBUTE_HIDDEN);
+    fs.zw_close(file.handle);
+
+    // Enumerate the directory: `.`, `..`, then the child, through the native encoder.
+    let mut out = [0u8; 512];
+    let r = fs.zw_query_directory_file(dir.handle, FILE_DIRECTORY_INFORMATION, false, None, false, &mut out);
+    assert_eq!(r.status, STATUS_SUCCESS);
+    let mut names = alloc::vec::Vec::new();
+    let mut off = 0usize;
+    loop {
+        let next = u32::from_le_bytes(out[off..off + 4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(out[off + 60..off + 64].try_into().unwrap()) as usize;
+        let name: alloc::string::String = out[off + 64..off + 64 + name_len]
+            .chunks(2)
+            .map(|c| char::from(c[0]))
+            .collect();
+        names.push(name);
+        if next == 0 {
+            break;
+        }
+        off += next;
+    }
+    assert_eq!(names, ["." , "..", "ntuser.dat"]);
+    // A second call with no restart is at the end of the scan.
+    let more = fs.zw_query_directory_file(dir.handle, FILE_DIRECTORY_INFORMATION, false, None, false, &mut out);
+    assert_eq!(more.status, STATUS_NO_MORE_FILES);
+    // RestartScan rewinds it.
+    let restart = fs.zw_query_directory_file(dir.handle, FILE_DIRECTORY_INFORMATION, false, None, true, &mut out);
+    assert_eq!(restart.status, STATUS_SUCCESS);
+}
+
+#[test]
+fn writable_volume_set_information_and_delete() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles"));
+    let f = fs.zw_create_file(r"\??\C:\profiles\a.txt", FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0);
+    assert_eq!(fs.zw_write_file(f.handle, None, b"0123456789"), (STATUS_SUCCESS, 10));
+    // FileEndOfFileInformation truncates.
+    assert_eq!(
+        fs.zw_set_information_file(f.handle, FILE_END_OF_FILE_INFORMATION, &4u64.to_le_bytes()),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.zw_query_standard_information(f.handle).unwrap().end_of_file, 4);
+    // FilePositionInformation moves the file object's offset.
+    assert_eq!(
+        fs.zw_set_information_file(f.handle, FILE_POSITION_INFORMATION, &2u64.to_le_bytes()),
+        STATUS_SUCCESS
+    );
+    assert_eq!(fs.current_offset(f.handle), Some(2));
+    let (_, tail) = fs.zw_read_file(f.handle, None, 8);
+    assert_eq!(&tail[..], b"23");
+    // An unhandled class is reported honestly, not silently succeeded.
+    assert_eq!(
+        fs.zw_set_information_file(f.handle, FILE_RENAME_INFORMATION, &[0u8; 24]),
+        STATUS_NOT_IMPLEMENTED
+    );
+    // FileDispositionInformation deletes at close.
+    assert_eq!(
+        fs.zw_set_information_file(f.handle, FILE_DISPOSITION_INFORMATION, &[1u8]),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(f.handle);
+    assert!(fs.query_attributes(r"\??\C:\profiles\a.txt").is_none());
+    // The directory itself survived, and is still a directory.
+    let d = fs.query_attributes(r"\??\C:\profiles").unwrap();
+    assert!(d.is_directory && d.attributes & FILE_ATTRIBUTE_DIRECTORY != 0);
+}
+
+#[test]
+fn writable_volume_rejects_a_create_whose_parent_is_missing() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let r = fs.zw_create_file(
+        r"\??\C:\profiles\Administrator",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(r.status, STATUS_OBJECT_PATH_NOT_FOUND);
+    assert_eq!(r.handle, INVALID_HANDLE);
+}
