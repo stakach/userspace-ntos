@@ -1,9 +1,11 @@
 # Component-Dispatch Transport Migration — hand-rolled Send/Recv → seL4 `Call` + MCS reply objects
 
-**Status:** **Phases 0, 1 and 2 DONE** (gate **231/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
-`0x003a6ea5`). **There is now exactly ONE dispatch transport: seL4 `Call` ⇄ MCS reply objects, on
-BOTH substrates.** Phases 3-4 remain. Baseline `1141349` → Phase 0 `d287c48` → Phase 1 `01d0423` →
-Phase 2.
+**Status:** **Phases 0-3 DONE** (gate **232/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
+`0x003a6ea5`). **There is now exactly ONE dispatch transport — seL4 `Call` ⇄ MCS reply objects, on
+BOTH substrates — and exactly ONE reply mechanism anywhere in the executive: `Cap::Reply`.** The
+34-item kill-list is EXHAUSTED (§7); the legacy per-TCB `reply_to` reply is retired.
+Baseline `1141349` → Phase 0 `d287c48` → Phase 1 `01d0423` → Phase 2 `cc46342` → Phase 3a `e49e8b0`
+→ Phase 3b.
 
 > ### ★ WHAT THE PLAN GOT WRONG — corrections 1-3 found in Phase 1, 4-6 in Phase 2
 >
@@ -659,16 +661,62 @@ executive's answer could block — the two properties the whole migration buys.
 
 ---
 
-### Phase 3 — DELETE the hand-rolled machinery
+### Phase 3 — DELETE the hand-rolled machinery — **DONE** (two commits)
 
-Pure deletion + spec cleanup (see §7 for the kill-list). Nothing new is written except the two
-replacement specs already landed in Phases 1–2.
+Landed in two commits so the one TIMING change in the batch is independently attributable and
+independently revertable.
 
-**Must stay green:** the whole gate, unchanged count, PASS-list `diff`-identical to Phase 2 modulo
-the removed/renamed spec names. Three consecutive foreground boots with identical PASS lists
-(the established verification bar).
+#### 3a (`e49e8b0`) — retire the legacy `reply_to` reply
 
-**Rollback:** the Phase-2 commit.
+Phase 2 kept it deliberately (see the reasoning at the end of Phase 2). Phase 3 took it, alone:
+
+* `main.rs::reply_recv_badge` — the main service loop's ONE-syscall `SYS_REPLY_RECV`, whose reply
+  half targets `current.reply_to` — becomes `client_reply_on` + `recv_full_r12` on the object the
+  kernel BOUND to this caller. A pre-retype fallback (cptr 0, the demo/no-ntdll path, where the
+  reply objects do not exist yet) keeps the legacy syscall; nothing on the live boot reaches it.
+* The main loop's four-way reply fork COLLAPSES. `routed_win32k`, `routed_lpc`, `routed_csr` and
+  `spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO` are DELETED — all four existed only to ask "has
+  a component `Call` re-pointed `reply_to` since this caller's recv?", and the answer no longer
+  matters because no reply reads `reply_to`.
+* New spec **`exec_client_reply_bound`** (231 → 232/99): `CLIENT_REPLY_BOUND` client replies through
+  a bound reply object with `CLIENT_REPLY_ERRORS == 0`, plus the same unbound-reply negative control
+  (label **2**, non-blocking) that makes a 0 label non-vacuous.
+
+**★ THE TIMING QUESTION, ANSWERED WITH DATA.** The stated worry was that turning one `SysReplyRecv`
+into two syscalls on the hottest path in the boot would perturb timing enough to lose the paint (as
+`1141349` once did). It does not. Boot wall-clock, same host, same image pipeline:
+
+| build | boots | wall time |
+|---|---|---|
+| baseline `cc46342` (legacy reply live) | 1 | **299 s** |
+| Phase 3a (legacy reply retired) | 3 | **297 s / 311 s / 304 s** |
+
+Within run-to-run noise, and every counter is bit-identical across boots (9281 bound client replies
+on 3a, 9619 after 3b folds the remaining sites in; IRP 71/71; win32k 2557/2557; nesting high-water
+5). The legacy path is KEPT ONLY as the pre-retype fallback; it is not reachable on the live boot.
+
+#### 3b — fold `send_on_reply` into `reply_on`, and the prose sweep
+
+* Kill-list item 3, the last of the 34. All **36** `send_on_reply` call sites (22 in `rendezvous.rs`,
+  6 in `service_sec_image.rs`, 8 in `main.rs`) now go through `client_reply_on`, the error-counting
+  wrapper over the error-RETURNING `reply_on`. The `SYS_SEND` form — which *silently swallowed*
+  every invocation error — is deleted. Net: the executive has exactly ONE reply primitive
+  (`reply_on`) with exactly two bookkeeping wrappers, `client_reply_on` (clients) and
+  `pump_reply_on` (components), each backed by its own must-be-zero error counter.
+* All 36 sites reply with message **label 0** (the `msginfo` argument carries a length only), so
+  correction 1 does not bite; long (len-18) replies are unaffected because `decode_reply` re-stages
+  the length from `args.a1` itself and reads MR4+ from the invoker's IPC buffer exactly as the
+  `SYS_SEND` form did.
+* Prose sweep: `docs/component-harness.md` §7 and the `reply_to` narration in `main.rs` /
+  `spawn_hosts.rs` / `service_sec_image.rs` now describe the retired planes in the past tense.
+  **`reply_recv_full` and `ep_recv_full` are NOT deleted** (risk R11): the hosted-thread fault loops
+  (`main.rs:7749/7916/7982`) and `driver-host-ntdll` still use them.
+
+**Verified:** three consecutive foreground boots each for 3a and 3b — ALL RUNEXIT=3, `microtest
+sentinel`, **ZERO FAILs**, gate **232/99**, `diff`-identical PASS lists, paint **768/768 @
+`0x003a6ea5`**. Host tests unchanged: nt-ntdll 694, nt-process 79, nt-io-manager 86, nt-syscall 42.
+
+**Rollback:** the Phase-2 commit (or just 3a's, which is self-contained).
 
 ---
 
@@ -716,16 +764,39 @@ becomes its own follow-up batch — Phases 0–3 stand on their own merits.
 
 ## 7. Kill-list — what gets deleted (the checkable outcome)
 
-**34 items.** After Phase 3, `grep` for each of these must return **zero** hits outside this document.
-**Items 1-2, 4-33 are ALREADY DELETED (Phases 1-2)**; item 3 (`send_on_reply`) and the legacy
-`reply_to` reply are what Phase 3 still owes. A few *comments* in unrelated files still narrate the
-retired planes — prose, not code.
+**34 items — ALL DELETED.** Grep-verified at the end of Phase 3 over `components/**/*.rs`: every
+one of the 34 names has **zero CODE hits**. What remains is prose only — 18 mentions across 6 files,
+each a comment or doc-comment explaining what the symbol *was* and what replaced it, deliberately
+retained as the record of why the current shape is what it is. Verification recipe (re-runnable):
+
+```sh
+for s in ep_send ep_send_token send_on_reply send_done_on recv_req_on SH_REQ_SEQ \
+         PUMP_STALE_DONES PUMP_SLIP_INJECT FSD_DISPATCH_SEQ_HANDSHAKE DISPATCH_TOKEN_NEXT \
+         DISPATCH_TOKEN_STACK_MAX DISPATCH_TOKEN_STACK DISPATCH_TOKEN_DEPTH DISPATCH_TOKEN_MAX_DEPTH \
+         PUMP_TOKEN_MISMATCHES dispatch_token_push dispatch_token_top dispatch_token_pop \
+         dispatch_token_depth suspended_dispatch_token owns_token_stack_top W32_SLIP_INJECT \
+         W32_SLIP_INJECT_TOKEN W32_DISPATCH_TOKEN_BINDING nested_reply_cap use_reply_cap wake_first \
+         Transport exec_component_dispatch_in_phase exec_win32k_dispatch_in_phase_nested \
+         NESTED_SLIP_REJECTED COMPONENT_CALL_CLOBBERED_REPLY_TO; do
+  printf '%-38s code=%s\n' "$s" \
+    "$(grep -rn --include='*.rs' "\b$s\b" components/ | grep -v ':[[:space:]]*//' | wc -l)"
+done
+```
+
+**Two symbols the kill-list must NOT touch** (risk R11), re-verified: `reply_recv_full` (3 live call
+sites in `main.rs`'s hosted-thread fault loops + `driver-host-ntdll`) and `ep_recv_full`. They are
+not part of the dispatch transport.
+
+**One item was ADDED to the list during Phase 3** and is also deleted: the Phase-1
+`COMPONENT_CALL_CLOBBERED_REPLY_TO` guard, together with `routed_win32k` / `routed_lpc` /
+`routed_csr`. Those were the *workaround for the workaround* — the shape correction 2 warned would
+otherwise keep widening.
 
 ### Executive IPC helpers (`components/ntos-executive/src/main.rs`)
 1. `ep_send` (3855)
 2. `ep_send_token` (3871)
-3. `send_on_reply` (3995) — *renamed/replaced by* `reply_on` (error-returning). Delete the
-   error-swallowing form.
+3. `send_on_reply` (3995) — *replaced by* `reply_on` (error-returning) + its counting wrapper
+   `client_reply_on`. The error-swallowing `SYS_SEND` form is deleted; all 36 call sites moved.
 
 ### Component IPC helpers (`components/ntos-executive/src/driver_launch.rs`)
 4. `send_done_on` (1563)

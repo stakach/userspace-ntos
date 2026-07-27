@@ -535,7 +535,7 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(15, 0);
             set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
-            send_on_reply(reply, 18, 0, 0, 0, SM_RECV_RDX.load(Ordering::Relaxed));
+            client_reply_on(reply, 18, 0, 0, 0, SM_RECV_RDX.load(Ordering::Relaxed));
             recv_full_r12(ep, reply)
         } else {
             recv_full_r12(ep, reply)
@@ -581,7 +581,7 @@ pub(crate) unsafe fn sm_rendezvous(
                 print_str(b"\n");
                 break;
             }
-            send_on_reply(reply, 0, 0, 0, 0, 0);
+            client_reply_on(reply, 0, 0, 0, 0, 0);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
             mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
             continue;
@@ -592,7 +592,7 @@ pub(crate) unsafe fn sm_rendezvous(
             let fip = m0;
             if let Some(p) = ntdll_pe {
                 if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
-                    send_on_reply(reply, 3, fip + 3, m1, m2, 0);
+                    client_reply_on(reply, 3, fip + 3, m1, m2, 0);
                     let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
@@ -808,7 +808,7 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            send_on_reply(reply, 18, result, 0, 0, rdx);
+            client_reply_on(reply, 18, result, 0, 0, rdx);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
             mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
             continue;
@@ -913,7 +913,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     set_reply_mr(15, 0);
     set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
     set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
-    send_on_reply(reply, 18, 0, 0, 0, 0);
+    client_reply_on(reply, 18, 0, 0, 0, 0);
 
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
@@ -945,7 +945,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                     print_str(b"[sm-api] unresolved worker fault\n");
                     return false;
                 }
-                send_on_reply(reply, 0, 0, 0, 0, 0);
+                client_reply_on(reply, 0, 0, 0, 0, 0);
             }
             3 => {
                 let Some(pe) = ntdll_pe else { return false };
@@ -955,7 +955,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 {
                     return false;
                 }
-                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+                client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
             }
             2 => {
                 let ssn = m0;
@@ -1129,7 +1129,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 set_reply_mr(15, 0);
                 set_reply_mr(16, sp);
                 set_reply_mr(17, flags);
-                send_on_reply(reply, 18, result, 0, 0, rdx);
+                client_reply_on(reply, 18, result, 0, 0, rdx);
             }
             _ => return false,
         }
@@ -1269,7 +1269,7 @@ pub(crate) unsafe fn csr_sb_startup(
                     print_str(b"[csr-sb] unresolved startup fault\n");
                     return false;
                 }
-                send_on_reply(reply, 0, 0, 0, 0, 0);
+                client_reply_on(reply, 0, 0, 0, 0, 0);
             }
             3 => {
                 let Some(pe) = ntdll_pe else { return false };
@@ -1279,7 +1279,7 @@ pub(crate) unsafe fn csr_sb_startup(
                 {
                     return false;
                 }
-                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+                client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
             }
             2 if m0 == SSN_REPLY_WAIT_RECV => {
                 CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
@@ -2395,7 +2395,7 @@ unsafe fn csr_sb_accept_connection(
     set_reply_mr(15, 0);
     set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
     set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
-    send_on_reply(
+    client_reply_on(
         reply,
         18,
         0,
@@ -2434,7 +2434,7 @@ unsafe fn csr_sb_accept_connection(
                 {
                     return 0;
                 }
-                send_on_reply(reply, 0, 0, 0, 0, 0);
+                client_reply_on(reply, 0, 0, 0, 0, 0);
             }
             3 => {
                 let Some(pe) = ntdll_pe else { return 0 };
@@ -2444,7 +2444,7 @@ unsafe fn csr_sb_accept_connection(
                 {
                     return 0;
                 }
-                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+                client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
             }
             2 => {
                 let ssn = m0;
@@ -2487,7 +2487,7 @@ unsafe fn csr_sb_accept_connection(
                 set_reply_mr(15, 0);
                 set_reply_mr(16, sp);
                 set_reply_mr(17, flags);
-                send_on_reply(reply, 18, 0, 0, 0, rdx);
+                client_reply_on(reply, 18, 0, 0, 0, rdx);
             }
             _ => return 0,
         }
@@ -2596,7 +2596,7 @@ unsafe fn csr_sb_api_request_rendezvous(
     set_reply_mr(15, 0);
     set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
     set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
-    send_on_reply(reply, 18, 0, 0, 0, 0);
+    client_reply_on(reply, 18, 0, 0, 0, 0);
 
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
@@ -2628,7 +2628,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                     print_str(b"[csr-sb-api] unresolved worker fault\n");
                     return false;
                 }
-                send_on_reply(reply, 0, 0, 0, 0, 0);
+                client_reply_on(reply, 0, 0, 0, 0, 0);
             }
             3 => {
                 let Some(pe) = ntdll_pe else { return false };
@@ -2638,7 +2638,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                 {
                     return false;
                 }
-                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+                client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
             }
             2 => {
                 let ssn = m0;
@@ -2787,7 +2787,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                 set_reply_mr(15, 0);
                 set_reply_mr(16, sp);
                 set_reply_mr(17, flags);
-                send_on_reply(reply, 18, result, 0, 0, rdx);
+                client_reply_on(reply, 18, result, 0, 0, rdx);
             }
             _ => return false,
         }
@@ -2869,7 +2869,7 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(15, 0);
             set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
-            send_on_reply(
+            client_reply_on(
                 reply,
                 18,
                 0,
@@ -2923,7 +2923,7 @@ pub(crate) unsafe fn csr_rendezvous(
                 print_str(b"\n");
                 break;
             }
-            send_on_reply(reply, 0, 0, 0, 0, 0);
+            client_reply_on(reply, 0, 0, 0, 0, 0);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
             mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
             continue;
@@ -2932,7 +2932,7 @@ pub(crate) unsafe fn csr_rendezvous(
             let fip = m0;
             if let Some(p) = ntdll_pe {
                 if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
-                    send_on_reply(reply, 3, fip + 3, m1, m2, 0);
+                    client_reply_on(reply, 3, fip + 3, m1, m2, 0);
                     let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
@@ -3085,7 +3085,7 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            send_on_reply(reply, 18, result, 0, 0, rdx);
+            client_reply_on(reply, 18, result, 0, 0, rdx);
             if done {
                 break;
             }

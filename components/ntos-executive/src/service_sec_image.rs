@@ -2460,7 +2460,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    send_on_reply(reply_main, 0, 0, 0, 0, 0);
+                    client_reply_on(reply_main, 0, 0, 0, 0, 0);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                     badge = nb;
                     mi = nmi;
@@ -4526,7 +4526,7 @@ pub(crate) unsafe fn service_sec_image(
                 // GUI client. Forward it to the parked win32k component through the persistent dispatch
                 // loop; the handler runs in win32k's OWN context (GS=KPCR / session heap). Both clients
                 // are serviced ONE AT A TIME by the main loop (FIFO recv), each bound to REPLY_MAIN at
-                // its recv, so the routed reply (send_on_reply(REPLY_MAIN)) resumes exactly this caller
+                // its recv, so the reply (client_reply_on(REPLY_MAIN)) resumes exactly this caller
                 // — csrss and winlogon never orphan each other. Scalar + handle args ride the registers
                 // exactly as the native x64 syscall passed them (arg1=R10, arg2=RDX, arg3=R8, arg4=R9);
                 // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap/image
@@ -9473,7 +9473,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     set_reply_mr(15, waiter.resume_ip);
     set_reply_mr(16, waiter.resume_sp);
     set_reply_mr(17, waiter.resume_flags);
-    send_on_reply(
+    client_reply_on(
         waiter.reply_cap,
         18,
         if copied { 0 } else { 0xC000_0005 },
@@ -9574,7 +9574,7 @@ unsafe fn lsa_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) {
     set_reply_mr(15, ip);
     set_reply_mr(16, sp);
     set_reply_mr(17, flags);
-    send_on_reply(cap, 18, status, 0, 0, 0);
+    client_reply_on(cap, 18, status, 0, 0, 0);
     release_reply_pool_cap(cap);
 }
 
@@ -10091,7 +10091,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             set_reply_mr(15, w.resume_ip);
             set_reply_mr(16, w.resume_sp);
             set_reply_mr(17, w.resume_flags);
-            send_on_reply(cap, 18, status as u64, 0, 0, 0);
+            client_reply_on(cap, 18, status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
         }
         nt_handler.release_file_reference(w.file_id);

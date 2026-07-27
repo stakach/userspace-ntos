@@ -1362,7 +1362,7 @@ pub(crate) fn fsd_reply_slot(i: usize) -> u64 {
 /// loop keeps receiving other callers, we can't re-use the single REPLY_MAIN reply object for the
 /// next recv (that would rebind + orphan the parked caller), so the loop STEALS the reply object that
 /// received this caller into a waiter slot and rotates REPLY_MAIN_SLOT to a fresh POOL object for
-/// subsequent recvs. On `NtSetEvent(that event)` the loop does `send_on_reply(stolen_cap, WAIT_0)` to
+/// subsequent recvs. On `NtSetEvent(that event)` the loop does `client_reply_on(stolen_cap, WAIT_0)` to
 /// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
 const WAIT_REPLY_POOL_N: usize = 16;
@@ -3985,39 +3985,28 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
     (badge, msginfo, mr0, mr1, mr2, mr3)
 }
 
-/// Reply to a Call/fault via a `seL4_Send` on a `Cap::Reply` (kernel `decode_reply`): resume the
-/// reply object's bound caller, applying `apply_fault_reply` when the caller is blocked on a fault
-/// (the win32k/csrss demand-page + syscall replies are all fault replies). MR0..3 ride in
-/// r10/r8/r9/r15; MR4+ come from the IPC buffer (`set_reply_mr`). Used instead of SYS_REPLY_RECV so
-/// the reply targets the bound caller, NOT the (possibly clobbered) legacy `reply_to`.
-unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") reply_cptr,
-        in("rsi") msginfo,
-        in("r10") r0, in("r8") r1, in("r9") r2, in("r15") r3,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// ★ The ERROR-RETURNING reply on a `Cap::Reply` — the successor of [`send_on_reply`] and the
-/// executive's half of the `Call`/reply-object component-dispatch transport
-/// (`docs/transport-migration.md` §3.5).
+/// ★ THE reply primitive: resume a `Cap::Reply` object's BOUND caller (kernel `decode_reply`),
+/// applying `apply_fault_reply` when that caller is blocked on a fault (the win32k/csrss demand-page
+/// and syscall replies are all fault replies) and a full message transfer otherwise. MR0..3 ride in
+/// r10/r8/r9/r15; MR4+ come from the IPC buffer (`set_reply_mr`).
 ///
-/// Identical register layout to [`send_on_reply`], but issued as **`SYS_CALL`** so the kernel's
-/// non-endpoint invocation arm (`syscall_handler.rs` `handle_send`'s `other =>` →
-/// `decode_invocation` → `invocation.rs::decode_reply`) writes the invocation's error label into
-/// `rsi`. `tasks/lessons.md`: *"seL4 SYS_SEND invocations HIDE ALL errors — use SYS_CALL when a
-/// failure would be silent."* Replying to an UNBOUND reply object is exactly such a failure: it
-/// means we believed a component was blocked in a Call when it was not, i.e. an invariant break.
-/// This form returns `seL4_InvalidCapability` (6) for it instead of vanishing.
+/// It NEVER blocks: `decode_reply` either wakes `replies[idx].bound_tcb` or fails immediately. That
+/// non-blocking property is the whole point of the migration — it is what replaced the executive's
+/// blocking wake `Send` (`docs/transport-migration.md` defect 3).
 ///
-/// It NEVER blocks: `decode_reply` either wakes the reply object's bound caller (applying
-/// `fault::apply_fault_reply` when that caller is fault-blocked, else a full message transfer) or
-/// fails immediately. That non-blocking property is the whole point — it is what replaces the
-/// executive's blocking wake `Send`.
+/// Issued as **`SYS_CALL`**, not `SYS_SEND`, so the kernel's non-endpoint invocation arm
+/// (`syscall_handler.rs` `handle_send`'s `other =>` → `decode_invocation` →
+/// `invocation.rs::decode_reply`) writes the invocation's error label into `rsi` and this function
+/// can RETURN it. `tasks/lessons.md`: *"seL4 SYS_SEND invocations HIDE ALL errors — use SYS_CALL
+/// when a failure would be silent."* Replying to an UNBOUND reply object is exactly such a failure:
+/// it means we believed a thread was blocked awaiting this reply when it was not, i.e. an invariant
+/// break. This form returns `seL4_InvalidCapability` (**2**, `rust-micro/src/types.rs`) for it
+/// instead of vanishing. `SYS_SEND`'s error-swallowing predecessor (`send_on_reply`) is DELETED —
+/// kill-list item 3, the last of the 34.
+///
+/// Two wrappers add the bookkeeping their plane needs: [`client_reply_on`] (hosted clients) and
+/// `spawn_hosts::pump_reply_on` (components). Nothing else calls this directly except the
+/// deliberately-unbound negative-control probe in the gate.
 unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
@@ -4258,7 +4247,7 @@ unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) 
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);
-        send_on_reply(waiter.reply_cap, 18, 0, 0, 0, 0);
+        client_reply_on(waiter.reply_cap, 18, 0, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
         woken += 1;
         let wake_number = DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -4289,7 +4278,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);
-        send_on_reply(
+        client_reply_on(
             waiter.reply_cap,
             18,
             nt_io_completion::STATUS_TIMEOUT as u64,
@@ -4529,9 +4518,9 @@ unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool 
             set_reply_mr(15, block.resume_ip);
             set_reply_mr(16, block.resume_sp);
             set_reply_mr(17, block.resume_flags);
-            send_on_reply(block.reply_cap, 18, block.resume_status, 0, 0, 0);
+            client_reply_on(block.reply_cap, 18, block.resume_status, 0, 0, 0);
         }
-        DBGK_BLOCK_USER_EXCEPTION => send_on_reply(
+        DBGK_BLOCK_USER_EXCEPTION => client_reply_on(
             block.reply_cap,
             3,
             block.resume_ip,
@@ -4540,7 +4529,7 @@ unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool 
             0,
         ),
         // VMFault / DebugException: restart with no register transfer.
-        _ => send_on_reply(block.reply_cap, 0, 0, 0, 0, 0),
+        _ => client_reply_on(block.reply_cap, 0, 0, 0, 0, 0),
     }
     release_reply_pool_cap(block.reply_cap);
     DBGK_REPORTERS_RESUMED.fetch_add(1, Ordering::Relaxed);
@@ -4650,7 +4639,7 @@ unsafe fn keyed_wait_wake_one(key: u64, status: u64) -> bool {
         set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
         set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
         set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
-        send_on_reply(cap, 18, status, 0, 0, 0);
+        client_reply_on(cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(cap);
         keyed_wait_clear_slot(slot);
         KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -4710,7 +4699,7 @@ unsafe fn keyed_wait_wake_due() -> u64 {
             set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
             set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
             set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
-            send_on_reply(cap, 18, 0x102, 0, 0, 0);
+            client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
             woken += 1;
         }
@@ -5076,7 +5065,7 @@ unsafe fn wait_wake_dispatcher(
             set_reply_mr(15, WAITER_RESUME_IP[i].load(Ordering::Relaxed));
             set_reply_mr(16, WAITER_RESUME_SP[i].load(Ordering::Relaxed));
             set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
-            send_on_reply(cap, 18, wake_index, 0, 0, 0);
+            client_reply_on(cap, 18, wake_index, 0, 0, 0);
             // Return this reply object to the pool (clear its used bit).
             for p in 0..WAIT_REPLY_POOL_N {
                 if WAIT_REPLY_POOL[p].load(Ordering::Relaxed) == cap {
@@ -5111,7 +5100,7 @@ unsafe fn wait_wake_due() -> u64 {
             set_reply_mr(15, WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
             set_reply_mr(16, WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
             set_reply_mr(17, WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
-            send_on_reply(cap, 18, 0x102, 0, 0, 0);
+            client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
             woken += 1;
         }

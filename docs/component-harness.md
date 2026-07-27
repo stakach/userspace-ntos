@@ -13,9 +13,11 @@ consolidated final state is summarised in **§6** below.
 > §§1-6 describe the harness as designed, when the dispatch rendezvous was a hand-rolled
 > **Send/Recv pair** (`send_done_on`/`recv_req_on` + the executive's wake `ep_send`) with two
 > userspace correlation planes bolted on. That transport is **GONE**: both substrates now speak
-> seL4 `Call` ⇄ **MCS reply objects** (`docs/transport-migration.md` Phases 1-2), which deletes
+> seL4 `Call` ⇄ **MCS reply objects** (`docs/transport-migration.md` Phases 1-3), which deletes
 > `wake_first`, `nested_reply_cap`, the `SH_REQ_SEQ` handshake, the 32-deep dispatch-token stack and
-> the wake `Send` itself. Wherever §§1-6 name any of those, **§7 is authoritative**. The rest of the
+> the wake `Send` itself. Phase 3 finished the job on the CLIENT side too: the executive's legacy
+> per-TCB `reply_to` reply is retired, so `Cap::Reply` objects are now the executive's ONLY reply
+> mechanism on every plane. Wherever §§1-6 name any of those, **§7 is authoritative**. The rest of the
 > harness — one `component_main`, one `component_pump`, the `HostCaps` gates, the shared-frame
 > marshal — is unchanged and still the design of record.
 
@@ -612,7 +614,7 @@ milestone marker, spec PASS/FAIL line, and the `N/98 ... checks passed` gate sum
 
 ## 7. Transport correlation — binding a completion to the request that provoked it
 
-**★ SUPERSEDED (batch: `docs/transport-migration.md` Phases 1-2). Both substrates now speak seL4
+**★ SUPERSEDED (batch: `docs/transport-migration.md` Phases 1-3). Both substrates now speak seL4
 `Call` ⇄ MCS reply objects, and BOTH userspace correlation planes described below — the IRP
 substrate's `SH_REQ_SEQ` sequence handshake and the win32k substrate's per-dispatch token stack —
 are DELETED.** This section is kept as the record of WHY they existed and what replaced them.
@@ -650,8 +652,12 @@ Two notes that cost real debugging time:
   The component→executive direction is unaffected (it Calls an Endpoint cap).
 * **Every component `Call` writes `executive.reply_to = component`** (`finish_call` writes the
   RECEIVER's slot). A dispatch completion leaves the component blocked, so that clobber PERSISTS
-  past the pump — the main service loop must reply through the caller's BOUND reply object
-  (`spawn_hosts::COMPONENT_CALL_CLOBBERED_REPLY_TO`), not the legacy `reply_to`.
+  past the pump. Phase 1 dodged it with a `COMPONENT_CALL_CLOBBERED_REPLY_TO` flag that steered the
+  main service loop onto the caller's bound reply object when a component had spoken. **Phase 3
+  deleted the flag and the question**: `main.rs::reply_recv_badge` is now `client_reply_on` +
+  `recv_full_r12`, so EVERY client reply rides a bound reply object and a clobbered `reply_to` has
+  no consumer left to mislead (`exec_client_reply_bound`: 9281 bound client replies, 0 unbound
+  errors).
 
 ### 7.1 Nesting — why ONE reply object is enough at any depth
 
