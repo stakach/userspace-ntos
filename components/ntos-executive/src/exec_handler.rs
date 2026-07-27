@@ -9992,14 +9992,16 @@ impl ExecNtHandler {
                             // reaches `NtCreateNamedPipeFile(\samr)` — i.e. `SamIConnect` succeeds
                             // and samsrv publishes its own RPC endpoint. It is a REAL advance.
                             //
-                            // BUT the boot then spends its whole budget cycling that self-RPC and
-                            // never reaches winlogon's SAS window: the 45 s no-progress watchdog
-                            // quiesces first and the desktop paint is LOST (gate 211/99, 21 FAILs,
-                            // paint 0/768). No crash, no hang — a forward-progress/starvation
-                            // problem, not a correctness one. The paint is a hard safety invariant,
-                            // so this stays OFF until the starvation is addressed on its own batch.
-                            // Flip it to `true` to reproduce the advance exactly.
-                            const PIPE_FULL_DUPLEX_PARK: bool = false;
+                            // It was gated OFF for one batch on the reading that the boot then
+                            // "spends its whole budget cycling that self-RPC" and loses the desktop
+                            // paint to the 45 s no-progress watchdog. That reading was WRONG: the
+                            // budget was being eaten by an HPET interrupt storm in the executive's
+                            // own delay timer (2,745,189 deliveries that woke nothing in one boot),
+                            // which the self-RPC was merely the first thing to arm. See
+                            // `LSA_WORKER_ROUTE_ENABLED` and `exec_delay_timer_disarms`. With the
+                            // timer fixed the paint is deterministic (768/768 over six consecutive
+                            // boots) and this is ON.
+                            const PIPE_FULL_DUPLEX_PARK: bool = true;
                             let waiter_capacity = waiter_table.has_capacity()
                                 && !waiter_table.parked_on_dir(file_id, true)
                                 && (PIPE_FULL_DUPLEX_PARK
@@ -10315,9 +10317,8 @@ impl ExecNtHandler {
                             let waiter_table =
                                 unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
                             // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
-                            // pre-check, which carries the full rationale + measurements). Gated OFF
-                            // for the same reason, so this is the direction-blind check today.
-                            const PIPE_FULL_DUPLEX_PARK: bool = false;
+                            // pre-check, which carries the full rationale + measurements). ON.
+                            const PIPE_FULL_DUPLEX_PARK: bool = true;
                             let waiter_capacity = waiter_table.has_capacity()
                                 && !waiter_table.parked_on_dir(file_id, false)
                                 && (PIPE_FULL_DUPLEX_PARK

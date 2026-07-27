@@ -1,14 +1,17 @@
 # Component-Dispatch Transport Migration — hand-rolled Send/Recv → seL4 `Call` + MCS reply objects
 
-**Status:** **ALL PHASES (0-4) DONE** (gate **234/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
-`0x003a6ea5`). **There is now exactly ONE dispatch transport — seL4 `Call` ⇄ MCS reply objects, on
-BOTH substrates — and exactly ONE reply mechanism anywhere in the executive: `Cap::Reply`.** The
-34-item kill-list is EXHAUSTED (§7); the legacy per-TCB `reply_to` reply is retired.
+**Status:** **ALL PHASES (0-5) DONE** (gate **236/99 ZERO FAILs**, RUNEXIT=3, paint 768/768 @
+`0x003a6ea5`, **six consecutive boots**). **There is now exactly ONE dispatch transport — seL4
+`Call` ⇄ MCS reply objects, on BOTH substrates — and exactly ONE reply mechanism anywhere in the
+executive: `Cap::Reply`.** The 34-item kill-list is EXHAUSTED (§7); the legacy per-TCB `reply_to`
+reply is retired.
 Phase 4 CONFIRMED the migration's falsifiable prediction — the availability defect that gated the
-LSA worker route is structurally gone — and root-caused two further real defects; the route itself
-stays gated for a newly-isolated, different reason (§Phase 4).
+LSA worker route is structurally gone. **Phase 5 landed the route: `LSA_WORKER_ROUTE_ENABLED` and
+`PIPE_FULL_DUPLEX_PARK` are both ON permanently**, after root-causing the last thing that kept them
+off, which turned out to be neither scheduling nor the RPC but an **HPET interrupt storm in the
+executive's own delay timer** (§Phase 5).
 Baseline `1141349` → Phase 0 `d287c48` → Phase 1 `01d0423` → Phase 2 `cc46342` → Phase 3a `e49e8b0`
-→ Phase 3b `c587b8f` → Phase 4.
+→ Phase 3b `c587b8f` → Phase 4 `fae8bdc` → Phase 5.
 
 > ### ★ WHAT THE PLAN GOT WRONG — corrections 1-3 found in Phase 1, 4-6 in Phase 2
 >
@@ -822,6 +825,139 @@ i.e. nothing was fabricated — while `exec_lsa_rpc_handoff_reaches_new_client` 
 ASKED for the worker, so the route decision is ours and not a failure to get there. Either way it
 asserts the transport invariants: **0** pump walls, **0** reply errors, **0** pipe-waiter refusals,
 and every absorbed bound-notification tick accounted for.
+
+---
+
+### Phase 5 — land the route: it was an HPET INTERRUPT STORM, not scheduling — **DONE**
+
+Gate **236/99 ZERO FAILs**, RUNEXIT=3, paint **768/768 @ `0x003a6ea5`**, **six consecutive boots**
+with `diff`-identical PASS lists. `LSA_WORKER_ROUTE_ENABLED` and `PIPE_FULL_DUPLEX_PARK` end this
+phase **`true`**. **No kernel change; `rust-micro` is untouched**, so no sel4test re-verification is
+required. **No scheduling context, budget, period or priority was changed anywhere.**
+
+#### 5.1 Step one was to MEASURE the churn — and there wasn't any
+
+Phase 4 ended on "winlogon starves while the self-RPC churns and the 45 s watchdog quiesces first".
+That is a claim about who is spending the executive's wall-clock, and the executive's service loop is
+SINGLE-THREADED, so it is directly countable. A per-badge census (`print_progress_census`,
+`BADGE_EVENTS` / `BADGE_TIME_100NS` / `BADGE_LAST_T`, plus per-SSN histograms for lsass and winlogon)
+was added and a route-ON boot measured:
+
+| badge | who | loop events | wall-clock |
+|---|---|---:|---:|
+| 26 | **the LSA per-connection worker** | **51** | 0.4 s |
+| 15 | the SCM `\ntsvcs` worker (known-good 8-PDU baseline) | 49 | 0.4 s |
+| 8 | lsass' main thread | 2 074 | 50 s |
+| 4 | winlogon | 2 528 | 60 s |
+| 2 | csrss | 714 | 71 s |
+| **36** | **the HPET delay-timer notification** | **2 773 385** | **82 s** |
+
+lsass' ENTIRE process issued 1 253 native syscalls on that boot, spread across ~40 distinct SSNs —
+a flat, bounded profile with no retry loop, no poll and no repeated SSN. **The self-RPC is bounded,
+proportionate work, comparable to the SCM baseline it was asked to be compared against.** The
+livelock was somewhere else entirely: a timer delivering **2.77 million** times.
+
+#### 5.2 The root cause: `delay_timer_rearm` toggled the wrong bit
+
+Instrumented (`TIMER_TICKS_SEEN` / `TIMER_TICKS_SPURIOUS` + a bounded dump of the live HPET
+registers on a spurious tick):
+
+```
+[census] timer ticks-seen=2745192 spurious=2745189 past-deadline-rearms=2
+[timer-storm] spurious #0 counter=0x6_6015e9b8 cmp=0x6_60001125 cfg=0x00ff0104_00002c34 armed=0 ...
+```
+
+`cfg` bit 2 is **set** and bit 1 is **clear**, while `armed=0` says the last rearm had NO deadline
+and had taken its disarm branch. Per the IA-PC HPET spec §2.3.8, Timer N Configuration bit 1 is
+`Tn_INT_TYPE_CNF` (0 = edge, 1 = level) and bit **2** is `Tn_INT_ENB_CNF`. `delay_timer_rearm` (and
+`delay_timer_shutdown`) toggled **bit 1** to arm/disarm; the actual enable, bit 2, was set once by
+`delay_timer_init` and never cleared. So "disarm" only flipped the timer from level- to
+edge-triggered and left it ENABLED with a comparator now permanently behind the main counter —
+`counter = 0x6_6015e9b8 > cmp = 0x6_60001125` — which re-fires on every comparator re-arm. ~34 kHz,
+forever, each delivery a full round trip through the executive's single service loop.
+
+**Why it had never been seen:** on a route-OFF boot the HPET one-shot is **never armed at all**
+(`ticks-seen=0`, measured on a control boot). The LSA route is the first thing on the boot that ever
+calls `NtDelayExecution` — the rpcrt4 worker's `Sleep(1)`. It did not cause the storm; it was the
+first thing to switch the storm on.
+
+The fix names the bits (`HPET_TN_INT_TYPE_LEVEL`, `HPET_TN_INT_ENB`), keeps the trigger type LEVEL
+for the timer's whole life (matching the IOAPIC pin, which is issued `level = 1`), leaves the timer
+DISARMED at init, and uses `Tn_INT_ENB_CNF` as the one arm/disarm control. Three lines.
+
+| | before | after |
+|---|---:|---:|
+| HPET deliveries per boot | 2 745 192 | **3 – 60** |
+| of which woke nothing | 2 745 189 | **0 – 1** |
+| executive wall-clock on the timer | 82 s | **< 0.05 s** |
+| desktop paint | lost 3 of 5 boots | **768/768, 6 of 6 boots** |
+
+**Positive proof, not just green:** `exec_delay_timer_disarms` reads the LIVE `T0_CONFIG` back off
+the HPET at gate time and asserts `Tn_INT_TYPE_CNF` is still SET (under the bug it reads 0 whenever
+the timer is disarmed, which is the steady state) plus a delivery ceiling and a woke-nothing ceiling.
+`exec_lsa_selfrpc_route_enabled` asserts the route is ON and its cost is BOUNDED, printing the SCM
+worker's event count alongside as the comparison baseline.
+
+#### 5.3 What the 45 s watchdog is, and whether it fired legitimately
+
+`service_sec_image.rs`'s `STALL_BUDGET_100NS` — 45 s of WALL-CLOCK with no `PROGRESS_EPOCH` bump (a
+new DLL demand-loaded, a fresh page filled, an event created/signalled, a process spawned, or the
+paint). It is the boot's termination backstop: cooperatively-parked processes plus one thread that
+keeps issuing syscalls would otherwise block the service loop's `recv` forever, and the boot could
+never reach `qemu_exit`. It is deliberately blunt, and it **fired correctly**: the storm meant no
+process made any qualifying progress for 45 s, which is exactly the condition it exists to detect.
+It was reporting the bug, not causing it. With the storm gone it does not fire at all — all six
+verification boots quiesce on the normal steady-state path ("server listener parked + winlogon parked
+at empty SAS message loop + LSA signalled").
+
+#### 5.4 A third defect the route exposed: a spec that raced on the shared endpoint
+
+`exec_dbgk_debugger_wait_blocks_and_wakes` did a bare `recv_full_r12(fault_ep, …)` and assumed the
+next message was its own injected client's. `fault_ep` is the executive's SHARED endpoint, so a
+hosted thread still runnable at quiesce can land there first — observed with the route on as a
+win32k `m0 = 0x101b` from a live winlogon worker, which made the step read a foreign syscall and
+silently skip the whole assertion. It now SELECTS on the client's own SSN and leaves any foreign
+message unanswered (post-quiesce, an un-replied caller is exactly as parked as everything else on the
+`[parked]` list). The assertion itself is unchanged in strength.
+
+#### 5.5 How far the logon chain got, and the next wall
+
+Measured against a route-OFF **control boot of the same binaries**:
+
+| evidence | route OFF | route ON (Phase 5) |
+|---|---|---|
+| `SamIConnect-null-root-miss` | 1 | **0** — the wall is GONE |
+| `sam-setup-keys` / `sam-mount-opens` | 2 / 1 | **36 / 2** |
+| LSA policy attribute reads | 8 | **12** |
+| real SECURITY/SAM hive opens | 2 | **3** |
+| `LsaLogonUser` (api 2) outcome | replied `0xC0000034` at `SamIConnect` | server runs the FULL chain |
+| LSA server wall | none | **`NtCreateToken`, SSN 57** |
+
+The real LSA server thread now runs the whole `LsapLogonUser` → MSV1_0 → `SamValidateNormalUser`
+chain against a real `SampInitDatabase`, works through the privilege lookups
+(`LsapOpenDbObject(Accounts/S…)`), and stops at the last step before it could answer:
+**`NtCreateToken` (SSN 57), which the executive does not service.**
+`lsa_release_client_on_server_wall` releases winlogon with `STATUS_UNSUCCESSFUL`, which msgina
+reports as the real `LsaLogonUser failed (Status 0xc0000001)`. **Nothing is fabricated:**
+`Administrator` is not validated, no token is minted, `WLX_SAS_ACTION_LOGON` is not returned.
+`NtCreateToken` is the next frontier — a real service to implement (the token store, SID/group/
+privilege types and handle insertion already exist; `NtOpenProcessToken`, `NtDuplicateToken` and
+`NtQueryInformationToken` are already serviced), not a workaround.
+
+**Four specs that PINNED THE OLD WALL were re-pointed at the new one**, each strictly stronger:
+`exec_lsa_auth_port_connected` now asserts the wall SSN is EXACTLY `NtCreateToken` (resolved from the
+ABI table, so an unexpected wall anywhere else fails it) instead of "no wall";
+`exec_msv1_0_account_domain_sid_resolved` asserts the null-root miss is **0** (it asserted `>= 1`)
+plus the 16+ SAM database keys and the second mount open that only a SUCCEEDING `SamIConnect`
+produces; `exec_lsa_msv1_0_sam_validation_reached` asserts the same absence plus an unset reply
+status; `exec_lsa_logon_user_reached` asserts the exact `replies + 1 == requests` relation.
+
+**Verified:** six consecutive foreground boots — ALL RUNEXIT=3, `microtest sentinel`, **ZERO FAILs**,
+gate **236/99**, `diff`-identical 236-line PASS lists, paint **768/768 changed @ `0x003a6ea5`**.
+Host tests unchanged: nt-ntdll 694, nt-process 79, nt-io-manager 87, nt-syscall 42.
+
+**Rollback:** flip both consts back to `false`. The HPET fix is independent of them and should be
+kept regardless — it is a latent storm in any boot that ever arms the one-shot.
 
 ---
 

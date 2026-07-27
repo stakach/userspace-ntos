@@ -591,6 +591,49 @@ the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/
 > not correlation** — a materially better-isolated problem than the one this section started with,
 > and the next frontier.
 
+> **Update (batch 51, gate 236/99) — BOTH FLAGS ARE ON PERMANENTLY. The "forward-progress
+> scheduling" wall was a MISDIAGNOSIS: it was an HPET INTERRUPT STORM in the executive's own delay
+> timer.** `LSA_WORKER_ROUTE_ENABLED = true` and `PIPE_FULL_DUPLEX_PARK = true`, with the paint
+> DETERMINISTIC — **six consecutive foreground boots, all RUNEXIT=3, `microtest sentinel`, ZERO
+> FAILs, gate 236/99, `diff`-identical 236-line PASS lists, paint 768/768 changed @ `0x003a6ea5`**.
+> No kernel change (`rust-micro` untouched); **no scheduling context, budget, period or priority was
+> changed anywhere**.
+>
+> **The measurement that turned it around.** The executive's service loop is single-threaded, so
+> "who is starving whom" is countable. A per-badge census of it (loop events + wall-clock per badge,
+> plus per-SSN histograms for lsass and winlogon) showed the LSA self-RPC is TINY — the
+> per-connection worker costs **51** service events, against **49** for the known-good SCM `\ntsvcs`
+> worker, and lsass' whole process issues ~1,300 native syscalls across ~40 distinct SSNs with no
+> repeated SSN, no poll and no retry loop. Meanwhile the HPET delay-timer notification badge showed
+> **2,773,385** events consuming **82 s**. Instrumenting the timer: **2,745,192 deliveries, of which
+> 2,745,189 woke nothing.**
+>
+> **Root cause.** `delay_timer_rearm` toggled Timer-0 Configuration **bit 1** to arm/disarm. Bit 1 is
+> `Tn_INT_TYPE_CNF` (edge/level); the enable is bit **2**, `Tn_INT_ENB_CNF`, set once by
+> `delay_timer_init` and never cleared. "Disarm" only flipped the timer to edge-triggered and left it
+> enabled with a comparator permanently behind the main counter, so it re-fired at ~34 kHz forever —
+> each delivery a full round trip through the one service loop, which is what actually starved
+> winlogon. It had never been seen because on a route-OFF boot the one-shot is **never armed at all**
+> (measured: `ticks-seen = 0` on a control boot); the LSA route is simply the first thing that ever
+> calls `NtDelayExecution`. Fixed by naming the bits and using the real enable: deliveries per boot
+> 2,745,192 → **3-60**, woke-nothing → **0-1**. Proven by `exec_delay_timer_disarms`, which reads the
+> LIVE `T0_CONFIG` back off the HPET at gate time. The 45 s no-progress watchdog fired CORRECTLY — it
+> was reporting the storm, not causing it — and with the storm gone it does not fire at all.
+>
+> **DESKTOP FRONTIER — the logon chain now runs to token creation.** Against a route-OFF control boot
+> of the same binaries: `SamIConnect-null-root-miss` 1 → **0** (the wall is GONE), `sam-setup-keys`
+> 2 → **36**, `sam-mount-opens` 1 → **2**, LSA policy attribute reads 8 → **12**. The real LSA server
+> thread runs the WHOLE `LsapLogonUser` → MSV1_0 → `SamValidateNormalUser` chain against a real
+> `SampInitDatabase`, through the privilege lookups, and stops at the last step before it could
+> answer: **`NtCreateToken` (SSN 57), which the executive does not service.** The connector is
+> released with `STATUS_UNSUCCESSFUL` and msgina logs the real `LsaLogonUser failed (Status
+> 0xc0000001)`. **Nothing is fabricated**: `Administrator` is not validated, no token is minted and
+> `WLX_SAS_ACTION_LOGON` is not returned. **`NtCreateToken` is the next frontier** — a real service
+> to implement (the token store, SID/group/privilege types and handle insertion already exist;
+> `NtOpenProcessToken`, `NtDuplicateToken` and `NtQueryInformationToken` are already serviced).
+> Four specs that pinned the OLD wall were re-pointed at the new one, each strictly stronger — see
+> `docs/transport-migration.md` §Phase 5.5.
+
 ---
 
 ## 7. Corrections to `ntdll_plan.md`

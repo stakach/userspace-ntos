@@ -703,7 +703,7 @@ no `wait_park`/`pipe_wait_park`/`dbgk_reporter_park` steal can touch them.
 Correlation is not availability. The old pump could block in its **wake `Send`** if the component was
 not in a position to receive (running, or blocked as a sender elsewhere) — a separate failure mode
 from "the wrong reply was matched", and the one the LSA-worker route hit (see the
-`LSA_WORKER_ROUTE_ENABLED` comment in `exec_handler.rs`). There is no wake `Send` any more:
-`reply_on` is `decode_reply`, which wakes the bound caller or fails immediately. Whether that is
-sufficient for the LSA route is `docs/transport-migration.md` Phase 4's falsifiable prediction, not
-a claim made here.
+`LSA_WORKER_ROUTE_ENABLED` comment in `main.rs`). There is no wake `Send` any more:
+`reply_on` is `decode_reply`, which wakes the bound caller or fails immediately. Phase 4 CONFIRMED
+the prediction (the route no longer hangs), and Phase 5 landed the route for good — see
+`docs/transport-migration.md`.

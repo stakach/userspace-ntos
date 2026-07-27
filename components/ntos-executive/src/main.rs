@@ -1248,6 +1248,15 @@ const HPET_GEN_CONF: u64 = 0x10;
 const HPET_MAIN_COUNTER: u64 = 0xF0;
 const HPET_GEN_INT_STATUS: u64 = 0x20;
 const HPET_T0_CONFIG: u64 = 0x100;
+/// ★ Timer N Configuration bits (IA-PC HPET spec §2.3.8). These MUST be named: the arm/disarm path
+/// used to toggle bit **1** believing it was the enable, which silently left the timer ENABLED
+/// FOREVER with a comparator in the past — a ~34 kHz interrupt storm (see `delay_timer_rearm`).
+/// `Tn_INT_TYPE_CNF`: 0 = edge-triggered, 1 = level-triggered. The IOAPIC pin this timer is routed
+/// to is issued LEVEL (`ioapic_issue_irq_handler(.., level = 1, ..)`), so this stays SET for the
+/// timer's whole life — it is a wiring property, never an arm/disarm control.
+const HPET_TN_INT_TYPE_LEVEL: u64 = 1 << 1;
+/// `Tn_INT_ENB_CNF` — THE arm/disarm bit. Clearing it makes the timer stop delivering, full stop.
+const HPET_TN_INT_ENB: u64 = 1 << 2;
 const HPET_T0_COMPARATOR: u64 = 0x108;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
@@ -2538,7 +2547,15 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
             && client_port != 0
             && client_port != server_port
             && LSA_OPERATIONAL_MODE.load(Ordering::Relaxed) == 0x4321_8765
-            && LSA_SERVER_WALL_SSN.load(Ordering::Relaxed) == u64::MAX,
+            // ★ THE WALL MOVED (batch 51, `LSA_WORKER_ROUTE_ENABLED = true`). This used to assert
+            // "the server never walled", which was true only because `LsaLogonUser` gave up early
+            // at `SamIConnect`. With the self-RPC route on, the real LSA server runs the WHOLE
+            // `LsapLogonUser` → MSV1_0 → `SamValidateNormalUser` chain and stops at the last step
+            // before it can answer: **`NtCreateToken`**, which the executive does not service yet.
+            // Asserting the EXACT SSN — resolved from the ABI table, not a magic number — is
+            // strictly more specific than "no wall": an unexpected wall anywhere else fails this.
+            && Some(LSA_SERVER_WALL_SSN.load(Ordering::Relaxed))
+                == nt_syscall_abi::ssn_of("NtCreateToken").map(|ssn| ssn as u64),
         passed,
     );
     print_str(b"[lsa] data plane: requests=");
@@ -2559,10 +2576,17 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     // and resolvable — and `LsaLogonUser` (api 2) was then delivered and answered by that same server.
     const API_LOGON_USER: u64 = 1 << 2;
     const API_LOOKUP_PACKAGE: u64 = 1 << 3;
+    // `LsaLookupAuthenticationPackage` (api 3) still round-trips COMPLETELY — request and reply,
+    // SUCCESS. `LsaLogonUser` (api 2) is delivered and the server runs it for real, but it now runs
+    // FURTHER than it can finish: it reaches `NtCreateToken` and walls, so exactly ONE request is
+    // outstanding at the gate and the connector is released by `lsa_release_client_on_server_wall`
+    // (msgina logs the real `LsaLogonUser failed (Status 0xc0000001)`). The relation asserted is
+    // therefore `replies + 1 == requests`, which is exact: a SECOND outstanding request, or a
+    // silently-dropped one, both fail it.
     check(
         b"exec_lsa_logon_user_reached",
         LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed) >= 2
-            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed)
+            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed) + 1
                 == LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed)
             && LSA_API_MASK.load(Ordering::Relaxed) & API_LOOKUP_PACKAGE != 0
             && LSA_API_MASK.load(Ordering::Relaxed) & API_LOGON_USER != 0
@@ -2570,19 +2594,24 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
             && LSA_LAST_API_NUMBER.load(Ordering::Relaxed) == 2,
         passed,
     );
-    // ★ HONEST WALL. The real MSV1_0 authentication package ran `SamValidateNormalUser`. Its FIRST
-    // step, `GetAccountDomainSid` (`msv1_0/sam.c:267`), now SUCCEEDS against the real LSA policy
-    // database (see `exec_lsa_security_hive_backed`); the call then fails one step later in
-    // `SamIConnect` (`samsrv!SampOpenDbObject(NULL, NULL, L"SAM")` with a NULL `SamKeyHandle`), so
-    // the status is still STATUS_OBJECT_NAME_NOT_FOUND. This spec asserts EXACTLY that: the
-    // credentials were copied into the auth package out of winlogon's own address space (lsasrv's
-    // `LsapCopyFromClient`) and the answer came back as the REAL validation status — never a
-    // fabricated logon success.
-    const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
+    // ★ HONEST WALL — and it MOVED (batch 51). The real MSV1_0 authentication package runs
+    // `SamValidateNormalUser` on credentials copied out of winlogon's own address space (lsasrv's
+    // `LsapCopyFromClient`). Its first step, `GetAccountDomainSid` (`msv1_0/sam.c:267`), succeeds
+    // against the real LSA policy database. It used to fail ONE step later in `SamIConnect`
+    // (`samsrv!SampOpenDbObject(NULL, NULL, L"SAM")` with a NULL `SamKeyHandle`, because
+    // `SamIInitialize` had blocked forever in `SampGetAccountDomainInfo` → `LsaOpenPolicy`, the
+    // `\pipe\lsarpc` SELF-RPC lsass hosted no worker for) and return
+    // STATUS_OBJECT_NAME_NOT_FOUND. `LSA_WORKER_ROUTE_ENABLED` supplies that worker, so
+    // `SampInitDatabase` now runs and `SamIConnect` SUCCEEDS — asserted as the null-root miss being
+    // GONE, which the old spec asserted the presence of. The chain therefore no longer produces a
+    // validation status at all: it runs on to `NtCreateToken` and walls there
+    // (`exec_lsa_auth_port_connected` pins the SSN), leaving the reply status unset.
+    // **Nothing is fabricated**: `Administrator` is still not validated and no token is minted.
     check(
         b"exec_lsa_msv1_0_sam_validation_reached",
         LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed) >= 4
-            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == STATUS_OBJECT_NAME_NOT_FOUND
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == u64::MAX
+            && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
             && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0,
         passed,
     );
@@ -2669,14 +2698,25 @@ fn lsa_security_database_specs(passed: &mut u64) {
     //     name `SAM` with a NULL RootDirectory because samsrv's `SamKeyHandle` was never set —
     //     `SamIInitialize` never reached `SampInitDatabase`, having blocked forever inside
     //     `SampInitializeSAM` → `SampGetAccountDomainInfo` → `LsaOpenPolicy`, an ncacn_np
-    //     `\pipe\lsarpc` SELF-RPC that lsass hosts no per-connection worker for. Asserting the NULL
-    //     RootDirectory miss pins that exact wall, so no fabricated SAM can pass this spec.
+    //     `\pipe\lsarpc` SELF-RPC that lsass hosted no per-connection worker for.
+    //
+    //     ★ BATCH 51: `LSA_WORKER_ROUTE_ENABLED` supplies that worker, so this wall is GONE. The
+    //     spec is re-pointed at the ADVANCE it became, and every clause is the strictly stronger
+    //     form of what it replaced: the null-root miss must now be **0** (it was `>= 1`), and
+    //     `SampSetupCreateServer` must have built the real SAM database — 36 keys against 2, and a
+    //     second mount open — which is only reachable once `SamIConnect` SUCCEEDS. A fabricated SAM
+    //     cannot pass this: the keys are counted at the Config Manager, created by samsrv itself.
     check(
         b"exec_msv1_0_account_domain_sid_resolved",
         LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed) >= 4
             && LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.load(Ordering::Relaxed) >= 2
-            && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) >= 1
-            && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 0,
+            && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
+            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 16
+            && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
+            // The `LsaLogonUser` (api 2) that drove all of the above is STILL IN FLIGHT at the
+            // gate — cleared only by a delivered reply, which the `NtCreateToken` wall prevents.
+            // This is the counterpart of `exec_lsa_logon_user_reached`'s `replies + 1 == requests`.
+            && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) == 1,
         passed,
     );
     lsa_rpc_handoff_specs(passed);
@@ -2695,6 +2735,7 @@ fn lsa_security_database_specs(passed: &mut u64) {
 /// THREAD parked mid-handoff and `RPCRT4_new_client` — the call that creates the per-connection
 /// worker — was never reached at all.
 fn lsa_rpc_handoff_specs(passed: &mut u64) {
+    print_progress_census();
     let flushes = REG_FLUSH_KEY_CALLS.load(Ordering::Relaxed);
     let volatile_flushes = REG_FLUSH_KEY_VOLATILE.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
@@ -2752,20 +2793,21 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
 /// either way (no pump walls, no reply errors, no silently-degraded pipe I/O, every absorbed
 /// bound-notification tick accounted for).
 ///
-/// `LSA_WORKER_ROUTE_ENABLED` was gated OFF for two batches. The recorded reason was an
-/// AVAILABILITY defect of the hand-rolled component-dispatch transport: the executive's wake `Send`
-/// blocked against a component that was not yet receiving. RIP-sampled over 909 wakes, 907 landed at
+/// `LSA_WORKER_ROUTE_ENABLED` was gated OFF for three batches, on three successive readings — an
+/// AVAILABILITY defect of the hand-rolled component-dispatch transport (the executive's wake `Send`
+/// blocked against a component that was not yet receiving; RIP-sampled over 909 wakes, 907 landed at
 /// the component's completion-`Send`+2 and the ONE wake that never returned was the only sample at
-/// the receive syscall+2 — the transport had a window in which the component was runnable but not
-/// receiving, and the executive's wake could wedge in it.
+/// the receive syscall+2), then a silent per-connection pipe-parking degrade, then "forward-progress
+/// starvation".
 ///
-/// **That defect is structurally gone.** Under the `Call` transport
-/// the component is the CALLER: it is `BlockedOnReply` from the instant the kernel pairs it, with no
-/// user-visible gap, and the executive answers with `reply_on` (`decode_reply`), which wakes the
-/// bound caller or fails immediately and **cannot block**. There is no `Send` to an endpoint left to
-/// wedge in. With the route ON the boot no longer HANGS: it runs the self-RPC and reaches the gate
-/// with `RUNEXIT=3` on every run. What kept the route off is now a different problem — forward-
-/// progress starvation costing the paint on ~60% of runs — not availability. See the const.
+/// **The first is structurally gone.** Under the `Call` transport the component is the CALLER: it is
+/// `BlockedOnReply` from the instant the kernel pairs it, with no user-visible gap, and the executive
+/// answers with `reply_on` (`decode_reply`), which wakes the bound caller or fails immediately and
+/// **cannot block**. There is no `Send` to an endpoint left to wedge in. The second is fixed by
+/// `PIPE_FULL_DUPLEX_PARK`. **The third was a MISREADING**: a per-badge census of the service loop
+/// showed the self-RPC costs ~50-100 events while the executive's own HPET one-shot delivered
+/// 2,745,192 times in one boot, 2,745,189 of them waking nothing. It was an interrupt storm in the
+/// delay timer, not starvation by the RPC — see `exec_delay_timer_disarms`. The route is ON.
 ///
 /// It also exposed a SECOND, unrelated availability defect that the route is simply the first thing
 /// to reach — and which had nothing to do with correlation. The executive's ROOT TCB has the HPET
@@ -2849,6 +2891,103 @@ fn lsa_worker_route_spec(passed: &mut u64) {
             && pipe_full == 0,
         passed,
     );
+    delay_timer_disarm_spec(passed);
+    lsa_selfrpc_bounded_spec(passed);
+}
+
+/// ═══ ★ THE HPET ONE-SHOT REALLY DISARMS (batch 51) ══════════════════════════════════════════════
+///
+/// The LSA self-RPC route is the FIRST thing on the boot that ever arms the executive's HPET
+/// one-shot (its rpcrt4 worker calls `NtDelayExecution`). Turning it on therefore exercised the
+/// arm/disarm path for the first time at scale, and it was BROKEN: `delay_timer_rearm` toggled
+/// **bit 1** of the Timer-0 Configuration register to arm/disarm, but bit 1 is `Tn_INT_TYPE_CNF`
+/// (the edge/level trigger selector). The real enable is **bit 2**, `Tn_INT_ENB_CNF`, which
+/// `delay_timer_init` set once and nothing ever cleared. So "disarm" only flipped the timer from
+/// level- to edge-triggered and left it ENABLED with a comparator now permanently behind the main
+/// counter — a self-sustaining ~34 kHz interrupt storm.
+///
+/// It was not a small effect. Measured on one route-ON boot BEFORE the fix: **2,745,192** HPET
+/// deliveries, of which **2,745,189 woke nothing** (99.9999% spurious), consuming **80 s** of the
+/// executive's single-threaded service loop — against a self-RPC whose ENTIRE legitimate cost is
+/// 51 worker service events. That is what starved winlogon of the forward progress the desktop
+/// paint needs, and it is why the paint was non-deterministic with the route on. It was never a
+/// priority or scheduling-context problem: no MCS budget, period or priority was changed to fix it.
+///
+/// The assertions are the invariants that CANNOT hold under the bug:
+///   * `Tn_INT_TYPE_CNF` is still SET at the gate — the arm/disarm path is not touching the
+///     trigger-type bit any more. Under the bug this reads 0 whenever the timer is disarmed (which
+///     is the steady state), so this alone falsifies it;
+///   * deliveries are BOUNDED, and essentially all of them did real work. A storm is unbounded by
+///     construction, so a ceiling is the honest shape of the claim.
+fn delay_timer_disarm_spec(passed: &mut u64) {
+    let seen = TIMER_TICKS_SEEN.load(Ordering::Relaxed);
+    let spurious = TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed);
+    let past = TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed);
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    let config = if handler != 0 {
+        unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) }
+    } else {
+        0
+    };
+    print_str(b"[delay-timer] armed-ever=");
+    print_u64(if handler != 0 { 1 } else { 0 });
+    print_str(b" deliveries=");
+    print_u64(seen);
+    print_str(b" woke-nothing=");
+    print_u64(spurious);
+    print_str(b" past-deadline-rearms=");
+    print_u64(past);
+    print_str(b" T0_CONFIG=0x");
+    print_hex_u64(config);
+    print_str(b" (bit1=level bit2=enable)\n");
+    // A boot that never armed the timer must show no deliveries at all (nothing is fabricated);
+    // a boot that did must show BOUNDED deliveries that overwhelmingly did real work, on a timer
+    // whose trigger-type bit was never used as an arm control.
+    let shape = if handler == 0 {
+        seen == 0 && spurious == 0
+    } else {
+        (config & HPET_TN_INT_TYPE_LEVEL) != 0 && seen >= 1 && seen <= 4096 && spurious <= 64
+    };
+    check(b"exec_delay_timer_disarms", shape, passed);
+}
+
+/// ═══ ★ THE LSA SELF-RPC IS BOUNDED WORK, NOT CHURN (batch 51) ═══════════════════════════════════
+///
+/// The route was gated off on the reading that "winlogon starves while the self-RPC churns". The
+/// census falsified that: the self-RPC is TINY. Measured with the route on, the per-connection
+/// worker consumes ~50 service-loop events and lsass' whole process ~1,300 native syscalls over the
+/// entire boot, against ~2.75 MILLION timer deliveries. The starvation was the timer storm; the
+/// self-RPC was the innocent thing that first armed the timer.
+///
+/// This spec pins that reading down so it cannot silently regress into a livelock: the route is ON,
+/// it really RAN (the worker issued syscalls, the handshake happened — asserted by
+/// `exec_lsa_worker_route` above), and its cost stays under a ceiling proportionate to the known-good
+/// SCM `\ntsvcs` worker, which does the same job for `services.exe` in ~50 events.
+fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
+    let worker_syscalls = LSA_WORKER_SYSCALLS.load(Ordering::Relaxed);
+    let worker_events = BADGE_EVENTS[census_slot(LSA_WORKER_BADGE)].load(Ordering::Relaxed);
+    let scm_events = BADGE_EVENTS[census_slot(SCM_WORKER_BADGE)].load(Ordering::Relaxed);
+    let delay_calls = DELAY_PARKED_COUNT.load(Ordering::Relaxed);
+    print_str(b"[lsa-bounded] route=");
+    print_u64(if LSA_WORKER_ROUTE_ENABLED { 1 } else { 0 });
+    print_str(b" worker-events=");
+    print_u64(worker_events);
+    print_str(b" worker-syscalls=");
+    print_u64(worker_syscalls);
+    print_str(b" (SCM \\ntsvcs worker baseline events=");
+    print_u64(scm_events);
+    print_str(b") delay-parks=");
+    print_u64(delay_calls);
+    print_str(b"\n");
+    check(
+        b"exec_lsa_selfrpc_route_enabled",
+        LSA_WORKER_ROUTE_ENABLED
+            && worker_syscalls >= 1
+            && worker_events >= 1
+            && worker_events <= 2048
+            && delay_calls <= 4096,
+        passed,
+    );
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
@@ -2906,46 +3045,57 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued by lsass' own
 /// main thread from samsrv) complete instead of blocking forever on an unserved pipe.
 static LSA_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
-/// ★★ THE LSA SELF-RPC WORKER ROUTE — **MEASURED WITH IT ON, THEN RE-GATED OFF** (Phase 4).
+/// ★★ THE LSA SELF-RPC WORKER ROUTE — **ON** (batch 51; was gated off for three batches).
 ///
-/// Turning this on routes lsass' `\pipe\lsarpc` per-connection RPC worker (`RPCRT4_new_client` →
-/// `RPCRT4_io_thread`) for real, which is the thread that answers lsass' OWN `LsaOpenPolicy`
-/// self-RPC — the chain samsrv needs for `SampGetAccountDomainInfo` → `SamIConnect` →
-/// `SamrLookupNamesInDomain(Administrator)` → `WLX_SAS_ACTION_LOGON`.
+/// Routes lsass' `\pipe\lsarpc` per-connection RPC worker (`RPCRT4_new_client` ->
+/// `RPCRT4_io_thread`) for real — the thread that answers lsass' OWN `LsaOpenPolicy` self-RPC, the
+/// chain samsrv needs for `SampGetAccountDomainInfo` -> `SamIConnect` ->
+/// `SamrLookupNamesInDomain(Administrator)` -> `WLX_SAS_ACTION_LOGON`.
 ///
-/// **The defect that used to gate it is GONE.** It was an AVAILABILITY defect of the hand-rolled
-/// component-dispatch transport: the executive's wake `Send` blocked against a component that was
-/// not yet receiving (RIP-sampled: 907/909 wakes healthy at the completion-`Send`+2, and the one
-/// wake that never returned was the only sample at the receive syscall+2). Under the `Call`
-/// transport there is no wake `Send` at all — the component is the caller and is `BlockedOnReply`
-/// with no user-visible gap, and the executive answers with `reply_on` (`decode_reply`), which
-/// cannot block. Measured with the route ON: the boot NO LONGER HANGS. It reaches the gate with
-/// `RUNEXIT=3` every time, ZERO pump walls and ZERO reply errors, and the self-RPC completes a real
-/// MS-RPC handshake inside lsass (worker reads the bind PDU 0x0b off npfs, writes the bind_ack
-/// 0x0c). Two route-ON boots were **fully green, 232/99, paint 768/768**.
+/// **Three walls gated it, in three different subsystems, and all three are now root-caused.**
 ///
-/// **It is nevertheless OFF, for a different and honest reason: it is not DETERMINISTIC.** Across
-/// five route-ON boots of the same binaries the desktop paint survived twice and was lost three
-/// times (gate 211-213/99, ~20 FAILs, paint 0/768) — no crash and no hang, but winlogon starved
-/// while lsass' self-RPC churned and the 45 s no-progress watchdog quiesced before the SAS window.
-/// The paint is a hard safety invariant, so a route that keeps it only ~40% of the time cannot land.
+/// 1. **Availability** (fixed by `docs/transport-migration.md` Phases 0-3). The executive's wake
+///    `Send` blocked against a component that was not yet receiving. Under the `Call` transport
+///    there is no wake `Send` at all: the component is the CALLER, and the executive answers with
+///    `reply_on` (`decode_reply`), which cannot block.
 ///
-/// Two REAL defects were root-caused by turning it on, and BOTH fixes are landed:
-///   1. **The pump did not screen bound-notification deliveries** — see
-///      `inject_bound_notification_tick` / `exec_pump_screens_bound_notification`. This one WALLED
-///      npfs mid-boot and is fixed unconditionally.
-///   2. **Pipe parking was per-connection, not per-direction**, so an rpcrt4 server's pending READ
-///      refused its own response WRITE with `STATUS_INSUFFICIENT_RESOURCES` — see
-///      `PIPE_FULL_DUPLEX_PARK` in `exec_handler.rs` (fix written + host-tested in
-///      `nt_io_manager::PipeWaiterTable::parked_on_dir`, gated off). With BOTH fixes on, the chain
-///      advances much further — the `LsarOpenPolicy` responses are delivered (status 0, 48 bytes),
-///      `SamIConnect-null-root-miss` goes 1 → 0, `sam-setup-keys` 2 → 36, and lsass reaches
-///      `NtCreateNamedPipeFile(\samr)`, i.e. samsrv publishes its own RPC endpoint — but the paint
-///      is then lost every time, so that combination is the next batch's problem, not this one's.
+/// 2. **A silent functional degrade** (fixed by `PIPE_FULL_DUPLEX_PARK`, also now ON). Pipe parking
+///    was per-CONNECTION rather than per-DIRECTION, so an rpcrt4 server's pending READ refused its
+///    own response WRITE with `STATUS_INSUFFICIENT_RESOURCES` — which is how the 48-byte
+///    `LsarOpenPolicy` RESPONSE was lost.
 ///
-/// **Nothing is fabricated.** With the route off, `LsaOpenPolicy` does not return over RPC,
-/// `Administrator` is not validated and `WLX_SAS_ACTION_LOGON` is not returned.
-pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = false;
+/// 3. **★ An HPET interrupt storm in the executive's own delay timer** — the reason the paint was
+///    non-deterministic, and NOT what it looked like. The recorded reading was "winlogon starves
+///    while the self-RPC churns". A per-badge census of the service loop falsified that: the
+///    self-RPC is TINY (a per-connection worker costing ~50-100 service events, lsass' whole
+///    process ~1,300 native syscalls), while the HPET one-shot delivered **2,745,192** times in a
+///    single boot with **2,745,189 of them waking nothing**, eating 80 s of the executive's
+///    single-threaded service loop. `delay_timer_rearm` was toggling Timer-0 Configuration **bit 1**
+///    to arm/disarm, but that bit is `Tn_INT_TYPE_CNF` (the edge/level trigger selector); the enable
+///    is **bit 2**, `Tn_INT_ENB_CNF`, which init set once and nothing ever cleared. "Disarm" only
+///    flipped the timer to edge-triggered and left it enabled with a comparator permanently behind
+///    the main counter. The route is simply the FIRST thing on the boot that ever arms an HPET
+///    one-shot (`NtDelayExecution` from the rpcrt4 worker), so it was the first thing to expose it —
+///    on a route-OFF boot the timer is never armed at all and the storm cannot be observed. Fixed by
+///    naming the bits; proven by `exec_delay_timer_disarms`. **No scheduling context, budget,
+///    period or priority was changed** — this was never an MCS scheduling problem.
+///
+/// Turning it on also root-caused a fourth, unrelated defect that is fixed UNCONDITIONALLY: the
+/// component pump did not screen BOUND-NOTIFICATION deliveries, so an HPET tick could satisfy a
+/// pump's blocking `Recv` and WALL the component (`exec_pump_screens_bound_notification`).
+///
+/// **What the route buys, measured against a route-OFF control boot of the same binaries:**
+/// `SamIConnect-null-root-miss` 1 -> **0** (the wall is gone), `sam-setup-keys` 2 -> **36**,
+/// `sam-mount-opens` 1 -> **2**, LSA policy attribute reads 8 -> **12**, and lsass reaches
+/// `NtCreateNamedPipeFile(\samr)` — samsrv publishes its own RPC endpoint. The real LSA server now
+/// runs the WHOLE `LsapLogonUser` -> MSV1_0 -> `SamValidateNormalUser` chain.
+///
+/// **The next wall is `NtCreateToken` (SSN 57)**, which the executive does not service: the LSA
+/// server thread walls there and `lsa_release_client_on_server_wall` releases winlogon with
+/// `STATUS_UNSUCCESSFUL`, which msgina reports as the real `LsaLogonUser failed (Status 0xc0000001)`.
+/// **Nothing is fabricated**: `Administrator` is not validated, no token is minted, and
+/// `WLX_SAS_ACTION_LOGON` is not returned.
+pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = true;
 static LSA_WORKER_TID: AtomicU64 = AtomicU64::new(0);
 static LSA_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Times lsass' `\pipe\lsarpc` rpcrt4 SERVER thread reached `RPCRT4_new_client`
@@ -2967,6 +3117,125 @@ pub(crate) static LSA_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Native syscalls the LSA per-connection worker actually issued (unbounded) — the counter the gate
 /// asserts on: it can only be nonzero if a real per-connection worker thread RAN in lsass' VSpace.
 pub(crate) static LSA_WORKER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+/// ═══ FORWARD-PROGRESS CENSUS (batch 51 diagnostic) ═══════════════════════════════════════════
+/// The executive's service loop is SINGLE-THREADED: every hosted thread's syscall/fault is one
+/// iteration of it, so the loop's WALL-CLOCK is the scarce resource the whole boot competes for.
+/// A "starvation" claim is only meaningful with the census that says WHO SPENT IT. `BADGE_EVENTS`
+/// counts loop iterations per badge; `BADGE_TIME_100NS` attributes the wall-clock between two
+/// consecutive loop tops to the badge that was serviced in between. Both are indexed by badge
+/// (every live badge is < [`BADGE_CENSUS_N`]); anything larger lands in the last slot.
+pub(crate) const BADGE_CENSUS_N: usize = 40;
+pub(crate) static BADGE_EVENTS: [AtomicU64; BADGE_CENSUS_N] =
+    [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
+pub(crate) static BADGE_TIME_100NS: [AtomicU64; BADGE_CENSUS_N] =
+    [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
+/// Per-SSN histogram for lsass (pi 4) — the whole process, all its badges. A BOUNDED unit of work
+/// shows a flat spread of distinct SSNs; a POLL / RETRY LIVELOCK shows one or two SSNs with counts
+/// in the thousands. `SSN_HIST_N` covers the whole Win7 x64 SSN space; anything above lands in the
+/// last bucket.
+pub(crate) const SSN_HIST_N: usize = 512;
+pub(crate) static LSASS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Same histogram for winlogon (pi 2) — the process whose forward progress the paint depends on.
+pub(crate) static WINLOGON_SSN_HIST: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Wall-clock (100ns) of the LAST service-loop event for each badge, so the census can say how long
+/// before the quiesce each badge was last able to run.
+pub(crate) static BADGE_LAST_T: [AtomicU64; BADGE_CENSUS_N] =
+    [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
+/// Map a badge to its census slot. The hosted-thread badges are small and dense (0..=26) so they
+/// index directly; the three non-thread deliveries the loop can see get their own named slots.
+pub(crate) fn census_slot(badge: u64) -> usize {
+    match badge {
+        DELAY_TIMER_BADGE => 36,
+        IRQ_BADGE => 37,
+        ISR_DONE_BADGE | CN_GUARD_BADGE => 38,
+        b if (b as usize) < 36 => b as usize,
+        _ => 39,
+    }
+}
+/// Timer-storm diagnostics: HPET one-shot deliveries the service loop saw, and how many of them
+/// woke NOTHING (a rearm that keeps firing on an already-past deadline is a livelock, not work).
+pub(crate) static TIMER_TICKS_SEEN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TIMER_TICKS_SPURIOUS: AtomicU64 = AtomicU64::new(0);
+/// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
+/// 1 = delay queue, 2 = event waiter, 3 = keyed waiter, 4 = io-completion waiter.
+pub(crate) static TIMER_PAST_DEADLINE_SOURCE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TIMER_PAST_DEADLINE_REARMS: AtomicU64 = AtomicU64::new(0);
+/// What the last `delay_timer_rearm` actually programmed, so a spurious tick can be explained.
+pub(crate) static LAST_REARM_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static LAST_REARM_SOURCE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_REARM_TARGET: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_REARM_NOW: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
+/// Print the census. Called once, after the loop quiesces, from the spec runner.
+pub(crate) fn print_progress_census() {
+    let quiesce_t = monotonic_time_100ns();
+    print_str(b"[census] quiesce_t_ms=");
+    print_u64(quiesce_t / 10_000);
+    print_str(b"\n");
+    for badge in 0..BADGE_CENSUS_N {
+        let events = BADGE_EVENTS[badge].load(Ordering::Relaxed);
+        if events == 0 {
+            continue;
+        }
+        print_str(b"[census] badge=");
+        print_u64(badge as u64);
+        print_str(b" events=");
+        print_u64(events);
+        print_str(b" ms=");
+        print_u64(BADGE_TIME_100NS[badge].load(Ordering::Relaxed) / 10_000);
+        print_str(b" last_ms=");
+        print_u64(BADGE_LAST_T[badge].load(Ordering::Relaxed) / 10_000);
+        print_str(b"\n");
+    }
+    print_str(b"[census] timer ticks-seen=");
+    print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
+    print_str(b" spurious=");
+    print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
+    print_str(b" past-deadline-rearms=");
+    print_u64(TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed));
+    print_str(b" last-past-source=");
+    print_u64(TIMER_PAST_DEADLINE_SOURCE.load(Ordering::Relaxed));
+    print_str(b" (1=delay 2=event 3=keyed 4=iocp)\n");
+    print_ssn_hist(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
+    print_ssn_hist(b"winlogon", unsafe {
+        &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
+    });
+}
+/// Print the 12 hottest SSNs of a histogram (selection sort over the buckets — no alloc).
+fn print_ssn_hist(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
+    let mut total = 0u64;
+    for bucket in hist.iter() {
+        total += bucket.load(Ordering::Relaxed);
+    }
+    print_str(b"[census] ssn-hist ");
+    print_str(who);
+    print_str(b" total=");
+    print_u64(total);
+    print_str(b" top:");
+    let mut taken = [false; SSN_HIST_N];
+    for _ in 0..12 {
+        let mut best = usize::MAX;
+        let mut best_n = 0u64;
+        for (ssn, bucket) in hist.iter().enumerate() {
+            let n = bucket.load(Ordering::Relaxed);
+            if !taken[ssn] && n > best_n {
+                best_n = n;
+                best = ssn;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        print_str(b" 0x");
+        print_hex(best as u32);
+        print_str(b"=");
+        print_u64(best_n);
+    }
+    print_str(b"\n");
+}
 /// RPC PDUs the LSA per-connection worker READ off the accepted `\pipe\lsarpc` connection, and the
 /// PDU type byte (offset 2) of the first one. A real MS-RPC bind is type 0x0b.
 pub(crate) static LSA_WORKER_PDU_READS: AtomicU64 = AtomicU64::new(0);
@@ -4304,8 +4573,8 @@ fn release_reply_pool_cap(cap: u64) {
 /// leaving a stray binding would let it interact with `delay_timer_init`'s own later bind.
 ///
 /// Deliberately does NOT use the HPET: no comparator is armed, no IOAPIC route is claimed and no IRQ
-/// is left needing an Ack, so the injection cannot perturb the real delay-timer plane (which, with
-/// `LSA_WORKER_ROUTE_ENABLED` off, is never initialised on this boot at all).
+/// is left needing an Ack, so the injection cannot perturb the real delay-timer plane (which the
+/// LSA route DOES now initialise — this injection stays independent of it by construction).
 unsafe fn inject_bound_notification_tick() -> bool {
     let notification = make_object(OBJ_NOTIFICATION);
     if notification == 0 {
@@ -4382,7 +4651,10 @@ unsafe fn delay_timer_init() -> bool {
         0,
     );
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let config = (1u64 << 2) | (pin << 9);
+    // LEVEL-triggered (matching the IOAPIC pin we just issued) and DISARMED: the timer delivers
+    // only while `delay_timer_rearm` has a real deadline to arm it with. Init used to set
+    // `Tn_INT_ENB` here and never clear it again, which is what made the disarm path a no-op.
+    let config = HPET_TN_INT_TYPE_LEVEL | (pin << 9);
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
@@ -4428,13 +4700,43 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
         let target = nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period);
         let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+        // DIAGNOSTIC: a deadline that is ALREADY PAST is clamped to `now + 1`, so the comparator
+        // re-fires immediately. If the waiter holding it is not popped by any `*_wake_due`, that
+        // is a self-sustaining interrupt storm, not a timer. Attribute the source.
+        let source = if queue.next_deadline() == Some(deadline) {
+            1
+        } else if event_deadline == Some(deadline) {
+            2
+        } else if keyed_deadline == Some(deadline) {
+            3
+        } else {
+            4
+        };
+        if target <= now {
+            TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
+            TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
+        }
+        LAST_REARM_DEADLINE.store(deadline, Ordering::Relaxed);
+        LAST_REARM_SOURCE.store(source, Ordering::Relaxed);
+        LAST_REARM_TARGET.store(target, Ordering::Relaxed);
+        LAST_REARM_NOW.store(now, Ordering::Relaxed);
+        LAST_REARM_ARMED.store(1, Ordering::Relaxed);
         core::ptr::write_volatile(
             (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
             target.max(now.saturating_add(1)),
         );
-        config |= 1u64 << 1;
+        // ARM. The comparator is written FIRST so the enable edge arms against the new deadline.
+        config |= HPET_TN_INT_ENB;
     } else {
-        config &= !(1u64 << 1);
+        // DISARM — nothing is waiting on time, so the timer must stop delivering entirely.
+        // This used to clear `Tn_INT_TYPE_CNF` (bit 1) instead, leaving `Tn_INT_ENB` set with a
+        // comparator now permanently BEHIND the main counter. The result was a self-sustaining
+        // ~34 kHz interrupt storm: measured 2,745,189 spurious deliveries in one boot (99.9999% of
+        // all ticks woke nothing), 80 s of the executive's single-threaded service loop, which
+        // starved winlogon of the forward progress the desktop paint needs. See
+        // `exec_delay_timer_disarms` and `docs/transport-migration.md` §5.
+        LAST_REARM_ARMED.store(0, Ordering::Relaxed);
+        config &= !HPET_TN_INT_ENB;
     }
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
 }
@@ -4538,10 +4840,38 @@ unsafe fn delay_timer_interrupt(
     handler: &mut ExecNtHandler,
 ) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let _ = delay_wake_due(queue);
-    let _ = wait_wake_due();
-    let _ = keyed_wait_wake_due();
-    let _ = io_completion_wake_due(handler);
+    let woken = delay_wake_due(queue)
+        + wait_wake_due()
+        + keyed_wait_wake_due()
+        + io_completion_wake_due(handler);
+    TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+    if woken == 0 {
+        let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
+        if n < 10 || n % 400_000 == 0 {
+            let counter = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+            let cmp = core::ptr::read_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *const u64);
+            let cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+            print_str(b"[timer-storm] spurious #");
+            print_u64(n);
+            print_str(b" counter=0x");
+            print_hex_u64(counter);
+            print_str(b" cmp=0x");
+            print_hex_u64(cmp);
+            print_str(b" cfg=0x");
+            print_hex_u64(cfg);
+            print_str(b" armed=");
+            print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
+            print_str(b" src=");
+            print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
+            print_str(b" deadline=");
+            print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
+            print_str(b" now100=");
+            print_u64(monotonic_time_100ns());
+            print_str(b" delayq=");
+            print_u64(queue.len() as u64);
+            print_str(b"\n");
+        }
+    }
     delay_timer_rearm(queue);
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
@@ -4562,7 +4892,8 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>
         return;
     }
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !(1u64 << 1);
+    // Same correction as `delay_timer_rearm`'s disarm: clear the ENABLE bit, not the trigger-type.
+    config &= !HPET_TN_INT_ENB;
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = syscall5(

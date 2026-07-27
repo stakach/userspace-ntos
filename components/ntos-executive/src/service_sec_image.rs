@@ -775,6 +775,10 @@ pub(crate) unsafe fn service_sec_image(
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
     let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
     let mut last_progress_t = monotonic_time_100ns();
+    // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
+    // consecutive loop tops to the badge that was serviced in between, and count the iterations.
+    let mut census_prev_t = last_progress_t;
+    let mut census_prev_badge = usize::MAX;
     loop {
         if ntdll.is_some() {
             publish_kuser_clocks();
@@ -784,6 +788,17 @@ pub(crate) unsafe fn service_sec_image(
         {
             let ep = PROGRESS_EPOCH.load(Ordering::Relaxed);
             let now = monotonic_time_100ns();
+            {
+                let slot = census_slot(badge);
+                if census_prev_badge != usize::MAX {
+                    BADGE_TIME_100NS[census_prev_badge]
+                        .fetch_add(now.wrapping_sub(census_prev_t), Ordering::Relaxed);
+                }
+                BADGE_EVENTS[slot].fetch_add(1, Ordering::Relaxed);
+                BADGE_LAST_T[slot].store(now, Ordering::Relaxed);
+                census_prev_badge = slot;
+                census_prev_t = now;
+            }
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
                 last_progress_t = now;
@@ -2368,6 +2383,17 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" arg2=0x");
                     print_hex(arg2 as u32);
                     print_str(b"\n");
+                }
+            }
+            // FORWARD-PROGRESS CENSUS: per-SSN histogram for the two processes that matter to the
+            // starvation question — lsass (whose self-RPC is suspected of churning) and winlogon
+            // (whose SAS window the paint depends on). A poll/retry livelock is unmistakable here.
+            if pi == 4 || pi == 2 {
+                let bucket = (ssn as usize).min(SSN_HIST_N - 1);
+                if pi == 4 {
+                    LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed);
                 }
             }
             if is_lsa_worker {
@@ -8284,8 +8310,31 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                     }
-                    let (_wb, w_mi, w_m0, _w1, w_m2, _w3) =
-                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    // ★ SELECT this test's client, don't just take whatever arrives. `fault_ep` is
+                    // the executive's SHARED endpoint: a hosted thread that was still runnable when
+                    // the loop quiesced can land here first, and a bare `recv` would then read ITS
+                    // message as the client's (observed: a win32k `m0 = 0x101b` from a still-live
+                    // winlogon worker, which made this step read a foreign syscall and silently skip
+                    // the whole assertion). Any foreign message is simply LEFT UNANSWERED — the boot
+                    // has already quiesced, so an un-replied caller is exactly as parked as every
+                    // other thread on the `[parked]` list. The selection is on the client's own
+                    // distinctive SSN, so the assertion below is unchanged in strength.
+                    let mut w_mi = 0u64;
+                    let mut w_m0 = 0u64;
+                    let mut w_m2 = 0u64;
+                    let mut select_guard = 0;
+                    while select_guard < 8 {
+                        select_guard += 1;
+                        let (_wb, mi_r, m0_r, _w1, m2_r, _w3) =
+                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        w_mi = mi_r;
+                        w_m0 = m0_r;
+                        w_m2 = m2_r;
+                        if (mi_r >> 12) == 2 && m0_r == 0xD1 {
+                            break;
+                        }
+                        dbgk_blk_trace(b"dw1-foreign", mi_r, m0_r, 0, marker_d());
+                    }
                     let w_ip = w_m2; // RCX = the syscall return address (the loop's `resume_ip`)
                     let w_sp = get_recv_mr(16);
                     let w_flags = get_recv_mr(17);
