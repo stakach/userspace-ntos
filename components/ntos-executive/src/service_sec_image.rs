@@ -1262,6 +1262,158 @@ pub(crate) unsafe fn service_sec_image(
                 // held by the DEBUG_EVENT. The next event has already been received.
                 continue;
             }
+            // ★ POST-LOGON CPU-EXCEPTION DIAGNOSTIC (bounded to the first 4). A label-3 fault
+            // reports only IP/SP/FLAGS/vector/code, which is not enough to tell a bad POINTER from a
+            // bad TARGET. Recover the faulting thread's GPRs, the stack's return-address chain and —
+            // when the fault IP is inside our `RtlEnterCriticalSection` — the 40-byte
+            // `RTL_CRITICAL_SECTION` the caller handed us, so the wall is MEASURED, not attributed.
+            if pi == 2
+                && owner_top_badge(badge) == WINLOGON_BADGE
+                && crate::WL_CPUEXC_DIAG_N.fetch_add(1, Ordering::Relaxed) < 4
+            {
+                let tcb = if badge == WINLOGON_BADGE {
+                    crate::PM_MAIN_TCBS[2].load(Ordering::Relaxed)
+                } else {
+                    0
+                };
+                let mut regs = [0u64; 20];
+                if tcb != 0 {
+                    crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                }
+                let (rip, rsp, rax, rcx, rdx) = (regs[0], regs[1], regs[3], regs[5], regs[6]);
+                let ntdll_base = ntdll.map(|(nb, _)| nb).unwrap_or(0);
+                print_str(b"[cs-diag] label=3 exc#=");
+                print_u64(m3);
+                print_str(b" code=0x");
+                print_hex(get_recv_mr(4) as u32);
+                print_str(b" fip=n+0x");
+                print_hex(fip.wrapping_sub(ntdll_base) as u32);
+                print_str(b" rip=n+0x");
+                print_hex(rip.wrapping_sub(ntdll_base) as u32);
+                print_str(b" rsp=0x");
+                print_hex((rsp >> 32) as u32);
+                print_hex(rsp as u32);
+                print_str(b" rax=0x");
+                print_hex((rax >> 32) as u32);
+                print_hex(rax as u32);
+                print_str(b" rcx=0x");
+                print_hex((rcx >> 32) as u32);
+                print_hex(rcx as u32);
+                print_str(b" rdx=0x");
+                print_hex((rdx >> 32) as u32);
+                print_hex(rdx as u32);
+                // Canonical-address test: a #GP(0) on a memory operand in long mode is what a
+                // NON-canonical effective address produces (a merely unmapped/RO page is a #PF).
+                let canonical = {
+                    let top = rcx >> 47;
+                    top == 0 || top == 0x1FFFF
+                };
+                print_str(b" rcx-canonical=");
+                print_u64(canonical as u64);
+                print_str(b"\n");
+                let stk_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+                let stk_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+                let stk_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+                let read_wl = |va: u64| -> Option<u64> {
+                    unsafe {
+                        if va >= stk_base && va + 8 <= stk_base + stk_size {
+                            return Some(core::ptr::read_volatile(
+                                (stk_mirror + (va - stk_base)) as *const u64,
+                            ));
+                        }
+                        img_spawn::client_read_u64_mapped(
+                            pi as u64,
+                            va,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                    }
+                };
+                // The RTL_CRITICAL_SECTION itself: DebugInfo/LockCount/RecursionCount/OwningThread/
+                // LockSemaphore/SpinCount at +0x00/08/0c/10/18/20.
+                if canonical {
+                    print_str(b"[cs-diag] CS@0x");
+                    print_hex((rcx >> 32) as u32);
+                    print_hex(rcx as u32);
+                    let mut ok = true;
+                    for off in (0..0x28u64).step_by(8) {
+                        match read_wl(rcx + off) {
+                            Some(v) => {
+                                print_str(b" +0x");
+                                print_u64(off);
+                                print_str(b"=0x");
+                                print_hex((v >> 32) as u32);
+                                print_hex(v as u32);
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        print_str(b" <unreadable: not backed by any mapped frame>");
+                    }
+                    print_str(b"\n");
+                }
+                // The live TEB tail through the executive's persistent alias: TEB+0x1698 is
+                // `ReservedForNtRpc`, rpcrt4's per-thread `threaddata` cache.
+                if crate::TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << 2) != 0 {
+                    print_str(b"[cs-diag] live TEB+0x1680..0x16b0:");
+                    let mut off = 0u64;
+                    while off < 0x30 {
+                        print_str(b" ");
+                        print_hex((core::ptr::read_volatile(
+                            (crate::WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x680 + off)
+                                as *const u64,
+                        ) >> 32) as u32);
+                        print_hex(core::ptr::read_volatile(
+                            (crate::WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x680 + off)
+                                as *const u64,
+                        ) as u32);
+                        off += 8;
+                    }
+                    print_str(b"\n");
+                }
+                // The return-address chain. RtlEnterCriticalSection's frame is push/push/sub 0x28,
+                // so its own return address sits at SP+0x38 at the faulting instruction.
+                print_str(b"[cs-diag] ret@sp+0x38=0x");
+                match read_wl(rsp + 0x38) {
+                    Some(v) => {
+                        print_hex((v >> 32) as u32);
+                        print_hex(v as u32);
+                        if ntdll_base != 0 && v >= ntdll_base {
+                            print_str(b" (n+0x");
+                            print_hex(v.wrapping_sub(ntdll_base) as u32);
+                            print_str(b")");
+                        }
+                    }
+                    None => print_str(b"?"),
+                }
+                print_str(b" callers:");
+                let mut shown = 0;
+                for i in 0..96u64 {
+                    if let Some(v) = read_wl(rsp + i * 8) {
+                        if let Some((nb, npe)) = ntdll {
+                            if v >= nb && v < nb + image_extent(npe) {
+                                print_str(b" n+0x");
+                                print_hex((v - nb) as u32);
+                                shown += 1;
+                            }
+                        }
+                        if v >= 0x8000_0000 && v < 0x8080_0000 {
+                            print_str(b" d+0x");
+                            print_hex(v as u32);
+                            shown += 1;
+                        }
+                        if shown >= 24 {
+                            break;
+                        }
+                    }
+                }
+                print_str(b"\n");
+            }
             // ★ WINLOGON POST-LOGON MILESTONE PARK — the same rule the #PF arm applies, and for the
             // same reason. Once the interactive logon has really completed, a fault on winlogon's
             // post-logon path is a FRONTIER, not a crash: `park_and_log!` would latch the whole
@@ -5315,6 +5467,14 @@ pub(crate) unsafe fn service_sec_image(
                         );
                     }
                     crate::teb_tail_watch(pi, 1, m0, 0);
+                    // ★ `KiSystemCallHandler`'s win32k arm (ntoskrnl/ke/amd64/traphandler.c:180):
+                    // BEFORE dispatching any win32k system call, if the caller's
+                    // `TEB.GdiBatchCount != 0`, run `KeGdiFlushUserBatch`. Without this step
+                    // `gdi32!GdiAllocBatchCommand`'s `GdiTebBatch.Offset` never resets and the
+                    // deferred-GDI records march straight through the caller's TEB — the single root
+                    // cause of the whole TEB-clobber family (batches 53/59/60) and of winlogon's
+                    // `#GP` in `RtlEnterCriticalSection` on rpcrt4's `TEB.ReservedForNtRpc`.
+                    crate::ke_gdi_flush_user_batch(pi, client_teb);
                     let r = win32k_glue::win32k_dispatch_wide(
                         m0,
                         d_a0,

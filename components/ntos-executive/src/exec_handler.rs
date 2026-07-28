@@ -2010,7 +2010,37 @@ impl ExecNtHandler {
         desired_access: u32,
     ) -> Option<(usize, u64, u64)> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let (slot, tid) = self.claim_pool_thread(self.pi, entry, create_suspended)?;
+        let (slot, tid) = match self.claim_pool_thread(self.pi, entry, create_suspended) {
+            Some(claimed) => claimed,
+            None => {
+                // A refused runtime thread create surfaces to the caller only as
+                // STATUS_INSUFFICIENT_RESOURCES (rpcrt4 prints `error=5aa` and drops the
+                // connection), so NAME the reason: which pool, how full, and whether the pre-created
+                // ETHREAD pool had a slot at all.
+                if crate::PM_POOL_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
+                    unsafe {
+                        print_str(b"[thread-pool] REFUSED NtCreateThread pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" used-mask=0x");
+                        print_hex(
+                            PM_POOL_USED
+                                .get(self.pi)
+                                .map(|used| used.load(Ordering::Relaxed))
+                                .unwrap_or(0) as u32,
+                        );
+                        print_str(b" slots=");
+                        print_u64(PM_RUNTIME_THREAD_SLOTS as u64);
+                        print_str(b" pool-tids:");
+                        for index in 0..PM_RUNTIME_THREAD_SLOTS {
+                            print_str(b" ");
+                            print_u64(PM_POOL_TID[self.pi][index].load(Ordering::Relaxed));
+                        }
+                        print_str(b"\n");
+                    }
+                }
+                return None;
+            }
+        };
         let used = PM_POOL_USED.get(self.pi)?;
         let t = tid as nt_process::ThreadId;
         let h =

@@ -214,3 +214,54 @@ interrupt storm: every comparator write must be strictly AHEAD of the main count
 trigger-type bit is never an arm control. Count a watchdog delivery as WORK, or it inflates the
 "woke nothing" metric that exists to detect a storm. A nested pump that merely LATCHES the tick must
 also re-arm + Ack it, or a deadlock inside a dispatch gets exactly one tick and can never trip.
+
+## BATCH 61 — DISASSEMBLE THE FAULTING INSTRUCTION BEFORE THEORISING ABOUT THE FUNCTION
+A fault reported as "`RtlEnterCriticalSection+0x14` — our code" produced a whole candidate list
+(`DebugInfo == -1`, NULL `LockSemaphore`, a wrong field offset, an uninitialised CS). Objdump on the
+staged DLL answered it in one command: `+0x14` is `lock incl 0x8(%rcx)`, the FIRST dereference of the
+structure. Everything on the list is downstream of an instruction that never ran, so the function was
+never a suspect — only its ARGUMENT was. Rules:
+- **`objdump -d --start-address=<base+rva>` the artefact you actually shipped.** The symbol name plus
+  an offset is not a diagnosis; the instruction is.
+- **Read the exception VECTOR, not just "it crashed".** seL4 label 3 carried `exc# = 13` (`#GP`) with
+  `code = 0`. In long mode a memory operand only `#GP(0)`s when the effective address is
+  NON-CANONICAL — a `#PF` would mean unmapped/read-only. That single bit says "the pointer is
+  garbage", not "the memory is bad", and it eliminated half the hypotheses for free.
+- **A label-3/label-6 fault message carries IP/SP only; recover the GPRs.** `tcb_read_regs20` plus
+  `[rsp + <frame size from the prologue>]` gives the argument AND the caller's return address, which
+  named the module and the exact call site (`rpcrt4+0x4d97e`) in the same boot.
+
+## BATCH 61 — WHEN A FIELD IS WRITTEN CORRECTLY AND LATER WRONG, WATCH THE FIELD, NOT THE SUSPECTS
+The `TEB.ReservedForNtRpc` slot went `0 -> <real heap pointer, stored by rpcrt4 itself> -> garbage`.
+An 8-byte watch on that ONE address — sampled at every service-loop event and on both sides of every
+win32k dispatch, reporting only TRANSITIONS with the neighbouring 0x30 bytes — turned "who corrupts
+the TEB" into "the neighbourhood 0x1680..0x16A8 fills with structured data while the CLIENT runs".
+That is what made the answer findable: it was gdi32's deferred-GDI batch writing at
+`TEB + 0x300 + Offset`, with `Offset` unbounded. Three batches had blamed win32k for the same class.
+**Corollary: an unbounded producer with a bound the CONSUMER is supposed to reset is a clobber
+engine.** When a client-side buffer has a "the kernel empties this" contract (`GdiTebBatch`,
+`GdiBatchCount`), the host MUST implement the emptying step, or the buffer walks whatever follows it.
+
+## BATCH 61 — A BUG CAN BE LOAD-BEARING; CHECK WHAT THE BROKEN STATE WAS ACCIDENTALLY BUYING
+Bounding `GdiTebBatch.Offset` correctly LOST drawing: `ExtTextOutW`/`PolyPatBlt` fall through to the
+real win32k system call **only when the batch record would not fit**, so the runaway `Offset` was the
+only reason those calls reached win32k at all. Fixing it silently converted a memory-corruption bug
+into a lost-rendering bug (`exec_msgina_credentials_entered` went red, `gdi-readbacks` 1 -> 0). Rules:
+- **After a root-cause fix, diff the SPEC LIST, not just the symptom.** The spec that goes red is
+  telling you what the bug was propping up.
+- **Re-anchor an observation to the data, not to the transport.** The credential read-back moved from
+  a dispatched `NtGdiExtTextOutW` to a `GdiBCTextOut` batch record — the same live `EDITSTATE.text`.
+  Asserting the CONTENT (with the walk in a host-tested crate) survives the transport change; asserting
+  the SSN did not.
+- **A "clean" total fix can be worse than a scoped one — measure it.** Disabling gdi32 batching
+  outright (a non-HDC sentinel in `GdiTebBatch.HDC`) looked more correct and was measured at
+  **226/99 with 27 FAILs**. One control boot beat a plausible argument.
+
+## BATCH 61 — "CLAIMED A SLOT" IS NOT "GOT A THREAD"
+Batch 60 shipped `exec_lsarpc_deadlock_guarded` asserting the extra RPC connection worker was
+*claimed*; the claim succeeded and `NtCreateThread` still answered STATUS_INSUFFICIENT_RESOURCES,
+because the pre-created ETHREAD pool behind the slot was empty (`used-mask = 0x1f`, all 5). It stayed
+invisible for a batch because the process then crashed for an unrelated reason before it could
+deadlock. Assert the RESOURCE the caller receives, and make every "insufficient resources" refusal
+print WHICH pool and how full — a status code that several distinct causes collapse onto is a
+diagnosis-free failure.

@@ -1959,6 +1959,11 @@ static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// its already-filled frame instead of re-filled from the raw PE, so reloc/IAT-snap fixups survive).
 static FIXUP_REMAP_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_HANDLE_FAULT_DIAG_N: AtomicU64 = AtomicU64::new(0);
+/// BATCH 61 — bounded diagnostic for winlogon's post-logon CPU exception (label 3). Dumps the
+/// faulting thread's GPRs, the stack's return-address chain and — when the fault IP is inside our
+/// `RtlEnterCriticalSection` — the `RTL_CRITICAL_SECTION` the caller handed us, so the wall is
+/// MEASURED rather than attributed.
+pub(crate) static WL_CPUEXC_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static KERNEL32_TABLE_WATCH_SCRATCH: AtomicU64 = AtomicU64::new(0);
 static KERNEL32_TABLE_WATCH_CORRUPT: AtomicU64 = AtomicU64::new(0);
 /// (B) SPIN WATCHDOG for the win32k dispatch. A hosted GUI client (notably csrss's user32
@@ -2158,6 +2163,20 @@ pub(crate) unsafe fn winlogon_credential_observe_text_out(string: u64, count: u6
     if !img_spawn::smss_copyin(string, &mut bytes) {
         return;
     }
+    winlogon_credential_observe_text_bytes(&bytes, count, b"NtGdiExtTextOutW");
+}
+
+/// The same READ-BACK, from UTF-16 bytes already in the executive's hands. `via` names the transport
+/// the render request arrived on, because there are now two REAL ones: a dispatched
+/// `NtGdiExtTextOutW`, and a `GdiBCTextOut` record in the caller's own `GdiTebBatch` (which
+/// `ke_gdi_flush_user_batch` reads through the executive's TEB alias). Both carry the SAME evidence —
+/// the live `EDITSTATE.text` buffer the edit control renders — so the assertion is about the
+/// control's content, not about which of gdi32's two code paths happened to carry it.
+pub(crate) unsafe fn winlogon_credential_observe_text_bytes(bytes: &[u8], count: u64, via: &[u8]) {
+    let expected = &nt_user_callback::LOGON_USERNAME;
+    if count as usize != expected.len() || bytes.len() < 2 * expected.len() {
+        return;
+    }
     for (index, unit) in expected.iter().enumerate() {
         if u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]) != *unit {
             return;
@@ -2167,7 +2186,9 @@ pub(crate) unsafe fn winlogon_credential_observe_text_out(string: u64, count: u6
     if state.text_readbacks() == 0 {
         print_str(b"[cred-inject] IDD_LOGON edit control RENDERED the injected user name (");
         print_u64(count);
-        print_str(b" chars via NtGdiExtTextOutW)\n");
+        print_str(b" chars via ");
+        print_str(via);
+        print_str(b")\n");
     }
     state.record_text_readback();
     winlogon_credential_store(state);
@@ -3006,6 +3027,74 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     vm_pool_headroom_spec(passed);
     unsafe { teb_tail_protected_spec(passed) };
     unsafe { lsarpc_connection_worker_spec(passed) };
+    unsafe { gdi_user_batch_flush_spec(passed) };
+}
+
+/// ═══ THE KERNEL FLUSHES THE GDI USER BATCH, SO THE CLIENT'S TEB STOPS BEING EATEN ═══════════════
+///
+/// The whole TEB-clobber family (batch 53's `ACTIVATION_CONTEXT_STACK`, batch 59/60's
+/// `StaticUnicodeString`, and this batch's `#GP` in `RtlEnterCriticalSection` on rpcrt4's
+/// `TEB.ReservedForNtRpc`) was ONE bug: `gdi32!GdiAllocBatchCommand` appends deferred GDI records at
+/// `TEB + 0x300 + GdiTebBatch.Offset` and relies on the KERNEL clearing `Offset`/`GdiBatchCount` at
+/// every win32k system call (`KiSystemCallHandler` → `KeGdiFlushUserBatch`). Our host never did, so
+/// `Offset` grew without bound and walked the TEB.
+///
+/// Every clause is a counter off the REAL path, and each one fails for a different reason:
+///  * the kernel step really RAN on a live client win32k system call (`flushes >= 1`) — otherwise
+///    this spec would pass vacuously on a boot where no GDI batching happened at all;
+///  * `GdiTebBatch.Offset` NEVER exceeded `GDIBATCHBUFSIZE` at any win32k system call — the direct
+///    statement of the bug ("the buffer overran its own bounds"), and the clause that goes red the
+///    instant the flush is bypassed;
+///  * winlogon's LIVE `TEB.ReservedForNtRpc` is either NULL or CANONICAL — the exact field rpcrt4
+///    dereferences without validating, read from the real tail through the executive's alias;
+///  * the whole 0x1680..0x16A8 neighbourhood the overrun used to reach is still what the spawn left
+///    (`Vdm`/`DbgSsReserved` zero) — a region no legitimate writer touches;
+///  * the spawn canary at `TEB+0x1FC0` is intact, so nothing else walked the page either.
+unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
+    let flushes = GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
+    let discarded = GDI_BATCH_RECORDS_DISCARDED.load(Ordering::Relaxed);
+    let max_offset = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
+    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
+    let ntrpc = core::ptr::read_volatile((tail + 0x698) as *const u64);
+    let vdm = core::ptr::read_volatile((tail + 0x690) as *const u64);
+    let tls_links = core::ptr::read_volatile((tail + 0x680) as *const u64);
+    let dbgss = core::ptr::read_volatile((tail + 0x6a0) as *const u64);
+    let live_offset = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2F0) as *const u32);
+    // A user-mode pointer is canonical AND below the 128 TiB user half; NULL is equally fine (it is
+    // what makes rpcrt4 ALLOCATE a threaddata instead of dereferencing a non-pointer).
+    let ntrpc_ok = ntrpc == 0 || (ntrpc >> 47) == 0;
+    print_str(b"[gdi-batch] KeGdiFlushUserBatch flushes=");
+    print_u64(flushes);
+    print_str(b" records-cleared=");
+    print_u64(discarded);
+    print_str(b" max-Offset=0x");
+    print_hex(max_offset as u32);
+    print_str(b"/0x");
+    print_hex(GDI_BATCH_BUF_SIZE);
+    print_str(b" live-Offset=0x");
+    print_hex(live_offset);
+    print_str(b" | winlogon TEB+0x1680=0x");
+    print_hex_u64(tls_links);
+    print_str(b" +0x1690=0x");
+    print_hex_u64(vdm);
+    print_str(b" ReservedForNtRpc=0x");
+    print_hex_u64(ntrpc);
+    print_str(b" +0x16a0=0x");
+    print_hex_u64(dbgss);
+    print_str(b"\n");
+    check(
+        b"exec_gdi_user_batch_flushed",
+        GDI_USER_BATCH_FLUSH
+            && flushes >= 1
+            && max_offset <= GDI_BATCH_BUF_SIZE as u64
+            && live_offset <= GDI_BATCH_BUF_SIZE
+            && ntrpc_ok
+            && vdm == 0
+            && tls_links == 0
+            && dbgss == 0
+            && teb_tail_canary_intact(tail),
+        passed,
+    );
 }
 
 /// ═══ ★ THE CLIENT TEB TAIL SURVIVES TO THE GATE, AND win32k IS EXONERATED ══════════════════════
@@ -5338,6 +5427,142 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
     }
 }
 
+// ═══ ★ BATCH 61 — `KeGdiFlushUserBatch`: THE MISSING KERNEL STEP THAT WAS EATING THE TEB ═══════
+//
+// **The measurement.** winlogon's post-`\lsarpc` `#GP(0)` at `RtlEnterCriticalSection+0x14`
+// (`lock inc [rcx+8]`, `rcx = 0x0005_0005_0018_010F`, NON-canonical) is rpcrt4
+// `RPCRT4_SetThreadCurrentConnection` → `get_or_create_threaddata()`, which returns
+// `NtCurrentTeb()->ReservedForNtRpc` (**x64 TEB+0x1698**) WITHOUT validating it and then enters
+// `tdata->cs` at `tdata+0x10`. A watch on that one slot showed it going
+// `0 -> 0x…3003a240` (the REAL `HeapAlloc`'d `threaddata`, stored by rpcrt4 itself at
+// `rpcrt4+0x5001f`) `-> 0x…300300ff -> 0x0000_0002_0058_00ff -> 0x0005_0005_0018_00ff`, with
+// `TEB+0x1680 = 0xff`, `TEB+0x1690 = 0xffff00c8_d0d40000` and `TEB+0x16a0 = 0x8000` appearing
+// alongside it. `0x00c8d0d4` is the SAME byte pattern batches 53/59/60 chased.
+//
+// **The cause, and it is neither win32k nor a mapping.** `gdi32!GdiAllocBatchCommand`
+// (`win32ss/gdi/gdi32/include/gdi32p.h:406`) writes each deferred GDI command into
+// `TEB.GdiTebBatch.Buffer` at `TEB + 0x300 + GdiTebBatch.Offset` and bumps `Offset` / `GdiBatchCount`.
+// Its overflow guard (`Offset + cjSize > GDIBATCHBUFSIZE (0x4D8)`) calls `NtGdiFlush()` and then
+// appends ANYWAY — because in real NT the flush is not what resets the buffer: the KERNEL does it.
+// `KiSystemCallHandler` (`ntoskrnl/ke/amd64/traphandler.c:183`) reads `NtCurrentTeb()->GdiBatchCount`
+// **before dispatching any win32k system call** and, if non-zero, calls `KeGdiFlushUserBatch()` —
+// win32k's `NtGdiFlushUserBatch` (`win32ss/gdi/ntgdi/gdibatch.c:487`), whose last act is
+// `GdiTebBatch.Offset = 0; GdiBatchCount = 0; GdiTebBatch.HDC = 0`.
+//
+// **Our host never did that step.** So `Offset` grew without bound and `GdiAllocBatchCommand`
+// marched GDI batch records straight through the caller's TEB: `Win32ClientInfo` (0x800),
+// `StaticUnicodeString` (0x1258 — `Offset` 0xF58), the TLS slots (0x1480) and `ReservedForNtRpc`
+// (0x1698 — `Offset` 0x1398). That is the single root cause of the whole TEB-clobber family, and it
+// is why win32k was measurably innocent every time it was accused (`w32 ro-maps = 0`,
+// `store-faults = 0`): the writer was always the CLIENT's own gdi32, in the client's own window.
+//
+// **The fix is the kernel step, at the kernel's site, done by the kernel.** The executive is what
+// plays `KiSystemCallHandler` for a hosted process' win32k syscalls, so it performs the flush
+// through its OWN persistent aliases of the client's two TEB pages — never through win32k's view,
+// which keeps `exec_teb_not_clobbered_by_win32k`'s "win32k stored zero times" clause meaningful.
+//
+// **What is NOT done here, stated honestly.** `NtGdiFlushUserBatch` also EXECUTES the batched
+// commands (`GdiFlushUserBatch(pDC, pHdr)` per record) before clearing. Our host does not: those
+// records are discarded, which is *exactly* what already happened before this batch (nothing ever
+// ran them), so this is a strict improvement with no rendering change — and the discarded count is
+// COUNTED (`GDI_BATCH_RECORDS_DISCARDED`) rather than hidden. Executing them means driving win32k's
+// registered `BatchFlushRoutine` over a staged TEB, which changes what gets drawn and belongs in its
+// own measured step.
+/// Ship switch for the `KeGdiFlushUserBatch` kernel step (bypass control).
+pub(crate) const GDI_USER_BATCH_FLUSH: bool = true;
+/// ★ WHAT BOUNDING `Offset` COSTS, MEASURED — and why the flush WALKS the records it clears.
+///
+/// `ExtTextOutW` (`objects/text.c:603`) and `PolyPatBlt` (`objects/painting.c:655`) re-check the LIVE
+/// `GdiTebBatch.Offset` after `GdiAllocBatchCommand` and fall through to the real
+/// `NtGdiExtTextOutW` / `NtGdiPolyPatBlt` **only when the record would not fit**. The runaway
+/// `Offset` made that check fail every time, so those calls reached win32k as real system calls.
+/// With `Offset` correctly bounded they start FITTING and are batched instead — and this host does
+/// not execute batch records, so winlogon's credential-edit `ExtTextOut` moved off the syscall path
+/// (measured: `gdi-readbacks` 1 -> 0). The DATA did not disappear, only its transport: the record in
+/// `GdiTebBatch` carries the same live `EDITSTATE.text`, and the flush reads it through the
+/// executive's TEB alias. Executing the records for real (win32k's registered `BatchFlushRoutine`)
+/// is the tracked follow-up — it changes what is DRAWN, which a corruption fix must not do blind.
+/// A control experiment that disabled batching outright (parking a non-HDC sentinel in
+/// `GdiTebBatch.HDC`, so `gdi32p.h:443` refuses every DC) was measured and REJECTED: 226/99 with 27
+/// FAILs — winlogon never reached its SAS post at all.
+///
+/// `GDIBATCHBUFSIZE` + the `TEB.GdiTebBatch` field offsets — the host-tested layout constants.
+pub(crate) use nt_user_callback::{
+    GDI_BATCH_BUF_SIZE, TEB_GDI_BATCH_COUNT, TEB_GDI_TEB_BATCH_BUFFER as GDI_TEB_BATCH_BUFFER,
+    TEB_GDI_TEB_BATCH_OFFSET as GDI_TEB_BATCH_OFFSET,
+};
+/// Number of times the kernel step really ran on a live client win32k system call.
+pub(crate) static GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
+/// Batch records the flush cleared (and, for now, discarded) — the named fidelity gap.
+pub(crate) static GDI_BATCH_RECORDS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+/// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
+/// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
+pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `pi`, exactly where
+/// `KiSystemCallHandler` runs it. Reads + clears `GdiBatchCount` / `GdiTebBatch.Offset` / `.HDC`
+/// through the EXECUTIVE's persistent aliases of the client's TEB pages (page 1 at `scr + 0x0000`,
+/// the tail at `scr + 0x5000`), so win32k's view of the tail is never involved.
+pub(crate) unsafe fn ke_gdi_flush_user_batch(pi: usize, client_teb: u64) {
+    if !GDI_USER_BATCH_FLUSH || client_teb != SMSS_TEB_VA {
+        // Only a process' MAIN thread TEB has a fixed executive alias; a hosted worker thread's TEB
+        // is a different VA and is not a win32k GUI client in this boot.
+        return;
+    }
+    let env_scratch = env_scratch_base_for_pi(pi);
+    if env_scratch == 0 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
+        return;
+    }
+    // TEB.GdiBatchCount @ 0x1740 (tail page, offset 0x740); TEB.GdiTebBatch @ 0x2F0 (page 1):
+    // Offset @ 0x2F0, HDC @ 0x2F8, Buffer @ 0x300.
+    let count_field = (env_scratch + 0x4000 + TEB_GDI_BATCH_COUNT) as *mut u32;
+    let count = core::ptr::read_volatile(count_field);
+    if count == 0 {
+        return;
+    }
+    let offset_field = (env_scratch + GDI_TEB_BATCH_OFFSET) as *mut u32;
+    let offset = core::ptr::read_volatile(offset_field);
+    let previous = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
+    if offset as u64 > previous {
+        GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
+    }
+    GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    GDI_BATCH_RECORDS_DISCARDED.fetch_add(count as u64, Ordering::Relaxed);
+    // ── WALK the records the flush is about to clear, with the host-tested
+    // `nt_user_callback::walk_gdi_batch` (the same list `NtGdiFlushUserBatch` walks). This is what
+    // keeps the credential READ-BACK real: bounding `Offset` moves winlogon's credential-edit
+    // `ExtTextOut` off the `NtGdiExtTextOutW` syscall path and INTO a `GdiBCTextOut` record, which
+    // carries the identical live `EDITSTATE.text`.
+    let buffer = env_scratch + GDI_TEB_BATCH_BUFFER;
+    let mut records = [0u8; nt_user_callback::GDI_BATCH_BUF_SIZE as usize];
+    core::ptr::copy_nonoverlapping(buffer as *const u8, records.as_mut_ptr(), records.len());
+    nt_user_callback::walk_gdi_batch(&records, offset, count, |record| {
+        if let Some((chars, start)) = record.text {
+            let want = nt_user_callback::LOGON_USERNAME.len();
+            if chars as usize == want {
+                let at = start as usize;
+                winlogon_credential_observe_text_bytes(
+                    &records[at..at + 2 * want],
+                    chars as u64,
+                    b"GdiBCTextOut batch record",
+                );
+            }
+        }
+    });
+    // "Exit and clear out for the next round" (gdibatch.c:524).
+    //
+    // ★ `GdiTebBatch.HDC` is deliberately NOT cleared, and this is the one place we knowingly differ
+    // from `NtGdiFlushUserBatch` — because we clear the records without EXECUTING them. Real NT
+    // clears `HDC` because the batch has just been drawn. Clearing it here would instead let
+    // `GdiAllocBatchCommand` start batching for the NEXT DC, whose records we would then also
+    // discard. Left claimed, `GdiAllocBatchCommand` returns NULL for every other DC
+    // (`gdi32p.h:443`) and gdi32 issues a REAL win32k system call — which is exactly what this boot
+    // already did. Executing the records means driving win32k's registered `BatchFlushRoutine`;
+    // that changes what is drawn and belongs in its own measured step, not in a corruption fix.
+    core::ptr::write_volatile(offset_field, 0);
+    core::ptr::write_volatile(count_field, 0);
+}
+
 ///
 /// Kept as a TRIPWIRE now that the CLASS fix (`W32_CLIENT_TEB_TAIL_PROTECTED`, below) exists: with
 /// the tail no longer part of win32k's writable client-frame surface this must never fire, and
@@ -5642,6 +5867,11 @@ pub(crate) static TEB_TAIL_ALIAS_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Per-pi "the tail was intact last time we looked" bit, so only the TRANSITION is reported.
 static TEB_WATCH_GOOD: [AtomicU64; 5] = [const { AtomicU64::new(1) }; 5];
 static TEB_WATCH_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// Last observed value of winlogon's `TEB.ReservedForNtRpc` (TEB+0x1698) + a bounded report budget.
+pub(crate) static WL_NTRPC_SLOT: AtomicU64 = AtomicU64::new(0);
+static WL_NTRPC_SLOT_REPORTS: AtomicU64 = AtomicU64::new(0);
+static WL_NTRPC_LAST_TAG: AtomicU64 = AtomicU64::new(u64::MAX);
+static WL_NTRPC_LAST_AUX: AtomicU64 = AtomicU64::new(0);
 /// The PREVIOUS observation point, so a transition names the event boundary it happened inside.
 static TEB_WATCH_LAST_TAG: AtomicU64 = AtomicU64::new(u64::MAX);
 static TEB_WATCH_LAST_AUX: AtomicU64 = AtomicU64::new(0);
@@ -5657,6 +5887,52 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
     let env_scratch = env_scratch_base_for_pi(pi);
     if env_scratch == 0 {
         return;
+    }
+    // ★ BATCH 61 — `TEB.ReservedForNtRpc` (x64 offset 0x1698) is rpcrt4's per-thread `threaddata`
+    // cache: `get_or_create_threaddata` returns whatever it finds there WITHOUT validating it, and
+    // then `RPCRT4_SetThreadCurrentConnection` does `EnterCriticalSection(&tdata->cs)` on
+    // `tdata + 0x10`. Report EVERY change of that one slot, with the event boundary it happened
+    // inside, so "who put a non-pointer there" is measured rather than attributed.
+    if pi == 2 {
+        let slot = core::ptr::read_volatile((env_scratch + 0x5000 + 0x698) as *const u64);
+        let previous = WL_NTRPC_SLOT.swap(slot, Ordering::Relaxed);
+        let prev_tag = WL_NTRPC_LAST_TAG.swap(tag, Ordering::Relaxed);
+        let prev_aux = WL_NTRPC_LAST_AUX.swap(aux, Ordering::Relaxed);
+        if slot != previous && WL_NTRPC_SLOT_REPORTS.fetch_add(1, Ordering::Relaxed) < 24 {
+            print_str(b"[ntrpc] TEB+0x1698 0x");
+            print_hex_u64(previous);
+            print_str(b" -> 0x");
+            print_hex_u64(slot);
+            print_str(b" at tag=");
+            print_u64(tag);
+            print_str(b" aux=0x");
+            print_hex_u64(aux);
+            print_str(b" (prev pi=2 observation tag=");
+            print_u64(prev_tag);
+            print_str(b" aux=0x");
+            print_hex_u64(prev_aux);
+            // ★ THE DECISIVE BIT: was winlogon's OWN mapping of the page read-only across the
+            // window in which the value changed? If it was, no CLIENT store could have done it
+            // without faulting — which leaves win32k's view or an executive-side alias.
+            print_str(b") client-protected=");
+            print_u64(WL_TEB2_PROTECTED.load(Ordering::Relaxed));
+            print_str(b" client-store-faults=");
+            print_u64(WL_TEB2_WRITE_FAULTS.load(Ordering::Relaxed));
+            print_str(b" w32-ro-maps=");
+            print_u64(W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed));
+            print_str(b" w32-store-faults=");
+            print_u64(W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed));
+            print_str(b" neighbours 0x1680..0x16b0:");
+            let mut off = 0u64;
+            while off < 0x30 {
+                print_str(b" ");
+                print_hex_u64(core::ptr::read_volatile(
+                    (env_scratch + 0x5000 + 0x680 + off) as *const u64,
+                ));
+                off += 8;
+            }
+            print_str(b"\n");
+        }
     }
     let tail = env_scratch + 0x5000 + 0x258;
     let max = core::ptr::read_volatile((tail + 2) as *const u16);
@@ -10394,10 +10670,22 @@ pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
 /// creation remains allocation-free. Three slots cover the existing specialized fan-out and two
 /// more admit the ntdll scheduler and completion worker without reallocating under the loop reset.
-const PM_RUNTIME_THREAD_SLOTS: usize = 5;
+///
+/// ★ RAISED 5 -> 8 (batch 61), on a MEASUREMENT rather than a guess: with the TEB corruption fixed
+/// winlogon really reaches its post-profile `LsaOpenPolicy`, rpcrt4 accepts a SECOND `\pipe\lsarpc`
+/// connection and asks for its per-connection `RPCRT4_io_thread` — and `[thread-pool] REFUSED
+/// NtCreateThread pi=4 used-mask=0x1f slots=5 pool-tids: 29 30 31 32 33` says lsass' pool was FULL,
+/// so the create answered STATUS_INSUFFICIENT_RESOURCES (`rpc_server.c:631 error=5aa`) and rpcrt4
+/// dropped the connection. Batch 60's "claim a generic worker slot" reached that refusal too; the
+/// slot it claimed existed, the ETHREAD behind it did not.
+const PM_RUNTIME_THREAD_SLOTS: usize = 8;
 static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
     [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
 static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Runtime `NtCreateThread`s refused because the pre-created ETHREAD pool had no free slot. Counted
+/// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
+/// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.
+pub(crate) static PM_POOL_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Bit `slot` is set while a runtime thread still has its initial suspend count.
 static PM_POOL_SUSPENDED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its

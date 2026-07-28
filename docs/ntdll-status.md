@@ -1135,3 +1135,87 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > winlogon raises an unhandled CPU exception at `ntdll+0x13284 = RtlEnterCriticalSection+0x14`
 > (milestone park, clean quiesce). **`NtLoadKey`/`NtUnloadKey` (SSN 102/272) were NOT reached and are
 > NOT implemented; no hive is loaded and `userinit.exe` did not spawn.**
+
+> **★★ BATCH 61 (gate 252 -> 253/99, ZERO FAILs, RUNEXIT=3, sentinel, paint 767/768 @ `0x003a6ea5`
+> plus cursor overlay, three consecutive foreground boots at 326/329/323 s with `diff`-identical
+> 253-line PASS lists) — THE WHOLE TEB-CLOBBER FAMILY WAS ONE MISSING KERNEL STEP:
+> `KeGdiFlushUserBatch`.**
+>
+> **(1) THE MEASUREMENT, before any theory.** The `#GP(0)` at `ntdll+0x13284` disassembles to
+> `RtlEnterCriticalSection+0x14 = lock incl 0x8(%rcx)` — the FIRST dereference of the critical
+> section, so nothing about `DebugInfo`, `LockSemaphore` or our `Enter` logic was ever involved.
+> A GPR dump at the fault gave `rcx = rax = 0x0005_0005_0018_010F`, **non-canonical** (which is why
+> it is a `#GP(0)` and not a `#PF`), and `ret@sp+0x38 = rpcrt4+0x4d97e`. That call site is
+> `RPCRT4_SetThreadCurrentConnection`: it calls `get_or_create_threaddata()`, which returns
+> `NtCurrentTeb()->ReservedForNtRpc` (**x64 TEB+0x1698**) *without validating it* and then enters
+> `tdata->cs` at `tdata + 0x10` (`0x…001800FF + 0x10 = 0x…0018010F`). A watch on that one slot
+> showed `0 -> 0x0000_0100_3003_a240` (the REAL `HeapAlloc`'d `threaddata`, stored by rpcrt4 itself
+> at `rpcrt4+0x5001f`) `-> 0x…300300ff -> 0x0000_0002_0058_00ff -> 0x0005_0005_0018_00ff`, with
+> `TEB+0x1680 = 0xff`, `TEB+0x1690 = 0xffff00c8_d0d40000` and `TEB+0x16a0 = 0x8000` appearing
+> around it — the same `0x00c8d0d4` bytes batches 53/59/60 chased.
+>
+> **(2) THE ROOT CAUSE.** `gdi32!GdiAllocBatchCommand` (`win32ss/gdi/gdi32/include/gdi32p.h:406`)
+> writes every deferred GDI command into `TEB.GdiTebBatch.Buffer` at `TEB + 0x300 +
+> GdiTebBatch.Offset` and bumps `Offset` / `GdiBatchCount`. Its overflow guard calls `NtGdiFlush()`
+> and then **appends anyway**, because in real NT the flush is not what empties the buffer — the
+> KERNEL is: `KiSystemCallHandler` (`ntoskrnl/ke/amd64/traphandler.c:180`) reads
+> `NtCurrentTeb()->GdiBatchCount` **before dispatching any win32k system call** and calls
+> `KeGdiFlushUserBatch()`, i.e. win32k's `NtGdiFlushUserBatch` (`win32ss/gdi/ntgdi/gdibatch.c:487`),
+> whose last act is `GdiTebBatch.Offset = 0; GdiBatchCount = 0; GdiTebBatch.HDC = 0`. **Our
+> executive — which is what plays `KiSystemCallHandler` for a hosted process' win32k syscalls —
+> never did that step.** So `Offset` grew without bound (measured **`0x15BA`, 11.8x
+> `GDIBATCHBUFSIZE`**) and marched GDI records through the caller's TEB: `Win32ClientInfo` (0x800),
+> `StaticUnicodeString` (0x1258), the TLS slots (0x1480) and `ReservedForNtRpc` (0x1698). That is
+> the single root cause of batch 53's `ACTIVATION_CONTEXT_STACK` clobber, batch 59/60's
+> `StaticUnicodeString` clobber AND this `#GP` — and it is why win32k measured innocent every time
+> it was accused (`w32 ro-maps = 0`, `store-faults = 0`): the writer was always the client's own
+> gdi32, in the client's own window.
+>
+> **(3) THE FIX** is the kernel step, at the kernel's site, done by the kernel: `ke_gdi_flush_user_batch`
+> runs at the win32k system-call entry and clears `Offset`/`GdiBatchCount` through the executive's
+> OWN persistent aliases of the client's two TEB pages — never through win32k's view, so
+> `exec_teb_not_clobbered_by_win32k`'s "win32k stored zero times" clause keeps its meaning. Ship
+> switch `GDI_USER_BATCH_FLUSH`. **No `rust-micro` change.**
+>
+> **(4) WHAT BOUNDING `Offset` COSTS, AND WHY THE FLUSH WALKS THE RECORDS.** `ExtTextOutW`
+> (`objects/text.c:603`) and `PolyPatBlt` (`objects/painting.c:655`) re-check the LIVE `Offset` after
+> `GdiAllocBatchCommand` and fall through to the real `NtGdiExtTextOutW` **only when the record would
+> not fit** — the runaway `Offset` is what forced those calls to reach win32k at all. Bounded, they
+> start fitting and get batched, and this host does not execute batch records: winlogon's credential
+> edit `ExtTextOut` moved off the syscall path exactly that way (`gdi-readbacks` 1 -> 0). The DATA did
+> not disappear, only its transport, so the flush WALKS the records it clears (host-tested
+> `nt_user_callback::walk_gdi_batch`, 5 new tests) and reads the `GdiBCTextOut` record's inline
+> string — `[cred-inject] IDD_LOGON edit control RENDERED the injected user name (13 chars via
+> GdiBCTextOut batch record)`. `GdiTebBatch.HDC` is deliberately NOT cleared (the one knowing
+> deviation from `NtGdiFlushUserBatch`): left claimed, `gdi32p.h:443` refuses every other DC and
+> gdi32 issues a real win32k system call, which is what this boot already did. **A control experiment
+> that disabled batching outright (a non-HDC sentinel in `GdiTebBatch.HDC`) was measured and
+> REJECTED: 226/99 with 27 FAILs — winlogon never reached its SAS post.** Executing the records via
+> win32k's registered `BatchFlushRoutine` is the tracked next step; it changes what is DRAWN.
+>
+> **(5) THE SECOND `\pipe\lsarpc` WORKER WAS AN EMPTY ETHREAD POOL.** Past the `#GP`, winlogon
+> really reaches its post-profile `LsaOpenPolicy`; rpcrt4 accepts a SECOND connection and asks for its
+> per-connection `RPCRT4_io_thread`. Batch 60's "claim a generic worker slot" reached the create and
+> it STILL failed — `[thread-pool] REFUSED NtCreateThread pi=4 used-mask=0x1f slots=5 pool-tids:
+> 29 30 31 32 33`: the slot existed, the pre-created ETHREAD behind it did not.
+> `PM_RUNTIME_THREAD_SLOTS` 5 -> 8. The RPC now completes and the in-`recv` deadman never trips.
+>
+> **(6) NEW SPEC** `exec_gdi_user_batch_flushed`: the kernel step really ran on a live client win32k
+> syscall (`flushes = 221`), `Offset` never exceeded `GDIBATCHBUFSIZE` (`max 0x1EE / 0x4D8`),
+> winlogon's live `ReservedForNtRpc` is canonical, `TEB+0x1680/0x1690/0x16a0` are still what the
+> spawn left, and the `TEB+0x1FC0` canary is intact.
+>
+> **BYPASS** (`GDI_USER_BATCH_FLUSH = false`): 253/99 ZERO FAILs -> **252/99 with exactly 1 FAIL**
+> (`exec_gdi_user_batch_flushed`), `live-Offset = 0x15BA`, `TEB+0x1690 = 0xffff00c8_d0d40000`,
+> `ReservedForNtRpc = 0x0005_0005_0018_00ff`, and the `[cs-diag] #GP` at
+> `RtlEnterCriticalSection+0x14` is back. Paint stays 767/768; every other spec stays green.
+>
+> **★ NEW FRONTIER.** `LoadUserProfileW` proceeds and reaches `profile.c:1094` — the
+> `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")` site — which returns **`Error: 2`
+> (ERROR_FILE_NOT_FOUND)**: the copied profile has no `ntuser.dat` (the ISO has none; `config\default`
+> is staged in DEFHIVEBUF as the source). `NtLoadKey` (SSN 102) never appears in the trace and the
+> caller does NOT park; `CreateUserProfileW` then fails and winlogon quiesces cleanly at its own
+> main-loop `GetMessage`. **No hive is loaded, `NtLoadKey`/`NtUnloadKey` are still unimplemented, and
+> `userinit.exe` did NOT spawn** — so `Userinit`/`AutoAdminLogon` is unchanged (`WlxActivateUserShell`
+> is still not reached; winlogon's SOFTWARE route stays exact-name scoped). Root-CSpace slots at the
+> gate: **107883 / 130357 (82.8 %)** with five processes.

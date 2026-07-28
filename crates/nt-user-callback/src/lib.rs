@@ -1750,6 +1750,114 @@ fn checked_payload_length(length: usize) -> Result<(), ValidationError> {
     }
 }
 
+// ═══ gdi32's DEFERRED GDI BATCH (`TEB.GdiTebBatch`) ═════════════════════════════════════════════
+//
+// `gdi32!GdiAllocBatchCommand` (`win32ss/gdi/gdi32/include/gdi32p.h:406`) appends each deferred GDI
+// command to `TEB.GdiTebBatch.Buffer` at `Offset` and bumps `Offset` / `TEB.GdiBatchCount`. The
+// KERNEL is what empties it: `KiSystemCallHandler` (`ntoskrnl/ke/amd64/traphandler.c:180`) calls
+// `KeGdiFlushUserBatch` before dispatching ANY win32k system call whenever `GdiBatchCount != 0`, and
+// `NtGdiFlushUserBatch` (`win32ss/gdi/ntgdi/gdibatch.c:487`) walks the records and then resets
+// `Offset`/`GdiBatchCount`/`HDC`. A host that omits that step lets `Offset` grow past
+// [`GDI_BATCH_BUF_SIZE`] and `GdiAllocBatchCommand` then writes GDI records straight through the
+// rest of the caller's TEB.
+//
+// The layout constants and the record WALK live here — pure, host-tested — so the executive's
+// `ke_gdi_flush_user_batch` is a thin reader over the client's TEB alias.
+
+/// `GDIBATCHBUFSIZE` — `sizeof(GDI_TEB_BATCH.Buffer)` (310 `ULONG`s).
+pub const GDI_BATCH_BUF_SIZE: u32 = 0x4D8;
+/// `TEB.GdiTebBatch` (x64 TEB offset): `Offset` @ +0x00, `HDC` @ +0x08, `Buffer` @ +0x10.
+pub const TEB_GDI_TEB_BATCH_OFFSET: u64 = 0x2F0;
+/// `TEB.GdiTebBatch.HDC`.
+pub const TEB_GDI_TEB_BATCH_HDC: u64 = 0x2F8;
+/// `TEB.GdiTebBatch.Buffer` — where the records themselves start.
+pub const TEB_GDI_TEB_BATCH_BUFFER: u64 = 0x300;
+/// `TEB.GdiBatchCount` (x64).
+pub const TEB_GDI_BATCH_COUNT: u64 = 0x1740;
+/// `GDIBATCHCMD::GdiBCTextOut` (`win32ss/include/ntgdityp.h:88`) — a batched `TextOutW`.
+pub const GDI_BC_TEXT_OUT: u16 = 2;
+/// `sizeof(GDIBSTEXTOUT)` on x64 — the minimum size a `GdiBCTextOut` record can have.
+pub const GDIBSTEXTOUT_SIZE: u32 = 0x58;
+/// `GDIBSTEXTOUT.cbCount` (character count).
+pub const GDIBSTEXTOUT_CBCOUNT: u32 = 0x38;
+/// `GDIBSTEXTOUT.Size` — the byte count of the Dx array that PRECEDES the string.
+pub const GDIBSTEXTOUT_DXSIZE: u32 = 0x3C;
+/// `GDIBSTEXTOUT.String` — the inline UTF-16 text, after the Dx array (`objects/text.c:632`).
+pub const GDIBSTEXTOUT_STRING: u32 = 0x54;
+
+/// One record found by [`walk_gdi_batch`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GdiBatchRecord {
+    /// Byte offset of the record within `GdiTebBatch.Buffer`.
+    pub offset: u32,
+    /// `GDIBATCHHDR.Size` — the record's total byte size (how the walk advances).
+    pub size: u32,
+    /// `GDIBATCHHDR.Cmd`.
+    pub command: u16,
+    /// For [`GDI_BC_TEXT_OUT`]: the character count and the buffer-relative byte offset of the
+    /// inline UTF-16 string. `None` for every other command (and for a malformed text record).
+    pub text: Option<(u32, u32)>,
+}
+
+/// Walk the `count` records `gdi32` appended to `buffer` (the first `offset` bytes of
+/// `GdiTebBatch.Buffer`), exactly as `NtGdiFlushUserBatch` does: read `GDIBATCHHDR { SHORT Size;
+/// SHORT Cmd; }`, hand the record to `visit`, advance by `Size`, stop on a zero/oversized `Size`.
+/// Returns how many records were walked — which is less than `count` iff the list is malformed.
+///
+/// Every bound is checked against BOTH the live `offset` and [`GDI_BATCH_BUF_SIZE`], because the
+/// whole point of the missing kernel step is that `Offset` can be a value the buffer cannot hold.
+pub fn walk_gdi_batch(
+    buffer: &[u8],
+    offset: u32,
+    count: u32,
+    mut visit: impl FnMut(GdiBatchRecord),
+) -> u32 {
+    let limit = offset.min(GDI_BATCH_BUF_SIZE).min(buffer.len() as u32);
+    let mut cursor = 0u32;
+    let mut walked = 0u32;
+    while walked < count && cursor + 4 <= limit {
+        let base = cursor as usize;
+        let size = u16::from_le_bytes([buffer[base], buffer[base + 1]]) as u32;
+        let command = u16::from_le_bytes([buffer[base + 2], buffer[base + 3]]);
+        if size < 4 || cursor + size > limit {
+            break;
+        }
+        let text = if command == GDI_BC_TEXT_OUT && size >= GDIBSTEXTOUT_SIZE {
+            let read = |field: u32| -> u32 {
+                let at = base + field as usize;
+                u32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]])
+            };
+            let chars = read(GDIBSTEXTOUT_CBCOUNT);
+            let dx = read(GDIBSTEXTOUT_DXSIZE);
+            let start = cursor
+                .checked_add(GDIBSTEXTOUT_STRING)
+                .and_then(|start| start.checked_add(dx));
+            match start {
+                Some(start)
+                    if chars
+                        .checked_mul(2)
+                        .and_then(|bytes| start.checked_add(bytes))
+                        .is_some_and(|end| end <= limit) =>
+                {
+                    Some((chars, start))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        visit(GdiBatchRecord {
+            offset: cursor,
+            size,
+            command,
+            text,
+        });
+        cursor += size;
+        walked += 1;
+    }
+    walked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2877,5 +2985,121 @@ mod tests {
             }
             index += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod gdi_batch_tests {
+    extern crate alloc;
+    use super::*;
+
+    /// Build one `GDIBSTEXTOUT` record carrying `text`, with an optional Dx array before the string.
+    fn text_out_record(text: &[u16], dx_bytes: u32) -> alloc::vec::Vec<u8> {
+        let size = GDIBSTEXTOUT_STRING + dx_bytes + (text.len() as u32 * 2);
+        let size = (size + 7) & !7; // gdi32 keeps records 8-aligned
+        let mut record = alloc::vec![0u8; size as usize];
+        record[0..2].copy_from_slice(&(size as u16).to_le_bytes());
+        record[2..4].copy_from_slice(&GDI_BC_TEXT_OUT.to_le_bytes());
+        let at = GDIBSTEXTOUT_CBCOUNT as usize;
+        record[at..at + 4].copy_from_slice(&(text.len() as u32).to_le_bytes());
+        let at = GDIBSTEXTOUT_DXSIZE as usize;
+        record[at..at + 4].copy_from_slice(&dx_bytes.to_le_bytes());
+        let mut at = (GDIBSTEXTOUT_STRING + dx_bytes) as usize;
+        for unit in text {
+            record[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            at += 2;
+        }
+        record
+    }
+
+    fn buffer_of(records: &[alloc::vec::Vec<u8>]) -> (alloc::vec::Vec<u8>, u32) {
+        let mut buffer = alloc::vec![0u8; GDI_BATCH_BUF_SIZE as usize];
+        let mut offset = 0usize;
+        for record in records {
+            buffer[offset..offset + record.len()].copy_from_slice(record);
+            offset += record.len();
+        }
+        (buffer, offset as u32)
+    }
+
+    fn read_text(buffer: &[u8], start: u32, chars: u32) -> alloc::vec::Vec<u16> {
+        (0..chars as usize)
+            .map(|index| {
+                let at = start as usize + index * 2;
+                u16::from_le_bytes([buffer[at], buffer[at + 1]])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn walk_finds_every_record_and_locates_the_inline_string() {
+        let first: alloc::vec::Vec<u16> = "Administrator".encode_utf16().collect();
+        let second: alloc::vec::Vec<u16> = "ok".encode_utf16().collect();
+        let (buffer, offset) = buffer_of(&[
+            text_out_record(&first, 0),
+            text_out_record(&second, 8), // a Dx array shifts the string
+        ]);
+        let mut seen = alloc::vec::Vec::new();
+        let walked = walk_gdi_batch(&buffer, offset, 2, |record| {
+            let (chars, start) = record.text.expect("both records are GdiBCTextOut");
+            seen.push(read_text(&buffer, start, chars));
+        });
+        assert_eq!(walked, 2);
+        assert_eq!(seen, alloc::vec![first, second]);
+    }
+
+    #[test]
+    fn walk_reports_non_text_commands_without_a_string() {
+        let mut record = alloc::vec![0u8; 0x20];
+        record[0..2].copy_from_slice(&0x20u16.to_le_bytes());
+        record[2..4].copy_from_slice(&7u16.to_le_bytes()); // GdiBCDelObj
+        let (buffer, offset) = buffer_of(&[record]);
+        let mut commands = alloc::vec::Vec::new();
+        assert_eq!(
+            walk_gdi_batch(&buffer, offset, 1, |r| {
+                assert!(r.text.is_none());
+                commands.push(r.command);
+            }),
+            1
+        );
+        assert_eq!(commands, alloc::vec![7u16]);
+    }
+
+    #[test]
+    fn walk_stops_on_a_zero_or_oversized_size_instead_of_running_away() {
+        let (mut buffer, _) = buffer_of(&[text_out_record(&[b'A' as u16], 0)]);
+        // A second "record" whose Size is 0 must terminate the walk, not spin.
+        let offset = GDIBSTEXTOUT_STRING + 8;
+        assert_eq!(walk_gdi_batch(&buffer, offset, 8, |_| {}), 1);
+        // A Size that runs past the live Offset is refused outright.
+        buffer[0..2].copy_from_slice(&(GDI_BATCH_BUF_SIZE as u16 + 8).to_le_bytes());
+        assert_eq!(walk_gdi_batch(&buffer, offset, 8, |_| {}), 0);
+    }
+
+    #[test]
+    fn walk_is_bounded_by_the_buffer_even_when_offset_ran_away() {
+        // ★ THE BUG this exists for: without the kernel flush, `GdiTebBatch.Offset` grows PAST the
+        // buffer (it is what marched GDI records through the rest of the TEB). The walk must clamp
+        // to GDIBATCHBUFSIZE and to the slice, never to the caller's Offset.
+        let (buffer, _) = buffer_of(&[text_out_record(&[b'Z' as u16], 0)]);
+        let walked = walk_gdi_batch(&buffer, 0x1398, 64, |record| {
+            assert!(record.offset + record.size <= GDI_BATCH_BUF_SIZE);
+        });
+        assert_eq!(walked, 1); // the one real record, then the zeroed tail stops it
+    }
+
+    #[test]
+    fn a_text_record_whose_string_would_leave_the_buffer_reports_no_text() {
+        let mut record = text_out_record(&[b'A' as u16; 4], 0);
+        // Claim far more characters than the record holds.
+        let at = GDIBSTEXTOUT_CBCOUNT as usize;
+        record[at..at + 4].copy_from_slice(&4096u32.to_le_bytes());
+        let (buffer, offset) = buffer_of(&[record]);
+        let mut records = 0;
+        walk_gdi_batch(&buffer, offset, 1, |r| {
+            assert!(r.text.is_none());
+            records += 1;
+        });
+        assert_eq!(records, 1);
     }
 }
