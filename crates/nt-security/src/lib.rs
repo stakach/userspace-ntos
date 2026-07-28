@@ -44,8 +44,8 @@ pub use token::{
     STATUS_BAD_IMPERSONATION_LEVEL, STATUS_BAD_TOKEN_TYPE, STATUS_INVALID_OWNER,
 };
 pub use token_info::{
-    encode_token_default_dacl, encode_token_owner, encode_token_statistics, InvalidTokenSid,
-    TokenInformationEncoding, TOKEN_STATISTICS_LENGTH,
+    encode_token_default_dacl, encode_token_groups, encode_token_owner, encode_token_statistics,
+    InvalidTokenSid, TokenInformationEncoding, SID_AND_ATTRIBUTES_LENGTH, TOKEN_STATISTICS_LENGTH,
 };
 
 #[cfg(test)]

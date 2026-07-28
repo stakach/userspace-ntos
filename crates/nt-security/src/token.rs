@@ -79,6 +79,26 @@ impl TokenGroup {
             owner: true,
         }
     }
+
+    /// The native `SID_AND_ATTRIBUTES.Attributes` bits for this group, as `TOKEN_GROUPS` reports
+    /// them. `SE_GROUP_MANDATORY` accompanies an enabled group that is not deny-only, matching how
+    /// the tokens modelled here are built (none of them are optional/enabled-by-request groups).
+    pub fn attributes(&self) -> u32 {
+        use crate::create_token::{
+            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_MANDATORY, SE_GROUP_OWNER,
+            SE_GROUP_USE_FOR_DENY_ONLY,
+        };
+        let mut attributes = 0;
+        if self.deny_only {
+            attributes |= SE_GROUP_USE_FOR_DENY_ONLY;
+        } else if self.enabled {
+            attributes |= SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+        }
+        if self.owner {
+            attributes |= SE_GROUP_OWNER;
+        }
+        attributes
+    }
 }
 
 /// A privilege in a token (spec §7.4).

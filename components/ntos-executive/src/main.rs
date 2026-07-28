@@ -3028,6 +3028,126 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     unsafe { teb_tail_protected_spec(passed) };
     unsafe { lsarpc_connection_worker_spec(passed) };
     unsafe { gdi_user_batch_flush_spec(passed) };
+    unsafe { profile_ntuser_dat_spec(passed) };
+    unsafe { nt_load_key_spec(passed) };
+}
+
+/// ═══ THE PROFILE HAS A REAL `ntuser.dat` — the setup step the LiveCD skips ══════════════════════
+///
+/// `CreateUserProfileExW` ends by `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")`
+/// (`profile.c:1088`). That returned **`Error: 2` (ERROR_FILE_NOT_FOUND)**: the ISO carries no
+/// `ntuser.dat` at all, because a LiveCD never runs the setup step that creates one. ReactOS setup
+/// makes it by copying `system32\config\default` — the genuine `$$$PROTO.HIV` the kernel also
+/// mounts as `HKEY_USERS\.DEFAULT` — into the Default User profile. This asserts that step ran,
+/// with that data, and that WINLOGON'S OWN `CopyDirectory` carried it into the user's profile.
+///
+/// Every clause is CONTENT, not existence: both files must parse as `regf` hives through
+/// `nt-hive-regf` (the same navigator the registry mounts them with) AND their roots must really
+/// enumerate subkeys; and the destination's length must equal the source's, which only a real
+/// `CopyFileW` of the whole file produces.
+unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
+    use crate::writable_fs::*;
+    let staged = NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed);
+    let source = regf_len_at(DEFAULT_USER_NTUSER_DAT) as u64;
+    let copied = regf_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
+    print_str(b"[wl-ntuser] Default User\\ntuser.dat provisioned=");
+    print_u64(staged);
+    print_str(b"B regf-parses=");
+    print_u64(source);
+    print_str(b"B -> copied to the profile as a regf of ");
+    print_u64(copied);
+    print_str(b"B (source=config\\default ");
+    print_u64(DEFAULT_HIVE_SIZE.load(Ordering::Relaxed));
+    print_str(b"B)\n");
+    check(
+        b"exec_profile_ntuser_dat_present",
+        !PROVISION_NTUSER_DAT
+            || (staged > 0
+                // the SOURCE profile really holds the genuine hive, byte-length exact …
+                && source == staged
+                && staged == DEFAULT_HIVE_SIZE.load(Ordering::Relaxed)
+                // … and winlogon's own CopyDirectory produced an equally real one in the profile.
+                && copied == source),
+        passed,
+    );
+}
+
+/// ═══ `NtLoadKey` / `NtUnloadKey` REALLY MOUNT AND DETACH A PER-USER HIVE ════════════════════════
+///
+/// SSN 102 / 272, faithful to `ntoskrnl/config/ntapi.c`. An UNSERVICED SSN parks the caller, so
+/// before this batch `userenv`'s `RegLoadKeyW` was a wall the moment the file existed.
+///
+/// What is asserted, and why each clause cannot be satisfied by a stub:
+///   * **the privilege is real** — `SeSinglePrivilegeCheck(SeRestorePrivilege)` is enforced, and
+///     the LocalSystem token carries that privilege present-but-DISABLED, so the only way
+///     `PRIVILEGE_HELD` can be 1 is that `userenv!AcquireRemoveRestorePrivilege(TRUE)`'s
+///     `AdjustTokenPrivileges` really ran through `NtAdjustPrivilegesToken` and enabled it;
+///   * **a real hive was mounted** — its byte length and its root's subkey count come from parsing
+///     the file the caller named, and its root must have the subkeys `config\default` has;
+///   * **it is reachable where NT puts it** — `\Registry\User\<SID>` opens really resolved, and a
+///     value read back out of the mounted hive matches the hive's OWN content;
+///   * **the unload really detaches** — the mount is gone AND the write overlay's keys under it are
+///     detached, so the path stops answering.
+unsafe fn nt_load_key_spec(passed: &mut u64) {
+    let calls = NT_LOAD_KEY_CALLS.load(Ordering::Relaxed);
+    let mounted = NT_LOAD_KEY_MOUNTED.load(Ordering::Relaxed);
+    let held = NT_LOAD_KEY_PRIVILEGE_HELD.load(Ordering::Relaxed);
+    let refused = NT_LOAD_KEY_NO_PRIVILEGE.load(Ordering::Relaxed);
+    let bytes = NT_LOAD_KEY_HIVE_BYTES.load(Ordering::Relaxed);
+    let subkeys = NT_LOAD_KEY_ROOT_SUBKEYS.load(Ordering::Relaxed);
+    let unloads = NT_UNLOAD_KEY_CALLS.load(Ordering::Relaxed);
+    let detached = NT_UNLOAD_KEY_DETACHED.load(Ordering::Relaxed);
+    let user_opens = USER_HIVE_KEY_OPENED.load(Ordering::Relaxed);
+    let default_opens = USER_DEFAULT_KEY_OPENED.load(Ordering::Relaxed);
+    let root_opens = USER_ROOT_OPENED.load(Ordering::Relaxed);
+    let readback = NT_LOAD_KEY_VALUE_READBACK.load(Ordering::Relaxed);
+    print_str(b"[cm-load] NtLoadKey calls=");
+    print_u64(calls);
+    print_str(b" mounted=");
+    print_u64(mounted);
+    print_str(b" SeRestorePrivilege-held=");
+    print_u64(held);
+    print_str(b" refused-no-privilege=");
+    print_u64(refused);
+    print_str(b" hive=");
+    print_u64(bytes);
+    print_str(b"B root-subkeys=");
+    print_u64(subkeys);
+    print_str(b" | NtUnloadKey calls=");
+    print_u64(unloads);
+    print_str(b" detached=");
+    print_u64(detached);
+    print_str(b" | \\Registry\\User opens: root=");
+    print_u64(root_opens);
+    print_str(b" .Default=");
+    print_u64(default_opens);
+    print_str(b" <SID>=");
+    print_u64(user_opens);
+    print_str(b" value-readback-ok=");
+    print_u64(readback);
+    print_str(b"\n");
+    check(
+        b"exec_ntloadkey_serviced",
+        !NT_LOAD_KEY_SERVICED
+            || (calls >= 1
+                && mounted >= 1
+                && held == 1
+                && refused == 0
+                // a REAL regf: the hive it mounted is the profile's own `ntuser.dat` …
+                && bytes == DEFAULT_HIVE_SIZE.load(Ordering::Relaxed)
+                && bytes > 0
+                // … with `config\default`'s five root subkeys (AppEvents, Control Panel,
+                // Environment, Keyboard Layout, Software) …
+                && subkeys >= 5
+                // … reachable at `HKEY_USERS\<SID>`, with a value read back BY CONTENT …
+                && root_opens >= 1
+                && user_opens >= 1
+                && readback == 1
+                // … and the unload really detached the mount.
+                && unloads >= 1
+                && detached >= 1),
+        passed,
+    );
 }
 
 /// ═══ THE KERNEL FLUSHES THE GDI USER BATCH, SO THE CLIENT'S TEB STOPS BEING EATEN ═══════════════
@@ -3462,6 +3582,8 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     let bytes = PROFILE_SOURCE_BYTES.load(Ordering::Relaxed);
     let entries = PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed);
     let probe = PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed);
+    // The one file this executive deliberately adds to the ISO's own `Default User` tree.
+    let provisioned_ntuser = (NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed) != 0) as u64;
     let (staged_default_user_dir, staged_probe_ok) = staged_profiles_by_path();
     print_str(b"[profile-source] on-image \\Profiles: `Default User` dir=");
     print_u64(staged_default_user_dir as u64);
@@ -3488,8 +3610,17 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
             // 45 directories and all 31 files (5307 bytes of genuine `.lnk`/`.cmd` content),
             // `Default User` enumerating `.`, `..` and its 15 real children through the same `Zw*`
             // record encoder `FindFirstFileW` reaches, and the same file readable off the volume.
+            //
+            // ★ Plus EXACTLY ONE deliberate addition when `PROVISION_NTUSER_DAT` is on: the
+            // `ntuser.dat` the LiveCD's skipped setup step would have left in this profile (see
+            // `writable_fs::PROVISION_NTUSER_DAT`). The counts stay EXACT — they are the ISO tree's
+            // own numbers plus that one file — so a staging regression still turns this spec red.
             && (!crate::writable_fs::PROVISION_DEFAULT_USER_PROFILE
-                || (dirs >= 45 && files >= 31 && bytes >= 5307 && entries == 17 && probe == 1)),
+                || (dirs >= 45
+                    && files >= 31 + provisioned_ntuser
+                    && bytes >= 5307 + crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed)
+                    && entries == 17 + provisioned_ntuser
+                    && probe == 1)),
         passed,
     );
 }
@@ -8794,6 +8925,12 @@ const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
 /// stored inside process-local `HandleObject::RegistryKey` entries; they are not handle values.
 const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
 const SYNTH_KBD_KEY: KeyRef = 0xFFFF_FF03;
+/// Typed key target for the predefined `HKEY_USERS` root (`\Registry\User`) — the container the
+/// per-user hives mount INTO. advapi32's `MapDefaultKey(HKEY_USERS)` opens it by name and then
+/// opens `.Default` / `<SID>` relative to it; `NtLoadKey`/`NtUnloadKey` name their target the same
+/// way. Like `MACHINE_ROOT_KEY` this is a sentinel, not a hive cell: the root itself has no
+/// backing regf (in NT it is a `\Registry` directory object, not a hive).
+const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
 /// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
 /// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
 /// far above any real cell offset and below the synthetic key targets.
@@ -8823,9 +8960,20 @@ pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
 /// `ERROR_FILE_NOT_FOUND`, `userenv!GetProfilesDirectoryW` fails (Error 2) and winlogon's
 /// `HandleLogon` takes `goto cleanup` instead of reaching `StartUserShell`.
 pub(crate) const SOFTWARE_HIVE_MOUNTED: bool = true;
-pub(crate) const HIVE_SEL_MASK: u32 = 0xE000_0000;
+/// ★ WIDENED `0xE000_0000` -> `0xF000_0000` (batch 62). The mask must leave room for the hives
+/// mounted at RUN time by `NtLoadKey` as well as the four mounted at boot, and every selector has
+/// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_synth_key` is unchanged. Four
+/// tags of 3 bits gave exactly four mounts; four bits gives EIGHT (`0x0`-`0x7`), of which the four
+/// boot mounts keep their existing values byte-for-byte and the odd ones are free for the
+/// `\Registry\User` namespace. A widened mask is safe because a real cell offset is bounded by the
+/// hive's file size and the largest hive on the image is 471040 B — three orders of magnitude
+/// below the smallest tag.
+pub(crate) const HIVE_SEL_MASK: u32 = 0xF000_0000;
 /// Hive selector 0 — the SYSTEM hive (untagged, so every pre-existing SYSTEM `KeyRef` is unchanged).
 pub(crate) const HIVE_SEL_SYSTEM: u32 = 0x0000_0000;
+/// Hive selector for `\Registry\User\.Default` — the genuine `config\default` (`$$$PROTO.HIV`)
+/// prototype hive `CmpInitializeHiveList` mounts on every NT boot, staged in `DEFHIVEBUF`.
+pub(crate) const HIVE_SEL_USER_DEFAULT: u32 = 0x1000_0000;
 /// Hive selector for `\Registry\Machine\SOFTWARE` (the 4th mount; 460 KiB, so its cell offsets stay
 /// far below the 0x2000_0000 tag).
 pub(crate) const HIVE_SEL_SOFTWARE: u32 = 0x2000_0000;
@@ -8833,6 +8981,12 @@ pub(crate) const HIVE_SEL_SOFTWARE: u32 = 0x2000_0000;
 pub(crate) const HIVE_SEL_SECURITY: u32 = 0x4000_0000;
 /// Hive selector for `\Registry\Machine\SAM`.
 pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
+/// The selectors a DYNAMIC (`NtLoadKey`) mount can take, in allocation order. Same scheme as the
+/// boot mounts — a dynamic mount differs only in WHEN it is created and in carrying its NT mount
+/// path at run time; every consumer (`base_hive`, `resolve_key`, `registry_target_path`,
+/// `open_key_from`) treats it identically.
+pub(crate) const HIVE_SEL_DYNAMIC: [u32; 2] = [0x3000_0000, 0x5000_0000];
+const _: () = assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
 /// The hive selector bits of a `KeyRef` (meaningful only for a non-synth key).
 pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
     kr & HIVE_SEL_MASK
@@ -8841,15 +8995,107 @@ pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
 pub(crate) fn hive_cell(kr: KeyRef) -> KeyRef {
     kr & !HIVE_SEL_MASK
 }
-/// The NT mount path of a hive selector (the prefix its `key_path` results hang off).
+/// The NT mount path of a BOOT hive selector (the prefix its `key_path` results hang off).
+/// Dynamic mounts carry their path at run time — see `ExecNtHandler::hive_mount_path`.
 pub(crate) fn hive_mount(sel: u32) -> &'static str {
     match sel {
         HIVE_SEL_SOFTWARE => r"\Registry\Machine\SOFTWARE",
         HIVE_SEL_SECURITY => r"\Registry\Machine\SECURITY",
         HIVE_SEL_SAM => r"\Registry\Machine\SAM",
+        HIVE_SEL_USER_DEFAULT => r"\Registry\User\.Default",
         _ => r"\Registry\Machine\System",
     }
 }
+
+/// ── `NtLoadKey` / `NtUnloadKey` — the run-time hive mounts ────────────────────────────────────
+/// One mounted `regf` hive that is NOT one of the four boot mounts: its selector, the NT path it
+/// is mounted at, the file it was loaded from, and the parsed navigator over its bytes.
+///
+/// `\Registry\User\.Default` is mounted through this SAME table at boot (it is not a special
+/// case — it simply has `dynamic == false`, so `NtUnloadKey` refuses to detach it, exactly as NT
+/// refuses to unload a hive it did not load on request).
+pub(crate) struct HiveMount {
+    /// This mount's `HIVE_SEL_*` tag; `hive_sel(KeyRef) == sel` selects it.
+    pub(crate) sel: u32,
+    /// The canonical (folded) NT path the hive is mounted at, e.g. `\registry\user\.default`.
+    pub(crate) canon: alloc::string::String,
+    /// The original-case NT mount path, used to build `registry_target_path` results.
+    pub(crate) mount: alloc::string::String,
+    /// The NT file path `NtLoadKey` read the hive out of (empty for a boot mount).
+    pub(crate) file: alloc::string::String,
+    /// The read-only navigator over this mount's bytes.
+    pub(crate) hive: RegfHive<'static>,
+    /// Which static hive slot backs it (dynamic mounts only), so `NtUnloadKey` can free it.
+    pub(crate) slot: Option<usize>,
+    /// `true` iff created by `NtLoadKey` — the only mounts `NtUnloadKey` may detach.
+    pub(crate) dynamic: bool,
+}
+
+/// Backing storage for a dynamically loaded hive. `RegfHive` BORROWS its bytes for the life of the
+/// mount, and the writable volume's own buffers live on the bump heap (which the service loop
+/// resets and which a later write could reallocate), so a loaded hive is COPIED into one of these
+/// executive-lifetime statics. Sized for the largest per-user hive this image can produce: the
+/// `config\default` prototype is 139264 B.
+pub(crate) const USER_HIVE_SLOT_BYTES: usize = 192 * 1024;
+pub(crate) const USER_HIVE_SLOTS: usize = HIVE_SEL_DYNAMIC.len();
+pub(crate) static mut USER_HIVE_BUF: [[u8; USER_HIVE_SLOT_BYTES]; USER_HIVE_SLOTS] =
+    [[0; USER_HIVE_SLOT_BYTES]; USER_HIVE_SLOTS];
+/// Which slots are in use (bit per slot), so a load/unload pair really recycles storage.
+pub(crate) static USER_HIVE_SLOT_USED: AtomicU64 = AtomicU64::new(0);
+
+/// ★ BYPASS SWITCH for `NtLoadKey`/`NtUnloadKey` (SSN 102 / 272). `false` leaves both SSNs OUT of
+/// the service table — exactly the pre-batch state, in which `RegLoadKeyW` reaches an unserviced
+/// SSN. `exec_ntloadkey_serviced` FAILs. Verified.
+pub(crate) const NT_LOAD_KEY_SERVICED: bool = true;
+
+/// `NtLoadKey(POBJECT_ATTRIBUTES TargetKey, POBJECT_ATTRIBUTES SourceFile)` — ReactOS
+/// `ntoskrnl/config/ntapi.c:1129` (→ `NtLoadKeyEx`, which requires `SeRestorePrivilege`).
+pub const SSN_NT_LOAD_KEY: u64 = 102;
+/// `NtUnloadKey(POBJECT_ATTRIBUTES TargetKey)` — `ntoskrnl/config/ntapi.c:1789` (→ `NtUnloadKey2`,
+/// which also requires `SeRestorePrivilege`).
+pub const SSN_NT_UNLOAD_KEY: u64 = 272;
+
+/// Print a `str`'s printable ASCII to the debug console (`?` for anything else) — registry mount
+/// paths and hive file names are runtime strings, so the trace has to be able to show them.
+pub(crate) fn print_ascii_str(s: &str) {
+    for byte in s.bytes() {
+        debug_put_char(if (0x20..0x7f).contains(&byte) { byte } else { b'?' });
+    }
+}
+
+/// `NtLoadKey`/`NtUnloadKey` outcome counters, so the gate asserts what really happened.
+pub(crate) static NT_LOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_LOAD_KEY_MOUNTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_LOAD_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_UNLOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_UNLOAD_KEY_DETACHED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_UNLOAD_KEY_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Did the caller of `NtLoadKey` really hold `SeRestorePrivilege` ENABLED at the call (1) — i.e.
+/// did `userenv!AcquireRemoveRestorePrivilege(TRUE)`'s `AdjustTokenPrivileges` really take effect?
+pub(crate) static NT_LOAD_KEY_PRIVILEGE_HELD: AtomicU64 = AtomicU64::new(0);
+/// Bytes of the hive the LAST successful `NtLoadKey` mounted, and how many subkeys its root has —
+/// content-level evidence that a REAL regf was mounted rather than an empty placeholder.
+pub(crate) static NT_LOAD_KEY_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_LOAD_KEY_ROOT_SUBKEYS: AtomicU64 = AtomicU64::new(0);
+/// Set to 1 when a value read back THROUGH the mounted-hive namespace (`\Registry\User\<SID>\
+/// Environment\TEMP`, resolved by `resolve_key` exactly as a hosted process' `NtQueryValueKey`
+/// would) matched the SAME value in the `.Default` prototype the profile hive was copied from.
+/// Content-level proof that the mount serves the file's real data, not an empty placeholder.
+pub(crate) static NT_LOAD_KEY_VALUE_READBACK: AtomicU64 = AtomicU64::new(0);
+/// Opens that resolved into the `\Registry\User` namespace: the predefined root, `.Default`, and
+/// keys inside a dynamically loaded per-user hive.
+pub(crate) static USER_NS_TRACED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static POST_PROFILE_TRACED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static POST_PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
+/// True once `LoadUserProfileW`'s OWN `RegLoadKeyW` has mounted the user hive (the second load of
+/// the boot — `CreateUserProfileExW` does the first). Everything after this point is winlogon's
+/// remaining `HandleLogon` sequence, whose failures are `WARN`-only in the shipped binary.
+pub(crate) fn post_profile_phase() -> bool {
+    NT_LOAD_KEY_MOUNTED.load(Ordering::Relaxed) >= 2
+}
+pub(crate) static USER_ROOT_OPENED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USER_DEFAULT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USER_HIVE_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// If a `KeyRef` names an overlay (created) key, return its overlay index.
 fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
     if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
@@ -9418,6 +9664,15 @@ struct ExecNtHandler {
     /// `Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory`, which is what
     /// `userenv!GetProfilesDirectoryW` — the first thing winlogon's `LoadUserProfileW` does — reads.
     pub(crate) software_hive: Option<RegfHive<'static>>,
+    /// ★ The `\Registry\User` (`HKEY_USERS`) MOUNT TABLE — every hive that is not one of the four
+    /// boot mounts above, in ONE general mechanism: `\Registry\User\.Default` (mounted at
+    /// construction from the staged `config\default`, exactly as `CmpInitializeHiveList` does) and
+    /// the per-user hives `NtLoadKey` mounts at run time. Pre-reserved in `new()` so pushes never
+    /// reallocate; the run-time `String` growth is pinned via `hive_mounts_dirty`.
+    pub(crate) hive_mounts: alloc::vec::Vec<HiveMount>,
+    /// Set by `NtLoadKey`/`NtUnloadKey`; the service loop pins the bump-heap mark past the mount's
+    /// path strings so the mount survives the per-syscall reset (the `overlay_dirty` contract).
+    pub(crate) hive_mounts_dirty: bool,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
@@ -9915,6 +10170,18 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtFlushKey,
                 if NT_FLUSH_KEY_SERVICED { SSN_NT_FLUSH_KEY as u32 } else { u32::MAX },
+            ),
+            // ★ `NtLoadKey` / `NtUnloadKey` — mount a per-user `regf` hive at `HKEY_USERS\<SID>`.
+            // BYPASS EXPERIMENT SWITCH: flip `NT_LOAD_KEY_SERVICED` to `false` and both SSNs leave
+            // the table exactly as before this batch -> `userenv!CreateUserProfileExW`'s
+            // `RegLoadKeyW` reaches an UNSERVICED SSN, which parks winlogon.
+            (
+                NativeService::NtLoadKey,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_LOAD_KEY as u32 } else { u32::MAX },
+            ),
+            (
+                NativeService::NtUnloadKey,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_UNLOAD_KEY as u32 } else { u32::MAX },
             ),
             (NativeService::NtSetSystemInformation, SSN_NT_SET_SYSTEM_INFORMATION as u32),
             (NativeService::NtUnmapViewOfSection, 277),

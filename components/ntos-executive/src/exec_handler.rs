@@ -245,6 +245,26 @@ impl ExecNtHandler {
                 RegfHive::new(core::slice::from_raw_parts(SWHIVEBUF_VADDR as *const u8, n))
             }
         };
+        // ★ THE `\Registry\User` MOUNT TABLE. `\Registry\User\.Default` is the genuine
+        // `config\default` (`$$$PROTO.HIV`) the storage host read BY PATH into DEFHIVEBUF, mounted
+        // exactly where `CmpInitializeHiveList` mounts it on a real NT boot — and mounted through
+        // the SAME table `NtLoadKey` uses, so a per-user hive is not a special case.
+        // SAFETY: DEFHIVEBUF is a fixed executive-lifetime mapping; the size is the storage host's.
+        let mut hive_mounts: alloc::vec::Vec<HiveMount> =
+            alloc::vec::Vec::with_capacity(1 + USER_HIVE_SLOTS);
+        unsafe {
+            if let Some(hive) = crate::writable_fs::default_hive_bytes().and_then(RegfHive::new) {
+                hive_mounts.push(HiveMount {
+                    sel: HIVE_SEL_USER_DEFAULT,
+                    canon: alloc::string::String::from(r"\registry\user\.default"),
+                    mount: alloc::string::String::from(hive_mount(HIVE_SEL_USER_DEFAULT)),
+                    file: alloc::string::String::from(r"\SystemRoot\System32\config\default"),
+                    hive,
+                    slot: None,
+                    dynamic: false,
+                });
+            }
+        }
         unsafe {
             print_str(b"[cm-hive] mounted base hives: SYSTEM=");
             print_u64(REAL_HIVE_SIZE.load(Ordering::Relaxed));
@@ -274,6 +294,16 @@ impl ExecNtHandler {
                     .as_ref()
                     .map_or(0, |h| h.subkeys(h.root()).len() as u64),
             );
+            print_str(b") \\Registry\\User mounts=");
+            print_u64(hive_mounts.len() as u64);
+            print_str(b" .Default=");
+            print_u64(DEFAULT_HIVE_SIZE.load(Ordering::Relaxed));
+            print_str(b"B(subkeys=");
+            print_u64(
+                hive_mounts
+                    .first()
+                    .map_or(0, |m| m.hive.subkeys(m.hive.root()).len() as u64),
+            );
             print_str(b")\n");
         }
         let time_zone_information = seed_time_zone(hive.as_ref());
@@ -283,6 +313,8 @@ impl ExecNtHandler {
             security_hive,
             sam_hive,
             software_hive,
+            hive_mounts,
+            hive_mounts_dirty: false,
             time_zone_information,
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
@@ -599,35 +631,478 @@ impl ExecNtHandler {
     }
 
     /// The mounted base hive a non-synth `KeyRef` belongs to, plus its in-hive cell offset. The
-    /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`].
+    /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`]
+    /// — or one of the `\Registry\User` mounts in [`ExecNtHandler::hive_mounts`] (`.Default` plus
+    /// whatever `NtLoadKey` has mounted). Uniform: a dynamic mount resolves exactly like a boot one.
     pub(crate) fn base_hive(&self, target: KeyRef) -> Option<(&RegfHive<'static>, KeyRef)> {
         if is_synth_key(target) {
             return None;
         }
-        let hive = match hive_sel(target) {
+        let sel = hive_sel(target);
+        let hive = match sel {
             HIVE_SEL_SOFTWARE => self.software_hive.as_ref()?,
             HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
             HIVE_SEL_SAM => self.sam_hive.as_ref()?,
-            _ => self.hive.as_ref()?,
+            HIVE_SEL_SYSTEM => self.hive.as_ref()?,
+            _ => &self.hive_mounts.iter().find(|m| m.sel == sel)?.hive,
         };
         Some((hive, hive_cell(target)))
+    }
+
+    /// The NT mount path a hive selector's keys hang off. The four boot mounts are compile-time
+    /// constants; a `\Registry\User` mount carries its own path (a `<SID>` is only known at
+    /// `NtLoadKey` time), so this is the one place that has to be a lookup.
+    pub(crate) fn hive_mount_path(&self, sel: u32) -> Option<alloc::string::String> {
+        match sel {
+            HIVE_SEL_SOFTWARE | HIVE_SEL_SECURITY | HIVE_SEL_SAM | HIVE_SEL_SYSTEM => {
+                Some(alloc::string::String::from(hive_mount(sel)))
+            }
+            _ => self
+                .hive_mounts
+                .iter()
+                .find(|m| m.sel == sel)
+                .map(|m| m.mount.clone()),
+        }
     }
 
     fn registry_target_path(&self, target: KeyRef) -> Option<alloc::string::String> {
         if target == MACHINE_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\machine"));
         }
+        if target == USER_ROOT_KEY {
+            return Some(alloc::string::String::from(r"\registry\user"));
+        }
         if let Some(index) = overlay_key_idx(target) {
             return self.overlay.path(index).map(alloc::string::String::from);
         }
         let (hive, cell) = self.base_hive(target)?;
         let relative = hive.key_path(cell)?;
-        let mut full = alloc::string::String::from(hive_mount(hive_sel(target)));
+        let mut full = self.hive_mount_path(hive_sel(target))?;
         if !relative.is_empty() {
             full.push('\\');
             full.push_str(&relative);
         }
         Some(self.overlay_canon(&full))
+    }
+
+    /// Resolve a full NT path inside the `\Registry\User` namespace against the mount table.
+    /// `None` if no mount owns the path, or the mount owns it but has no such key.
+    pub(crate) fn resolve_user_key(&self, full_path: &str) -> Option<KeyRef> {
+        let canon = nt_hive_core::canon_path(full_path);
+        for mount in &self.hive_mounts {
+            if canon == mount.canon {
+                return Some(mount.sel | mount.hive.root());
+            }
+            let Some(rest) = canon
+                .strip_prefix(mount.canon.as_str())
+                .and_then(|rest| rest.strip_prefix('\\'))
+            else {
+                continue;
+            };
+            // The mount OWNS this path: it resolves here or nowhere (never fall through to a
+            // different mount, which would let `\Registry\User\<sid>\x` answer out of `.Default`).
+            return mount.hive.open_key(rest).map(|cell| mount.sel | cell);
+        }
+        None
+    }
+
+    /// The effective OBJECT_ATTRIBUTES name for a registry open: the mirror-read `path`, or — when
+    /// that came back EMPTY because the name is an `RTL_CONSTANT_STRING` in a `.rdata` page the
+    /// process never dereferenced — the PE-backed read. (`RegOpenKeyExW(HKEY_USERS, L".Default")`
+    /// in `userenv!CreateUserHive` is exactly that case.)
+    ///
+    /// # Safety
+    /// `oa` is a caller VA read through the cross-AS reader, which bounds-checks every access.
+    unsafe fn effective_objattr_name(&self, path: &str, oa: u64) -> alloc::string::String {
+        if !path.is_empty() {
+            return alloc::string::String::from(path);
+        }
+        let mut name = alloc::string::String::new();
+        for &unit in &self.read_objattr_name_pe(oa) {
+            if let Some(c) = char::from_u32(unit as u32) {
+                name.push(c);
+            }
+        }
+        name
+    }
+
+    /// Split an NT registry path into its non-empty components.
+    fn key_components(path: &str) -> alloc::vec::Vec<&str> {
+        path.split('\\').filter(|c| !c.is_empty()).collect()
+    }
+
+    /// True if `comps` is exactly `Registry\User` (the predefined `HKEY_USERS` root).
+    fn is_user_root_comps(comps: &[&str]) -> bool {
+        comps.len() == 2
+            && comps[0].eq_ignore_ascii_case("Registry")
+            && comps[1].eq_ignore_ascii_case("User")
+    }
+
+    /// Resolve the FULL NT path of a `\Registry\User` open/load/unload target: either absolute
+    /// (`\Registry\User\…`) or relative to the `HKEY_USERS` root sentinel / a key already inside
+    /// the namespace. `None` when the target is not in the user namespace at all.
+    fn user_namespace_target(
+        &self,
+        root_target: Option<KeyRef>,
+        name: &str,
+    ) -> Option<alloc::string::String> {
+        let base = match root_target {
+            None => {
+                let comps = Self::key_components(name);
+                if comps.len() > 2
+                    && comps[0].eq_ignore_ascii_case("Registry")
+                    && comps[1].eq_ignore_ascii_case("User")
+                {
+                    return Some(alloc::string::String::from(name));
+                }
+                return None;
+            }
+            Some(USER_ROOT_KEY) => alloc::string::String::from(r"\Registry\User"),
+            Some(target) => {
+                let path = self.registry_target_path(target)?;
+                if path != r"\registry\user" && !path.starts_with(r"\registry\user\") {
+                    return None;
+                }
+                path
+            }
+        };
+        let mut full = base;
+        if !name.is_empty() {
+            full.push('\\');
+            full.push_str(name);
+        }
+        Some(full)
+    }
+
+    /// `NtOpenKey` for the `\Registry\User` (`HKEY_USERS`) namespace. `Some(status)` when this open
+    /// belongs to the namespace (and is therefore fully answered here), `None` to let the caller's
+    /// existing resolution run unchanged.
+    ///
+    /// # Safety
+    /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader and mints a
+    /// handle into the current process's own EPROCESS handle table.
+    unsafe fn open_user_namespace_key(
+        &mut self,
+        root_target: Option<KeyRef>,
+        path: &str,
+        oa: u64,
+        args: &[u64],
+    ) -> Option<u32> {
+        // An EMPTY mirror-read name means the OA names an `RTL_CONSTANT_STRING` in a `.rdata` page
+        // the process never dereferenced — `userenv!UpdateUsersShellFolderSettings` opens
+        // `SOFTWARE\…\Shell Folders` relative to the user-hive handle exactly that way — so recover
+        // it from the backing PE. Only reached for an empty name, and a name that turns out NOT to
+        // be in this namespace falls through with the caller's original `path` untouched.
+        let name = self.effective_objattr_name(path, oa);
+        // (a) The predefined `HKEY_USERS` root itself (advapi32's `MapDefaultKey`).
+        if root_target.is_none() && Self::is_user_root_comps(&Self::key_components(&name)) {
+            USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            return Some(self.mint_registry_key(USER_ROOT_KEY, args[1] as u32, args[0]));
+        }
+        let full = self.user_namespace_target(root_target, &name)?;
+        // (b) A created key shadows the mount, exactly as it does for the machine hives.
+        let canon = self.overlay_canon(&full);
+        if let Some(index) = self.overlay.find(&canon) {
+            return Some(self.mint_registry_key(
+                OVERLAY_KEY_TAG | index as u32,
+                args[1] as u32,
+                args[0],
+            ));
+        }
+        // (c) …otherwise the mount table. A miss inside the namespace is a real NOT_FOUND (which is
+        // what every `\Registry\User` open returned before this batch), never a fabricated key.
+        if USER_NS_TRACED.fetch_add(1, Ordering::Relaxed) < 40 {
+            print_str(b"[user-ns] pi=");
+            print_u64(self.pi as u64);
+            print_str(b" open ");
+            print_ascii_str(&full);
+            print_str(b" -> ");
+            print_u64(self.resolve_user_key(&full).unwrap_or(0) as u64);
+            print_str(b"\n");
+        }
+        match self.resolve_user_key(&full) {
+            Some(key) => {
+                if hive_sel(key) == HIVE_SEL_USER_DEFAULT {
+                    USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(self.mint_registry_key(key, args[1] as u32, args[0]))
+            }
+            None => {
+                if self.pi == 2 && post_profile_phase() && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64 {
+                    print_str(b"[post-profile] open MISS ");
+                    print_ascii_str(&full);
+                    print_str(b"\n");
+                }
+                Some(0xC000_0034) // STATUS_OBJECT_NAME_NOT_FOUND
+            }
+        }
+    }
+
+    /// Bounded trace of a registry MISS in winlogon's post-profile window: which key, which value.
+    fn trace_post_profile_registry(&self, what: &[u8], key: KeyRef, name: &str) {
+        if POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) >= 64 {
+            return;
+        }
+        print_str(b"[post-profile] ");
+        print_str(what);
+        print_str(b" MISS key=");
+        match self.registry_target_path(key) {
+            Some(path) => print_ascii_str(&path),
+            None => {
+                print_str(b"<synth 0x");
+                print_hex(key);
+                print_str(b">");
+            }
+        }
+        print_str(b" value=\"");
+        print_ascii_str(name);
+        print_str(b"\"\n");
+    }
+
+    /// Read a whole file named by an NT path into `dst`, returning its byte length. Serves
+    /// `NtLoadKey`'s SourceFile: the writable volume first (where a copied profile's `ntuser.dat`
+    /// lives), then the read-only `\reactos` FAT reader.
+    ///
+    /// # Safety
+    /// Borrows the mounted writable volume for the duration of the copy; single-threaded executive.
+    unsafe fn read_file_by_nt_path(name16: &[u16], dst: &mut [u8]) -> Option<usize> {
+        if let Some(relative) = crate::writable_fs::writable_path(name16) {
+            let fs = crate::writable_fs::writable_fs()?;
+            let mut path = alloc::string::String::from(r"\??\C:\");
+            for &byte in &relative {
+                path.push(byte as char);
+            }
+            let bytes = fs.file_bytes(&path)?;
+            if bytes.len() > dst.len() {
+                return None;
+            }
+            dst[..bytes.len()].copy_from_slice(bytes);
+            return Some(bytes.len());
+        }
+        None
+    }
+
+    /// `NtLoadKey(POBJECT_ATTRIBUTES TargetKey, POBJECT_ATTRIBUTES SourceFile)` — ReactOS
+    /// `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a `regf` hive FILE at a key in the
+    /// registry namespace. The order of checks is the source's: privilege first, then the captured
+    /// object attributes, then the load.
+    ///
+    /// # Safety
+    /// Reads two caller OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
+    unsafe fn nt_load_key(&mut self, args: &[u64]) -> u32 {
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_SHARING_VIOLATION: u32 = 0xC000_0043;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+        NT_LOAD_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+
+        // `SeSinglePrivilegeCheck(SeRestorePrivilege, PreviousMode)` (ntapi.c:1168). Enforced, not
+        // assumed: `userenv!AcquireRemoveRestorePrivilege(TRUE)` must really have ENABLED it on the
+        // caller's token through `NtAdjustPrivilegesToken` (the LocalSystem token carries
+        // SeRestorePrivilege present-but-DISABLED, exactly as ReactOS's does).
+        let held = self.current_token_has_privilege(nt_security::SE_RESTORE);
+        NT_LOAD_KEY_PRIVILEGE_HELD.store(held as u64, Ordering::Relaxed);
+        if !held {
+            NT_LOAD_KEY_NO_PRIVILEGE.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-load] NtLoadKey REFUSED: SeRestorePrivilege not held (pi=");
+            print_u64(self.pi as u64);
+            print_str(b")\n");
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+
+        // The TARGET key: RootDirectory (usually the HKEY_USERS handle) + the leaf name (the SID).
+        let target_oa = args[0];
+        let mut rd = [0u8; 8];
+        if target_oa == 0 || !self.xas_read(target_oa + 8, &mut rd) {
+            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+        }
+        let root_dir = u64::from_le_bytes(rd);
+        let root_target = if root_dir == 0 {
+            None
+        } else {
+            match self.resolve_registry_key(root_dir, 0) {
+                Ok(target) => Some(target),
+                Err(status) => return status,
+            }
+        };
+        let target_name = self.effective_objattr_name("", target_oa);
+        let Some(full) = self.user_namespace_target(root_target, &target_name) else {
+            // Only the `\Registry\User` namespace has hive mounts in this executive; a load
+            // anywhere else is refused rather than faked.
+            print_str(b"[cm-load] NtLoadKey target is not under \\Registry\\User\n");
+            return STATUS_INVALID_PARAMETER;
+        };
+        let canon = nt_hive_core::canon_path(&full);
+        if canon == r"\registry\user" {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if self.hive_mounts.iter().any(|m| m.canon == canon) {
+            // The hive is already mounted here — `userenv!LoadUserProfileW` explicitly tolerates
+            // ERROR_SHARING_VIOLATION as "the profile is already loaded" (profile.c:2136).
+            return STATUS_SHARING_VIOLATION;
+        }
+
+        // The SOURCE file: read the whole regf out of the filesystem into a durable static slot.
+        let file16 = self.read_objattr_name_pe(args[1]);
+        let mut file_name = alloc::string::String::new();
+        for &unit in &file16 {
+            if let Some(c) = char::from_u32(unit as u32) {
+                file_name.push(c);
+            }
+        }
+        let Some(slot) = (0..USER_HIVE_SLOTS)
+            .find(|s| USER_HIVE_SLOT_USED.load(Ordering::Relaxed) & (1 << s) == 0)
+        else {
+            print_str(b"[cm-load] NtLoadKey REFUSED: all hive slots in use\n");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        // SAFETY: single-threaded executive; the slot is claimed below and only released by
+        // `NtUnloadKey`, which drops the borrowing mount first.
+        let buffer = &mut (*core::ptr::addr_of_mut!(USER_HIVE_BUF))[slot];
+        let Some(len) = Self::read_file_by_nt_path(&file16, buffer) else {
+            print_str(b"[cm-load] NtLoadKey: source file unreadable: ");
+            print_ascii_str(&file_name);
+            print_str(b"\n");
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        // SAFETY: the slot is a `'static` array; the borrow lives exactly as long as the mount.
+        let bytes: &'static [u8] =
+            core::slice::from_raw_parts((*core::ptr::addr_of!(USER_HIVE_BUF))[slot].as_ptr(), len);
+        let Some(hive) = RegfHive::new(bytes) else {
+            print_str(b"[cm-load] NtLoadKey: not a regf hive (");
+            print_u64(len as u64);
+            print_str(b" bytes)\n");
+            return STATUS_REGISTRY_CORRUPT;
+        };
+        let root_subkeys = hive.subkeys(hive.root()).len() as u64;
+        USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
+        self.hive_mounts.push(HiveMount {
+            sel: HIVE_SEL_DYNAMIC[slot],
+            canon,
+            mount: full,
+            file: file_name,
+            hive,
+            slot: Some(slot),
+            dynamic: true,
+        });
+        self.hive_mounts_dirty = true;
+        NT_LOAD_KEY_MOUNTED.fetch_add(1, Ordering::Relaxed);
+        NT_LOAD_KEY_HIVE_BYTES.store(len as u64, Ordering::Relaxed);
+        NT_LOAD_KEY_ROOT_SUBKEYS.store(root_subkeys, Ordering::Relaxed);
+        print_str(b"[cm-load] NtLoadKey MOUNTED ");
+        print_ascii_str(&self.hive_mounts[self.hive_mounts.len() - 1].mount);
+        print_str(b" <- ");
+        print_ascii_str(&self.hive_mounts[self.hive_mounts.len() - 1].file);
+        print_str(b" bytes=");
+        print_u64(len as u64);
+        print_str(b" root-subkeys=");
+        print_u64(root_subkeys);
+        print_str(b" slot=");
+        print_u64(slot as u64);
+        print_str(b"\n");
+        // CONTENT read-back through the namespace, not through the mount object: resolve
+        // `<mount>\Environment` the way a hosted process' `NtOpenKey` would and compare its `TEMP`
+        // value with the SAME value in the `.Default` prototype the profile hive was copied from.
+        // Byte-for-byte equality of a non-empty value is what makes "a REAL hive is mounted here"
+        // a measurement instead of a claim.
+        let mount_path = self.hive_mounts[self.hive_mounts.len() - 1].mount.clone();
+        let mut env_path = mount_path;
+        env_path.push_str("\\Environment");
+        let mounted_temp = self
+            .resolve_key(&env_path)
+            .and_then(|key| self.registry_value(key, "TEMP"));
+        let default_temp = self
+            .resolve_key(r"\Registry\User\.Default\Environment")
+            .and_then(|key| self.registry_value(key, "TEMP"));
+        match (&mounted_temp, &default_temp) {
+            (Some((ty, data)), Some((dty, ddata)))
+                if !data.is_empty() && ty == dty && data == ddata =>
+            {
+                NT_LOAD_KEY_VALUE_READBACK.store(1, Ordering::Relaxed);
+                print_str(b"[cm-load] read-back \\Environment\\TEMP through the mount: ");
+                print_u64(data.len() as u64);
+                print_str(b" bytes, type ");
+                print_u64(*ty as u64);
+                print_str(b", identical to \\Registry\\User\\.Default's\n");
+            }
+            _ => {
+                print_str(b"[cm-load] read-back MISMATCH mounted=");
+                print_u64(mounted_temp.map_or(0, |(_, d)| d.len() as u64));
+                print_str(b" default=");
+                print_u64(default_temp.map_or(0, |(_, d)| d.len() as u64));
+                print_str(b"\n");
+            }
+        }
+        0
+    }
+
+    /// `NtUnloadKey(POBJECT_ATTRIBUTES TargetKey)` — ReactOS `ntoskrnl/config/ntapi.c:1796`
+    /// (`NtUnloadKey2`). Detach a hive `NtLoadKey` mounted: the mount goes, its backing slot is
+    /// released, and the write overlay's keys under that path are detached too — otherwise the
+    /// writes made through the mount would keep answering at the same path and the "unload" would
+    /// be cosmetic.
+    ///
+    /// # Safety
+    /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
+    unsafe fn nt_unload_key(&mut self, args: &[u64]) -> u32 {
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        NT_UNLOAD_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+        if !self.current_token_has_privilege(nt_security::SE_RESTORE) {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        let oa = args[0];
+        let mut rd = [0u8; 8];
+        if oa == 0 || !self.xas_read(oa + 8, &mut rd) {
+            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+        }
+        let root_dir = u64::from_le_bytes(rd);
+        let root_target = if root_dir == 0 {
+            None
+        } else {
+            match self.resolve_registry_key(root_dir, 0) {
+                Ok(target) => Some(target),
+                Err(status) => return status,
+            }
+        };
+        let name = self.effective_objattr_name("", oa);
+        let Some(full) = self.user_namespace_target(root_target, &name) else {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        };
+        let canon = nt_hive_core::canon_path(&full);
+        let Some(index) = self.hive_mounts.iter().position(|m| m.canon == canon) else {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if !self.hive_mounts[index].dynamic {
+            // `.Default` is mounted by the boot, not by a caller: refusing to unload it is the
+            // same refusal NT makes for a hive it did not load on request.
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mount = self.hive_mounts.remove(index);
+        if let Some(slot) = mount.slot {
+            USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+        }
+        let overlay_detached = self.overlay.detach_subtree(&canon);
+        self.overlay_dirty = true;
+        self.hive_mounts_dirty = true;
+        NT_UNLOAD_KEY_DETACHED.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[cm-load] NtUnloadKey DETACHED ");
+        print_ascii_str(&mount.mount);
+        print_str(b" overlay-keys=");
+        print_u64(overlay_detached as u64);
+        print_str(b" mounts-left=");
+        print_u64(self.hive_mounts.len() as u64);
+        print_str(b"\n");
+        0
     }
 
     fn registry_overlay_index(&self, target: KeyRef) -> Option<usize> {
@@ -4933,6 +5408,15 @@ impl ExecNtHandler {
     pub(crate) fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
         let aliased = apply_ccs_alias(full_path);
         let comps: alloc::vec::Vec<&str> = aliased.split('\\').filter(|c| !c.is_empty()).collect();
+        // ★ `\Registry\User\…` — the per-user hive namespace, served by the mount table so every
+        // generic consumer of `resolve_key` (path-exists, value/subkey reads, `NtCreateKey`'s
+        // parent check, the overlay's base-hive fall-through) composes with a loaded hive for free.
+        if comps.len() >= 3
+            && comps[0].eq_ignore_ascii_case("Registry")
+            && comps[1].eq_ignore_ascii_case("User")
+        {
+            return self.resolve_user_key(&aliased);
+        }
         if comps.len() < 3
             || !comps[0].eq_ignore_ascii_case("Registry")
             || !comps[1].eq_ignore_ascii_case("Machine")
@@ -5426,6 +5910,14 @@ impl ExecNtHandler {
                         );
                     }
                 }
+                // ★ `\Registry\User` (HKEY_USERS) — the per-user hive namespace. EXACT-NAMESPACE
+                // scoped: only the predefined root and names under it are answered here, so every
+                // HKLM/HKCR open (including the paint-time reads the arms below deliberately keep
+                // narrow) is byte-identical to before. Today every `\Registry\User` open returns
+                // NOT_FOUND, so nothing that currently succeeds can change.
+                if let Some(status) = self.open_user_namespace_key(root_target, &path, oa, args) {
+                    return status;
+                }
                 // winlogon (pi 2) — msgina's `GetRegistrySettings` (WlxInitialize) opens the Winlogon
                 // key `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`. advapi32's
                 // `RegOpenKeyExW(HKLM, subkey)` first maps HKLM by opening `\Registry\Machine`, then
@@ -5894,6 +6386,11 @@ impl ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS — HvSyncHive's volatile / no-dirty-block early return
             }
+            // ★ NtLoadKey(*TargetKey[0], *SourceFile[1]) / NtUnloadKey(*TargetKey[0]) — mount and
+            // detach a per-user `regf` hive at `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW`
+            // and `LoadUserProfileW` both go through here (`RegLoadKeyW`/`RegUnLoadKeyW`).
+            NativeService::NtLoadKey => unsafe { self.nt_load_key(args) },
+            NativeService::NtUnloadKey => unsafe { self.nt_unload_key(args) },
             NativeService::NtDeleteValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -6447,6 +6944,14 @@ impl ExecNtHandler {
                     if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
                         LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
+                // `HandleLogon` steps (`CreateUserEnvironment` → `SetDefaultLanguage` →
+                // `AllowAccessOnSession` → `StartUserShell`) fail through `WARN`, which the shipped
+                // binary does not print. A missed value read is the only externally visible
+                // evidence of which step gave up, so name the KEY and the VALUE.
+                if self.pi == 2 && val.is_none() && post_profile_phase() {
+                    self.trace_post_profile_registry(b"query-value", key, &name_lc);
                 }
                 match val {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
@@ -8990,6 +9495,17 @@ impl ExecNtHandler {
                         let sid_length = token.user.write_native(&mut output[16..]).unwrap_or(0);
                         output[..8].copy_from_slice(&buf.wrapping_add(16).to_le_bytes());
                         16 + sid_length
+                    }
+                    2 => {
+                        // TOKEN_GROUPS. `userenv!CheckForGuestsAndAdmins` (profile.c:365) and
+                        // `winlogon!AllowAccessOnSession` (security.c:1400) both size this buffer
+                        // with a NULL/zero-length query and REQUIRE the `STATUS_BUFFER_TOO_SMALL`
+                        // (⇒ ERROR_INSUFFICIENT_BUFFER) answer; returning INVALID_INFO_CLASS made
+                        // them report `Error 87` and give up. Encoding lives in `nt-security`.
+                        match nt_security::encode_token_groups(token, buf, &mut output) {
+                            Ok(encoded) => encoded.required_length,
+                            Err(_) => return 0xC000_0078, // STATUS_INVALID_SID
+                        }
                     }
                     3 => {
                         // TOKEN_PRIVILEGES: current attributes from the same mutable token adjusted

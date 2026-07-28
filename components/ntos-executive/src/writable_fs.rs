@@ -83,6 +83,65 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// `dirs=45 files=31 bytes=5307` with `Default User` enumerating its real 17 records.
 pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 
+/// ★ THE SETUP STEP THE LIVECD SKIPS — `Default User\ntuser.dat`, from GENUINE ReactOS data.
+///
+/// `CreateUserProfileExW` copies `C:\Profiles\Default User` into the new profile and then calls
+/// `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")` (`profile.c:1088`). On this image that
+/// returned **`Error: 2` (ERROR_FILE_NOT_FOUND)**: there is **no `ntuser.dat` anywhere on the
+/// ISO**, because a LiveCD never runs the setup step that creates one — ReactOS setup
+/// (`base/setup/lib/registry.c`, `CreateUserHive`/`InstallHives`) copies
+/// `system32\config\default` — the `$$$PROTO.HIV` prototype, i.e. the very hive the kernel mounts
+/// as `HKEY_USERS\.DEFAULT` — into the Default User profile as `ntuser.dat`. This performs THAT
+/// step, with THAT file: the 139264 bytes the storage host already read BY PATH off
+/// `\reactos\system32\config\default` into `DEFHIVEBUF` ([`default_hive_bytes`]). Nothing is
+/// synthesised and nothing is fabricated — it is the image's own regf, byte for byte.
+///
+/// **Why the `Default User` profile and not the user's.** winlogon must stay the actor: dropping
+/// the file into `C:\Profiles\Administrator` directly would make `LoadUserProfileW`'s
+/// `GetFileAttributesW(<profile>\ntuser.dat)` probe (`profile.c:2088`) SUCCEED, which SKIPS
+/// `CreateUserProfileW` entirely — no `CreateDirectoryW`, no `CopyDirectory`, i.e. it would delete
+/// the very behaviour `exec_winlogon_profile_directories_created` and
+/// `exec_winlogon_profile_copied` measure. Placed in the SOURCE profile instead, winlogon's own
+/// `CopyDirectory` → `CopyFileW` carries it across, through the real `NtCreateFile`/`NtReadFile`/
+/// `NtWriteFile` path, and the destination hive is winlogon's own output.
+///
+/// ★ BYPASS SWITCH: `false` restores the pre-batch state — the copied profile has no `ntuser.dat`
+/// and `RegLoadKeyW` returns `Error: 2` again (`exec_profile_ntuser_dat_present` FAILs).
+pub(crate) const PROVISION_NTUSER_DAT: bool = true;
+
+/// The `ntuser.dat` leaf, its source profile, and the destination the copy must produce.
+pub(crate) const NTUSER_DAT_LEAF: &str = "ntuser.dat";
+pub(crate) const DEFAULT_USER_NTUSER_DAT: &str = r"\??\C:\Profiles\Default User\ntuser.dat";
+pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = r"\??\C:\Profiles\Administrator\ntuser.dat";
+
+/// Bytes of the `ntuser.dat` really provisioned into the `Default User` profile (0 = not present).
+pub(crate) static NTUSER_DAT_PROVISIONED: AtomicU64 = AtomicU64::new(0);
+
+/// Is `path` a REAL regf hive on this volume? Checked by CONTENT, not by existence: the bytes must
+/// parse through the same `nt-hive-regf` navigator the registry mounts a hive with, AND its root
+/// must really enumerate subkeys (a zero-filled or truncated file cannot fake that). Returns the
+/// hive's byte length, or 0.
+pub(crate) fn regf_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
+    let Some(bytes) = fs.file_bytes(path) else {
+        return 0;
+    };
+    match RegfHive::new(bytes) {
+        Some(hive) if !hive.subkeys(hive.root()).is_empty() => bytes.len(),
+        _ => 0,
+    }
+}
+
+/// [`regf_len_on`] against the LIVE mounted volume (the gate specs' read-back).
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the read.
+pub(crate) unsafe fn regf_len_at(path: &str) -> usize {
+    match writable_fs() {
+        Some(fs) => regf_len_on(fs, path),
+        None => 0,
+    }
+}
+
 /// The staged tree's FAT root name, and its mount point on the writable volume.
 pub(crate) const STAGED_PROFILES_DIR: &[u8] = b"Profiles";
 pub(crate) const PROFILES_VOLUME_ROOT: &str = r"\??\C:\Profiles";
@@ -572,6 +631,25 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     if fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1") {
         PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
     }
+    // ★ THE SETUP STEP THE LIVECD SKIPS (see `PROVISION_NTUSER_DAT`): give the `Default User`
+    // profile the `ntuser.dat` setup would have made for it, from the image's OWN
+    // `system32\config\default` regf. Done here, on the SOURCE profile, so winlogon's own
+    // `CopyDirectory` is what puts it in the user's profile.
+    if PROVISION_NTUSER_DAT {
+        match default_hive_bytes() {
+            Some(hive) if RegfHive::new(hive).is_some() => {
+                if fs.provision_file(DEFAULT_USER_NTUSER_DAT, hive) {
+                    files += 1;
+                    bytes += hive.len() as u64;
+                    NTUSER_DAT_PROVISIONED.store(hive.len() as u64, Ordering::Relaxed);
+                }
+            }
+            _ => print_str(b"[profile-source] config\\default NOT staged -> no ntuser.dat\n"),
+        }
+        PROFILE_SOURCE_DIRS.store(dirs, Ordering::Relaxed);
+        PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
+        PROFILE_SOURCE_BYTES.store(bytes, Ordering::Relaxed);
+    }
     PROFILE_SOURCE_ENTRIES.store(count_entries(fs, DEFAULT_USER_PROFILE_DIR), Ordering::Relaxed);
     print_str(b"[profile-source] materialised ::Profiles onto the writable volume: dirs=");
     print_u64(dirs);
@@ -583,7 +661,13 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_u64(PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed));
     print_str(b" probe-file-content-ok=");
     print_u64(PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed));
-    print_str(b"\n");
+    print_str(b" ntuser.dat=");
+    print_u64(NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
+    print_str(b"B(regf-ok=");
+    // Read it back off the LIVE volume and parse it, so the claim "a real regf is in the source
+    // profile" is measured through the same navigator the registry will mount it with.
+    print_u64(regf_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
+    print_str(b")\n");
 }
 
 /// The largest staged profile file the executive will materialise (the whole tree is ~360 bytes;

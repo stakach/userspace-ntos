@@ -464,6 +464,30 @@ mod tests {
         }
     }
 
+    /// The genuine ReactOS `\reactos\system32\config\default` hive — the `HKEY_USERS\.DEFAULT`
+    /// prototype that setup copies to become a new user's `ntuser.dat`, and therefore the hive the
+    /// executive mounts through `NtLoadKey`. This asserts the two structures that flow depends on:
+    /// the `Shell Folders` key `userenv!UpdateUsersShellFolderSettings` writes into, and the
+    /// `Environment` values `RegCopyTreeW` carries across.
+    #[test]
+    fn reactos_default_user_hive_has_the_profile_keys() {
+        let path = "../../rust-micro/.tmp/reactos/reactos/system32/config/default";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: staged `config\\default` not present");
+            return;
+        };
+        let hive = RegfHive::new(&bytes).expect("the staged `config\\default` must be a regf hive");
+        let roots: Vec<String> = hive.subkeys(hive.root()).into_iter().map(|(n, _)| n).collect();
+        for expected in ["environment", "control panel", "software"] {
+            assert!(roots.iter().any(|n| n == expected), "missing {expected} in {roots:?}");
+        }
+        hive.open_key(r"software\microsoft\windows\currentversion\explorer\shell folders")
+            .expect("UpdateUsersShellFolderSettings needs `Shell Folders`");
+        let env = hive.open_key("environment").expect("Environment");
+        let names: Vec<String> = hive.values(env).into_iter().map(|(n, _)| n).collect();
+        assert!(names.iter().any(|n| n == "temp"), "expected TEMP, got {names:?}");
+    }
+
     #[test]
     fn rejects_non_regf() {
         assert!(RegfHive::new(&[0u8; 0x2000]).is_none());

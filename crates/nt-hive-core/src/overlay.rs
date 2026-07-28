@@ -60,9 +60,14 @@ struct OverlayValue {
 }
 
 /// A key created in the overlay: its canonical path + the values written on it.
+///
+/// `detached` is the `NtUnloadKey` state: the key's *slot* stays in place (so an already-minted
+/// `KeyRef` that encodes this index can never silently start naming a DIFFERENT key) but the key
+/// is invisible to every lookup, exactly as if the hive it shadowed had never been mounted.
 struct OverlayKey {
     path: String,
     values: Vec<OverlayValue>,
+    detached: bool,
 }
 
 /// A mutable registry write overlay over a read-only base hive. See the module docs.
@@ -83,9 +88,16 @@ impl RegistryOverlay {
         Self { keys: Vec::with_capacity(n) }
     }
 
-    /// Number of created keys.
+    /// Number of key SLOTS, including slots detached by [`Self::detach_subtree`]. This is the
+    /// allocator's high-water mark (indices are never reused), which is what a capacity check
+    /// must be compared against.
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Number of keys that are actually visible (slots minus detached ones).
+    pub fn live_len(&self) -> usize {
+        self.keys.iter().filter(|k| !k.detached).count()
     }
 
     /// Whether the overlay has no created keys.
@@ -93,31 +105,81 @@ impl RegistryOverlay {
         self.keys.is_empty()
     }
 
-    /// Find an existing overlay key by canonical path.
+    /// Find an existing overlay key by canonical path. A detached key is not found.
     pub fn find(&self, canon: &str) -> Option<usize> {
-        self.keys.iter().position(|k| k.path == canon)
+        self.keys
+            .iter()
+            .position(|k| k.path == canon && !k.detached)
+    }
+
+    /// Whether the slot at `idx` has been detached by [`Self::detach_subtree`].
+    pub fn is_detached(&self, idx: usize) -> bool {
+        self.keys.get(idx).is_some_and(|k| k.detached)
     }
 
     /// Create-or-open a key at the canonical `canon` path. Returns `(index, created)` where
     /// `created` is `true` only if the key did not already exist in the overlay.
+    ///
+    /// A DETACHED slot with the same path is re-attached in place (and emptied): re-mounting a
+    /// hive at a path that was unloaded must start from the mounted hive's own contents, not from
+    /// the writes the previous mount accumulated, and re-using the slot keeps indices dense.
     pub fn create(&mut self, canon: &str) -> (usize, bool) {
         if let Some(i) = self.find(canon) {
             return (i, false);
         }
-        self.keys.push(OverlayKey { path: String::from(canon), values: Vec::new() });
+        if let Some(i) = self
+            .keys
+            .iter()
+            .position(|k| k.path == canon && k.detached)
+        {
+            self.keys[i].detached = false;
+            self.keys[i].values.clear();
+            return (i, true);
+        }
+        self.keys.push(OverlayKey {
+            path: String::from(canon),
+            values: Vec::new(),
+            detached: false,
+        });
         (self.keys.len() - 1, true)
     }
 
-    /// The canonical path of an overlay key.
+    /// The canonical path of an overlay key. `None` for a detached slot.
     pub fn path(&self, idx: usize) -> Option<&str> {
-        self.keys.get(idx).map(|k| k.path.as_str())
+        self.keys
+            .get(idx)
+            .filter(|k| !k.detached)
+            .map(|k| k.path.as_str())
+    }
+
+    /// DETACH every key at or below `canon` — the write-plane half of `NtUnloadKey`. Without this
+    /// an unload would leave the writes made through the mounted hive still resolving at the same
+    /// path, so the "unloaded" key would keep answering opens. Returns how many keys were
+    /// detached (0 = nothing was mounted there, which the caller must report as a refusal).
+    pub fn detach_subtree(&mut self, canon: &str) -> usize {
+        let mut detached = 0;
+        for key in self.keys.iter_mut() {
+            if key.detached {
+                continue;
+            }
+            let under = key.path == canon
+                || (key.path.len() > canon.len()
+                    && key.path.starts_with(canon)
+                    && key.path.as_bytes()[canon.len()] == b'\\');
+            if under {
+                key.detached = true;
+                key.values.clear();
+                detached += 1;
+            }
+        }
+        detached
     }
 
     /// Set (create-or-replace) a value on an overlay key. `name` may be `""` (the default value).
     /// Returns `false` if `idx` is out of range.
     pub fn set_value(&mut self, idx: usize, name: &str, ty: u32, data: &[u8]) -> bool {
         let folded = fold(name);
-        let Some(k) = self.keys.get_mut(idx) else {
+        let Some(k) = self.keys.get_mut(idx).filter(|k| !k.detached) else {
             return false;
         };
         if let Some(v) = k.values.iter_mut().find(|v| v.name_folded == folded) {
@@ -143,7 +205,7 @@ impl RegistryOverlay {
     /// Returns `false` if `idx` is out of range.
     pub fn delete_value(&mut self, idx: usize, name: &str) -> bool {
         let folded = fold(name);
-        let Some(k) = self.keys.get_mut(idx) else {
+        let Some(k) = self.keys.get_mut(idx).filter(|k| !k.detached) else {
             return false;
         };
         if let Some(v) = k.values.iter_mut().find(|v| v.name_folded == folded) {
@@ -167,6 +229,7 @@ impl RegistryOverlay {
         let folded = fold(name);
         self.keys
             .get(idx)
+            .filter(|k| !k.detached)
             .and_then(|k| k.values.iter().find(|v| v.name_folded == folded))
             .is_some_and(|v| v.deleted)
     }
@@ -174,7 +237,7 @@ impl RegistryOverlay {
     /// Read a value by name (case-insensitive) on an overlay key: `(reg_type, data)`.
     pub fn value(&self, idx: usize, name: &str) -> Option<(u32, &[u8])> {
         let folded = fold(name);
-        let k = self.keys.get(idx)?;
+        let k = self.keys.get(idx).filter(|k| !k.detached)?;
         k.values
             .iter()
             .find(|v| v.name_folded == folded && !v.deleted)
@@ -185,12 +248,13 @@ impl RegistryOverlay {
     pub fn values_len(&self, idx: usize) -> usize {
         self.keys
             .get(idx)
+            .filter(|k| !k.detached)
             .map_or(0, |k| k.values.iter().filter(|v| !v.deleted).count())
     }
 
     /// Enumerate the value at `i` on an overlay key: `(original-case name, reg_type, data)`.
     pub fn value_by_index(&self, idx: usize, i: usize) -> Option<(&str, u32, &[u8])> {
-        let k = self.keys.get(idx)?;
+        let k = self.keys.get(idx).filter(|k| !k.detached)?;
         k.values
             .iter()
             .filter(|v| !v.deleted)
@@ -201,7 +265,7 @@ impl RegistryOverlay {
     /// The immediate child key-name components (already canonical/folded) of `parent_canon`.
     pub fn subkeys(&self, parent_canon: &str) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
-        for k in &self.keys {
+        for k in self.keys.iter().filter(|k| !k.detached) {
             if let Some(child) = immediate_child(&k.path, parent_canon) {
                 if !out.contains(&child) {
                     out.push(child);
@@ -315,6 +379,63 @@ mod tests {
         assert_eq!(ty, 4);
         assert_eq!(data, &1u32.to_le_bytes());
         assert!(ov.value_by_index(i, 1).is_none());
+    }
+
+    // ── `NtUnloadKey`'s write-plane half ─────────────────────────────────────────────────────
+    #[test]
+    fn detach_subtree_hides_the_key_and_everything_under_it() {
+        let mut ov = RegistryOverlay::new();
+        let (root, _) = ov.create(r"\registry\user\s-1-5-21-1");
+        let (child, _) = ov.create(r"\registry\user\s-1-5-21-1\environment");
+        let (other, _) = ov.create(r"\registry\user\s-1-5-21-11"); // NOT a child (prefix only)
+        let (keep, _) = ov.create(r"\registry\user\.default");
+        ov.set_value(root, "Loaded", 4, &1u32.to_le_bytes());
+        ov.set_value(child, "TEMP", 1, b"t");
+        assert_eq!(ov.live_len(), 4);
+
+        assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-1"), 2);
+
+        // The unloaded subtree answers nothing…
+        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1"), None);
+        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1\environment"), None);
+        assert!(ov.is_detached(root) && ov.is_detached(child));
+        assert_eq!(ov.path(root), None);
+        assert_eq!(ov.value(root, "Loaded"), None);
+        assert_eq!(ov.values_len(root), 0);
+        assert!(!ov.set_value(root, "Loaded", 4, &2u32.to_le_bytes()));
+        assert!(ov.subkeys(r"\registry\user\s-1-5-21-1").is_empty());
+        assert!(!ov
+            .subkeys(r"\registry\user")
+            .contains(&"s-1-5-21-1"));
+        // …and nothing else moved: the slots are still there, only 2 are live.
+        assert_eq!(ov.len(), 4);
+        assert_eq!(ov.live_len(), 2);
+        assert_eq!(ov.find(r"\registry\user\s-1-5-21-11"), Some(other));
+        assert_eq!(ov.find(r"\registry\user\.default"), Some(keep));
+    }
+
+    #[test]
+    fn detach_refuses_a_path_that_was_never_mounted() {
+        let mut ov = RegistryOverlay::new();
+        ov.create(r"\registry\user\.default");
+        assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-9"), 0);
+        assert_eq!(ov.live_len(), 1);
+    }
+
+    #[test]
+    fn re_creating_a_detached_path_reuses_the_slot_and_starts_empty() {
+        let mut ov = RegistryOverlay::new();
+        let (idx, created) = ov.create(r"\registry\user\s-1-5-21-1");
+        assert!(created);
+        ov.set_value(idx, "Stale", 4, &7u32.to_le_bytes());
+        assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-1"), 1);
+
+        let (again, created_again) = ov.create(r"\registry\user\s-1-5-21-1");
+        assert_eq!(again, idx, "a re-mount must re-use the detached slot");
+        assert!(created_again, "a re-mounted key is newly created, not opened");
+        assert!(!ov.is_detached(idx));
+        assert_eq!(ov.values_len(idx), 0, "the previous mount's writes must not survive");
+        assert_eq!(ov.len(), 1);
     }
 
     #[test]

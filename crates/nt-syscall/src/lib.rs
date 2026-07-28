@@ -86,6 +86,10 @@ pub enum NativeService {
     NtEnumerateValueKey,
     NtQueryKey,
     NtFlushKey,
+    // `NtLoadKey` / `NtUnloadKey` — mount and detach a `regf` hive file at a key in the registry
+    // namespace (`ntoskrnl/config/ntapi.c:1129` / `:1789`). Both require `SeRestorePrivilege`.
+    NtLoadKey,
+    NtUnloadKey,
     // Memory / section (§16.4)
     NtAllocateVirtualMemory,
     NtFreeVirtualMemory,
@@ -248,6 +252,8 @@ impl NativeService {
             NtEnumerateValueKey => "NtEnumerateValueKey",
             NtQueryKey => "NtQueryKey",
             NtFlushKey => "NtFlushKey",
+            NtLoadKey => "NtLoadKey",
+            NtUnloadKey => "NtUnloadKey",
             NtAllocateVirtualMemory => "NtAllocateVirtualMemory",
             NtFreeVirtualMemory => "NtFreeVirtualMemory",
             NtReadVirtualMemory => "NtReadVirtualMemory",
@@ -472,6 +478,8 @@ impl NativeService {
         NativeService::NtWaitForDebugEvent,
         NativeService::NtAllocateLocallyUniqueId,
         NativeService::NtCreateToken,
+        NativeService::NtLoadKey,
+        NativeService::NtUnloadKey,
     ];
 }
 

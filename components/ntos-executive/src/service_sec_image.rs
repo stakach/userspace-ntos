@@ -3098,6 +3098,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
                 nt_handler.token_dirty = false;
+                nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
@@ -3384,6 +3385,14 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.token_dirty = false;
                     heap_mark = allocator::mark();
                 }
+                // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
+                // table's path `String`s above `heap_mark`. Same contract as `overlay_dirty` — a
+                // mounted hive must outlive the syscall that mounted it. (The hive BYTES live in a
+                // static slot, so only the paths need pinning.)
+                if nt_handler.hive_mounts_dirty {
+                    nt_handler.hive_mounts_dirty = false;
+                    heap_mark = allocator::mark();
+                }
                 // WRITABLE FILESYSTEM plane: a handler that touched the writable overlay
                 // (`writable_fs`) — its lazy mount, or a create/write/set-information/close — grew
                 // the volume's `Vec`/`String` state ABOVE `heap_mark`. Pin the mark PAST it so the
@@ -3408,7 +3417,12 @@ pub(crate) unsafe fn service_sec_image(
                     && result != 0x8000_0006
                     && result != 0xC000_0003
                     && crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) != 0
-                    && PROFILE_FRONTIER_TRACED.fetch_add(1, Ordering::Relaxed) < 32
+                    // A SECOND budget opens once the user hive is loaded: the profile-copy phase
+                    // exhausts the first one long before winlogon's remaining `HandleLogon` steps
+                    // run, and those steps fail through `WARN`, which the binary does not print.
+                    && (PROFILE_FRONTIER_TRACED.fetch_add(1, Ordering::Relaxed) < 32
+                        || (post_profile_phase()
+                            && POST_PROFILE_FRONTIER_TRACED.fetch_add(1, Ordering::Relaxed) < 96))
                 {
                     print_str(b"[profile-frontier] winlogon SSN=");
                     print_u64(m0);

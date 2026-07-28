@@ -42,6 +42,57 @@ pub fn encode_token_owner(
     })
 }
 
+/// Native x64 `SID_AND_ATTRIBUTES`: `{ PSID Sid; DWORD Attributes; }` — 8-byte aligned, so 16.
+pub const SID_AND_ATTRIBUTES_LENGTH: usize = 16;
+
+/// Encode `TOKEN_GROUPS` (class 2): `{ DWORD GroupCount; SID_AND_ATTRIBUTES Groups[]; }` with the
+/// SID bodies laid out after the array and each `Sid` pointer expressed in the CALLER's address
+/// space (`caller_base` + offset), exactly as the kernel's `SeQueryInformationToken` does.
+///
+/// `caller_base` is the user VA the buffer will be copied to; the pointers are only meaningful
+/// there. Returns the required length even when the buffer is too small, so a caller can do the
+/// standard "query size, allocate, query again" dance (`GetTokenInformation(.., NULL, 0, &size)` →
+/// `STATUS_BUFFER_TOO_SMALL`, which is what `userenv!CheckForGuestsAndAdmins` and
+/// `winlogon!AllowAccessOnSession` both require).
+pub fn encode_token_groups(
+    token: &AccessToken,
+    caller_base: u64,
+    output: &mut [u8],
+) -> Result<TokenInformationEncoding, InvalidTokenSid> {
+    // GroupCount (4) + 4 bytes of padding so the array is 8-aligned, then the array, then the SIDs.
+    let array_offset = 8;
+    let sid_offset = array_offset + token.groups.len() * SID_AND_ATTRIBUTES_LENGTH;
+    let mut required_length = sid_offset;
+    for group in &token.groups {
+        required_length += group.sid.native_len().ok_or(InvalidTokenSid)?;
+    }
+    let Some(output) = output.get_mut(..required_length) else {
+        return Ok(TokenInformationEncoding {
+            required_length,
+            written: false,
+        });
+    };
+
+    output.fill(0);
+    output[..4].copy_from_slice(&(token.groups.len() as u32).to_le_bytes());
+    let mut sid_cursor = sid_offset;
+    for (index, group) in token.groups.iter().enumerate() {
+        let entry = array_offset + index * SID_AND_ATTRIBUTES_LENGTH;
+        output[entry..entry + 8]
+            .copy_from_slice(&caller_base.wrapping_add(sid_cursor as u64).to_le_bytes());
+        output[entry + 8..entry + 12].copy_from_slice(&group.attributes().to_le_bytes());
+        let written = group
+            .sid
+            .write_native(&mut output[sid_cursor..])
+            .ok_or(InvalidTokenSid)?;
+        sid_cursor += written;
+    }
+    Ok(TokenInformationEncoding {
+        required_length,
+        written: true,
+    })
+}
+
 /// Encode `TOKEN_DEFAULT_DACL`, preserving null and present-empty ACL as distinct states.
 pub fn encode_token_default_dacl(
     token: &AccessToken,

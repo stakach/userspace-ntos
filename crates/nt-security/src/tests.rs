@@ -205,6 +205,54 @@ fn native_acl_validates_known_and_object_ace_sids() {
     }
 }
 
+/// `TOKEN_GROUPS` (class 2) — the class `userenv!CheckForGuestsAndAdmins` and
+/// `winlogon!AllowAccessOnSession` size with a NULL/zero-length query before allocating.
+#[test]
+fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
+    let system = AccessToken::system();
+    let base = 0x7fff_0000u64;
+    let mut output = [0xcc; 256];
+    let encoded = encode_token_groups(&system, base, &mut output).unwrap();
+    assert!(encoded.written);
+
+    // GroupCount, then one 16-byte SID_AND_ATTRIBUTES per group, then the SID bodies.
+    let count = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+    assert_eq!(count, system.groups.len());
+    assert_eq!(count, 3, "the LocalSystem token has Administrators/AuthUsers/Everyone");
+    let array = 8;
+    let mut expected_len = array + count * SID_AND_ATTRIBUTES_LENGTH;
+    for group in &system.groups {
+        expected_len += group.sid.native_len().unwrap();
+    }
+    assert_eq!(encoded.required_length, expected_len);
+
+    // Every `Sid` pointer must land INSIDE the caller's buffer, in order, on the real SID bytes.
+    let mut cursor = array + count * SID_AND_ATTRIBUTES_LENGTH;
+    for (index, group) in system.groups.iter().enumerate() {
+        let entry = array + index * SID_AND_ATTRIBUTES_LENGTH;
+        let sid_va = u64::from_le_bytes(output[entry..entry + 8].try_into().unwrap());
+        assert_eq!(sid_va, base + cursor as u64, "group {index} SID pointer");
+        let attributes = u32::from_le_bytes(output[entry + 8..entry + 12].try_into().unwrap());
+        assert_eq!(attributes, group.attributes());
+        let mut expected = alloc::vec![0u8; group.sid.native_len().unwrap()];
+        group.sid.write_native(&mut expected).unwrap();
+        assert_eq!(&output[cursor..cursor + expected.len()], &expected[..]);
+        cursor += expected.len();
+    }
+    assert_eq!(cursor, encoded.required_length);
+
+    // The Administrators group is the token's OWNER group; the other two are plain enabled groups.
+    assert_eq!(system.groups[0].attributes() & 0x8, 0x8, "SE_GROUP_OWNER");
+    assert_eq!(system.groups[1].attributes() & 0x8, 0, "not an owner group");
+    assert_eq!(system.groups[1].attributes() & 0x7, 0x7, "mandatory|default|enabled");
+
+    // The SIZE QUERY: a zero-length buffer must still report the exact length and write nothing.
+    let mut none = [0u8; 0];
+    let sized = encode_token_groups(&system, base, &mut none).unwrap();
+    assert_eq!(sized.required_length, expected_len);
+    assert!(!sized.written);
+}
+
 #[test]
 fn native_token_information_encoders_are_exact_and_relocatable() {
     let system = AccessToken::system();
