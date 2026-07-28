@@ -591,8 +591,22 @@ pub(crate) unsafe fn spawn_sec_image(
                                                                                // (TEB+0x828 = 0: the WND already carries its client VA — no server->client shift needed).
         core::ptr::write_volatile((scr + 0x820) as *mut u64, SMSS_DESKINFO_VA); // CLIENTINFO.pDeskInfo
         core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
-        let _ = page_map(copy_cap(teb2), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
+        crate::seed_teb_tail_canary(scr + 0x5000);
+        if pi < 5 {
+            crate::TEB_TAIL_ALIAS_LIVE.fetch_or(1u64 << pi, core::sync::atomic::Ordering::Relaxed);
+            crate::TEB2_FRAME_CAP[pi as usize].store(teb2, core::sync::atomic::Ordering::Relaxed);
+        }
+        let teb2_client_cap = copy_cap(teb2);
+        let _ = page_map(teb2_client_cap, SMSS_TEB_VA + 0x1000, RW_NX, pml4);
+        if pi == 2 {
+            crate::WL_TEB2_CAP.store(teb2_client_cap, core::sync::atomic::Ordering::Relaxed);
+            crate::WL_TEB2_PML4.store(pml4, core::sync::atomic::Ordering::Relaxed);
+        }
         csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
+        // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's
+        // TEB), but is mapped READ-ONLY there and copy-on-written on the first store. See
+        // `W32_CLIENT_TEB_TAIL_PROTECTED`.
+        crate::teb_tail_register(SMSS_TEB_VA + 0x1000);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);

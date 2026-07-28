@@ -7552,6 +7552,39 @@ impl ExecNtHandler {
                             && (start.rip == completion_entry || start.rcx == completion_entry)
                         {
                             Some(1)
+                        } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
+                            && self.pi == 4
+                            && self.current_badge == LSASS_LISTENER3_BADGE
+                            && LSA_WORKER_TID.load(Ordering::Relaxed) != 0
+                        {
+                            // ★ THE SECOND `\pipe\lsarpc` CLIENT. rpcrt4 spawns ONE per-connection
+                            // `RPCRT4_io_thread` per accepted connection (`RPCRT4_new_client`,
+                            // `rpc_server.c:627`). The first — lsass' own self-RPC — takes the named
+                            // `LSA_WORKER` slot, which is a server thread and therefore never frees
+                            // it. So when winlogon's post-profile `LsaOpenPolicy` binds to
+                            // `\pipe\lsarpc`, the recognizer above falls through, nothing else claims
+                            // the create, and `NtCreateThread` answers STATUS_INSUFFICIENT_RESOURCES:
+                            // measured as `rpcrt4 rpc_server.c:631 failed to create thread,
+                            // error=5aa` (`ERROR_NO_SYSTEM_RESOURCES`). rpcrt4 then simply RELEASES
+                            // the connection — nobody ever reads winlogon's bind PDU — so winlogon
+                            // wait-parks on its async `\pipe\lsarpc` read while lsass parks in
+                            // `NtWaitForMultipleObjects`, and the boot has no runnable signaler left.
+                            //
+                            // The answer is to COMPLETE THE RPC, not to guess at a park/wake gap: give
+                            // the additional connection worker a real thread. It needs no new named
+                            // slot — the generic `(pi, slot)` hosted-thread layout is already fully
+                            // general (badge, target VAs, executive mirror + env scratch, multiplex
+                            // sub-select) and pi 4 has a free slot, so this claims one.
+                            let free = (0..TP_WORKER_SLOT_COUNT)
+                                .find(|slot| TP_WORKER_TID[4][*slot].load(Ordering::Relaxed) == 0);
+                            if free.is_some() {
+                                crate::LSA_RPC_EXTRA_WORKERS_CLAIMED
+                                    .fetch_add(1, Ordering::Relaxed);
+                                print_str(b"[lsa-worker] SECOND \\lsarpc connection (winlogon's LSA bind): named slot busy -> claiming a generic worker slot\n");
+                            } else {
+                                print_str(b"[lsa-worker] SECOND \\lsarpc connection: NO free worker slot -> the bind cannot be serviced\n");
+                            }
+                            free
                         } else {
                             None
                         };

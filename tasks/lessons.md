@@ -170,3 +170,47 @@ TEB field win32k clobbers, whose `int 3` crash-parked winlogon and cost two prot
 repairing THAT field took winlogon into an MS-RPC wait that deadlocks the single-threaded loop
 (`RUNEXIT=124`). Land the fix plus a **milestone park** at the new frontier, and ship the next
 repair only with the machinery its own frontier needs. Do not ship a repair that is measured to hang.
+
+## BATCH 60 — "it looks like X's data" is NOT attribution; make the accused's access COUNTABLE
+Two batches attributed a clobbered client TEB page to win32k because the bytes contained
+`0x00c8d0d4` (`COLOR_BTNFACE`) and win32k is the component that owns system colours. It was wrong.
+The refutation took three cheap, independent measurements, and every one of them is a counter, not a
+narrative:
+- **Map the accused's view READ-ONLY and count its store faults.** Zero faults = the accused never
+  wrote it. The same mapping doubles as the fix if the accusation had been right (copy-on-write into
+  a private shadow), so the experiment costs nothing to keep.
+- **Count whether the accused was ever even handed the page** (`ro-maps`). It was not — the page is
+  *registered* as reachable but no fault ever asked for it. "Registered" is not "accessed"; without
+  this counter, "zero store faults" is unfalsifiable.
+- **Scan for a FRAME ALIAS.** A second registration of the same frame cap under another key would
+  make a write anywhere else land in this page. There was none.
+- **Sample the invariant at EVERY boundary and report only the TRANSITION**, with a tag naming the
+  call site: before/after every dispatch (at the one funnel nested dispatches also use), after every
+  serviced syscall, and at the service-loop top. The transition only ever appeared across the window
+  in which the CLIENT runs — which is the whole answer.
+Then, to name the writer, protect the page **in the suspect's own address space** and log the RIP of
+every store. The flood from one legitimate high-frequency writer (`RtlNtStatusToDosError`'s
+`TEB.LastStatusValue` store) is handled by EMULATING that one instruction — write the value through
+the executive's alias and step the client past it — so the protection stays continuously armed
+instead of being torn down and re-armed thousands of times. Arm such a watch from the SUSPECT'S
+SPAWN: arming it at the milestone nearest the symptom was measured to be one second too late.
+
+## BATCH 60 — an "unserviceable" RPC is usually a REFUSED resource, so read the client's own error
+The `\pipe\lsarpc` deadlock looked like a park/wake correlation gap (both sides parked, nothing to
+signal). It was not: rpcrt4 printed its own diagnosis into the log — `rpc_server.c:631 failed to
+create thread, error=5aa` — i.e. `RPCRT4_new_client`'s `CreateThread` was refused
+STATUS_INSUFFICIENT_RESOURCES, so the connection was released and nobody ever read the bind PDU.
+A per-connection server needs one worker PER CONNECTION; a single NAMED slot serves exactly one, and
+a server thread never frees it. Before inventing a new named slot, check whether the generic
+`(pi, slot)` hosted-thread layout already has a free one — it is fully general (badge, target VAs,
+mirror, env scratch, multiplex sub-select), so an extra connection worker can be one `else if` arm.
+
+## BATCH 60 — the only place a single-threaded loop can be watched is the place it BLOCKS
+A wall-clock stall watchdog at the service-loop top cannot see a deadlock, because a deadlock is
+precisely "the loop top is never reached again". Put the check inside the ONE blocking primitive
+(`recv_full_r12`) and give it a deadline that joins the existing delay-timer `min()`, using the
+bound notification that can already cancel any `Recv`. Two rules keep it from becoming the next
+interrupt storm: every comparator write must be strictly AHEAD of the main counter, and the
+trigger-type bit is never an arm control. Count a watchdog delivery as WORK, or it inflates the
+"woke nothing" metric that exists to detect a storm. A nested pump that merely LATCHES the tick must
+also re-arm + Ack it, or a deadlock inside a dispatch gets exactly one tick and can never trip.

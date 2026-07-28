@@ -5731,3 +5731,86 @@ private page in winlogon's VSpace at `PRIVATE_VM_LIMIT - 0x1000`, `proof=0x3f/0x
    a dynamic mount in the same selector scheme, `config\default` is staged in its own DEFHIVEBUF
    window as the `ntuser.dat` source. **Unserviced SSNs PARK the caller**, so these must exist before
    `LoadUserProfileW`'s two `RegLoadKeyW` calls are reached.
+
+## Batch 60 — the TEB-tail clobber was **NOT win32k**; winlogon's `\pipe\lsarpc` bind gets a REAL worker; the loop gets a watchdog that fires INSIDE `recv` (gate 250 -> **252/99, ZERO FAILs**)
+
+**★ THE STANDING ATTRIBUTION WAS WRONG, AND THE MEASUREMENTS SAY SO.** Batch 53 (the
+`ACTIVATION_CONTEXT_STACK` at `TEB+0x1800`) and batch 59 (`StaticUnicodeString` at `TEB+0x1258`,
+whose kernel32 `client/file/fileutils.c:26` `int 3` killed winlogon) both blamed win32k's
+`KeStackAttachProcess` client-frame mapping, on the strength of the clobbered bytes LOOKING like
+USER server data (`0x00c8d0d4` = `COLOR_BTNFACE`). Three independent measurements refute it:
+
+1. **`win32k ro-maps = 0`** — the tail page is *never handed to win32k at all*. It is registered as a
+   client frame, but no win32k demand fault ever asks for it, so `map_csrss_page_into_win32k` never
+   runs for it. (Mapping it READ-ONLY when it *is* asked for is what makes this countable.)
+2. **`win32k store-faults = 0`** — with the read-only mapping in place, win32k never took a single
+   store fault on it.
+3. **No frame ALIAS** (`teb_tail_alias_scan`: exactly one registration, the legitimate one), and the
+   good→bad transition **never straddled a win32k dispatch** — sampled before and after every
+   dispatch at the one funnel every nested dispatch also passes through (`win32k_dispatch_wide`),
+   and after every serviced native syscall. It only ever appeared across the window in which the
+   CLIENT runs.
+
+**Who really writes the page.** Mapping winlogon's own second TEB page READ-ONLY *in winlogon's
+VSpace* named the traffic exactly: `RtlNtStatusToDosError+0x12` (`ntdll+0x1c2c2`,
+`mov [rax+0x1250], ecx` — `TEB.LastStatusValue`, ~170 stores), gdi32 at `TEB+0x1740`
+(`GdiBatchCount`), ntdll's TLS-slot stores at `TEB+0x1480..0x14b8`, and `RtlAnsiStringToUnicodeString`
+filling `StaticUnicodeBuffer` at `TEB+0x1268`. All legitimate. The descriptor corruption is a rare,
+timing-dependent client-side event that the continuously-armed protection did not reproduce.
+
+**What ships (both halves, because the boot needs both).**
+* **The mapping class fix** — the tail page is mapped **read-only** into win32k and the first store
+  is **copy-on-written** into a private shadow seeded from the live page. The whole mapping-borne
+  class is structurally impossible, at a measured cost of zero, and its counters are what *prove*
+  win32k innocent rather than merely leaving it unaccused.
+* **The enforced invariant** — the page is also mapped read-only in winlogon, the
+  `TEB.LastStatusValue` store is **emulated in place** (value written through the executive alias,
+  client stepped past the 6-byte instruction) so the protection stays continuously armed instead of
+  being torn down thousands of times, every other client store is reported with its RIP, and
+  `StaticUnicodeString`'s shape is re-asserted on every service-loop event.
+* **A 64-byte spawn CANARY at `TEB+0x1FC0`**, asserted at the gate. This is the guard that catches a
+  field *nobody has thought of yet* — an assertion on `StaticUnicodeString` alone would only ever
+  re-detect the clobber we already know about.
+
+**★ THE `\pipe\lsarpc` DEADLOCK WAS A REFUSED THREAD CREATE, not a park/wake gap.** With the tail
+intact, winlogon runs past kernel32's assertion, `CreateUserProfileW` completes, and its post-profile
+`LsaOpenPolicy` opens `\??\pipe\lsarpc`. lsass' `\lsarpc` `RPCRT4_server_thread` accepts and calls
+`RPCRT4_new_client` → `CreateThread(RPCRT4_io_thread)` (`rpc_server.c:627`) — and the executive
+REFUSED it: `rpc_server.c:631  failed to create thread, error=5aa` (`ERROR_NO_SYSTEM_RESOURCES`),
+because there was exactly ONE named per-connection LSA worker slot and lsass' own self-RPC worker is
+a server thread that never frees it. rpcrt4 then released the connection, so nobody ever read
+winlogon's bind PDU: winlogon wait-parked on its async read, lsass parked in
+`NtWaitForMultipleObjects`, and the executive blocked in `recv` with no runnable signaler
+(`RUNEXIT=124`, no gate). **Fix: complete the RPC.** The additional connection worker is routed onto
+a FREE generic `(pi, slot)` hosted-thread layout — badge, target VAs, executive mirror + env scratch
+and multiplex sub-select are already fully general, and pi 4 has a free slot — so this needed no new
+named slot at all.
+
+**★ A WATCHDOG THAT FIRES INSIDE `recv`.** The wall-clock stall watchdog only ran at the loop top,
+so a boot that stops receiving IPC entirely was invisible to it — the reason two batches read
+`RUNEXIT=124` as a TCG budget overrun. The deadman is a coarse 20 s deadline that joins
+`delay_timer_rearm`'s existing `min()` and is checked inside **`recv_full_r12`**, the one place the
+executive ever blocks — so it covers the nested component-pump receives a dispatch makes as well as
+the loop's own (`watchdog_nested_rearm` re-arms the comparator + Acks the IRQ from the pump path,
+which the main loop cannot do while blocked). A TRIP needs two consecutive silent periods; it prints
+a full report (event/keyed waiters, resume IPs, timer state) and the loop then QUIESCES to the gate.
+`exec_delay_timer_disarms` is respected by construction: the trigger-type bit is never used as an arm
+control, every comparator write is strictly ahead of `now`, the whole post-logon window costs
+single-digit deliveries against that spec's 4096 ceiling, and a watchdog delivery is counted as WORK
+(`WATCHDOG_TICK_IS_OURS`) so `spurious <= 64` keeps meaning "this timer woke nothing".
+
+**New specs.** `exec_teb_not_clobbered_by_win32k` (canary + descriptor shape + the private ACS
+pointer + the protection was live and saw real client traffic + **win32k took zero stores**) and
+`exec_lsarpc_deadlock_guarded` (the extra connection worker was really claimed + the deadman is armed
+with zero trips).
+
+**BYPASS.** `LSA_RPC_EXTRA_CONNECTION_WORKERS = false`: 252 -> **251/99, exactly 1 FAIL**
+(`exec_lsarpc_deadlock_guarded`), `failed to create thread, error=5aa` back.
+`WL_TEB_TAIL_WRITE_WATCH = false`: 252 -> **250/99, 2 FAILs** — the kernel32 assertion returns
+(`MaximumLength=33`, `descriptor-restores=808`) and winlogon never reaches the `\lsarpc` bind, so the
+second spec goes red with it. **The two genuinely cannot ship apart**, exactly as batch 59 predicted.
+
+**NEW FRONTIER.** Past the bind, winlogon raises an unhandled CPU exception at
+`ntdll+0x13284 = RtlEnterCriticalSection+0x14` (milestone park, clean quiesce). `NtLoadKey` /
+`NtUnloadKey` (SSN 102/272) were NOT reached and are NOT implemented; no hive is loaded and
+`userinit.exe` did not spawn.

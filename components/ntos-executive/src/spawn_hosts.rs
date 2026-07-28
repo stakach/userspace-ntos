@@ -684,6 +684,10 @@ unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
         let (badge, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
         if badge == crate::DELAY_TIMER_BADGE {
             crate::DELAY_TIMER_TICK_PENDING.store(true, Ordering::Relaxed);
+            // The main service loop owns the ordinary re-arm + IRQ Ack, and it cannot run while this
+            // pump is blocked — so a deadlock INSIDE a dispatch would get exactly one tick and could
+            // never trip the deadman. Re-arm it here (see `watchdog_nested_rearm`).
+            crate::watchdog_nested_rearm();
             let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
                 crate::print_str(
@@ -787,7 +791,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     {
         PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
     }
-    let (mut mi, mut m0, mut m1, mut _m2, mut _m3) = pump_recv(ch);
+    let (mut mi, mut m0, mut m1, mut _m2, mut m3) = pump_recv(ch);
     let mut faults = 0u64;
     let mut demand = 0u64;
     let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded → a looping assert walls)
@@ -835,7 +839,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             m0 = nm0;
             m1 = nm1;
             _m2 = nm2;
-            _m3 = nm3;
+            m3 = nm3;
             continue;
         } else if label == 6 {
             let ip = m0;
@@ -869,6 +873,31 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 }
                 // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
                 if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+                    crate::win32k_glue::win32k_dispatch_backtrace();
+                    wall_ip = ip;
+                    wall_addr = addr;
+                    wall_label = label;
+                    break;
+                }
+                // ★ THE CLIENT TEB TAIL IS READ-ONLY TO win32k. A WRITE fault (x86 `#PF` error-code
+                // bit 1, delivered as the VMFault `FSR`) on a page that is ALREADY attached can only
+                // be the read-only tail mapping refusing a store — every other attached page is RW.
+                // Answer it with a private copy-on-write shadow instead of the caller's real TEB.
+                if crate::W32_CLIENT_TEB_TAIL_PROTECTED
+                    && (m3 & 0x2) != 0
+                    && crate::win32k_glue::w32_attach_mapped(page)
+                    && crate::is_teb_tail_page(page)
+                {
+                    if crate::win32k_glue::w32_teb_tail_cow(page, ch.client_pi, ch.pml4, ip) {
+                        demand += 1;
+                        let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 0, 0);
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        _m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
                     crate::win32k_glue::win32k_dispatch_backtrace();
                     wall_ip = ip;
                     wall_addr = addr;
@@ -949,7 +978,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             m0 = nm0;
             m1 = nm1;
             _m2 = nm2;
-            _m3 = nm3;
+            m3 = nm3;
             continue;
         } else if label == 3 && ch.caps.assert_skip {
             // ── win32k checked-build int-0x2c ASSERT-SKIP (relocated VERBATIM). Verify CD 2C via the
@@ -981,12 +1010,12 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 m0 = nm0;
                 m1 = nm1;
                 _m2 = nm2;
-                _m3 = nm3;
+                m3 = nm3;
                 continue;
             }
             // Not a skippable int-0x2c — fall through to the wall.
             if ch.caps.client_attach {
-                win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+                win32k_wall_diag(ch, label, m0, m1, _m2, m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
             wall_ip = m0;
@@ -996,7 +1025,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
         } else {
             // Any other fault — a real wall inside the handler.
             if ch.caps.client_attach {
-                win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+                win32k_wall_diag(ch, label, m0, m1, _m2, m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
             wall_ip = m0;

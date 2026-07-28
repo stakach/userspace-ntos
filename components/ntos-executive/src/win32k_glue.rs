@@ -2280,6 +2280,88 @@ pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
     }
     false
 }
+/// Re-point `page`'s attach record at a NEW copy-cap `slot` (the copy-on-write swap below), so the
+/// detach Unmap tears down whichever frame is actually mapped. Returns the OLD slot, or 0.
+pub(crate) unsafe fn w32_attach_replace_slot(page: u64, slot: u64) -> u64 {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    let pages = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
+    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
+    for i in 0..n {
+        if core::ptr::read(pages.add(i)) == page {
+            let old = core::ptr::read(slots.add(i));
+            core::ptr::write(slots.add(i), slot);
+            return old;
+        }
+    }
+    0
+}
+
+/// ★ COPY-ON-WRITE the caller's TEB tail out from under a win32k store.
+///
+/// Called from the component fault pump when win32k takes a WRITE fault (`fsr` bit 1) on a page that
+/// is already attached — which, for a tail page, can only mean the read-only mapping refused the
+/// store. The client's real frame is swapped for a private shadow seeded from it, mapped RW at the
+/// same VA, and recorded in the attach table so the ordinary detach unmaps it. win32k restarts the
+/// faulting instruction and completes its write into the shadow.
+///
+/// The first few are reported with the faulting IP and its win32k RVA plus a stack backtrace: that
+/// is the measurement which names the writer, and it is why this is a diagnosis rather than a guess.
+pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) -> bool {
+    let seen = crate::W32_TEB_TAIL_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let rva = ip.wrapping_sub(win32k_subsystem::WIN32K_CODE_VA);
+    let _ = crate::W32_TEB_TAIL_FIRST_WRITER_RVA.compare_exchange(
+        0,
+        rva,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    let shadow = crate::teb_tail_shadow(pi, page);
+    if shadow == 0 {
+        print_str(b"[teb-tail] no shadow available for client TEB tail page 0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" pi=");
+        print_u64(pi);
+        print_str(b"\n");
+        return false;
+    }
+    let old = w32_attach_replace_slot(page, 0);
+    if old != 0 {
+        let error = page_unmap(old);
+        if error != 0 {
+            print_str(b"[teb-tail] COW unmap failed error=");
+            print_u64(error);
+            print_str(b"\n");
+        }
+    }
+    let cc = copy_cap(shadow);
+    let error = page_map(cc, page, RW_NX, w_pml4);
+    if error != 0 {
+        print_str(b"[teb-tail] COW map failed error=");
+        print_u64(error);
+        print_str(b"\n");
+        return false;
+    }
+    if w32_attach_replace_slot(page, cc) == 0 {
+        w32_attach_record(page, cc);
+    }
+    if seen < 6 {
+        print_str(b"[teb-tail] win32k STORE into the client TEB tail REFUSED (page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" pi=");
+        print_u64(pi);
+        print_str(b") ip=0x");
+        print_hex((ip >> 32) as u32);
+        print_hex(ip as u32);
+        print_str(b" win32k RVA=0x");
+        print_hex(rva as u32);
+        print_str(b" -> redirected to a private shadow\n");
+        win32k_dispatch_backtrace();
+    }
+    true
+}
+
 /// Record that `page` is now mapped into win32k via copy-cap `slot` (for a later detach Unmap).
 pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64) {
     let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
@@ -2340,8 +2422,19 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     ensure_w32_client_paging(page, w_pml4);
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
     // the client so writes propagate back (out-params). Non-executable — client data, not code.
+    //
+    // ★ EXCEPT the TEB TAIL. The caller's SECOND TEB page carries `StaticUnicodeString`, the ACS the
+    // client used to keep there, TLS slots, `DeallocationStack` — user-mode state that win32k has no
+    // contract to modify (see `main.rs`, `W32_CLIENT_TEB_TAIL_PROTECTED`). It is mapped READ-ONLY, so
+    // win32k reads the caller's real values and the FIRST store faults into `w32_teb_tail_cow` below
+    // instead of scribbling the live TEB.
+    let protect_tail = crate::W32_CLIENT_TEB_TAIL_PROTECTED && crate::is_teb_tail_page(page);
+    if protect_tail {
+        crate::W32_TEB_TAIL_RO_MAPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let rights = if protect_tail { crate::RO_NX } else { RW_NX };
     let cc = copy_cap(fr);
-    let error = page_map(cc, page, RW_NX, w_pml4);
+    let error = page_map(cc, page, rights, w_pml4);
     if error != 0 {
         print_str(b"[w32attach] page_map failed page=0x");
         print_hex((page >> 32) as u32);
@@ -2580,6 +2673,11 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
     // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
     let client_pi = client.pi as u64;
+    // TAIL WATCH tag 4/5 — sample EVERY hosted process' TEB tail immediately before and after every
+    // win32k dispatch (this is the single funnel all dispatch sites go through, nested ones too).
+    for watch_pi in 1..5usize {
+        crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
+    }
     if !w32_client_attach(client_pi) {
         return (0xC000_0001u32 as i32, false);
     }
@@ -2697,6 +2795,9 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         },
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
+    for watch_pi in 1..5usize {
+        crate::teb_tail_watch(watch_pi, 5, ssn, client_pi);
+    }
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,

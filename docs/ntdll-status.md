@@ -1090,3 +1090,48 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > `[dbg] (dll\win32\userenv\directory.c:148) Error: 1450` back, `vm-fail map` 0 → 2, `asids` 7 → 0,
 > and the overlay counters collapse to the pre-batch numbers (creates 28 → 23, dirs 25 → 21,
 > reads 3 → 1, writes 3 → 1). Paint stays 768/768; every other spec stays green.
+
+> **BATCH 60 (gate 250 -> 252/99, ZERO FAILs, RUNEXIT=3, sentinel, paint 767/768 @ `0x003a6ea5` plus
+> cursor overlay, four consecutive foreground boots at 317-331 s with `diff`-identical 252-line PASS
+> lists).**
+>
+> **(1) THE TEB-TAIL CLOBBER IS NOT win32k — the standing attribution is REFUTED.** The tail page is
+> never handed to win32k at all (`win32k ro-maps = 0`); with it mapped READ-ONLY into win32k, win32k
+> took ZERO store faults on it (`store-faults = 0`); the frame is not aliased (exactly one
+> registration); and the good→bad transition never straddled a win32k dispatch — sampled before and
+> after every dispatch at `win32k_dispatch_wide` (the funnel every nested dispatch also uses) and
+> after every serviced native syscall. It only ever appeared across the window in which the CLIENT
+> runs. `0x00c8d0d4` looking like `COLOR_BTNFACE` was a coincidence that cost two batches.
+>
+> **(2) WHAT SHIPS.** *The mapping class fix*: the tail page is read-only to win32k and the first
+> store copy-on-writes into a private shadow seeded from the live page — the mapping-borne class is
+> structurally impossible, measured cost zero, and its counters are the proof of (1). *The enforced
+> invariant*: the page is also read-only in winlogon's own VSpace,
+> `RtlNtStatusToDosError+0x12` (`ntdll+0x1c2c2`, the `TEB.LastStatusValue` store) is EMULATED in
+> place so the protection stays continuously armed, every other client store is reported with its
+> RIP, and `StaticUnicodeString`'s shape is re-asserted on every service-loop event. *The guard that
+> generalises*: a 64-byte spawn CANARY at `TEB+0x1FC0`, asserted at the gate — it catches a field
+> nobody has thought of yet, which an assertion on `StaticUnicodeString` alone never could.
+>
+> **(3) THE `\pipe\lsarpc` DEADLOCK WAS A REFUSED THREAD CREATE.** winlogon's post-profile
+> `LsaOpenPolicy` binds `\??\pipe\lsarpc`; lsass' `\lsarpc` `RPCRT4_server_thread` accepts and calls
+> `RPCRT4_new_client` → `CreateThread(RPCRT4_io_thread)`, and the executive refused it —
+> `rpc_server.c:631 failed to create thread, error=5aa` (`ERROR_NO_SYSTEM_RESOURCES`) — because there
+> was ONE named per-connection LSA worker slot and lsass' own self-RPC worker never frees it. rpcrt4
+> released the connection, nobody read winlogon's bind PDU, and both sides parked. The fix COMPLETES
+> the RPC: the additional connection worker is routed onto a FREE generic `(pi, slot)` hosted-thread
+> layout, which is already general enough to need no new named slot.
+>
+> **(4) A WATCHDOG THAT FIRES INSIDE `recv`.** A coarse 20 s deadline joins `delay_timer_rearm`'s
+> existing `min()` and is checked inside `recv_full_r12` — the one place the executive ever blocks,
+> so nested component-pump receives are covered too (`watchdog_nested_rearm` re-arms + Acks from the
+> pump path, which the main loop cannot do while blocked). Two consecutive silent periods TRIP it: it
+> prints a full report (waiters, resume IPs, timer state) and the loop quiesces to the gate, so a
+> deadlock ends as a gate line instead of `RUNEXIT=124`. `exec_delay_timer_disarms` is respected by
+> construction — the trigger-type bit is never an arm control, every comparator write is strictly
+> ahead of `now`, and a watchdog delivery counts as WORK so `spurious <= 64` keeps its meaning.
+>
+> **(5) NEW FRONTIER.** `CreateUserProfileW` completes and the `\pipe\lsarpc` bind is served; past it
+> winlogon raises an unhandled CPU exception at `ntdll+0x13284 = RtlEnterCriticalSection+0x14`
+> (milestone park, clean quiesce). **`NtLoadKey`/`NtUnloadKey` (SSN 102/272) were NOT reached and are
+> NOT implemented; no hive is loaded and `userinit.exe` did not spawn.**

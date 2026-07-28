@@ -1649,6 +1649,179 @@ pub(crate) static DELAY_TIMER_TICK_PENDING: core::sync::atomic::AtomicBool =
 pub(crate) static PUMP_TIMER_TICKS_ABSORBED: AtomicU64 = AtomicU64::new(0);
 /// Latched ticks actually drained + serviced by the main service loop.
 pub(crate) static PUMP_TIMER_TICKS_DRAINED: AtomicU64 = AtomicU64::new(0);
+// ═══ ★ A WATCHDOG THAT CAN FIRE WHILE THE LOOP IS BLOCKED IN `recv` ═════════════════════════════
+//
+// The wall-clock stall watchdog runs at the SERVICE-LOOP TOP, so it can only observe a boot that is
+// still receiving messages. A genuine deadlock — every hosted thread parked, nobody left to signal —
+// produces no messages at all, the executive blocks forever inside `seL4_Recv`, and the loop top is
+// never reached again. That is precisely why two batches read `RUNEXIT=124` as "the TCG budget" and
+// went looking for work to remove: there was no wall-clock evidence at all, only a silent tail.
+//
+// The mechanism that CAN interrupt a blocking `Recv` already exists: the executive's root TCB has
+// the HPET one-shot notification BOUND to it (`delay_timer_init`), which is how `NtDelayExecution`
+// wakes a parked waiter while the loop sits in `recv`. So the watchdog is a coarse deadline that
+// joins the delay queue's own `min()` in `delay_timer_rearm`, and the check runs inside
+// `recv_full_r12` — i.e. at EVERY blocking receive the executive makes, including the nested ones a
+// component pump takes during a dispatch.
+//
+// ★ IT RESPECTS `exec_delay_timer_disarms`. The trigger-type bit is never used as an arm control
+// (only `delay_timer_rearm`'s existing `Tn_INT_ENB` path arms/disarms), the period is 20 s so the
+// whole post-logon window costs single-digit deliveries against that spec's 4096 ceiling, and a
+// watchdog tick is counted as WORK rather than as a spurious wake (`WATCHDOG_TICK_IS_OURS`), so the
+// `spurious <= 64` clause keeps meaning what it meant. The storm that cost 2.7 M deliveries came
+// from a comparator left permanently BEHIND the main counter; every path here writes a comparator
+// strictly ahead of `now`.
+/// Ship switch: `false` removes the deadline from the rearm chain and the check from every recv.
+pub(crate) const EXEC_DEADMAN_WATCHDOG: bool = true;
+/// 20 s of wall clock. A TRIP needs two consecutive expiries with no message in between, so the
+/// boot must have been completely silent for ~40 s — well past any single TCG-slow dispatch.
+const WATCHDOG_PERIOD_100NS: u64 = 20 * 10_000_000;
+pub(crate) static WATCHDOG_ARMED: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Every real (non-timer) message the executive has received. The deadlock predicate is simply
+/// "this did not move across a whole watchdog period" — no clock read on the hot path.
+pub(crate) static WATCHDOG_MSGS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_LAST_SEEN_MSGS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static WATCHDOG_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WATCHDOG_TRIPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WATCHDOG_TRIPPED: AtomicU64 = AtomicU64::new(0);
+/// Ticks the watchdog re-armed itself from inside a NESTED component-pump receive (where the main
+/// service loop's `delay_timer_interrupt` cannot run to re-arm it).
+pub(crate) static WATCHDOG_NESTED_REARMS: AtomicU64 = AtomicU64::new(0);
+/// Set by `watchdog_on_tick` when the delivery it saw was the watchdog's own deadline, consumed by
+/// `delay_timer_interrupt` so the tick counts as work instead of as a spurious wake.
+static WATCHDOG_TICK_IS_OURS: AtomicU64 = AtomicU64::new(0);
+
+/// The watchdog's contribution to `delay_timer_rearm`'s deadline `min()`.
+fn watchdog_deadline() -> Option<u64> {
+    if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+    if deadline == u64::MAX { None } else { Some(deadline) }
+}
+
+/// Arm the deadman. Scoped ON at the POST-LOGON milestone: that is where the frontier is, it is past
+/// every SM/CSR/LSA rendezvous (whose nested receive loops do not screen a bound-notification badge),
+/// and it keeps the added deliveries to the handful this batch actually needs.
+pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+    if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    if !delay_timer_init() {
+        WATCHDOG_ARMED.store(0, Ordering::Relaxed);
+        return;
+    }
+    WATCHDOG_DEADLINE.store(
+        monotonic_time_100ns().saturating_add(WATCHDOG_PERIOD_100NS),
+        Ordering::Relaxed,
+    );
+    WATCHDOG_LAST_SEEN_MSGS.store(u64::MAX, Ordering::Relaxed);
+    delay_timer_rearm(queue);
+    print_str(b"[deadman] in-recv watchdog ARMED (period 20s, trip = two silent periods)\n");
+}
+
+/// Run at every bound-notification delivery, from inside `recv_full_r12` — so it fires even when the
+/// executive is blocked in a NESTED receive that the service loop can never return from.
+pub(crate) unsafe fn watchdog_on_tick() {
+    if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    WATCHDOG_TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = monotonic_time_100ns();
+    if now < WATCHDOG_DEADLINE.load(Ordering::Relaxed) {
+        return; // an ordinary delay/wait tick; not our deadline
+    }
+    WATCHDOG_TICK_IS_OURS.store(1, Ordering::Relaxed);
+    WATCHDOG_DEADLINE.store(now.saturating_add(WATCHDOG_PERIOD_100NS), Ordering::Relaxed);
+    let messages = WATCHDOG_MSGS.load(Ordering::Relaxed);
+    let previous = WATCHDOG_LAST_SEEN_MSGS.swap(messages, Ordering::Relaxed);
+    if messages != previous {
+        return; // the executive is still receiving real work
+    }
+    let trip = WATCHDOG_TRIPS.fetch_add(1, Ordering::Relaxed);
+    WATCHDOG_TRIPPED.store(1, Ordering::Relaxed);
+    if trip < 3 {
+        watchdog_report(messages);
+    }
+}
+
+/// What a deadlock now SAYS about itself, instead of a silent tail.
+unsafe fn watchdog_report(messages: u64) {
+    print_str(b"[deadman] ***** DEADLOCK: no IPC reached the executive for two 20s periods *****\n");
+    print_str(b"[deadman] messages-received=");
+    print_u64(messages);
+    print_str(b" ticks=");
+    print_u64(WATCHDOG_TICKS.load(Ordering::Relaxed));
+    print_str(b" nested-rearms=");
+    print_u64(WATCHDOG_NESTED_REARMS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    for slot in 0..WAITER_N {
+        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX {
+            continue;
+        }
+        print_str(b"[deadman] event-waiter tid=");
+        print_u64(WAITER_TID[slot].load(Ordering::Relaxed));
+        print_str(b" events=");
+        print_u64(WAITER_EVENT_COUNT[slot].load(Ordering::Relaxed));
+        print_str(b" wait-all=");
+        print_u64(WAITER_WAIT_ALL[slot].load(Ordering::Relaxed));
+        print_str(b" deadline=");
+        print_u64(WAITER_DEADLINE[slot].load(Ordering::Relaxed));
+        print_str(b" resume-ip=0x");
+        print_hex_u64(WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+    for slot in 0..KEYED_WAITER_N {
+        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX {
+            continue;
+        }
+        print_str(b"[deadman] keyed-waiter tid=");
+        print_u64(KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
+        print_str(b" key=0x");
+        print_hex_u64(KEYED_WAITER_KEY[slot].load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+    print_str(b"[deadman] delay-timer deliveries=");
+    print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
+    print_str(b" woke-nothing=");
+    print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
+    print_str(b" last-rearm-armed=");
+    print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
+    print_str(b" src=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
+    print_str(b"\n[deadman] -> the service loop will QUIESCE and run the gate rather than hang\n");
+}
+
+/// Re-arm the HPET from inside a NESTED component-pump receive. The main service loop's
+/// `delay_timer_interrupt` (which owns the ordinary re-arm + IRQ Ack) cannot run while the pump is
+/// blocked, and the IOAPIC line stays masked until that Ack — so without this a nested deadlock
+/// would get exactly ONE tick and could never TRIP. The sequence mirrors `delay_timer_interrupt`'s
+/// exactly: comparator strictly AHEAD of `now` first, then clear the level-triggered status, then
+/// Ack — the ordering that keeps a still-asserted line from storming.
+pub(crate) unsafe fn watchdog_nested_rearm() {
+    if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
+    if handler == 0 || period == 0 {
+        return;
+    }
+    let step = nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
+    let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    core::ptr::write_volatile(
+        (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
+        now.saturating_add(step),
+    );
+    let config =
+        core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) | HPET_TN_INT_ENB;
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+    WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
+}
+
 const DELAY_TIMER_IRQ: u64 = 12;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
@@ -2831,6 +3004,158 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
     vm_pool_headroom_spec(passed);
+    unsafe { teb_tail_protected_spec(passed) };
+    unsafe { lsarpc_connection_worker_spec(passed) };
+}
+
+/// ═══ ★ THE CLIENT TEB TAIL SURVIVES TO THE GATE, AND win32k IS EXONERATED ══════════════════════
+///
+/// ★ THE PREVIOUS TWO BATCHES' ATTRIBUTION WAS WRONG, AND THIS SPEC IS WRITTEN AROUND THE
+/// MEASUREMENT THAT REFUTES IT. Batch 53 (the `ACTIVATION_CONTEXT_STACK` at `TEB+0x1800`) and batch
+/// 59 (`StaticUnicodeString` at `TEB+0x1258`, whose kernel32 `fileutils.c:26` `int 3` killed
+/// winlogon) both blamed win32k, on the strength of the clobbered bytes LOOKING like USER server
+/// data (`0x00c8d0d4` = `COLOR_BTNFACE`). Three independent measurements say otherwise:
+///
+///  1. `W32_TEB_TAIL_RO_MAPS == 0` — the tail page is NEVER handed to win32k at all. It is
+///     registered as a client frame, but no win32k demand fault ever asks for it, so
+///     `map_csrss_page_into_win32k` never runs for it;
+///  2. `W32_TEB_TAIL_WRITE_FAULTS == 0` — with the page mapped READ-ONLY into win32k (the class fix
+///     below), win32k never once took a store fault on it;
+///  3. the frame is not ALIASED (`teb_tail_alias_scan`: exactly ONE registration, the legitimate
+///     one), and the good→bad transition never straddled a win32k dispatch — sampled before AND
+///     after every dispatch, at the single funnel every nested dispatch also goes through. It only
+///     ever appeared across the window in which the CLIENT runs.
+///
+/// So two things ship. **The class fix**: the tail page is mapped read-only into win32k and the
+/// first store is copy-on-written into a private shadow, which makes the whole mapping-borne class
+/// structurally impossible — measured cost zero, and its counters are what proves win32k innocent
+/// rather than merely unaccused. **The enforced invariant**: the page is also mapped read-only in
+/// WINLOGON's own VSpace, `RtlNtStatusToDosError`'s `TEB.LastStatusValue` store (ntdll+0x1c2c2, by
+/// far the most frequent writer) is emulated in place so the protection stays continuously armed,
+/// every other client store is reported with its RIP, and the descriptor invariant is re-asserted on
+/// every service-loop event.
+///
+/// The assertions, and why each generalises:
+///  * the 64-byte spawn CANARY at `TEB+0x1FC0` is byte-for-byte what the spawn wrote. ★ THIS is the
+///    clause that catches a field NOBODY HAS THOUGHT OF YET — nothing writes there, so any stray
+///    store into the tail's unused region breaks it, instead of waiting to be discovered by the next
+///    `int 3`;
+///  * `StaticUnicodeString.MaximumLength == 522` and `.Buffer == TEB+0x1268` at the gate — the exact
+///    shape kernel32 asserts, read from winlogon's LIVE tail;
+///  * `TEB+0x2C8` still addresses the private ACS page (batch 53's fix is still standing);
+///  * the protection was really LIVE (`WL_TEB2_CYCLES >= 1`) and really saw client traffic
+///    (`WL_TEB2_EMULATED + WL_TEB2_WRITE_FAULTS >= 1`), so an intact tail is CONTAINMENT, not the
+///    absence of anything happening;
+///  * win32k took ZERO stores on it — the refutation, asserted rather than narrated.
+unsafe fn teb_tail_protected_spec(passed: &mut u64) {
+    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
+    let maximum_length = core::ptr::read_volatile((tail + 0x25a) as *const u16);
+    let buffer = core::ptr::read_volatile((tail + 0x260) as *const u64);
+    let canary = teb_tail_canary_intact(tail);
+    let actctx = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2c8) as *const u64);
+    let write_faults = W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed);
+    let ro_maps = W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed);
+    let repairs = TEB_TAIL_REPAIRS.load(Ordering::Relaxed);
+    let cycles = WL_TEB2_CYCLES.load(Ordering::Relaxed);
+    let emulated = WL_TEB2_EMULATED.load(Ordering::Relaxed);
+    let client_stores = WL_TEB2_WRITE_FAULTS.load(Ordering::Relaxed);
+    print_str(b"[teb-tail] winlogon MaximumLength=");
+    print_u64(maximum_length as u64);
+    print_str(b" Buffer=0x");
+    print_hex_u64(buffer);
+    print_str(b" expected=0x");
+    print_hex_u64(SMSS_TEB_VA + 0x1268);
+    print_str(b" canary=");
+    print_u64(canary as u64);
+    print_str(b" actctx=0x");
+    print_hex_u64(actctx);
+    print_str(b" | win32k ro-maps=");
+    print_u64(ro_maps);
+    print_str(b" store-faults=");
+    print_u64(write_faults);
+    print_str(b" shadows=");
+    print_u64(W32_TEB_TAIL_SHADOWS.load(Ordering::Relaxed));
+    print_str(b" | client protected=");
+    print_u64(WL_TEB2_PROTECTED.load(Ordering::Relaxed));
+    print_str(b" arms=");
+    print_u64(cycles);
+    print_str(b" emulated=");
+    print_u64(emulated);
+    print_str(b" reported-stores=");
+    print_u64(client_stores);
+    print_str(b" descriptor-restores=");
+    print_u64(repairs);
+    print_str(b"\n");
+    check(
+        b"exec_teb_not_clobbered_by_win32k",
+        canary
+            && maximum_length == 522
+            && buffer == SMSS_TEB_VA + 0x1268
+            && actctx == ACS_PAGE_VA
+            // The protection was live and really saw the client writing this page…
+            && cycles >= 1
+            && emulated + client_stores >= 1
+            // …and win32k, the accused, never stored into it once.
+            && write_faults == 0,
+        passed,
+    );
+}
+
+/// ═══ ★ winlogon's `\pipe\lsarpc` BIND GETS A REAL SERVER THREAD, AND THE LOOP CANNOT HANG ═══════
+///
+/// Measured on the batch-59 repair boot: winlogon's post-profile `LsaOpenPolicy` opens
+/// `\pipe\lsarpc`, lsass' `\lsarpc` `RPCRT4_server_thread` accepts it and calls `RPCRT4_new_client`
+/// → `CreateThread(RPCRT4_io_thread)` — and that create was REFUSED
+/// (`rpc_server.c:631  failed to create thread, error=5aa`), because the executive had exactly ONE
+/// named per-connection LSA worker slot and lsass' own self-RPC worker holds it forever. rpcrt4
+/// released the connection, so winlogon's async read had no reader on the other end: winlogon
+/// wait-parked, lsass parked in `NtWaitForMultipleObjects`, and the executive blocked in `recv` with
+/// nothing left to signal it (`RUNEXIT=124`, no gate).
+///
+/// Two independent claims, because they fix two different things:
+///  1. the additional connection really got a worker — `LSA_RPC_NEW_CLIENT_REQUESTS >= 2` (rpcrt4
+///     asked twice) and `LSA_RPC_EXTRA_WORKERS_CLAIMED >= 1` (the second ask was granted a real
+///     generic worker slot, not an opaque handle);
+///  2. the DEADMAN is armed and did not have to fire. It is the general answer to "a blocking call
+///     driven synchronously by the single-threaded loop": armed at the post-logon milestone, joined
+///     to the delay timer's own deadline `min()`, checked inside `recv_full_r12` so it covers nested
+///     component-pump receives too. A clean boot must show it armed with ZERO trips — and a boot
+///     that does deadlock shows a `[deadman]` report and a gate, never a silent hang.
+unsafe fn lsarpc_connection_worker_spec(passed: &mut u64) {
+    let requests = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
+    let claimed = LSA_RPC_EXTRA_WORKERS_CLAIMED.load(Ordering::Relaxed);
+    let armed = WATCHDOG_ARMED.load(Ordering::Relaxed);
+    let ticks = WATCHDOG_TICKS.load(Ordering::Relaxed);
+    let trips = WATCHDOG_TRIPS.load(Ordering::Relaxed);
+    let messages = WATCHDOG_MSGS.load(Ordering::Relaxed);
+    print_str(b"[lsa-rpc] first-connection new-client requests=");
+    print_u64(requests);
+    print_str(b" extra-connection workers claimed=");
+    print_u64(claimed);
+    print_str(b" | [deadman] armed=");
+    print_u64(armed);
+    print_str(b" ticks=");
+    print_u64(ticks);
+    print_str(b" trips=");
+    print_u64(trips);
+    print_str(b" nested-rearms=");
+    print_u64(WATCHDOG_NESTED_REARMS.load(Ordering::Relaxed));
+    print_str(b" messages=");
+    print_u64(messages);
+    print_str(b"\n");
+    check(
+        b"exec_lsarpc_deadlock_guarded",
+        // winlogon's `\pipe\lsarpc` bind really reached `RPCRT4_new_client` a SECOND time and was
+        // granted a real per-connection worker instead of STATUS_INSUFFICIENT_RESOURCES…
+        claimed >= 1
+            && requests >= 1
+            // …and the deadman that turns any residual deadlock into a gate line is armed, saw the
+            // timer, and never had to trip.
+            && armed != 0
+            && trips == 0
+            && messages > 0,
+        passed,
+    );
 }
 
 /// ═══ A HOSTED VSpace HAS A REAL ASID, SO `Page::Unmap` REALLY CLEARS ITS PTEs ════════════════════
@@ -4000,6 +4325,12 @@ static LSA_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
 /// **Nothing is fabricated**: `Administrator` is not validated, no token is minted, and
 /// `WLX_SAS_ACTION_LOGON` is not returned.
 pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = true;
+/// Ship switch for the SECOND (and further) `\pipe\lsarpc` per-connection rpcrt4 worker — the one
+/// winlogon's post-profile `LsaOpenPolicy` bind needs. `false` restores the single named slot, the
+/// `rpc_server.c:631 failed to create thread, error=5aa` refusal, and the deadlock behind it.
+pub(crate) const LSA_RPC_EXTRA_CONNECTION_WORKERS: bool = true;
+/// Additional `\lsarpc` connection workers that were given a real generic worker slot.
+pub(crate) static LSA_RPC_EXTRA_WORKERS_CLAIMED: AtomicU64 = AtomicU64::new(0);
 static LSA_WORKER_TID: AtomicU64 = AtomicU64::new(0);
 static LSA_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Times lsass' `\pipe\lsarpc` rpcrt4 SERVER thread reached `RPCRT4_new_client`
@@ -5008,16 +5339,12 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
 }
 
 ///
-/// ★ OBSERVE-ONLY, deliberately. REPAIRING the field was measured (batch 59): winlogon then runs
-/// straight past kernel32's assertion into its post-profile MS-RPC path, opens `\pipe\lsarpc`,
-/// issues an async `NtReadFile` and wait-parks on the completion event — with lsass ALSO parked in
-/// `NtWaitForMultipleObjects` and no runnable signaler left. That deadlock cannot be seen by the
-/// service loop (it is blocked in `recv`, so even the wall-clock stall watchdog at the loop top
-/// never runs) ⇒ `RUNEXIT=124`, no gate. So this batch NAMES the frontier and parks at it; making
-/// the TEB tail durable belongs with the RPC-completion work that has to follow it.
+/// Kept as a TRIPWIRE now that the CLASS fix (`W32_CLIENT_TEB_TAIL_PROTECTED`, below) exists: with
+/// the tail no longer part of win32k's writable client-frame surface this must never fire, and
+/// `TEB_TAIL_REPAIRS` is asserted zero by `exec_teb_tail_protected_from_win32k`.
 pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
     let env_scratch = env_scratch_base_for_pi(pi);
-    if env_scratch == 0 {
+    if env_scratch == 0 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
         return;
     }
     const STATIC_UNICODE_STRING: u64 = 0x258; // TEB+0x1258, i.e. offset 0x258 of the 2nd TEB page
@@ -5043,6 +5370,468 @@ pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
         print_hex(buffer as u32);
         print_str(b") -- kernel32 fileutils.c:26 ASSERTs on this\n");
     }
+}
+
+// ═══ ★ THE CLIENT TEB TAIL IS NOT PART OF win32k's WRITABLE CLIENT-FRAME SURFACE ════════════════
+//
+// THE CLASS, not the field. Twice now a win32k dispatch has come back having overwritten the
+// CALLER's second TEB page: batch 53 lost the `ACTIVATION_CONTEXT_STACK` that used to live at
+// `TEB+0x1800` (fixed by moving the ACS to a private page — a FIELD fix), and batch 59 lost
+// `TEB.StaticUnicodeString` at `TEB+0x1258`, which kernel32 `fileutils.c:26` ASSERTs on and whose
+// `int 3` killed winlogon. `StaticUnicodeString` sits at a FIXED x64 TEB offset and cannot be moved,
+// so a third field was guaranteed. The *shape* of the bug is the mapping, not any one field:
+//
+//   `spawn_sec_image` / `spawn_hosted_thread` register BOTH TEB pages with `csrss_frame_put`, so a
+//   win32k demand fault at either VA is answered with the client's OWN frame, mapped RW at the same
+//   VA (`map_csrss_page_into_win32k`, the KeStackAttachProcess model). Anything win32k stores at
+//   `TEB+0x1000..0x1FFF` therefore lands in the client's real TEB.
+//
+// win32k has legitimate business in TEB page ONE — `CLIENTINFO` at `TEB+0x800` and
+// `Win32ThreadInfo` at `TEB+0x78` are exactly what the model exists for, and both stay RW-shared.
+// In page TWO the only field ReactOS' win32k touches by contract is `StaticUnicodeString`, and it
+// touches it as SCRATCH: `BuildUserModeWindowStationName` (`win32ss/user/ntuser/winsta.c:649`)
+// borrows the caller's `StaticUnicodeBuffer` to format `\Windows\WindowStations\Service-0x..-..$`
+// for its own `ObOpenObjectByName`, and the client never reads the result back. Every other write
+// there is server state that has no business in a user TEB at all.
+//
+// So the tail page is mapped into win32k **READ-ONLY**, and the FIRST write fault on it is answered
+// with a private **copy-on-write shadow** seeded from the client's live page. win32k keeps reading
+// consistent values (including a `StaticUnicodeString.Buffer` that still points into its own view of
+// the tail) and keeps writing wherever it likes — into the shadow. The client's real TEB tail
+// becomes STRUCTURALLY unreachable for a win32k store, which retires the whole class: no future
+// field can be scribbled, because no byte of the page can. The shadow rides the ordinary attach
+// table, so a client switch drops it and the next fault re-establishes the read-only view of the
+// (by then current) real page.
+/// Ship switch for the class fix — `false` restores the RW-shared tail and the clobber comes back.
+pub(crate) const W32_CLIENT_TEB_TAIL_PROTECTED: bool = true;
+/// `page_map` rights: bit1 = read, bit0 = write. Read-only + non-executable.
+pub(crate) const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER;
+/// The 64-byte spawn CANARY at the very end of every hosted thread's second TEB page
+/// (`TEB+0x1FC0`, past the x64 TEB's own `0x1818` end and past the `spawn_hosted_thread` CONTEXT
+/// scratch at `TEB+0x1900`). ★ THE GUARD THAT CATCHES A **NEW** FIELD: an assertion on
+/// `StaticUnicodeString` alone would only ever re-catch the field we already know about, so the gate
+/// spec also verifies these 64 bytes. Any win32k store anywhere in the tail's unused region breaks
+/// them, whichever named field the next batch would otherwise have discovered by `int 3`.
+pub(crate) const TEB_TAIL_CANARY_OFFSET: u64 = 0xFC0;
+const TEB_TAIL_CANARY_SEED: u64 = 0x5445_425F_5441_494C; // "TEB_TAIL"
+/// Write the canary through an executive alias of a second TEB page.
+pub(crate) unsafe fn seed_teb_tail_canary(teb2_alias: u64) {
+    let mut offset = 0u64;
+    while offset < 64 {
+        core::ptr::write_volatile(
+            (teb2_alias + TEB_TAIL_CANARY_OFFSET + offset) as *mut u64,
+            TEB_TAIL_CANARY_SEED ^ offset,
+        );
+        offset += 8;
+    }
+}
+/// Is the canary still exactly what the spawn wrote?
+pub(crate) unsafe fn teb_tail_canary_intact(teb2_alias: u64) -> bool {
+    let mut offset = 0u64;
+    while offset < 64 {
+        if core::ptr::read_volatile((teb2_alias + TEB_TAIL_CANARY_OFFSET + offset) as *const u64)
+            != TEB_TAIL_CANARY_SEED ^ offset
+        {
+            return false;
+        }
+        offset += 8;
+    }
+    true
+}
+
+/// Every OTHER key under which this process' TEB-tail FRAME is reachable. A second key is an alias:
+/// a write anyone makes through it lands in this TEB, which is exactly the shape a "win32k scribbled
+/// the TEB" symptom takes when win32k never actually touched the TEB's own VA.
+pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
+    let frame = TEB2_FRAME_CAP[pi].load(Ordering::Relaxed);
+    print_str(b"[teb-watch] alias scan pi=");
+    print_u64(pi as u64);
+    print_str(b" teb2-frame-cap=0x");
+    print_hex_u64(frame);
+    if frame == 0 {
+        print_str(b" (unknown)\n");
+        return;
+    }
+    let mut aliases = 0u64;
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
+    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
+    let frames = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
+    for index in 0..n {
+        if core::ptr::read(frames.add(index)) == frame {
+            aliases += 1;
+            print_str(b" | client-frame pi=");
+            print_u64(core::ptr::read(pis.add(index)) as u64);
+            print_str(b" va=0x");
+            print_hex_u64(core::ptr::read(vas.add(index)));
+        }
+    }
+    let dn = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
+    let dvas = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
+    let dfrs = core::ptr::addr_of!(DLL_CACHE_FR) as *const u64;
+    for index in 0..dn {
+        if core::ptr::read(dfrs.add(index)) == frame {
+            aliases += 1;
+            print_str(b" | dll-cache va=0x");
+            print_hex_u64(core::ptr::read(dvas.add(index)));
+        }
+    }
+    print_str(b" aliases=");
+    print_u64(aliases);
+    print_str(b"\n");
+}
+
+// --- CLIENT-SIDE TEB-TAIL WRITE WATCH (the measurement that names the real writer) --------------
+/// Diagnostic switch: map winlogon's SECOND TEB page READ-ONLY *in winlogon's own VSpace* from the
+/// post-logon milestone on, so every store the CLIENT makes to it faults and reports its RIP. This
+/// is the same trick as the win32k-side protection, aimed at the address space the evidence actually
+/// points at.
+pub(crate) const WL_TEB_TAIL_WRITE_WATCH: bool = true;
+/// The cap winlogon's own TEB-tail mapping uses, so the protection can be toggled.
+pub(crate) static WL_TEB2_CAP: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WL_TEB2_PML4: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WL_TEB2_PROTECTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WL_TEB2_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WL_TEB2_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WL_TEB2_EMULATED: AtomicU64 = AtomicU64::new(0);
+static WL_TEB2_PROTECT_REPORTS: AtomicU64 = AtomicU64::new(0);
+static WL_TEB2_PROTECT_FAILS: AtomicU64 = AtomicU64::new(0);
+const WL_TEB2_MAX_CYCLES: u64 = 60_000;
+
+/// ★ THE ENFORCED INVARIANT. `TEB.StaticUnicodeString` is a per-thread SCRATCH descriptor whose
+/// shape (`MaximumLength == sizeof(StaticUnicodeBuffer)`, `Buffer == &StaticUnicodeBuffer`) is set
+/// once at thread creation and never legitimately changes — `RtlAnsiStringToUnicodeString(dst, src,
+/// FALSE)` writes only `Length`. kernel32 ASSERTs exactly that shape on every ANSI file call
+/// (`client/file/fileutils.c:26`), and its `int 3` is fatal. Re-assert it through the executive's
+/// persistent alias whenever the protection is (re-)armed and after every store that faults on the
+/// page: idempotent, and a no-op on a boot that never breaks it.
+pub(crate) unsafe fn wl_teb2_reassert_descriptor() {
+    if TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << 2) == 0 {
+        return;
+    }
+    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x258;
+    let maximum_length = core::ptr::read_volatile((tail + 2) as *const u16);
+    let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
+    if maximum_length == 522 && buffer == SMSS_TEB_VA + 0x1268 {
+        return;
+    }
+    core::ptr::write_volatile((tail + 2) as *mut u16, 522);
+    core::ptr::write_volatile((tail + 8) as *mut u64, SMSS_TEB_VA + 0x1268);
+    let n = TEB_TAIL_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    let _ = TEB_TAIL_FIRST_BAD.compare_exchange(
+        0xFFFF,
+        maximum_length as u64,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    if n < 4 {
+        print_str(b"[teb-tail] StaticUnicodeString descriptor RESTORED (was MaximumLength=");
+        print_u64(maximum_length as u64);
+        print_str(b" Buffer=0x");
+        print_hex_u64(buffer);
+        print_str(b")\n");
+    }
+}
+
+/// Re-arm the read-only protection (idempotent, bounded).
+pub(crate) unsafe fn wl_teb2_protect() {
+    if !WL_TEB_TAIL_WRITE_WATCH {
+        return;
+    }
+    // The invariant is enforced on EVERY service-loop event, not only when the protection re-arms —
+    // a store that lands while the page happens to be writable is still caught before the client's
+    // next kernel32 ANSI file call can assert on it.
+    wl_teb2_reassert_descriptor();
+    if WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let cap = WL_TEB2_CAP.load(Ordering::Relaxed);
+    let pml4 = WL_TEB2_PML4.load(Ordering::Relaxed);
+    if cap == 0 || pml4 == 0 || WL_TEB2_CYCLES.fetch_add(1, Ordering::Relaxed) >= WL_TEB2_MAX_CYCLES {
+        return;
+    }
+    let unmap = page_unmap_r(cap);
+    let map = page_map_r(cap, SMSS_TEB_VA + 0x1000, RO_NX, pml4);
+    if map == 0 {
+        WL_TEB2_PROTECTED.store(1, Ordering::Relaxed);
+    }
+    if WL_TEB2_PROTECT_REPORTS.fetch_add(1, Ordering::Relaxed) < 3 || map != 0 {
+        if WL_TEB2_PROTECT_FAILS.load(Ordering::Relaxed) < 4 {
+            if map != 0 {
+                WL_TEB2_PROTECT_FAILS.fetch_add(1, Ordering::Relaxed);
+            }
+            print_str(b"[teb-writer] protect unmap=");
+            print_u64(unmap);
+            print_str(b" map=");
+            print_u64(map);
+            print_str(b"\n");
+        }
+    }
+}
+
+/// `RtlNtStatusToDosError` + 0x12 — `mov [rax+0x1250], ecx`, the 4-byte `TEB.LastStatusValue`
+/// store. It is BY FAR the most frequent write to the tail page (every failing syscall makes one)
+/// and it is entirely legitimate, so the watch EMULATES it — writes the value through the
+/// executive's alias and steps the client past the instruction — instead of dropping the protection
+/// for it. That is what lets the page stay continuously protected long enough to catch the RARE
+/// store that actually lands on the descriptor.
+const RTL_LAST_STATUS_STORE_RVA: u64 = 0x1c2c2;
+const RTL_LAST_STATUS_STORE_LEN: u64 = 6;
+
+/// A client store into the protected tail: report WHO (RIP + the byte it aimed at), drop the
+/// protection so the instruction can complete, and let the loop re-arm it. Returns true if the store
+/// was emulated in place (protection retained).
+pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool {
+    let offset = addr & 0xFFF;
+    if tcb != 0 && offset == 0x250 && ip == NTDLL_BASE.wrapping_add(RTL_LAST_STATUS_STORE_RVA) {
+        let mut registers = [0u64; 20];
+        win32k_glue::tcb_read_regs20(tcb, &mut registers);
+        if registers[0] == ip {
+            core::ptr::write_volatile(
+                (WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x250) as *mut u32,
+                registers[5] as u32,
+            );
+            if win32k_glue::rewind_fault_ip(tcb, ip + RTL_LAST_STATUS_STORE_LEN) {
+                WL_TEB2_EMULATED.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    let n = WL_TEB2_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let descriptor = (0x258..0x268).contains(&offset);
+    if n < 48 || descriptor {
+        print_str(if descriptor {
+            b"[teb-writer] ***DESCRIPTOR*** client store TEB+0x1"
+        } else {
+            b"[teb-writer] client store TEB+0x1"
+        });
+        print_hex(offset as u32);
+        print_str(b" from ip=0x");
+        print_hex_u64(ip);
+        print_str(b" ntdll+0x");
+        print_hex(ip.wrapping_sub(NTDLL_BASE) as u32);
+        print_str(b" image+0x");
+        print_hex(ip.wrapping_sub(PE_LOAD_BASE) as u32);
+        print_str(b" #");
+        print_u64(n);
+        print_str(b"\n");
+    }
+    let cap = WL_TEB2_CAP.load(Ordering::Relaxed);
+    let pml4 = WL_TEB2_PML4.load(Ordering::Relaxed);
+    if cap != 0 && pml4 != 0 {
+        let _ = page_unmap_r(cap);
+        let _ = page_map_r(cap, SMSS_TEB_VA + 0x1000, RW_NX, pml4);
+    }
+    WL_TEB2_PROTECTED.store(0, Ordering::Relaxed);
+    wl_teb2_reassert_descriptor();
+    false
+}
+
+/// Tail pages that were really mapped READ-ONLY into win32k. Without this the "win32k took zero
+/// write faults" reading would be unfalsifiable — it could just mean win32k never touched the page.
+pub(crate) static W32_TEB_TAIL_RO_MAPS: AtomicU64 = AtomicU64::new(0);
+
+// --- TAIL WATCH: WHICH EVENT turns the tail bad? -------------------------------------------------
+/// Each process' MAIN-thread TEB tail frame cap, so a transition report can ask the decisive
+/// question: is this frame ALIASED — registered/cached under some OTHER key, so that a write win32k
+/// or a demand fill makes elsewhere lands in this TEB?
+pub(crate) static TEB2_FRAME_CAP: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Bit `pi` set once `spawn_sec_image` has actually MAPPED that process' `scr + 0x5000` TEB-tail
+/// alias. Reading the alias before then is a #PF in the executive itself (measured).
+pub(crate) static TEB_TAIL_ALIAS_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Per-pi "the tail was intact last time we looked" bit, so only the TRANSITION is reported.
+static TEB_WATCH_GOOD: [AtomicU64; 5] = [const { AtomicU64::new(1) }; 5];
+static TEB_WATCH_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// The PREVIOUS observation point, so a transition names the event boundary it happened inside.
+static TEB_WATCH_LAST_TAG: AtomicU64 = AtomicU64::new(u64::MAX);
+static TEB_WATCH_LAST_AUX: AtomicU64 = AtomicU64::new(0);
+static TEB_WATCH_LAST_AUX2: AtomicU64 = AtomicU64::new(0);
+/// Sample a process' live TEB tail and report the good→bad TRANSITION with the event that preceded
+/// it. `tag`/`aux` name the call site (0 = service-loop event with `aux` = SSN, 1 = before a win32k
+/// dispatch, 2 = after one) — the measurement that says whether a win32k dispatch is the writer at
+/// all, rather than assuming it from the fact that the value looks like USER data.
+pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
+    if pi >= 5 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
+        return;
+    }
+    let env_scratch = env_scratch_base_for_pi(pi);
+    if env_scratch == 0 {
+        return;
+    }
+    let tail = env_scratch + 0x5000 + 0x258;
+    let max = core::ptr::read_volatile((tail + 2) as *const u16);
+    let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
+    let good = max == 522 && buffer == SMSS_TEB_VA + 0x1268;
+    let was_good = TEB_WATCH_GOOD[pi].swap(good as u64, Ordering::Relaxed) != 0;
+    if good || !was_good {
+        TEB_WATCH_LAST_TAG.store(tag, Ordering::Relaxed);
+        TEB_WATCH_LAST_AUX.store(aux, Ordering::Relaxed);
+        TEB_WATCH_LAST_AUX2.store(aux2, Ordering::Relaxed);
+        return;
+    }
+    if TEB_WATCH_REPORTS.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    print_str(b"[teb-watch] FIRST BAD pi=");
+    print_u64(pi as u64);
+    print_str(b" tag=");
+    print_u64(tag);
+    print_str(b" aux=0x");
+    print_hex_u64(aux);
+    print_str(b" aux2=0x");
+    print_hex_u64(aux2);
+    print_str(b" MaximumLength=");
+    print_u64(max as u64);
+    print_str(b" Buffer=0x");
+    print_hex_u64(buffer);
+    print_str(b" win32k-ro-maps=");
+    print_u64(W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed));
+    print_str(b" win32k-store-faults=");
+    print_u64(W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed));
+    print_str(b" PREV-observation tag=");
+    print_u64(TEB_WATCH_LAST_TAG.load(Ordering::Relaxed));
+    print_str(b" aux=0x");
+    print_hex_u64(TEB_WATCH_LAST_AUX.load(Ordering::Relaxed));
+    print_str(b" aux2=0x");
+    print_hex_u64(TEB_WATCH_LAST_AUX2.load(Ordering::Relaxed));
+    print_str(b"\n");
+    teb_tail_alias_scan(pi);
+    print_str(b"[teb-watch] tail bytes TEB+0x1240..0x1280:");
+    let mut offset = 0u64;
+    while offset < 0x40 {
+        print_str(b" ");
+        print_hex_u64(core::ptr::read_volatile(
+            (env_scratch + 0x5000 + 0x240 + offset) as *const u64,
+        ));
+        offset += 8;
+    }
+    print_str(b"\n");
+}
+
+/// Registered client TEB **tail** page VAs (the second page of every hosted thread's TEB). VAs
+/// repeat across VSpaces by design, so this is a small de-duplicated VA set, not a (pi, VA) table.
+const TEB_TAIL_PAGE_CAP: usize = 32;
+static mut TEB_TAIL_PAGE: [u64; TEB_TAIL_PAGE_CAP] = [0; TEB_TAIL_PAGE_CAP];
+static mut TEB_TAIL_PAGE_N: usize = 0;
+/// Record `page` as a client TEB tail page (called by BOTH spawn paths, next to the
+/// `csrss_frame_put` that makes it reachable from win32k at all).
+pub(crate) unsafe fn teb_tail_register(page: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_PAGE_N));
+    let pages = core::ptr::addr_of!(TEB_TAIL_PAGE) as *const u64;
+    for index in 0..n {
+        if core::ptr::read(pages.add(index)) == page {
+            return;
+        }
+    }
+    if n < TEB_TAIL_PAGE_CAP {
+        core::ptr::write((core::ptr::addr_of_mut!(TEB_TAIL_PAGE) as *mut u64).add(n), page);
+        core::ptr::write(core::ptr::addr_of_mut!(TEB_TAIL_PAGE_N), n + 1);
+    }
+}
+pub(crate) unsafe fn is_teb_tail_page(page: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_PAGE_N));
+    let pages = core::ptr::addr_of!(TEB_TAIL_PAGE) as *const u64;
+    for index in 0..n {
+        if core::ptr::read(pages.add(index)) == page {
+            return true;
+        }
+    }
+    false
+}
+
+/// Copy-on-write shadows of client TEB tail pages, keyed by (pi, page). Each entry keeps a
+/// PERMANENT pair of executive aliases — the client's real frame and the shadow — so re-seeding a
+/// shadow is a plain 4 KiB copy with no further capability work.
+const TEB_TAIL_SHADOW_CAP: usize = 16;
+/// Executive alias window for those pairs: a free 2 MiB page-table slot between `NTDLLBUF`
+/// (`0x1440_0000` + 480 frames) and the file-buffer `POOL` (`0x1500_0000`).
+pub const TEB_TAIL_ALIAS_BASE: u64 = 0x0000_0100_1460_0000;
+static mut TEB_TAIL_SHADOW_PI: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
+static mut TEB_TAIL_SHADOW_PAGE: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
+static mut TEB_TAIL_SHADOW_FRAME: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
+static mut TEB_TAIL_SHADOW_N: usize = 0;
+static TEB_TAIL_ALIAS_PT: AtomicU64 = AtomicU64::new(0);
+/// win32k write faults on a protected tail page (each one is a scribble that DIDN'T happen).
+pub(crate) static W32_TEB_TAIL_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Shadows created, and re-seeds (a shadow re-established after a client switch dropped it).
+pub(crate) static W32_TEB_TAIL_SHADOWS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static W32_TEB_TAIL_RESEEDS: AtomicU64 = AtomicU64::new(0);
+/// The first win32k image RVA measured storing into a client TEB tail — the evidence that names the
+/// writer instead of guessing at it.
+pub(crate) static W32_TEB_TAIL_FIRST_WRITER_RVA: AtomicU64 = AtomicU64::new(0);
+
+/// The private shadow frame for (`pi`, `page`), seeded from the client's LIVE tail page. Returns 0
+/// if the client frame is unknown or the executive is out of shadow slots (the caller then leaves
+/// the read-only mapping in place, which is a wall, never a silent scribble).
+pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
+    let (real_frame, _) = csrss_frame_get_exact(pi, page);
+    if real_frame == 0 {
+        return 0;
+    }
+    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_SHADOW_N));
+    let pis = core::ptr::addr_of!(TEB_TAIL_SHADOW_PI) as *const u64;
+    let pages = core::ptr::addr_of!(TEB_TAIL_SHADOW_PAGE) as *const u64;
+    let frames = core::ptr::addr_of!(TEB_TAIL_SHADOW_FRAME) as *const u64;
+    let mut slot = usize::MAX;
+    for index in 0..n {
+        if core::ptr::read(pis.add(index)) == pi && core::ptr::read(pages.add(index)) == page {
+            slot = index;
+            break;
+        }
+    }
+    if slot == usize::MAX {
+        if n >= TEB_TAIL_SHADOW_CAP {
+            return 0;
+        }
+        if TEB_TAIL_ALIAS_PT.swap(1, Ordering::Relaxed) == 0 {
+            let pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+            let _ = paging_struct_map(
+                pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                TEB_TAIL_ALIAS_BASE,
+                CAP_INIT_THREAD_VSPACE,
+            );
+        }
+        let shadow = alloc_frame();
+        let real_alias = TEB_TAIL_ALIAS_BASE + (2 * n as u64) * 0x1000;
+        let shadow_alias = real_alias + 0x1000;
+        let e_real = page_map_r(copy_cap(real_frame), real_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let e_shadow = page_map_r(copy_cap(shadow), shadow_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+        if e_real != 0 || e_shadow != 0 {
+            print_str(b"[teb-shadow] alias map failed real/shadow=");
+            print_u64(e_real);
+            print_str(b"/");
+            print_u64(e_shadow);
+            print_str(b"\n");
+            return 0;
+        }
+        core::ptr::write((core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_PI) as *mut u64).add(n), pi);
+        core::ptr::write((core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_PAGE) as *mut u64).add(n), page);
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_FRAME) as *mut u64).add(n),
+            shadow,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_N), n + 1);
+        slot = n;
+        W32_TEB_TAIL_SHADOWS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        W32_TEB_TAIL_RESEEDS.fetch_add(1, Ordering::Relaxed);
+    }
+    // (Re-)seed: the shadow starts life as an exact copy of what the client's tail holds RIGHT NOW,
+    // so every value win32k may read there — `StaticUnicodeString`, `DeallocationStack`, TLS slots —
+    // is the caller's real one. Only the WRITES diverge.
+    let real_alias = TEB_TAIL_ALIAS_BASE + (2 * slot as u64) * 0x1000;
+    let shadow_alias = real_alias + 0x1000;
+    let mut offset = 0u64;
+    while offset < 0x1000 {
+        core::ptr::write_volatile(
+            (shadow_alias + offset) as *mut u64,
+            core::ptr::read_volatile((real_alias + offset) as *const u64),
+        );
+        offset += 8;
+    }
+    core::ptr::read(frames.add(slot))
 }
 
 // --- PRIVATE-VM UNMAP SELF-TEST (proves the ASID fix, by construction) --------------------------
@@ -6039,6 +6828,16 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    // ★ THE DEADMAN LIVES HERE, not at the service-loop top — this is the ONE place the executive
+    // ever blocks, so a check here covers the nested component-pump receives a dispatch makes as
+    // well as the loop's own. Cost on the hot path is one relaxed increment.
+    if EXEC_DEADMAN_WATCHDOG {
+        if badge == DELAY_TIMER_BADGE {
+            watchdog_on_tick();
+        } else {
+            WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     (badge, msginfo, mr0, mr1, mr2, mr3)
 }
 
@@ -6288,12 +7087,16 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .min();
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
+    // The deadman joins the same `min()` as every real waiter — it is a deadline like any other, so
+    // the arm/disarm path (and `exec_delay_timer_disarms`' invariants) are untouched by it.
+    let deadman_deadline = watchdog_deadline();
     let deadline = queue
         .next_deadline()
         .into_iter()
         .chain(event_deadline)
         .chain(keyed_deadline)
         .chain(io_completion_deadline)
+        .chain(deadman_deadline)
         .min();
     if let Some(deadline) = deadline {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
@@ -6308,8 +7111,10 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
             2
         } else if keyed_deadline == Some(deadline) {
             3
-        } else {
+        } else if io_completion_deadline == Some(deadline) {
             4
+        } else {
+            5 // the deadman
         };
         if target <= now {
             TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
@@ -6439,10 +7244,15 @@ unsafe fn delay_timer_interrupt(
     handler: &mut ExecNtHandler,
 ) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
+    // it must not be counted as a spurious wake — `exec_delay_timer_disarms`' `spurious <= 64`
+    // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
+    let watchdog_tick = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
     let woken = delay_wake_due(queue)
         + wait_wake_due()
         + keyed_wait_wake_due()
-        + io_completion_wake_due(handler);
+        + io_completion_wake_due(handler)
+        + watchdog_tick;
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
         let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
@@ -9150,6 +9960,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let teb2_target_map = page_map(teb2, t.teb_va + 0x1000, RW_NX, t.pml4);
     if t.client_pi != 0 {
         csrss_frame_put(t.client_pi, t.teb_va + 0x1000, teb2);
+        // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
+        teb_tail_register(t.teb_va + 0x1000);
     }
     let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     // DeallocationStack is in TEB page 2; populate it only after its scratch alias is mapped.
@@ -9187,6 +9999,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     }
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
+    seed_teb_tail_canary(scr + 0x1000);
     if teb_target_map != 0
         || teb_scratch_map != 0
         || teb_live_map != 0

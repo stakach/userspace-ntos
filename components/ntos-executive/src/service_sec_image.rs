@@ -824,6 +824,28 @@ pub(crate) unsafe fn service_sec_image(
                 break;
             }
         }
+        // TAIL WATCH — sample every hosted process' TEB tail on EVERY service-loop event, so the
+        // good→bad transition is attributed to the event that preceded it rather than to whichever
+        // observer happened to look next.
+        for watch_pi in 1..5usize {
+            crate::teb_tail_watch(watch_pi, 0, m0, badge);
+        }
+        // ★ ARM THE IN-`recv` DEADMAN at the POST-LOGON milestone — the frontier this batch works
+        // on, and safely past every SM/CSR/LSA rendezvous whose nested receive loops do not screen a
+        // bound-notification badge. From here on a boot that stops receiving IPC entirely reports
+        // itself (`[deadman]`) and quiesces to the gate instead of hanging out the run's timeout.
+        if crate::EXEC_DEADMAN_WATCHDOG
+            && crate::WATCHDOG_ARMED.load(Ordering::Relaxed) == 0
+            && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+        {
+            crate::watchdog_arm(&delay_queue);
+        }
+        // Keep the client-side TEB-tail watch armed from winlogon's SPAWN on (bounded by
+        // WL_TEB2_MAX_CYCLES). Arming it at the post-logon milestone was measured to be TOO LATE —
+        // the descriptor was already corrupt one second before the first arm.
+        if crate::WL_TEB_TAIL_WRITE_WATCH {
+            crate::wl_teb2_protect();
+        }
         // ★ DRAIN a timer tick a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
         // which cannot service it (the delay queue lives here). The pump latches it instead; this
@@ -851,6 +873,14 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
             delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
+            // ★ THE DEADMAN'S TEETH. `watchdog_on_tick` (inside `recv_full_r12`) has already
+            // REPORTED the deadlock; this is where the boot acts on it — quiesce and run the gate,
+            // so a deadlock ends as a gate line with a diagnosis instead of `RUNEXIT=124`.
+            if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+                print_str(b"[deadman] tripped -> QUIESCE; run the gate\n");
+                stop = m1;
+                break;
+            }
             let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             badge = received.0;
             mi = received.1;
@@ -1433,6 +1463,31 @@ pub(crate) unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
+            // ★ CLIENT-SIDE TEB-TAIL WRITE WATCH — a WRITE fault on winlogon's own (present,
+            // read-only) second TEB page. This is the measurement that names the code corrupting
+            // `StaticUnicodeString`: win32k is exonerated (it is never handed this page, and the
+            // good→bad transition never straddles a dispatch), so the writer runs in the client.
+            if crate::WL_TEB_TAIL_WRITE_WATCH
+                && pi == 2
+                && page == SMSS_TEB_VA + 0x1000
+                && (m3 & 0x2) != 0
+                && crate::WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0
+            {
+                let tcb = if owner_top_badge(badge) == WINLOGON_BADGE && badge == WINLOGON_BADGE {
+                    crate::PM_MAIN_TCBS[2].load(Ordering::Relaxed)
+                } else {
+                    0
+                };
+                crate::wl_teb2_report_write(m0, addr, tcb);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             if pi == 2
                 && (m3 & 0x7) == 0x7
                 && WINLOGON_HANDLE_FAULT_DIAG_N.fetch_add(1, Ordering::Relaxed) == 0
@@ -5259,6 +5314,7 @@ pub(crate) unsafe fn service_sec_image(
                             &dll_pes,
                         );
                     }
+                    crate::teb_tail_watch(pi, 1, m0, 0);
                     let r = win32k_glue::win32k_dispatch_wide(
                         m0,
                         d_a0,
@@ -5281,6 +5337,7 @@ pub(crate) unsafe fn service_sec_image(
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
                     // invariants the client's own CRT depends on, so the frontier has a number.
+                    crate::teb_tail_watch(pi, 2, m0, 0);
                     crate::observe_client_teb_tail(pi);
                     // The credential READ-BACK. A single-line edit control renders itself with
                     // `EDIT_PaintText -> TextOutW -> NtGdiExtTextOutW(hdc, x, y, opts, lprc,
@@ -6216,6 +6273,10 @@ pub(crate) unsafe fn service_sec_image(
             // `routed_lpc`, `routed_csr` and `COMPONENT_CALL_CLOBBERED_REPLY_TO` were four ways of
             // asking "did anything clobber it?". With the legacy reply retired the question is moot:
             // nothing can re-point a bound reply object, so the answer is always the same reply.
+            // TAIL WATCH tag 3: the executive has FINISHED servicing this native syscall and has not
+            // yet resumed the caller. A transition seen here is the executive's own handler; a
+            // transition that only ever shows at tag 0 happened while the CLIENT was running.
+            crate::teb_tail_watch(pi, 3, m0, badge);
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
