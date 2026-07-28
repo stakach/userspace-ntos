@@ -592,6 +592,8 @@ pub(crate) unsafe fn service_sec_image(
     // is crash-parked (so `recv` would block forever). Cooperative parks (wait/delay/listener) are a
     // DIFFERENT, wakeable state and are left as-is; only a real crash sets a `crash_parked` bit.
     let mut crash_parked: u64 = 0;
+    // Which THREAD badges have already logged a `[parked]` fault line (see `park_and_log!`).
+    let mut crash_logged: u64 = 0;
     // Cooperative-wait bitmask: top-level process badges currently parked in a WAKEABLE wait
     // (NtWaitForSingleObject/MultipleObjects on an unsignalled event, or a lsass-post-signal
     // containment park). A wait-parked process CAN still be woken by a RUNNING process's NtSetEvent,
@@ -613,7 +615,15 @@ pub(crate) unsafe fn service_sec_image(
             let __pi: usize = $pi;
             let __owner = owner_top_badge(badge);
             let __bit = 1u64 << __owner;
-            let __already = (crash_parked & __bit) != 0;
+            // ★ THE LOG LINE IS PER *THREAD* BADGE, the crash BIT is per process. A hosted process
+            // has several threads and one of them can already have milestone-parked (which sets the
+            // process's crash bit) — suppressing the print on the process bit then SILENCED a
+            // genuinely NEW fault on a different thread, and the boot quiesced with no fault line at
+            // all. Measured in batch 59: winlogon's worker parked on an empty GetMessage, then its
+            // main thread faulted post-profile-copy and printed NOTHING.
+            let __log_bit = 1u64 << (badge & 63);
+            let __already = (crash_logged & __log_bit) != 0;
+            crash_logged |= __log_bit;
             crash_parked |= __bit;
             if !__already {
                 print_str(b"[parked] pi=");
@@ -1220,6 +1230,43 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 // The faulting thread is BLOCKED on the debugger's continue; its reply capability is
                 // held by the DEBUG_EVENT. The next event has already been received.
+                continue;
+            }
+            // ★ WINLOGON POST-LOGON MILESTONE PARK — the same rule the #PF arm applies, and for the
+            // same reason. Once the interactive logon has really completed, a fault on winlogon's
+            // post-logon path is a FRONTIER, not a crash: `park_and_log!` would latch the whole
+            // process as a dead win32k callback client, which disarms the post-quiesce callback
+            // injections (`exec_user_callback_dead_client_unwind` /
+            // `exec_win32k_transport_call_nested`) even though winlogon's other threads are alive and
+            // hold no callback frames. Batch 59 measured exactly that: with `CopyDirectory` really
+            // running, winlogon reaches kernel32's `ASSERT(StaticUnicodeString.MaximumLength == …)`
+            // in `fileutils.c:26`, whose `int 3` lands HERE.
+            if pi == 2
+                && owner_top_badge(badge) == WINLOGON_BADGE
+                && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                && !win32k_glue::client_has_active_callback_frames(2)
+            {
+                print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path raises an unhandled CPU exception at ip=0x");
+                print_hex((fip >> 32) as u32);
+                print_hex(fip as u32);
+                print_str(b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n");
+                crash_parked |= 1u64 << owner_top_badge(badge);
+                procs[pi].faults = faults;
+                procs[pi].first = first;
+                procs[pi].ntfaults = ntfaults;
+                pfilled[pi] = *filled_pages;
+                WINLOGON_POST_LOGON_MILESTONE_PARK.store(fip, Ordering::Relaxed);
+                WINLOGON_POST_LOGON_MILESTONE_CR2.store(fip, Ordering::Relaxed);
+                if (live_top_badges() & !(crash_parked | wait_parked)) == 0
+                    || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                {
+                    print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
+                    stop = fip;
+                    break;
+                }
+                let (nb, nmi, nm0, nm1, nm2, nm3) =
+                    recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                 continue;
             }
             // Unhandled CPU exception (label 3) at a non-skippable site — a real crash. Park+log.
@@ -2035,8 +2082,16 @@ pub(crate) unsafe fn service_sec_image(
                 // this is ONE thread and winlogon's worker threads are alive, hold no callback
                 // frames (asserted, not assumed) and are still valid callback clients. The faulting
                 // thread is left blocked at its fault exactly as any other park leaves its thread.
+                //
+                // ★ ANY winlogon THREAD, not just badge 4. The post-logon profile/`userinit` work is
+                // driven from whichever winlogon thread `WlxActivateUserShell` runs on, and once the
+                // profile copy really advanced (batch 59) the fault landed on a WORKER badge — which
+                // fell through to `park_and_log!` and latched the whole process as a dead win32k
+                // callback client, disarming both post-quiesce callback injections. The guard that
+                // makes this safe is the callback-frame assertion below, which is per-PROCESS, so it
+                // holds for any of its threads.
                 if pi == 2
-                    && badge == WINLOGON_BADGE
+                    && owner_top_badge(badge) == WINLOGON_BADGE
                     && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
                     && !win32k_glue::client_has_active_callback_frames(2)
                 {
@@ -5223,6 +5278,10 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         },
                     );
+                    // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
+                    // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
+                    // invariants the client's own CRT depends on, so the frontier has a number.
+                    crate::observe_client_teb_tail(pi);
                     // The credential READ-BACK. A single-line edit control renders itself with
                     // `EDIT_PaintText -> TextOutW -> NtGdiExtTextOutW(hdc, x, y, opts, lprc,
                     // es->text + col, count, …)` (args 5..9 ride the win64 stack tail). The string
@@ -5952,8 +6011,11 @@ pub(crate) unsafe fn service_sec_image(
                     if winlogon_worker_can_signal {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
-                    } else if park_wait_deadline.is_none() && pi_is_top_level(badge) {
-                        mark_wait_parked!(pi, resume_ip);
+                    } else if park_wait_deadline.is_none() {
+                        trace_indefinite_wait_park(badge, live_top_badges(), crash_parked, wait_parked);
+                        if pi_is_top_level(badge) {
+                            mark_wait_parked!(pi, resume_ip);
+                        }
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -5986,8 +6048,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" NtWaitForMultipleObjects(");
                     print_u64(park_wait_set_n as u64);
                     print_str(if park_wait_set_all { b" events, WaitAll) UNSIGNALLED -> PARK caller\n" } else { b" events, WaitAny) UNSIGNALLED -> PARK caller\n" });
-                    if park_wait_deadline.is_none() && pi_is_top_level(badge) {
-                        mark_wait_parked!(pi, resume_ip);
+                    if park_wait_deadline.is_none() {
+                        trace_indefinite_wait_park(badge, live_top_badges(), crash_parked, wait_parked);
+                        if pi_is_top_level(badge) {
+                            mark_wait_parked!(pi, resume_ip);
+                        }
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -6196,6 +6261,10 @@ pub(crate) unsafe fn service_sec_image(
     // a REAL win32k user-mode callback (WM_NULL, so nothing can change), terminates it there, and
     // asserts `unwind_dead_client_user_callbacks` recovers win32k. Without that unwind this is the
     // shape that WEDGED the boot (RUNEXIT=124, no gate at all). See `exec_user_callback_dead_client_unwind`. ===
+    // === PRIVATE-VM COMMIT/DECOMMIT/RE-COMMIT SELF-TEST (POST-QUIESCE). Runs on the real
+    // `vm_map_private_page` path in a real hosted VSpace, at a VA above every placement the boot
+    // makes, so it perturbs nothing. See `private_vm_unmap_selftest`. ===
+    crate::private_vm_unmap_selftest(2, procs[2].pml4, procs[2].scratch_base);
     if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
         let client_pid = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
         let scratch_base = procs[2].scratch_base;
@@ -10611,6 +10680,31 @@ fn owner_top_badge(badge: u64) -> u64 {
 /// process's indefinite wait is quiesce-relevant (a sub-thread listener parks cooperatively but its
 /// parent process may still run).
 #[inline]
+/// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
+/// woken by another RUNNABLE thread, and if none is left the loop's next `recv` blocks forever —
+/// past even the wall-clock stall watchdog, which lives at the loop top and therefore never runs.
+/// Only a TOP-LEVEL badge's park is counted toward quiesce (a worker parking says nothing about its
+/// process's main thread), so trace every one of them with the three masks the quiesce test reads.
+fn trace_indefinite_wait_park(badge: u64, live: u64, crash_parked: u64, wait_parked: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    print_str(b"[wait-park] badge=");
+    print_u64(badge);
+    print_str(b" owner=");
+    print_u64(owner_top_badge(badge));
+    print_str(b" top-level=");
+    print_u64(pi_is_top_level(badge) as u64);
+    print_str(b" live=0x");
+    print_hex(live as u32);
+    print_str(b" crash=0x");
+    print_hex(crash_parked as u32);
+    print_str(b" wait=0x");
+    print_hex(wait_parked as u32);
+    print_str(b"\n");
+}
+
 fn pi_is_top_level(badge: u64) -> bool {
     matches!(
         badge,

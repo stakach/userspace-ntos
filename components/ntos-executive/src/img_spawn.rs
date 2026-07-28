@@ -187,6 +187,11 @@ pub(crate) unsafe fn spawn_pe_thread(
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
+    // `Page::Unmap` cannot find this vspace (`pml4_paddr_for_asid(0)` == "none") and every unmap of
+    // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
+    // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
+    let _ = vspace_assign_asid(pml4);
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
@@ -405,6 +410,11 @@ pub(crate) unsafe fn spawn_sec_image(
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
+    // `Page::Unmap` cannot find this vspace (`pml4_paddr_for_asid(0)` == "none") and every unmap of
+    // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
+    // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
+    let _ = vspace_assign_asid(pml4);
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();

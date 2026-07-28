@@ -126,3 +126,47 @@ a stack overflow into the guard page, not a bad pointer.
 `FILE_BASIC_INFORMATION` is 40, so the volume correctly rejected it and `CopyFileW` failed with a
 DOS error (24) that named nothing. Size staging buffers by the LARGEST class the handler serves, and
 trace `class` + `length` next to the status.
+
+## BATCH 59 — "resource exhausted" is a HYPOTHESIS; make the failing STEP name itself
+`STATUS_INSUFFICIENT_RESOURCES` out of a multi-step helper says nothing about WHICH step failed.
+`vm_map_private_page` has five failure points (page-table retype, frame acquire, `page_map`, alias
+map, registry insert) and collapsed all five into one status. A per-step counter plus the seL4 error
+LABEL named the real one in a single boot: `page_map_r` → **label 8 `seL4_DeleteFirst`**, i.e. a leaf
+PTE that was already occupied — a VA collision, with 89 MiB of the boot Untyped still free. Rules:
+- **Count the sub-steps, print the label.** A helper that maps a status onto several distinct causes
+  must carry a per-cause counter, or every diagnosis of it is a guess.
+- **Measure the pool before raising it.** The census said Untyped 64 %, registry 59 %, VAD 31 %,
+  free list 16/4096 — no pool was near its cap, which is what falsified the whole framing.
+- **A bounded map/unmap WATCH over the one suspect VA** (`[vm-watch]`, `VM_WATCH_LO/HI`) gives the
+  life of that address — who mapped it, who released it, with which frame cap — in one boot.
+
+## BATCH 59 — seL4 `Page::Unmap` needs the VSpace to have an ASID, or it silently does NOTHING
+`decode_frame_unmap` finds the vspace via `pml4_paddr_for_asid(frame.asid)`; a PML4 retyped out of an
+Untyped has `asid == 0`, and that lookup returns "no vspace" — so the unmap clears no PTE **and
+returns `seL4_NoError`**. The root task must call `X86ASIDPoolAssign` on every VSpace it creates.
+Until it does, every unmap in a hosted VSpace is a no-op whose only symptom is a `DeleteFirst` on the
+next map at that VA, arbitrarily far away in time. **Assign the ASID at PML4 creation, before
+anything is mapped**, and prove unmap with a commit → decommit → **RE-COMMIT** self-test — the only
+assertion that goes red when the unmap is a no-op.
+
+## BATCH 59 — a suppressed log line is a diagnostic hole; key the LOG on the thread, the STATE on the process
+`park_and_log!` printed `[parked] pi=… fault=…` only if the PROCESS's crash bit was clear. A worker
+thread's earlier milestone park already set that bit, so a genuinely new fault on the MAIN thread
+printed **nothing** and the boot quiesced with no fault line at all. Per-process STATE with a
+per-thread LOG key is the right split.
+
+## BATCH 59 — a crash park latches the process as a DEAD win32k callback client
+`park_and_log!` calls `unwind_dead_client_user_callbacks(pi)`, which sets the whole `pi` dead. Every
+later callback for that process then fails closed with `STATUS_THREAD_IS_TERMINATING`, which disarms
+the post-quiesce injections `exec_user_callback_dead_client_unwind` and
+`exec_win32k_transport_call_nested` — they go red with `proof=0x00`, and the reason is invisible
+unless you look for `[user-callback] callback not redirected … status=0xc000004b`. **Any new fault
+arm on a process that has passed a real milestone must take the MILESTONE park** (guarded by
+`!client_has_active_callback_frames(pi)`), never `park_and_log!`.
+
+## BATCH 59 — fixing a wall MOVES the boot; budget for the next wall before turning it on
+The ASID fix let `CopyDirectory` complete, which took winlogon into kernel32 code that ASSERTs on a
+TEB field win32k clobbers, whose `int 3` crash-parked winlogon and cost two protected specs;
+repairing THAT field took winlogon into an MS-RPC wait that deadlocks the single-threaded loop
+(`RUNEXIT=124`). Land the fix plus a **milestone park** at the new frontier, and ship the next
+repair only with the machinery its own frontier needs. Do not ship a repair that is measured to hang.

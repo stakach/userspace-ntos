@@ -1373,6 +1373,9 @@ const REG_KEY: &str = r"\Registry\Machine\System\CurrentControlSet\Services\From
 
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(0);
+/// The first free root-CNode slot (`BootInfo.empty.start`), kept so the pool census can report
+/// root-CSpace occupancy as used/capacity rather than an opaque absolute CPtr.
+static ROOT_CSPACE_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -2826,6 +2829,102 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     winlogon_profile_directories_spec(passed);
     unsafe { winlogon_profile_copied_spec(passed) };
     get_message_guard_spec(passed);
+    vspace_asid_unmap_spec(passed);
+    vm_pool_headroom_spec(passed);
+}
+
+/// ═══ A HOSTED VSpace HAS A REAL ASID, SO `Page::Unmap` REALLY CLEARS ITS PTEs ════════════════════
+///
+/// ★ THE BATCH-59 ROOT CAUSE, asserted by construction. seL4 finds the VSpace an `X86Page::Unmap`
+/// must edit by looking the FRAME cap's recorded ASID up against every PML4 cap
+/// (`pml4_paddr_for_asid`). A PML4 retyped out of an Untyped starts with `asid == 0`, for which that
+/// lookup means "no vspace" — so the unmap clears NOTHING and still returns SUCCESS. The executive
+/// had never assigned ASIDs, so every unmap of a hosted process's private page was a silent no-op:
+/// the frame cap was recycled while the leaf PTE stayed live. Nothing noticed until a VA was
+/// RE-COMMITTED, when `page_map` returned `seL4_DeleteFirst` and `vm_map_private_page` reported it
+/// as `STATUS_INSUFFICIENT_RESOURCES` — a PHANTOM out-of-memory. That is what stopped winlogon's
+/// `CopyLoop` 64 KiB buffer (`userenv` `directory.c:148 Error: 1450`), and it looked exactly like an
+/// exhausted frame budget while the boot Untyped was 64 % free.
+///
+/// The proof is the commit → decommit → RE-COMMIT self-test, not the absence of a symptom: with
+/// `VSPACE_ASIDS = false` the re-map bit cannot be set, because the leaf PTE is still occupied.
+fn vspace_asid_unmap_spec(passed: &mut u64) {
+    let proof = VM_UNMAP_SELFTEST.load(Ordering::Relaxed);
+    let assigned = ASID_ASSIGNED.load(Ordering::Relaxed);
+    let assign_fails = ASID_ASSIGN_FAILS.load(Ordering::Relaxed);
+    let map_fails = VM_FAIL_MAP.load(Ordering::Relaxed);
+    let unmap_fails = VM_UNMAP_FAILS.load(Ordering::Relaxed);
+    print_str(b"[vspace-asid] vspaces assigned=");
+    print_u64(assigned);
+    print_str(b" assign-failures=");
+    print_u64(assign_fails);
+    print_str(b" private-map refusals=");
+    print_u64(map_fails);
+    print_str(b" unmap error-labels=");
+    print_u64(unmap_fails);
+    print_str(b" re-commit selftest=0x");
+    print_hex(proof as u32);
+    print_str(b"\n");
+    check(
+        b"exec_vspace_asid_unmap_clears_pte",
+        VSPACE_ASIDS
+            // Every hosted process VSpace really took an ASID out of the initial pool …
+            && assigned >= 5
+            && assign_fails == 0
+            // … the full commit/decommit/re-commit cycle passed on the REAL path …
+            && proof == VM_UNMAP_SELFTEST_ALL
+            // … and across the whole boot no private map was refused and no unmap errored.
+            && map_fails == 0
+            && unmap_fails == 0,
+        passed,
+    );
+}
+
+/// ═══ EVERY POOL THAT BACKS HOSTED PRIVATE MEMORY HAS MEASURED HEADROOM ══════════════════════════
+///
+/// The recurring wall in this codebase is a fixed-capacity resource that answers "no" in silence:
+/// the bump heap at 93 %, `HEAP_FRAMES`, the VAD map, the frame registry. Each one is now measured
+/// with a HIGH-WATER mark next to its capacity and printed at the gate (`[pools]`), and this spec
+/// makes exhaustion a RED SPEC rather than a mystery — including for the 6th hosted process that
+/// `userinit.exe` will add. Thresholds are deliberately at 3/4 of capacity, not 100 %: the point is
+/// to fail BEFORE the wall, while there is still room to diagnose.
+fn vm_pool_headroom_spec(passed: &mut u64) {
+    let untyped_used = UT_RETYPE_BYTES.load(Ordering::Relaxed);
+    let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
+    let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let slots_total =
+        ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
+    let vad = VM_REGION_HW.load(Ordering::Relaxed);
+    let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
+    print_pool_census(b"gate");
+    check(
+        b"exec_vm_pool_headroom",
+        // The boot Untyped's size was really read from BootInfo (so this is measured, not assumed) …
+        untyped_total != 0
+            // … and every pool is strictly under three quarters of its capacity …
+            && untyped_used * 4 < untyped_total * 3
+            && slots_total != 0
+            && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
+            && vad * 4 < VM_REGION_CAPACITY as u64 * 3
+            && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
+            // ★ ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT, measured: 107.7k of 130.4k (82.6 %)
+            // for FIVE hosted processes. `alloc_slot` is a pure bump allocator — a deleted cap's
+            // slot is never reused — and the root CNode's size is the KERNEL's
+            // `init_thread_cnode_size_bits`, so this is the pool a 6th hosted process
+            // (`userinit.exe`) will exhaust first. Held to 90 % here rather than the 75 % the other
+            // pools get, because 82.6 % is today's honest number; recycling freed slots is the
+            // tracked follow-up that buys the headroom back.
+            && slots_used * 10 < slots_total * 9
+            // … with nothing having been refused by any of them.
+            && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
+            && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
+            && VM_FAIL_PT.load(Ordering::Relaxed) == 0
+            && VM_FAIL_FRAME.load(Ordering::Relaxed) == 0
+            && VM_FAIL_ALIAS.load(Ordering::Relaxed) == 0
+            && VM_FAIL_REGISTRY.load(Ordering::Relaxed) == 0,
+        passed,
+    );
 }
 
 /// ═══ `CopyDirectory` REALLY RAN — the profile tree was COPIED, not just created ═════════════════
@@ -4206,6 +4305,7 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_str(b" closes=");
     print_u64(writable_fs::OVERLAY_CLOSES.load(Ordering::Relaxed));
     print_str(b"\n");
+    print_pool_census(tag);
 }
 
 /// The per-badge table — factored out of [`print_progress_census`] so the periodic dump prints the
@@ -4494,8 +4594,10 @@ unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_
             alias_cap,
         );
         core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
+        note_high_water(&CSRSS_FRAME_HW, (n + 1) as u64);
         true
     } else {
+        CSRSS_FRAME_FULL.fetch_add(1, Ordering::Relaxed);
         false
     }
 }
@@ -4652,6 +4754,362 @@ unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
     }
     0
 }
+// --- POOL CENSUS (batch 59) ------------------------------------------------------------------
+// A fixed-capacity resource that silently returns "no" is this codebase's recurring wall (the bump
+// heap at 93 %; `HEAP_FRAMES`; the VAD map). Every pool that backs a hosted process's private
+// memory is now MEASURED — a high-water mark next to its capacity — and printed at the gate, so the
+// NEXT exhaustion names itself instead of surfacing as a mysterious `STATUS_INSUFFICIENT_RESOURCES`.
+/// Bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`, 256 MiB) — the ONE pool with no
+/// executive-side capacity constant, because the number lives in the kernel's `ROOTSERVER_UT_SIZE_BITS`.
+/// seL4 aligns each retype to the object's own size, so this is a close lower bound, not exact.
+pub(crate) static UT_RETYPE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UT_RETYPE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// The boot Untyped's size, published by the kernel in `BootInfo.untyped_list[..]` (the one
+/// non-device untyped). Read at `_start`; 0 until then.
+pub(crate) static UT_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Retypes that came back with a real seL4 error label, and the last such label/object type.
+/// `seL4_NotEnoughMemory` = 10 is "the boot Untyped is spent".
+pub(crate) static UT_RETYPE_FAILS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UT_LAST_FAIL_LABEL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UT_LAST_FAIL_OBJ: AtomicU64 = AtomicU64::new(0);
+/// High-water of the (pi, page) -> frame-cap registry (`CSRSS_FRAME_CAP`).
+pub(crate) static CSRSS_FRAME_HW: AtomicU64 = AtomicU64::new(0);
+/// Times the registry refused an insert because it was FULL — the failure that turns into
+/// `STATUS_INSUFFICIENT_RESOURCES` out of `vm_map_private_page` with every seL4 call succeeding.
+pub(crate) static CSRSS_FRAME_FULL: AtomicU64 = AtomicU64::new(0);
+/// High-water of the recycled-frame free list (`VM_FREE_FRAME_CAPACITY`).
+pub(crate) static VM_FREE_FRAME_HW: AtomicU64 = AtomicU64::new(0);
+/// Per-step failure tally for `vm_map_private_page`, so a refusal names its own sub-step.
+pub(crate) static VM_FAIL_PT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VM_FAIL_FRAME: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VM_FAIL_MAP: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VM_FAIL_ALIAS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VM_FAIL_REGISTRY: AtomicU64 = AtomicU64::new(0);
+/// High-water of the per-process VAD extent count (`VM_REGION_CAPACITY`).
+pub(crate) static VM_REGION_HW: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes one retyped object of `obj` (user size `bits`) consumes, mirroring the kernel's
+/// `object_type::size_in_bits`.
+fn retype_object_bytes(obj: u64, bits: u32) -> u64 {
+    match obj {
+        OBJ_TCB => 1 << 11,
+        OBJ_ENDPOINT => 1 << 4,
+        OBJ_NOTIFICATION => 1 << 5,
+        OBJ_REPLY => 1 << 5,
+        OBJ_CNODE => 1u64 << (bits + 5),
+        OBJ_SCHED_CONTEXT | OBJ_UNTYPED => 1u64 << bits,
+        // 4K page / PT / PD / PDPT / PML4 are each one 4 KiB page.
+        _ => 1 << 12,
+    }
+}
+
+fn note_retype(untyped: u64, obj: u64, bits: u32, num: u32) {
+    if untyped != CAP_INIT_UNTYPED {
+        return;
+    }
+    UT_RETYPE_CALLS.fetch_add(1, Ordering::Relaxed);
+    UT_RETYPE_BYTES.fetch_add(retype_object_bytes(obj, bits) * num as u64, Ordering::Relaxed);
+}
+
+fn note_retype_error(untyped: u64, obj: u64, label: u64) {
+    if label == 0 || untyped != CAP_INIT_UNTYPED {
+        return;
+    }
+    UT_RETYPE_FAILS.fetch_add(1, Ordering::Relaxed);
+    UT_LAST_FAIL_LABEL.store(label, Ordering::Relaxed);
+    UT_LAST_FAIL_OBJ.store(obj, Ordering::Relaxed);
+}
+
+/// Accounting shadow of `sel4_rt::untyped_retype`. An explicit item beats the `pub use sel4_rt::*`
+/// glob, so every existing call site is measured with no edit. The SEND form cannot see an error
+/// label (that is the documented `SYS_SEND` hazard) — only the bytes are counted here.
+pub(crate) fn untyped_retype(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
+    note_retype(untyped, obj, bits, num);
+    sel4_rt::untyped_retype(untyped, obj, bits, num, dest)
+}
+
+/// Monotone high-water helper.
+pub(crate) fn note_high_water(cell: &AtomicU64, value: u64) {
+    if cell.load(Ordering::Relaxed) < value {
+        cell.store(value, Ordering::Relaxed);
+    }
+}
+
+/// One line per pool: `used/capacity`. Printed with the periodic census AND at the gate, so an
+/// exhaustion is visible in the SAME dump that shows the boot stalling.
+pub(crate) fn print_pool_census(tag: &[u8]) {
+    let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    print_str(b"[pools] ");
+    print_str(tag);
+    print_str(b" untyped=");
+    print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed) >> 10);
+    print_str(b"KiB/");
+    print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed) >> 10);
+    print_str(b"KiB retypes=");
+    print_u64(UT_RETYPE_CALLS.load(Ordering::Relaxed));
+    print_str(b" ut-fails=");
+    print_u64(UT_RETYPE_FAILS.load(Ordering::Relaxed));
+    print_str(b" last-label=");
+    print_u64(UT_LAST_FAIL_LABEL.load(Ordering::Relaxed));
+    print_str(b" last-obj=");
+    print_u64(UT_LAST_FAIL_OBJ.load(Ordering::Relaxed));
+    print_str(b" cslots=");
+    print_u64(slots_used);
+    print_str(b"/");
+    print_u64(slots_cap);
+    print_str(b" frame-reg=");
+    print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(CSRSS_FRAME_CAP as u64);
+    print_str(b" reg-full=");
+    print_u64(CSRSS_FRAME_FULL.load(Ordering::Relaxed));
+    print_str(b" freelist=");
+    print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(VM_FREE_FRAME_CAPACITY as u64);
+    print_str(b" vad=");
+    print_u64(VM_REGION_HW.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(VM_REGION_CAPACITY as u64);
+    print_str(b" vm-fail pt=");
+    print_u64(VM_FAIL_PT.load(Ordering::Relaxed));
+    print_str(b" frame=");
+    print_u64(VM_FAIL_FRAME.load(Ordering::Relaxed));
+    print_str(b" map=");
+    print_u64(VM_FAIL_MAP.load(Ordering::Relaxed));
+    print_str(b" alias=");
+    print_u64(VM_FAIL_ALIAS.load(Ordering::Relaxed));
+    print_str(b" registry=");
+    print_u64(VM_FAIL_REGISTRY.load(Ordering::Relaxed));
+    print_str(b" unmap-fails=");
+    print_u64(VM_UNMAP_FAILS.load(Ordering::Relaxed));
+    print_str(b" asids=");
+    print_u64(ASID_ASSIGNED.load(Ordering::Relaxed));
+    print_str(b" asid-fails=");
+    print_u64(ASID_ASSIGN_FAILS.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
+/// `page_unmap` is a `SYS_SEND`, so a REFUSED unmap is invisible — and an unmap that does not clear
+/// the leaf PTE turns into a `seL4_DeleteFirst` on the NEXT map at that VA, i.e. a phantom
+/// "out of memory". This is the SYS_CALL form; the label comes back so the failure is countable.
+pub(crate) unsafe fn page_unmap_r(frame: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") frame => _,
+        inout("rsi") LBL_X86_PAGE_UNMAP << 12 => reply,
+        inout("r10") 0u64 => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    let label = reply >> 12;
+    if label != 0 {
+        VM_UNMAP_FAILS.fetch_add(1, Ordering::Relaxed);
+    }
+    label
+}
+/// Unmaps that came back with a real error label (see [`page_unmap_r`]).
+pub(crate) static VM_UNMAP_FAILS: AtomicU64 = AtomicU64::new(0);
+
+// --- VSpace ASIDs ------------------------------------------------------------------------------
+// ★ BATCH 59 ROOT CAUSE. seL4's `X86Page::Unmap` finds the VSpace to clear the leaf PTE in by
+// looking the FRAME cap's recorded ASID up against every PML4 cap (`pml4_paddr_for_asid`), and a
+// PML4 retyped out of an Untyped starts with `asid == 0` — for which that lookup returns "no
+// vspace" and the unmap clears NOTHING while still reporting SUCCESS. The executive had never
+// assigned ASIDs, so EVERY unmap of a hosted process's page was a silent no-op: the frame cap was
+// freed and recycled, but the PTE stayed live. Nothing noticed until a VA was re-committed —
+// `page_map` then found the leaf busy and returned `seL4_DeleteFirst`, which
+// `vm_map_private_page` reported as `STATUS_INSUFFICIENT_RESOURCES`, i.e. a PHANTOM out-of-memory
+// (winlogon's `CopyLoop` 64 KiB buffer → `userenv` `Error: 1450`). The fix is the piece seL4 always
+// expected the root task to do: assign each process VSpace an ASID out of the initial pool.
+/// Ship switch for the ASID assignment, so the BYPASS experiment is one constant: `false` restores
+/// the pre-batch-59 behaviour (every process VSpace `asid == 0`, every unmap a silent no-op) and
+/// `userenv`'s `Error: 1450` comes straight back.
+pub(crate) const VSPACE_ASIDS: bool = true;
+/// `seL4_CapInitThreadASIDPool` — canonical root-CSpace slot 6 (see `rootserver::rs_set`).
+pub(crate) const CAP_INIT_ASID_POOL: u64 = 6;
+/// `InvocationLabel::X86ASIDPoolAssign`.
+pub(crate) const LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
+/// VSpaces that were given a real ASID, and assignments that came back with an error label.
+pub(crate) static ASID_ASSIGNED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ASID_ASSIGN_FAILS: AtomicU64 = AtomicU64::new(0);
+/// Assign `pml4` (a root-CNode slot holding a freshly retyped PML4) the next ASID from the initial
+/// pool, so `Page::Unmap` / cap deletion can find this VSpace and really clear its PTEs. Legacy
+/// (non-extraCaps) ABI: the vspace's root-CNode slot index rides in `a2`. Returns the error label.
+pub(crate) unsafe fn vspace_assign_asid(pml4: u64) -> u64 {
+    if !VSPACE_ASIDS {
+        return 0;
+    }
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_ASID_POOL => _,
+        inout("rsi") LBL_X86_ASID_POOL_ASSIGN << 12 => reply,
+        inout("r10") pml4 => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    let label = reply >> 12;
+    if label == 0 {
+        ASID_ASSIGNED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ASID_ASSIGN_FAILS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[asid] assign failed pml4=0x");
+        print_hex(pml4 as u32);
+        print_str(b" label=");
+        print_u64(label);
+        print_str(b"\n");
+    }
+    label
+}
+
+// --- THE CLIENT TEB TAIL IS SERVER-WRITABLE, SO ITS INVARIANTS MUST BE RE-ASSERTED ---------------
+/// Times [`reassert_client_teb_tail`] checked, and times it really had to REPAIR the invariant.
+pub(crate) static TEB_TAIL_REASSERTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEB_TAIL_REPAIRS: AtomicU64 = AtomicU64::new(0);
+/// The first bad `MaximumLength` observed (0xFFFF = none), so a repair is evidence, not a guess.
+pub(crate) static TEB_TAIL_FIRST_BAD: AtomicU64 = AtomicU64::new(0xFFFF);
+
+/// Re-assert `TEB.StaticUnicodeString` for a hosted process's MAIN thread.
+///
+/// ★ WHY THIS EXISTS. Both TEB pages of a GUI client are deliberately registered as win32k client
+/// frames (the `KeStackAttachProcess` model — win32k dereferences the caller's TEB directly), so
+/// win32k writes SERVER-side data straight through them; batch 53 measured winlogon's whole 2nd TEB
+/// page coming back overwritten with USER metrics spanning `TEB+0x1000..0x18B8`. The x64 TEB tail
+/// also holds `StaticUnicodeString` (`TEB+0x1258`), the fixed per-thread `UNICODE_STRING` the loader
+/// and kernel32 convert names into — and kernel32 ASSERTs `MaximumLength == sizeof(StaticUnicodeBuffer)`
+/// (`kernel32/client/file/fileutils.c:26`). That assertion is an `int 3`, so a clobbered field kills
+/// the process the first time it takes a `Rtl*` path through fileutils — which is exactly where
+/// batch 59's advanced profile flow ended up (`cpu-exception(3)` at `ntdll+0x34477`).
+///
+/// The repair goes through the executive's PERSISTENT alias of the client's 2nd TEB page
+/// (`scratch_base + 0x5000`, mapped at spawn and never unmapped), the same technique the callback
+/// window cache re-assert uses. Idempotent, and a no-op on every dispatch that did not clobber it.
+///
+/// `pi` selects the process's ENV-SCRATCH base — the `scr_base` its `spawn_sec_image` was given,
+/// which is NOT `procs[pi].scratch_base` (that is the per-process demand-fill window).
+pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
+    match pi {
+        0 => 0x0000_0100_1074_0000,
+        1 => 0x0000_0100_1078_0000,
+        2 => WINLOGON_MAIN_TEB_MIRROR_VA, // 0x…107C_0000
+        3 => SERVICES_ENV_SCRATCH_VA,
+        4 => LSASS_ENV_SCRATCH_VA,
+        _ => 0,
+    }
+}
+
+///
+/// ★ OBSERVE-ONLY, deliberately. REPAIRING the field was measured (batch 59): winlogon then runs
+/// straight past kernel32's assertion into its post-profile MS-RPC path, opens `\pipe\lsarpc`,
+/// issues an async `NtReadFile` and wait-parks on the completion event — with lsass ALSO parked in
+/// `NtWaitForMultipleObjects` and no runnable signaler left. That deadlock cannot be seen by the
+/// service loop (it is blocked in `recv`, so even the wall-clock stall watchdog at the loop top
+/// never runs) ⇒ `RUNEXIT=124`, no gate. So this batch NAMES the frontier and parks at it; making
+/// the TEB tail durable belongs with the RPC-completion work that has to follow it.
+pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
+    let env_scratch = env_scratch_base_for_pi(pi);
+    if env_scratch == 0 {
+        return;
+    }
+    const STATIC_UNICODE_STRING: u64 = 0x258; // TEB+0x1258, i.e. offset 0x258 of the 2nd TEB page
+    const MAXIMUM_LENGTH: u16 = 522; // sizeof(StaticUnicodeBuffer) = 261 * sizeof(WCHAR)
+    let tail = env_scratch + 0x5000 + STATIC_UNICODE_STRING;
+    TEB_TAIL_REASSERTS.fetch_add(1, Ordering::Relaxed);
+    let max = core::ptr::read_volatile((tail + 2) as *const u16);
+    let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
+    if max == MAXIMUM_LENGTH && buffer == SMSS_TEB_VA + 0x1268 {
+        return;
+    }
+    let _ = TEB_TAIL_FIRST_BAD.compare_exchange(
+        0xFFFF,
+        max as u64,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    if TEB_TAIL_REPAIRS.fetch_add(1, Ordering::Relaxed) < 4 {
+        print_str(b"[teb-tail] StaticUnicodeString CLOBBERED by win32k (MaximumLength=");
+        print_u64(max as u64);
+        print_str(b" Buffer=0x");
+        print_hex((buffer >> 32) as u32);
+        print_hex(buffer as u32);
+        print_str(b") -- kernel32 fileutils.c:26 ASSERTs on this\n");
+    }
+}
+
+// --- PRIVATE-VM UNMAP SELF-TEST (proves the ASID fix, by construction) --------------------------
+/// Proof bits for [`private_vm_unmap_selftest`].
+pub(crate) const VM_UNMAP_SELFTEST_MAPPED: u64 = 0x01;
+/// The registry really recorded a frame for the test VA (the map went through the real path).
+pub(crate) const VM_UNMAP_SELFTEST_REGISTERED: u64 = 0x02;
+/// The unmap really released the frame (the registry entry is gone).
+pub(crate) const VM_UNMAP_SELFTEST_RELEASED: u64 = 0x04;
+/// ★ THE LOAD-BEARING BIT: the SAME VA can be committed AGAIN. With no ASID on the process VSpace,
+/// seL4's `Page::Unmap` cannot find the vspace, leaves the leaf PTE live, and this second map comes
+/// back `seL4_DeleteFirst` — which `vm_map_private_page` reports as STATUS_INSUFFICIENT_RESOURCES.
+pub(crate) const VM_UNMAP_SELFTEST_REMAPPED: u64 = 0x08;
+/// The released frame really went back through the recycling pool and was handed out again — the
+/// decommit ran end-to-end (release → free list → re-acquire → zero → re-map), not just far enough
+/// to drop the registry entry.
+pub(crate) const VM_UNMAP_SELFTEST_RECYCLED: u64 = 0x10;
+/// The VA was left clean (second unmap released it too).
+pub(crate) const VM_UNMAP_SELFTEST_CLEAN: u64 = 0x20;
+pub(crate) const VM_UNMAP_SELFTEST_ALL: u64 = 0x3f;
+pub(crate) static VM_UNMAP_SELFTEST: AtomicU64 = AtomicU64::new(0);
+
+/// Commit → decommit → RE-COMMIT one private page in a hosted process's VSpace, on the real
+/// `vm_map_private_page` / `vm_unmap_private_page` path, at a VA the VAD allocator never reaches
+/// (the very top of the private window — placements run upward from `SMSS_ALLOC_VA` and the boot's
+/// highest measured selection is `…305b0000`). This is the direct, bypass-sensitive proof that an
+/// unmap really clears the leaf PTE.
+pub(crate) unsafe fn private_vm_unmap_selftest(pi: usize, pml4: u64, scratch_base: u64) {
+    if pml4 == 0 || scratch_base == 0 {
+        return;
+    }
+    let page = PRIVATE_VM_LIMIT - 0x1000;
+    let mut proof = 0u64;
+    if vm_map_private_page(pi, page, nt_address_space::PAGE_READWRITE, pml4, scratch_base).is_ok() {
+        proof |= VM_UNMAP_SELFTEST_MAPPED;
+    }
+    let first = csrss_frame_get_exact(pi as u64, page).0;
+    if first != 0 {
+        proof |= VM_UNMAP_SELFTEST_REGISTERED;
+    }
+    vm_unmap_private_page(pi, page);
+    if csrss_frame_get_exact(pi as u64, page).0 == 0 {
+        proof |= VM_UNMAP_SELFTEST_RELEASED;
+    }
+    if vm_map_private_page(pi, page, nt_address_space::PAGE_READWRITE, pml4, scratch_base).is_ok() {
+        proof |= VM_UNMAP_SELFTEST_REMAPPED;
+    }
+    let second = csrss_frame_get_exact(pi as u64, page).0;
+    if second != 0 && second == first {
+        proof |= VM_UNMAP_SELFTEST_RECYCLED;
+    }
+    vm_unmap_private_page(pi, page);
+    if csrss_frame_get_exact(pi as u64, page).0 == 0 {
+        proof |= VM_UNMAP_SELFTEST_CLEAN;
+    }
+    VM_UNMAP_SELFTEST.store(proof, Ordering::Relaxed);
+    print_str(b"[vm-selftest] commit/decommit/RE-COMMIT of one private page: proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(VM_UNMAP_SELFTEST_ALL as u32);
+    print_str(b" first-frame=0x");
+    print_hex(first as u32);
+    print_str(b" second-frame=0x");
+    print_hex(second as u32);
+    print_str(b"\n");
+}
+
 unsafe fn alloc_frame() -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
@@ -4681,14 +5139,14 @@ unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     core::ptr::write_bytes(scratch as *mut u8, 0, 0x1000);
-    let _ = page_unmap(frame);
+    let _ = page_unmap_r(frame);
     Ok(frame)
 }
 
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
-    let _ = page_unmap(frame);
+    let _ = page_unmap_r(frame);
     if alias_cap != 0 {
-        let _ = page_unmap(alias_cap);
+        let _ = page_unmap_r(alias_cap);
         let _ = cnode_delete_r(alias_cap);
     }
     let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
@@ -4698,6 +5156,7 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
             frame,
         );
         core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count + 1);
+        note_high_water(&VM_FREE_FRAME_HW, (count + 1) as u64);
     } else {
         let _ = cnode_delete_r(frame);
     }
@@ -4750,10 +5209,12 @@ unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u3
     let pt = alloc_slot();
     if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt) != 0 {
         let _ = cnode_delete_r(pt);
+        VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     if paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, page & !0x1f_ffff, pml4) != 0 {
         let _ = cnode_delete_r(pt);
+        VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     core::ptr::write(slot, pt);
@@ -4768,9 +5229,34 @@ unsafe fn vm_map_private_page(
     scratch_base: u64,
 ) -> Result<(), u32> {
     vm_ensure_private_pt(pi, page, pml4)?;
-    let frame = vm_frame_acquire(scratch_base)?;
-    if page_map_r(frame, page, vm_page_rights(protection), pml4) != 0 {
+    let frame = match vm_frame_acquire(scratch_base) {
+        Ok(frame) => frame,
+        Err(status) => {
+            VM_FAIL_FRAME.fetch_add(1, Ordering::Relaxed);
+            return Err(status);
+        }
+    };
+    let map_label = page_map_r(frame, page, vm_page_rights(protection), pml4);
+    if map_label != 0 {
         vm_frame_release(frame, 0);
+        if VM_FAIL_MAP.fetch_add(1, Ordering::Relaxed) < 8 {
+            // Name the refusal instead of collapsing it into STATUS_INSUFFICIENT_RESOURCES:
+            // label 8 (`seL4_DeleteFirst`) = the leaf PTE is ALREADY occupied, i.e. a VA collision,
+            // not an exhausted pool. `known` says whether the frame registry knows that mapping.
+            let known = csrss_frame_get_exact(pi as u64, page).0;
+            print_str(b"[vm-map-fail] pi=");
+            print_u64(pi as u64);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" prot=0x");
+            print_hex(protection);
+            print_str(b" label=");
+            print_u64(map_label);
+            print_str(b" known-frame=0x");
+            print_hex(known as u32);
+            print_str(b"\n");
+        }
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let mut alias = 0;
@@ -4781,20 +5267,49 @@ unsafe fn vm_map_private_page(
         if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
             let _ = cnode_delete_r(copied);
             vm_frame_release(frame, 0);
+            VM_FAIL_ALIAS.fetch_add(1, Ordering::Relaxed);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         alias_cap = copied;
     }
     if !csrss_frame_put_at_cap(pi as u64, page, frame, alias, alias_cap) {
         vm_frame_release(frame, alias_cap);
+        VM_FAIL_REGISTRY.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
+    vm_watch(b"map", pi, page, frame);
     Ok(())
+}
+
+/// A bounded map/unmap WATCH over one private-VM page window, so the LIFE of a colliding VA is
+/// readable in a single boot (who mapped it, who released it, with which frame cap). Off unless
+/// [`VM_WATCH_LO`] < [`VM_WATCH_HI`]; both zero in the shipping build.
+const VM_WATCH_LO: u64 = 0;
+const VM_WATCH_HI: u64 = 0;
+static VM_WATCH_N: AtomicU64 = AtomicU64::new(0);
+fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
+    if page < VM_WATCH_LO || page >= VM_WATCH_HI || VM_WATCH_N.fetch_add(1, Ordering::Relaxed) > 64
+    {
+        return;
+    }
+    print_str(b"[vm-watch] ");
+    print_str(what);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" frame=0x");
+    print_hex(frame as u32);
+    print_str(b"\n");
 }
 
 unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
     if let Some((frame, alias_cap)) = csrss_frame_take(pi as u64, page) {
+        vm_watch(b"unmap", pi, page, frame);
         vm_frame_release(frame, alias_cap);
+    } else {
+        vm_watch(b"unmap-miss", pi, page, 0);
     }
 }
 
@@ -4809,7 +5324,7 @@ unsafe fn vm_reprotect_private_page(
     if frame == 0 {
         return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
     }
-    let _ = page_unmap(frame);
+    let _ = page_unmap_r(frame);
     if page_map_r(frame, page, vm_page_rights(new_protection), pml4) == 0 {
         Ok(())
     } else {
@@ -4838,6 +5353,7 @@ unsafe fn mint_badged(src: u64, badge: u64) -> u64 {
 // the same register layout via seL4_Call and hand back the reply's error label so callers can
 // detect and react. The reply's message-info comes back in rsi; its label is `reply >> 12`.
 unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
+    note_retype(untyped, obj, bits, num);
     let size_num = ((bits as u64) << 32) | (num as u64);
     let reply: u64;
     core::arch::asm!(
@@ -4851,7 +5367,9 @@ unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u6
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    reply >> 12
+    let label = reply >> 12;
+    note_retype_error(untyped, obj, label);
+    label
 }
 unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
     let Some(d) = try_alloc_slot() else {
@@ -10060,6 +10578,7 @@ struct Fat32 {
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
+    ROOT_CSPACE_START.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_END.store(bi.empty.end, Ordering::Relaxed);
     IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
     let img = bi.user_image_frames;
@@ -10081,6 +10600,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
         let pages = 1u64 << (desc.size_bits as u32 - PAGING_BITS);
         let first = desc.paddr >> PAGING_BITS;
+        // The boot Untyped is the untyped_list entry at `CAP_INIT_UNTYPED`'s index — record its real
+        // size so the pool census reports untyped consumption against the kernel's actual capacity
+        // instead of a constant duplicated on this side.
+        if bi.untyped.start + index as u64 == CAP_INIT_UNTYPED {
+            UT_TOTAL_BYTES.store(1u64 << desc.size_bits, Ordering::Relaxed);
+        }
         physical_pages = physical_pages.saturating_add(pages);
         lowest_page = lowest_page.min(first);
         highest_page = highest_page.max(first.saturating_add(pages - 1));

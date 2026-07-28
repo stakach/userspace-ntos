@@ -995,3 +995,98 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > FAILs**, `exec_writable_overlay_mounted` and `exec_winlogon_profile_directories_created` both red,
 > `profile.c:933  Error: 1` back, every overlay counter 0. Paint stays 768/768; every other spec
 > stays green.
+
+> **★★ UPDATE (batch 59, gate 250/99) — THE "FRAME BUDGET" WAS A MISSING VSpace ASID, AND
+> `CopyDirectory` NOW COMPLETES.** Not an ntdll change, and no kernel change (`rust-micro`
+> untouched — the fix uses an invocation the kernel already implements). Three consecutive
+> foreground boots, all `RUNEXIT=3`, `microtest sentinel`, **ZERO FAILs**, gate **250/99**,
+> `diff`-identical 250-line PASS lists, paint **768/768 changed @ `0x003a6ea5`**.
+>
+> **(1) THE ROOT CAUSE, measured — not a budget at all.** Batch 58 traced winlogon's
+> `userenv directory.c:148 Error: 1450` to `SSN=18 -> 0xC000009A`, the `NtAllocateVirtualMemory` of
+> `CopyLoop`'s 64 KiB buffer, and (correctly) ruled out the VAD map. A new **pool census** — a
+> high-water mark next to the capacity of every pool that backs hosted private memory, printed at the
+> gate and every 30 s as `[pools]` — showed the boot Untyped at **167 MiB of 256 MiB (64 %)**, the
+> frame registry at **9657/16384**, the recycled-frame free list at **16/4096**, the VAD at
+> **20/64**, and **zero** exhaustion refusals anywhere. What it did show was `vm-fail map=1`: the
+> refusal came from `page_map_r`, with seL4 error label **8 = `seL4_DeleteFirst`** — the leaf PTE at
+> `0x0000_0100_305b_0000` was **already occupied**. A bounded `[vm-watch]` map/unmap trace over that
+> one VA gave the whole story in one boot: winlogon mapped 16 pages there, unmapped all 16, and the
+> next commit was refused.
+>
+> **Why the unmap did nothing.** seL4 finds the VSpace an `X86Page::Unmap` must edit by looking the
+> FRAME cap's recorded ASID up against every PML4 cap (`invocation.rs pml4_paddr_for_asid`). A PML4
+> retyped out of an Untyped starts with `asid == 0`, for which that lookup returns "no vspace" — so
+> the unmap clears **nothing** and still returns **success** (`unmap-fails=0` for the whole boot,
+> even through the `page_unmap_r` SYS_CALL form this batch introduced). The executive had never
+> assigned ASIDs, so **every unmap of a hosted process's private page had always been a silent
+> no-op**: the frame cap was freed and recycled while the leaf PTE stayed live. Nothing noticed until
+> a VA was RE-COMMITTED — and then it surfaced as a phantom `STATUS_INSUFFICIENT_RESOURCES`, i.e. an
+> exhausted-looking pool with 89 MiB of Untyped to spare.
+>
+> **(2) THE FIX is the piece seL4 always expected the root task to do:** `spawn_sec_image` /
+> `spawn_pe_thread` now call `X86ASIDPoolAssign` on the fresh PML4 before anything is mapped into it
+> (`vspace_assign_asid`, root-CSpace slot 6 = `seL4_CapInitThreadASIDPool`, legacy `a2 = vspace slot`
+> ABI). **7 VSpaces assigned, 0 failures.** Shipped ON behind `VSPACE_ASIDS`. Component VSpaces
+> (`spawn_component`, win32k) are deliberately left unassigned for now — `w32_client_attach`'s detach
+> is written against the current no-op semantics, and making it real is a separate, measured step.
+>
+> **(3) PROVEN BY CONSTRUCTION, not by the absence of a symptom.** `exec_vspace_asid_unmap_clears_pte`
+> runs a commit → decommit → **RE-COMMIT** of one private page in winlogon's real VSpace, on the real
+> `vm_map_private_page` / `vm_unmap_private_page` path, at the very top of the private window
+> (`PRIVATE_VM_LIMIT - 0x1000`, above every placement the boot makes): mapped, registered, released,
+> **re-mapped at the same VA**, the released frame recycled, VA left clean (`proof=0x3f/0x3f`), plus
+> `assigned >= 5`, `assign-failures == 0`, `private-map refusals == 0`, `unmap error-labels == 0`.
+>
+> **(4) WHAT IT BOUGHT.** `Error: 1450` is gone and `userenv!CopyDirectory` runs on:
+> overlay **creates 23 -> 28, dirs 21 -> 25, reads 1 -> 3, writes 1 -> 3** — the Quick Launch
+> `Command Prompt.lnk` / `ReactOS Explorer.lnk` and `livecd_start.cmd` really copy, and
+> `exec_winlogon_profile_copied` still verifies destination content byte-for-byte.
+>
+> **(5) THE POOL CENSUS + THE 6th-PROCESS ANSWER (`exec_vm_pool_headroom`).** At the gate:
+> Untyped **167601 KiB / 262144 KiB (64 %)**, root-CSpace slots **107704 / 130363 (82.6 %)**, frame
+> registry **9657 / 16384 (59 %)**, free list **16 / 4096**, VAD **20 / 64 (31 %)**, and every
+> refusal counter 0. **Root-CSpace slots are the binding constraint for a 6th hosted process**:
+> `alloc_slot` is a pure bump allocator (a deleted cap's slot is never reused) and the root CNode's
+> size is the KERNEL's `init_thread_cnode_size_bits`, so `userinit.exe` will hit that ceiling first.
+> The spec holds cslots to 90 % and every other pool to 75 %. **Tracked follow-up: recycle freed
+> root-CSpace slots** (a free list fed by the `cnode_delete_r` sites) — worth roughly the 22 k slots
+> the boot currently leaks through `copy_cap` and the win32k attach path.
+>
+> **(6) THE NEW FRONTIER — the client TEB TAIL is server-writable, and kernel32 ASSERTs on it.**
+> With the copy running, winlogon reaches kernel32
+> `ASSERT(NtCurrentTeb()->StaticUnicodeString.MaximumLength == sizeof(StaticUnicodeBuffer))`
+> (`dll/win32/kernel32/client/file/fileutils.c:26`), whose `int 3` lands as `cpu-exception(3)` at
+> `ntdll+0x34477`. It is not a guess: `observe_client_teb_tail` reads the field through the
+> executive's persistent alias of the client's 2nd TEB page (`env-scratch + 0x5000`) after every
+> win32k dispatch and reports **`MaximumLength = 33`, `Buffer = 0xffff00c8_d0d40000`** — win32k's own
+> USER server data, the same clobber batch 53 measured (both TEB pages are deliberately registered as
+> win32k client frames under the `KeStackAttachProcess` model). **The repair is deliberately NOT
+> shipped**: a boot with it applied was measured to run winlogon straight past the assertion into its
+> post-profile MS-RPC path — `\pipe\lsarpc` opened, async `NtReadFile` pending, winlogon wait-parked
+> on the completion event with lsass ALSO parked in `NtWaitForMultipleObjects` and no runnable
+> signaler left. That deadlock is invisible to the service loop (blocked in `recv`, so even the
+> loop-top wall-clock stall watchdog never runs) ⇒ `RUNEXIT=124`, no gate. **Making the TEB tail
+> durable belongs with the RPC-completion work that has to follow it.**
+>
+> **(7) TWO PARK/DIAGNOSTIC FIXES that fell out of it.** (a) `park_and_log!` suppressed its
+> `[parked]` line on the PROCESS's crash bit, so a genuinely new fault on a SECOND thread of a
+> process whose worker had already milestone-parked printed **nothing** — the boot quiesced with no
+> fault line at all. The log line is now keyed on the THREAD badge (the crash bit stays per process).
+> (b) The winlogon POST-LOGON **milestone park** now covers *any* winlogon thread badge and the
+> `cpu-exception(3)` arm as well as the `#PF` arm. That matters, not cosmetically: `park_and_log!`
+> latches the whole process as a dead win32k callback client, which disarms the two post-quiesce
+> callback injections (`exec_user_callback_dead_client_unwind`,
+> `exec_win32k_transport_call_nested` — both went red for exactly this reason before the fix). The
+> guard that keeps it honest is unchanged: `!client_has_active_callback_frames(2)`.
+>
+> **`NtLoadKey`/`NtUnloadKey`, `\Registry\User` and `userinit.exe` are NOT implemented in this
+> batch** — nothing claims a hive was loaded and there is no 6th hosted process. `Userinit` /
+> `AutoAdminLogon`: nothing changed; `WlxActivateUserShell` is still not reached and winlogon's
+> SOFTWARE route stays exact-name scoped on `is_profile_list_key`, so `AutoAdminLogon` cannot leak.
+>
+> **BYPASS** (`VSPACE_ASIDS = false`): 250/99 ZERO FAILs → **249/99 with exactly 1 FAIL**,
+> `exec_vspace_asid_unmap_clears_pte` red (`selftest=0x2f`, the RE-COMMIT bit unset),
+> `[dbg] (dll\win32\userenv\directory.c:148) Error: 1450` back, `vm-fail map` 0 → 2, `asids` 7 → 0,
+> and the overlay counters collapse to the pre-batch numbers (creates 28 → 23, dirs 25 → 21,
+> reads 3 → 1, writes 3 → 1). Paint stays 768/768; every other spec stays green.

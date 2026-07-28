@@ -9928,6 +9928,7 @@ impl ExecNtHandler {
                     Ok(plan) => plan,
                     Err(status) => return status,
                 };
+                crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
                 if !created_vad
                     && allocation_type != nt_address_space::MEM_RESET
                     && copy_on_write

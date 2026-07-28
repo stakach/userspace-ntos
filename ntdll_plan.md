@@ -5684,3 +5684,50 @@ becomes `RUNEXIT=124` at 555 s** — the gate is never reached at all, no summar
 the log's last line is `[win32k-svc] -> SSN 0x1006 (dispatch)` with no reply. That is the whole
 delta, and it is why the guard's spec is counted (`preflight peeks=6`, `empty-queue parks=2`) rather
 than timed: the symptom it removes is a permanent stop, not a slowdown.
+
+---
+
+## Batch 59 — the "executive frame budget" was a MISSING VSpace ASID (gate 248 -> 250/99)
+
+**Premise checked, and it was wrong.** The wall was not a pool. A pool census (high-water vs
+capacity for every pool that backs hosted private memory, printed as `[pools]` at the gate and every
+30 s) showed the boot Untyped at 64 %, the frame registry at 59 %, the VAD at 31 %, the recycled
+frame free list at 16/4096, and **zero refusals**. The refusal that produced winlogon's
+`userenv directory.c:148 Error: 1450` came out of `page_map_r` with seL4 label **8 =
+`seL4_DeleteFirst`**: the leaf PTE was already occupied.
+
+**Root cause.** seL4's `X86Page::Unmap` locates the VSpace by looking the FRAME cap's recorded ASID
+up against every PML4 cap. A PML4 retyped out of an Untyped has `asid == 0`, for which that lookup
+means "no vspace" — the unmap clears nothing **and returns success**. The executive had never
+assigned ASIDs, so every unmap of a hosted process's private page was a silent no-op; the failure
+only ever appeared on a RE-COMMIT of the same VA, disguised as `STATUS_INSUFFICIENT_RESOURCES`.
+
+**Fix.** `spawn_sec_image` / `spawn_pe_thread` call `X86ASIDPoolAssign` (root slot 6, legacy
+`a2 = vspace slot` ABI) on the fresh PML4 before anything is mapped into it. 7 VSpaces assigned, 0
+failures. Ship switch `VSPACE_ASIDS`. No `rust-micro` change — the invocation already existed.
+
+**New specs.** `exec_vspace_asid_unmap_clears_pte` (a real commit → decommit → **re-commit** of one
+private page in winlogon's VSpace at `PRIVATE_VM_LIMIT - 0x1000`, `proof=0x3f/0x3f`) and
+`exec_vm_pool_headroom` (every pool's high-water under its threshold, every refusal counter 0).
+
+**BYPASS** (`VSPACE_ASIDS = false`): **250 -> 249/99, exactly 1 FAIL**, `Error: 1450` returns,
+`vm-fail map` 0 -> 2, overlay counters collapse to the pre-batch numbers.
+
+**What is next, in order.**
+1. **The client TEB tail.** win32k clobbers `TEB.StaticUnicodeString` (measured `MaximumLength = 33`,
+   `Buffer = 0xffff00c8_d0d40000`) because both TEB pages are registered as win32k client frames;
+   kernel32 `fileutils.c:26` ASSERTs on it and its `int 3` is now winlogon's milestone park. The
+   repair is one write through the executive's persistent `env-scratch + 0x5000` alias — but it must
+   land **together with** (2), because on its own it walks straight into a deadlock.
+2. **RPC completion for winlogon's post-profile `\pipe\lsarpc` call.** With the TEB tail repaired,
+   winlogon issues an async `NtReadFile` and wait-parks on the completion event while lsass is parked
+   in `NtWaitForMultipleObjects` — no runnable signaler, and the service loop cannot see it because it
+   is blocked in `recv`. A watchdog that can fire while the loop is in `recv` (a coarse always-armed
+   deadline) is the general answer; note `exec_delay_timer_disarms` constrains that design.
+3. **Root-CSpace slot recycling.** 107704/130363 slots (82.6 %) for FIVE processes, with a pure bump
+   allocator. This is what a 6th hosted process (`userinit.exe`) exhausts first.
+4. **`NtLoadKey`/`NtUnloadKey` + `\Registry\User`** (SSN 102 / 272) — untouched this batch. The
+   groundwork stands: widen `HIVE_SEL_MASK` `0xE000_0000` -> `0xF000_0000`, mount the loaded hive as
+   a dynamic mount in the same selector scheme, `config\default` is staged in its own DEFHIVEBUF
+   window as the `ntuser.dat` source. **Unserviced SSNs PARK the caller**, so these must exist before
+   `LoadUserProfileW`'s two `RegLoadKeyW` calls are reached.
