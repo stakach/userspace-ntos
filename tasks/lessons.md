@@ -79,3 +79,50 @@ When the top interactive process (winlogon) crash-parks at its GUI/login frontie
 top-level processes are just idle RPC servers (SCM/LSA) with no client left — the loop blocks in `recv`
 forever → timeout. Add: `pi==2 crash && LSA signalled -> mark crash_parked + stop + break` so the gate
 runs cleanly. This is the "break-on-winlogon-crash quiesce."
+
+## BATCH 58 — "it got slower" is a HYPOTHESIS; timestamp the log on the HOST before believing it
+A boot that blows the TCG budget (`RUNEXIT=124`) is NOT evidence of more/slower work. Batch 57
+attributed it to "post-logon UI work grew ~2.5x" from a LINE COUNT (788 -> 1744) and shipped a
+working feature disabled for "time". It was a **deadlock**: host-side timestamps
+(`timeout 555 ./scripts/run_specs.sh 2>&1 | perl -ne 'BEGIN{$|=1;$t0=time()} s/\x00//g;
+printf("[%04d] %s", time()-$t0, $_)'`) showed **zero output for the last 245 s** and a final
+`SSN 0x1006 (dispatch)` with no reply. Rules:
+- **Timestamp on the HOST, not the guest.** A guest clock is a suspect in exactly the scenario you
+  are investigating (this batch spent one boot on a false "the HPET froze" lead; the host timestamps
+  killed it in one).
+- **Line counts and per-op averages computed from a truncated log are worthless.** Compute the RATE
+  from real timestamps, and check whether the tail is slow or ABSENT.
+- **A periodic census beats a final one.** `print_progress_census` only ran at quiesce, i.e. only on
+  the boots that did not need diagnosing. It now dumps every 30 s — and the clock is a STATIC ticked
+  from the win32k dispatch arm too, because that arm runs a NESTED pump and can spend minutes
+  without the service-loop top ever being reached (which is why the first periodic census still
+  stopped at dump #6 and looked like a frozen clock).
+- **Cover BOTH service tables in any per-SSN histogram.** `SSN_HIST_N = 512` collapsed every win32k
+  SSN (`0x1000+`) into one bucket, so "the win32k work grew" was unmeasurable by construction.
+- **Count vs COST are different questions with different fixes.** Attribute wall-clock between two
+  consecutive dispatch entries to the SSN in between (`W32_SSN_TIME_100NS`), the same technique the
+  per-badge census uses at the loop top.
+
+## BATCH 58 — a blocking win32k call in a single-threaded host is a SYSTEM-WIDE deadlock
+`NtUserGetMessage` (`0x1006`) on an empty queue does not block one thread — the executive drives
+win32k synchronously, so it blocks everything, INCLUDING the loop-top stall watchdog, so the boot
+cannot even quiesce to the gate. Never dispatch a blocking win32k service speculatively: ask the
+NON-blocking half first (`NtUserPeekMessage` with `PM_NOREMOVE`) and park on empty. Per-window
+special cases do not generalise — the next dialog nobody anticipated (here: userenv's error
+MessageBox) walks straight into the wall.
+Corollary: **whose park ends the boot matters.** Quiescing on a WORKER thread's park cut a
+still-advancing `CopyDirectory` off mid-tree; only the process's MAIN thread running dry is a
+terminal condition.
+
+## BATCH 58 — the executive's stack floats right after its image; do not put big values on it
+`NtAllocateVirtualMemory`/`NtFreeVirtualMemory` copied a whole `VmRegionMap` onto the stack TWICE per
+call. Raising `VM_REGION_CAPACITY` 64 -> 256 (a control experiment, ~10 KB per copy) killed the boot
+instantly with a `#PF err=6` in the executive one page past `.bss`. Snapshot/rollback state belongs
+in a STATIC scratch (the executive is single-threaded). A `#PF` whose cr2 is just past `.bss_end` is
+a stack overflow into the guard page, not a bad pointer.
+
+## BATCH 58 — a truncating staging buffer is silent until a bigger structure arrives
+`NtSetInformationFile` staged the caller's payload into `[0u8; 32]` and passed `&payload[..32]`;
+`FILE_BASIC_INFORMATION` is 40, so the volume correctly rejected it and `CopyFileW` failed with a
+DOS error (24) that named nothing. Size staging buffers by the LARGEST class the handler serves, and
+trace `class` + `length` next to the status.

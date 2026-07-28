@@ -72,18 +72,16 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// FAT32 write-through milestone replaces the backing without touching any of it. The cost is the
 /// tree's bytes in RAM, which for this tree is ~76 nodes and ~360 bytes of file content.
 ///
-/// ★ **LEFT OFF — and the reason is a MEASURED time budget, not a defect.** With this `true` the
-/// staging + materialisation work exactly as designed (measured: `dirs=45 files=31 bytes=5307`,
-/// `Default User` enumerating its real 17 records, a staged file's bytes read back), the `Error: 3`
-/// is gone and `CopyDirectory` really enumerates the source. But winlogon then CONTINUES — the
-/// profile flow that used to die at `FindFirstFileW` now runs on — and its post-logon win32k/UI
-/// work grows ~2.5x (post-failure trace 788 -> 1744 lines). The boot's quiesce moved 282s -> 305s
-/// with the tree alone (still green), and past `CopyDirectory` it no longer reaches quiesce inside
-/// the gate's ~555s TCG budget at all (RUNEXIT=124). That budget — not the profile source — is now
-/// the binding constraint on advancing winlogon, so it ships OFF rather than red.
-///
-/// Everything it needs is in place and verified; turning it on is one `bool`.
-pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = false;
+/// ★ **ON since batch 58.** It shipped `false` for one batch on the belief that the profile flow
+/// blew the TCG time budget ("post-logon UI work grows ~2.5x"). That was WRONG: host-side
+/// timestamps showed the boot going COMPLETELY SILENT for the last 245 s behind a blocking
+/// `NtUserGetMessage` that win32k could never answer — a deadlock, not a budget. With that fixed
+/// (see `GET_MESSAGE_EMPTY_QUEUE_GUARD`) the boot quiesces in 319-329 s of the ~555 s window with
+/// the flow ON, and `userenv!CopyDirectory` really runs: 20 subdirectories created below
+/// `C:\Profiles\<user>` and 2 files copied byte-exact from the ISO's `Default User`
+/// (`exec_winlogon_profile_copied`). Materialisation itself is unchanged and still measured at
+/// `dirs=45 files=31 bytes=5307` with `Default User` enumerating its real 17 records.
+pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 
 /// The staged tree's FAT root name, and its mount point on the writable volume.
 pub(crate) const STAGED_PROFILES_DIR: &[u8] = b"Profiles";
@@ -93,6 +91,24 @@ pub(crate) const PROFILES_VOLUME_ROOT: &str = r"\??\C:\Profiles";
 pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
 pub(crate) const DEFAULT_USER_PROBE_FILE: &str =
     r"\??\C:\Profiles\Default User\My Documents\livecd_start.cmd";
+
+/// The DESTINATION path `CopyDirectory` must have produced for the probe file, and the source
+/// bytes it must contain. The user directory is the real profile name `CreateUserProfileExW`
+/// derived from the logged-on account, so this is the copy's own output path, not a fabrication.
+pub(crate) const COPIED_PROFILE_PROBE_FILE: &str =
+    r"\??\C:\Profiles\Administrator\My Documents\livecd_start.cmd";
+
+/// Whether `CopyDirectory` really wrote the SOURCE file's exact bytes to its DESTINATION path —
+/// read back off the LIVE writable volume, by content.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the read.
+pub(crate) unsafe fn copied_profile_probe_ok() -> bool {
+    match writable_fs() {
+        Some(fs) => fs.file_bytes(COPIED_PROFILE_PROBE_FILE) == Some(b"@start %1"),
+        None => false,
+    }
+}
 
 /// Directories / files / content bytes really materialised from the staged `\Profiles` tree.
 pub(crate) static PROFILE_SOURCE_DIRS: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +162,11 @@ pub(crate) static PROFILE_USER_DIR_CREATED: AtomicU64 = AtomicU64::new(0);
 /// evidence of REAL volume state, never of a fabricated success.
 pub(crate) static PROFILE_ROOT_COLLIDED: AtomicU64 = AtomicU64::new(0);
 
+/// ★ …and `CopyDirectory` itself: the directories and files winlogon created BELOW
+/// `C:\Profiles\<user>`, which only its recursion over the `Default User` source can produce.
+pub(crate) static PROFILE_COPY_DIRS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_COPY_FILES: AtomicU64 = AtomicU64::new(0);
+
 /// Classify winlogon's writable-volume DIRECTORY create as the profiles root / a per-user profile
 /// directory, for the winlogon profile-creation spec. Pure path shape, no name allow-list.
 /// `created` distinguishes a `FILE_CREATED` from a real `STATUS_OBJECT_NAME_COLLISION` refusal.
@@ -162,6 +183,23 @@ pub(crate) fn note_directory_create(pi: usize, relative: &[u8], created: bool) {
         }
     } else if created && depth == 1 && relative.starts_with(b"profiles\\") {
         PROFILE_USER_DIR_CREATED.fetch_add(1, Ordering::Relaxed);
+    } else if created && depth >= 2 && relative.starts_with(b"profiles\\") {
+        // Anything DEEPER than `profiles\<user>` can only have been made by `CopyDirectory`'s
+        // recursion (`userenv!directory.c:124  CreateDirectoryExW(src, dst, NULL)`) — winlogon
+        // itself only ever creates the root and the per-user directory.
+        PROFILE_COPY_DIRS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Note a winlogon FILE create/write inside the per-user profile tree — `CopyDirectory`'s
+/// `CopyFileW` leg (`directory.c:139`). Only pi 2, only under `profiles\<something>\`, and only for
+/// a create that the volume really reported as `FILE_CREATED`.
+pub(crate) fn note_profile_file_create(pi: usize, relative: &[u8]) {
+    if pi == 2
+        && relative.starts_with(b"profiles\\")
+        && relative.iter().filter(|byte| **byte == b'\\').count() >= 2
+    {
+        PROFILE_COPY_FILES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -270,6 +308,8 @@ pub(crate) unsafe fn read(
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_READS.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_READ.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    } else {
+        trace_io_refusal(b"read", file_id, byte_offset, length, status);
     }
     (status, bytes)
 }
@@ -283,6 +323,8 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_WRITTEN.fetch_add(written as u64, Ordering::Relaxed);
+    } else {
+        trace_io_refusal(b"write", file_id, byte_offset, data.len(), status);
     }
     (status, written)
 }
@@ -348,6 +390,28 @@ pub(crate) unsafe fn query_directory(
         print_str(b"\"\n");
     }
     result
+}
+
+static IO_REFUSAL_TRACED: AtomicU64 = AtomicU64::new(0);
+
+/// Trace (bounded) a read/write the volume REFUSED. `CopyFileW`'s failures surface in userenv as a
+/// bare `GetLastError()` number, so the NTSTATUS that produced it has to be visible here or the
+/// frontier is a guess.
+fn trace_io_refusal(what: &[u8], file_id: u64, offset: Option<u64>, length: usize, status: u32) {
+    if IO_REFUSAL_TRACED.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    print_str(b"[writable-fs] ");
+    print_str(what);
+    print_str(b" REFUSED id=");
+    print_u64(file_id);
+    print_str(b" off=");
+    print_u64(offset.unwrap_or(u64::MAX));
+    print_str(b" len=");
+    print_u64(length as u64);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
 }
 
 static DIR_QUERY_MISS_TRACED: AtomicU64 = AtomicU64::new(0);

@@ -874,6 +874,56 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > live syscall counters: winlogon really created 2 directories through `NtCreateFile` and really
 > missed 1 by-path attribute query through `NtQueryAttributesFile`.
 >
+> **★★ UPDATE (batch 58, gate 248/99) — THE "TIME BUDGET" WAS A HANG, AND THE PROFILE FLOW NOW
+> SHIPS ON.** Batch 57's claim (repeated below) that the profile flow "no longer reaches quiesce
+> inside the ~555 s TCG budget" because its post-logon UI work "grows ~2.5x" was **wrong, and the
+> census says so**. Host-side timestamps on the serial log show the boot goes **completely silent at
+> t = 310 s and produces ZERO output for the remaining 245 s**, with the last line a
+> `[win32k-svc] -> SSN 0x1006 (dispatch)` that never replies. `0x1006` is `NtUserGetMessage`, and
+> win32k is driven **synchronously by the single-threaded service loop** — so
+> `co_IntGetPeekMessage`'s wait blocks the whole system AND the loop-top wall-clock stall watchdog
+> with it, which is why the boot could not even quiesce to the gate. `RUNEXIT=124` was a DEADLOCK,
+> never a budget overrun.
+>
+> **THE GENERAL FIX** is NT's own definition of GetMessage — *peek, then wait*: before letting a
+> blocking `NtUserGetMessage` into win32k the executive dispatches the caller's own arguments through
+> the non-blocking `NtUserPeekMessage(PM_NOREMOVE)`. A non-empty queue dispatches exactly as before;
+> an EMPTY queue — the only case that could hang — takes the established milestone park. Guarded by
+> `GET_MESSAGE_EMPTY_QUEUE_GUARD` and asserted by `exec_win32k_blocking_getmessage_guarded`
+> (preflight peeks 6, empty-queue parks 2). **BYPASS: `false` ⇒ `RUNEXIT=124` at 555 s, the gate
+> never runs.** A worker thread's empty pump parks the THREAD and lets the loop continue (bounded
+> grace); only winlogon's MAIN thread's empty SAS loop still ends the boot — quiescing on the worker
+> cut `CopyDirectory` off mid-tree.
+>
+> **`PROVISION_DEFAULT_USER_PROFILE = true` NOW SHIPS**, and `userenv!CopyDirectory` REALLY RUNS:
+> **20 subdirectories** created below `C:\Profiles\Administrator` and **2 files copied**, with
+> `C:\Profiles\Administrator\My Documents\livecd_start.cmd` reading back off the LIVE writable volume
+> with the ISO source's exact 9 bytes (`exec_winlogon_profile_copied`). Getting there needed four
+> more MEASURED fixes: (1) `NtQueryInformationFile` served only `FileStandardInformation`, so
+> `CreateDirectoryExW`'s `FileBasicInformation`/`FileEaInformation` queries failed ⇒ `Error: 87`
+> (both now encoded honestly — real kind, zero timestamps, `EaSize = 0`); (2) the writable overlay
+> inherited the isolated-FSD 16 KiB argument-window cap, so `CopyLoop`'s 64 KiB `NtReadFile` was
+> refused ⇒ `Error: 1784` (an overlay read is served in-process and never crosses that transport);
+> (3) `NtSetInformationFile`'s staging buffer was **32** bytes while `FILE_BASIC_INFORMATION` is
+> **40**, so `SetLastWriteTime` — which ends every `CopyFileW` — arrived truncated ⇒ `Error: 24`;
+> (4) a latent **executive stack overflow** (two whole-`VmRegionMap` copies per VM syscall, on a
+> rootserver stack that floats right after `.bss`) — both snapshots moved to static scratch.
+>
+> **WHERE WINLOGON STOPS NOW (verified):** `directory.c:148  Error: 1450` on
+> `…\Quick Launch\Command Prompt.lnk`, traced to **`SSN=18 -> 0xC000009A`** — winlogon's
+> `NtAllocateVirtualMemory` of `CopyLoop`'s 64 KiB buffer. **NOT** the VAD map: a control boot at
+> `VM_REGION_CAPACITY = 256` gave the same status at the same file with byte-identical overlay
+> counters, so it is the frame / page-table commit under `vm_map_private_page` (the executive's boot
+> frame budget). `NtLoadKey`/`NtUnloadKey`, `\Registry\User` and `userinit.exe` are still ahead.
+>
+> **WHERE THE WALL-CLOCK GOES** (now measurable — the census dumps every 30 s including from inside
+> the nested win32k pump, and the per-SSN histogram covers the win32k shadow table): of a 323.6 s
+> boot, **201.6 s across 3787 win32k dispatches (avg 53 ms)**. Hottest: `0x10fa`
+> NtUserProcessConnect 90.7 s, `0x10bd` NtUserGetClassInfo 40.8 s, `0x1058` 22.1 s, `0x125a`
+> NtUserInitialize 20.0 s, `0x10b4` 10.7 s. Per-pi: winlogon 3540, services 122, lsass 122, csrss 4.
+> Nothing pathological — demand-faults **2**, heap **36 %**, user-callback pushes == unwinds, timer
+> ticks 3 with 0 spurious. TCG really is that slow per win32k round-trip; the budget is fine.
+>
 > **★ UPDATE (batch 57, gate 246/99) — THE PROFILE SOURCE WAS A STAGING GAP, NOT MISSING MEDIA.**
 > The claim below that "our media is a LiveCD extract with no profile tree" was WRONG. The ReactOS
 > LiveCD ISO carries a real **76-entry `Profiles/` tree** (`Default User/…`, `All Users/…`) as a

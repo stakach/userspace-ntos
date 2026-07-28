@@ -779,6 +779,11 @@ pub(crate) unsafe fn service_sec_image(
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
     let mut census_prev_badge = usize::MAX;
+    // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
+    // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
+    // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
+    // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
+    CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     loop {
         if ntdll.is_some() {
             publish_kuser_clocks();
@@ -798,6 +803,7 @@ pub(crate) unsafe fn service_sec_image(
                 BADGE_LAST_T[slot].store(now, Ordering::Relaxed);
                 census_prev_badge = slot;
                 census_prev_t = now;
+                census_tick_static(now);
             }
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
@@ -2437,13 +2443,13 @@ pub(crate) unsafe fn service_sec_image(
             // FORWARD-PROGRESS CENSUS: per-SSN histogram for the two processes that matter to the
             // starvation question — lsass (whose self-RPC is suspected of churning) and winlogon
             // (whose SAS window the paint depends on). A poll/retry livelock is unmistakable here.
-            if pi == 4 || pi == 2 {
-                let bucket = (ssn as usize).min(SSN_HIST_N - 1);
-                if pi == 4 {
-                    LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed);
-                } else {
-                    WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed);
-                }
+            if pi == 4 || pi == 2 || pi == 1 {
+                let bucket = ssn_bucket(ssn);
+                match pi {
+                    4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                    2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                    _ => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                };
             }
             if is_lsa_worker {
                 LSA_WORKER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
@@ -2731,6 +2737,9 @@ pub(crate) unsafe fn service_sec_image(
             // BATCH 43: set when winlogon reaches its win32k SAS-window creation milestone (0x1077 OK) →
             // park it (recv-next-without-reply) so the boot quiesces + the gate runs (see the !handled block).
             let mut wl_milestone_park = false;
+            // Set alongside `wl_milestone_park` when the park must NOT end the boot (see the
+            // blocking-GetMessage guard): the thread parks, the service loop keeps running.
+            let mut wl_park_defer_quiesce = false;
             // (Phase 3: the `routed_win32k` / `routed_lpc` / `routed_csr` flags that used to live
             // here are GONE. They existed solely to steer this syscall's reply away from the legacy
             // `reply_to` — which a nested win32k / SM-loop / CSR-thread fault had clobbered — and
@@ -3123,6 +3132,31 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.writable_fs_dirty {
                     nt_handler.writable_fs_dirty = false;
                     heap_mark = allocator::mark();
+                }
+                // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
+                // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
+                // only ever prints `GetLastError()`, and several distinct NTSTATUSes collapse onto
+                // the same DOS error, so the frontier is unmeasurable without this.
+                if pi == 2
+                    && m0 < 0x1000
+                    && result != 0
+                    // STATUS_NO_MORE_FILES ends every legitimate `FindNextFileW` loop and
+                    // STATUS_INVALID_INFO_CLASS is a probe kernel32 makes and ignores; both flood
+                    // the window without being frontier information.
+                    && result != 0x8000_0006
+                    && result != 0xC000_0003
+                    && crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) != 0
+                    && PROFILE_FRONTIER_TRACED.fetch_add(1, Ordering::Relaxed) < 32
+                {
+                    print_str(b"[profile-frontier] winlogon SSN=");
+                    print_u64(m0);
+                    print_str(b" arg4=");
+                    print_u64(get_recv_mr(8));
+                    print_str(b" stack5=");
+                    print_u64(smss_stack_read(get_recv_mr(16) + 0x28));
+                    print_str(b" -> status=0x");
+                    print_hex(result as u32);
+                    print_str(b"\n");
                 }
                 // Bump-heap PRESSURE tripwire. Every pin above moves the permanent floor; when it
                 // climbs, say so. A silent approach to the cap is what an exhausted no-free heap
@@ -4568,6 +4602,99 @@ pub(crate) unsafe fn service_sec_image(
                         handled = false;
                         wl_milestone_park = true;
                     }
+                } else if m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                    && GET_MESSAGE_EMPTY_QUEUE_GUARD
+                {
+                    // ★ BATCH 58 — THE GENERAL RULE: A BLOCKING `NtUserGetMessage` MUST NEVER BE
+                    // DISPATCHED INTO win32k ON AN EMPTY QUEUE.
+                    //
+                    // The executive's service loop is SINGLE-THREADED and win32k is a component it
+                    // drives synchronously, so `co_IntGetPeekMessage`'s wait does not block one
+                    // thread — it blocks THE WHOLE SYSTEM, permanently. And because the loop is then
+                    // stuck inside `win32k_dispatch`'s recv, the wall-clock stall watchdog at the
+                    // loop top never runs either, so the boot can never even quiesce to the gate.
+                    // MEASURED (batch 58, `PROVISION_DEFAULT_USER_PROFILE = true`): the profile
+                    // flow's `Error: 87` puts up a real userenv MessageBox whose modal pump calls
+                    // GetMessage on a window no existing special case covers; the boot went
+                    // COMPLETELY SILENT at t=310 s and was killed at 555 s (`RUNEXIT=124`). It was
+                    // never "more UI work costing more time" — the log's last line is a `0x1006`
+                    // dispatch with no reply, and host-side timestamps show ZERO output for the
+                    // remaining 245 s.
+                    //
+                    // The rule is NT's own definition of GetMessage — *peek, and only then wait* —
+                    // so ask win32k the non-blocking half FIRST, with the caller's real arguments
+                    // and `PM_NOREMOVE` (the message stays queued for the GetMessage that follows).
+                    // A non-empty queue dispatches exactly as before (byte-identical behaviour); an
+                    // EMPTY queue — the only case that could hang — takes the established milestone
+                    // park, so the boot quiesces and the gate runs. This subsumes the special-cased
+                    // parks above rather than competing with them: it is the LAST arm of the chain.
+                    let sp = get_recv_mr(16);
+                    let peb_mirror = match pi {
+                        0 => 0x0000_0100_1074_1000,
+                        1 => 0x0000_0100_1078_1000,
+                        2 => 0x0000_0100_107C_1000,
+                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
+                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        _ => 0,
+                    };
+                    let client_teb = nt_handler
+                        .pm
+                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .filter(|teb| *teb != 0)
+                        .unwrap_or(SMSS_TEB_VA);
+                    // The caller's own NtUserGetMessage(MSG* [R10], HWND [RDX], min [R8], max [R9]);
+                    // NtUserPeekMessage takes the same four plus wRemoveMsg on the stack.
+                    W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+                    let peek = win32k_glue::win32k_dispatch_wide(
+                        nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
+                        get_recv_mr(9),
+                        m3,
+                        get_recv_mr(7),
+                        get_recv_mr(8),
+                        sp,
+                        5,
+                        &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
+                        win32k_glue::Win32kClientContext {
+                            pi: pi as u32,
+                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                            badge,
+                            tid: nt_handler.current_tid,
+                            teb: client_teb,
+                            peb_mirror,
+                            scratch_base,
+                        },
+                    );
+                    GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
+                    if peek.0 == 0 {
+                        let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
+                        // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
+                        // of messages is the established terminal condition — it is the thread that
+                        // drives the logon, so its empty SAS loop means winlogon has nothing left.
+                        // A WORKER thread's pump running dry does NOT: measured, the profile copy
+                        // runs on the MAIN thread while worker badge 13 pumps the desktop, so
+                        // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
+                        // Park the worker and keep the loop running so the main thread advances;
+                        // the grace is BOUNDED so a boot where nothing else can run still reaches
+                        // the gate rather than blocking in the loop's recv forever.
+                        const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
+                        let defer = badge != WINLOGON_BADGE && n < EMPTY_QUEUE_PARK_GRACE;
+                        if n < 8 {
+                            print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
+                            print_u64(pi as u64);
+                            print_str(b" badge=");
+                            print_u64(badge);
+                            print_str(b" hwnd-filter=0x");
+                            print_hex(m3 as u32);
+                            print_str(if defer {
+                                b") -> parking this thread, loop continues\n"
+                            } else {
+                                b") -> parking instead of hanging win32k\n"
+                            });
+                        }
+                        handled = false;
+                        wl_milestone_park = true;
+                        wl_park_defer_quiesce = defer;
+                    }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
                 // services pi 3 / lsass pi 4) so it attaches win32k's client window to this client's frames
@@ -4621,6 +4748,23 @@ pub(crate) unsafe fn service_sec_image(
                         W32_TOTAL_LIMIT
                     };
                     let total = W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed) + 1;
+                    // FORWARD-PROGRESS CENSUS: the win32k SHADOW table lands in the same per-process
+                    // histogram as the native table (high half). Without this the census could see
+                    // only the native syscalls, and every "the UI work grew" claim about a win32k
+                    // frontier was unmeasured by construction.
+                    {
+                        let bucket = ssn_bucket(m0);
+                        match pi {
+                            4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                            2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                            1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                            _ => 0,
+                        };
+                        // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
+                        // pump, so the main loop's badge census cannot see any of the time spent
+                        // here. It also ticks the periodic dump, so a non-quiescing boot reports.
+                        w32_census_enter(m0);
+                    }
                     if total >= limit {
                         print_str(b"[w32-spin] pi=");
                         print_u64(pi as u64);
@@ -5527,7 +5671,8 @@ pub(crate) unsafe fn service_sec_image(
                 if wl_milestone_park {
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     crash_parked |= 1u64 << owner_top_badge(badge);
-                    if WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
+                    if !wl_park_defer_quiesce
+                        && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
                         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                     {
                         print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");

@@ -5537,3 +5537,150 @@ Nothing claims a hive was loaded. `userinit.exe` was **NOT** spawned and no 6th 
 exists. `Userinit`/`AutoAdminLogon`: **nothing changed** — `WlxActivateUserShell` was never reached,
 the Winlogon key is still `SYNTH_WINLOGON_KEY`, and `AutoAdminLogon` cannot leak because winlogon's
 SOFTWARE route stays exact-name scoped on `is_profile_list_key`.
+
+---
+
+# BATCH 58 — THE TIME BUDGET WAS A **HANG**, NOT SLOWNESS; `PROVISION_DEFAULT_USER_PROFILE` SHIPS ON
+
+Gate **246 -> 248/99, ZERO FAILs**, RUNEXIT=3, `microtest sentinel`, paint **768/768 @ 0x003a6ea5**,
+`diff`-identical PASS lists across 3 consecutive foreground boots (**319 s / 326 s / 329 s** of the
+gate's ~555 s TCG window). No `rust-micro/src` change. Host targets green (nt-fs **31 -> 33**,
+nt-ntdll 694, nt-process 79, nt-security 47, nt-hive-core 16, nt-hive-regf 5).
+
+## ★ THE PREVIOUS BATCH'S DIAGNOSIS WAS WRONG, AND THE CENSUS SAYS SO
+
+Batch 57 recorded: *"with the profile flow ON, winlogon's post-logon win32k/UI work grows ~2.5x
+(post-failure trace 788 -> 1744 lines) and the boot no longer reaches quiesce inside the ~555 s TCG
+budget"*, and left the flow OFF **for time**. That framing said the boot was doing more work, more
+slowly. It was doing **nothing at all**.
+
+**Measured, host-side.** The serial log was timestamped on the HOST (`perl` prefixing
+`time()-$t0` per line) so the guest's own clock could not be the witness:
+
+| host t | what the boot is doing |
+|---|---|
+| 0 – 310 s | identical to the route-OFF boot up to the profile flow, then the profile flow + its UI |
+| **310 s** | last line: `[win32k-svc] -> SSN 0x1006 (dispatch)` — **no reply** |
+| 310 – 555 s | **ZERO output. 245 seconds of complete silence.** |
+| 555 s | `timeout` kills QEMU, `RUNEXIT=124` |
+
+Line rate per host second went `1683` at t=310 to `0` for the remaining 245 s. That is not a
+throughput collapse; it is a stop. The guest clock was **fine** (host `[0310]` ↔ guest
+`t_ms=305141`), which also disproves the intermediate hypothesis that the HPET had frozen.
+
+## ★ THE BUG: A BLOCKING `NtUserGetMessage` DEADLOCKS THE WHOLE EXECUTIVE
+
+`SSN 0x1006` is `NtUserGetMessage`. win32k is driven **synchronously** by the executive's
+**single-threaded** service loop, so `co_IntGetPeekMessage`'s wait does not block one thread — it
+blocks the entire system, forever. Worse, the loop is then stuck inside `win32k_dispatch`'s recv, so
+the loop-top **wall-clock stall watchdog never runs either** and the boot cannot even quiesce to the
+gate. `RUNEXIT=124` was that, not a budget overrun.
+
+Why it only appeared with the profile flow on: the existing parks for a blocking GetMessage are
+special-cased per window (`sas_hwnd`, the correlated `IDD_LOGON` modal). The profile flow's failure
+puts up a **real userenv MessageBox** ("ReactOS could not load the locally stored user profile"),
+whose modal pump calls GetMessage on a window no special case covers. It was dispatched, and win32k
+sat down for good.
+
+**The fix is NT's own definition of GetMessage — *peek, then wait*.** Before ever letting a blocking
+`NtUserGetMessage` into win32k, the executive dispatches the caller's own arguments through the
+non-blocking `NtUserPeekMessage` with **`PM_NOREMOVE`** (so the message stays queued for the
+GetMessage that follows). A non-empty queue dispatches exactly as before — byte-identical. An EMPTY
+queue — the only case that could hang — takes the established milestone park. It is the LAST arm of
+the existing chain, so it subsumes the special cases rather than competing with them.
+
+One refinement, measured: **whose park ends the boot matters.** Parking winlogon's *worker* badge 13
+and quiescing there CUT `CopyDirectory` OFF MID-TREE, because the profile copy runs on winlogon's
+*main* thread (badge 4). A worker's empty pump now parks the thread and the loop keeps running
+(bounded grace of 3); only the main thread's empty SAS loop is the terminal condition, exactly as
+before.
+
+## The census machinery, extended (it is what made all of this countable)
+
+* the per-badge census now dumps **every 30 s of wall-clock**, not only at quiesce — a boot killed at
+  `RUNEXIT=124` used to produce no census at all;
+* the clock is a **static**, ticked from the win32k dispatch arm too, because that arm runs a
+  **nested pump** (a user callback re-enters the client, whose next win32k syscall is received
+  *inside* the dispatch) and can spend minutes without the loop top being reached;
+* the per-SSN histogram covers the **win32k shadow table** (`0x1000+`) as well as the native one —
+  previously every win32k SSN collapsed into a single "above 512" bucket, so no claim about win32k
+  work was ever measurable;
+* **`W32_SSN_TIME_100NS`** attributes the wall-clock *between* two win32k dispatch entries to the SSN
+  dispatched in between, which is what separates "more calls" from "each call got dearer".
+
+**Where the wall-clock actually goes (final boot, 323.6 s):** `w32-time total_ms=201590` over
+`dispatches=3787` (**avg 53 ms**) — i.e. ~62 % of the boot is inside win32k dispatch. Hottest:
+`0x10fa` NtUserProcessConnect **90.7 s**, `0x10bd` NtUserGetClassInfo **40.8 s**, `0x1058` 22.1 s,
+`0x125a` NtUserInitialize 20.0 s, `0x10b4` NtUserRegisterClassExWOW 10.7 s, `0x11e0` NtGdiInit 3.5 s,
+`0x1006` GetMessage 2.3 s. Per-pi dispatches: winlogon 3540, services 122, lsass 122, csrss 4.
+Nothing pathological: **demand-faults=2** (no fault storm), heap **2250072/6291456 = 36 %** (not near
+the cap), user-callback **pushes 2345 == unwinds 2345** (no leak), timer ticks 3 with **0 spurious**.
+The distribution is flat and proportionate; TCG really is that slow per win32k round-trip. The
+budget was never the problem.
+
+## `PROVISION_DEFAULT_USER_PROFILE = true` — and `CopyDirectory` REALLY RUNS
+
+With the hang gone the profile flow was chased through **four more real bugs**, each MEASURED (a
+new bounded `[profile-frontier]` trace prints winlogon's failing native SSN + NTSTATUS, because
+`userenv` only ever prints `GetLastError()` and several NTSTATUSes collapse onto one DOS error):
+
+1. **`Error: 87` — `NtQueryInformationFile` served exactly ONE information class.**
+   `kernel32!CreateDirectoryExW` queries `FileBasicInformation` (`dir.c:246`) and `FileEaInformation`
+   (`dir.c:381`) on the template directory; both returned `STATUS_INVALID_INFO_CLASS` ⇒
+   ERROR_INVALID_PARAMETER. Both are now encoded honestly: `FileBasicInformation` reports the REAL
+   kind (`FILE_ATTRIBUTE_DIRECTORY` / `_NORMAL`) with zero timestamps (a zero time in that structure
+   means "no value", which is the truth for a volume that does not track them), and
+   `FileEaInformation` reports `EaSize == 0`, which is both true and what makes the caller skip its
+   `NtQueryEaFile` loop. (2 new nt-fs host tests.)
+2. **`Error: 1784` — the writable overlay inherited the isolated-FSD argument-window cap.**
+   `kernel32!CopyLoop` allocates a **64 KiB** copy buffer; `NtReadFile` refused any length above
+   `FSD_ARG_FRAMES * 0x1000` = 16 KiB with `STATUS_INVALID_BUFFER_SIZE` ⇒ ERROR_INVALID_USER_BUFFER.
+   An overlay read/write is served **in-process** from the volume and never crosses that transport,
+   so it no longer inherits its bound (writes get a documented 64 KiB staging bound).
+3. **`Error: 24` — `NtSetInformationFile`'s staging buffer was 32 bytes.**
+   `FILE_BASIC_INFORMATION` is **40**, so `kernel32!SetLastWriteTime` — which every `CopyFileW` ends
+   with — arrived TRUNCATED and the volume correctly rejected it `STATUS_INFO_LENGTH_MISMATCH` ⇒
+   ERROR_BAD_LENGTH, *after* the file's bytes had already been copied. Buffer is now 64.
+4. **A latent EXECUTIVE STACK OVERFLOW, found by a control experiment.** `NtAllocateVirtualMemory` /
+   `NtFreeVirtualMemory` took **two whole-`VmRegionMap` copies onto the stack** per call. Raising
+   `VM_REGION_CAPACITY` 64 -> 256 to test the VAD hypothesis instantly killed the boot with a
+   `#PF err=6` in the executive one page past `.bss` — the rootserver stack floats immediately after
+   the loaded image. Both snapshots now live in **static** scratch, so the frame cost is a pointer.
+   (The VAD hypothesis itself was FALSIFIED — see the frontier below — and the capacity is back at
+   64, with the measurement recorded so nobody re-tries it.)
+
+**What the copy really did** (`exec_winlogon_profile_copied`, asserted by CONTENT and STRUCTURE):
+`CopyDirectory` created **20 subdirectories** below `C:\Profiles\Administrator` — `NetHood`,
+`My Pictures`, `My Music`, `PrintHood`, `Local Settings\{Temporary Internet Files, Application Data,
+History}`, `Start Menu\Programs\{StartUp, Administrative Tools}`, `Favorites`, `My Documents`,
+`Desktop`, `SendTo`, `Application Data\Microsoft\Internet Explorer\Quick Launch`, … — and **copied 2
+files**, with `C:\Profiles\Administrator\My Documents\livecd_start.cmd` reading back off the LIVE
+writable volume with the ISO source's exact 9 bytes `@start %1`. None of it is fabricated: every
+directory is a real `CreateDirectoryExW` the volume reported `FILE_CREATED`, and the file's bytes
+came through a real `NtReadFile` of the `Default User` original and a real `NtWriteFile`.
+
+## ★ WHERE WINLOGON STOPS NOW (verified, not assumed)
+
+`CopyDirectory` fails at `userenv/directory.c:148` with **`Error: 1450`** (ERROR_NO_SYSTEM_RESOURCES)
+on the file `Application Data\Microsoft\Internet Explorer\Quick Launch\Command Prompt.lnk`. The
+`[profile-frontier]` trace names it exactly: **`winlogon SSN=18 -> status=0xC000009A`** — winlogon's
+`NtAllocateVirtualMemory` of `CopyLoop`'s 64 KiB buffer returns STATUS_INSUFFICIENT_RESOURCES.
+**It is NOT the VAD extent map**: a control boot at `VM_REGION_CAPACITY = 256` produced the *same*
+status at the *same* file with *byte-identical* overlay counters (creates=23 dirs=21 reads=1
+writes=1), so the refusal comes from the frame / page-table commit under `vm_map_private_page`
+(`vm_frame_acquire` → `alloc_frame_r`, or the leaf-PT map) — the executive's boot frame budget, not
+the address-space bookkeeping. That is the next milestone.
+
+Behind it, unchanged and still ahead: `CreateUserProfileW` returns FALSE, `LoadUserProfileW` fails,
+`HandleLogon` takes `goto cleanup`, **`userinit.exe` is NOT spawned**, and `NtLoadKey` (102) /
+`NtUnloadKey` (272) + a `\Registry\User` namespace are still unimplemented (the prototype hive is
+staged in DEFHIVEBUF and waiting). The boot then quiesces at winlogon's main-thread empty SAS
+GetMessage exactly as before, paint 768/768.
+
+## BYPASS (control experiment)
+
+`GET_MESSAGE_EMPTY_QUEUE_GUARD = false` (the one-line kill switch): **248/99 ZERO FAILs at 311 s
+becomes `RUNEXIT=124` at 555 s** — the gate is never reached at all, no summary line is printed, and
+the log's last line is `[win32k-svc] -> SSN 0x1006 (dispatch)` with no reply. That is the whole
+delta, and it is why the guard's spec is counted (`preflight peeks=6`, `empty-queue parks=2`) rather
+than timed: the symptom it removes is a permanent stop, not a slowdown.

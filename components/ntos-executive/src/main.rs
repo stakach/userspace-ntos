@@ -1061,10 +1061,28 @@ pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDO
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
+/// Per-process VAD extents. A real NT process's VAD is an unbounded AVL tree; ours is a fixed slot
+/// array, and `insert` returns STATUS_INSUFFICIENT_RESOURCES once it is full.
+///
+/// ★ BATCH 58 measured this and RULED IT OUT as the `CopyDirectory` frontier. Raised to 256 for a
+/// control boot: `kernel32!CopyLoop`'s `NtAllocateVirtualMemory` still returned
+/// STATUS_INSUFFICIENT_RESOURCES at exactly the same file, with byte-identical overlay counters
+/// (creates=23 dirs=21 reads=1 writes=1), so the map is NOT full — the refusal comes from the frame
+/// / page-table commit below `vm_map_private_page`. Left at 64; the control boot's real finding was
+/// the STACK (see [`VM_MAP_BEFORE`]).
 const VM_REGION_CAPACITY: usize = 64;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
     [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
+/// Read-modify-write scratch for `NtAllocateVirtualMemory` / `NtFreeVirtualMemory`. A whole
+/// `VmRegionMap` is KILOBYTES, and the executive's rootserver stack floats immediately after its
+/// loaded image — two on-stack copies per call overflowed it into the guard page as soon as
+/// [`VM_REGION_CAPACITY`] grew. Static (the executive is single-threaded and neither snapshot
+/// outlives its call), so the frame cost is a pointer.
+pub(crate) static mut VM_MAP_BEFORE: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
+    nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+pub(crate) static mut VM_MAP_AFTER: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
+    nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
 const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
 static mut PROCESS_VM_PT_CAPS: [[u64; PRIVATE_VM_PT_COUNT]; MAX_PI] =
     [[0; PRIVATE_VM_PT_COUNT]; MAX_PI];
@@ -2806,6 +2824,80 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     );
     unsafe { default_user_profile_spec(passed) };
     winlogon_profile_directories_spec(passed);
+    unsafe { winlogon_profile_copied_spec(passed) };
+    get_message_guard_spec(passed);
+}
+
+/// ═══ `CopyDirectory` REALLY RAN — the profile tree was COPIED, not just created ═════════════════
+///
+/// `userenv!CreateUserProfileExW` seeds a new profile by calling
+/// `CopyDirectory(C:\Profiles\<user>, C:\Profiles\Default User)` (`profile.c:1000`), which
+/// `FindFirstFileW`s the source, `CreateDirectoryExW`s every subdirectory and `CopyFileW`s every
+/// file, recursing. Before this batch it returned at its FIRST `CreateDirectoryExW` with
+/// `Error: 87`, because `NtQueryInformationFile` served exactly ONE information class.
+///
+/// The proof here is by CONTENT and by STRUCTURE, never by non-failure:
+///   * the DESTINATION copy of a real ISO file reads back off the LIVE writable volume with the
+///     source's exact 9 bytes — `CopyFileW` genuinely read the `Default User` original and wrote
+///     those bytes into `C:\Profiles\<user>\My Documents\livecd_start.cmd`;
+///   * the destination subdirectories BELOW `C:\Profiles\<user>` can only come from
+///     `CopyDirectory`'s recursion (winlogon itself creates only the root and the per-user
+///     directory, which the sibling spec already accounts for);
+///   * and it happened off the REAL interactive logon, under the SID `NtCreateToken` minted.
+unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
+    use crate::writable_fs::*;
+    let dirs = PROFILE_COPY_DIRS.load(Ordering::Relaxed);
+    let files = PROFILE_COPY_FILES.load(Ordering::Relaxed);
+    let content_ok = copied_profile_probe_ok();
+    print_str(b"[wl-profile-copy] CopyDirectory: subdirectories created=");
+    print_u64(dirs);
+    print_str(b" files copied=");
+    print_u64(files);
+    print_str(b" destination-content-matches-source=");
+    print_u64(content_ok as u64);
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_profile_copied",
+        // Only meaningful when the profile source is really provisioned; with the route off the
+        // copy has nothing to copy and the spec must not pretend otherwise.
+        !PROVISION_DEFAULT_USER_PROFILE
+            || (dirs >= 15
+                && files >= 1
+                && content_ok
+                && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
+                && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1),
+        passed,
+    );
+}
+
+/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD IS LIVE, AND IT REALLY FIRED ═════════════════════════
+///
+/// This is the batch's PERFORMANCE guard, and it is counted rather than timed on purpose: the
+/// symptom it prevents is not "slow", it is a PERMANENT stop. win32k is driven synchronously by the
+/// executive's single-threaded service loop, so `co_IntGetPeekMessage` waiting for a message that
+/// nobody can post blocks the entire system — including the loop-top wall-clock stall watchdog, so
+/// the boot cannot even quiesce to this gate (measured: output ceases at t=310 s and the harness
+/// kills QEMU at 555 s, `RUNEXIT=124`).
+///
+/// `PREFLIGHT_PEEKS >= 1` proves the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` really runs
+/// ahead of every blocking GetMessage; `EMPTY_QUEUE_PARKS >= 1` proves it really caught a call that
+/// would have blocked forever and parked the caller instead. The fact that this spec RUNS AT ALL is
+/// the other half of the proof — with the guard bypassed the gate is never reached.
+fn get_message_guard_spec(passed: &mut u64) {
+    let peeks = GET_MESSAGE_PREFLIGHT_PEEKS.load(Ordering::Relaxed);
+    let parks = GET_MESSAGE_EMPTY_QUEUE_PARKS.load(Ordering::Relaxed);
+    print_str(b"[wl-getmessage] preflight PeekMessage(PM_NOREMOVE) calls=");
+    print_u64(peeks);
+    print_str(b" empty-queue parks (hangs prevented)=");
+    print_u64(parks);
+    print_str(b" guard=");
+    print_u64(GET_MESSAGE_EMPTY_QUEUE_GUARD as u64);
+    print_str(b"\n");
+    check(
+        b"exec_win32k_blocking_getmessage_guarded",
+        !GET_MESSAGE_EMPTY_QUEUE_GUARD || (peeks >= 1 && parks >= 1 && peeks >= parks),
+        passed,
+    );
 }
 
 /// ═══ THE PROFILE SOURCE — the ISO's OWN `Profiles/` TREE, WHICH OUR STAGING WAS DROPPING ══════
@@ -3844,14 +3936,34 @@ pub(crate) static BADGE_TIME_100NS: [AtomicU64; BADGE_CENSUS_N] =
     [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
 /// Per-SSN histogram for lsass (pi 4) — the whole process, all its badges. A BOUNDED unit of work
 /// shows a flat spread of distinct SSNs; a POLL / RETRY LIVELOCK shows one or two SSNs with counts
-/// in the thousands. `SSN_HIST_N` covers the whole Win7 x64 SSN space; anything above lands in the
-/// last bucket.
-pub(crate) const SSN_HIST_N: usize = 512;
+/// in the thousands.
+///
+/// ★ BATCH 58: the histogram covers BOTH service tables. The low 1024 buckets are the NATIVE SSN
+/// space (`ntdll`, `0x000..0x3FF`); the high 1024 are the **win32k SHADOW table** (`0x1000+`, which
+/// used to collapse into a single "everything above 512" bucket and so could never show which
+/// win32k service was hot). `ssn_bucket` does the mapping and [`print_ssn_hist`] prints the shadow
+/// buckets back as their real `0x1xxx` SSN.
+pub(crate) const SSN_HIST_NATIVE: usize = 1024;
+pub(crate) const SSN_HIST_N: usize = 2048;
 pub(crate) static LSASS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
 /// Same histogram for winlogon (pi 2) — the process whose forward progress the paint depends on.
 pub(crate) static WINLOGON_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// …and for csrss (pi 1), the process the previous batch's failing boot accused of "looping in
+/// win32k user-callbacks". An accusation is only worth anything with the histogram behind it.
+pub(crate) static CSRSS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Map a system-service number to its histogram bucket: native table low, win32k shadow table high.
+pub(crate) fn ssn_bucket(ssn: u64) -> usize {
+    if ssn < SSN_HIST_NATIVE as u64 {
+        ssn as usize
+    } else if (0x1000..0x1000 + SSN_HIST_NATIVE as u64).contains(&ssn) {
+        SSN_HIST_NATIVE + (ssn - 0x1000) as usize
+    } else {
+        SSN_HIST_N - 1
+    }
+}
 /// Wall-clock (100ns) of the LAST service-loop event for each badge, so the census can say how long
 /// before the quiesce each badge was last able to run.
 pub(crate) static BADGE_LAST_T: [AtomicU64; BADGE_CENSUS_N] =
@@ -3881,12 +3993,224 @@ pub(crate) static LAST_REARM_SOURCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_TARGET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_NOW: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
-/// Print the census. Called once, after the loop quiesces, from the spec runner.
-pub(crate) fn print_progress_census() {
-    let quiesce_t = monotonic_time_100ns();
-    print_str(b"[census] quiesce_t_ms=");
-    print_u64(quiesce_t / 10_000);
+/// ═══ PERIODIC CENSUS (batch 58) ══════════════════════════════════════════════════════════════
+///
+/// [`print_progress_census`] only ever ran AFTER the loop quiesced — which is exactly the boot that
+/// does NOT need diagnosing. A boot that blows the TCG budget (`RUNEXIT=124`) is killed before the
+/// gate runs, so it produced no census at all and every claim about "where the time went" was a
+/// guess. The service loop now dumps the same census every [`CENSUS_PERIOD_100NS`] of wall-clock,
+/// so a NON-quiescing boot still says who spent the seconds — and the successive dumps make a
+/// runaway visible as a RATE, not just a total.
+pub(crate) const CENSUS_PERIOD_100NS: u64 = 30 * 10_000_000; // 30 s
+pub(crate) static CENSUS_PERIODIC_DUMPS: AtomicU64 = AtomicU64::new(0);
+/// The last dump's timestamp, as a STATIC rather than a service-loop local: the win32k dispatch arm
+/// runs a NESTED pump (a user callback re-enters the client, whose next win32k syscall is received
+/// inside the dispatch, not at the loop top), so a burst of nested callbacks can spend MINUTES
+/// without the main loop top ever being reached — which is exactly why the previous batch's failing
+/// boot produced no census at all past its 6th dump. The dispatch arm ticks the same clock.
+pub(crate) static CENSUS_LAST_DUMP: AtomicU64 = AtomicU64::new(0);
+
+/// ═══ PER-SSN WIN32K WALL-CLOCK ═══════════════════════════════════════════════════════════════
+///
+/// Counts alone cannot separate "the flow issued MORE win32k calls" from "each win32k call became
+/// MORE EXPENSIVE" — and those two have completely different fixes. `W32_SSN_TIME_100NS`
+/// attributes the wall-clock between two consecutive win32k dispatch ENTRIES to the SSN that was
+/// dispatched in between (the same technique the per-badge census uses at the loop top), which is
+/// correct under nesting: an SSN that re-enters simply keeps accruing until the next entry.
+pub(crate) static W32_SSN_TIME_100NS: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+static W32_PREV_T: AtomicU64 = AtomicU64::new(0);
+static W32_PREV_BUCKET: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Total win32k dispatch entries and the wall-clock they span, so an average per-dispatch cost is
+/// directly readable and a per-dispatch REGRESSION (rather than a work increase) is unmistakable.
+pub(crate) static W32_DISPATCH_SPAN_100NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static W32_DISPATCH_SPANNED: AtomicU64 = AtomicU64::new(0);
+
+/// ═══ THE BLOCKING-`NtUserGetMessage` GUARD ═══════════════════════════════════════════════════
+///
+/// `PREFLIGHT_PEEKS` counts the non-blocking `NtUserPeekMessage(PM_NOREMOVE)` the executive issues
+/// before ever letting a blocking `NtUserGetMessage` into win32k; `EMPTY_QUEUE_PARKS` counts the
+/// times that peek came back EMPTY and the caller was parked instead. Every one of those parks is a
+/// PERMANENT system-wide hang that did not happen: win32k is driven synchronously by the
+/// single-threaded service loop, so `co_IntGetPeekMessage`'s wait would stop the whole boot AND the
+/// loop-top stall watchdog with it (measured: silent from t=310 s to the 555 s kill, `RUNEXIT=124`).
+pub(crate) static PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
+/// The guard's kill switch — the BYPASS control. `false` restores the pre-batch behaviour exactly
+/// (a blocking `NtUserGetMessage` is dispatched straight into win32k), which is a permanent
+/// system-wide hang the moment one finds an empty queue.
+pub(crate) const GET_MESSAGE_EMPTY_QUEUE_GUARD: bool = true;
+pub(crate) static GET_MESSAGE_PREFLIGHT_PEEKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GET_MESSAGE_EMPTY_QUEUE_PARKS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a win32k dispatch entry for the census, and tick the periodic dump from inside the
+/// nested pump. Called from the SSN >= 0x1000 arm of the service loop.
+pub(crate) fn w32_census_enter(ssn: u64) {
+    let now = monotonic_time_100ns();
+    let prev = W32_PREV_BUCKET.load(Ordering::Relaxed);
+    if prev != u64::MAX {
+        let delta = now.wrapping_sub(W32_PREV_T.load(Ordering::Relaxed));
+        W32_SSN_TIME_100NS[prev as usize].fetch_add(delta, Ordering::Relaxed);
+        W32_DISPATCH_SPAN_100NS.fetch_add(delta, Ordering::Relaxed);
+        W32_DISPATCH_SPANNED.fetch_add(1, Ordering::Relaxed);
+    }
+    W32_PREV_BUCKET.store(ssn_bucket(ssn) as u64, Ordering::Relaxed);
+    W32_PREV_T.store(now, Ordering::Relaxed);
+    // ★ A COUNT-triggered heartbeat as well as the wall-clock one. A wall-clock-only dump cannot
+    // distinguish "no dispatches happened" from "the CLOCK stopped" — and the whole quiesce
+    // watchdog is wall-clock based, so a stopped clock is precisely the failure that would make a
+    // boot un-quiescable. Printing the RAW HPET counter next to the derived ms settles it.
+    let n = W32_DISPATCH_SPANNED.load(Ordering::Relaxed);
+    if n % 128 == 0 {
+        let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
+        let raw = if period != 0 {
+            unsafe {
+                core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64)
+            }
+        } else {
+            0
+        };
+        print_str(b"[w32-clock] dispatches=");
+        print_u64(n);
+        print_str(b" t_ms=");
+        print_u64(now / 10_000);
+        print_str(b" hpet=");
+        print_u64(raw);
+        print_str(b" period_fs=");
+        print_u64(period);
+        print_str(b"\n");
+    }
+    census_tick_static(now);
+}
+
+/// Dump the census if the period has elapsed, using the shared static clock.
+pub(crate) fn census_tick_static(now: u64) {
+    let last = CENSUS_LAST_DUMP.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < CENSUS_PERIOD_100NS {
+        return;
+    }
+    CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
+    let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[census] ---- periodic dump #");
+    print_u64(n);
+    print_str(b" ----\n");
+    print_census_badges();
+    print_census_counters(b"periodic");
+    print_ssn_hist(b"winlogon", unsafe {
+        &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
+    });
+    print_ssn_hist(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
+    print_ssn_hist(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
+    print_w32_ssn_time();
+}
+
+/// The 16 win32k SSNs that cost the most WALL-CLOCK (ms), plus the average per dispatch.
+pub(crate) fn print_w32_ssn_time() {
+    let span = W32_DISPATCH_SPAN_100NS.load(Ordering::Relaxed);
+    let n = W32_DISPATCH_SPANNED.load(Ordering::Relaxed);
+    print_str(b"[census] w32-time total_ms=");
+    print_u64(span / 10_000);
+    print_str(b" dispatches=");
+    print_u64(n);
+    print_str(b" avg_us=");
+    print_u64(if n == 0 { 0 } else { span / 10 / n });
+    print_str(b" top_ms:");
+    let mut taken = [false; SSN_HIST_N];
+    for _ in 0..16 {
+        let mut best = usize::MAX;
+        let mut best_n = 0u64;
+        for (bucket, cell) in unsafe { &*core::ptr::addr_of!(W32_SSN_TIME_100NS) }
+            .iter()
+            .enumerate()
+        {
+            let v = cell.load(Ordering::Relaxed);
+            if !taken[bucket] && v > best_n {
+                best_n = v;
+                best = bucket;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        let ssn = if best < SSN_HIST_NATIVE {
+            best as u32
+        } else {
+            0x1000 + (best - SSN_HIST_NATIVE) as u32
+        };
+        print_str(b" ");
+        print_hex(ssn);
+        print_str(b"=");
+        print_u64(best_n / 10_000);
+    }
     print_str(b"\n");
+}
+
+/// The operation classes the profile flow was suspected of multiplying. Printed with every census
+/// dump so a per-operation cost (and a runaway RATE) can be computed from any two dumps.
+pub(crate) fn print_census_counters(tag: &[u8]) {
+    let (_, _, _, redirects, returns, pushes, unwinds, nested, _, _, seq) =
+        win32k_glue::user_callback_proofs();
+    print_str(b"[census] ");
+    print_str(tag);
+    print_str(b" t_ms=");
+    print_u64(monotonic_time_100ns() / 10_000);
+    print_str(b" demand-faults=");
+    print_u64(DEMAND_FAULTS.load(Ordering::Relaxed));
+    print_str(b" heap=");
+    print_u64(allocator::mark() as u64);
+    print_str(b"/");
+    print_u64(allocator::HEAP_FRAMES * 0x1000);
+    print_str(b" ucb-redirects=");
+    print_u64(redirects);
+    print_str(b" ucb-returns=");
+    print_u64(returns);
+    print_str(b" ucb-pushes=");
+    print_u64(pushes);
+    print_str(b" ucb-unwinds=");
+    print_u64(unwinds);
+    print_str(b" ucb-nested=");
+    print_u64(nested);
+    print_str(b" ucb-seq=");
+    print_u64(seq);
+    print_str(b" pipe-parked=");
+    print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
+    print_str(b" pipe-woken=");
+    print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
+    print_str(b" w32-dispatch/pi=");
+    for pi in 0..MAX_PI {
+        if pi != 0 {
+            print_str(b",");
+        }
+        print_u64(W32_TOTAL_DISPATCH[pi].load(Ordering::Relaxed));
+    }
+    print_str(b"\n[census] ");
+    print_str(tag);
+    print_str(b" overlay creates=");
+    print_u64(writable_fs::OVERLAY_CREATES.load(Ordering::Relaxed));
+    print_str(b" opens=");
+    print_u64(writable_fs::OVERLAY_OPENS.load(Ordering::Relaxed));
+    print_str(b" dirs=");
+    print_u64(writable_fs::OVERLAY_DIRS_CREATED.load(Ordering::Relaxed));
+    print_str(b" reads=");
+    print_u64(writable_fs::OVERLAY_READS.load(Ordering::Relaxed));
+    print_str(b" writes=");
+    print_u64(writable_fs::OVERLAY_WRITES.load(Ordering::Relaxed));
+    print_str(b" dir-queries=");
+    print_u64(writable_fs::OVERLAY_DIR_QUERIES.load(Ordering::Relaxed));
+    print_str(b" dir-entries=");
+    print_u64(writable_fs::OVERLAY_DIR_ENTRIES.load(Ordering::Relaxed));
+    print_str(b" attr-queries=");
+    print_u64(writable_fs::OVERLAY_ATTR_QUERIES.load(Ordering::Relaxed));
+    print_str(b" set-info=");
+    print_u64(writable_fs::OVERLAY_SET_INFO.load(Ordering::Relaxed));
+    print_str(b" closes=");
+    print_u64(writable_fs::OVERLAY_CLOSES.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
+/// The per-badge table — factored out of [`print_progress_census`] so the periodic dump prints the
+/// identical thing.
+fn print_census_badges() {
     for badge in 0..BADGE_CENSUS_N {
         let events = BADGE_EVENTS[badge].load(Ordering::Relaxed);
         if events == 0 {
@@ -3902,6 +4226,16 @@ pub(crate) fn print_progress_census() {
         print_u64(BADGE_LAST_T[badge].load(Ordering::Relaxed) / 10_000);
         print_str(b"\n");
     }
+}
+
+/// Print the census. Called once, after the loop quiesces, from the spec runner.
+pub(crate) fn print_progress_census() {
+    let quiesce_t = monotonic_time_100ns();
+    print_str(b"[census] quiesce_t_ms=");
+    print_u64(quiesce_t / 10_000);
+    print_str(b"\n");
+    print_census_counters(b"final");
+    print_census_badges();
     print_str(b"[census] timer ticks-seen=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b" spurious=");
@@ -3915,35 +4249,54 @@ pub(crate) fn print_progress_census() {
     print_ssn_hist(b"winlogon", unsafe {
         &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
     });
+    print_ssn_hist(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
+    print_w32_ssn_time();
 }
-/// Print the 12 hottest SSNs of a histogram (selection sort over the buckets — no alloc).
+/// Print the 16 hottest SSNs of a histogram (selection sort over the buckets — no alloc), with the
+/// native / win32k-shadow split totalled separately so "which TABLE is the boot spending itself in"
+/// is answerable at a glance. Shadow buckets print as their real `0x1xxx` SSN.
 fn print_ssn_hist(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
-    let mut total = 0u64;
-    for bucket in hist.iter() {
-        total += bucket.load(Ordering::Relaxed);
+    let mut native = 0u64;
+    let mut shadow = 0u64;
+    for (bucket, cell) in hist.iter().enumerate() {
+        let n = cell.load(Ordering::Relaxed);
+        if bucket < SSN_HIST_NATIVE {
+            native += n;
+        } else {
+            shadow += n;
+        }
     }
     print_str(b"[census] ssn-hist ");
     print_str(who);
     print_str(b" total=");
-    print_u64(total);
+    print_u64(native + shadow);
+    print_str(b" native=");
+    print_u64(native);
+    print_str(b" win32k=");
+    print_u64(shadow);
     print_str(b" top:");
     let mut taken = [false; SSN_HIST_N];
-    for _ in 0..12 {
+    for _ in 0..16 {
         let mut best = usize::MAX;
         let mut best_n = 0u64;
-        for (ssn, bucket) in hist.iter().enumerate() {
-            let n = bucket.load(Ordering::Relaxed);
-            if !taken[ssn] && n > best_n {
+        for (bucket, cell) in hist.iter().enumerate() {
+            let n = cell.load(Ordering::Relaxed);
+            if !taken[bucket] && n > best_n {
                 best_n = n;
-                best = ssn;
+                best = bucket;
             }
         }
         if best == usize::MAX {
             break;
         }
         taken[best] = true;
-        print_str(b" 0x");
-        print_hex(best as u32);
+        let ssn = if best < SSN_HIST_NATIVE {
+            best as u32
+        } else {
+            0x1000 + (best - SSN_HIST_NATIVE) as u32
+        };
+        print_str(b" ");
+        print_hex(ssn);
         print_str(b"=");
         print_u64(best_n);
     }

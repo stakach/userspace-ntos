@@ -2883,8 +2883,16 @@ impl ExecNtHandler {
         let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
             as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
             .add(target_pi);
-        let before = core::ptr::read(vm_map);
-        let mut after = before;
+        // ★ The before/after snapshots live in STATIC scratch, never on the stack. The executive's
+        // rootserver stack floats immediately after its loaded image and is only a few pages; a
+        // whole `VmRegionMap` is kilobytes, so taking two copies per call overflowed straight into
+        // the guard page the moment [`VM_REGION_CAPACITY`] was raised (measured: a `#PF err=6` in
+        // the executive at `.bss_end + 0x898`, one page past the mapped image, during smss' spawn).
+        // Single-threaded executive, and neither scratch outlives this call.
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = core::ptr::read(vm_map);
+        *after = *before;
         let plan = match after.free(base, size, free_type) {
             Ok(plan) => plan,
             Err(status) => return status,
@@ -2901,7 +2909,7 @@ impl ExecNtHandler {
             }
             page += 0x1000;
         }
-        core::ptr::write(vm_map, after);
+        core::ptr::write(vm_map, *after);
         let _ = self.xas_write_u64(size_ptr, plan.size);
         let _ = self.xas_write_u64(base_ptr, plan.base);
         0
@@ -9709,7 +9717,9 @@ impl ExecNtHandler {
                 let output = args[2];
                 let length = args[3] as usize;
                 let class = args[4] as u32;
-                let mut encoded = [0u8; 24];
+                // 40 = the largest class this encoder produces (FILE_BASIC_INFORMATION); it was 24
+                // when FILE_STANDARD_INFORMATION was the only one supported.
+                let mut encoded = [0u8; 40];
                 let encoded_capacity = encoded.len();
                 let required = match nt_fs::encode_query_information(
                     class,
@@ -9903,8 +9913,11 @@ impl ExecNtHandler {
                 let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
                     as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
                     .add(target_pi);
-                let before = core::ptr::read(vm_map);
-                let mut after = before;
+                // STATIC scratch, not stack — see the matching note in the free path.
+                let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+                let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+                *before = core::ptr::read(vm_map);
+                *after = *before;
                 let plan = match after.allocate_below(
                     (base_in != 0).then_some(base_in),
                     want,
@@ -10011,7 +10024,7 @@ impl ExecNtHandler {
                     }
                     return map_status;
                 }
-                core::ptr::write(vm_map, after);
+                core::ptr::write(vm_map, *after);
                 let size_written = self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes());
                 let base_written = self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes());
                 if !created_vad && (!size_written || !base_written) {
@@ -10474,6 +10487,10 @@ impl ExecNtHandler {
                         } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
                             crate::writable_fs::note_directory_create(self.pi, &relative, false);
                         }
+                    } else if status == nt_fs::STATUS_SUCCESS
+                        && info == nt_fs::FILE_CREATED as u64
+                    {
+                        crate::writable_fs::note_profile_file_create(self.pi, &relative);
                     }
                     if let Some(file_id) = file_id {
                         match self.mint_overlay_file_handle(file_id, args[1] as u32) {
@@ -10519,7 +10536,7 @@ impl ExecNtHandler {
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                 }
                 if self.pi == 2
-                    && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8
+                    && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 40
                 {
                     print_str(b"[nt-create-file-winlogon] status=0x"); print_hex(status);
                     print_str(b" info="); print_u64(info);
@@ -10557,10 +10574,20 @@ impl ExecNtHandler {
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
-                let mut payload = alloc::vec![0u8; len.min(transport_capacity)];
+                // The writable overlay is served IN-PROCESS from the volume and never crosses the
+                // isolated-FSD argument window, so it is not bounded by it (see the matching note
+                // on `NtReadFile`). It gets a copy-chunk-sized staging bound instead — exactly the
+                // 64 KiB buffer `kernel32!CopyLoop` allocates.
+                const OVERLAY_IO_CAP: usize = 64 * 1024;
+                let write_capacity = if self.overlay_file_id_for(fh).is_some() {
+                    OVERLAY_IO_CAP
+                } else {
+                    transport_capacity
+                };
+                let mut payload = alloc::vec![0u8; len.min(write_capacity)];
                 let payload_ok = len == 0
                     || (buffer != 0
-                        && len <= transport_capacity
+                        && len <= write_capacity
                         && self.xas_read(buffer, &mut payload));
 
                 let completion_event = self.validate_io_event(event);
@@ -10571,7 +10598,7 @@ impl ExecNtHandler {
                 let mut async_file_retained = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if len > transport_capacity {
+                } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
@@ -10867,8 +10894,20 @@ impl ExecNtHandler {
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
+                // ★ THE WRITABLE OVERLAY IS NOT ON THE FSD TRANSPORT. `transport_capacity` is the
+                // isolated-FSD argument window (4 frames = 16 KiB); an overlay read is served
+                // in-process from the volume into its OWN buffer and never crosses it, so it must
+                // not inherit that cap — and it needs no `output` staging buffer at all.
+                // MEASURED (batch 58): `kernel32!CopyLoop` allocates a **64 KiB** copy buffer and
+                // issues `NtReadFile(len = 0x10000)`, which this arm refused with
+                // STATUS_INVALID_BUFFER_SIZE => `GetLastError() == 1784` (ERROR_INVALID_USER_BUFFER)
+                // — the wall `CopyDirectory` hit at `userenv/directory.c:148` after creating the
+                // whole destination tree and opening BOTH files.
+                let overlay_file = self.overlay_file_id_for(fh);
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) {
                     len.min(16 * 1024 * 1024)
+                } else if overlay_file.is_some() {
+                    0
                 } else {
                     len.min(transport_capacity)
                 };
@@ -10880,7 +10919,10 @@ impl ExecNtHandler {
                 let mut async_file_retained = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !matches!(disk_file, Ok(Some(_))) && len > transport_capacity {
+                } else if !matches!(disk_file, Ok(Some(_)))
+                    && overlay_file.is_none()
+                    && len > transport_capacity
+                {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
@@ -11167,7 +11209,13 @@ impl ExecNtHandler {
                 let sp = get_recv_mr(16);
                 let information_class = smss_stack_read(sp + 0x28) as u32;
                 let length = args[3] as usize;
-                let mut payload = [0u8; 32];
+                // ★ 64, not 32. The staging buffer TRUNCATES the caller's structure to its own
+                // size, so a 40-byte `FILE_BASIC_INFORMATION` (the class `kernel32!SetLastWriteTime`
+                // uses at the end of every `CopyFileW`) arrived as 32 bytes and the volume
+                // correctly rejected it with STATUS_INFO_LENGTH_MISMATCH => `GetLastError() == 24`
+                // (ERROR_BAD_LENGTH) — measured as the wall `CopyDirectory` hit at
+                // `userenv/directory.c:148` AFTER the file's bytes had already been copied.
+                let mut payload = [0u8; 64];
                 let payload_len = length.min(payload.len());
                 let payload_ok = payload_len == 0 || self.xas_read(args[2], &mut payload[..payload_len]);
                 if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {

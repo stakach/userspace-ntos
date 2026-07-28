@@ -35,6 +35,63 @@ fn query_information_rejects_bad_contracts_without_mutating_output() {
     );
     assert_eq!(&output, &[0xCC; 40]);
 }
+/// `kernel32!CreateDirectoryExW` queries the TEMPLATE directory's `FileBasicInformation` and hands
+/// the attributes it reads straight to the `NtCreateFile` that makes the copy, so the class has to
+/// exist AND report the real kind. Serving only `FileStandardInformation` made every
+/// `CreateDirectoryExW` fail STATUS_INVALID_INFO_CLASS => `GetLastError() == 87`.
+#[test]
+fn query_information_encodes_basic_information_attributes_by_kind() {
+    let mut output = [0xCC; 48];
+    let directory = QueryMetadata {
+        directory: true,
+        ..QueryMetadata::default()
+    };
+    assert_eq!(
+        encode_query_information(FILE_BASIC_INFORMATION, directory, &mut output),
+        Ok(40)
+    );
+    // The four timestamps are "no value" (0); the attributes say DIRECTORY.
+    assert_eq!(&output[..32], &[0u8; 32]);
+    assert_eq!(u32::from_le_bytes(output[32..36].try_into().unwrap()), 0x10);
+    // …and the bytes past the structure are untouched.
+    assert_eq!(&output[40..], &[0xCC; 8]);
+
+    let file = QueryMetadata::default();
+    assert_eq!(
+        encode_query_information(FILE_BASIC_INFORMATION, file, &mut output),
+        Ok(40)
+    );
+    assert_eq!(u32::from_le_bytes(output[32..36].try_into().unwrap()), 0x80);
+
+    // A caller that offers less than the structure is refused, not truncated.
+    assert_eq!(
+        encode_query_information(FILE_BASIC_INFORMATION, file, &mut output[..39]),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
+/// `FileEaInformation` is the second class `CreateDirectoryExW` needs. A volume with no extended
+/// attributes must answer `EaSize == 0` — which is both true and what makes the caller SKIP its
+/// `NtQueryEaFile` loop rather than fail.
+#[test]
+fn query_information_encodes_zero_ea_size() {
+    let mut output = [0xCC; 8];
+    assert_eq!(
+        encode_query_information(FILE_EA_INFORMATION, QueryMetadata::default(), &mut output),
+        Ok(4)
+    );
+    assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 0);
+    assert_eq!(&output[4..], &[0xCC; 4]);
+    assert_eq!(
+        encode_query_information(
+            FILE_EA_INFORMATION,
+            QueryMetadata::default(),
+            &mut output[..3]
+        ),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
 use core::cell::RefCell;
 use nt_hive_core::{HiveKind, HiveLogOp, HiveManager, RegistryValueType};
 
