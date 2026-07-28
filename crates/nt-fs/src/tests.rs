@@ -515,3 +515,88 @@ fn writable_volume_rejects_a_create_whose_parent_is_missing() {
     assert_eq!(r.status, STATUS_OBJECT_PATH_NOT_FOUND);
     assert_eq!(r.handle, INVALID_HANDLE);
 }
+
+/// PROVISIONING a file (the content an installed volume already carries) creates every missing
+/// directory above it, is reachable through the ORDINARY by-path surface, enumerates as a normal
+/// child of its parent, and reads back byte-identical through `ZwReadFile`.
+#[test]
+fn provisioned_file_is_a_real_enumerable_file() {
+    const HIVE: &[u8] = b"regf\x02\x00\x00\x00 default-hive body";
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", HIVE));
+    // (1) The parent chain really exists, as DIRECTORIES.
+    for dir in [r"\??\C:\profiles", r"\??\C:\profiles\Default User"] {
+        let info = fs.query_attributes(dir).expect("provisioned parent");
+        assert!(info.is_directory);
+    }
+    // (2) The leaf is a FILE with the right size, by path, with no handle.
+    let info = fs.query_attributes(r"\??\C:\profiles\Default User\ntuser.dat").unwrap();
+    assert!(!info.is_directory);
+    assert_eq!(info.end_of_file, HIVE.len() as u64);
+    // (3) It borrows back in place, byte-identical.
+    assert_eq!(fs.file_bytes(r"\??\C:\profiles\Default User\ntuser.dat"), Some(HIVE));
+    // (4) An ordinary open + read returns the same bytes.
+    let f = fs.zw_create_file(
+        r"\??\C:\profiles\Default User\ntuser.dat",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(f.status, STATUS_SUCCESS);
+    assert_eq!(f.information, FILE_OPENED);
+    let (status, bytes) = fs.zw_read_file(f.handle, Some(0), HIVE.len());
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(bytes, HIVE);
+    fs.zw_close(f.handle);
+    // (5) …and it ENUMERATES as a normal child of its directory (`.`, `..`, ntuser.dat).
+    let dir = fs.zw_create_file(
+        r"\??\C:\profiles\Default User",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    let mut out = [0u8; 512];
+    let r = fs.zw_query_directory_file(dir.handle, FILE_DIRECTORY_INFORMATION, false, None, true, &mut out);
+    assert_eq!(r.status, STATUS_SUCCESS);
+    let mut names = alloc::vec::Vec::new();
+    let mut off = 0usize;
+    loop {
+        let next = u32::from_le_bytes(out[off..off + 4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(out[off + 60..off + 64].try_into().unwrap()) as usize;
+        let name: alloc::string::String = out[off + 64..off + 64 + name_len]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as u8 as char)
+            .collect();
+        names.push(name);
+        if next == 0 {
+            break;
+        }
+        off += next;
+    }
+    assert_eq!(names, [".", "..", "ntuser.dat"]);
+    fs.zw_close(dir.handle);
+}
+
+/// Provisioning REPLACES an existing file's bytes exactly (no append, no stale tail), refuses a
+/// path that names a directory, and refuses a path off this volume. `file_bytes` misses honestly.
+#[test]
+fn provisioning_replaces_bytes_and_refuses_non_files() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", b"0123456789"));
+    assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", b"abc"));
+    assert_eq!(fs.file_bytes(r"\??\C:\profiles\Default User\ntuser.dat"), Some(&b"abc"[..]));
+    assert_eq!(
+        fs.query_attributes(r"\??\C:\profiles\Default User\ntuser.dat").unwrap().end_of_file,
+        3
+    );
+    // A directory is not a file.
+    assert!(!fs.provision_file(r"\??\C:\profiles\Default User", b"x"));
+    assert_eq!(fs.file_bytes(r"\??\C:\profiles\Default User"), None);
+    // A path that never resolved is an honest miss.
+    assert_eq!(fs.file_bytes(r"\??\C:\profiles\nope.dat"), None);
+}

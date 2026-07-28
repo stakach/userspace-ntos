@@ -5416,3 +5416,124 @@ timestamp update on close, and write ordering through the isolated storage host.
 (`exec_writable_overlay_mounted`, `exec_winlogon_profile_directories_created`),
 `profile.c:933  Error: 1` returns, and every overlay counter goes to 0 (mounted 1 -> 0, selftest
 0x1FF -> 0x000, dirs 2 -> 0, attr-queries 1 -> 0). Paint stays 768/768; every other spec stays green.
+
+---
+
+# BATCH 57 — the ISO's OWN `Profiles/` TREE (a real STAGING GAP), + three enumeration bugs
+
+Gate **245 -> 246/99, ZERO FAILs**, RUNEXIT=3, `microtest sentinel`, paint **768/768 @ 0x003a6ea5**,
+`diff`-identical PASS lists across 3 consecutive foreground boots. No `rust-micro/src` change
+(scripts only). Host targets green (nt-fs **29 -> 31**, nt-hive-core 16, nt-hive-regf 5,
+nt-ntdll 694, nt-process 79).
+
+## ★ THE PROFILE TREE WAS NEVER MISSING FROM THE MEDIA — IT WAS MISSING FROM OUR STAGING
+
+The previous batch's frontier read: "our media is a LiveCD extract that carries no profile tree,
+because ReactOS SETUP is what creates one". **That was wrong, and it is worth recording as a
+staging gap rather than an incidental fix.** The ReactOS LiveCD ISO carries a real, complete
+user-profile tree — **76 entries: `Profiles/Default User/…` and `Profiles/All Users/…`** — as a
+**TOP-LEVEL sibling of `reactos/`**. Every extraction in `fetch_reactos.sh` is scoped to `reactos`
+(the curated binaries, then the `.fulltree-ok` recursive `reactos` tree), so `Profiles/` was
+silently dropped and never reached the disk image. `userenv!CreateUserProfileExW` seeds a new
+profile by COPYING `C:\Profiles\Default User` (`profile.c:1000` -> `CopyDirectory`), so the logon
+died at `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) for a tree that was on the ISO all along.
+
+* `fetch_reactos.sh` now extracts it (idempotent, `.profiles-ok` marker) and `make_image.sh` lays it
+  down at **`::Profiles`** — exactly what `%SystemDrive%\Profiles`, i.e. the real SOFTWARE hive's
+  `ProfileList\ProfilesDirectory`, resolves to and where winlogon already creates `C:\Profiles`.
+* Measured on the image, BY PATH through the ordinary read-only FAT reader:
+  `\Profiles\Default User` is a real directory and `\Profiles\Default User\My Documents\
+  livecd_start.cmd` reads back the ISO's exact 9 bytes `@start %1`
+  (`exec_default_user_profile_staged`).
+* The ISO has **no `ntuser.dat` anywhere** (verified). On a real ReactOS the per-user hive is
+  created at first logon by `NtLoadKey`; `\reactos\system32\config\default` (the genuine
+  `$$$PROTO.HIV`, 139264 B) is the prototype, and it is now staged into its own **DEFHIVEBUF**
+  window (40 frames at `0x…10BC_0000`, in the leftover of the shared 0xA0-0xC0 input page table)
+  by the same one-table-entry by-path mechanism as SECURITY/SAM/SOFTWARE. FS-by-path hits 34 -> 35,
+  fallbacks still 0. It is the source `\Registry\User\.Default` will mount.
+
+## Composition with the writable overlay, and why it ships OFF
+
+`C:\Profiles` is a writable-volume prefix (MemFs) while the staged tree is on the read-only FAT
+volume. The chosen composition is **materialise-at-mount** (over a union/read-through layer): on
+first touch the executive walks `\Profiles` off the FAT volume with the same
+`fat_visit_directory`/`dir_find_lfn`/`fat_read_file` reader every hosted binary is loaded with, and
+recreates it — directories AND file bytes — on the writable volume. It leaves ONE code path, so
+`CopyDirectory` enumerates/reads the source and writes the destination with no per-operation layer
+arbitration, and a later FAT32 write-through milestone replaces the backing without touching any of
+it. It works, and was measured working: **dirs=45 files=31 bytes=5307**, `Default User` enumerating
+its real **17** records (`.`, `..` + 15 children) through the same `Zw*` encoder `FindFirstFileW`
+reaches, and a staged file's bytes read back off the live volume.
+
+**It nonetheless ships behind `PROVISION_DEFAULT_USER_PROFILE = false`, and the reason is a measured
+TIME BUDGET, not a defect.** With the tree materialised the `Error: 3` is gone and winlogon's
+profile flow, which used to die at `FindFirstFileW`, runs on — and its post-logon win32k/UI work
+grows ~2.5x (post-failure trace 788 -> 1744 lines). Quiesce moves 282s -> 305s with the tree alone
+(still green); once `CopyDirectory` really advances the boot **no longer reaches quiesce inside the
+gate's ~555s TCG budget at all** (RUNEXIT=124). **That budget is now the binding constraint on
+advancing winlogon past the logon**, and it is the next thing to solve — not the profile source.
+
+## Three REAL bugs found on the enumeration path (all root-caused, all fixed)
+
+`CopyDirectory` failed with `Error: 998` / `Error: 1450`; both are ambiguous, so each was MEASURED
+with a bounded `[query-dir]` trace rather than guessed.
+
+1. **`NtQueryDirectoryFile` alignment gate was stricter than NT.** We required the
+   `FileInformation` buffer to be 8-byte aligned; `NtQueryDirectoryFile` does
+   `ProbeForWrite(FileInformation, Length, sizeof(ULONG))` (`ntoskrnl/io/iomgr/iofunc.c:2029`), i.e.
+   **4**. kernel32's `FindFirstFileExW` depends on it — its scratch buffer is literally
+   `DECLSPEC_ALIGN(4) BYTE DirectoryInfo[FIND_DATA_SIZE]` with the comment "NtQueryDirectoryFile
+   requires the buffer to be ULONG-aligned" (`kernel32/client/file/find.c:694`). Now 4, as NT.
+2. **`probe_user_output` did not know a stack GROWS below its declared window.** `ACTIVE_STACK_BASE/
+   SIZE` are the pages the spawn pre-mapped (winlogon: 16 KiB at `0x…105C_0000`); a deeper frame
+   simply faults and the service loop demand-maps it. `FindFirstFileExW`'s 16 KiB buffer + its
+   IO_STATUS_BLOCK landed ~12 KiB BELOW that window, so the probe called genuinely-backed memory
+   unreachable and returned STATUS_ACCESS_VIOLATION => 998. Fixed by a **monotone** widening: only
+   where the code already returned false, and only after asking `client_range_has_backing` whether
+   every page REALLY has backing — the same test the winlogon listener stack already used.
+3. **Stack-argument WIDTHS.** `Length` is a `ULONG` and `ReturnSingleEntry`/`RestartScan` are
+   `BOOLEAN`s, but they are 5th+ arguments on the caller's stack: MSVC writes them with a 32-bit
+   store and leaves the top half of the 8-byte slot holding the high half of a previously-stored
+   pointer (`0x0000_0100`). Read as a u64, `Length` came out `0x0000_0100_0000_4000`, failed the
+   `MAX_QUERY_BUFFER` bound and returned STATUS_INSUFFICIENT_RESOURCES => `Error: 1450` — the wall
+   `FindNextFileW` hit at `directory.c:160`. Truncation is correct for every caller, but applying it
+   on the read-only FAT path makes a large population of previously-failing loader enumerations
+   succeed at once across smss/csrss/services/lsass, which was measured to destabilise the boot
+   (each such call rescans a ~700-entry `\reactos` directory twice). **Scoped to the writable volume
+   for now**; widening the FAT path needs a per-`FILE_OBJECT` scan cache and is a separate step.
+
+## ★ The bump heap was at 93% — and a no-free heap at its cap does not panic
+
+Instrumented (`[heap] executive bump high-water=…`) and measured: **1953957 / 2097152 = 93%** at the
+winlogon profile frontier. A bump allocator that reaches its cap returns null; callers quietly take
+their error paths, and the boot goes mysteriously slow and never quiesces — which is exactly what
+the previous batch's `RUNEXIT=124` was. `HEAP_FRAMES` **512 -> 1536** (2 -> 6 MiB) for the executive
+only; `SERVICE_HEAP_FRAMES` deliberately stays 512 (the recorded lesson: growing the shared value
+starves spawns), with the documented consequence that a service over-allocating past its own 2 MiB
+now faults instead of returning null — nothing comes close. `map_heap_pt` became `map_heap_pts`
+(one leaf PT per 2 MiB). Also removed one pointless pin: an `NtQueryDirectoryFile` on the writable
+volume mutates only the FILE_OBJECT's fixed-size cursor, so it no longer sets `writable_fs_dirty`
+and no longer strands its 16 KiB encode buffer for the rest of the boot.
+
+## One protected spec re-pointed, honestly
+
+`exec_winlogon_profile_directories_created` asserted `PROFILE_ROOT_CREATED >= 1`. Once a profile
+source exists, `C:\Profiles` legitimately EXISTS before winlogon runs (setup makes it on every
+installed system), so `CreateDirectoryW(szProfilesPath)` takes `profile.c:929`'s
+`ERROR_ALREADY_EXISTS` arm. The spec now asserts `created + collided >= 1` — winlogon really drove
+the profiles-root create against a real volume and really got the correct answer — plus the
+unchanged `user_dir >= 1` (it really CREATED `C:\Profiles\Administrator`, only reachable past that)
+and the unchanged logon/token/ProfileList clauses. `PROFILE_ROOT_COLLIDED` counts only a create the
+volume really refused with `STATUS_OBJECT_NAME_COLLISION`, so it is evidence of real volume state,
+never of a fabricated success. It holds in both the provisioned and unprovisioned states.
+
+## NOT done this batch (carried forward, unchanged in scope)
+
+**`NtLoadKey` (SSN 102) / `NtUnloadKey` (272) + the `\Registry\User` (`HKEY_USERS`) namespace + the
+5th dynamic `regf` mount were NOT implemented.** The `config\default` hive they need is staged and
+mapped; the `KeyRef` selector space is understood (`HIVE_SEL_MASK` must widen `0xE000_0000` ->
+`0xF000_0000` to free `0x1/0x3/0x5/0x7000_0000` below `OVERLAY_KEY_TAG`); nothing was faked.
+Nothing claims a hive was loaded. `userinit.exe` was **NOT** spawned and no 6th hosted process
+exists. `Userinit`/`AutoAdminLogon`: **nothing changed** — `WlxActivateUserShell` was never reached,
+the Winlogon key is still `SYNTH_WINLOGON_KEY`, and `AutoAdminLogon` cannot leak because winlogon's
+SOFTWARE route stays exact-name scoped on `is_profile_list_key`.

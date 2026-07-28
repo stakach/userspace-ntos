@@ -25,11 +25,19 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// executive gets a generous 2 MiB (was a cramped 128 KiB that OOM'd during registry enum, forcing
 /// per-syscall mark/reset). Spawned services map only [`SERVICE_HEAP_FRAMES`] to spare the boot
 /// frame budget; they never allocate near this cap.
-pub const HEAP_FRAMES: u64 = 512;
-/// Heap frames mapped into a spawned service's VSpace. Kept equal to [`HEAP_FRAMES`] so a service's
-/// allocator END always matches its mapped frames (over-allocation returns null, never faults). If
-/// the boot frame budget ever gets tight, drop this to a smaller value (services are lightweight —
-/// the old shared 32-frame heap sufficed) at the cost of that null-vs-fault guarantee.
+/// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
+/// at the winlogon profile frontier: the CM overlay, the writable volume and every `*_dirty`
+/// mark-pin move the permanent floor, and a no-free bump heap that reaches its cap does not panic
+/// — allocations start returning null and callers quietly take their error paths, which is what a
+/// mysteriously slow, never-quiescing boot looks like from outside. The materialised profile tree
+/// and the per-user hive load need headroom above that, so the executive gets it.
+pub const HEAP_FRAMES: u64 = 1536;
+/// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
+/// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would cost
+/// `services x 1024` extra frames of boot budget for heaps that never exceed a few KiB (the
+/// recorded lesson: growing the shared value starves spawns). The documented consequence is that a
+/// spawned service allocating past its own 2 MiB now FAULTS instead of returning null; nothing
+/// comes remotely close (the old shared 32-frame heap sufficed for them).
 pub const SERVICE_HEAP_FRAMES: u64 = 512;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;

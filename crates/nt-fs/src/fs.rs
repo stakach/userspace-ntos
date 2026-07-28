@@ -291,10 +291,41 @@ impl MemFs {
         let end = (start + len).min(n.data.len());
         n.data[start..end].to_vec()
     }
+    /// Replace a file node's contents with `bytes`, allocating EXACTLY once (the volume lives on a
+    /// bump heap in the executive, so a growth-by-doubling `resize` would strand the intermediate
+    /// buffers). `false` if the node is missing or is a directory.
+    fn set_file_data(&mut self, id: u64, bytes: &[u8]) -> bool {
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        if node.is_dir {
+            return false;
+        }
+        let mut data = Vec::new();
+        if data.try_reserve_exact(bytes.len()).is_err() {
+            return false;
+        }
+        data.extend_from_slice(bytes);
+        node.data = data;
+        true
+    }
+
+    /// A file node's bytes, borrowed in place. `None` for a directory or a missing node.
+    fn file_data(&self, rel_path: &str) -> Option<&[u8]> {
+        let id = self.lookup(rel_path)?;
+        let node = self.node(id)?;
+        (!node.is_dir).then_some(node.data.as_slice())
+    }
+
     fn write_at(&mut self, id: u64, offset: u64, bytes: &[u8]) -> usize {
         let Some(n) = self.node_mut(id) else { return 0 };
         let start = offset as usize;
         if start + bytes.len() > n.data.len() {
+            // Reserve EXACTLY what the write needs before growing: the executive backs this volume
+            // with a no-free bump heap, so `resize`'s amortised doubling would strand a buffer up
+            // to twice the useful size on every extend.
+            n.data
+                .reserve_exact(start + bytes.len() - n.data.len());
             n.data.resize(start + bytes.len(), 0);
         }
         n.data[start..start + bytes.len()].copy_from_slice(bytes);
@@ -590,6 +621,37 @@ impl FileSystem {
         };
         let id = self.volume.ensure_dir(&rel);
         self.volume.is_dir(id)
+    }
+
+    /// Create `path` (and every missing directory above it) as a FILE holding `bytes`.
+    ///
+    /// This is volume PROVISIONING — the content an *installed* volume already carries because the
+    /// installer put it there — not a syscall path: hosted processes only ever reach the `Zw*`
+    /// surface above. It is the file-shaped sibling of [`provision_directory`](Self::provision_directory).
+    /// Returns `false` if the path does not resolve to this volume or names an existing directory.
+    pub fn provision_file(&mut self, path: &str, bytes: &[u8]) -> bool {
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return false;
+        };
+        let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
+            return false;
+        };
+        let parent = self.volume.ensure_dir(parent_path);
+        let id = match self.volume.child(parent, leaf) {
+            Some(id) => id,
+            None => self.volume.create_child(parent, leaf, false),
+        };
+        if self.volume.is_dir(id) {
+            return false;
+        }
+        self.volume.set_file_data(id, bytes)
+    }
+
+    /// A file's bytes, borrowed in place (no copy) — the read side [`provision_file`] writes.
+    /// `None` when the path does not resolve to a file on this volume.
+    pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
+        let rel = self.to_relative(&normalize_separators(path))?;
+        self.volume.file_data(&rel)
     }
 
     /// Total live node count (root included) — the volume's occupancy, for diagnostics.

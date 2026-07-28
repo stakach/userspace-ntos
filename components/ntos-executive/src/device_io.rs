@@ -424,6 +424,9 @@ pub(crate) unsafe fn storage_probe(
             (b"reactos\\system32\\config\\security".as_slice(), b"SECURITY   ", SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES, 0x98u64),
             (b"reactos\\system32\\config\\sam".as_slice(), b"SAM        ", SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES, 0x9Cu64),
             (b"reactos\\system32\\config\\software".as_slice(), b"SOFTWARE   ", SWHIVEBUF_VADDR, SWHIVEBUF_FRAMES, 0xA8u64),
+            // The DEFAULT hive — HKEY_USERS\.DEFAULT's backing store AND the file setup copies to
+            // become a new user's ntuser.dat. Size reported at STORAGE_SHARED+0xAC.
+            (b"reactos\\system32\\config\\default".as_slice(), b"DEFAULT    ", DEFHIVEBUF_VADDR, DEFHIVEBUF_FRAMES, 0xACu64),
         ] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;

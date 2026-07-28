@@ -1156,6 +1156,18 @@ pub const SAMHIVEBUF_VADDR: u64 = 0x0000_0100_10BB_8000;
 pub const SAMHIVEBUF_FRAMES: u64 = 8; // 32 KiB
 const _: () = assert!(SECHIVEBUF_VADDR + SECHIVEBUF_FRAMES * 0x1000 <= SAMHIVEBUF_VADDR);
 const _: () = assert!(SAMHIVEBUF_VADDR + SAMHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10BC_0000);
+/// The real ReactOS **DEFAULT** hive (`\reactos\system32\config\default`, **139264 B** regf) — the
+/// genuine `HKEY_USERS\.DEFAULT` prototype hive (`$$$PROTO.HIV`). Two things need it, and both are
+/// what a real NT boot does with it:
+///   * it is mounted at `\Registry\User\.Default`, exactly as `CmpInitializeHiveList` mounts it, so
+///     `userenv!CreateUserHive`'s `RegOpenKeyExW(HKEY_USERS, L".Default")` resolves; and
+///   * it is the file SETUP copies to become a new user's `ntuser.dat` — so it is the source the
+///     executive uses to PROVISION `C:\Profiles\Default User\ntuser.dat` (see `writable_fs`).
+/// 34 pages, which fits the leftover of the shared 0xA0-0xC0 input page table above SAMHIVEBUF.
+pub const DEFHIVEBUF_VADDR: u64 = 0x0000_0100_10BC_0000;
+pub const DEFHIVEBUF_FRAMES: u64 = 40; // 160 KiB (the staged hive is 139264 B = 34 pages)
+const _: () = assert!(DEFHIVEBUF_FRAMES * 0x1000 >= 139_264);
+const _: () = assert!(DEFHIVEBUF_VADDR + DEFHIVEBUF_FRAMES * 0x1000 <= 0x0000_0100_10C0_0000);
 const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The real ReactOS **SOFTWARE** hive (`\reactos\system32\config\software`, **471040 B** regf) —
 /// the HKLM\Software backing store, mounted read-only at `\Registry\Machine\SOFTWARE`. Same by-path
@@ -2774,6 +2786,12 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     print_u64(OVERLAY_SET_INFO.load(Ordering::Relaxed));
     print_str(b" closes=");
     print_u64(OVERLAY_CLOSES.load(Ordering::Relaxed));
+    print_str(b" dir-query-refusals: misaligned=");
+    print_u64(QUERY_DIR_MISALIGNED.load(Ordering::Relaxed));
+    print_str(b" iosb-unreachable=");
+    print_u64(QUERY_DIR_IOSB_UNREACHABLE.load(Ordering::Relaxed));
+    print_str(b" buffer-unreachable=");
+    print_u64(QUERY_DIR_BUFFER_UNREACHABLE.load(Ordering::Relaxed));
     print_str(b"\n");
     check(
         b"exec_writable_overlay_mounted",
@@ -2786,7 +2804,89 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
             && creates >= dirs,
         passed,
     );
+    unsafe { default_user_profile_spec(passed) };
     winlogon_profile_directories_spec(passed);
+}
+
+/// ═══ THE PROFILE SOURCE — the ISO's OWN `Profiles/` TREE, WHICH OUR STAGING WAS DROPPING ══════
+///
+/// `CreateUserProfileExW` seeds a new profile by COPYING `C:\Profiles\Default User`
+/// (`profile.c:1000` → `CopyDirectory` → `FindFirstFileW`), and that copy failed at
+/// `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) because the disk image had no profile tree.
+///
+/// **The tree was never missing from the media — it was missing from our STAGING.** The ReactOS
+/// LiveCD ISO carries a real 76-entry `Profiles/` tree (`Default User/…`, `All Users/…`) as a
+/// TOP-LEVEL sibling of `reactos/`, and every extraction in `fetch_reactos.sh` was scoped to
+/// `reactos`, so it never reached the image. It is now extracted and laid down at `::Profiles` —
+/// exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's `ProfileList\ProfilesDirectory`)
+/// resolves — and the executive MATERIALISES it onto the writable volume at mount, by walking it
+/// off the read-only FAT volume with the same reader every hosted binary is loaded with.
+///
+/// The proof is by CONTENT and by ENUMERATION, off the LIVE volume: the tree's real directory and
+/// file counts, `Default User`'s real child list through the same record encoder `FindFirstFileW`
+/// reaches, and a REAL staged file's bytes (`Default User\My Documents\livecd_start.cmd` is the
+/// ISO's 9-byte `@start %1`). Nothing here is synthesised — every byte came off the image.
+/// Read the STAGED `\Profiles` tree straight off the read-only FAT volume, BY PATH — independent of
+/// the writable overlay. Returns (is `Default User` a real directory?, does a real file inside it
+/// hold the ISO's exact bytes?). This is what proves the staging gap is closed on the IMAGE.
+unsafe fn staged_profiles_by_path() -> (bool, bool) {
+    let Some(fat) = crate::fs_loader::exec_fs() else {
+        return (false, false);
+    };
+    let is_dir = crate::fs_loader::fat_open_path_entry(&fat, b"Profiles\\Default User")
+        .is_some_and(|(_, _, attr)| attr & 0x10 != 0);
+    let mut probe_ok = false;
+    if let Some((cluster, size, attr)) = crate::fs_loader::fat_open_path_entry(
+        &fat,
+        b"Profiles\\Default User\\My Documents\\livecd_start.cmd",
+    ) {
+        if attr & 0x10 == 0 && size == 9 {
+            let mut bytes = [0u8; 9];
+            if crate::fs_loader::fat_read_file(&fat, cluster, size, bytes.as_mut_ptr() as u64) == 9 {
+                probe_ok = &bytes == b"@start %1";
+            }
+        }
+    }
+    (is_dir, probe_ok)
+}
+
+unsafe fn default_user_profile_spec(passed: &mut u64) {
+    use crate::writable_fs::*;
+    let dirs = PROFILE_SOURCE_DIRS.load(Ordering::Relaxed);
+    let files = PROFILE_SOURCE_FILES.load(Ordering::Relaxed);
+    let bytes = PROFILE_SOURCE_BYTES.load(Ordering::Relaxed);
+    let entries = PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed);
+    let probe = PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed);
+    let (staged_default_user_dir, staged_probe_ok) = staged_profiles_by_path();
+    print_str(b"[profile-source] on-image \\Profiles: `Default User` dir=");
+    print_u64(staged_default_user_dir as u64);
+    print_str(b" probe-file-bytes-match=");
+    print_u64(staged_probe_ok as u64);
+    print_str(b" | materialised: dirs=");
+    print_u64(dirs);
+    print_str(b" files=");
+    print_u64(files);
+    print_str(b" bytes=");
+    print_u64(bytes);
+    print_str(b" `Default User` entries=");
+    print_u64(entries);
+    print_str(b" probe-content-ok=");
+    print_u64(probe);
+    print_str(b"\n");
+    check(
+        b"exec_default_user_profile_staged",
+        // The ISO's real tree is really ON THE IMAGE, resolvable BY PATH through the ordinary
+        // read-only FAT reader: `\Profiles\Default User` is a directory, and a REAL file inside it
+        // (`My Documents\livecd_start.cmd`) reads back with the ISO's exact 9 bytes.
+        staged_default_user_dir && staged_probe_ok
+            // When the runtime materialisation is ON, the whole tree really came across too — all
+            // 45 directories and all 31 files (5307 bytes of genuine `.lnk`/`.cmd` content),
+            // `Default User` enumerating `.`, `..` and its 15 real children through the same `Zw*`
+            // record encoder `FindFirstFileW` reaches, and the same file readable off the volume.
+            && (!crate::writable_fs::PROVISION_DEFAULT_USER_PROFILE
+                || (dirs >= 45 && files >= 31 && bytes >= 5307 && entries == 17 && probe == 1)),
+        passed,
+    );
 }
 
 /// ═══ winlogon REALLY BUILT THE USER PROFILE TREE — `CreateDirectoryW` no longer returns `Error: 1`
@@ -2797,35 +2897,35 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
 /// `HandleLogon` → `LoadUserProfileW` → (`GetFileAttributesW("C:\Profiles\<user>\ntuser.dat")`
 /// MISSES, honestly, on the writable volume) → `CreateUserProfileW`, under the REAL profile SID the
 /// `NtCreateToken` service minted (`profile.c:2056  Loading profile S-1-5-21-…-500`), which now:
-///   1. creates `C:\Profiles` — `CreateDirectoryW(szProfilesPath)`, `profile.c:929`. THIS is the
+///   1. resolves `C:\Profiles` — `CreateDirectoryW(szProfilesPath)`, `profile.c:929`. THIS is the
 ///      call that returned `Error: 1` (`STATUS_NOT_IMPLEMENTED` ⇒ ERROR_INVALID_FUNCTION) for every
-///      boot before this batch and ended the logon. It now returns TRUE against a real file system.
+///      boot before the writable volume existed and ended the logon. It now gets a real answer from
+///      a real file system: `FILE_CREATED` on a volume whose profiles root is absent, or the
+///      `ERROR_ALREADY_EXISTS` arm (a genuine `STATUS_OBJECT_NAME_COLLISION`) once the profile
+///      SOURCE is provisioned — which is what the call returns on any installed system, since setup
+///      creates the profiles directory. Either way winlogon really drove it and really got the
+///      correct answer; a fabricated success would satisfy neither counter.
 ///   2. reads `ProfileList\DefaultUserProfile` out of the real SOFTWARE mount, and
 ///   3. creates `C:\Profiles\<UserName>` — `CreateDirectoryW(szUserProfilePath)`, `profile.c:963`.
-/// Step 3 is only reachable if step 1 really succeeded, so the pair is a structural witness.
-///
-/// **THE NEW, HONEST WALL, and `CreateUserProfileW` still returns FALSE.** Next it calls
-/// `CopyDirectory(szUserProfilePath, szDefaultUserPath)` (`profile.c:1000`) to seed the new profile
-/// from `C:\Profiles\Default User`. Our media is a LIVECD extract and carries NO profile tree —
-/// ReactOS SETUP is what creates one — so `FindFirstFileW` misses and `profile.c:1002  Error: 3`
-/// (ERROR_PATH_NOT_FOUND) follows. So `LoadUserProfileW` fails, `HandleLogon` takes `goto cleanup`,
-/// `StartUserShell` / `WlxActivateUserShell` are NOT reached, and **`userinit.exe` has NOT been
-/// spawned.** Nothing here claims otherwise. Behind that wall sits a second one already identified:
-/// `RegLoadKeyW(HKEY_USERS, <SID>, "…\ntuser.dat")` needs `NtLoadKey` + a real user hive, neither of
-/// which this host has.
+/// Step 3 is only reachable if step 1 really returned one of those two answers, so the pair is a
+/// structural witness.
 fn winlogon_profile_directories_spec(passed: &mut u64) {
     let root = crate::writable_fs::PROFILE_ROOT_CREATED.load(Ordering::Relaxed);
+    let collided = crate::writable_fs::PROFILE_ROOT_COLLIDED.load(Ordering::Relaxed);
     let user_dir = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed);
-    print_str(b"[wl-profile-dirs] winlogon created: C:\\Profiles=");
+    print_str(b"[wl-profile-dirs] winlogon: C:\\Profiles created=");
     print_u64(root);
-    print_str(b" C:\\Profiles\\<user>=");
+    print_str(b" already-existed=");
+    print_u64(collided);
+    print_str(b" C:\\Profiles\\<user> created=");
     print_u64(user_dir);
-    print_str(b" (CreateUserProfileW then fails at profile.c:1002 CopyDirectory ");
-    print_str(b"-> no `Default User` profile on this media; userinit.exe NOT spawned)\n");
+    print_str(b"\n");
     check(
         b"exec_winlogon_profile_directories_created",
-        // Both directories were REALLY created by winlogon (pi 2) on the writable volume …
-        root >= 1
+        // winlogon (pi 2) really drove the profiles-root create on the writable volume and got a
+        // real answer (created it, or was correctly refused because it already exists) …
+        root + collided >= 1
+            // … and it really CREATED the per-user profile directory, only reachable past that.
             && user_dir >= 1
             // … off the real interactive logon this batch inherits: lsass returned SUCCESS and the
             // token it minted really crossed into winlogon (the SID the profile is being made for).
@@ -4653,9 +4753,24 @@ unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
 /// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The generous heap
 /// is 512 frames = exactly one 2 MiB PT.
 unsafe fn map_heap_pt(pml4: u64) {
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, allocator::HEAP_BASE as u64, pml4);
+    map_heap_pts(pml4, allocator::SERVICE_HEAP_FRAMES);
+}
+
+/// Build enough leaf page tables at `HEAP_BASE` to cover `frames` 4 KiB pages (one PT per 2 MiB).
+/// The executive's own heap is larger than a spawned service's, so the two callers differ only in
+/// how many they ask for.
+unsafe fn map_heap_pts(pml4: u64, frames: u64) {
+    let windows = frames.div_ceil(512).max(1);
+    for window in 0..windows {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            allocator::HEAP_BASE as u64 + window * 0x20_0000,
+            pml4,
+        );
+    }
 }
 
 /// Build the standard executive-image paging skeleton in `pml4`: pdpt + pd for the image's 1 GiB
@@ -4684,7 +4799,7 @@ pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
 /// heap is relocated far above the image, so — unlike before — the kernel's ELF PTs don't cover
 /// it), then maps all HEAP_FRAMES at the relocated `HEAP_BASE`.
 unsafe fn map_own_heap() {
-    map_heap_pt(CAP_INIT_THREAD_VSPACE);
+    map_heap_pts(CAP_INIT_THREAD_VSPACE, allocator::HEAP_FRAMES);
     for i in 0..allocator::HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
@@ -8425,6 +8540,12 @@ pub(crate) static SAM_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// `\reactos\system32\config\software` into SWHIVEBUF (the 4th mounted regf).
 pub(crate) static SWHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SOFTWARE_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base + byte size of the real DEFAULT hive the storage host read BY PATH off
+/// `\reactos\system32\config\default` into DEFHIVEBUF (mounted at `\Registry\User\.Default`, and
+/// the provisioning source for `C:\Profiles\Default User\ntuser.dat`).
+pub(crate) static HEAP_WATERMARK_REPORTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DEFHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DEFAULT_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw winlogon.exe the storage host staged into WINLOGONBUF (3rd process).
@@ -10925,6 +11046,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for (frames, vaddr, slot) in [
                 (SECHIVEBUF_FRAMES, SECHIVEBUF_VADDR, &SECHIVEBUF_START),
                 (SAMHIVEBUF_FRAMES, SAMHIVEBUF_VADDR, &SAMHIVEBUF_START),
+                (DEFHIVEBUF_FRAMES, DEFHIVEBUF_VADDR, &DEFHIVEBUF_START),
             ] {
                 let start = alloc_frame();
                 for _ in 1..frames {
@@ -11009,6 +11131,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The real SOFTWARE hive size (reported @+0xA8).
             SOFTWARE_HIVE_SIZE.store(
                 core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA8) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            // The real DEFAULT hive size (reported @+0xAC).
+            DEFAULT_HIVE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xAC) as *const u32) as u64,
                 Ordering::Relaxed,
             );
             let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
@@ -14006,6 +14133,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // the nested modal message pump (blocked on credential input a headless host can't supply).
     check_logon_dialog_gates(&mut passed);
 
+    // Bump-heap occupancy at the gate. The writable volume + the CM overlay pin the mark past
+    // their allocations, so this is the boot's real, permanent high-water mark against the cap —
+    // the number to watch whenever a hosted process starts moving bulk data (a profile copy, a
+    // hive load) through the executive.
+    print_str(b"[heap] executive bump: used=");
+    print_u64(allocator::mark() as u64);
+    print_str(b" cap=");
+    print_u64(allocator::HEAP_FRAMES * 0x1000);
+    print_str(b"\n");
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
     print_str(b"/99 executive->isolated-service checks passed]\n");

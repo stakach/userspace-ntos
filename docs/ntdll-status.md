@@ -874,6 +874,50 @@ Anything in `ntdll_plan.md` not listed here was either verified or not re-checke
 > live syscall counters: winlogon really created 2 directories through `NtCreateFile` and really
 > missed 1 by-path attribute query through `NtQueryAttributesFile`.
 >
+> **★ UPDATE (batch 57, gate 246/99) — THE PROFILE SOURCE WAS A STAGING GAP, NOT MISSING MEDIA.**
+> The claim below that "our media is a LiveCD extract with no profile tree" was WRONG. The ReactOS
+> LiveCD ISO carries a real **76-entry `Profiles/` tree** (`Default User/…`, `All Users/…`) as a
+> **TOP-LEVEL sibling of `reactos/`**, and every extraction in `fetch_reactos.sh` was scoped to
+> `reactos`, so it was silently dropped and never reached the disk image. It is now extracted
+> (`.profiles-ok` marker) and laid down at **`::Profiles`** — exactly what `%SystemDrive%\Profiles`
+> resolves to — and proved BY PATH off the read-only FAT volume: `\Profiles\Default User` is a real
+> directory and `\Profiles\Default User\My Documents\livecd_start.cmd` reads back the ISO's exact
+> 9 bytes (`exec_default_user_profile_staged`). The ISO has **no `ntuser.dat` anywhere**; the real
+> `\reactos\system32\config\default` prototype hive (`$$$PROTO.HIV`, 139264 B) is now staged into
+> its own DEFHIVEBUF window for the `NtLoadKey` / `\Registry\User\.Default` work.
+>
+> **Composition:** `C:\Profiles` is a writable-volume (MemFs) prefix while the staged tree is on the
+> read-only FAT volume, so the executive **materialises** the staged tree onto the writable volume at
+> mount (chosen over a union layer: one code path, so `CopyDirectory` enumerates/reads the source and
+> writes the destination with no per-operation arbitration). Measured working — `dirs=45 files=31
+> bytes=5307`, `Default User` enumerating its real 17 records, a staged file's bytes read back — but
+> it **ships behind `PROVISION_DEFAULT_USER_PROFILE = false` for a measured TIME reason, not a
+> defect**: with it on, winlogon's profile flow runs on instead of dying at `FindFirstFileW`, its
+> post-logon win32k/UI work grows ~2.5x, and the boot stops reaching quiesce inside the gate's ~555s
+> TCG budget (RUNEXIT=124). **That budget is now the binding constraint on advancing winlogon past
+> the logon.**
+>
+> **Three real enumeration bugs were root-caused and fixed** (each MEASURED with a bounded
+> `[query-dir]` trace, because `Error: 998`/`1450` are ambiguous): (1) our `NtQueryDirectoryFile`
+> demanded an 8-byte-aligned output buffer where NT does `ProbeForWrite(…, sizeof(ULONG))` = 4, and
+> kernel32's `FindFirstFileExW` buffer is literally `DECLSPEC_ALIGN(4)`; (2) `probe_user_output` did
+> not know a hosted stack GROWS BELOW its declared window (the 16 KiB `FindFirstFileExW` buffer lands
+> ~12 KiB under it and is demand-faulted in) — widened MONOTONELY, and only via a real
+> `client_range_has_backing` check; (3) `Length`/`ReturnSingleEntry`/`RestartScan` are ULONG/BOOLEAN
+> **stack** arguments whose high bits are caller junk (`0x0000_0100_0000_4000` for 16384) — truncated
+> to the declared width, scoped to the writable volume because widening the FAT path unblocks a large
+> population of loader enumerations at once and destabilised the boot.
+>
+> **The bump heap was at 93%** (1953957/2097152, now instrumented at the gate). A no-free bump heap at
+> its cap does not panic — allocations return null and callers take error paths, which is what a
+> mysteriously slow, never-quiescing boot looks like. `HEAP_FRAMES` 512 -> 1536 (executive only;
+> `SERVICE_HEAP_FRAMES` stays 512 per the recorded lesson).
+>
+> **`NtLoadKey`/`NtUnloadKey`, `\Registry\User` and the 5th dynamic mount are NOT implemented** —
+> nothing claims a hive was loaded. `userinit.exe` was **NOT** spawned; there is no 6th hosted
+> process. `Userinit`/`AutoAdminLogon`: nothing changed, and `AutoAdminLogon` cannot leak (winlogon's
+> SOFTWARE route stays exact-name scoped on `is_profile_list_key`).
+>
 > **DESKTOP FRONTIER — the profile TREE is built; the profile SOURCE and the user HIVE are not.**
 > `CreateUserProfileW` now creates `C:\Profiles` (`profile.c:929` — the old `Error: 1`) and
 > `C:\Profiles\Administrator` (`profile.c:963`), then calls `CopyDirectory(…, "C:\Profiles\Default

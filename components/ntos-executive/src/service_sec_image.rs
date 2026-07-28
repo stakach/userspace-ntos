@@ -3124,6 +3124,18 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.writable_fs_dirty = false;
                     heap_mark = allocator::mark();
                 }
+                // Bump-heap PRESSURE tripwire. Every pin above moves the permanent floor; when it
+                // climbs, say so. A silent approach to the cap is what an exhausted no-free heap
+                // looks like from the outside (allocations start returning null and callers take
+                // their error paths), so this makes the boot's real occupancy visible in the log.
+                if heap_mark >= HEAP_WATERMARK_REPORTED.load(Ordering::Relaxed) as usize + 0x2_0000 {
+                    HEAP_WATERMARK_REPORTED.store(heap_mark as u64, Ordering::Relaxed);
+                    print_str(b"[heap] executive bump high-water=");
+                    print_u64(heap_mark as u64);
+                    print_str(b" cap=");
+                    print_u64(allocator::HEAP_FRAMES * 0x1000);
+                    print_str(b"\n");
+                }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
                 // need a persistent image-page alias; other hosted processes can also return values
                 // to DLL globals. Use the handler's common cross-address-space writer for both.

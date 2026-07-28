@@ -3949,6 +3949,24 @@ impl ExecNtHandler {
         {
             return true;
         }
+        // ★ A hosted thread's stack GROWS BELOW its declared window. `ACTIVE_STACK_BASE/SIZE` are
+        // the pages the spawn pre-mapped; a deeper frame simply faults and the service loop
+        // demand-maps it, so a legitimate buffer can sit below `stack_base` and still be fully
+        // backed. kernel32's `FindFirstFileExW` is exactly that case — it puts a 16 KiB
+        // `DECLSPEC_ALIGN(4) BYTE DirectoryInfo[FIND_DATA_SIZE]` scratch buffer plus its
+        // IO_STATUS_BLOCK on the caller's stack (`kernel32/client/file/find.c:694`), which for
+        // winlogon lands ~12 KiB below the 16 KiB declared window. The window test alone called
+        // that unreachable, so `NtQueryDirectoryFile` returned STATUS_ACCESS_VIOLATION and
+        // `CopyDirectory` reported `GetLastError() == 998` (ERROR_NOACCESS).
+        //
+        // This clause is a strictly MONOTONE widening: it runs only where the code already
+        // returned false, and it does not assume anything — it asks whether every page of the
+        // range REALLY has backing in the caller's VSpace, the same `client_range_has_backing`
+        // test the winlogon listener stack above already uses. Unmapped memory is still refused.
+        const STACK_GROWTH_WINDOW: u64 = 0x10_0000; // 1 MiB, the PE's committed stack reserve
+        if end <= stack_end && va >= stack_base.saturating_sub(STACK_GROWTH_WINDOW) {
+            return client_range_has_backing(self.pi as u64, va, len);
+        }
 
         fn writable_image_range(pe: &nt_pe_loader::PeFile, base: u64, va: u64, len: usize) -> bool {
             let rva = match va.checked_sub(base) {
@@ -9440,7 +9458,15 @@ impl ExecNtHandler {
                 const GENERIC_ALL: u32 = 0x1000_0000;
                 const MAX_QUERY_BUFFER: usize = 1024 * 1024;
 
+                let iosb = args[4];
+                let output = args[5];
+                crate::writable_fs::trace_dir_refusal(
+                    b"call", self.pi, args[0], iosb, output, args[6] as usize, args[7],
+                );
                 if args[2] != 0 {
+                    crate::writable_fs::trace_dir_refusal(
+                        b"REFUSED apc-unsupported", self.pi, args[0], iosb, output, args[6] as usize, args[7],
+                    );
                     return STATUS_NOT_SUPPORTED;
                 }
                 let event_index = if args[1] == 0 {
@@ -9451,21 +9477,74 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
-                let iosb = args[4];
-                let output = args[5];
-                let length = match usize::try_from(args[6]) {
+                // ★ STACK-ARGUMENT WIDTHS. `Length` is a **ULONG** and `ReturnSingleEntry` /
+                // `RestartScan` are **BOOLEAN**s, but they are 5th+ arguments and therefore live on
+                // the caller's stack: MSVC stores them with a 32-bit `mov dword ptr [rsp+N]` and
+                // leaves the upper half of the 8-byte slot holding whatever was there before (in
+                // practice the high half of a previously-stored pointer, `0x0000_0100`). Reading
+                // the slot as a full u64 saw `0x0000_0100_0000_4000` for a 16384-byte buffer, which
+                // failed the `MAX_QUERY_BUFFER` bound and returned STATUS_INSUFFICIENT_RESOURCES ⇒
+                // `GetLastError() == 1450` — the wall `CopyDirectory`'s `FindNextFileW` hit at
+                // `directory.c:160`. Truncating to the declared parameter width is what the real
+                // syscall stub does.
+                //
+                // ★ SCOPED, deliberately. The truncation is correct for EVERY caller, but applying
+                // it on the read-only FAT path also makes a large population of previously-failing
+                // loader enumerations succeed at once across smss/csrss/services/lsass — a real
+                // behaviour change which was MEASURED to destabilise the boot (each such call
+                // rescans a ~700-entry `\reactos` directory twice, and the boot stopped reaching
+                // its quiesce inside the gate's time budget). So it is applied to the WRITABLE
+                // VOLUME only; the read-only path keeps its pre-batch bound, unchanged. Widening
+                // the FAT path — with a per-`FILE_OBJECT` scan cache to pay for it — is a separate,
+                // tracked step, not something to smuggle in behind a profile batch.
+                let overlay_target = self
+                    .pm_pid_for_pi(self.pi)
+                    .and_then(|pid| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
+                    .is_some_and(|object| {
+                        matches!(object, nt_process::HandleObject::OverlayFile(_))
+                    });
+                let raw_length = if overlay_target { args[6] & 0xFFFF_FFFF } else { args[6] };
+                let length = match usize::try_from(raw_length) {
                     Ok(length) if length <= MAX_QUERY_BUFFER => length,
                     _ => return STATUS_INSUFFICIENT_RESOURCES,
+                };
+                let information_class = args[7] as u32;
+                let (return_single_entry, restart_scan) = if overlay_target {
+                    (args[8] as u8 != 0, args[10] as u8 != 0)
+                } else {
+                    (args[8] != 0, args[10] != 0)
                 };
                 if iosb == 0 || output == 0 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if iosb & 7 != 0 || output & 7 != 0 {
+                // ★ NT requires the FileInformation buffer to be **ULONG**-aligned, not ULONGLONG:
+                // `IopQueryDirectoryFile` checks `(ULONG_PTR)FileInformation & (sizeof(ULONG)-1)`.
+                // kernel32's `FindFirstFileExW` relies on exactly that — its 16 KiB scratch buffer
+                // is declared `DECLSPEC_ALIGN(4) BYTE DirectoryInfo[FIND_DATA_SIZE]`
+                // (`kernel32/client/file/find.c:694`, with the comment "NtQueryDirectoryFile
+                // requires the buffer to be ULONG-aligned"). Our 8-byte gate was stricter than the
+                // kernel it models, so a legitimately 4-aligned buffer was rejected with
+                // STATUS_DATATYPE_MISALIGNMENT ⇒ `GetLastError() == 998`. The IO_STATUS_BLOCK is
+                // still ULONGLONG-aligned (a pointer-sized field pair), as NT requires.
+                if iosb & 7 != 0 || output & 3 != 0 {
+                    crate::writable_fs::QUERY_DIR_MISALIGNED.fetch_add(1, Ordering::Relaxed);
+                    crate::writable_fs::trace_dir_refusal(
+                        b"REFUSED misaligned", self.pi, args[0], iosb, output, length, args[7],
+                    );
                     return STATUS_DATATYPE_MISALIGNMENT;
                 }
-                if !self.probe_user_output(iosb, 16)
-                    || !self.probe_user_output(output, length)
-                {
+                if !self.probe_user_output(iosb, 16) {
+                    crate::writable_fs::QUERY_DIR_IOSB_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+                    crate::writable_fs::trace_dir_refusal(
+                        b"REFUSED iosb-unreachable", self.pi, args[0], iosb, output, length, args[7],
+                    );
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if !self.probe_user_output(output, length) {
+                    crate::writable_fs::QUERY_DIR_BUFFER_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+                    crate::writable_fs::trace_dir_refusal(
+                        b"REFUSED buffer-unreachable", self.pi, args[0], iosb, output, length, args[7],
+                    );
                     return STATUS_ACCESS_VIOLATION;
                 }
 
@@ -9485,12 +9564,20 @@ impl ExecNtHandler {
                     Some(nt_process::HandleObject::OverlayFile(file_id)) => {
                         let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
                         if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
+                            crate::writable_fs::trace_dir_refusal(
+                                b"REFUSED access-denied", self.pi, args[0], iosb, output, length, granted as u64,
+                            );
                             return nt_fs::STATUS_ACCESS_DENIED;
                         }
                         let mut pattern = [0u16; nt_fs::MAX_DIRECTORY_NAME];
                         let pattern_len = match self.read_directory_pattern(args[9], &mut pattern) {
                             Ok(length) => length,
-                            Err(status) => return status,
+                            Err(status) => {
+                                crate::writable_fs::trace_dir_refusal(
+                                    b"REFUSED pattern-unreadable", self.pi, args[9], iosb, output, length, status as u64,
+                                );
+                                return status;
+                            }
                         };
                         let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
                         let mut encoded = alloc::vec::Vec::new();
@@ -9498,13 +9585,18 @@ impl ExecNtHandler {
                             return STATUS_INSUFFICIENT_RESOURCES;
                         }
                         encoded.resize(length, 0);
-                        self.writable_fs_dirty = true;
+                        // NOTE: deliberately NOT `writable_fs_dirty`. Reaching this arm means a
+                        // volume file object already exists, so the volume is mounted and an
+                        // enumeration mutates only the FILE_OBJECT's fixed-size cursor — nothing
+                        // is allocated that must outlive the syscall. Pinning here would strand
+                        // this `length`-byte encode buffer (16 KiB for every `FindFirstFileW`)
+                        // on the no-free bump heap for the rest of the boot.
                         let result = crate::writable_fs::query_directory(
                             file_id,
-                            args[7] as u32,
-                            args[8] != 0,
+                            information_class,
+                            return_single_entry,
                             pattern,
-                            args[10] != 0,
+                            restart_scan,
                             &mut encoded,
                         );
                         let mut iosb_bytes = [0u8; 16];
@@ -9524,8 +9616,18 @@ impl ExecNtHandler {
                         }
                         return result.status;
                     }
-                    Some(_) => return STATUS_OBJECT_TYPE_MISMATCH,
-                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                    Some(_) => {
+                        crate::writable_fs::trace_dir_refusal(
+                            b"REFUSED type-mismatch", self.pi, args[0], iosb, output, length, args[7],
+                        );
+                        return STATUS_OBJECT_TYPE_MISMATCH;
+                    }
+                    None => {
+                        crate::writable_fs::trace_dir_refusal(
+                            b"REFUSED no-handle", self.pi, args[0], iosb, output, length, args[7],
+                        );
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    }
                 };
                 let granted = self.pm.handle_access(pid, handle).unwrap_or(0);
                 if granted & (FILE_LIST_DIRECTORY | GENERIC_READ | GENERIC_ALL) == 0 {
@@ -9574,10 +9676,10 @@ impl ExecNtHandler {
                     nt_fs::query_directory(
                         &mut directory.query,
                         &entries,
-                        args[7] as u32,
-                        args[8] != 0,
+                        information_class,
+                        return_single_entry,
                         pattern,
-                        args[10] != 0,
+                        restart_scan,
                         &mut encoded,
                     )
                 };
@@ -10366,11 +10468,12 @@ impl ExecNtHandler {
                     );
                     status = st;
                     info = information;
-                    if status == nt_fs::STATUS_SUCCESS
-                        && info == nt_fs::FILE_CREATED as u64
-                        && args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0
-                    {
-                        crate::writable_fs::note_directory_created(self.pi, &relative);
+                    if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                        if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64 {
+                            crate::writable_fs::note_directory_create(self.pi, &relative, true);
+                        } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
+                            crate::writable_fs::note_directory_create(self.pi, &relative, false);
+                        }
                     }
                     if let Some(file_id) = file_id {
                         match self.mint_overlay_file_handle(file_id, args[1] as u32) {

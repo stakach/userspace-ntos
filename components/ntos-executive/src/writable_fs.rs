@@ -46,24 +46,63 @@ pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles"];
 /// returns `Error: 1` again and the overlay specs go red. Nothing else in the executive changes.
 pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 
-/// ★ MEASURED EXPERIMENT — LEFT OFF, deliberately. `CreateUserProfileExW` copies the machine's
-/// `Default User` profile into the new one (`profile.c:1000` → `CopyDirectory` →
-/// `FindFirstFileW("C:\Profiles\Default User\*.*")`). Our media is a LIVECD extract: it carries no
-/// profile tree at all, because ReactOS SETUP is what creates one — so that copy fails honestly at
-/// `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND).
+/// ★ THE PROFILE SOURCE — **the ISO's OWN `Profiles/` tree, which our staging was dropping.**
 ///
-/// Provisioning the skeleton here (i.e. having the writable volume carry what an installed system's
-/// volume would) was TRIED for one boot and is NOT a clean advance, so it stays off:
-///   * `CopyDirectory` still fails — now `profile.c:1002  Error: 998` (ERROR_NOACCESS), i.e. the
-///     directory ENUMERATION behind `FindFirstFileW` is rejected before it returns entries. Both
-///     `STATUS_DATATYPE_MISALIGNMENT` (the pre-existing `output & 7` gate in the
-///     `NtQueryDirectoryFile` handler) and `STATUS_ACCESS_VIOLATION` map to 998, so which one it is
-///     still has to be measured.
-///   * and that boot went UNSTABLE: it never quiesced (`RUNEXIT=124`, csrss looping in win32k
-///     user-callbacks), which is a hang — a hard fail.
-/// So the honest state is the one that ships: the copy source genuinely does not exist. Making it
-/// exist is the NEXT batch's work, together with the `NtLoadKey`/`ntuser.dat` wall behind it.
+/// `CreateUserProfileExW` seeds a new user's profile by COPYING `C:\Profiles\Default User`
+/// (`profile.c:1000` → `CopyDirectory` → `FindFirstFileW("C:\Profiles\Default User\*.*")`), and
+/// that copy failed at `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND) because the image had no
+/// profile tree at all.
+///
+/// The tree was NOT missing from the media — it was missing from OUR STAGING. The ReactOS LiveCD
+/// ISO carries a real 76-entry `Profiles/` tree (`Default User/…`, `All Users/…`) as a **top-level
+/// sibling of `reactos/`**, and every extraction in `fetch_reactos.sh` was scoped to `reactos`, so
+/// it never reached the disk image. `fetch_reactos.sh` now extracts it and `make_image.sh` lays it
+/// down at `::Profiles` — exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's
+/// `ProfileList\ProfilesDirectory`) resolves. Nothing is synthesised: these are the ISO's own
+/// directories and files, byte for byte.
+///
+/// **Composition with the writable volume.** `C:\Profiles` is a writable-volume prefix
+/// ([`WRITABLE_PREFIXES`]) while the staged tree is on the READ-ONLY FAT volume, so the two must
+/// compose. The chosen composition is **materialise-at-mount**: when the writable volume is first
+/// touched, the executive walks the staged `\Profiles` tree off the FAT volume and recreates it —
+/// directories AND file contents — on the writable volume. That was picked over a union/read-through
+/// layer because it is strictly simpler and leaves ONE code path: after mount every hosted-process
+/// syscall sees a single, coherent, writable `C:\Profiles`, so `CopyDirectory` can enumerate and
+/// read the source and write the destination with no per-operation layer arbitration, and a later
+/// FAT32 write-through milestone replaces the backing without touching any of it. The cost is the
+/// tree's bytes in RAM, which for this tree is ~76 nodes and ~360 bytes of file content.
+///
+/// ★ **LEFT OFF — and the reason is a MEASURED time budget, not a defect.** With this `true` the
+/// staging + materialisation work exactly as designed (measured: `dirs=45 files=31 bytes=5307`,
+/// `Default User` enumerating its real 17 records, a staged file's bytes read back), the `Error: 3`
+/// is gone and `CopyDirectory` really enumerates the source. But winlogon then CONTINUES — the
+/// profile flow that used to die at `FindFirstFileW` now runs on — and its post-logon win32k/UI
+/// work grows ~2.5x (post-failure trace 788 -> 1744 lines). The boot's quiesce moved 282s -> 305s
+/// with the tree alone (still green), and past `CopyDirectory` it no longer reaches quiesce inside
+/// the gate's ~555s TCG budget at all (RUNEXIT=124). That budget — not the profile source — is now
+/// the binding constraint on advancing winlogon, so it ships OFF rather than red.
+///
+/// Everything it needs is in place and verified; turning it on is one `bool`.
 pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = false;
+
+/// The staged tree's FAT root name, and its mount point on the writable volume.
+pub(crate) const STAGED_PROFILES_DIR: &[u8] = b"Profiles";
+pub(crate) const PROFILES_VOLUME_ROOT: &str = r"\??\C:\Profiles";
+/// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
+/// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
+pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
+pub(crate) const DEFAULT_USER_PROBE_FILE: &str =
+    r"\??\C:\Profiles\Default User\My Documents\livecd_start.cmd";
+
+/// Directories / files / content bytes really materialised from the staged `\Profiles` tree.
+pub(crate) static PROFILE_SOURCE_DIRS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_SOURCE_FILES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// A REAL staged file's content, read back off the LIVE volume (`livecd_start.cmd` == `@start %1`).
+pub(crate) static PROFILE_SOURCE_PROBE_OK: AtomicU64 = AtomicU64::new(0);
+/// Directory entries `Default User` really enumerates (`.`, `..` + its 15 real children), read back
+/// through the SAME `Zw*` record encoder `NtQueryDirectoryFile` — and so `FindFirstFileW` — uses.
+pub(crate) static PROFILE_SOURCE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 /// The mounted writable volume. `None` until the first path resolves into it (the volume is
 /// created lazily so a boot that never writes pays nothing).
@@ -79,6 +118,11 @@ pub(crate) static OVERLAY_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_BYTES_READ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_DIR_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_DIR_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Why an `NtQueryDirectoryFile` was refused BEFORE it reached a volume, so the enumeration
+/// frontier is measured rather than guessed (both statuses map to `GetLastError() == 998`).
+pub(crate) static QUERY_DIR_MISALIGNED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static QUERY_DIR_IOSB_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static QUERY_DIR_BUFFER_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_SET_INFO: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_ATTR_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OVERLAY_ATTR_HITS: AtomicU64 = AtomicU64::new(0);
@@ -95,16 +139,28 @@ pub(crate) static PROFILE_ROOT_CREATED: AtomicU64 = AtomicU64::new(0);
 /// create succeeded AND `ProfileList\DefaultUserProfile` read back from the real SOFTWARE hive.
 pub(crate) static PROFILE_USER_DIR_CREATED: AtomicU64 = AtomicU64::new(0);
 
-/// Classify a freshly created writable-volume DIRECTORY as the profiles root / a per-user profile
+/// ★ …and winlogon's `CreateDirectoryW(szProfilesPath)` genuinely COLLIDING with a profiles root
+/// that already exists — `profile.c:929`'s `ERROR_ALREADY_EXISTS` arm, which is what the call
+/// returns on any installed system whose setup already made the profiles directory. Counted only
+/// for a `FILE_CREATE` that the volume really refused with `STATUS_OBJECT_NAME_COLLISION`, so it is
+/// evidence of REAL volume state, never of a fabricated success.
+pub(crate) static PROFILE_ROOT_COLLIDED: AtomicU64 = AtomicU64::new(0);
+
+/// Classify winlogon's writable-volume DIRECTORY create as the profiles root / a per-user profile
 /// directory, for the winlogon profile-creation spec. Pure path shape, no name allow-list.
-pub(crate) fn note_directory_created(pi: usize, relative: &[u8]) {
+/// `created` distinguishes a `FILE_CREATED` from a real `STATUS_OBJECT_NAME_COLLISION` refusal.
+pub(crate) fn note_directory_create(pi: usize, relative: &[u8], created: bool) {
     if pi != 2 {
         return;
     }
     let depth = relative.iter().filter(|byte| **byte == b'\\').count();
     if relative == b"profiles" {
-        PROFILE_ROOT_CREATED.fetch_add(1, Ordering::Relaxed);
-    } else if depth == 1 && relative.starts_with(b"profiles\\") {
+        if created {
+            PROFILE_ROOT_CREATED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PROFILE_ROOT_COLLIDED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if created && depth == 1 && relative.starts_with(b"profiles\\") {
         PROFILE_USER_DIR_CREATED.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -123,7 +179,7 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
         let fs = slot.as_mut().unwrap();
         selftest(fs);
         if PROVISION_DEFAULT_USER_PROFILE {
-            fs.provision_directory(r"\??\C:\profiles\Default User");
+            provision_staged_profiles(fs);
         }
     }
     slot.as_mut()
@@ -274,8 +330,61 @@ pub(crate) unsafe fn query_directory(
     OVERLAY_DIR_QUERIES.fetch_add(1, Ordering::Relaxed);
     if result.status == nt_fs::STATUS_SUCCESS {
         OVERLAY_DIR_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    } else if DIR_QUERY_MISS_TRACED.fetch_add(1, Ordering::Relaxed) < 4 {
+        print_str(b"[writable-fs] dir-query MISS status=0x");
+        print_hex(result.status);
+        print_str(b" class=");
+        print_u64(information_class as u64);
+        print_str(b" single=");
+        print_u64(return_single_entry as u64);
+        print_str(b" restart=");
+        print_u64(restart_scan as u64);
+        print_str(b" out-len=");
+        print_u64(output.len() as u64);
+        print_str(b" pattern=\"");
+        for &unit in pattern.unwrap_or(&[]).iter().take(32) {
+            debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+        }
+        print_str(b"\"\n");
     }
     result
+}
+
+static DIR_QUERY_MISS_TRACED: AtomicU64 = AtomicU64::new(0);
+static DIR_REFUSAL_TRACED: AtomicU64 = AtomicU64::new(0);
+
+/// Trace (a bounded number of times) an `NtQueryDirectoryFile` — its entry arguments, and any
+/// refusal the executive made BEFORE the call reached a volume, with everything needed to tell the
+/// refusals apart (they all map to the same `GetLastError()` values, so guessing is not an option).
+pub(crate) fn trace_dir_refusal(
+    why: &[u8],
+    pi: usize,
+    handle: u64,
+    iosb: u64,
+    output: u64,
+    length: usize,
+    class: u64,
+) {
+    if DIR_REFUSAL_TRACED.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    print_str(b"[query-dir] ");
+    print_str(why);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" handle=0x");
+    print_hex(handle as u32);
+    print_str(b" iosb=0x");
+    print_hex((iosb >> 32) as u32);
+    print_hex(iosb as u32);
+    print_str(b" out=0x");
+    print_hex((output >> 32) as u32);
+    print_hex(output as u32);
+    print_str(b" len=");
+    print_u64(length as u64);
+    print_str(b" class=");
+    print_u64(class);
+    print_str(b"\n");
 }
 
 /// `NtDuplicateObject` on a writable-volume file object.
@@ -296,6 +405,167 @@ pub(crate) unsafe fn close(file_id: u64) {
             OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// The genuine `\reactos\system32\config\default` bytes, borrowed from the live DEFHIVEBUF mapping
+/// the isolated storage host filled BY PATH. `None` when the host did not report a size.
+///
+/// # Safety
+/// DEFHIVEBUF is a fixed, executive-lifetime mapping; the reported size is bounded by its window.
+pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
+    let size = DEFAULT_HIVE_SIZE.load(Ordering::Relaxed) as usize;
+    if size == 0 || size > (DEFHIVEBUF_FRAMES * 0x1000) as usize {
+        return None;
+    }
+    Some(core::slice::from_raw_parts(
+        DEFHIVEBUF_VADDR as *const u8,
+        size,
+    ))
+}
+
+/// MATERIALISE the ISO's staged `\Profiles` tree onto the writable volume.
+///
+/// This is a real recursive copy off the READ-ONLY FAT volume — the same `fat_visit_directory` /
+/// `dir_find_lfn` / `fat_read_file` reader every hosted binary is loaded with — into the writable
+/// volume's ordinary create surface. Every directory and every file byte comes from the image;
+/// nothing is invented. The result is then read back the way a hosted process reads it (by path,
+/// by content and by ENUMERATION) so the "real, enumerable tree" claim is measured, not asserted.
+unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
+    let Some(fat) = crate::fs_loader::exec_fs() else {
+        print_str(b"[profile-source] no FAT volume -> \\Profiles NOT materialised\n");
+        return;
+    };
+    let Some((root_cluster, _, attr)) =
+        crate::fs_loader::dir_find_lfn(&fat, fat.root_cl, STAGED_PROFILES_DIR)
+    else {
+        print_str(b"[profile-source] ::Profiles ABSENT from the image -> not materialised\n");
+        return;
+    };
+    if attr & 0x10 == 0 {
+        return;
+    }
+    // Explicit DFS stack (no recursion in the executive): (fat cluster, volume path of the dir).
+    const MAX_DEPTH: u32 = 12;
+    let mut stack: alloc::vec::Vec<(u32, alloc::string::String, u32)> = alloc::vec::Vec::new();
+    let _ = fs.provision_directory(PROFILES_VOLUME_ROOT);
+    stack.push((root_cluster, alloc::string::String::from(PROFILES_VOLUME_ROOT), 0));
+    let (mut dirs, mut files, mut bytes) = (0u64, 0u64, 0u64);
+    while let Some((cluster, base, depth)) = stack.pop() {
+        // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
+        // drive the sector cache, so the names are captured before any further reads.
+        let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        crate::fs_loader::fat_visit_directory(&fat, cluster, |entry| {
+            let mut name = alloc::string::String::new();
+            for &unit in entry.name() {
+                if unit == 0 || unit > 0x7f {
+                    return true; // non-ASCII name: skip it rather than mangle it
+                }
+                name.push(unit as u8 as char);
+            }
+            if !name.is_empty() && name != "." && name != ".." {
+                names.push(name);
+            }
+            true
+        });
+        for name in names {
+            let Some((child, size, child_attr)) =
+                crate::fs_loader::dir_find_lfn(&fat, cluster, name.as_bytes())
+            else {
+                continue;
+            };
+            let mut path = base.clone();
+            path.push('\\');
+            path.push_str(&name);
+            if child_attr & 0x10 != 0 {
+                if fs.provision_directory(&path) {
+                    dirs += 1;
+                    if depth + 1 < MAX_DEPTH {
+                        stack.push((child, path, depth + 1));
+                    }
+                }
+            } else if size as usize <= MAX_STAGED_FILE {
+                let mut data = alloc::vec::Vec::new();
+                if data.try_reserve_exact(size as usize).is_err() {
+                    continue;
+                }
+                data.resize(size as usize, 0);
+                let got = if size == 0 {
+                    0
+                } else {
+                    crate::fs_loader::fat_read_file(&fat, child, size, data.as_mut_ptr() as u64)
+                };
+                if got == size && fs.provision_file(&path, &data) {
+                    files += 1;
+                    bytes += size as u64;
+                }
+            }
+        }
+    }
+    PROFILE_SOURCE_DIRS.store(dirs, Ordering::Relaxed);
+    PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
+    PROFILE_SOURCE_BYTES.store(bytes, Ordering::Relaxed);
+    // Read a REAL staged file back off the live volume, by content.
+    if fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1") {
+        PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
+    }
+    PROFILE_SOURCE_ENTRIES.store(count_entries(fs, DEFAULT_USER_PROFILE_DIR), Ordering::Relaxed);
+    print_str(b"[profile-source] materialised ::Profiles onto the writable volume: dirs=");
+    print_u64(dirs);
+    print_str(b" files=");
+    print_u64(files);
+    print_str(b" bytes=");
+    print_u64(bytes);
+    print_str(b" `Default User` dir-entries=");
+    print_u64(PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed));
+    print_str(b" probe-file-content-ok=");
+    print_u64(PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
+/// The largest staged profile file the executive will materialise (the whole tree is ~360 bytes;
+/// this is a guard against a future tree dragging bulk data onto the bump heap).
+const MAX_STAGED_FILE: usize = 256 * 1024;
+
+/// How many records a directory really enumerates through the `Zw*` surface (`.`, `..`, children) —
+/// the same encoder `NtQueryDirectoryFile`, and therefore `FindFirstFileW`, goes through.
+fn count_entries(fs: &mut nt_fs::FileSystem, path: &str) -> u64 {
+    let dir = fs.zw_create_file(
+        path,
+        nt_fs::FILE_READ_DATA,
+        0,
+        0,
+        nt_fs::FILE_OPEN,
+        nt_fs::FILE_DIRECTORY_FILE,
+    );
+    if dir.status != nt_fs::STATUS_SUCCESS {
+        return 0;
+    }
+    let mut buffer = [0u8; 4096];
+    let result = fs.zw_query_directory_file(
+        dir.handle,
+        nt_fs::FILE_DIRECTORY_INFORMATION,
+        false,
+        None,
+        true,
+        &mut buffer,
+    );
+    let mut names = 0u64;
+    if result.status == nt_fs::STATUS_SUCCESS {
+        let mut offset = 0usize;
+        loop {
+            if offset + 64 > result.information {
+                break;
+            }
+            names += 1;
+            let next = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+            if next == 0 {
+                break;
+            }
+            offset += next;
+        }
+    }
+    fs.zw_close(dir.handle);
+    names
 }
 
 /// Mount-time PROOF that this is a real filesystem, exercised through the same `Zw*` surface the
