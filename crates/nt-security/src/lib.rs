@@ -20,11 +20,13 @@ mod token;
 mod token_info;
 
 pub use access::{
-    access_check, privilege_check, AccessCheckResult, AccessMask, Ace, AceType, Acl,
+    access_check, map_token_access, privilege_check, AccessCheckResult, AccessMask, Ace, AceType, Acl,
     GenericMapping, ProcessorMode, SecurityDescriptor, ACCESS_SYSTEM_SECURITY, DELETE, GENERIC_ALL,
     GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, MAXIMUM_ALLOWED, READ_CONTROL,
     STATUS_ACCESS_DENIED, STATUS_PRIVILEGE_NOT_HELD, STATUS_SUCCESS, SYNCHRONIZE, WRITE_DAC,
-    WRITE_OWNER,
+    WRITE_OWNER, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ADJUST_SESSIONID, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_EXECUTE,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_READ, TOKEN_WRITE,
 };
 pub use create_token::{
     capture_token, ClientMemory, CapturedToken, CreateTokenArgs, MAX_CAPTURED_GROUPS,

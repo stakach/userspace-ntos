@@ -24,6 +24,56 @@ pub const GENERIC_WRITE: AccessMask = 0x4000_0000;
 pub const GENERIC_READ: AccessMask = 0x8000_0000;
 const GENERIC_MASK: AccessMask = GENERIC_ALL | GENERIC_EXECUTE | GENERIC_WRITE | GENERIC_READ;
 
+// Token object rights and generic mapping (`SepTokenMapping` in ReactOS).
+pub const TOKEN_ASSIGN_PRIMARY: AccessMask = 0x0000_0001;
+pub const TOKEN_DUPLICATE: AccessMask = 0x0000_0002;
+pub const TOKEN_IMPERSONATE: AccessMask = 0x0000_0004;
+pub const TOKEN_QUERY: AccessMask = 0x0000_0008;
+pub const TOKEN_QUERY_SOURCE: AccessMask = 0x0000_0010;
+pub const TOKEN_ADJUST_PRIVILEGES: AccessMask = 0x0000_0020;
+pub const TOKEN_ADJUST_GROUPS: AccessMask = 0x0000_0040;
+pub const TOKEN_ADJUST_DEFAULT: AccessMask = 0x0000_0080;
+pub const TOKEN_ADJUST_SESSIONID: AccessMask = 0x0000_0100;
+pub const TOKEN_READ: AccessMask = READ_CONTROL | TOKEN_QUERY;
+pub const TOKEN_WRITE: AccessMask = READ_CONTROL
+    | TOKEN_ADJUST_PRIVILEGES
+    | TOKEN_ADJUST_GROUPS
+    | TOKEN_ADJUST_DEFAULT;
+pub const TOKEN_EXECUTE: AccessMask = READ_CONTROL;
+pub const TOKEN_ALL_ACCESS: AccessMask = DELETE
+    | READ_CONTROL
+    | WRITE_DAC
+    | WRITE_OWNER
+    | TOKEN_ASSIGN_PRIMARY
+    | TOKEN_DUPLICATE
+    | TOKEN_IMPERSONATE
+    | TOKEN_QUERY
+    | TOKEN_QUERY_SOURCE
+    | TOKEN_ADJUST_PRIVILEGES
+    | TOKEN_ADJUST_GROUPS
+    | TOKEN_ADJUST_DEFAULT
+    | TOKEN_ADJUST_SESSIONID;
+
+/// Expand a token handle's requested generic access into concrete granted rights. Token object
+/// security descriptors are not modelled yet, so `MAXIMUM_ALLOWED` grants the complete token mask,
+/// matching the process/thread object policy used by the executive.
+pub fn map_token_access(desired: AccessMask) -> AccessMask {
+    let mut mapped = desired & !(GENERIC_MASK | MAXIMUM_ALLOWED);
+    if desired & GENERIC_READ != 0 {
+        mapped |= TOKEN_READ;
+    }
+    if desired & GENERIC_WRITE != 0 {
+        mapped |= TOKEN_WRITE;
+    }
+    if desired & GENERIC_EXECUTE != 0 {
+        mapped |= TOKEN_EXECUTE;
+    }
+    if desired & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+        mapped |= TOKEN_ALL_ACCESS;
+    }
+    mapped
+}
+
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;

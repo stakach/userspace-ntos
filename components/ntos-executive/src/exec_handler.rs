@@ -3681,6 +3681,12 @@ impl ExecNtHandler {
             .pm
             .lookup_handle(source_pid, source_handle)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let desired_access = desired_access.map(|access| match object {
+            nt_process::HandleObject::TokenObject(_) | nt_process::HandleObject::Token(_) => {
+                nt_security::map_token_access(access)
+            }
+            _ => access,
+        });
         let handle = self.pm.duplicate_handle_with_access(
             source_pid,
             source_handle,
@@ -3739,7 +3745,7 @@ impl ExecNtHandler {
         let handle = match self.pm.insert_handle(
             caller_pid,
             nt_process::HandleObject::TokenObject(token),
-            desired_access,
+            nt_security::map_token_access(desired_access),
         ) {
             Ok(handle) => handle,
             Err(_) => {

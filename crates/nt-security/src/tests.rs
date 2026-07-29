@@ -15,6 +15,22 @@ fn file_mapping() -> GenericMapping {
 }
 
 #[test]
+fn token_generic_access_mapping_matches_nt_object_policy() {
+    assert_eq!(map_token_access(TOKEN_QUERY), TOKEN_QUERY);
+    assert_eq!(map_token_access(GENERIC_READ), TOKEN_READ);
+    assert_eq!(map_token_access(GENERIC_WRITE), TOKEN_WRITE);
+    assert_eq!(map_token_access(GENERIC_EXECUTE), TOKEN_EXECUTE);
+    assert_eq!(map_token_access(GENERIC_ALL), TOKEN_ALL_ACCESS);
+    assert_eq!(map_token_access(MAXIMUM_ALLOWED), TOKEN_ALL_ACCESS);
+    assert_eq!(TOKEN_ALL_ACCESS, 0x000f_01ff);
+
+    let requested = GENERIC_READ | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY;
+    let granted = map_token_access(requested);
+    assert_eq!(granted, TOKEN_READ | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY);
+    assert_eq!(granted & (GENERIC_READ | MAXIMUM_ALLOWED), 0);
+}
+
+#[test]
 fn sid_wellknown_and_sddl() {
     assert_eq!(Sid::administrators().to_sddl(), "S-1-5-32-544");
     assert_eq!(Sid::local_system().to_sddl(), "S-1-5-18");
