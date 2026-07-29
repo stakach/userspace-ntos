@@ -366,8 +366,7 @@ impl ExecNtHandler {
             loop_ctx: None,
             spawn_request: false,
             winlogon_spawn_request: false,
-            services_spawn_request: false,
-            lsass_spawn_request: false,
+            exe_spawn_request: None,
             process_spawn_desired_access: 0,
             sm_spawn_request: false,
             wl_spawn_request: 0,
@@ -5618,6 +5617,11 @@ impl ExecNtHandler {
             // table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
                 let mut closed = false;
+                if let Some(loop_ctx) = self.loop_ctx {
+                    unsafe {
+                        let _ = (&mut *loop_ctx.exe_images).close(self.pi, args[0]);
+                    }
+                }
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
                     closed = self.close_process_handle(pid, args[0]);
                 }
@@ -10493,14 +10497,12 @@ impl ExecNtHandler {
                             (&*ctx.winlogon_pe)
                                 .as_ref()
                                 .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.pi == 2 && args[0] == *ctx.services_file_handle {
-                            (&*ctx.services_pe)
-                                .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.pi == 2 && args[0] == *ctx.lsass_file_handle {
-                            (&*ctx.lsass_pe)
-                                .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else if let Some(index) =
+                            (&*ctx.exe_images).index_for_file(self.pi, args[0])
+                        {
+                            (&*ctx.exe_images)
+                                .get(index)
+                                .map(|slot| (slot.metadata.file_size, false))
                         } else {
                             None
                         }
@@ -12483,10 +12485,42 @@ impl ExecNtHandler {
                         *ctx.winlogon_file_handle = h; // for NtCreateSection
                     }
                     if is_services {
-                        *ctx.services_file_handle = h; // for NtCreateSection (winlogon → services.exe)
+                        if let Some(pe) = (&*ctx.services_pe).as_ref() {
+                            let (major, minor) = pe.subsystem_version();
+                            let _ = (&mut *ctx.exe_images).open(
+                                self.pi,
+                                b"services.exe",
+                                h,
+                                nt_exe_image::ImageMetadata {
+                                    pool_va: ctx.services_pool_va,
+                                    file_size: pe.bytes().len() as u64,
+                                    image_size: pe.size_of_image() as u64,
+                                    entry_rva: pe.entry_point_rva(),
+                                    subsystem: pe.subsystem(),
+                                    subsystem_major: major,
+                                    subsystem_minor: minor,
+                                },
+                            );
+                        }
                     }
                     if is_lsass {
-                        *ctx.lsass_file_handle = h; // for NtCreateSection (winlogon → lsass.exe)
+                        if let Some(pe) = (&*ctx.lsass_pe).as_ref() {
+                            let (major, minor) = pe.subsystem_version();
+                            let _ = (&mut *ctx.exe_images).open(
+                                self.pi,
+                                b"lsass.exe",
+                                h,
+                                nt_exe_image::ImageMetadata {
+                                    pool_va: ctx.lsass_pool_va,
+                                    file_size: pe.bytes().len() as u64,
+                                    image_size: pe.size_of_image() as u64,
+                                    entry_rva: pe.entry_point_rva(),
+                                    subsystem: pe.subsystem(),
+                                    subsystem_major: major,
+                                    subsystem_minor: minor,
+                                },
+                            );
+                        }
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
@@ -12574,47 +12608,24 @@ impl ExecNtHandler {
                         info[0x26..0x28].copy_from_slice(&major.to_le_bytes());
                         (info, b"winlogon.exe" as &[u8])
                     })
-                } else if self.pi == 2
-                    && *ctx.services_section_handle != 0
-                    && sect == *ctx.services_section_handle
+                } else if let Some(index) =
+                    (&*ctx.exe_images).index_for_section(self.pi, sect)
                 {
-                    // winlogon's kernel32 CreateProcessInternalW queries SectionImageInformation on the
-                    // services.exe SEC_IMAGE (for the entry/stack/subsystem) before NtCreateProcessEx.
-                    // Unlike smss's native path, kernel32 VALIDATES SubSystemType (must be GUI/CUI, not
-                    // NATIVE — proc.c:3504) + SubSystemVersion (>= 3.10 — BasepIsImageVersionOk), so
-                    // patch the image_info's defaults (SubSystemType@0x20, MinorVersion@0x24,
-                    // MajorVersion@0x26) with services.exe's REAL PE values.
-                    (*ctx.services_pe).as_ref().map(|p| {
+                    (&*ctx.exe_images).get(index).map(|slot| {
+                        let metadata = slot.metadata;
                         let mut info = nt_dll_registry::image_info(
                             PE_LOAD_BASE,
-                            p.entry_point_rva(),
-                            p.size_of_image(),
+                            metadata.entry_rva,
+                            metadata.image_size as u32,
                             false,
                         );
-                        let (maj, min) = p.subsystem_version();
-                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
-                        info[0x24..0x26].copy_from_slice(&min.to_le_bytes());
-                        info[0x26..0x28].copy_from_slice(&maj.to_le_bytes());
-                        (info, b"services.exe" as &[u8])
-                    })
-                } else if self.pi == 2
-                    && *ctx.lsass_section_handle != 0
-                    && sect == *ctx.lsass_section_handle
-                {
-                    // winlogon's kernel32 queries SectionImageInformation on the lsass.exe SEC_IMAGE
-                    // before NtCreateProcessEx. Same subsystem/version patch as services.
-                    (*ctx.lsass_pe).as_ref().map(|p| {
-                        let mut info = nt_dll_registry::image_info(
-                            PE_LOAD_BASE,
-                            p.entry_point_rva(),
-                            p.size_of_image(),
-                            false,
-                        );
-                        let (maj, min) = p.subsystem_version();
-                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
-                        info[0x24..0x26].copy_from_slice(&min.to_le_bytes());
-                        info[0x26..0x28].copy_from_slice(&maj.to_le_bytes());
-                        (info, b"lsass.exe" as &[u8])
+                        info[0x20..0x24]
+                            .copy_from_slice(&(metadata.subsystem as u32).to_le_bytes());
+                        info[0x24..0x26]
+                            .copy_from_slice(&metadata.subsystem_minor.to_le_bytes());
+                        info[0x26..0x28]
+                            .copy_from_slice(&metadata.subsystem_major.to_le_bytes());
+                        (info, slot.leaf())
                     })
                 } else {
                     None
@@ -12694,21 +12705,18 @@ impl ExecNtHandler {
                     print_hex(h as u32);
                     print_str(b"\n");
                 }
-                // The services.exe SEC_IMAGE is created by WINLOGON (pi 2) — its Win32 CreateProcessW.
-                if self.pi == 2 && *ctx.services_file_handle != 0 && sec_file == *ctx.services_file_handle {
-                    *ctx.services_section_handle = h;
-                    SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for services.exe -> handle 0x");
-                    print_hex((h >> 32) as u32);
-                    print_hex(h as u32);
-                    print_str(b"\n");
-                }
-                // The lsass.exe SEC_IMAGE is also created by WINLOGON (pi 2) — its StartLsass
-                // CreateProcessW. Distinct dense file handle (append-only) → no alias with services.
-                if self.pi == 2 && *ctx.lsass_file_handle != 0 && sec_file == *ctx.lsass_file_handle {
-                    *ctx.lsass_section_handle = h;
-                    LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for lsass.exe -> handle 0x");
+                if let Ok(index) =
+                    (&mut *ctx.exe_images).create_section(self.pi, sec_file, h)
+                {
+                    let leaf = (&*ctx.exe_images).get(index).unwrap().leaf();
+                    if leaf == b"services.exe" {
+                        SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
+                    } else if leaf == b"lsass.exe" {
+                        LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
+                    }
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                    print_str(leaf);
+                    print_str(b" -> handle 0x");
                     print_hex((h >> 32) as u32);
                     print_hex(h as u32);
                     print_str(b"\n");
@@ -12957,12 +12965,13 @@ impl ExecNtHandler {
                 if self.pi == 2 {
                     print_str(b"[wl-createproc] pi=2 sect=0x");
                     print_hex(sect as u32);
-                    print_str(b" services_sect=0x");
-                    print_hex(*ctx.services_section_handle as u32);
-                    print_str(b" lsass_sect=0x");
-                    print_hex(*ctx.lsass_section_handle as u32);
-                    print_str(b" lsass_pe=");
-                    print_u64((*ctx.lsass_pe).is_some() as u64);
+                    print_str(b" exe-slot=");
+                    print_u64(
+                        (&*ctx.exe_images)
+                            .index_for_section(self.pi, sect)
+                            .map(|index| index as u64 + 1)
+                            .unwrap_or(0),
+                    );
                     print_str(b"\n");
                 }
                 // NtCreateProcess(csrss/winlogon) is issued ONLY by smss (pi 0); scope so a dense
@@ -12983,26 +12992,34 @@ impl ExecNtHandler {
                     self.process_spawn_desired_access = args[1] as u32;
                     self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
                     0
-                } else if self.pi == 2
-                    && *ctx.services_section_handle != 0
-                    && sect == *ctx.services_section_handle
-                    && (*ctx.services_pe).is_some()
-                {
-                    // winlogon's Win32 NtCreateProcessEx(50) StartServicesManager — loop spawns
-                    // services.exe (4th process). SSN 50 routes here (registered in the native table),
-                    // so the spawn body lives in the loop's flag-consumption block (mirrors winlogon).
-                    self.process_spawn_desired_access = args[1] as u32;
-                    self.services_spawn_request = true;
-                    0
-                } else if self.pi == 2
-                    && *ctx.lsass_section_handle != 0
-                    && sect == *ctx.lsass_section_handle
-                    && (*ctx.lsass_pe).is_some()
-                {
-                    // winlogon's Win32 NtCreateProcessEx(50) StartLsass — loop spawns lsass.exe (5th).
-                    self.process_spawn_desired_access = args[1] as u32;
-                    self.lsass_spawn_request = true;
-                    0
+                } else if self.pi == 2 {
+                    let table = &mut *ctx.exe_images;
+                    let child_pi = table
+                        .index_for_section(self.pi, sect)
+                        .and_then(|index| table.get(index))
+                        .and_then(|slot| match slot.leaf() {
+                            b"services.exe" => Some(3),
+                            b"lsass.exe" => Some(4),
+                            _ => None,
+                        });
+                    if let Some(child_pi) = child_pi {
+                        match table.reserve_spawn(
+                            self.pi,
+                            sect,
+                            child_pi,
+                            args[1] as u32,
+                            get_recv_mr(9),
+                        ) {
+                            Ok(request) => {
+                                self.exe_spawn_request = Some(request);
+                                0
+                            }
+                            Err(_) => 0xC000_000D,
+                        }
+                    } else {
+                        self.stop = true;
+                        0xC000_0002
+                    }
                 } else {
                     self.stop = true; // not a known section / not staged -> clean stop
                     0xC0000002

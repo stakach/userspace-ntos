@@ -66,6 +66,7 @@ nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 nt-process = { path = "../../crates/nt-process" }
 # Generic DLL registry — host-tested name/handle/VA decisions for demand-loaded shared-text DLLs.
 nt-dll-registry = { path = "../../crates/nt-dll-registry" }
+nt-exe-image = { path = "../../crates/nt-exe-image" }
 nt-loader-trace = { path = "../../crates/nt-loader-trace" }
 nt-delay-execution = { path = "../../crates/nt-delay-execution" }
 nt-thread-start = { path = "../../crates/nt-thread-start" }

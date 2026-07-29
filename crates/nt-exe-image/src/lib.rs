@@ -11,6 +11,7 @@ pub const MAX_EXE_LEAF: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageMetadata {
     pub pool_va: u64,
+    pub file_size: u64,
     pub image_size: u64,
     pub entry_rva: u32,
     pub subsystem: u16,
@@ -71,6 +72,7 @@ pub struct ImageSlot {
 
 const EMPTY_METADATA: ImageMetadata = ImageMetadata {
     pool_va: 0,
+    file_size: 0,
     image_size: 0,
     entry_rva: 0,
     subsystem: 0,
@@ -142,7 +144,7 @@ impl<const N: usize> ImageTable<N> {
         if file_handle == 0 {
             return Err(ImageError::InvalidHandle);
         }
-        if metadata.pool_va == 0 || metadata.image_size == 0 {
+        if metadata.pool_va == 0 || metadata.file_size == 0 || metadata.image_size == 0 {
             return Err(ImageError::InvalidMetadata);
         }
         let leaf = canonical_exe_leaf(path).ok_or(ImageError::InvalidPath)?;
@@ -370,6 +372,7 @@ mod tests {
 
     const META: ImageMetadata = ImageMetadata {
         pool_va: 0x1000_1500_0000,
+        file_size: 0x28_000,
         image_size: 0x50_000,
         entry_rva: 0x1234,
         subsystem: 2,

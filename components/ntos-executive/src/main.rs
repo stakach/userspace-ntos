@@ -9671,14 +9671,13 @@ struct ExecLoopCtx {
     winlogon_file_handle: *mut u64,
     winlogon_section_handle: *mut u64,
     winlogon_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// services.exe (4th hosted process, spawned by winlogon's Win32 CreateProcessW): its file/section
-    /// handles (set when winlogon (pi 2) opens+creates the services.exe SEC_IMAGE) + the parsed PE.
-    services_file_handle: *mut u64,
-    services_section_handle: *mut u64,
+    /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
+    /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
+    exe_images: *mut nt_exe_image::ImageTable<8>,
+    services_pool_va: u64,
     services_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// lsass.exe (5th hosted process): file/section handles + parsed PE (winlogon (pi 2) opens/creates).
-    lsass_file_handle: *mut u64,
-    lsass_section_handle: *mut u64,
+    /// lsass.exe's preloaded PE and backing pool address; migrated through `exe_images` too.
+    lsass_pool_va: u64,
     lsass_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
@@ -9828,14 +9827,9 @@ struct ExecNtHandler {
     /// Like `spawn_request` but for the 3rd hosted process: NtCreateProcess recognised winlogon's
     /// SEC_IMAGE section, so the loop spawns winlogon (badge WINLOGON_BADGE) after dispatch.
     winlogon_spawn_request: bool,
-    /// Like `spawn_request` but for the 4th hosted process: winlogon's Win32 `NtCreateProcessEx`
-    /// (SSN 50, `StartServicesManager`) recognised the services.exe SEC_IMAGE section, so the loop
-    /// spawns services (badge SERVICES_BADGE) after dispatch.
-    services_spawn_request: bool,
-    /// Like `spawn_request` but for the 5th hosted process: winlogon's Win32 `NtCreateProcessEx`
-    /// (SSN 50, `StartLsass`) recognised the lsass.exe SEC_IMAGE section, so the loop spawns lsass
-    /// (badge LSASS_BADGE) after dispatch.
-    lsass_spawn_request: bool,
+    /// Generic Win32-child spawn reservation produced by the executable image state table. The
+    /// loop consumes it after dispatch, then publishes or rolls the reservation back.
+    exe_spawn_request: Option<nt_exe_image::SpawnRequest>,
     /// Access requested by the `NtCreateProcess` call that raised one of the spawn signals above.
     /// The loop maps generic bits and publishes the typed child handle with this grant.
     process_spawn_desired_access: u32,

@@ -332,15 +332,10 @@ pub(crate) unsafe fn service_sec_image(
     let mut winlogon_file_handle = 0u64;
     let mut winlogon_section_handle = 0u64;
     let mut winlogon_process_handle = 0u64;
-    // services.exe (the 4th hosted process, winlogon's Win32 CreateProcessW target): the file/section
-    // handles winlogon opens+creates for it. Same roles as the csrss_/winlogon_ trios; `services_pe`
-    // is parsed above. `services_process_handle` is set by the NtCreateProcessEx spawn (badge 4).
-    let mut services_file_handle = 0u64;
-    let mut services_section_handle = 0u64;
+    // Generic owner-local file/section/spawn state for Win32 children. services/lsass migrate first;
+    // userinit and later explorer use the same bounded state machine once runtime PE loading lands.
+    let mut exe_images = nt_exe_image::ImageTable::<8>::new();
     let mut services_process_handle = 0u64;
-    // lsass.exe (the 5th hosted process, winlogon's StartLsass CreateProcessW target).
-    let mut lsass_file_handle = 0u64;
-    let mut lsass_section_handle = 0u64;
     let mut lsass_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
@@ -3102,8 +3097,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
-                nt_handler.services_spawn_request = false;
-                nt_handler.lsass_spawn_request = false;
+                nt_handler.exe_spawn_request = None;
                 nt_handler.process_spawn_desired_access = 0;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = 0;
@@ -3161,11 +3155,10 @@ pub(crate) unsafe fn service_sec_image(
                     winlogon_file_handle: &mut winlogon_file_handle as *mut u64,
                     winlogon_section_handle: &mut winlogon_section_handle as *mut u64,
                     winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    services_file_handle: &mut services_file_handle as *mut u64,
-                    services_section_handle: &mut services_section_handle as *mut u64,
+                    exe_images: &mut exe_images as *mut nt_exe_image::ImageTable<8>,
+                    services_pool_va: services_va,
                     services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    lsass_file_handle: &mut lsass_file_handle as *mut u64,
-                    lsass_section_handle: &mut lsass_section_handle as *mut u64,
+                    lsass_pool_va: lsass_va,
                     lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
@@ -3740,15 +3733,15 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                     WINLOGON_SPAWNED.store(1, Ordering::Relaxed);
                 }
-                // winlogon's Win32 NtCreateProcessEx(50) StartServicesManager — spawn services.exe (the
-                // 4th hosted process). SSN 50 is table-routed to exec_handler's NtCreateProcess handler,
-                // which validated the services.exe SEC_IMAGE section + set services_spawn_request; the
-                // actual spawn lives here (it needs fault_ep + procs[]/mirrors — loop-resident). Mirrors
-                // the winlogon_spawn_request block above.
-                if nt_handler.services_spawn_request
+                // The generic Win32-child lane reserved a services.exe spawn after validating the
+                // owner-local file -> section -> process transition in `exe_images`.
+                if nt_handler
+                    .exe_spawn_request
+                    .is_some_and(|request| request.child_pi == 3)
                     && SERVICES_SPAWNED.swap(1, Ordering::Relaxed) == 0
                     && services_pe.is_some()
                 {
+                    let request = nt_handler.exe_spawn_request.unwrap();
                     let sf_c = mint_badged(fault_ep, SERVICES_BADGE);
                     let spe = services_pe.as_ref().unwrap();
                     const SERVICES_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\services.exe";
@@ -3771,7 +3764,7 @@ pub(crate) unsafe fn service_sec_image(
                                 wl_pid,
                                 nt_process::HandleObject::Process(sv_pid),
                                 nt_process::map_process_access(
-                                    nt_handler.process_spawn_desired_access,
+                                    request.desired_access,
                                 ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
@@ -3787,32 +3780,30 @@ pub(crate) unsafe fn service_sec_image(
                             g
                         }
                     };
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
+                    let published = nt_handler.publish_created_process(
+                        request.process_handle_out,
                         services_process_handle,
                         SMSS_PEB_VA,
-                    ) {
+                    );
+                    if !published {
                         result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        let _ = exe_images.rollback_spawn(request);
+                    } else if exe_images.publish(request, services_process_handle).is_err() {
+                        result = 0xC000_000D; // STATUS_INVALID_PARAMETER
                     }
                     print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
                     print_hex((services_process_handle >> 32) as u32);
                     print_hex(services_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                } else if nt_handler.services_spawn_request && services_process_handle != 0 {
-                    // Idempotent re-create: return the same handle.
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
-                        services_process_handle,
-                        SMSS_PEB_VA,
-                    ) {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
                 }
-                // winlogon's StartLsass NtCreateProcessEx(50) — spawn lsass.exe (the 5th hosted process).
-                if nt_handler.lsass_spawn_request
+                // The same generic lane for lsass.exe (the fifth hosted process).
+                if nt_handler
+                    .exe_spawn_request
+                    .is_some_and(|request| request.child_pi == 4)
                     && LSASS_SPAWNED.swap(1, Ordering::Relaxed) == 0
                     && lsass_pe.is_some()
                 {
+                    let request = nt_handler.exe_spawn_request.unwrap();
                     let lf_c = mint_badged(fault_ep, LSASS_BADGE);
                     let lpe = lsass_pe.as_ref().unwrap();
                     const LSASS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\lsass.exe";
@@ -3835,7 +3826,7 @@ pub(crate) unsafe fn service_sec_image(
                                 wl_pid,
                                 nt_process::HandleObject::Process(ls_pid),
                                 nt_process::map_process_access(
-                                    nt_handler.process_spawn_desired_access,
+                                    request.desired_access,
                                 ),
                             );
                             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
@@ -3845,25 +3836,21 @@ pub(crate) unsafe fn service_sec_image(
                         }
                         _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
                     };
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
+                    let published = nt_handler.publish_created_process(
+                        request.process_handle_out,
                         lsass_process_handle,
                         SMSS_PEB_VA,
-                    ) {
+                    );
+                    if !published {
                         result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        let _ = exe_images.rollback_spawn(request);
+                    } else if exe_images.publish(request, lsass_process_handle).is_err() {
+                        result = 0xC000_000D; // STATUS_INVALID_PARAMETER
                     }
                     print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
                     print_hex((lsass_process_handle >> 32) as u32);
                     print_hex(lsass_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                } else if nt_handler.lsass_spawn_request && lsass_process_handle != 0 {
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
-                        lsass_process_handle,
-                        SMSS_PEB_VA,
-                    ) {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
