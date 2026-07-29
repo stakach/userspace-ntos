@@ -197,11 +197,15 @@ const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
 const RC_ARG_BUF_CAP: u64 = 0x0200;
 static RC_ARG_CAPTURE_NEXT: AtomicU64 = AtomicU64::new(0);
 
+fn le_u64_at(raw: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+}
+
 /// Is `va` inside the client's MAIN IMAGE window? Every hosted process is loaded at the SAME
 /// `PE_LOAD_BASE`, so these VAs COLLIDE across clients: win32k's per-client demand window can observe
 /// an empty/other-client page at such a VA WITHOUT faulting, so the demand-fault client-frame sharing
 /// never runs and win32k reads zeros. Client stack/heap VAs do not have this problem (they are
-/// recorded per-process and resolve correctly), so only this range needs capturing.
+/// recorded per-process and resolve correctly), so only this range needs legacy create-window capture.
 fn client_image_range(va: u64) -> bool {
     va >= PE_LOAD_BASE && va < PE_LOAD_BASE + IMAGE_MIRROR_WINDOW
 }
@@ -212,11 +216,82 @@ fn client_image_range(va: u64) -> bool {
 /// of the leading `Length` field and in `LARGE_STRING`'s `MaximumLength:31 | bAnsi:1` word.
 ///
 /// Returns the ARG-frame VA of the captured descriptor, or `sp_va` UNCHANGED when capture is
-/// unnecessary or impossible: a `Length == 0` MAKEINTATOM form (`Buffer` IS the atom and must never
-/// be dereferenced), a buffer outside the colliding image range (those already resolve correctly), an
-/// oversized string, or an unreadable descriptor/buffer. Falling back to the original pointer keeps
-/// this strictly fail-safe — it can only ever improve on what win32k would otherwise read.
+/// impossible. Even `Length == 0` atom/resource forms are staged: win32k still probes the descriptor
+/// before interpreting `Buffer` as the atom. For nonzero strings, both descriptor and bytes are copied
+/// unconditionally when readable. Falling back to the original pointer keeps this strictly fail-safe.
 unsafe fn capture_client_string_arg(
+    pi: u64,
+    sp_va: u64,
+    large: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> u64 {
+    if sp_va == 0 {
+        return sp_va;
+    }
+    let mut sd = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(pi, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
+        return sp_va;
+    }
+    let length = if large {
+        u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64
+    } else {
+        u16::from_le_bytes([sd[0], sd[1]]) as u64
+    };
+    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
+    if length + 2 > RC_ARG_BUF_CAP || (length != 0 && buffer == 0) {
+        return sp_va;
+    }
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc = win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
+    let buf = desc + 0x20;
+    let captured_buffer = if length == 0 {
+        buffer
+    } else {
+        let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
+        if !img_spawn::client_copyin_mapped(
+            pi,
+            buffer,
+            &mut chars[..length as usize],
+            filled_pages,
+            nfilled,
+            scratch_base,
+        ) {
+            return sp_va;
+        }
+        core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
+        core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
+        buf
+    };
+    if large {
+        // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32), Buffer(u64). Preserve bAnsi.
+        let ansi_bit = u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x8000_0000;
+        core::ptr::write_volatile(desc as *mut u32, length as u32);
+        let maximum = if length == 0 {
+            u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x7fff_ffff
+        } else {
+            length as u32 + 2
+        };
+        core::ptr::write_volatile((desc + 4) as *mut u32, maximum | ansi_bit);
+    } else {
+        core::ptr::write_volatile(desc as *mut u16, length as u16);
+        let maximum = if length == 0 {
+            u16::from_le_bytes([sd[2], sd[3]])
+        } else {
+            (length + 2) as u16
+        };
+        core::ptr::write_volatile((desc + 2) as *mut u16, maximum);
+        core::ptr::write_volatile((desc + 4) as *mut u32, 0); // explicit x64 padding
+    }
+    core::ptr::write_volatile((desc + 8) as *mut u64, captured_buffer);
+    desc
+}
+
+/// Legacy `NtUserCreateWindowEx` capture: only rebase counted strings whose buffers live in the
+/// colliding main-image range. Completed-dispatch observers still inspect original client descriptors,
+/// so stack/heap/DLL strings must remain untouched here.
+unsafe fn capture_client_string_arg_if_main_image(
     pi: u64,
     sp_va: u64,
     large: bool,
@@ -298,7 +373,7 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
         return false;
     }
     core::ptr::copy_nonoverlapping(sd.as_ptr(), desc_out as *mut u8, sd.len());
-    if length != 0 && client_image_range(buffer) {
+    if length != 0 {
         let out = core::slice::from_raw_parts_mut(buf_out as *mut u8, length as usize);
         if !img_spawn::client_copyin_mapped(pi, buffer, out, filled_pages, nfilled, scratch_base) {
             return false;
@@ -5617,47 +5692,37 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" (dispatch)\n");
                 }
                 // ── NT ARGUMENT CAPTURE for `NtUserRegisterClassExWOW` (SSN 0x10b4).
-                // arg2 = ClassName and arg3 = ClsVersion are client `PUNICODE_STRING`s whose `Buffer`
-                // still points into the CLIENT's address space. A class-name buffer that lives in the
-                // client's MAIN IMAGE cannot be resolved reliably through win32k's per-client demand
-                // window: every hosted process is loaded at the SAME `PE_LOAD_BASE`, so that VA
-                // COLLIDES across clients and win32k can observe an empty/other-client page WITHOUT
-                // ever faulting (so the demand-fault client-frame sharing never runs). win32k then
-                // copies ZEROS as the class name and `RtlAddAtomToAtomTable` fails
-                // STATUS_OBJECT_NAME_INVALID — the exact wall that made winlogon's "SAS Window class"
-                // registration fail (`sas.c:1767`), so `InitializeSAS` failed and winlogon bugchecked
-                // 0xF4 and called NtTerminateProcess.
+                // arg2 = ClassName and arg3 = ClsVersion are client `PUNICODE_STRING`s whose descriptor
+                // and `Buffer` both belong to the caller's address space. Real NT probes and captures
+                // them before win32k consumes them. Do the same at the executive's cross-VSpace boundary:
+                // stage a bounded descriptor for atoms/resources too, and stage readable nonzero buffers
+                // regardless of whether they live in the main image, a DLL, stack, or heap.
                 //
-                // Real NT captures user strings into kernel memory before use. Do the same: stage an
-                // exact copy into the shared ARG frame (mapped in BOTH VSpaces, already the proven
-                // mechanism for `NtUserProcessConnect`) and hand win32k a UNICODE_STRING that points at
-                // that copy. This removes the dependence on client-page mapping for these arguments
-                // entirely. `Length == 0` is the MAKEINTATOM form (`Buffer` IS the atom, never a
-                // pointer) and is passed through untouched; any unreadable/oversized string also falls
-                // back to the original pointer, so this is fail-safe.
-                // `NtUserRegisterClassExWOW` (0x10b4) takes UNICODE_STRING ClassName/ClsVersion;
-                // `NtUserCreateWindowEx` (0x1077) takes LARGE_STRING ClassName/ClsVersion/WindowName.
-                // Capture whichever of them point into the client's colliding main-image range so
-                // win32k reads the real bytes. Without this, winlogon's "SAS Window class" (a string
-                // in winlogon.exe's .rdata) reached win32k as ZEROS: the class registration failed
-                // (`RtlAddAtomToAtomTable` -> STATUS_OBJECT_NAME_INVALID, `sas.c:1767`) and the
-                // subsequent CreateWindowEx could not find the class (`sas.c:1781`), so
-                // `InitializeSAS` failed and winlogon bugchecked 0xF4 -> NtTerminateProcess.
+                // The shared ARG frame is mapped in both VSpaces (already the proven mechanism for
+                // `NtUserProcessConnect`). Any unreadable/oversized string falls back to the original
+                // pointer, so this is fail-safe.
                 let mut d_a2 = a2;
                 let mut d_a3 = a3;
-                if m0 == 0x10b4 || m0 == 0x1077 {
-                    let large = m0 == 0x1077;
+                if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
-                        pi as u64, d_a1, large, filled_pages, faults as usize, scratch_base,
+                        pi as u64, d_a1, false, filled_pages, faults as usize, scratch_base,
                     );
                     d_a2 = capture_client_string_arg(
-                        pi as u64, d_a2, large, filled_pages, faults as usize, scratch_base,
+                        pi as u64, d_a2, false, filled_pages, faults as usize, scratch_base,
                     );
-                    if large {
-                        d_a3 = capture_client_string_arg(
-                            pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
-                        );
-                    }
+                } else if m0 == 0x1077 {
+                    // `NtUserCreateWindowEx` takes LARGE_STRING ClassName/ClsVersion/WindowName.
+                    // Keep the older narrow capture here: the winlogon completion observer correlates
+                    // IDD_LOGON by reading the original client WindowName descriptor after dispatch.
+                    d_a1 = capture_client_string_arg_if_main_image(
+                        pi as u64, d_a1, true, filled_pages, faults as usize, scratch_base,
+                    );
+                    d_a2 = capture_client_string_arg_if_main_image(
+                        pi as u64, d_a2, true, filled_pages, faults as usize, scratch_base,
+                    );
+                    d_a3 = capture_client_string_arg_if_main_image(
+                        pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
+                    );
                 }
                 if m0 == 0x10b4 {
                     if let Some((class_arg, menu_arg)) = capture_register_class_graph(
