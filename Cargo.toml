@@ -73,6 +73,7 @@ members = [
     "crates/nt-driver-runtime",
     "crates/nt-driver-test-fixtures",
     "crates/nt-dll-registry",
+    "crates/nt-exe-image",
     "crates/nt-loader-trace",
     "crates/nt-delay-execution",
     "crates/nt-thread-start",
