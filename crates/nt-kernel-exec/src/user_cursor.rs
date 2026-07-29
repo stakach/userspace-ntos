@@ -106,7 +106,7 @@ impl CursorResource {
         CursorText::new(units).map(Self::Name)
     }
 
-    fn equals(&self, other: &Self) -> bool {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Atom(left), Self::Atom(right)) => left == right,
             (Self::Name(left), Self::Name(right)) => left.equals_case_insensitive(right),
@@ -140,7 +140,7 @@ impl CursorLookupKey {
     fn equals(&self, other: &Self) -> bool {
         self.icon_kind == other.icon_kind
             && self.module.equals_case_insensitive(&other.module)
-            && self.resource.equals(&other.resource)
+            && self.resource.same_identity(&other.resource)
     }
 }
 

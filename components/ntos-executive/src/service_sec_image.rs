@@ -190,6 +190,8 @@ unsafe fn observe_completed_dialog_modal_dispatch(
 const RC_ARG_CAPTURE_BASE: u64 = 0x1000;
 const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
 const RC_ARG_CAPTURE_SLOTS: u64 = 0x000C;
+const RC_CLASS_MENU_DESC_OFF: u64 = 0x0080;
+const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
 /// Maximum bytes captured per string. `RTL_MAXIMUM_ATOM_LENGTH` is 255 chars, so 0x200 bytes covers
 /// every legal class/window name; anything longer is passed through untouched.
 const RC_ARG_BUF_CAP: u64 = 0x0200;
@@ -266,6 +268,111 @@ unsafe fn capture_client_string_arg(
     }
     core::ptr::write_volatile((desc + 8) as *mut u64, buf);
     desc
+}
+
+unsafe fn stage_unicode_string_descriptor_for_win32k(
+    pi: u64,
+    descriptor: u64,
+    desc_out: u64,
+    buf_out: u64,
+    buf_cap: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    core::ptr::write_bytes(desc_out as *mut u8, 0, 16);
+    if descriptor == 0 {
+        return true;
+    }
+    let mut sd = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(pi, descriptor, &mut sd, filled_pages, nfilled, scratch_base) {
+        return false;
+    }
+    let length = u16::from_le_bytes([sd[0], sd[1]]) as u64;
+    let maximum = u16::from_le_bytes([sd[2], sd[3]]) as u64;
+    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
+    if length & 1 != 0 {
+        return false;
+    }
+    if length != 0 && (buffer == 0 || length > maximum || length + 2 > buf_cap) {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(sd.as_ptr(), desc_out as *mut u8, sd.len());
+    if length != 0 && client_image_range(buffer) {
+        let out = core::slice::from_raw_parts_mut(buf_out as *mut u8, length as usize);
+        if !img_spawn::client_copyin_mapped(pi, buffer, out, filled_pages, nfilled, scratch_base) {
+            return false;
+        }
+        core::ptr::write_volatile((buf_out + length) as *mut u16, 0);
+        core::ptr::write_volatile((desc_out + 2) as *mut u16, (length + 2) as u16);
+        core::ptr::write_volatile((desc_out + 8) as *mut u64, buf_out);
+    }
+    true
+}
+
+unsafe fn capture_register_class_graph(
+    pi: u64,
+    wnd_class: u64,
+    class_menu: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<(u64, u64)> {
+    use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
+
+    let mut wnd = [0u8; WNDCLASSEXW_SIZE];
+    if wnd_class == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            wnd_class,
+            &mut wnd,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let mut menu = [0u8; 24];
+    if class_menu == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            class_menu,
+            &mut menu,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let base = win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
+    let wnd_out = base;
+    let menu_out = base + WNDCLASSEXW_SIZE as u64 + 0x10;
+    let menu_desc_out = base + RC_CLASS_MENU_DESC_OFF;
+    let menu_buf_out = base + RC_CLASS_MENU_BUF_OFF;
+    let menu_buf_cap = RC_ARG_CAPTURE_SLOT - RC_CLASS_MENU_BUF_OFF;
+    core::ptr::write_bytes(base as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    core::ptr::copy_nonoverlapping(wnd.as_ptr(), wnd_out as *mut u8, wnd.len());
+
+    let menu_descriptor = u64::from_le_bytes(menu[16..24].try_into().unwrap());
+    if !stage_unicode_string_descriptor_for_win32k(
+        pi,
+        menu_descriptor,
+        menu_desc_out,
+        menu_buf_out,
+        menu_buf_cap,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    menu[16..24].copy_from_slice(&menu_desc_out.to_le_bytes());
+    core::ptr::copy_nonoverlapping(menu.as_ptr(), menu_out as *mut u8, menu.len());
+    Some((wnd_out, menu_out))
 }
 
 enum CapturedCursorString {
@@ -432,6 +539,128 @@ unsafe fn capture_cursor_set_data_key(
         filled_pages,
         nfilled,
         scratch_base,
+    )
+}
+
+unsafe fn capture_class_name_identity(
+    pi: u64,
+    descriptor: u64,
+    allow_none: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_class::ClassNameIdentity> {
+    use nt_kernel_exec::user_class::ClassNameIdentity;
+    use nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP;
+
+    if descriptor == 0 && allow_none {
+        return Some(ClassNameIdentity::none());
+    }
+    let mut descriptor_bytes = [0u8; 16];
+    if descriptor == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            descriptor,
+            &mut descriptor_bytes,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let length = u16::from_le_bytes([descriptor_bytes[0], descriptor_bytes[1]]);
+    let buffer = u64::from_le_bytes(descriptor_bytes[8..16].try_into().unwrap());
+    if allow_none && length == 0 && buffer == 0 {
+        return Some(ClassNameIdentity::none());
+    }
+    let mut name = [0u16; CURSOR_TEXT_CAP];
+    match capture_cursor_counted_string(
+        pi,
+        descriptor,
+        true,
+        &mut name,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )? {
+        CapturedCursorString::Atom(atom) => Some(ClassNameIdentity::atom(atom)),
+        CapturedCursorString::Text(len) => ClassNameIdentity::name(&name[..len]),
+    }
+}
+
+unsafe fn capture_builtin_class_key(
+    pi: u64,
+    wnd_class: u64,
+    class_name: u64,
+    class_version: u64,
+    class_menu: u64,
+    fn_id: u32,
+    flags: u32,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_class::BuiltinClassKey> {
+    use nt_kernel_exec::user_class::{BuiltinClassKey, WNDCLASSEXW_SIZE};
+
+    let mut wnd = [0u8; WNDCLASSEXW_SIZE];
+    if wnd_class == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            wnd_class,
+            &mut wnd,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let class_name = capture_class_name_identity(
+        pi,
+        class_name,
+        false,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    let class_version = capture_class_name_identity(
+        pi,
+        class_version,
+        false,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    let mut menu_graph = [0u8; 24];
+    if class_menu == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            class_menu,
+            &mut menu_graph,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let menu_descriptor = u64::from_le_bytes(menu_graph[16..24].try_into().unwrap());
+    let menu_name = capture_class_name_identity(
+        pi,
+        menu_descriptor,
+        true,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    BuiltinClassKey::decode(
+        &wnd,
+        class_name,
+        class_version,
+        menu_name,
+        fn_id,
+        flags,
     )
 }
 
@@ -5430,6 +5659,19 @@ pub(crate) unsafe fn service_sec_image(
                         );
                     }
                 }
+                if m0 == 0x10b4 {
+                    if let Some((class_arg, menu_arg)) = capture_register_class_graph(
+                        pi as u64,
+                        a0,
+                        a3,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        d_a0 = class_arg;
+                        d_a3 = menu_arg;
+                    }
+                }
                 let cursor_identity_key = if m0 == 0x103d {
                     capture_cursor_lookup_key(
                         pi as u64,
@@ -5453,6 +5695,50 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
+                let builtin_class_args = if m0 == 0x10b4 {
+                    let sp = get_recv_mr(16);
+                    match (
+                        client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ),
+                        client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ),
+                    ) {
+                        (Some(fn_id), Some(flags)) => Some((fn_id as u32, flags as u32)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let builtin_class_attempt = builtin_class_args.is_some_and(|(fn_id, flags)| {
+                    (nt_kernel_exec::user_class::FNID_BUILTIN_FIRST
+                        ..=nt_kernel_exec::user_class::FNID_BUILTIN_LAST)
+                        .contains(&fn_id)
+                        && flags == 0
+                });
+                let builtin_class_key = builtin_class_args.and_then(|(fn_id, flags)| {
+                    capture_builtin_class_key(
+                        pi as u64,
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        fn_id,
+                        flags,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                });
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
@@ -5653,6 +5939,31 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     } else {
                         print_str(b"[win32k-svc] userinit global cursor cache miss -> NULL\n");
+                    }
+                    (hit.unwrap_or(0) as i32, true)
+                } else if m0 == 0x10b4 && pi == 5 && builtin_class_attempt {
+                    // The hosted win32k currently has one shared PROCESSINFO, whose built-in class
+                    // list was populated by winlogon. A second real registration would mutate that
+                    // same list and report duplicate-class semantics. Reuse only an exact real atom
+                    // learned from winlogon's successful registration of the same complete class.
+                    let hit = builtin_class_key
+                        .as_ref()
+                        .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key));
+                    if let (Some(key), Some(atom)) = (builtin_class_key.as_ref(), hit) {
+                        let bit = 1u64 << (key.fn_id() - 0x02a1);
+                        USERINIT_BUILTIN_CLASS_HITS.fetch_add(1, Ordering::Relaxed);
+                        USERINIT_BUILTIN_CLASS_MASK.fetch_or(bit, Ordering::Relaxed);
+                        if key.fn_id() == 0x02a4 {
+                            USERINIT_DIALOG_CLASS_ATOM.store(atom as u64, Ordering::Relaxed);
+                        }
+                        print_str(b"[win32k-svc] userinit builtin class HIT fnid=0x");
+                        print_hex(key.fn_id());
+                        print_str(b" -> real atom 0x");
+                        print_hex(atom as u32);
+                        print_str(b"\n");
+                    } else {
+                        USERINIT_BUILTIN_CLASS_MISSES.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] userinit builtin class mirror MISS -> atom 0\n");
                     }
                     (hit.unwrap_or(0) as i32, true)
                 } else if m0 == 0x103d && svc_noninteractive {
@@ -6021,6 +6332,12 @@ pub(crate) unsafe fn service_sec_image(
                     } else if m0 == 0x1283 && st != 0 {
                         GLOBAL_CURSOR_MIRROR.promote(a0 as u32);
                         GLOBAL_CURSOR_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if m0 == 0x10b4 && st != 0 {
+                        if let Some(key) = builtin_class_key.as_ref() {
+                            GLOBAL_BUILTIN_CLASS_MIRROR.observe(key, st as u16);
+                            GLOBAL_BUILTIN_CLASSES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 if winlogon_switch && !redirected_user_callback {

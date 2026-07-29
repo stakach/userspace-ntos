@@ -2017,6 +2017,15 @@ pub(crate) static GLOBAL_CURSOR_IDENTITIES_OBSERVED: AtomicU64 = AtomicU64::new(
 pub(crate) static GLOBAL_CURSOR_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_GLOBAL_CURSOR_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_GLOBAL_CURSOR_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Exact built-in class identities and real atoms learned from winlogon's successful registrations.
+pub(crate) static mut GLOBAL_BUILTIN_CLASS_MIRROR:
+    nt_kernel_exec::user_class::BuiltinClassMirror<16> =
+    nt_kernel_exec::user_class::BuiltinClassMirror::new();
+pub(crate) static GLOBAL_BUILTIN_CLASSES_OBSERVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.
@@ -3141,6 +3150,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let cursor_promotions = GLOBAL_CURSOR_PROMOTIONS.load(Ordering::Relaxed);
     let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
     let cursor_handle = USERINIT_GLOBAL_CURSOR_HANDLE.load(Ordering::Relaxed);
+    let classes_observed = GLOBAL_BUILTIN_CLASSES_OBSERVED.load(Ordering::Relaxed);
+    let class_hits = USERINIT_BUILTIN_CLASS_HITS.load(Ordering::Relaxed);
+    let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
+    let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
+    let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3167,6 +3181,16 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(cursor_hits);
     print_str(b" pi5-cursor=0x");
     print_hex(cursor_handle as u32);
+    print_str(b" classes-observed=");
+    print_u64(classes_observed);
+    print_str(b" class-hits/misses=");
+    print_u64(class_hits);
+    print_str(b"/");
+    print_u64(class_misses);
+    print_str(b" class-mask=0x");
+    print_hex(class_mask as u32);
+    print_str(b" dialog-atom=0x");
+    print_hex(dialog_atom as u32);
     print_str(b"\n");
     check(
         b"exec_userinit_process_spawned",
@@ -3184,6 +3208,15 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     check(
         b"exec_userinit_global_cursor_reused",
         cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
+        passed,
+    );
+    check(
+        b"exec_userinit_builtin_classes_reused",
+        classes_observed >= 9
+            && class_hits >= 9
+            && class_misses == 0
+            && class_mask & 0x02ff == 0x02ff
+            && dialog_atom == 0x8002,
         passed,
     );
 }
