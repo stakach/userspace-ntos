@@ -3041,10 +3041,9 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
 /// `AllowAccessOnSession` → `StartUserShell` → `WlxActivateUserShell` → `CreateProcessAsUserW`.
 /// Reaching the LAST link is therefore a structural witness that every earlier one succeeded.
 ///
-/// **`userinit.exe` is NOT spawned and nothing here claims it is.** The image open winlogon issues
-/// really returns `STATUS_OBJECT_NAME_NOT_FOUND` — `kernel32!CreateProcessInternalW` prints its own
-/// `proc.c:2745  Open file failed: c0000034 (\??\C:\Windows\system32\userinit.exe)` — because the
-/// executive's EXE-open classifier knows only the five boot images. That is the batch's honest wall.
+/// **`userinit.exe` is NOT spawned and nothing here claims it is.** The generic image lane now
+/// accepts its open, creates SEC_IMAGE, and answers SectionImageInformation; the separate gate below
+/// proves those stages. The honest wall is the effectful pi=5 process reservation and VSpace spawn.
 ///
 /// The `AutoAdminLogon` clause is the trap this spec exists to hold shut: the real SOFTWARE hive's
 /// Winlogon key carries `AutoAdminLogon = "1"` next to `Userinit`, and serving it would change the
@@ -3098,6 +3097,32 @@ fn user_shell_activation_spec(passed: &mut u64) {
                     || (DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
                         && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0))
             ),
+        passed,
+    );
+    userinit_image_pipeline_spec(passed);
+}
+
+/// ═══ userinit HAS REAL FILE + SEC_IMAGE SEMANTICS, BUT NO pi=5 PROCESS YET ══════════════════════
+fn userinit_image_pipeline_spec(passed: &mut u64) {
+    let opened = USERINIT_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
+    let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
+    let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
+    let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
+    let spawned_pid = PM_PIDS[5].load(Ordering::Relaxed);
+    print_str(b"[userinit-image] opens=");
+    print_u64(opened);
+    print_str(b" sections=");
+    print_u64(sectioned);
+    print_str(b" image-info-queries=");
+    print_u64(queried);
+    print_str(b" create-process-requests=");
+    print_u64(creates);
+    print_str(b" pi5-pid=");
+    print_u64(spawned_pid);
+    print_str(b" (STATUS_NOT_IMPLEMENTED: process mechanism not yet published)\n");
+    check(
+        b"exec_userinit_sec_image_reached",
+        opened >= 1 && sectioned >= 1 && queried >= 1 && creates >= 1 && spawned_pid == 0,
         passed,
     );
 }
@@ -3866,8 +3891,8 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
     print_str(b" unsupported-file-opens=");
     print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
-    print_str(b" (the whole HandleLogon chain now runs; the wall is kernel32's image open for ");
-    print_str(b"\\??\\C:\\Windows\\system32\\userinit.exe -> c0000034; userinit.exe NOT spawned)\n");
+    print_str(b" (the whole HandleLogon chain now runs; userinit has a real SEC_IMAGE, but pi=5 ");
+    print_str(b"process publication returns STATUS_NOT_IMPLEMENTED; userinit.exe NOT spawned)\n");
     check(
         b"exec_winlogon_profile_directory_resolved",
         // BOTH ProfileList opens — GetProfilesDirectoryW's and CreateUserProfileW's — were served
@@ -9174,9 +9199,15 @@ pub(crate) const SERVE_WINLOGON_USERINIT: bool = true;
 pub(crate) static WINLOGON_USERINIT_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_USERINIT_TYPE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_USERINIT_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Image opens for `userinit.exe` that winlogon's OWN `CreateProcessAsUserW` really issued. They
-/// MISS (the executive hosts five EXEs), so this counts the request, never a spawn.
+/// Image opens for `userinit.exe` that winlogon's OWN `CreateProcessAsUserW` really issued. This is
+/// an attempt count; `USERINIT_IMAGE_OPEN_SUCCESSES` proves which opens entered the generic lane.
 pub(crate) static WINLOGON_USERINIT_IMAGE_OPENS: AtomicU64 = AtomicU64::new(0);
+/// Successful generic-image stages for userinit. A create-process request is not a spawn: until the
+/// pi=5 mechanism is installed the request returns STATUS_NOT_IMPLEMENTED and no child is published.
+pub(crate) static USERINIT_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// Every value the synthesized Winlogon key ANSWERED — the leak check for `AutoAdminLogon`.
 pub(crate) static WINLOGON_KEY_VALUES_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Groups in the token `NtCreateToken` minted that carry `SE_GROUP_LOGON_ID` — the logon SID
@@ -9679,6 +9710,10 @@ struct ExecLoopCtx {
     /// lsass.exe's preloaded PE and backing pool address; migrated through `exe_images` too.
     lsass_pool_va: u64,
     lsass_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// userinit.exe uses the same generic image lane through section query; pi=5 spawning remains
+    /// a separate checked mechanism step.
+    userinit_pool_va: u64,
+    userinit_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 512],

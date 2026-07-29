@@ -410,6 +410,18 @@ pub(crate) unsafe fn service_sec_image(
         let e_lfanew = core::ptr::read_volatile((lsass_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((lsass_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
+    // userinit.exe — the first post-login image. It enters the generic Win32-child image table now;
+    // the effectful pi=5 spawn remains deliberately separate so image semantics can be gated first.
+    let (userinit_pe, userinit_va) = if ntdll.is_some() {
+        load_dll_from_fs(br"reactos\system32\userinit.exe", b"userinit.exe")
+    } else {
+        (None, 0)
+    };
+    if let Some(ref upe) = userinit_pe {
+        apply_relocations_to_buf(upe, userinit_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((userinit_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((userinit_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
     // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
@@ -3160,6 +3172,8 @@ pub(crate) unsafe fn service_sec_image(
                     services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     lsass_pool_va: lsass_va,
                     lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    userinit_pool_va: userinit_va,
+                    userinit_pe: &userinit_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
                     scratch_base,

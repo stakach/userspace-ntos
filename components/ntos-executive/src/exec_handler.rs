@@ -5575,6 +5575,8 @@ impl ExecNtHandler {
         } else if folded.windows(5).any(|w| w == b"lsass") {
             // "lsass" is specific (lsasrv.dll folds to "lsasr", no match).
             Some(b"lsass.exe")
+        } else if folded.windows(8).any(|w| w == b"userinit") {
+            Some(b"userinit.exe")
         } else {
             None
         }
@@ -12392,10 +12394,9 @@ impl ExecNtHandler {
                 // ★ THE 6TH PROCESS' IMAGE OPEN. `msgina!WlxActivateUserShell` →
                 // `WlxStartApplication` → `CreateProcessAsUserW` reaches
                 // `kernel32!CreateProcessInternalW`'s image open for `userinit.exe`
-                // (`proc.c:2745`). Counted, NOT satisfied: `exe_probe_canon` classifies only the
-                // five boot EXEs, so this open really returns STATUS_OBJECT_NAME_NOT_FOUND and
-                // NOTHING claims a spawn. This counter is the honest witness that winlogon's own
-                // process-create reached the shell binary.
+                // (`proc.c:2745`). Counted separately from success: the generic image table now
+                // accepts the real file and carries it through SectionImageInformation, while pi=5
+                // process publication remains the next mechanism boundary.
                 if self.pi == 2 && !want_dir && nb[..nlen].windows(8).any(|w| w == b"userinit") {
                     WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -12403,6 +12404,7 @@ impl ExecNtHandler {
                 let is_winlogon = exe_exists && nb[..nlen].windows(8).any(|w| w == b"winlogon");
                 let is_services = exe_exists && nb[..nlen].windows(8).any(|w| w == b"services");
                 let is_lsass = exe_exists && nb[..nlen].windows(5).any(|w| w == b"lsass");
+                let is_userinit = exe_exists && nb[..nlen].windows(8).any(|w| w == b"userinit");
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -12451,6 +12453,7 @@ impl ExecNtHandler {
                     || is_winlogon
                     || is_services
                     || is_lsass
+                    || is_userinit
                     || dll_i.is_some()
                 {
                     let h = if let Some(first_cluster) = volume_directory {
@@ -12520,6 +12523,30 @@ impl ExecNtHandler {
                                     subsystem_minor: minor,
                                 },
                             );
+                        }
+                    }
+                    if is_userinit {
+                        if let Some(pe) = (&*ctx.userinit_pe).as_ref() {
+                            let (major, minor) = pe.subsystem_version();
+                            if (&mut *ctx.exe_images)
+                                .open(
+                                    self.pi,
+                                    b"userinit.exe",
+                                    h,
+                                    nt_exe_image::ImageMetadata {
+                                        pool_va: ctx.userinit_pool_va,
+                                        file_size: pe.bytes().len() as u64,
+                                        image_size: pe.size_of_image() as u64,
+                                        entry_rva: pe.entry_point_rva(),
+                                        subsystem: pe.subsystem(),
+                                        subsystem_major: major,
+                                        subsystem_minor: minor,
+                                    },
+                                )
+                                .is_ok()
+                            {
+                                USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     if let Some(i) = dll_i {
@@ -12632,6 +12659,9 @@ impl ExecNtHandler {
                 };
                 if class == 1 && info.is_some() {
                     let (bytes, who) = info.unwrap();
+                    if who == b"userinit.exe" {
+                        USERINIT_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
+                    }
                     // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
                     for k in 0..8 {
                         let mut w = [0u8; 8];
@@ -12713,6 +12743,8 @@ impl ExecNtHandler {
                         SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
                     } else if leaf == b"lsass.exe" {
                         LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
+                    } else if leaf == b"userinit.exe" {
+                        USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
                     }
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                     print_str(leaf);
@@ -13000,9 +13032,17 @@ impl ExecNtHandler {
                         .and_then(|slot| match slot.leaf() {
                             b"services.exe" => Some(3),
                             b"lsass.exe" => Some(4),
+                            b"userinit.exe" => Some(5),
                             _ => None,
                         });
                     if let Some(child_pi) = child_pi {
+                        if child_pi == 5 {
+                            USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                            // The image path is real through SectionImageInformation. Do not claim a
+                            // child until pi=5 PM identity, badge/layout, caps, and rollback are
+                            // installed transactionally in the loop.
+                            return 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+                        }
                         match table.reserve_spawn(
                             self.pi,
                             sect,
