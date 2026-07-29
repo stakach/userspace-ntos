@@ -3030,6 +3030,76 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     unsafe { gdi_user_batch_flush_spec(passed) };
     unsafe { profile_ntuser_dat_spec(passed) };
     unsafe { nt_load_key_spec(passed) };
+    user_shell_activation_spec(passed);
+}
+
+/// ═══ winlogon RAN ITS WHOLE `HandleLogon` AND ASKED FOR `userinit.exe` ══════════════════════════
+///
+/// The batch's user-visible advance, named for exactly what was MEASURED. `HandleLogon`
+/// (`sas.c:571`) is a chain in which EVERY step is fatal: `LoadUserProfileW` →
+/// `CreateUserEnvironment` → `UpdatePerUserSystemParameters` → `SetDefaultLanguage` →
+/// `AllowAccessOnSession` → `StartUserShell` → `WlxActivateUserShell` → `CreateProcessAsUserW`.
+/// Reaching the LAST link is therefore a structural witness that every earlier one succeeded.
+///
+/// **`userinit.exe` is NOT spawned and nothing here claims it is.** The image open winlogon issues
+/// really returns `STATUS_OBJECT_NAME_NOT_FOUND` — `kernel32!CreateProcessInternalW` prints its own
+/// `proc.c:2745  Open file failed: c0000034 (\??\C:\Windows\system32\userinit.exe)` — because the
+/// executive's EXE-open classifier knows only the five boot images. That is the batch's honest wall.
+///
+/// The `AutoAdminLogon` clause is the trap this spec exists to hold shut: the real SOFTWARE hive's
+/// Winlogon key carries `AutoAdminLogon = "1"` next to `Userinit`, and serving it would change the
+/// logon flow that produces the desktop paint. The key answers EXACTLY two values — `Userinit`
+/// (from the real hive, by exact name) and the empty `DefaultPassword` — and this counts them.
+fn user_shell_activation_spec(passed: &mut u64) {
+    let reads = WINLOGON_USERINIT_READS.load(Ordering::Relaxed);
+    let ty = WINLOGON_USERINIT_TYPE.load(Ordering::Relaxed);
+    let bytes = WINLOGON_USERINIT_BYTES.load(Ordering::Relaxed);
+    let opens = WINLOGON_USERINIT_IMAGE_OPENS.load(Ordering::Relaxed);
+    let served = WINLOGON_KEY_VALUES_SERVED.load(Ordering::Relaxed);
+    let defpwd = WINLOGON_DEFPWD_EMPTY.load(Ordering::Relaxed);
+    let logon_sids = SE_CREATE_TOKEN_LOGON_SIDS.load(Ordering::Relaxed);
+    print_str(b"[wl-shell] WlxActivateUserShell: Userinit reads=");
+    print_u64(reads);
+    print_str(b" (REG type ");
+    print_u64(ty);
+    print_str(b", ");
+    print_u64(bytes);
+    print_str(b" bytes) -> CreateProcessAsUserW image opens for userinit.exe=");
+    print_u64(opens);
+    print_str(b" | Winlogon-key values served=");
+    print_u64(served);
+    print_str(b" (Userinit+DefaultPassword only; AutoAdminLogon NOT among them) | logon-SID groups in the token=");
+    print_u64(logon_sids);
+    print_str(b" | user locale bytes=");
+    print_u64(DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed));
+    print_str(b" (REG type ");
+    print_u64(DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed));
+    print_str(b")");
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_user_shell_activated",
+        !SERVE_WINLOGON_USERINIT
+            || (
+                // `WlxActivateUserShell` really read `Userinit`, and got the REAL hive value:
+                // `%SystemRoot%\system32\userinit.exe` is 35 chars ⇒ 70 bytes with its NUL, and
+                // the hive stores it as REG_EXPAND_SZ (2) — the type msgina insists on.
+                reads >= 1
+                && ty == 2
+                && bytes == 70
+                // …winlogon's OWN CreateProcessAsUserW then reached the shell binary…
+                && opens >= 1
+                // …the Winlogon key leaked NOTHING else (AutoAdminLogon above all)…
+                && served == reads + defpwd
+                // …`AllowAccessOnSession` could only have been passed with a real logon SID in
+                // TOKEN_GROUPS (it dereferences an uninitialised local otherwise)…
+                && logon_sids >= 1
+                // …and setup's locale step really seeded the value `SetDefaultLanguage` needs.
+                && (!PROVISION_DEFAULT_USER_LOCALE
+                    || (DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
+                        && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0))
+            ),
+        passed,
+    );
 }
 
 /// ═══ THE PROFILE HAS A REAL `ntuser.dat` — the setup step the LiveCD skips ══════════════════════
@@ -3796,8 +3866,8 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
     print_str(b" unsupported-file-opens=");
     print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
-    print_str(b" (CreateDirectoryW now SUCCEEDS on the writable overlay; next wall: CopyDirectory ");
-    print_str(b"of `Default User`; userinit.exe NOT spawned)\n");
+    print_str(b" (the whole HandleLogon chain now runs; the wall is kernel32's image open for ");
+    print_str(b"\\??\\C:\\Windows\\system32\\userinit.exe -> c0000034; userinit.exe NOT spawned)\n");
     check(
         b"exec_winlogon_profile_directory_resolved",
         // BOTH ProfileList opens — GetProfilesDirectoryW's and CreateUserProfileW's — were served
@@ -9063,6 +9133,16 @@ pub(crate) fn print_ascii_str(s: &str) {
     }
 }
 
+/// ★ BYPASS SWITCH for setup's locale step (see `provision_default_user_locale`). `false` leaves
+/// `HKU\.DEFAULT\Control Panel\International` valueless, exactly as the ISO ships it, and
+/// `winlogon!SetDefaultLanguage(Session)` fails again -> `HandleLogon` aborts into
+/// `UnloadUserProfile` and the user shell never starts.
+pub(crate) const PROVISION_DEFAULT_USER_LOCALE: bool = true;
+/// Bytes + REG type of the language id really copied from the SYSTEM hive into the default user's
+/// `Control Panel\International\Locale` (0 = the step did not run).
+pub(crate) static DEFAULT_USER_LOCALE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DEFAULT_USER_LOCALE_TYPE: AtomicU64 = AtomicU64::new(0);
+
 /// `NtLoadKey`/`NtUnloadKey` outcome counters, so the gate asserts what really happened.
 pub(crate) static NT_LOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_MOUNTED: AtomicU64 = AtomicU64::new(0);
@@ -9084,6 +9164,24 @@ pub(crate) static NT_LOAD_KEY_ROOT_SUBKEYS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_VALUE_READBACK: AtomicU64 = AtomicU64::new(0);
 /// Opens that resolved into the `\Registry\User` namespace: the predefined root, `.Default`, and
 /// keys inside a dynamically loaded per-user hive.
+/// ★ BYPASS SWITCH: serve `Userinit` on the synthesized Winlogon key from the real SOFTWARE hive.
+/// `false` restores the pre-batch state — every value on that key misses, so
+/// `msgina!WlxActivateUserShell` (`msgina.c:498`) returns FALSE, `StartUserShell` fails and
+/// `HandleLogon` unwinds into `UnloadUserProfile` with no user shell.
+pub(crate) const SERVE_WINLOGON_USERINIT: bool = true;
+/// How many times `Userinit` was served, and what it was (type + byte length), so the gate can
+/// assert the REAL hive value rather than a fabricated string.
+pub(crate) static WINLOGON_USERINIT_READS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_USERINIT_TYPE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_USERINIT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Image opens for `userinit.exe` that winlogon's OWN `CreateProcessAsUserW` really issued. They
+/// MISS (the executive hosts five EXEs), so this counts the request, never a spawn.
+pub(crate) static WINLOGON_USERINIT_IMAGE_OPENS: AtomicU64 = AtomicU64::new(0);
+/// Every value the synthesized Winlogon key ANSWERED — the leak check for `AutoAdminLogon`.
+pub(crate) static WINLOGON_KEY_VALUES_SERVED: AtomicU64 = AtomicU64::new(0);
+/// Groups in the token `NtCreateToken` minted that carry `SE_GROUP_LOGON_ID` — the logon SID
+/// `winlogon!AllowAccessOnSession` scans `TOKEN_GROUPS` for.
+pub(crate) static SE_CREATE_TOKEN_LOGON_SIDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_NS_TRACED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POST_PROFILE_TRACED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POST_PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);

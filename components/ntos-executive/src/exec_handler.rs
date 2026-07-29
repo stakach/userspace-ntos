@@ -552,7 +552,77 @@ impl ExecNtHandler {
             let token = handler.token_store.insert(nt_security::AccessToken::system());
             let _ = handler.pm.replace_process_primary_token(pid, Some(token));
         }
+        unsafe { handler.provision_default_user_locale() };
         handler
+    }
+
+    /// ═══ THE SECOND SETUP STEP THE LIVECD SKIPS — the default user's LOCALE ═══════════════════
+    ///
+    /// `winlogon!SetDefaultLanguage(Session)` (`sas.c:119`) opens HKCU, reads
+    /// `Control Panel\International\Locale` and returns FALSE if it is missing — and its caller
+    /// `HandleLogon` treats that as fatal (`goto cleanup` → `UnloadUserProfile`, no user shell).
+    /// MEASURED, at `sas.c`'s exact key:
+    /// `[post-profile] query-value MISS key=\registry\user\.default\control panel\international
+    /// value="locale"`.
+    ///
+    /// The key EXISTS in the ISO's `config\default` and has ZERO values: `hivedef.inf:156` creates
+    /// `HKCU\"Control Panel\International"` empty, and the VALUE is written later by SETUP —
+    /// `base/setup/lib/settings.c:968 ProcessLocaleRegistry()` does exactly
+    /// `NtSetValueKey(HKU\.DEFAULT\Control Panel\International, L"Locale", REG_SZ, <LanguageId>)`.
+    /// A LiveCD never runs it, so the hive it ships has no locale — the same shape of gap as the
+    /// missing `ntuser.dat`.
+    ///
+    /// This performs that step, at setup's own location, with the machine's OWN language id: the
+    /// REG_SZ under `HKLM\SYSTEM\CurrentControlSet\Control\Nls\Language\Default` in the staged
+    /// SYSTEM hive — which is the same value `SetDefaultLanguage(NULL)` (the SYSTEM path, already
+    /// live in this boot: it is what makes `InitializeSAS` succeed) reads. Nothing is invented:
+    /// if the SYSTEM hive has no such value, nothing is written and the miss stands.
+    ///
+    /// ★ BYPASS SWITCH `PROVISION_DEFAULT_USER_LOCALE`.
+    ///
+    /// # Safety
+    /// Runs during construction, below the service loop's bump-heap mark, so the overlay strings
+    /// it allocates are permanent by construction (no `overlay_dirty` pin needed).
+    unsafe fn provision_default_user_locale(&mut self) {
+        if !PROVISION_DEFAULT_USER_LOCALE {
+            return;
+        }
+        const NLS_LANGUAGE: &str =
+            r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
+        const USER_INTERNATIONAL: &str = r"\Registry\User\.Default\Control Panel\International";
+        // The machine's language id, out of the real SYSTEM hive.
+        let Some((source_ty, language_id)) = self
+            .resolve_key(NLS_LANGUAGE)
+            .and_then(|key| self.registry_value(key, "Default"))
+        else {
+            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n");
+            return;
+        };
+        // `SetDefaultLanguage` rejects every other type, and setup's
+        // `ProcessLocaleRegistry` writes REG_SZ explicitly rather than copying the source type.
+        const REG_SZ: u32 = 1;
+        if source_ty != REG_SZ {
+            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not REG_SZ -> no user locale\n");
+            return;
+        }
+        // The target key must ALREADY exist in the prototype hive (hivedef.inf creates it empty);
+        // creating it ourselves would be inventing structure rather than performing setup's step.
+        if self.resolve_key(USER_INTERNATIONAL).is_none() {
+            print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
+            return;
+        }
+        let canon = self.overlay_canon(USER_INTERNATIONAL);
+        let (index, _) = self.overlay.create(&canon);
+        self.overlay.set_value(index, "Locale", REG_SZ, &language_id);
+        DEFAULT_USER_LOCALE_BYTES.store(language_id.len() as u64, Ordering::Relaxed);
+        DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
+        print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
+        for &byte in language_id.iter().step_by(2) {
+            debug_put_char(if (0x20..0x7f).contains(&byte) { byte } else { b'.' });
+        }
+        print_str(b" (REG type ");
+        print_u64(REG_SZ as u64);
+        print_str(b", from HKLM\\SYSTEM\\...\\Nls\\Language\\Default)\n");
     }
     fn registry_map_access(desired: u32) -> u32 {
         const GENERIC_READ: u32 = 0x8000_0000;
@@ -3848,6 +3918,12 @@ impl ExecNtHandler {
         let user_rid = captured.token.user.sub_authorities.last().copied();
         let user_subauths = captured.token.user.sub_authorities.len() as u64;
         let group_count = captured.token.groups.len() as u64;
+        // ★ Does the token lsasrv minted carry a LOGON SID (`SE_GROUP_LOGON_ID`)?
+        // `winlogon!AllowAccessOnSession` scans `TOKEN_GROUPS` for exactly this and dereferences an
+        // UNINITIALISED local when it finds nothing (measured: a read fault at `RtlLengthSid+0x5`,
+        // `ntdll+0x1acc5`, with a garbage `LogonSid`). Counted so the claim is a measurement.
+        let logon_sid_groups = captured.token.groups.iter().filter(|g| g.logon_id).count() as u64;
+        SE_CREATE_TOKEN_LOGON_SIDS.store(logon_sid_groups, Ordering::Relaxed);
         let privilege_count = captured.token.privileges.len() as u64;
         let authentication_id = captured.token.authentication_id;
         let token_type = captured.token.token_type;
@@ -3908,6 +3984,8 @@ impl ExecNtHandler {
             print_u64(user_subauths);
             print_str(b" groups=");
             print_u64(group_count);
+            print_str(b" logon-sid-groups=");
+            print_u64(logon_sid_groups);
             print_str(b" privs=");
             print_u64(privilege_count);
             print_str(b" authid=0x");
@@ -6912,6 +6990,55 @@ impl ExecNtHandler {
                     // legitimate value; AutoAdminLogon defaults FALSE so it is never used to log in.
                     WINLOGON_DEFPWD_EMPTY.fetch_add(1, Ordering::Relaxed);
                     Some((1u32 /* REG_SZ */, alloc::vec![0u8, 0u8]))
+                } else if key == SYNTH_WINLOGON_KEY
+                    && name_lc == "userinit"
+                    && SERVE_WINLOGON_USERINIT
+                {
+                    // ★ THE ONE VALUE `WlxActivateUserShell` CANNOT DO WITHOUT (`msgina.c:498`):
+                    // it reads `Userinit` off the Winlogon key and returns FALSE outright if the
+                    // read fails or the type is not REG_SZ/REG_EXPAND_SZ — no shell, and
+                    // `HandleLogon` unwinds into `UnloadUserProfile`. Served from the REAL SOFTWARE
+                    // hive, by exact value name.
+                    //
+                    // ★ EXACT-VALUE scoped, deliberately. The same key in the real hive also holds
+                    // **`AutoAdminLogon = "1"`**, `DefaultUserName`, `Shell` and `LogonType`;
+                    // letting those through would change the flow that produced the desktop paint
+                    // (msgina applies documented defaults on a missing value, and that is the path
+                    // this boot's SAS/credential sequence takes). Only `Userinit` is answered here;
+                    // every other value on this key still MISSES, exactly as before.
+                    let value = self
+                        .software_hive
+                        .as_ref()
+                        .and_then(|hive| {
+                            hive.open_key(r"Microsoft\Windows NT\CurrentVersion\Winlogon")
+                        })
+                        .and_then(|cell| {
+                            self.software_hive.as_ref()?.value(cell, "Userinit")
+                        });
+                    if let Some((ty, ref data)) = value {
+                        WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
+                        WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
+                        WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
+                        use_xas_write = true;
+                        if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
+                            print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
+                            for pair in data.chunks_exact(2) {
+                                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                                if unit == 0 {
+                                    break;
+                                }
+                                debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                    unit as u8
+                                } else {
+                                    b'?'
+                                });
+                            }
+                            print_str(b"\" (REG type ");
+                            print_u64(ty as u64);
+                            print_str(b", from the real SOFTWARE hive; AutoAdminLogon NOT served)\n");
+                        }
+                    }
+                    value
                 } else {
                     if self.pi == 2 && !is_synth_key(key) {
                     // winlogon (pi 2) reading a value out of a REAL MOUNTED HIVE (not a synth handle):
@@ -6952,6 +7079,13 @@ impl ExecNtHandler {
                 // evidence of which step gave up, so name the KEY and the VALUE.
                 if self.pi == 2 && val.is_none() && post_profile_phase() {
                     self.trace_post_profile_registry(b"query-value", key, &name_lc);
+                }
+                // Every value the synthesized Winlogon key ever ANSWERS. The gate asserts this
+                // equals `Userinit` + `DefaultPassword` and nothing else — i.e. `AutoAdminLogon`
+                // (which the real hive holds as "1", and which would change the logon flow that
+                // produced the desktop paint) never leaks through this key.
+                if key == SYNTH_WINLOGON_KEY && val.is_some() {
+                    WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
                 }
                 match val {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
@@ -12253,6 +12387,16 @@ impl ExecNtHandler {
                     .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
                     .flatten();
                 let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
+                // ★ THE 6TH PROCESS' IMAGE OPEN. `msgina!WlxActivateUserShell` →
+                // `WlxStartApplication` → `CreateProcessAsUserW` reaches
+                // `kernel32!CreateProcessInternalW`'s image open for `userinit.exe`
+                // (`proc.c:2745`). Counted, NOT satisfied: `exe_probe_canon` classifies only the
+                // five boot EXEs, so this open really returns STATUS_OBJECT_NAME_NOT_FOUND and
+                // NOTHING claims a spawn. This counter is the honest witness that winlogon's own
+                // process-create reached the shell binary.
+                if self.pi == 2 && !want_dir && nb[..nlen].windows(8).any(|w| w == b"userinit") {
+                    WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
+                }
                 let is_csrss = exe_exists && nb[..nlen].windows(5).any(|w| w == b"csrss");
                 let is_winlogon = exe_exists && nb[..nlen].windows(8).any(|w| w == b"winlogon");
                 let is_services = exe_exists && nb[..nlen].windows(8).any(|w| w == b"services");

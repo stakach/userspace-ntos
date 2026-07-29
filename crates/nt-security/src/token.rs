@@ -51,6 +51,12 @@ pub struct TokenGroup {
     pub enabled: bool,
     pub deny_only: bool,
     pub owner: bool,
+    /// `SE_GROUP_LOGON_ID` — this group is the LOGON SID of an interactive logon session. It is a
+    /// *distinguishing* bit, not a state bit: `winlogon!AllowAccessOnSession` (`security.c:1432`)
+    /// scans `TOKEN_GROUPS` for it to find the SID it grants window-station/desktop access to, and
+    /// dereferences whatever it finds — so dropping the bit does not merely lose information, it
+    /// leaves the caller's `LogonSid` local UNINITIALISED.
+    pub logon_id: bool,
 }
 
 impl TokenGroup {
@@ -60,6 +66,7 @@ impl TokenGroup {
             enabled: true,
             deny_only: false,
             owner: false,
+            logon_id: false,
         }
     }
     pub fn deny_only(sid: Sid) -> Self {
@@ -68,6 +75,7 @@ impl TokenGroup {
             enabled: false,
             deny_only: true,
             owner: false,
+            logon_id: false,
         }
     }
 
@@ -77,6 +85,7 @@ impl TokenGroup {
             enabled: true,
             deny_only: false,
             owner: true,
+            logon_id: false,
         }
     }
 
@@ -85,8 +94,8 @@ impl TokenGroup {
     /// the tokens modelled here are built (none of them are optional/enabled-by-request groups).
     pub fn attributes(&self) -> u32 {
         use crate::create_token::{
-            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_MANDATORY, SE_GROUP_OWNER,
-            SE_GROUP_USE_FOR_DENY_ONLY,
+            SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_LOGON_ID, SE_GROUP_MANDATORY,
+            SE_GROUP_OWNER, SE_GROUP_USE_FOR_DENY_ONLY,
         };
         let mut attributes = 0;
         if self.deny_only {
@@ -96,6 +105,9 @@ impl TokenGroup {
         }
         if self.owner {
             attributes |= SE_GROUP_OWNER;
+        }
+        if self.logon_id {
+            attributes |= SE_GROUP_LOGON_ID;
         }
         attributes
     }

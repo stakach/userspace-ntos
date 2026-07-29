@@ -253,6 +253,51 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
     assert!(!sized.written);
 }
 
+/// `SE_GROUP_LOGON_ID` must SURVIVE capture and re-encoding. `winlogon!AllowAccessOnSession`
+/// (`security.c:1432`) scans `TOKEN_GROUPS` for `(Attributes & SE_GROUP_LOGON_ID) ==
+/// SE_GROUP_LOGON_ID` and leaves its `LogonSid` local UNINITIALISED when nothing matches — it then
+/// dereferences it in `GetLengthSid`. Dropping the bit is therefore not a loss of information, it
+/// is a wild pointer in the caller.
+#[test]
+fn logon_sid_group_keeps_its_se_group_logon_id_through_capture_and_encode() {
+    use crate::create_token::{group_from_attributes, SE_GROUP_ENABLED, SE_GROUP_LOGON_ID,
+        SE_GROUP_MANDATORY};
+    // The logon SID lsasrv mints for an interactive logon: S-1-5-5-X-Y, mandatory+enabled+logon-id.
+    let logon_sid = Sid::new(5, &[5, 0, 0x3e7f]);
+    let attributes = SE_GROUP_MANDATORY | SE_GROUP_ENABLED | SE_GROUP_LOGON_ID;
+    let group = group_from_attributes(logon_sid.clone(), attributes);
+    assert!(group.logon_id, "capture must keep SE_GROUP_LOGON_ID");
+    assert_eq!(group.attributes() & SE_GROUP_LOGON_ID, SE_GROUP_LOGON_ID);
+
+    // A plain enabled group must NOT claim to be the logon SID (one bit of the two-bit mask being
+    // set is not a match — the winlogon test compares the WHOLE mask).
+    let plain = group_from_attributes(Sid::administrators(), SE_GROUP_MANDATORY | SE_GROUP_ENABLED);
+    assert!(!plain.logon_id);
+    let half = group_from_attributes(Sid::everyone(), 0x4000_0000);
+    assert!(!half.logon_id, "half of SE_GROUP_LOGON_ID is not a logon SID");
+
+    // …and the encoder must place it where the scan looks: entry 1's Attributes word.
+    let mut token = AccessToken::system();
+    token.groups.push(group);
+    let mut output = [0u8; 256];
+    let encoded = encode_token_groups(&token, 0x4000_0000, &mut output).unwrap();
+    assert!(encoded.written);
+    let count = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+    let mut found = None;
+    for index in 0..count {
+        let entry = 8 + index * SID_AND_ATTRIBUTES_LENGTH;
+        let attrs = u32::from_le_bytes(output[entry + 8..entry + 12].try_into().unwrap());
+        if attrs & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID {
+            found = Some(u64::from_le_bytes(output[entry..entry + 8].try_into().unwrap()));
+        }
+    }
+    let sid_va = found.expect("the scan winlogon performs must find exactly this group");
+    let offset = (sid_va - 0x4000_0000) as usize;
+    let mut expected = alloc::vec![0u8; logon_sid.native_len().unwrap()];
+    logon_sid.write_native(&mut expected).unwrap();
+    assert_eq!(&output[offset..offset + expected.len()], &expected[..]);
+}
+
 #[test]
 fn native_token_information_encoders_are_exact_and_relocatable() {
     let system = AccessToken::system();

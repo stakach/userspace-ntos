@@ -67,6 +67,9 @@ pub const SE_GROUP_ENABLED_BY_DEFAULT: u32 = 0x0000_0002;
 pub const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 pub const SE_GROUP_OWNER: u32 = 0x0000_0008;
 pub const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+/// `SE_GROUP_LOGON_ID` — marks the logon SID of an interactive logon session (two bits, so a
+/// simple `& SE_GROUP_LOGON_ID` test is not enough; the caller must compare the whole mask).
+pub const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
@@ -330,6 +333,9 @@ pub fn group_from_attributes(sid: Sid, attributes: u32) -> TokenGroup {
         enabled: mandatory || attributes & SE_GROUP_ENABLED != 0,
         deny_only: attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0,
         owner: attributes & SE_GROUP_OWNER != 0,
+        // `SE_GROUP_LOGON_ID` is a TWO-bit mask; test it whole, exactly as
+        // `winlogon!AllowAccessOnSession` does (`(Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID`).
+        logon_id: attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID,
     }
 }
 
