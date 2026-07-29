@@ -2009,6 +2009,14 @@ pub(crate) const DEBUG_TRACE: bool = cfg!(feature = "debug-trace");
 /// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
 /// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
 pub(crate) static W32_HOT_LOG: AtomicU64 = AtomicU64::new(0);
+/// Exact USER cursor identities and handles learned from winlogon's real win32k calls. The executive
+/// event loop is single-threaded, so accesses in `service_sec_image` are serialized.
+pub(crate) static mut GLOBAL_CURSOR_MIRROR: nt_kernel_exec::user_cursor::GlobalCursorMirror<32, 16> =
+    nt_kernel_exec::user_cursor::GlobalCursorMirror::new();
+pub(crate) static GLOBAL_CURSOR_IDENTITIES_OBSERVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_CURSOR_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_GLOBAL_CURSOR_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_GLOBAL_CURSOR_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.
@@ -3129,6 +3137,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let pml4 = PM_PML4S[5].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[5].load(Ordering::Relaxed);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
+    let cursor_identities = GLOBAL_CURSOR_IDENTITIES_OBSERVED.load(Ordering::Relaxed);
+    let cursor_promotions = GLOBAL_CURSOR_PROMOTIONS.load(Ordering::Relaxed);
+    let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
+    let cursor_handle = USERINIT_GLOBAL_CURSOR_HANDLE.load(Ordering::Relaxed);
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3147,6 +3159,14 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(tcb as u32);
     print_str(b" primary-token-assignments=");
     print_u64(token_assigned);
+    print_str(b" cursor-identities=");
+    print_u64(cursor_identities);
+    print_str(b" promotions=");
+    print_u64(cursor_promotions);
+    print_str(b" pi5-cache-hits=");
+    print_u64(cursor_hits);
+    print_str(b" pi5-cursor=0x");
+    print_hex(cursor_handle as u32);
     print_str(b"\n");
     check(
         b"exec_userinit_process_spawned",
@@ -3159,6 +3179,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && pml4 != 0
             && tcb > 1
             && token_assigned >= 1,
+        passed,
+    );
+    check(
+        b"exec_userinit_global_cursor_reused",
+        cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
         passed,
     );
 }

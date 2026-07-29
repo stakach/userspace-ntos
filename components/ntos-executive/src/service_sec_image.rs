@@ -268,6 +268,173 @@ unsafe fn capture_client_string_arg(
     desc
 }
 
+enum CapturedCursorString {
+    Atom(u16),
+    Text(usize),
+}
+
+/// Capture one `UNICODE_STRING` used by `NtUserFindExistingCursorIcon`. A zero-length resource is
+/// the MAKEINTRESOURCE form: its Buffer field is the integer identity and is never dereferenced.
+unsafe fn capture_cursor_counted_string(
+    pi: u64,
+    descriptor: u64,
+    allow_atom: bool,
+    units: &mut [u16; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedCursorString> {
+    use nt_kernel_exec::user_cursor::{decode_utf16, parse_string_descriptor, CursorStringDescriptor};
+
+    let mut raw = [0u8; 16];
+    if descriptor == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            descriptor,
+            &mut raw,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let (length, buffer) = match parse_string_descriptor(&raw, allow_atom)? {
+        CursorStringDescriptor::Atom(atom) => return Some(CapturedCursorString::Atom(atom)),
+        CursorStringDescriptor::Text { byte_len, buffer } => (byte_len, buffer),
+    };
+    let mut bytes = [0u8; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP * 2];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        buffer,
+        &mut bytes[..length],
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    decode_utf16(&bytes[..length], units).map(CapturedCursorString::Text)
+}
+
+unsafe fn capture_cursor_identity_key(
+    pi: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    icon_kind: u32,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
+    use nt_kernel_exec::user_cursor::{CursorLookupKey, CursorResource, CURSOR_TEXT_CAP};
+
+    let mut module = [0u16; CURSOR_TEXT_CAP];
+    let module_len = match capture_cursor_counted_string(
+        pi,
+        module_descriptor,
+        false,
+        &mut module,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )? {
+        CapturedCursorString::Text(len) => len,
+        CapturedCursorString::Atom(_) => return None,
+    };
+    let mut resource_name = [0u16; CURSOR_TEXT_CAP];
+    let resource = match capture_cursor_counted_string(
+        pi,
+        resource_descriptor,
+        true,
+        &mut resource_name,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )? {
+        CapturedCursorString::Atom(atom) => CursorResource::atom(atom),
+        CapturedCursorString::Text(len) => CursorResource::name(&resource_name[..len])?,
+    };
+    CursorLookupKey::new(&module[..module_len], resource, icon_kind)
+}
+
+/// Probe and capture the complete three-argument lookup key before crossing into win32k. The size
+/// fields are intentionally ignored because ReactOS uses only module, resource, and bIcon when it
+/// searches the per-process and global cursor lists. Preserve the raw BOOL because win32k compares
+/// it directly with its canonical 0/1 object type.
+unsafe fn capture_cursor_lookup_key(
+    pi: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    parameter: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
+    let mut params = [0u8; 12];
+    if parameter == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            parameter,
+            &mut params,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let icon_kind = u32::from_le_bytes(params[0..4].try_into().unwrap());
+    capture_cursor_identity_key(
+        pi,
+        module_descriptor,
+        resource_descriptor,
+        icon_kind,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
+}
+
+/// Capture the identity assigned by a real `NtUserSetCursorIconData`. `CURSORDATA.rt` is RT_CURSOR
+/// (1) or RT_ICON (3); normalize it to the canonical BOOL stored by a later lookup key.
+unsafe fn capture_cursor_set_data_key(
+    pi: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    cursor_data: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
+    let mut data_prefix = [0u8; 18];
+    if cursor_data == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            cursor_data,
+            &mut data_prefix,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+    let icon_kind = match u16::from_le_bytes([data_prefix[16], data_prefix[17]]) {
+        1 => 0,
+        3 => 1,
+        _ => return None,
+    };
+    capture_cursor_identity_key(
+        pi,
+        module_descriptor,
+        resource_descriptor,
+        icon_kind,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
+}
+
 /// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
 /// at `(base, pe)` — so smss's resolved ntdll calls fault ntdll's pages in and EXECUTE. SAFE
 /// STOP: halt (don't loop) on a fault outside BOTH images (a null deref / bad address), a
@@ -5263,6 +5430,29 @@ pub(crate) unsafe fn service_sec_image(
                         );
                     }
                 }
+                let cursor_identity_key = if m0 == 0x103d {
+                    capture_cursor_lookup_key(
+                        pi as u64,
+                        a0,
+                        a1,
+                        a2,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                } else if m0 == 0x10a8 {
+                    capture_cursor_set_data_key(
+                        pi as u64,
+                        a1,
+                        a2,
+                        a3,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                } else {
+                    None
+                };
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
@@ -5446,6 +5636,25 @@ pub(crate) unsafe fn service_sec_image(
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
                     (0x0409_0409i32, true)
+                } else if m0 == 0x103d && pi == 5 {
+                    // userinit is a distinct interactive process, but the current win32k host still
+                    // has one shared PROCESSINFO. Entering the real handler with that mismatched state
+                    // reaches an unbounded EngCopyBits path. Model the handler's second (`gcurFirst`)
+                    // search exactly: only return a handle learned from a real winlogon lookup and a
+                    // successful real NtUserSetSystemCursor promotion; an exact miss remains NULL.
+                    let hit = cursor_identity_key
+                        .as_ref()
+                        .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
+                    if let Some(handle) = hit {
+                        USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
+                        USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] userinit global cursor cache HIT -> real HCURSOR 0x");
+                        print_hex(handle);
+                        print_str(b"\n");
+                    } else {
+                        print_str(b"[win32k-svc] userinit global cursor cache miss -> NULL\n");
+                    }
+                    (hit.unwrap_or(0) as i32, true)
                 } else if m0 == 0x103d && svc_noninteractive {
                     // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -5801,6 +6010,17 @@ pub(crate) unsafe fn service_sec_image(
                         let resumed = win32k_glue::cancel_suspended_user_callback();
                         st = resumed.0;
                         ok = resumed.1;
+                    }
+                }
+                if pi == 2 && ok && !redirected_user_callback {
+                    if m0 == 0x10a8 && st != 0 {
+                        if let Some(key) = cursor_identity_key.as_ref() {
+                            GLOBAL_CURSOR_MIRROR.observe_identity(key, a0 as u32);
+                            GLOBAL_CURSOR_IDENTITIES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if m0 == 0x1283 && st != 0 {
+                        GLOBAL_CURSOR_MIRROR.promote(a0 as u32);
+                        GLOBAL_CURSOR_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 if winlogon_switch && !redirected_user_callback {

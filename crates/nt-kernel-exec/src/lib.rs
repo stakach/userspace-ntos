@@ -31,6 +31,7 @@ pub mod session_section;
 mod spin;
 mod timer;
 pub mod timezone;
+pub mod user_cursor;
 mod work_item;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
