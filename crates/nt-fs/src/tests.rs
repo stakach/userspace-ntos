@@ -153,9 +153,20 @@ fn local_nt_paths_resolve_to_the_fat_volume() {
         b"reactos\\system32"
     );
     assert_eq!(
+        nt_path_to_volume_relative(&utf16(r"\??\C:\Windows"), b"reactos").unwrap(),
+        b"reactos"
+    );
+    assert_eq!(
         nt_path_to_volume_relative(&utf16(r"\??\C:\"), b"reactos").unwrap(),
         b""
     );
+}
+
+#[test]
+fn fat_attributes_translate_to_native_file_attributes() {
+    assert_eq!(file_attributes_from_fat(0), FILE_ATTRIBUTE_NORMAL);
+    assert_eq!(file_attributes_from_fat(0x10), FILE_ATTRIBUTE_DIRECTORY);
+    assert_eq!(file_attributes_from_fat(0x21), 0x21);
 }
 
 #[test]

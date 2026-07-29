@@ -592,7 +592,7 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x820) as *mut u64, SMSS_DESKINFO_VA); // CLIENTINFO.pDeskInfo
         core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
         crate::seed_teb_tail_canary(scr + 0x5000);
-        if pi < 5 {
+        if (pi as usize) < MAX_PI {
             crate::TEB_TAIL_ALIAS_LIVE.fetch_or(1u64 << pi, core::sync::atomic::Ordering::Relaxed);
             crate::TEB2_FRAME_CAP[pi as usize].store(teb2, core::sync::atomic::Ordering::Relaxed);
         }

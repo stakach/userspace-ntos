@@ -29,6 +29,17 @@ pub const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+/// FAT directory entries use the same low attribute bits as NT file attributes. Preserve those
+/// real bits, but translate an empty FAT attribute byte into NT's required NORMAL marker.
+pub fn file_attributes_from_fat(raw: u8) -> u32 {
+    let attributes = u32::from(raw);
+    if attributes == 0 {
+        FILE_ATTRIBUTE_NORMAL
+    } else {
+        attributes
+    }
+}
 /// The attribute bits a create/set-information caller may choose. FILE_ATTRIBUTE_DIRECTORY is NOT
 /// among them — the file system owns it (NT ignores it on the caller's side too).
 pub const FILE_ATTRIBUTE_SETTABLE: u32 = FILE_ATTRIBUTE_READONLY

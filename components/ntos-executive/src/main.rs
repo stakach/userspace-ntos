@@ -250,6 +250,21 @@ pub const LSASS_STACK_MIRROR_VA: u64 = 0x0000_0100_106E_0000; // FILEBUF PT, pre
 pub const LSASS_HEAP_MIRROR_VA: u64 = 0x0000_0100_12A0_0000; // own PT (spawn_sec_image creates it)
 pub const LSASS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_12C0_0000; // own PT (spawn_sec_image creates it)
 pub const LSASS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1077_0000; // FILEBUF PT (past services' 0x1076)
+/// The 6th hosted process — userinit.exe, launched by winlogon's CreateProcessAsUserW after an
+/// interactive logon. Badge 27 is the first free thread badge after the fixed 16..25 TP range and
+/// the LSA worker at 26. Its executive mirrors occupy the free band immediately below FILE POOL.
+pub const USERINIT_BADGE: u64 = 27;
+pub const USERINIT_STACK_MIRROR_VA: u64 = 0x0000_0100_1480_0000;
+pub const USERINIT_ENV_SCRATCH_VA: u64 = 0x0000_0100_1490_0000;
+pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
+pub const USERINIT_IMAGE_MIRROR_VA: u64 = 0x0000_0100_14C0_0000;
+const _: () = {
+    assert!(USERINIT_STACK_MIRROR_VA & 0x1f_ffff == 0);
+    assert!(USERINIT_ENV_SCRATCH_VA >= USERINIT_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
+    assert!(USERINIT_ENV_SCRATCH_VA + 0x9000 <= USERINIT_HEAP_MIRROR_VA);
+    assert!(USERINIT_HEAP_MIRROR_VA + 0x20_0000 <= USERINIT_IMAGE_MIRROR_VA);
+    assert!(USERINIT_IMAGE_MIRROR_VA + 0x10_0000 <= fs_loader::POOL_VADDR);
+};
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
 // smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
@@ -1019,7 +1034,7 @@ pub const FRAMEBUFBUF_FRAMES: u64 = 8;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
-// ★ BATCH 22 demand-fault scratch layout. The old scheme packed all 5 processes' scratch into the
+// ★ BATCH 22 demand-fault scratch layout. The old scheme packed the early processes' scratch into the
 // single 8-PT span 0x1100..0x1200 with ~512-page inter-process spacing — too tight now that the
 // BATCH bulk-fill lets a process (lsass) page in its full LSA-init DLL tree (thousands of pages;
 // each fill takes a UNIQUE monotonic scratch slot). Each process now gets its OWN 64 MiB window
@@ -1049,9 +1064,11 @@ pub const LSASS_BADGE: u64 = 8;
 /// lsass.exe's demand-fault scratch window (own 64 MiB) — sized so lsass's full LSA-init DLL tree
 /// (lsasrv/samsrv/msv1_0 + deps) can page in without overflowing into a neighbour's scratch.
 pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDOW;
+pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WINDOW;
 /// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
-/// per-process arrays are sized for. The 5 current processes (smss/csrss/winlogon/services/lsass =
-/// pi 0..4) are live; the extra headroom is for the post-login processes (userinit, explorer, the
+/// per-process arrays are sized for. The 6 current processes
+/// (smss/csrss/winlogon/services/lsass/userinit = pi 0..5) are live; the extra headroom is for
+/// later post-login processes (explorer, the
 /// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
 /// (PM_PIDS/PM_TIDS/PM_POOL_TID, PFILLED, the service_sec_image `procs`/`dll_pd_created`/
 /// `dll_pt_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
@@ -3041,9 +3058,8 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
 /// `AllowAccessOnSession` → `StartUserShell` → `WlxActivateUserShell` → `CreateProcessAsUserW`.
 /// Reaching the LAST link is therefore a structural witness that every earlier one succeeded.
 ///
-/// **`userinit.exe` is NOT spawned and nothing here claims it is.** The generic image lane now
-/// accepts its open, creates SEC_IMAGE, and answers SectionImageInformation; the separate gate below
-/// proves those stages. The honest wall is the effectful pi=5 process reservation and VSpace spawn.
+/// The generic image lane accepts its open, creates SEC_IMAGE, answers SectionImageInformation, and
+/// publishes a real pi=5 process. The separate gate below proves every stage plus the live VSpace.
 ///
 /// The `AutoAdminLogon` clause is the trap this spec exists to hold shut: the real SOFTWARE hive's
 /// Winlogon key carries `AutoAdminLogon = "1"` next to `Userinit`, and serving it would change the
@@ -3102,13 +3118,17 @@ fn user_shell_activation_spec(passed: &mut u64) {
     userinit_image_pipeline_spec(passed);
 }
 
-/// ═══ userinit HAS REAL FILE + SEC_IMAGE SEMANTICS, BUT NO pi=5 PROCESS YET ══════════════════════
+/// ═══ userinit HAS REAL FILE + SEC_IMAGE + pi=5 PROCESS SEMANTICS ═══════════════════════════════
 fn userinit_image_pipeline_spec(passed: &mut u64) {
     let opened = USERINIT_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
     let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
     let spawned_pid = PM_PIDS[5].load(Ordering::Relaxed);
+    let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
+    let pml4 = PM_PML4S[5].load(Ordering::Relaxed);
+    let tcb = PM_MAIN_TCBS[5].load(Ordering::Relaxed);
+    let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3119,10 +3139,26 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(creates);
     print_str(b" pi5-pid=");
     print_u64(spawned_pid);
-    print_str(b" (STATUS_NOT_IMPLEMENTED: process mechanism not yet published)\n");
+    print_str(b" spawned=");
+    print_u64(spawned);
+    print_str(b" pml4=0x");
+    print_hex(pml4 as u32);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" primary-token-assignments=");
+    print_u64(token_assigned);
+    print_str(b"\n");
     check(
-        b"exec_userinit_sec_image_reached",
-        opened >= 1 && sectioned >= 1 && queried >= 1 && creates >= 1 && spawned_pid == 0,
+        b"exec_userinit_process_spawned",
+        opened >= 1
+            && sectioned >= 1
+            && queried >= 1
+            && creates >= 1
+            && spawned_pid != 0
+            && spawned == 1
+            && pml4 != 0
+            && tcb > 1
+            && token_assigned >= 1,
         passed,
     );
 }
@@ -5649,6 +5685,7 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
         2 => WINLOGON_MAIN_TEB_MIRROR_VA, // 0x…107C_0000
         3 => SERVICES_ENV_SCRATCH_VA,
         4 => LSASS_ENV_SCRATCH_VA,
+        5 => USERINIT_ENV_SCRATCH_VA,
         _ => 0,
     }
 }
@@ -6086,12 +6123,13 @@ pub(crate) static W32_TEB_TAIL_RO_MAPS: AtomicU64 = AtomicU64::new(0);
 /// Each process' MAIN-thread TEB tail frame cap, so a transition report can ask the decisive
 /// question: is this frame ALIASED — registered/cached under some OTHER key, so that a write win32k
 /// or a demand fill makes elsewhere lands in this TEB?
-pub(crate) static TEB2_FRAME_CAP: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static TEB2_FRAME_CAP: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit `pi` set once `spawn_sec_image` has actually MAPPED that process' `scr + 0x5000` TEB-tail
 /// alias. Reading the alias before then is a #PF in the executive itself (measured).
 pub(crate) static TEB_TAIL_ALIAS_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Per-pi "the tail was intact last time we looked" bit, so only the TRANSITION is reported.
-static TEB_WATCH_GOOD: [AtomicU64; 5] = [const { AtomicU64::new(1) }; 5];
+static TEB_WATCH_GOOD: [AtomicU64; MAX_PI] = [const { AtomicU64::new(1) }; MAX_PI];
 static TEB_WATCH_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// Last observed value of winlogon's `TEB.ReservedForNtRpc` (TEB+0x1698) + a bounded report budget.
 pub(crate) static WL_NTRPC_SLOT: AtomicU64 = AtomicU64::new(0);
@@ -6107,7 +6145,7 @@ static TEB_WATCH_LAST_AUX2: AtomicU64 = AtomicU64::new(0);
 /// dispatch, 2 = after one) — the measurement that says whether a win32k dispatch is the writer at
 /// all, rather than assuming it from the fact that the value looks like USER data.
 pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
-    if pi >= 5 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
+    if pi >= MAX_PI || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
         return;
     }
     let env_scratch = env_scratch_base_for_pi(pi);
@@ -6459,6 +6497,7 @@ fn heap_mirror_for_pi(pi: usize) -> u64 {
         2 => WINLOGON_HEAP_MIRROR_VA,
         3 => SERVICES_HEAP_MIRROR_VA,
         4 => LSASS_HEAP_MIRROR_VA,
+        5 => USERINIT_HEAP_MIRROR_VA,
         _ => SMSS_HEAP_MIRROR_VA,
     }
 }
@@ -9202,12 +9241,12 @@ pub(crate) static WINLOGON_USERINIT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Image opens for `userinit.exe` that winlogon's OWN `CreateProcessAsUserW` really issued. This is
 /// an attempt count; `USERINIT_IMAGE_OPEN_SUCCESSES` proves which opens entered the generic lane.
 pub(crate) static WINLOGON_USERINIT_IMAGE_OPENS: AtomicU64 = AtomicU64::new(0);
-/// Successful generic-image stages for userinit. A create-process request is not a spawn: until the
-/// pi=5 mechanism is installed the request returns STATUS_NOT_IMPLEMENTED and no child is published.
+/// Successful generic-image stages for userinit, followed by publication of its pi=5 VSpace.
 pub(crate) static USERINIT_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_PRIMARY_TOKEN_ASSIGNED: AtomicU64 = AtomicU64::new(0);
 /// Every value the synthesized Winlogon key ANSWERED — the leak check for `AutoAdminLogon`.
 pub(crate) static WINLOGON_KEY_VALUES_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Groups in the token `NtCreateToken` minted that carry `SE_GROUP_LOGON_ID` — the logon SID
@@ -10933,6 +10972,7 @@ static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// NtCreateSection; SPAWNED set at NtCreateProcessEx; FAULTS = its loader demand-fault count.
 static LSASS_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
 static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static USERINIT_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass's lsasrv `LsapRmInitializeServer` NtConnectPort(\SeRmCommandPort) is modeled-accepted
 /// — i.e. lsass's LSA init (LsapInitLsa) has resolved lsasrv+samsrv (SERVICE 10 step 2) and is running
@@ -11014,9 +11054,9 @@ static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 // in `ExecNtHandler::new()` (below the per-syscall heap mark → survives the bump reset, no runtime
 // realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
 // keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
-/// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon / 3=services (0 = not yet created).
+/// EPROCESS pids for hosted process indices (0 = not yet created).
 static PM_PIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// How many EPROCESS objects the boot-time ProcessManager holds (expected 3).
+/// How many EPROCESS objects the boot-time ProcessManager holds (expected 6).
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
 /// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
@@ -11388,7 +11428,7 @@ impl ProcExec {
 }
 /// Bit i set iff `procs[i]` (the folded EPROCESS-linked per-process struct) has a live pml4 AND its
 /// `pid` matches the ProcessManager's pid for pi=i — proves the consolidated per-process mechanism
-/// struct is EPROCESS-linked at runtime (path 3). Expected 0b111 (all 3 hosted processes spawned).
+/// struct is EPROCESS-linked at runtime (path 3). Expected 0b11_1111 for the six live processes.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -13282,6 +13322,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let fb_pt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, fb_pt);
             let _ = paging_struct_map(fb_pt, LBL_X86_PAGE_TABLE_MAP, FILEBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+            // userinit is the first process whose stack and environment mirrors live outside the
+            // early FILEBUF PT. Install their shared 2 MiB executive PT before the runtime spawn so
+            // every mirrored stack/env page_map has a valid destination without allocating policy
+            // state under the per-syscall reset mark.
+            let userinit_mirror_pt = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                userinit_mirror_pt,
+            );
+            let _ = paging_struct_map(
+                userinit_mirror_pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                USERINIT_STACK_MIRROR_VA,
+                CAP_INIT_THREAD_VSPACE,
+            );
             let fb_start = alloc_frame();
             for _ in 1..FILEBUF_FRAMES {
                 let _ = alloc_frame();
@@ -15241,12 +15299,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // = the live service loop resolved a fault badge → its EPROCESS through the manager.
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == 5,
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == 6,
                         &mut passed,
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b11111,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
                     check(
@@ -15283,12 +15341,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b11111,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
                     check(
                         b"exec_main_thread_bound_at_spawn",
-                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 5,
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 6,
                         &mut passed,
                     );
                     check(
@@ -15636,7 +15694,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b11111,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
                     // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32

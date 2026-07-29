@@ -448,20 +448,23 @@ impl ExecNtHandler {
                 // The 5th hosted process — lsass.exe, spawned by winlogon's StartLsass Win32
                 // CreateProcessW (the LSA subsystem), so its EPROCESS parent is winlogon too.
                 let lsass_pid = pm.create_process("lsass.exe", Some(winlogon_pid), None);
+                let userinit_pid = pm.create_process("userinit.exe", Some(winlogon_pid), None);
                 PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
                 PM_PIDS[3].store(services_pid as u64, Ordering::Relaxed);
                 PM_PIDS[4].store(lsass_pid as u64, Ordering::Relaxed);
+                PM_PIDS[5].store(userinit_pid as u64, Ordering::Relaxed);
                 PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
                 // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
                 let mut ok = 0u64;
-                let expect: [(usize, u32, &str); 5] = [
+                let expect: [(usize, u32, &str); 6] = [
                     (0, smss_pid, "smss.exe"),
                     (1, csrss_pid, "csrss.exe"),
                     (2, winlogon_pid, "winlogon.exe"),
                     (3, services_pid, "services.exe"),
                     (4, lsass_pid, "lsass.exe"),
+                    (5, userinit_pid, "userinit.exe"),
                 ];
                 for (i, pid, name) in expect {
                     let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
@@ -482,7 +485,14 @@ impl ExecNtHandler {
                 // later, alloc-free, at the actual seL4 spawn (set_thread_start_address). Entry starts
                 // 0 = "not yet bound".
                 let mut mt_ok = 0u64;
-                let pids = [smss_pid, csrss_pid, winlogon_pid, services_pid, lsass_pid];
+                let pids = [
+                    smss_pid,
+                    csrss_pid,
+                    winlogon_pid,
+                    services_pid,
+                    lsass_pid,
+                    userinit_pid,
+                ];
                 for (i, &pid) in pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
                         PM_TIDS[i].store(tid as u64, Ordering::Relaxed);
@@ -520,10 +530,17 @@ impl ExecNtHandler {
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
                 // Measured peak is < ~100 handles per process over a full boot; 256 is ~3× headroom.
-                for pid in [smss_pid, csrss_pid, winlogon_pid, services_pid, lsass_pid] {
+                for pid in [
+                    smss_pid,
+                    csrss_pid,
+                    winlogon_pid,
+                    services_pid,
+                    lsass_pid,
+                    userinit_pid,
+                ] {
                     pm.reserve_handles(pid, PM_HANDLE_RESERVE);
                 }
-                // Record the reserved capacity (min across the 5) so the run can prove it never
+                // Record the reserved capacity (min across the 6) so the run can prove it never
                 // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
                 let cap = pm
                     .handle_capacity(smss_pid)
@@ -531,6 +548,7 @@ impl ExecNtHandler {
                     .min(pm.handle_capacity(winlogon_pid))
                     .min(pm.handle_capacity(services_pid))
                     .min(pm.handle_capacity(lsass_pid));
+                let cap = cap.min(pm.handle_capacity(userinit_pid));
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
@@ -546,7 +564,7 @@ impl ExecNtHandler {
             dll_loaded_dirty: false,
             writable_fs_dirty: false,
         };
-        for pi in 0..5 {
+        for pi in 0..6 {
             let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
             let token = handler.token_store.insert(nt_security::AccessToken::system());
             let _ = handler.pm.replace_process_primary_token(pid, Some(token));
@@ -3530,6 +3548,72 @@ impl ExecNtHandler {
             .is_some_and(|token| token.has_privilege(name))
     }
 
+    /// `NtSetInformationProcess(ProcessAccessToken)`: capture the native two-HANDLE structure, but
+    /// assign only its Token member. ReactOS fills Thread in advapi32 and the kernel deliberately
+    /// ignores it (`ntoskrnl/ps/query.c`, ProcessAccessToken), so resolving that handle here would
+    /// reject valid callers. TokenStore does not yet model token ancestry; require the real enabled
+    /// assignment privilege for the independent interactive logon token used by CreateProcessAsUser.
+    unsafe fn nt_set_process_access_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const PROCESS_SET_INFORMATION: u32 = 0x0200;
+        const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
+
+        if args[3] != 16 {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        let mut captured = [0u8; 16];
+        if args[2] == 0 || !self.xas_read(args[2], &mut captured) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let token_handle = u64::from_le_bytes(captured[..8].try_into().unwrap());
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let target = match self.pm.resolve_process_handle(
+            caller,
+            args[0],
+            PROCESS_SET_INFORMATION,
+        ) {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
+        let token = match self.token_id_for_handle(token_handle, TOKEN_ASSIGN_PRIMARY) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        if !self.current_token_has_privilege(nt_security::SE_ASSIGN_PRIMARY_TOKEN) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        if self
+            .token_store
+            .get(token)
+            .is_none_or(|token| token.token_type != nt_security::TokenType::Primary)
+        {
+            return nt_security::STATUS_BAD_TOKEN_TYPE;
+        }
+        if self.token_store.retain(token).is_err() {
+            return STATUS_INVALID_HANDLE;
+        }
+        let old = match self.pm.replace_process_primary_token(target, Some(token)) {
+            Ok(old) => old,
+            Err(status) => {
+                let _ = self.token_store.release(token);
+                return status;
+            }
+        };
+        if let Some(old) = old {
+            let _ = self.token_store.release(old);
+        }
+        if self.pi_for_pid(target) == Some(5) {
+            USERINIT_PRIMARY_TOKEN_ASSIGNED.fetch_add(1, Ordering::Relaxed);
+        }
+        0
+    }
+
     fn release_handle_object(&mut self, object: nt_process::HandleObject) {
         match object {
             nt_process::HandleObject::TokenObject(token) => {
@@ -4790,6 +4874,14 @@ impl ExecNtHandler {
             return alloc::vec::Vec::new();
         }
         self.read_ustr_pe(objname)
+    }
+
+    /// Render a complete FILE_BASIC_INFORMATION with the backing volume's real attributes. This
+    /// volume does not track timestamps, so zero is the honest value for all four time fields.
+    unsafe fn write_file_basic_attributes(&self, output: u64, attributes: u32) -> bool {
+        let mut basic = [0u8; 40];
+        basic[0x20..0x24].copy_from_slice(&attributes.to_le_bytes());
+        self.xas_try_write_buf(output, &basic)
     }
 
     /// Validate event OBJECT_ATTRIBUTES and return its root handle plus optional object name.
@@ -9356,6 +9448,9 @@ impl ExecNtHandler {
             // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
             // 236 NtSetInformationObject.)
             NativeService::NtSetInformationProcess => unsafe {
+                if args[1] == 9 {
+                    return self.nt_set_process_access_token(args);
+                }
                 if args[1] != 29 {
                     return 0;
                 }
@@ -10788,9 +10883,14 @@ impl ExecNtHandler {
             // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
             // → not-found so the loader's manifest probes keep failing.
             NativeService::NtQueryAttributesFile => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
-                let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
+                let name16 = self.read_objattr_name_pe(args[0]);
+                if name16.is_empty() {
+                    return STATUS_OBJECT_NAME_INVALID;
+                }
                 // ★ THE WRITABLE FILESYSTEM OVERLAY answers by-path attribute queries for its own
                 // namespace — `GetFileAttributesW` is how `LoadUserProfileW` (profile.c:2085) asks
                 // whether the user's hive already exists, and how `CreateDirectoryPath` probes.
@@ -10798,12 +10898,25 @@ impl ExecNtHandler {
                 if let Some(relative) = crate::writable_fs::writable_path(&name16) {
                     self.writable_fs_dirty = true;
                     return match crate::writable_fs::query_attributes(&relative) {
-                        Some(info) => {
-                            // FILE_BASIC_INFORMATION: 4×8-byte times, FileAttributes(u32) @ +0x20.
-                            smss_stack_write32(args[1] + 0x20, info.attributes);
+                        Some(info)
+                            if self.write_file_basic_attributes(args[1], info.attributes) =>
+                        {
                             nt_fs::STATUS_SUCCESS
                         }
+                        Some(_) => STATUS_ACCESS_VIOLATION,
                         None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+                    };
+                }
+                // General read-only namespace lookup. This is intentionally below the writable
+                // mount so C:\Profiles remains overlay-backed, but above the loader-specific EXE/DLL
+                // probes. In particular msgina passes C:\Windows as userinit's current directory;
+                // the canonicalizer maps it to the real FAT `reactos` directory and this returns its
+                // genuine FILE_ATTRIBUTE_DIRECTORY bit.
+                if let Some(attributes) = crate::fs_loader::query_nt_path_attributes(&name16) {
+                    return if self.write_file_basic_attributes(args[1], attributes) {
+                        nt_fs::STATUS_SUCCESS
+                    } else {
+                        STATUS_ACCESS_VIOLATION
                     };
                 }
                 let mut nb = [0u8; 96];
@@ -10834,11 +10947,17 @@ impl ExecNtHandler {
                 let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
                 let status: u32 = if exe_exists {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
-                    smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL (a file)
-                    0
+                    if self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) {
+                        0
+                    } else {
+                        STATUS_ACCESS_VIOLATION
+                    }
                 } else if dll_exists {
-                    smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
-                    0
+                    if self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) {
+                        0
+                    } else {
+                        STATUS_ACCESS_VIOLATION
+                    }
                 } else {
                     // DIAG: log the not-found probes from a DLL-loading process (csrss/winlogon) —
                     // a DllMain probes several files before failing init; we need to know which are
@@ -13038,10 +13157,12 @@ impl ExecNtHandler {
                     if let Some(child_pi) = child_pi {
                         if child_pi == 5 {
                             USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                            // The image path is real through SectionImageInformation. Do not claim a
-                            // child until pi=5 PM identity, badge/layout, caps, and rollback are
-                            // installed transactionally in the loop.
-                            return 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+                            // CreateProcessAsUserW must name winlogon itself as ParentProcess. The
+                            // measured call uses NtCurrentProcess; resolve it through the same typed
+                            // process-handle path rather than accepting an arbitrary parent scalar.
+                            if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(2) {
+                                return nt_process::STATUS_INVALID_HANDLE;
+                            }
                         }
                         match table.reserve_spawn(
                             self.pi,

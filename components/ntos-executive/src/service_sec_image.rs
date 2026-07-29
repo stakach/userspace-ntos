@@ -337,6 +337,7 @@ pub(crate) unsafe fn service_sec_image(
     let mut exe_images = nt_exe_image::ImageTable::<8>::new();
     let mut services_process_handle = 0u64;
     let mut lsass_process_handle = 0u64;
+    let mut userinit_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
@@ -1062,6 +1063,8 @@ pub(crate) unsafe fn service_sec_image(
             || is_lsa_worker
         {
             4
+        } else if badge == USERINIT_BADGE {
+            5
         } else {
             0
         };
@@ -1151,6 +1154,7 @@ pub(crate) unsafe fn service_sec_image(
                     2 => WINLOGON_STACK_MIRROR_VA,
                     3 => SERVICES_STACK_MIRROR_VA,
                     4 => LSASS_STACK_MIRROR_VA,
+                    5 => USERINIT_STACK_MIRROR_VA,
                     _ => SMSS_STACK_MIRROR_VA,
                 }
             },
@@ -1162,6 +1166,7 @@ pub(crate) unsafe fn service_sec_image(
                 2 => WINLOGON_IMAGE_MIRROR_VA,
                 3 => SERVICES_IMAGE_MIRROR_VA,
                 4 => LSASS_IMAGE_MIRROR_VA,
+                5 => USERINIT_IMAGE_MIRROR_VA,
                 _ => IMAGE_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -1172,6 +1177,7 @@ pub(crate) unsafe fn service_sec_image(
                 2 => WINLOGON_HEAP_MIRROR_VA,
                 3 => SERVICES_HEAP_MIRROR_VA,
                 4 => LSASS_HEAP_MIRROR_VA,
+                5 => USERINIT_HEAP_MIRROR_VA,
                 _ => SMSS_HEAP_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -1186,6 +1192,7 @@ pub(crate) unsafe fn service_sec_image(
             2 => winlogon_pe.as_ref().unwrap(),
             3 => services_pe.as_ref().unwrap(),
             4 => lsass_pe.as_ref().unwrap(),
+            5 => userinit_pe.as_ref().unwrap(),
             _ => pe,
         };
         faults = procs[pi].faults;
@@ -1936,7 +1943,14 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
-                print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else if pi == 2 { b"[winlogon vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
+                print_str(match pi {
+                    1 => b"[csrss vmf] NULL/low deref ip=0x",
+                    2 => b"[winlogon vmf] NULL/low deref ip=0x",
+                    3 => b"[services vmf] NULL/low deref ip=0x",
+                    4 => b"[lsass vmf] NULL/low deref ip=0x",
+                    5 => b"[userinit vmf] NULL/low deref ip=0x",
+                    _ => b"[smss vmf] NULL/low deref ip=0x",
+                });
                 print_hex((m0 >> 32) as u32);
                 print_hex(m0 as u32);
                 print_str(b" addr=0x");
@@ -3866,6 +3880,94 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(lsass_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                 }
+                // The first post-login process: winlogon's CreateProcessAsUserW has already driven
+                // userinit through the generic file -> SEC_IMAGE -> process reservation state
+                // machine. Build its real pi=5 VSpace, then publish only a typed process handle.
+                // Its initial TCB remains suspended until RtlCreateUserProcess creates/resumes the
+                // pre-created main ETHREAD, exactly like services and lsass.
+                if nt_handler
+                    .exe_spawn_request
+                    .is_some_and(|request| request.child_pi == 5)
+                    && USERINIT_SPAWNED.load(Ordering::Relaxed) == 0
+                    && userinit_pe.is_some()
+                {
+                    let request = nt_handler.exe_spawn_request.unwrap();
+                    let uf_c = mint_badged(fault_ep, USERINIT_BADGE);
+                    let upe = userinit_pe.as_ref().unwrap();
+                    const USERINIT_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\userinit.exe";
+                    const USERINIT_CMD_LINE: &[u8] = b"userinit.exe";
+                    let upml4 = spawn_sec_image(
+                        5,
+                        upe,
+                        uf_c,
+                        NTDLL_BASE,
+                        true,
+                        105,
+                        USERINIT_ENV_SCRATCH_VA,
+                        USERINIT_STACK_MIRROR_VA,
+                        USERINIT_HEAP_MIRROR_VA,
+                        USERINIT_IMAGE_MIRROR_VA,
+                        USERINIT_IMAGE_PATH,
+                        USERINIT_CMD_LINE,
+                        0,
+                    );
+                    procs[5].pml4 = upml4;
+                    PM_PML4S[5].store(upml4, Ordering::Relaxed);
+                    procs[5].img_end = PE_LOAD_BASE + image_extent(upe);
+                    procs[5].scratch_base = USERINIT_SCRATCH_BASE;
+                    map_demand_scratch_pts(USERINIT_SCRATCH_BASE);
+                    nt_handler.bind_main_thread_entry(
+                        5,
+                        PE_LOAD_BASE + upe.entry_point_rva() as u64,
+                    );
+
+                    let handle = match (
+                        nt_handler.pm_pid_for_pi(2),
+                        nt_handler.pm_pid_for_pi(5),
+                    ) {
+                        (Some(wl_pid), Some(userinit_pid)) => nt_handler
+                            .pm
+                            .insert_handle(
+                                wl_pid,
+                                nt_process::HandleObject::Process(userinit_pid),
+                                nt_process::map_process_access(request.desired_access),
+                            )
+                            .map(u64::from),
+                        _ => Err(nt_process::STATUS_INVALID_HANDLE),
+                    };
+                    match handle {
+                        Ok(handle) => {
+                            userinit_process_handle = handle;
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            let published = nt_handler.publish_created_process(
+                                request.process_handle_out,
+                                userinit_process_handle,
+                                SMSS_PEB_VA,
+                            );
+                            if !published {
+                                result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                                let _ = exe_images.rollback_spawn(request);
+                            } else if exe_images
+                                .publish(request, userinit_process_handle)
+                                .is_err()
+                            {
+                                result = 0xC000_000D; // STATUS_INVALID_PARAMETER
+                            } else {
+                                USERINIT_SPAWNED.store(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(status) => {
+                            result = u64::from(status);
+                            let _ = exe_images.rollback_spawn(request);
+                        }
+                    }
+                    print_str(
+                        b"[ntos-exec] NtCreateProcessEx: spawned userinit.exe (badge 27) -> handle 0x",
+                    );
+                    print_hex((userinit_process_handle >> 32) as u32);
+                    print_hex(userinit_process_handle as u32);
+                    print_str(b"; initial thread awaits NtCreateThread\n");
+                }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
                 // has Context* at [sp+0x30] (arg6), and RtlInitializeContext(amd64) set CONTEXT.Rip@0xF8
@@ -4776,6 +4878,7 @@ pub(crate) unsafe fn service_sec_image(
                     || is_wl_worker
                     || badge == SERVICES_BADGE
                     || badge == LSASS_BADGE
+                    || badge == USERINIT_BADGE
                     || (is_tp_worker && pi != 0))
             {
                 let dialog_modal_expected_ssn = if pi == 2 {
@@ -4912,6 +5015,7 @@ pub(crate) unsafe fn service_sec_image(
                         2 => 0x0000_0100_107C_1000,
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -5463,6 +5567,7 @@ pub(crate) unsafe fn service_sec_image(
                         2 => 0x0000_0100_107C_1000,
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -5670,6 +5775,7 @@ pub(crate) unsafe fn service_sec_image(
                         2 => 0x0000_0100_107C_1000,
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -6594,7 +6700,7 @@ pub(crate) unsafe fn service_sec_image(
         // hosted-thread self-exit. This replaces the batch-38 live-lifecycle terminate specs: with
         // the SCM RPC succeeding (route ON), the SCM worker/listener PERSIST as servers instead of
         // self-exiting, so a live self-exit COUNT is no longer a stable invariant. Runs post-loop on
-        // throwaway processes/threads only → the 5 hosted processes are untouched (byte-identical).
+        // throwaway processes/threads only -> the 6 hosted processes are untouched.
         {
             use nt_process::{HandleObject, ProcessState, ThreadState};
             const THREAD_TERMINATE: u32 = 0x0001;
@@ -9610,6 +9716,10 @@ pub(crate) unsafe fn service_sec_image(
         b"winlogon"
     } else if badge == SERVICES_BADGE {
         b"services"
+    } else if badge == LSASS_BADGE {
+        b"lsass"
+    } else if badge == USERINIT_BADGE {
+        b"userinit"
     } else {
         b"smss"
     });
@@ -9928,6 +10038,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
                     2 => WINLOGON_STACK_MIRROR_VA,
                     3 => SERVICES_STACK_MIRROR_VA,
                     4 => LSASS_STACK_MIRROR_VA,
+                    5 => USERINIT_STACK_MIRROR_VA,
                     _ => SMSS_STACK_MIRROR_VA,
                 };
                 (STACK_BASE, STACK_FRAMES, smv)
@@ -9939,6 +10050,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         2 => WINLOGON_HEAP_MIRROR_VA,
         3 => SERVICES_HEAP_MIRROR_VA,
         4 => LSASS_HEAP_MIRROR_VA,
+        5 => USERINIT_HEAP_MIRROR_VA,
         _ => SMSS_HEAP_MIRROR_VA,
     };
     let image_mirror = match pi {
@@ -9946,6 +10058,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         2 => WINLOGON_IMAGE_MIRROR_VA,
         3 => SERVICES_IMAGE_MIRROR_VA,
         4 => LSASS_IMAGE_MIRROR_VA,
+        5 => USERINIT_IMAGE_MIRROR_VA,
         _ => IMAGE_MIRROR_VA,
     };
     let scratch_base = match pi {
@@ -9953,6 +10066,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         2 => WINLOGON_SCRATCH_BASE,
         3 => SERVICES_SCRATCH_BASE,
         4 => LSASS_SCRATCH_BASE,
+        5 => USERINIT_SCRATCH_BASE,
         _ => SMSS_SCRATCH_BASE,
     };
     (
@@ -10885,7 +10999,7 @@ unsafe fn prefill_client_large_string_pages(
 
 /// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's
 /// crash belongs to its parent process for quiesce accounting). Top-level: smss=0, csrss=2,
-/// winlogon=4, services=6, lsass=8.
+/// winlogon=4, services=6, lsass=8, userinit=27.
 #[inline]
 fn owner_top_badge(badge: u64) -> u64 {
     if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
@@ -10908,6 +11022,7 @@ fn owner_top_badge(badge: u64) -> u64 {
         | LSASS_LISTENER2_BADGE
         | LSASS_LISTENER3_BADGE
         | LSA_WORKER_BADGE => LSASS_BADGE,
+        USERINIT_BADGE => USERINIT_BADGE,
         _ => 0, // smss (badge 0) + anything else
     }
 }
@@ -10944,7 +11059,7 @@ fn trace_indefinite_wait_park(badge: u64, live: u64, crash_parked: u64, wait_par
 fn pi_is_top_level(badge: u64) -> bool {
     matches!(
         badge,
-        0 | CSRSS_BADGE | WINLOGON_BADGE | SERVICES_BADGE | LSASS_BADGE
+        0 | CSRSS_BADGE | WINLOGON_BADGE | SERVICES_BADGE | LSASS_BADGE | USERINIT_BADGE
     )
 }
 
@@ -10965,6 +11080,9 @@ unsafe fn live_top_badges() -> u64 {
     }
     if LSASS_SPAWNED.load(Ordering::Relaxed) == 1 {
         m |= 1u64 << LSASS_BADGE;
+    }
+    if USERINIT_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= 1u64 << USERINIT_BADGE;
     }
     m
 }

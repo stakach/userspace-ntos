@@ -405,6 +405,20 @@ pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
     }
 }
 
+/// Resolve any local NT/DOS path against the mounted read-only FAT volume and return its native
+/// file attributes. The shared canonicalizer maps `C:\Windows` onto the staged `reactos` directory,
+/// so callers see the same namespace for `\SystemRoot` and DOS-drive spellings. Writable mounts are
+/// checked by the syscall layer first and therefore retain longest-prefix precedence.
+pub(crate) unsafe fn query_nt_path_attributes(name: &[u16]) -> Option<u32> {
+    let relative = nt_fs::nt_path_to_volume_relative(name, b"reactos")?;
+    if relative.is_empty() {
+        return Some(nt_fs::FILE_ATTRIBUTE_DIRECTORY);
+    }
+    let fs = exec_fs()?;
+    let (_, _, fat_attributes) = fat_open_path_entry(&fs, &relative)?;
+    Some(nt_fs::file_attributes_from_fat(fat_attributes))
+}
+
 // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------
 // After the isolated storage host reports and PARKS, the executive drives the SAME AHCI HBA itself
 // (it owns the BAR cap at AHCI_VADDR + the DMA frame cap + the VT-d IO mapping at AHCI_IOVA) to
