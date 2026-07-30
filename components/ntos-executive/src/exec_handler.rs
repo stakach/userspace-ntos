@@ -1734,6 +1734,53 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
+    fn readonly_disk_open_entry(
+        name16: &[u16],
+        desired_access: u32,
+        open_options: u32,
+    ) -> Option<(u32, u32)> {
+        const FILE_EXECUTE: u32 = 0x0000_0020;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let wants_read = desired_access & (nt_fs::FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) != 0;
+        let wants_execute = desired_access & (FILE_EXECUTE | GENERIC_EXECUTE) != 0;
+        let synchronous = open_options
+            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+            != 0;
+        if open_options & nt_fs::FILE_DIRECTORY_FILE != 0
+            || !wants_read
+            || wants_execute
+            || !synchronous
+        {
+            return None;
+        }
+        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
+            exec_fs().and_then(|fs| fat_open_path(&fs, &path))
+        })
+    }
+
+    fn unsupported_nt_create_file(&self, name16: &[u16]) -> u32 {
+        // A file namespace this host has no service for. Answer HONESTLY with
+        // STATUS_NOT_IMPLEMENTED: no fabricated handle, and the CALLER decides what to do. This
+        // used to also set `self.stop`, which PARKED the calling process as unrecoverable - a
+        // development tripwire, not a correctness requirement. Traced once + counted so the
+        // frontier stays visible rather than silent.
+        if !NT_CREATE_FILE_UNSUPPORTED_TRACED.swap(true, Ordering::Relaxed) {
+            print_str(b"[nt-create-file] pi=");
+            print_u64(self.pi as u64);
+            print_str(
+                b" unsupported file namespace -> STATUS_NOT_IMPLEMENTED (honest miss, no park) name=\"",
+            );
+            for &unit in name16.iter().take(96) {
+                debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+            }
+            print_str(b"\"\n");
+        }
+        NT_CREATE_FILE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+        0xC000_0002 // STATUS_NOT_IMPLEMENTED
+    }
+
     /// Mint a process-local handle for a directory on the mounted FAT volume.
     pub(crate) fn mint_directory_handle(
         &mut self,
@@ -11695,35 +11742,45 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                } else {
-                    // A file namespace this host has no service for (a plain disk file — the live
-                    // case is `\??\C:\Windows\system.ini`). Answer HONESTLY with
-                    // STATUS_NOT_IMPLEMENTED: no fabricated handle, and the CALLER decides what to
-                    // do. This used to also set `self.stop`, which PARKED the calling process as
-                    // unrecoverable — a development tripwire, not a correctness requirement, and
-                    // one that NO boot before this batch ever tripped (every prior NtCreateFile on
-                    // this host is a named pipe or the boot-status file, so this is behaviour-
-                    // preserving for everything that already ran).
-                    //
-                    // Mounting the real SOFTWARE hive is what made it reachable: winmm's DllMain
-                    // now finds `Microsoft\Windows NT\CurrentVersion\Drivers32` and takes its REAL
-                    // legacy-driver path (beepmidi/msacm32.drv/msacm32 load), which ends in a
-                    // `GetPrivateProfileStringW` probe of `system.ini`. Parking winlogon/services/
-                    // lsass for that one failed probe killed them mid-boot. A returned error is
-                    // exactly what the profile API is written to cope with (it falls back to its
-                    // documented defaults); an unrecoverable park is not. Traced once + counted so
-                    // the frontier stays visible rather than silent.
-                    if !NT_CREATE_FILE_UNSUPPORTED_TRACED.swap(true, Ordering::Relaxed) {
-                        print_str(b"[nt-create-file] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" unsupported file namespace -> STATUS_NOT_IMPLEMENTED (honest miss, no park) name=\"");
-                        for &unit in name16.iter().take(96) {
-                            debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+                } else if args[7] as u32 == nt_fs::FILE_OPEN {
+                    if let Some((first_cluster, file_size)) = Self::readonly_disk_open_entry(
+                        &name16,
+                        args[1] as u32,
+                        args[8] as u32,
+                    ) {
+                        status = nt_fs::STATUS_SUCCESS;
+                        info = nt_fs::FILE_OPENED as u64;
+                        match self.mint_disk_file_handle(first_cluster, file_size, args[1] as u32) {
+                            Some(handle) => {
+                                self.queue_write(args[0], handle);
+                                let count = NT_CREATE_FILE_READONLY_FAT_OPENS
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if count < 8 {
+                                    print_str(b"[nt-create-file] pi=");
+                                    print_u64(self.pi as u64);
+                                    print_str(b" read-only FAT open size=");
+                                    print_u64(file_size as u64);
+                                    print_str(b" name=\"");
+                                    for &unit in name16.iter().take(96) {
+                                        debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                            unit as u8
+                                        } else {
+                                            b'?'
+                                        });
+                                    }
+                                    print_str(b"\"\n");
+                                }
+                            }
+                            None => {
+                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                info = 0;
+                            }
                         }
-                        print_str(b"\"\n");
+                    } else {
+                        status = self.unsupported_nt_create_file(&name16);
                     }
-                    NT_CREATE_FILE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
-                    status = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+                } else {
+                    status = self.unsupported_nt_create_file(&name16);
                 }
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
@@ -12797,15 +12854,8 @@ impl ExecNtHandler {
                 let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
                 let open_options = smss_stack_read(sp + 0x30) as u32;
                 let desired_access = args[1] as u32;
-                let wants_read_data = desired_access & 0x0000_0001 != 0;
-                let wants_execute = desired_access & 0x0000_0020 != 0;
-                let synchronous = open_options & 0x0000_0030 != 0;
-                let disk_entry = if !want_dir && wants_read_data && !wants_execute && synchronous {
-                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos")
-                        .and_then(|path| exec_fs().and_then(|fs| fat_open_path(&fs, &path)))
-                } else {
-                    None
-                };
+                let disk_entry =
+                    Self::readonly_disk_open_entry(&name16, desired_access, open_options);
                 if let Some((first_cluster, file_size)) = disk_entry {
                     let mut status = nt_fs::STATUS_SUCCESS;
                     let opened_handle = self.mint_disk_file_handle(

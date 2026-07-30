@@ -4136,6 +4136,8 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(reads);
     print_str(b" SOFTWARE value-reads=");
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
+    print_str(b" readonly-fat-create-opens=");
+    print_u64(NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed));
     print_str(b" unsupported-file-opens=");
     print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
     print_str(b" (HandleLogon reaches profile load; userinit/explorer spawn is proven by later gates)\n");
@@ -4150,6 +4152,9 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
             // only way GetProfilesDirectoryW can return TRUE and the only way CreateUserProfileW
             // is reachable at all.
             && reads >= 1
+            // … and legacy profile/WinMM probes now open real read-only disk files through
+            // NtCreateFile instead of falling straight into the unsupported namespace branch.
+            && NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed) >= 1
             // … off the same real logon this batch inherits (unchanged clauses).
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
             && WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1,
@@ -9938,6 +9943,9 @@ static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
 /// for (a plain disk file). Answered STATUS_NOT_IMPLEMENTED — honestly, without parking the caller.
 pub(crate) static NT_CREATE_FILE_UNSUPPORTED_TRACED: AtomicBool = AtomicBool::new(false);
 pub(crate) static NT_CREATE_FILE_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+/// Count of read-only FAT files opened by `NtCreateFile(FILE_OPEN)`, using the same real disk-file
+/// handle path as `NtOpenFile`.
+pub(crate) static NT_CREATE_FILE_READONLY_FAT_OPENS: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_IO_COMPLETION_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_REMOVE_IO_COMPLETION_WAIT_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
