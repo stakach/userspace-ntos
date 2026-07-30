@@ -421,12 +421,10 @@ impl ExecNtHandler {
             lpc_connections: alloc::vec::Vec::with_capacity(16),
             winlogon_csr_view: 0,
             csr_view_mask: 0,
-            // The real Process Manager. Pre-create an EPROCESS for each hosted process (identity is
-            // fixed + known ahead of the actual seL4 spawn — real NT likewise has PspCreateProcess
-            // build the EPROCESS before its threads run). Creating all three here (before the
-            // service_sec_image heap mark) keeps every EPROCESS allocation persistent + avoids any
-            // runtime realloc under the per-syscall bump reset. `PM_PIDS[pi]` records the badge↔pid
-            // link (pi 0=smss / 1=csrss / 2=winlogon); the specs verify the objects back the badges.
+            // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
+            // subsystem handshake; post-winlogon children are created by the live
+            // `NtCreateProcess[Ex]` path that ReactOS drives. The fixed `pi` arrays remain the seL4
+            // mechanism slots for now; `PM_PIDS[pi]` is filled when a slot is claimed.
             pm: {
                 let mut pm = nt_process::ProcessManager::new();
                 // Path 1b: append-only handle values. The executive hands each hosted process its
@@ -439,128 +437,52 @@ impl ExecNtHandler {
                 // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
                 // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
                 pm.reserve_modules(64);
+                for pi in 0..MAX_PI {
+                    PM_PIDS[pi].store(0, Ordering::Relaxed);
+                    PM_TIDS[pi].store(0, Ordering::Relaxed);
+                    PM_PML4S[pi].store(0, Ordering::Relaxed);
+                    PM_POOL_USED[pi].store(0, Ordering::Relaxed);
+                    PM_POOL_SUSPENDED[pi].store(0, Ordering::Relaxed);
+                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
+                    }
+                }
+                PM_PROC_COUNT.store(0, Ordering::Relaxed);
+                PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
+                PM_IDENTITY_OK.store(0, Ordering::Relaxed);
+                PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
+                PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
                 let smss_pid = pm.create_process("smss.exe", None, None);
                 let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
-                // The 4th hosted process — services.exe, spawned by winlogon's Win32 CreateProcessW
-                // (StartServicesManager), so its EPROCESS parent is winlogon.
-                let services_pid = pm.create_process("services.exe", Some(winlogon_pid), None);
-                // The 5th hosted process — lsass.exe, spawned by winlogon's StartLsass Win32
-                // CreateProcessW (the LSA subsystem), so its EPROCESS parent is winlogon too.
-                let lsass_pid = pm.create_process("lsass.exe", Some(winlogon_pid), None);
-                let userinit_pid = pm.create_process("userinit.exe", Some(winlogon_pid), None);
-                let explorer_pid = pm.create_process("explorer.exe", Some(userinit_pid), None);
                 PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
-                PM_PIDS[3].store(services_pid as u64, Ordering::Relaxed);
-                PM_PIDS[4].store(lsass_pid as u64, Ordering::Relaxed);
-                PM_PIDS[5].store(userinit_pid as u64, Ordering::Relaxed);
-                PM_PIDS[6].store(explorer_pid as u64, Ordering::Relaxed);
-                PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
-                // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
-                let mut ok = 0u64;
-                let expect: [(usize, u32, &str); 7] = [
-                    (0, smss_pid, "smss.exe"),
-                    (1, csrss_pid, "csrss.exe"),
-                    (2, winlogon_pid, "winlogon.exe"),
-                    (3, services_pid, "services.exe"),
-                    (4, lsass_pid, "lsass.exe"),
-                    (5, userinit_pid, "userinit.exe"),
-                    (6, explorer_pid, "explorer.exe"),
-                ];
-                for (i, pid, name) in expect {
-                    let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
-                    if distinct
-                        && pm
-                            .process(pid)
-                            .is_some_and(|p| p.image_file_name.eq_ignore_ascii_case(name))
-                    {
-                        ok |= 1 << i;
-                    }
-                }
-                PM_IDENTITY_OK.store(ok, Ordering::Relaxed);
-                // Path 2 — create each hosted process's MAIN THREAD as a real ETHREAD (identity)
-                // NOW, at boot, below the service_sec_image heap mark: pm.create_thread's BTreeMap/
-                // BTreeSet inserts are durable but happen before the mark, so the per-syscall bump
-                // reset never rewinds them (same non-leaking pattern as the EPROCESSes). This moves
-                // each EPROCESS Created→Running + sets its main_thread. The real image ENTRY is bound
-                // later, alloc-free, at the actual seL4 spawn (set_thread_start_address). Entry starts
-                // 0 = "not yet bound".
-                let mut mt_ok = 0u64;
-                let pids = [
-                    smss_pid,
-                    csrss_pid,
-                    winlogon_pid,
-                    services_pid,
-                    lsass_pid,
-                    userinit_pid,
-                    explorer_pid,
-                ];
-                for (i, &pid) in pids.iter().enumerate() {
+                let bootstrap_pids = [smss_pid, csrss_pid, winlogon_pid];
+                // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
+                // identity sequence. Later hosted processes get the same setup at successful
+                // `NtCreateProcess[Ex]`.
+                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                        PM_TIDS[i].store(tid as u64, Ordering::Relaxed);
-                        let running = pm
-                            .process(pid)
-                            .is_some_and(|p| p.state == nt_process::ProcessState::Running);
-                        let cid_ok = pm.client_id(tid)
-                            == Some(nt_process::ClientId {
-                                unique_process: pid,
-                                unique_thread: tid,
-                            });
-                        if pm.main_thread(pid) == Some(tid) && running && cid_ok {
-                            mt_ok |= 1 << i;
-                        }
+                        PM_TIDS[pi].store(tid as u64, Ordering::Relaxed);
                     }
                 }
-                PM_MAIN_THREADS_OK.store(mt_ok, Ordering::Relaxed);
-                // General NtCreateThread — pre-create a POOL of extra ETHREADs NOW (at boot, below the
-                // service_sec_image heap mark) so runtime NtCreateThread can hand them out WITHOUT a
-                // BTreeMap insert (which, made during a serviced call above the mark, the per-syscall
-                // bump reset would rewind → corrupt). Runtime create then only pops a pool tid + binds
-                // its start routine/TEB (both alloc-free field writes) → reset-safe. One pool ETHREAD
-                // per process is enough for the current boot (only winlogon creates a runtime thread —
-                // the observed lsass fan-out needs three. Pool threads are NOT the main
-                // thread (main was created first above), so main_thread() is unchanged.
-                for (i, &pid) in pids.iter().enumerate() {
+                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
                     for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                         if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
                             let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
-                            PM_POOL_TID[i][slot].store(tid as u64, Ordering::Relaxed);
+                            PM_POOL_TID[pi][slot].store(tid as u64, Ordering::Relaxed);
                         }
                     }
                 }
-                // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
-                // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
-                // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
-                // Measured peak is < ~100 handles per process over a full boot; 256 is ~3× headroom.
-                for pid in [
-                    smss_pid,
-                    csrss_pid,
-                    winlogon_pid,
-                    services_pid,
-                    lsass_pid,
-                    userinit_pid,
-                    explorer_pid,
-                ] {
+                for pid in bootstrap_pids {
                     pm.reserve_handles(pid, PM_HANDLE_RESERVE);
                 }
-                // Record the reserved capacity (min across the hosted set) so the run can prove it never
-                // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
-                let cap = pm
-                    .handle_capacity(smss_pid)
-                    .min(pm.handle_capacity(csrss_pid))
-                    .min(pm.handle_capacity(winlogon_pid))
-                    .min(pm.handle_capacity(services_pid))
-                    .min(pm.handle_capacity(lsass_pid));
-                let cap = cap
-                    .min(pm.handle_capacity(userinit_pid))
-                    .min(pm.handle_capacity(explorer_pid));
-                PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
             token_store: nt_security::TokenStore::with_capacity(64),
             token_dirty: false,
+            process_dirty: false,
             // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
             // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
             // runtime and is retained past the per-syscall bump reset because the loop pins the heap
@@ -571,11 +493,13 @@ impl ExecNtHandler {
             dll_loaded_dirty: false,
             writable_fs_dirty: false,
         };
-        for pi in 0..7 {
-            let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
-            let token = handler.token_store.insert(nt_security::AccessToken::system());
-            let _ = handler.pm.replace_process_primary_token(pid, Some(token));
+        for pi in 0..MAX_PI {
+            if let Some(pid) = handler.pm_pid_for_pi(pi) {
+                let token = handler.token_store.insert(nt_security::AccessToken::system());
+                let _ = handler.pm.replace_process_primary_token(pid, Some(token));
+            }
         }
+        handler.refresh_process_manager_gates();
         unsafe { handler.provision_default_user_locale() };
         handler
     }
@@ -1338,6 +1262,149 @@ impl ExecNtHandler {
         let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
         (pid != 0).then_some(pid as nt_process::ProcessId)
     }
+
+    fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
+        match pi {
+            0 => Some("smss.exe"),
+            1 => Some("csrss.exe"),
+            2 => Some("winlogon.exe"),
+            3 => Some("services.exe"),
+            4 => Some("lsass.exe"),
+            5 => Some("userinit.exe"),
+            6 => Some("explorer.exe"),
+            _ => None,
+        }
+    }
+
+    fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
+        if leaf.eq_ignore_ascii_case(b"csrss.exe") {
+            Some(1)
+        } else if leaf.eq_ignore_ascii_case(b"winlogon.exe") {
+            Some(2)
+        } else if leaf.eq_ignore_ascii_case(b"services.exe") {
+            Some(3)
+        } else if leaf.eq_ignore_ascii_case(b"lsass.exe") {
+            Some(4)
+        } else if leaf.eq_ignore_ascii_case(b"userinit.exe") {
+            Some(5)
+        } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
+            Some(6)
+        } else {
+            None
+        }
+    }
+
+    fn refresh_process_manager_gates(&self) {
+        let mut process_count = 0u64;
+        let mut identity_ok = 0u64;
+        let mut main_threads_ok = 0u64;
+        let mut min_handle_cap = usize::MAX;
+        for pi in 0..MAX_PI {
+            let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
+            if pid == 0 {
+                continue;
+            }
+            process_count += 1;
+            min_handle_cap = min_handle_cap.min(self.pm.handle_capacity(pid));
+            let distinct = PM_PIDS.iter().enumerate().all(|(other_pi, stored)| {
+                other_pi == pi || stored.load(Ordering::Relaxed) != pid as u64
+            });
+            if let Some(name) = Self::hosted_process_name_for_pi(pi) {
+                if distinct
+                    && self
+                        .pm
+                        .process(pid)
+                        .is_some_and(|process| process.image_file_name.eq_ignore_ascii_case(name))
+                {
+                    identity_ok |= 1 << pi;
+                }
+            }
+            let tid = PM_TIDS[pi].load(Ordering::Relaxed) as nt_process::ThreadId;
+            if tid != 0 {
+                let running = self
+                    .pm
+                    .process(pid)
+                    .is_some_and(|process| process.state == nt_process::ProcessState::Running);
+                let cid_ok = self.pm.client_id(tid)
+                    == Some(nt_process::ClientId {
+                        unique_process: pid,
+                        unique_thread: tid,
+                    });
+                if self.pm.main_thread(pid) == Some(tid) && running && cid_ok {
+                    main_threads_ok |= 1 << pi;
+                }
+            }
+        }
+        PM_PROC_COUNT.store(process_count, Ordering::Relaxed);
+        PM_IDENTITY_OK.store(identity_ok, Ordering::Relaxed);
+        PM_MAIN_THREADS_OK.store(main_threads_ok, Ordering::Relaxed);
+        PM_HANDLE_CAP_BOOT.store(
+            if process_count == 0 {
+                0
+            } else {
+                min_handle_cap as u64
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    fn allocate_hosted_process_slot(
+        &mut self,
+        creator_pi: usize,
+        leaf: &[u8],
+    ) -> Result<usize, u32> {
+        let child_pi = Self::hosted_pi_for_leaf(leaf).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let name =
+            Self::hosted_process_name_for_pi(child_pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if let Some(existing_pid) = self.pm_pid_for_pi(child_pi) {
+            let matches_existing = self.pm.process(existing_pid).is_some_and(|process| {
+                process.image_file_name.eq_ignore_ascii_case(name)
+            });
+            if matches_existing {
+                return Ok(child_pi);
+            }
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let parent = self
+            .pm_pid_for_pi(creator_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let pid = self.pm.create_process(name, Some(parent), None);
+        PM_PIDS[child_pi].store(pid as u64, Ordering::Relaxed);
+        PM_POOL_USED[child_pi].store(0, Ordering::Relaxed);
+        PM_POOL_SUSPENDED[child_pi].store(0, Ordering::Relaxed);
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            PM_POOL_TID[child_pi][slot].store(0, Ordering::Relaxed);
+        }
+        let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
+        PM_TIDS[child_pi].store(main_tid as u64, Ordering::Relaxed);
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
+                let _ = self
+                    .pm
+                    .set_thread_state(tid, nt_process::ThreadState::Initialized);
+                PM_POOL_TID[child_pi][slot].store(tid as u64, Ordering::Relaxed);
+            }
+        }
+        self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
+        let token = self.token_store.insert(nt_security::AccessToken::system());
+        let _ = self.pm.replace_process_primary_token(pid, Some(token));
+        self.token_dirty = true;
+        self.process_dirty = true;
+        PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        self.refresh_process_manager_gates();
+        unsafe {
+            print_str(b"[pm-dynamic] allocated hosted process pi=");
+            print_u64(child_pi as u64);
+            print_str(b" pid=");
+            print_u64(pid as u64);
+            print_str(b" parent=");
+            print_u64(parent as u64);
+            print_str(b" image=");
+            print_str(name.as_bytes());
+            print_str(b"\n");
+        }
+        Ok(child_pi)
+    }
     /// Mint an executive handle for the CURRENT process (`self.pi`) and record it in that process's
     /// real EPROCESS handle table (path 1 of the nt-process convergence). Behaviour-preserving: the
     /// returned VALUE is still the global monotonic `next_handle` (so the reg/LPC/win32k consumers
@@ -1363,7 +1430,7 @@ impl ExecNtHandler {
                 return h as u64;
             }
         }
-        // Fallback (no EPROCESS for this pi — not the 3 hosted processes): global monotonic value.
+        // Fallback (no EPROCESS for this pi yet): global monotonic value.
         let h = self.next_handle;
         self.next_handle += 1;
         h
@@ -5691,7 +5758,7 @@ impl ExecNtHandler {
     /// Classify a folded probe path as one of the hosted-process EXEs by substring and return its
     /// canonical leaf (so existence resolves against the real file, not a possibly-malformed extracted
     /// leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator). Most hosted
-    /// EXEs live under System32; explorer is admitted by the caller's real volume-path result.
+    /// EXEs live under System32; explorer.exe is the shell and lives at the ReactOS root.
     /// `None` if it isn't a recognized EXE probe or if it's an SxS/actctx probe (which must fail so
     /// the loader doesn't take the .Local\/manifest path). Purely a name→canonical-leaf classifier;
     /// the caller still confirms the leaf on the real FS.
@@ -13250,30 +13317,62 @@ impl ExecNtHandler {
                     && sect == *ctx.csrss_section_handle
                     && (*ctx.csrss_pe).is_some()
                 {
-                    self.process_spawn_desired_access = args[1] as u32;
-                    self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
-                    0
+                    match self.allocate_hosted_process_slot(self.pi, b"csrss.exe") {
+                        Ok(1) => {
+                            self.process_spawn_desired_access = args[1] as u32;
+                            self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
+                            0
+                        }
+                        Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
+                        Err(status) => status,
+                    }
                 } else if self.pi == 0
                     && *ctx.winlogon_section_handle != 0
                     && sect == *ctx.winlogon_section_handle
                     && (*ctx.winlogon_pe).is_some()
                 {
-                    self.process_spawn_desired_access = args[1] as u32;
-                    self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
-                    0
+                    match self.allocate_hosted_process_slot(self.pi, b"winlogon.exe") {
+                        Ok(2) => {
+                            self.process_spawn_desired_access = args[1] as u32;
+                            self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
+                            0
+                        }
+                        Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
+                        Err(status) => status,
+                    }
                 } else if self.pi == 2 || self.pi == 5 {
-                    let table = &mut *ctx.exe_images;
-                    let child_pi = table
-                        .index_for_section(self.pi, sect)
-                        .and_then(|index| table.get(index))
-                        .and_then(|slot| match (self.pi, slot.leaf()) {
-                            (2, b"services.exe") => Some(3),
-                            (2, b"lsass.exe") => Some(4),
-                            (2, b"userinit.exe") => Some(5),
-                            (5, b"explorer.exe") => Some(6),
-                            _ => None,
-                        });
-                    if let Some(child_pi) = child_pi {
+                    let slot_info = {
+                        let table = &*ctx.exe_images;
+                        table.index_for_section(self.pi, sect).and_then(|index| {
+                            table.get(index).map(|slot| {
+                                let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
+                                let leaf_len = slot.leaf().len();
+                                leaf[..leaf_len].copy_from_slice(slot.leaf());
+                                (slot.child_pi, slot.state, leaf, leaf_len)
+                            })
+                        })
+                    };
+                    if let Some((reserved_child_pi, state, leaf, leaf_len)) = slot_info {
+                        let leaf = &leaf[..leaf_len];
+                        let allowed = (self.pi == 2
+                            && (leaf.eq_ignore_ascii_case(b"services.exe")
+                                || leaf.eq_ignore_ascii_case(b"lsass.exe")
+                                || leaf.eq_ignore_ascii_case(b"userinit.exe")))
+                            || (self.pi == 5 && leaf.eq_ignore_ascii_case(b"explorer.exe"));
+                        if !allowed {
+                            self.stop = true;
+                            return 0xC000_0002;
+                        }
+                        let child_pi = if state == nt_exe_image::ImageState::SpawnReserved
+                            && reserved_child_pi != 0
+                        {
+                            reserved_child_pi
+                        } else {
+                            match self.allocate_hosted_process_slot(self.pi, leaf) {
+                                Ok(child_pi) => child_pi,
+                                Err(status) => return status,
+                            }
+                        };
                         if child_pi == 5 || child_pi == 6 {
                             if child_pi == 5 {
                                 USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -13288,6 +13387,7 @@ impl ExecNtHandler {
                                 return nt_process::STATUS_INVALID_HANDLE;
                             }
                         }
+                        let table = &mut *ctx.exe_images;
                         match table.reserve_spawn(
                             self.pi,
                             sect,

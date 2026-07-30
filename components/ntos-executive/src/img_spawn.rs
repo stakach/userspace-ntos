@@ -388,6 +388,25 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
 /// present, image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. Process zero
 /// is the bootstrapped SMSS and starts immediately. Child processes remain suspended until their
 /// creator resumes the typed initial-thread handle returned by `NtCreateThread`.
+unsafe fn reserve_sec_image_page_tables(pml4: u64, image_va: u64, extent: u64) -> u64 {
+    let span = extent.max(0x1000);
+    let start = image_va & !0x1f_ffff;
+    let end = image_va.saturating_add(span - 1) & !0x1f_ffff;
+    let mut mapped = 0u64;
+    let mut va = start;
+    loop {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, va, pml4);
+        mapped += 1;
+        if va == end {
+            break;
+        }
+        va = va.saturating_add(0x20_0000);
+    }
+    mapped
+}
+
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     pe: &nt_pe_loader::PeFile,
@@ -419,12 +438,13 @@ pub(crate) unsafe fn spawn_sec_image(
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, image_extent(pe));
+    if pi == 6 {
+        EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
+    }
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
     map_tp_worker_slot1_pt(pml4);

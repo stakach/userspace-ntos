@@ -1214,10 +1214,9 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() {
         nt_handler.bind_main_thread_entry(0, PE_LOAD_BASE + smss_pe.entry_point_rva() as u64);
     }
-    // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each). Path 3:
-    // the ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
-    // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
-    // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
+    // Slots are EPROCESS-linked via `pid` (== PM_PIDS[pi]). smss is live from the initial recv; later
+    // hosted processes claim their pid on the native create-process path and fill pml4/scratch/img_end
+    // when the service loop constructs their seL4 mechanism.
     let mut procs = [ProcExec::empty(); MAX_PI];
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
@@ -3794,6 +3793,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
                 nt_handler.token_dirty = false;
+                nt_handler.process_dirty = false;
                 nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
@@ -4083,6 +4083,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.token_dirty = false;
                     heap_mark = allocator::mark();
                 }
+                if nt_handler.process_dirty {
+                    nt_handler.process_dirty = false;
+                    heap_mark = allocator::mark();
+                }
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
                 // table's path `String`s above `heap_mark`. Same contract as `overlay_dirty` — a
                 // mounted hive must outlive the syscall that mounted it. (The hive BYTES live in a
@@ -4328,6 +4332,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
+                    procs[1].pid = nt_handler.pm_pid_for_pi(1).map(|pid| pid as u64).unwrap_or(0);
                     procs[1].pml4 = cpml4;
                     PM_PML4S[1].store(cpml4, Ordering::Relaxed);
                     CSRSS_SPAWNED.store(1, Ordering::Relaxed);
@@ -4393,6 +4398,7 @@ pub(crate) unsafe fn service_sec_image(
                         WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
+                    procs[2].pid = nt_handler.pm_pid_for_pi(2).map(|pid| pid as u64).unwrap_or(0);
                     procs[2].pml4 = wpml4;
                     PM_PML4S[2].store(wpml4, Ordering::Relaxed);
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
@@ -4457,6 +4463,7 @@ pub(crate) unsafe fn service_sec_image(
                         SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
+                    procs[3].pid = nt_handler.pm_pid_for_pi(3).map(|pid| pid as u64).unwrap_or(0);
                     procs[3].pml4 = spml4;
                     PM_PML4S[3].store(spml4, Ordering::Relaxed);
                     procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
@@ -4519,6 +4526,7 @@ pub(crate) unsafe fn service_sec_image(
                         LSASS_IMAGE_PATH, LSASS_CMD_LINE,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
+                    procs[4].pid = nt_handler.pm_pid_for_pi(4).map(|pid| pid as u64).unwrap_or(0);
                     procs[4].pml4 = lpml4;
                     PM_PML4S[4].store(lpml4, Ordering::Relaxed);
                     procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
@@ -4588,6 +4596,7 @@ pub(crate) unsafe fn service_sec_image(
                         USERINIT_CMD_LINE,
                         0,
                     );
+                    procs[5].pid = nt_handler.pm_pid_for_pi(5).map(|pid| pid as u64).unwrap_or(0);
                     procs[5].pml4 = upml4;
                     PM_PML4S[5].store(upml4, Ordering::Relaxed);
                     procs[5].img_end = PE_LOAD_BASE + image_extent(upe);
@@ -4674,6 +4683,7 @@ pub(crate) unsafe fn service_sec_image(
                         EXPLORER_CMD_LINE,
                         0,
                     );
+                    procs[6].pid = nt_handler.pm_pid_for_pi(6).map(|pid| pid as u64).unwrap_or(0);
                     procs[6].pml4 = epml4;
                     PM_PML4S[6].store(epml4, Ordering::Relaxed);
                     procs[6].img_end = PE_LOAD_BASE + image_extent(epe);
@@ -6330,48 +6340,64 @@ pub(crate) unsafe fn service_sec_image(
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
                     (0x0409_0409i32, true)
-                } else if m0 == 0x103d && pi == 5 {
-                    // userinit is a distinct interactive process, but the current win32k host still
-                    // has one shared PROCESSINFO. Entering the real handler with that mismatched state
-                    // reaches an unbounded EngCopyBits path. Model the handler's second (`gcurFirst`)
-                    // search exactly: only return a handle learned from a real winlogon lookup and a
-                    // successful real NtUserSetSystemCursor promotion; an exact miss remains NULL.
+                } else if m0 == 0x103d && (pi == 5 || pi == 6) {
+                    // userinit/explorer are distinct interactive child processes, but the current
+                    // win32k host still has one shared PROCESSINFO. Entering the real handler with
+                    // that mismatched state reaches an unbounded EngCopyBits path. Model the
+                    // handler's second (`gcurFirst`) search exactly: only return a handle learned
+                    // from a real winlogon lookup and a successful real NtUserSetSystemCursor
+                    // promotion; an exact miss remains NULL.
                     let hit = cursor_identity_key
                         .as_ref()
                         .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
                     if let Some(handle) = hit {
-                        USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
-                        USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
-                        print_str(b"[win32k-svc] userinit global cursor cache HIT -> real HCURSOR 0x");
+                        if pi == 5 {
+                            USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
+                            USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
+                        }
+                        print_str(b"[win32k-svc] post-winlogon global cursor cache HIT pi=");
+                        print_u64(pi as u64);
+                        print_str(b" -> real HCURSOR 0x");
                         print_hex(handle);
                         print_str(b"\n");
                     } else {
-                        print_str(b"[win32k-svc] userinit global cursor cache miss -> NULL\n");
+                        print_str(b"[win32k-svc] post-winlogon global cursor cache MISS pi=");
+                        print_u64(pi as u64);
+                        print_str(b" -> NULL\n");
                     }
                     (hit.unwrap_or(0) as i32, true)
-                } else if m0 == 0x10b4 && pi == 5 && builtin_class_attempt {
+                } else if m0 == 0x10b4 && (pi == 5 || pi == 6) && builtin_class_attempt {
                     // The hosted win32k currently has one shared PROCESSINFO, whose built-in class
-                    // list was populated by winlogon. A second real registration would mutate that
-                    // same list and report duplicate-class semantics. Reuse only an exact real atom
-                    // learned from winlogon's successful registration of the same complete class.
+                    // list was populated by winlogon. A second real registration from userinit or
+                    // explorer would mutate that same list and report duplicate-class semantics.
+                    // Reuse only an exact real atom learned from winlogon's successful registration
+                    // of the same complete class.
                     let hit = builtin_class_key
                         .as_ref()
                         .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key));
                     if let (Some(key), Some(atom)) = (builtin_class_key.as_ref(), hit) {
-                        let bit = 1u64 << (key.fn_id() - 0x02a1);
-                        USERINIT_BUILTIN_CLASS_HITS.fetch_add(1, Ordering::Relaxed);
-                        USERINIT_BUILTIN_CLASS_MASK.fetch_or(bit, Ordering::Relaxed);
-                        if key.fn_id() == 0x02a4 {
-                            USERINIT_DIALOG_CLASS_ATOM.store(atom as u64, Ordering::Relaxed);
+                        if pi == 5 {
+                            let bit = 1u64 << (key.fn_id() - 0x02a1);
+                            USERINIT_BUILTIN_CLASS_HITS.fetch_add(1, Ordering::Relaxed);
+                            USERINIT_BUILTIN_CLASS_MASK.fetch_or(bit, Ordering::Relaxed);
+                            if key.fn_id() == 0x02a4 {
+                                USERINIT_DIALOG_CLASS_ATOM.store(atom as u64, Ordering::Relaxed);
+                            }
                         }
-                        print_str(b"[win32k-svc] userinit builtin class HIT fnid=0x");
+                        print_str(b"[win32k-svc] post-winlogon builtin class HIT pi=");
+                        print_u64(pi as u64);
+                        print_str(b" fnid=0x");
                         print_hex(key.fn_id());
                         print_str(b" -> real atom 0x");
                         print_hex(atom as u32);
                         print_str(b"\n");
                     } else {
-                        USERINIT_BUILTIN_CLASS_MISSES.fetch_add(1, Ordering::Relaxed);
-                        print_str(b"[win32k-svc] userinit builtin class mirror MISS -> atom 0\n");
+                        if pi == 5 {
+                            USERINIT_BUILTIN_CLASS_MISSES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        print_str(b"[win32k-svc] post-winlogon builtin class mirror MISS pi=");
+                        print_u64(pi as u64);
+                        print_str(b" -> atom 0\n");
                     }
                     (hit.unwrap_or(0) as i32, true)
                 } else if m0 == 0x103d && svc_noninteractive {
@@ -7059,6 +7085,44 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+                // After logon has succeeded, an unimplemented win32k syscall from winlogon's main
+                // thread is the same kind of frontier as the post-logon VM/#BP milestone parks
+                // above. Do not route this through `park_and_log!`: that helper intentionally
+                // latches the whole process as a dead callback client, which is wrong here because
+                // the expendable worker threads remain alive and hold no callback frames. The
+                // post-quiesce callback-injection gates depend on that distinction.
+                if pi == 2
+                    && owner_top_badge(badge) == WINLOGON_BADGE
+                    && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                    && !win32k_glue::client_has_active_callback_frames(2)
+                {
+                    print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path hit unimplemented win32k SSN=0x");
+                    print_hex(m0 as u32);
+                    print_str(b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n");
+                    crash_parked |= 1u64 << owner_top_badge(badge);
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    WINLOGON_POST_LOGON_MILESTONE_PARK.store(m0, Ordering::Relaxed);
+                    WINLOGON_POST_LOGON_MILESTONE_CR2.store(m0, Ordering::Relaxed);
+                    if (live_top_badges() & !(crash_parked | wait_parked)) == 0
+                        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
+                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
                     continue;
                 }
                 if is_tp_worker {

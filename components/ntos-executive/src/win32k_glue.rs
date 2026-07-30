@@ -49,6 +49,7 @@ static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
 static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequence =
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub(crate) struct CompletedWin32kDispatch {
@@ -495,6 +496,15 @@ unsafe fn abort_controlled_user_callbacks() {
     restore_all_client_callback_windows();
     *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
         nt_user_callback::ContinuationStack::new();
+    USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(0, Ordering::Relaxed);
+    USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
+}
+
+fn sas_sequence_matches(request: &nt_user_callback::CallbackHeader) -> bool {
+    let dispatch_id = USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed);
+    dispatch_id != 0
+        && request.dispatch_id == dispatch_id
+        && request.callback_id as u64 == USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.load(Ordering::Relaxed)
 }
 
 unsafe fn callback_payload_u64(frame: *mut nt_user_callback::CallbackFrame, offset: usize) -> u64 {
@@ -689,7 +699,9 @@ pub(crate) unsafe fn service_user_callback(
                     core::ptr::addr_of_mut!(USER_CALLBACK_SAS_SEQUENCE),
                     nt_user_callback::SasWmCreateNestedSequence::new(),
                 );
-                USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(1, Ordering::Relaxed);
+                USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID
+                    .store(request.callback_id as u64, Ordering::Relaxed);
+                USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(request.dispatch_id, Ordering::Relaxed);
             }
             suspend_component = true;
             print_str(b"[user-callback] selected real callback api=");
@@ -1890,12 +1902,13 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         abort_controlled_user_callbacks();
         return None;
     }
-    if USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed) != 0 {
+    if sas_sequence_matches(&request) {
         let sequence = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_SAS_SEQUENCE));
         if sequence.can_complete() {
             USER_CALLBACK_SEQUENCE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
         }
         USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(0, Ordering::Relaxed);
+        USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
     }
     print_str(
         b"[user-callback] A real callback returned through SSN 22; resuming B component\n",

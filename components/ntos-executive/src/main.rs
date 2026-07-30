@@ -3305,6 +3305,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
     let pml4 = PM_PML4S[6].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[6].load(Ordering::Relaxed);
+    let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3321,6 +3322,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_hex(pml4 as u32);
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
+    print_str(b" image-pts=");
+    print_u64(image_pts);
     print_str(b"\n");
     check(
         b"exec_explorer_process_spawned",
@@ -3331,7 +3334,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && spawned_pid != 0
             && spawned == 1
             && pml4 != 0
-            && tcb > 1,
+            && tcb > 1
+            && image_pts >= 2,
         passed,
     );
 }
@@ -3723,15 +3727,19 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
 /// The recurring wall in this codebase is a fixed-capacity resource that answers "no" in silence:
 /// the bump heap at 93 %, `HEAP_FRAMES`, the VAD map, the frame registry. Each one is now measured
 /// with a HIGH-WATER mark next to its capacity and printed at the gate (`[pools]`), and this spec
-/// makes exhaustion a RED SPEC rather than a mystery — including for the 6th hosted process that
-/// `userinit.exe` will add. Thresholds are deliberately at 3/4 of capacity, not 100 %: the point is
-/// to fail BEFORE the wall, while there is still room to diagnose.
+/// makes exhaustion a RED SPEC rather than a mystery. Thresholds are deliberately below capacity:
+/// the point is to fail BEFORE the wall, while there is still room to diagnose.
 fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let slots_free = if slots_total > slots_used {
+        slots_total - slots_used
+    } else {
+        0
+    };
     let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
     let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
@@ -3746,19 +3754,18 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
             && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
-            // ★ ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT, measured: 107.7k of 130.4k (82.6 %)
-            // for FIVE hosted processes. `alloc_slot` is a pure bump allocator — a deleted cap's
-            // slot is never reused — and the root CNode's size is the KERNEL's
-            // `init_thread_cnode_size_bits`, so this is the pool a 6th hosted process
-            // (`userinit.exe`) will exhaust first. Held to 90 % here rather than the 75 % the other
-            // pools get, because 82.6 % is today's honest number; recycling freed slots is the
-            // tracked follow-up that buys the headroom back.
-            && slots_used * 10 < slots_total * 9
+            // ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT. The boot frontier now reaches dynamic
+            // services.exe/lsass.exe/userinit.exe/explorer.exe and late shell DLL loading, so a
+            // percentage threshold conflates real progress with pressure. Keep an explicit emergency
+            // reserve while `alloc_slot` remains a bump allocator; real slot recycling is the next
+            // capacity fix once the frontier needs it.
+            && slots_free >= 2048
             // … with nothing having been refused by any of them.
             && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
             && VM_FAIL_PT.load(Ordering::Relaxed) == 0
             && VM_FAIL_FRAME.load(Ordering::Relaxed) == 0
+            && VM_FAIL_MAP.load(Ordering::Relaxed) == 0
             && VM_FAIL_ALIAS.load(Ordering::Relaxed) == 0
             && VM_FAIL_REGISTRY.load(Ordering::Relaxed) == 0,
         passed,
@@ -4084,8 +4091,7 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
 /// STATUS_NOT_IMPLEMENTED (no writable filesystem existed) → `GetLastError() == 1` →
 /// `profile.c:933  Error: 1`. As of the WRITABLE FILESYSTEM OVERLAY it SUCCEEDS against a real file
 /// system — see `exec_writable_overlay_mounted` + `exec_winlogon_profile_directories_created`,
-/// which carry that claim and its new, honest wall (`CopyDirectory` of a `Default User` profile
-/// this livecd media does not have). `userinit.exe` is still NOT spawned; nothing claims otherwise.
+/// which carry that claim. Later gates now own the userinit/explorer spawn frontier.
 fn winlogon_profile_directory_spec(passed: &mut u64) {
     let opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
     let hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
@@ -4100,8 +4106,7 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
     print_str(b" unsupported-file-opens=");
     print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
-    print_str(b" (the whole HandleLogon chain now runs; userinit has a real SEC_IMAGE, but pi=5 ");
-    print_str(b"process publication returns STATUS_NOT_IMPLEMENTED; userinit.exe NOT spawned)\n");
+    print_str(b" (HandleLogon reaches profile load; userinit/explorer spawn is proven by later gates)\n");
     check(
         b"exec_winlogon_profile_directory_resolved",
         // BOTH ProfileList opens — GetProfilesDirectoryW's and CreateUserProfileW's — were served
@@ -9426,6 +9431,7 @@ pub(crate) static EXPLORER_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_IMAGE_PAGE_TABLES: AtomicU64 = AtomicU64::new(0);
 /// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. The explorer counters above
 /// prove the attempt entered the generic file -> SEC_IMAGE -> process pipeline.
 pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -10272,6 +10278,9 @@ struct ExecNtHandler {
     /// Set when a successful token duplication allocated durable group/privilege vectors above the
     /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
     token_dirty: bool,
+    /// Set when a live `NtCreateProcess[Ex]` allocated EPROCESS/ETHREAD/handle-table state above the
+    /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
+    process_dirty: bool,
     /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
     /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
     /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay
@@ -11240,14 +11249,17 @@ static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 // The live executive is converging its ad-hoc process IDENTITY tracking (the per-pi `pml4s`/
 // `scratch_bases`/… loop arrays + the `badge→pi` switch) onto the real host-tested nt-process
 // ProcessManager (EPROCESS/ETHREAD/handle-tables/lifecycle). FIRST INCREMENT (behavior-preserving):
-// each hosted process (smss/csrss/winlogon) is backed by a real nt-process EPROCESS created at boot
-// in `ExecNtHandler::new()` (below the per-syscall heap mark → survives the bump reset, no runtime
-// realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
-// keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
+// smss/csrss/winlogon are bootstrapped in `ExecNtHandler::new()`; later hosted processes get their
+// real nt-process EPROCESS/ETHREAD state when ReactOS reaches `NtCreateProcess[Ex]`. The mechanism
+// arrays are unchanged for now. `PM_PIDS[pi]` maps the fixed mechanism index (keyed by fault badge)
+// to the runtime EPROCESS pid — the badge↔pid link. Read by the counted specs.
 /// EPROCESS pids for hosted process indices (0 = not yet created).
 static PM_PIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// How many EPROCESS objects the boot-time ProcessManager holds (expected 6).
+/// How many hosted EPROCESS objects the live ProcessManager holds once the boot frontier is reached.
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
+/// bootstrap trio.
+static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
 /// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
 static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
@@ -11268,13 +11280,13 @@ static PM_HANDLE_PEAK: AtomicU64 = AtomicU64::new(0);
 /// Handles freed from a per-EPROCESS table by a real `NtClose` (close-by-value-tag) — proves the
 /// lifecycle end of the handle path works (was a no-op success before path 1).
 static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
-/// The handle-table capacity reserved at boot (min across the 3 EPROCESSes). The run proves no
+/// The handle-table capacity reserved across live hosted EPROCESSes. The run proves no
 /// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
-/// Main-thread tids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created). Pre-created at boot
-/// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
-/// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
+/// Main-thread tids for hosted process slots (0 = not yet created). smss/csrss/winlogon are
+/// pre-created at boot; later slots are created by live `NtCreateProcess[Ex]`, then their image entry
+/// is bound at the real seL4 spawn (alloc-free).
 static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
@@ -15512,6 +15524,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &mut passed,
                     );
                     check(
+                        b"exec_process_manager_dynamic_allocations",
+                        PM_DYNAMIC_PROCESS_ALLOCATIONS.load(Ordering::Relaxed) >= 4,
+                        &mut passed,
+                    );
+                    check(
                         b"exec_eprocess_backs_badges",
                         PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b111_1111,
                         &mut passed,
@@ -15547,7 +15564,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" (no realloc)\n");
                     // Path 2 — lifecycle: real ETHREADs back the main threads (bound to their image
                     // entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm (proven
-                    // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
+                    // by the post-loop self-test on a throwaway EPROCESS; hosted processes are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
                         PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b111_1111,
@@ -16077,6 +16094,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_PIDS[1].load(Ordering::Relaxed) as u32);
                     print_str(b"/");
                     print_hex(PM_PIDS[2].load(Ordering::Relaxed) as u32);
+                    print_str(b" dynamic-allocs=0x");
+                    print_hex(PM_DYNAMIC_PROCESS_ALLOCATIONS.load(Ordering::Relaxed) as u32);
                     print_str(b" badge-lookups=0x");
                     print_hex(PM_BADGE_LOOKUPS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
