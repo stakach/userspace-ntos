@@ -2052,6 +2052,13 @@ pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
+/// Exact dynamic class atom names learned from successful real NtUserRegisterClassExWOW calls.
+pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
+    nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
+    nt_kernel_exec::user_class::ClassAtomNameMirror::new();
+pub(crate) static GLOBAL_CLASS_ATOM_NAMES_OBSERVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_CLASS_ATOM_NAME_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -3192,6 +3199,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
     let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
     let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
+    let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
+    let class_atom_fallbacks = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.load(Ordering::Relaxed);
+    let class_atom_fallback_failures =
+        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.load(Ordering::Relaxed);
     let scrollbar_queries = USERINIT_SCROLLBAR_CLASSINFO_QUERIES.load(Ordering::Relaxed);
     let scrollbar_copyouts = USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.load(Ordering::Relaxed);
     let scrollbar_errors = USERINIT_SCROLLBAR_CLASSINFO_ERRORS.load(Ordering::Relaxed);
@@ -3243,6 +3254,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(class_mask as u32);
     print_str(b" dialog-atom=0x");
     print_hex(dialog_atom as u32);
+    print_str(b" class-atom-names=");
+    print_u64(class_atom_names);
+    print_str(b" atom-name-fallbacks/failures=");
+    print_u64(class_atom_fallbacks);
+    print_str(b"/");
+    print_u64(class_atom_fallback_failures);
     print_str(b" scrollbar-classinfo=");
     print_u64(scrollbar_queries);
     print_str(b"/");
@@ -3317,6 +3334,10 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let create_window_string_captures =
         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
+    let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
+    let class_atom_fallbacks = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.load(Ordering::Relaxed);
+    let class_atom_fallback_failures =
+        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.load(Ordering::Relaxed);
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
     let process_self_term =
@@ -3345,6 +3366,12 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(create_window_string_captures);
     print_str(b" win32k-pool-exhaustions=");
     print_u64(win32k_pool_exhaustions);
+    print_str(b" class-atom-names=");
+    print_u64(class_atom_names);
+    print_str(b" atom-name-fallbacks/failures=");
+    print_u64(class_atom_fallbacks);
+    print_str(b"/");
+    print_u64(class_atom_fallback_failures);
     print_str(b" api0-redirects=");
     print_u64(api0_redirects);
     print_str(b" callback-failures=");

@@ -946,6 +946,18 @@ enum CapturedCursorString {
     Text(usize),
 }
 
+#[derive(Clone, Copy)]
+struct CapturedClassAtomName {
+    len: usize,
+    units: [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+}
+
+impl CapturedClassAtomName {
+    fn as_slice(&self) -> &[u16] {
+        &self.units[..self.len]
+    }
+}
+
 /// Capture one `UNICODE_STRING` used by `NtUserFindExistingCursorIcon`. A zero-length resource is
 /// the MAKEINTRESOURCE form: its Buffer field is the integer identity and is never dereferenced.
 unsafe fn capture_cursor_counted_string(
@@ -988,6 +1000,108 @@ unsafe fn capture_cursor_counted_string(
         return None;
     }
     decode_utf16(&bytes[..length], units).map(CapturedCursorString::Text)
+}
+
+unsafe fn capture_registered_class_atom_name(
+    pi: u64,
+    class_name_descriptor: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedClassAtomName> {
+    let mut captured = [0u16; nt_kernel_exec::user_cursor::CURSOR_TEXT_CAP];
+    let len = match capture_cursor_counted_string(
+        pi,
+        class_name_descriptor,
+        true,
+        &mut captured,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )? {
+        CapturedCursorString::Text(len) => len,
+        CapturedCursorString::Atom(_) => return None,
+    };
+    if len > nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP {
+        return None;
+    }
+    let mut units = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
+    units[..len].copy_from_slice(&captured[..len]);
+    Some(CapturedClassAtomName { len, units })
+}
+
+unsafe fn copy_class_atom_name_fallback(
+    pi: u64,
+    atom: u16,
+    unicode_string: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    let mut name = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
+    let name_len = GLOBAL_CLASS_ATOM_NAME_MIRROR
+        .copy_name(atom, &mut name)
+        .or_else(|| nt_kernel_exec::user_class::integer_atom_name(atom, &mut name))?;
+    let mut raw = [0u8; 16];
+    if unicode_string == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            unicode_string,
+            &mut raw,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let maximum = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    if maximum < 2 {
+        return Some(0);
+    }
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if buffer == 0 {
+        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let chars = name_len.min((maximum - 2) / 2);
+    let mut bytes = [0u8; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP * 2];
+    for (index, unit) in name[..chars].iter().copied().enumerate() {
+        bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    let text_ok = chars == 0
+        || img_spawn::client_write_mapped(
+            pi,
+            buffer,
+            &bytes[..chars * 2],
+            filled_pages,
+            nfilled,
+            scratch_base,
+        );
+    let terminator_ok = img_spawn::client_write_mapped(
+        pi,
+        buffer + chars as u64 * 2,
+        &0u16.to_le_bytes(),
+        filled_pages,
+        nfilled,
+        scratch_base,
+    );
+    if !text_ok || !terminator_ok {
+        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let fallback = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    if fallback < 8 {
+        print_str(b"[win32k-class-atom] NtUserGetAtomName fallback pi=");
+        print_u64(pi);
+        print_str(b" atom=0x");
+        print_hex(atom as u32);
+        print_str(b" bytes=");
+        print_u64((chars * 2) as u64);
+        print_str(b"\n");
+    }
+    Some((chars * 2) as u64)
 }
 
 unsafe fn capture_cursor_identity_key(
@@ -6317,6 +6431,17 @@ pub(crate) unsafe fn service_sec_image(
                         scratch_base,
                     )
                 });
+                let registered_class_atom_name = if m0 == 0x10b4 {
+                    capture_registered_class_atom_name(
+                        pi as u64,
+                        a1,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                } else {
+                    None
+                };
                 let get_class_info_capture = if m0 == 0x10bd {
                     let capture = capture_get_class_info_graph(
                         pi as u64,
@@ -6928,6 +7053,18 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if ok && !redirected_user_callback {
+                    if m0 == 0x10ad && st == 0 {
+                        if let Some(fallback) = copy_class_atom_name_fallback(
+                            pi as u64,
+                            a0 as u16,
+                            a1,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            st = fallback;
+                        }
+                    }
                     if let Some(capture) = get_class_info_capture {
                         if st != 0 {
                             if !copy_back_get_class_info(
@@ -6943,6 +7080,13 @@ pub(crate) unsafe fn service_sec_image(
                         } else if pi == 5 && capture.scrollbar {
                             USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
                             print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
+                        }
+                    }
+                }
+                if ok && !redirected_user_callback && m0 == 0x10b4 && st != 0 && !svc_noninteractive {
+                    if let Some(name) = registered_class_atom_name.as_ref() {
+                        if GLOBAL_CLASS_ATOM_NAME_MIRROR.observe(st as u16, name.as_slice()) {
+                            GLOBAL_CLASS_ATOM_NAMES_OBSERVED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }

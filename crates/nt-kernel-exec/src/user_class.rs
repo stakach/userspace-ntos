@@ -6,6 +6,7 @@ pub const WNDCLASSEXW_SIZE: usize = 0x50;
 pub const CS_GLOBALCLASS: u32 = 0x4000;
 pub const FNID_BUILTIN_FIRST: u32 = 0x02a1;
 pub const FNID_BUILTIN_LAST: u32 = 0x02aa;
+pub const CLASS_ATOM_NAME_CAP: usize = 255;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ClassNameIdentity {
@@ -164,6 +165,107 @@ impl<const N: usize> Default for BuiltinClassMirror<N> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ClassAtomNameEntry {
+    atom: u16,
+    len: u16,
+    units: [u16; CLASS_ATOM_NAME_CAP],
+}
+
+impl ClassAtomNameEntry {
+    const EMPTY: Self = Self {
+        atom: 0,
+        len: 0,
+        units: [0; CLASS_ATOM_NAME_CAP],
+    };
+}
+
+/// Bounded mirror of the dynamic class atom names learned from real successful registrations.
+///
+/// ReactOS stores USER class names in win32k's session-global atom table. In userspace-ntos the
+/// executive sometimes needs that atom name at the cross-VSpace boundary, after the real win32k
+/// query had no copyable result. This mirror never invents an atom: callers can only observe a
+/// nonzero atom returned by `NtUserRegisterClassExWOW` and later resolve that same atom.
+pub struct ClassAtomNameMirror<const N: usize> {
+    entries: [ClassAtomNameEntry; N],
+    next: usize,
+}
+
+impl<const N: usize> ClassAtomNameMirror<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [ClassAtomNameEntry::EMPTY; N],
+            next: 0,
+        }
+    }
+
+    pub fn observe(&mut self, atom: u16, units: &[u16]) -> bool {
+        if N == 0 || atom == 0 || units.is_empty() || units.len() > CLASS_ATOM_NAME_CAP {
+            return false;
+        }
+        let entry = if let Some(existing) = self.entries.iter_mut().find(|entry| entry.atom == atom)
+        {
+            existing
+        } else {
+            let entry = &mut self.entries[self.next];
+            self.next = (self.next + 1) % N;
+            entry
+        };
+        entry.atom = atom;
+        entry.len = units.len() as u16;
+        entry.units.fill(0);
+        entry.units[..units.len()].copy_from_slice(units);
+        true
+    }
+
+    pub fn copy_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.atom == atom && entry.len != 0)?;
+        let len = entry.len as usize;
+        if out.len() < len {
+            return None;
+        }
+        out[..len].copy_from_slice(&entry.units[..len]);
+        Some(len)
+    }
+}
+
+impl<const N: usize> Default for ClassAtomNameMirror<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn integer_atom_name(atom: u16, out: &mut [u16]) -> Option<usize> {
+    if atom >= 0xC000 {
+        return None;
+    }
+    let mut digits = [0u16; 5];
+    let mut n = atom as u32;
+    let mut digit_count = 0usize;
+    if n == 0 {
+        digits[0] = b'0' as u16;
+        digit_count = 1;
+    } else {
+        while n > 0 {
+            digits[digit_count] = (b'0' + (n % 10) as u8) as u16;
+            n /= 10;
+            digit_count += 1;
+        }
+    }
+    let len = 1 + digit_count;
+    if out.len() < len {
+        return None;
+    }
+    out[0] = b'#' as u16;
+    for index in 0..digit_count {
+        out[1 + index] = digits[digit_count - 1 - index];
+    }
+    Some(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +388,58 @@ mod tests {
         );
         assert_eq!(mirror.lookup(&with_menu(ClassNameIdentity::atom(1))), None);
         assert_eq!(mirror.lookup(&with_menu(ClassNameIdentity::none())), None);
+    }
+
+    #[test]
+    fn class_atom_name_mirror_resolves_only_observed_atoms() {
+        let name: alloc::vec::Vec<u16> = "ATL:ExplorerBand".encode_utf16().collect();
+        let mut mirror = ClassAtomNameMirror::<2>::new();
+        assert_eq!(
+            mirror.copy_name(0xc052, &mut [0u16; CLASS_ATOM_NAME_CAP]),
+            None
+        );
+        assert!(mirror.observe(0xc052, &name));
+
+        let mut out = [0u16; CLASS_ATOM_NAME_CAP];
+        let len = mirror.copy_name(0xc052, &mut out).unwrap();
+        assert_eq!(&out[..len], &name[..]);
+        assert_eq!(mirror.copy_name(0xc053, &mut out), None);
+    }
+
+    #[test]
+    fn class_atom_name_mirror_replaces_entries_boundedly() {
+        let first: alloc::vec::Vec<u16> = "First".encode_utf16().collect();
+        let second: alloc::vec::Vec<u16> = "Second".encode_utf16().collect();
+        let third: alloc::vec::Vec<u16> = "Third".encode_utf16().collect();
+        let mut mirror = ClassAtomNameMirror::<2>::new();
+        assert!(mirror.observe(0xc001, &first));
+        assert!(mirror.observe(0xc002, &second));
+        assert!(mirror.observe(0xc003, &third));
+
+        let mut out = [0u16; CLASS_ATOM_NAME_CAP];
+        assert_eq!(mirror.copy_name(0xc001, &mut out), None);
+        let len = mirror.copy_name(0xc002, &mut out).unwrap();
+        assert_eq!(&out[..len], &second[..]);
+        let len = mirror.copy_name(0xc003, &mut out).unwrap();
+        assert_eq!(&out[..len], &third[..]);
+    }
+
+    #[test]
+    fn class_atom_name_mirror_rejects_empty_or_oversized_names() {
+        let mut mirror = ClassAtomNameMirror::<2>::new();
+        assert!(!mirror.observe(0xc001, &[]));
+        assert!(!mirror.observe(0, &[b'A' as u16]));
+        let oversized = [b'X' as u16; CLASS_ATOM_NAME_CAP + 1];
+        assert!(!mirror.observe(0xc002, &oversized));
+    }
+
+    #[test]
+    fn integer_atom_name_uses_makeintatom_decimal_form() {
+        let mut out = [0u16; 8];
+        let len = integer_atom_name(0x8002, &mut out).unwrap();
+        let expected: alloc::vec::Vec<u16> = "#32770".encode_utf16().collect();
+        assert_eq!(&out[..len], &expected[..]);
+        assert_eq!(integer_atom_name(0xc000, &mut out), None);
+        assert_eq!(integer_atom_name(42, &mut [0u16; 2]), None);
     }
 }
