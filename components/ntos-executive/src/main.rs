@@ -3306,6 +3306,9 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let pml4 = PM_PML4S[6].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[6].load(Ordering::Relaxed);
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
+    let create_window_string_captures =
+        EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
+    let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3324,6 +3327,10 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_hex(tcb as u32);
     print_str(b" image-pts=");
     print_u64(image_pts);
+    print_str(b" create-window-string-captures=");
+    print_u64(create_window_string_captures);
+    print_str(b" win32k-pool-exhaustions=");
+    print_u64(win32k_pool_exhaustions);
     print_str(b"\n");
     check(
         b"exec_explorer_process_spawned",
@@ -3336,6 +3343,16 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && pml4 != 0
             && tcb > 1
             && image_pts >= 2,
+        passed,
+    );
+    check(
+        b"exec_explorer_create_window_strings_captured",
+        create_window_string_captures >= 1,
+        passed,
+    );
+    check(
+        b"exec_win32k_pool_no_exhaustion",
+        win32k_pool_exhaustions == 0,
         passed,
     );
 }
@@ -9432,6 +9449,7 @@ pub(crate) static EXPLORER_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_PAGE_TABLES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_CREATE_WINDOW_STRING_CAPTURES: AtomicU64 = AtomicU64::new(0);
 /// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. The explorer counters above
 /// prove the attempt entered the generic file -> SEC_IMAGE -> process pipeline.
 pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -11662,6 +11680,7 @@ pub(crate) static WIN32K_USERVM_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// pool into a GUI client's VSpace, making the bound DESKTOPINFO (winlogon's CLIENTINFO.pDeskInfo)
 /// client-readable — needed for user32's client-side DesktopPtrToUser (it reads pdi->pvDesktopBase).
 static WIN32K_POOL_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WIN32K_POOL_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
 /// 0 until win32k's USER heap arena has been RO-mapped into csrss (one-time; guards re-mapping on a
 /// second NtUserProcessConnect from the same client).
 static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);

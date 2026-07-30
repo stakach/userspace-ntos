@@ -214,7 +214,7 @@ unsafe fn observe_completed_dialog_modal_dispatch(
 /// callbacks (WM_NCCREATE/WM_CREATE ...), so a nested dispatch must not clobber an outer capture.
 const RC_ARG_CAPTURE_BASE: u64 = 0x1000;
 const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
-const RC_ARG_CAPTURE_SLOTS: u64 = 0x000C;
+const RC_ARG_CAPTURE_SLOTS: u64 = 0x0010;
 const RC_CLASS_MENU_DESC_OFF: u64 = 0x0080;
 const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
 /// Maximum bytes captured per string. `RTL_MAXIMUM_ATOM_LENGTH` is 255 chars, so 0x200 bytes covers
@@ -314,8 +314,9 @@ unsafe fn capture_client_string_arg(
 }
 
 /// Legacy `NtUserCreateWindowEx` capture: only rebase counted strings whose buffers live in the
-/// colliding main-image range. Completed-dispatch observers still inspect original client descriptors,
-/// so stack/heap/DLL strings must remain untouched here.
+/// colliding main-image range. Completed-dispatch observers inspect the argument vector that was sent
+/// to win32k, so non-explorer stack/heap/DLL strings must remain untouched until those observers carry
+/// their own saved original argument copy.
 unsafe fn capture_client_string_arg_if_main_image(
     pi: u64,
     sp_va: u64,
@@ -336,7 +337,7 @@ unsafe fn capture_client_string_arg_if_main_image(
     } else {
         u16::from_le_bytes([sd[0], sd[1]]) as u64
     };
-    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
+    let buffer = le_u64_at(&sd, 8);
     if length == 0 || buffer == 0 || length + 2 > RC_ARG_BUF_CAP || !client_image_range(buffer) {
         return sp_va;
     }
@@ -357,7 +358,7 @@ unsafe fn capture_client_string_arg_if_main_image(
     core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
     core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
     if large {
-        // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32), Buffer(u64). Preserve bAnsi.
+        // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32). Preserve bAnsi.
         let ansi_bit = u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x8000_0000;
         core::ptr::write_volatile(desc as *mut u32, length as u32);
         core::ptr::write_volatile((desc + 4) as *mut u32, (length as u32 + 2) | ansi_bit);
@@ -6019,17 +6020,62 @@ pub(crate) unsafe fn service_sec_image(
                     );
                 } else if m0 == 0x1077 {
                     // `NtUserCreateWindowEx` takes LARGE_STRING ClassName/ClsVersion/WindowName.
-                    // Keep the older narrow capture here: the winlogon completion observer correlates
-                    // IDD_LOGON by reading the original client WindowName descriptor after dispatch.
-                    d_a1 = capture_client_string_arg_if_main_image(
-                        pi as u64, d_a1, true, filled_pages, faults as usize, scratch_base,
-                    );
-                    d_a2 = capture_client_string_arg_if_main_image(
-                        pi as u64, d_a2, true, filled_pages, faults as usize, scratch_base,
-                    );
-                    d_a3 = capture_client_string_arg_if_main_image(
-                        pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
-                    );
+                    if pi == 6 {
+                        // Explorer reaches this path with create-window strings outside the main image
+                        // window. Capture them generically so isolated win32k never sees foreign VAs.
+                        prefill_client_large_string_pages(
+                            pi as u64,
+                            d_a1,
+                            scratch_base,
+                            &mut faults,
+                            filled_pages,
+                            &reg,
+                            &dll_pes,
+                        );
+                        prefill_client_large_string_pages(
+                            pi as u64,
+                            d_a2,
+                            scratch_base,
+                            &mut faults,
+                            filled_pages,
+                            &reg,
+                            &dll_pes,
+                        );
+                        prefill_client_large_string_pages(
+                            pi as u64,
+                            d_a3,
+                            scratch_base,
+                            &mut faults,
+                            filled_pages,
+                            &reg,
+                            &dll_pes,
+                        );
+                        let original_a1 = d_a1;
+                        let original_a2 = d_a2;
+                        let original_a3 = d_a3;
+                        d_a1 = capture_client_string_arg(
+                            pi as u64, d_a1, true, filled_pages, faults as usize, scratch_base,
+                        );
+                        d_a2 = capture_client_string_arg(
+                            pi as u64, d_a2, true, filled_pages, faults as usize, scratch_base,
+                        );
+                        d_a3 = capture_client_string_arg(
+                            pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
+                        );
+                        if d_a1 != original_a1 || d_a2 != original_a2 || d_a3 != original_a3 {
+                            EXPLORER_CREATE_WINDOW_STRING_CAPTURES.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        d_a1 = capture_client_string_arg_if_main_image(
+                            pi as u64, d_a1, true, filled_pages, faults as usize, scratch_base,
+                        );
+                        d_a2 = capture_client_string_arg_if_main_image(
+                            pi as u64, d_a2, true, filled_pages, faults as usize, scratch_base,
+                        );
+                        d_a3 = capture_client_string_arg_if_main_image(
+                            pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
+                        );
+                    }
                 } else if m0 == 0x1041 && a0 == 0x14 {
                     // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
                     // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph

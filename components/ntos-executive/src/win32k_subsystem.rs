@@ -577,6 +577,7 @@ unsafe fn pool_alloc(size: u64) -> u64 {
     let start = (WIN32K_POOL_VADDR + cur + 15) & !15;
     let cap = WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000;
     if size == 0 || start + size > cap {
+        crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         print_str(b"[win32k-host] POOL EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b" used=0x");
