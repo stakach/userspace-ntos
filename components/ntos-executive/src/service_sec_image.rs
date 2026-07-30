@@ -4299,9 +4299,76 @@ pub(crate) unsafe fn service_sec_image(
                             &mut nt_handler,
                         );
                     }
-                    ExecPostAction::CleanupProcessWaiters { process_index } => {
-                        io_completion_cancel_process(&mut nt_handler, process_index);
-                        delay_timer_rearm(&delay_queue);
+                    ExecPostAction::TerminateProcess {
+                        process_index,
+                        current_tid,
+                        drop_reply,
+                    } => {
+                        let preserve_tid = if current_tid != 0 {
+                            Some(current_tid)
+                        } else {
+                            None
+                        };
+                        let reply_dropped = if drop_reply {
+                            drop_current_syscall_reply()
+                        } else {
+                            false
+                        };
+                        let reclaimed = terminate_hosted_process_mechanisms(
+                            process_index,
+                            preserve_tid,
+                            &mut delay_queue,
+                            &mut nt_handler,
+                        );
+                        let current_deleted = if drop_reply && current_tid != 0 {
+                            terminate_hosted_thread_mechanism(
+                                current_tid,
+                                &mut delay_queue,
+                                &mut nt_handler,
+                            )
+                        } else {
+                            false
+                        };
+                        if drop_reply || current_tid == 0 {
+                            let _ =
+                                win32k_glue::unwind_dead_client_user_callbacks(process_index as u32);
+                        }
+                        if drop_reply && reply_dropped && current_deleted {
+                            PM_TERMINATE_PROCESS_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+                            if process_index < 64 {
+                                PM_TERMINATE_PROCESS_NO_REPLY_PIS
+                                    .fetch_or(1u64 << process_index, Ordering::Relaxed);
+                            }
+                        }
+                        print_str(b"[process-term] pi=");
+                        print_u64(process_index as u64);
+                        print_str(b" current_tid=");
+                        print_u64(current_tid);
+                        print_str(b" drop_reply=");
+                        print_u64(drop_reply as u64);
+                        print_str(b" reply-dropped=");
+                        print_u64(reply_dropped as u64);
+                        print_str(b" reclaimed=");
+                        print_u64(reclaimed as u64);
+                        print_str(b" current-deleted=");
+                        print_u64(current_deleted as u64);
+                        print_str(b"\n");
+                        if drop_reply {
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                recv_full_r12(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
                         let reply_dropped = drop_current_syscall_reply();

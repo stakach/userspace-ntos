@@ -894,9 +894,8 @@ pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
 /// previous-state, access-check, and buffer-size semantics.
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
-/// NtClose=27/NtCreateProcess=49/NtCreateThread=55). NOT issued during the current boot (no hosted
-/// process self-terminates) — registering them is additive; the teardown POLICY is proven by the
-/// post-loop self-test.
+/// NtClose=27/NtCreateProcess=49/NtCreateThread=55). ReactOS uses NtTerminateProcess in two shutdown
+/// phases, so the NULL-handle and handle-form semantics are both live behavior.
 pub const SSN_NT_TERMINATE_PROCESS: u64 = 266;
 pub const SSN_NT_TERMINATE_THREAD: u64 = 267;
 /// A distinctive fake handle we hand back for objects we don't yet model (ports, sections, ...), so it
@@ -3320,6 +3319,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
+    let process_self_term =
+        (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & (1u64 << 6)) != 0;
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3338,6 +3339,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_hex(tcb as u32);
     print_str(b" image-pts=");
     print_u64(image_pts);
+    print_str(b" self-term-no-reply=");
+    print_u64(process_self_term as u64);
     print_str(b" create-window-string-captures=");
     print_u64(create_window_string_captures);
     print_str(b" win32k-pool-exhaustions=");
@@ -3360,7 +3363,6 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && spawned_pid != 0
             && spawned == 1
             && pml4 != 0
-            && tcb > 1
             && image_pts >= 2,
         passed,
     );
@@ -8783,6 +8785,44 @@ unsafe fn terminate_hosted_thread_mechanism(
     }
 }
 
+unsafe fn terminate_hosted_process_mechanisms(
+    process_index: u8,
+    preserve_tid: Option<u64>,
+    delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
+) -> usize {
+    const MAX_PROCESS_TERMINATE_TIDS: usize = 64;
+    let mut tids = [0u64; MAX_PROCESS_TERMINATE_TIDS];
+    let mut count = 0usize;
+    if let Some(pid) = handler.pm_pid_for_pi(process_index as usize) {
+        if let Some(process) = handler.pm.process(pid) {
+            for tid in process.threads.iter().copied() {
+                if count == tids.len() {
+                    print_str(b"[process-term] tid-list-full pi=");
+                    print_u64(process_index as u64);
+                    print_str(b"\n");
+                    break;
+                }
+                tids[count] = tid as u64;
+                count += 1;
+            }
+        }
+    }
+
+    let mut reclaimed = 0usize;
+    for tid in tids.iter().copied().take(count) {
+        if preserve_tid == Some(tid) {
+            continue;
+        }
+        if terminate_hosted_thread_mechanism(tid, delay_queue, handler) {
+            reclaimed += 1;
+        }
+    }
+    io_completion_cancel_process(handler, process_index);
+    delay_timer_rearm(delay_queue);
+    reclaimed
+}
+
 /// GENERAL park: block the current caller on a SET of obj_ns events (`events`), with `wait_all`
 /// selecting WaitAll (wake when all signalled → WAIT_0) vs WaitAny (wake on the first signalled →
 /// WAIT_0+index). Steals this caller's bound reply object (REPLY_MAIN) into a free waiter slot and
@@ -10568,7 +10608,11 @@ enum ExecPostAction {
     None,
     TerminateCurrentThread { tid: u64 },
     TerminateRemoteThread { tid: u64 },
-    CleanupProcessWaiters { process_index: u8 },
+    TerminateProcess {
+        process_index: u8,
+        current_tid: u64,
+        drop_reply: bool,
+    },
     CriticalTermination { code: u32, object: u64 },
 }
 
@@ -11013,13 +11057,10 @@ fn build_nt_table() -> NativeServiceTable {
             // trailing JobMemberLevel, which smss passes as 0), so route SSN 50 to the SAME
             // NtCreateProcess handler. See ntdll_plan.md Step 2c reconciliation.
             (NativeService::NtCreateProcess, 50),
-            // ITEM 2a — live terminate-dispatch. NtTerminateProcess IS registered: it is NOT issued
-            // during a normal boot (the 3 hosted processes never self-terminate — verified: registering
-            // it keeps the boot byte-identical), so routing it to the real pm.terminate_process teardown
-            // (via resolve_process_handle: NtCurrentProcess→self, a child ProcessHandle→its Process(pid)
-            // via path 1b's value→object index) is additive. terminate_process only mutates below-mark
-            // EPROCESS/ETHREAD nodes in place + a transient consumed-and-dropped Vec → safe under the
-            // per-syscall heap reset even if a future flow does hit it.
+            // ITEM 2a — live terminate-dispatch. NtTerminateProcess is table-dispatched because real
+            // ReactOS shutdown depends on both NT forms: NULL current-process termination returns after
+            // stopping peer threads, while NtCurrentProcess/real Process handles are final and do not
+            // return to the caller.
             (NativeService::NtTerminateProcess, SSN_NT_TERMINATE_PROCESS as u32),
             (NativeService::NtTerminateThread, SSN_NT_TERMINATE_THREAD as u32),
         ],
@@ -11745,9 +11786,15 @@ static PM_HANDLE_LOCAL_OK: AtomicU64 = AtomicU64::new(0);
 /// NtOpenProcess self-test result (post-loop): opening a process by ClientId mints a Process handle in
 /// the opener's EPROCESS table that resolves back to the target pid.
 static PM_NTOPENPROCESS_OK: AtomicU64 = AtomicU64::new(0);
-/// Count of real NtTerminateProcess calls the executive serviced (0 during a normal boot — no hosted
-/// process terminates; the handler is additive + proven by the post-loop self-test).
+/// Count of real NtTerminateProcess calls the executive serviced. ReactOS process shutdown commonly
+/// uses a NULL-handle phase that returns to user mode and then a handle-form self-kill that must not
+/// return.
 static PM_TERMINATE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Successful handle-form process self-terminations whose syscall Reply object was dropped before the
+/// caller's TCB was suspended/deleted. The bitmask records the hosted process indices proven by the
+/// live path without making process death a boot-success requirement.
+static PM_TERMINATE_PROCESS_NO_REPLY: AtomicU64 = AtomicU64::new(0);
+static PM_TERMINATE_PROCESS_NO_REPLY_PIS: AtomicU64 = AtomicU64::new(0);
 /// Count of LIVE NtTerminateThread self-exits routed through the real ETHREAD teardown (item 2a).
 /// csrss.exe's init thread exits via NtTerminateThread(NtCurrentThread()) once during a normal boot
 /// ("CSRSRV keeps us going"); the executive marks that ETHREAD Terminated via `pm.exit_thread` (no
@@ -16293,6 +16340,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) as u32);
                     print_str(b" nt-terminate-process-calls=0x");
                     print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
+                    print_str(b" process-no-reply=0x");
+                    print_hex(PM_TERMINATE_PROCESS_NO_REPLY.load(Ordering::Relaxed) as u32);
+                    print_str(b" process-no-reply-pis=0x");
+                    print_hex(PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) as u32);
                     print_str(b")\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-

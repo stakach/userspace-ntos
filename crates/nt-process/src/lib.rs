@@ -1530,6 +1530,31 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// ReactOS/NT `NtTerminateProcess(NULL, status)` suicide phase: terminate every other thread in
+    /// the current process, but leave the caller running so user-mode shutdown can unload DLLs and
+    /// notify CSRSS before the final handle-form self-termination.
+    pub fn terminate_process_other_threads_at(
+        &mut self,
+        pid: ProcessId,
+        current_tid: ThreadId,
+        exit_status: u32,
+        exit_time_100ns: i64,
+    ) -> Result<(), u32> {
+        let tids = {
+            let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+            if proc.state == ProcessState::Terminated {
+                return Ok(());
+            }
+            proc.threads.iter().copied().collect::<Vec<_>>()
+        };
+        for tid in tids {
+            if tid != current_tid {
+                let _ = self.exit_thread_at(tid, exit_status, exit_time_100ns);
+            }
+        }
+        Ok(())
+    }
+
     /// A process/thread is a waitable dispatcher object, signalled once terminated (spec §12.1).
     pub fn is_process_signaled(&self, pid: ProcessId) -> bool {
         self.processes

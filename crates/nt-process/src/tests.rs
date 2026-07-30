@@ -600,6 +600,25 @@ fn pre_created_main_thread_bound_at_spawn() {
 }
 
 #[test]
+fn null_terminate_process_leaves_current_thread_running() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("shutdown.exe", None, None);
+    let current = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+
+    pm.terminate_process_other_threads_at(pid, current, 0x55aa, 123)
+        .unwrap();
+
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    assert_ne!(pm.thread(current).unwrap().state, ThreadState::Terminated);
+    assert_eq!(pm.thread(current).unwrap().exit_status, None);
+    assert_eq!(pm.thread(worker).unwrap().state, ThreadState::Terminated);
+    assert_eq!(pm.thread(worker).unwrap().exit_status, Some(0x55aa));
+    assert!(!pm.is_process_signaled(pid));
+    assert_eq!(pm.wait_process(pid), None);
+}
+
+#[test]
 fn runtime_thread_create_with_teb_and_handle() {
     // The general NtCreateThread service: a host pre-creates a POOL of extra ETHREADs at boot (below
     // its reset mark), then at runtime NtCreateThread pops one, binds the caller-supplied start

@@ -3637,8 +3637,8 @@ impl ExecNtHandler {
     /// `NtCurrentProcess()` (`-1`) → the caller (self-terminate). A real child ProcessHandle is now
     /// resolved via path 1b's value→object index: process handles are dense typed `Process(pid)`
     /// entries in the CALLER's EPROCESS handle table, so `lookup_handle(caller, handle)` returns the
-    /// target pid. Returns `None` for an unknown/untyped handle (→ the caller falls back to a benign
-    /// no-op, never terminating the wrong process).
+    /// target pid. Returns `None` for an unknown/untyped handle; each syscall maps that to its native
+    /// error/fallback behavior.
     pub(crate) fn resolve_process_handle(&self, handle: u64) -> Option<nt_process::ProcessId> {
         let caller = self.pm_pid_for_pi(self.pi)?;
         if handle == 0xFFFF_FFFF_FFFF_FFFF {
@@ -13871,35 +13871,68 @@ impl ExecNtHandler {
                     }
                 }
             },
-            // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route the
-            // POLICY teardown through pm: mark the target EPROCESS Terminated (signalled), terminate
-            // its threads, release its image-section map ref. NOT reached during a normal boot (no
-            // hosted process self-terminates); additive + proven by the post-loop self-test. FLAG:
-            // the seL4 MECHANISM teardown (reclaim the VSpace/CSpace/TCB caps + the mirror/scratch
-            // frames) is NOT done here — that needs the trusted-root-task cap reclamation and is the
-            // next path-2 follow-up; today the process simply stops faulting and its frames persist.
+            // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route NT's two
+            // user-mode shutdown phases through pm: NULL means terminate every other thread and return
+            // so kernel32 can unload/notify; NtCurrentProcess/real handle means final self-kill and the
+            // service loop must drop the reply before deleting the caller TCB.
             NativeService::NtTerminateProcess => {
                 PM_TERMINATE_CALLS.fetch_add(1, Ordering::Relaxed);
                 let handle = args.first().copied().unwrap_or(0);
                 let status = args.get(1).copied().unwrap_or(0) as u32;
-                if let Some(pid) = self.resolve_process_handle(handle) {
-                    if let Some(code) = self.pm.critical_process_termination_code(pid) {
-                        self.post_action = ExecPostAction::CriticalTermination {
-                            code,
-                            object: pid as u64,
-                        };
-                        return 0;
+                let kill_by_handle = handle != 0;
+                let caller_pid = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return nt_process::STATUS_INVALID_HANDLE,
+                };
+                let pid = if kill_by_handle {
+                    match self.resolve_process_handle(handle) {
+                        Some(pid) => pid,
+                        None => return nt_process::STATUS_INVALID_HANDLE,
                     }
-                    let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
-                    let _ =
-                        self.pm
-                            .terminate_process_at(pid, status, nt_system_time_100ns() as i64);
+                } else {
+                    caller_pid
+                };
+                if let Some(code) = self.pm.critical_process_termination_code(pid) {
+                    self.post_action = ExecPostAction::CriticalTermination {
+                        code,
+                        object: pid as u64,
+                    };
+                    return 0;
+                }
+                let process_index = self.pi_for_pid(pid).map(|pi| pi as u8);
+                let current_tid = self.current_tid as nt_process::ThreadId;
+                let exit_time = nt_system_time_100ns() as i64;
+                if !kill_by_handle && pid == caller_pid {
+                    if let Err(status) = self.pm.terminate_process_other_threads_at(
+                        pid,
+                        current_tid,
+                        status,
+                        exit_time,
+                    ) {
+                        return status;
+                    }
+                    if let Some(process_index) = process_index {
+                        self.post_action = ExecPostAction::TerminateProcess {
+                            process_index,
+                            current_tid: current_tid as u64,
+                            drop_reply: false,
+                        };
+                    }
+                } else {
+                    if let Err(status) = self.pm.terminate_process_at(pid, status, exit_time) {
+                        return status;
+                    }
                     self.release_process_handles(pid);
                     if let Some(process_index) = process_index {
-                        self.post_action = ExecPostAction::CleanupProcessWaiters { process_index };
+                        let is_current = pid == caller_pid;
+                        self.post_action = ExecPostAction::TerminateProcess {
+                            process_index,
+                            current_tid: if is_current { current_tid as u64 } else { 0 },
+                            drop_reply: is_current,
+                        };
                     }
                 }
-                0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
+                0 // STATUS_SUCCESS
             }
             NativeService::NtTerminateThread => {
                 const THREAD_TERMINATE: u32 = 0x0001;
