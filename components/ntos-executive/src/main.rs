@@ -6014,16 +6014,7 @@ pub(crate) static TEB_TAIL_FIRST_BAD: AtomicU64 = AtomicU64::new(0xFFFF);
 /// `pi` selects the process's ENV-SCRATCH base — the `scr_base` its `spawn_sec_image` was given,
 /// which is NOT `procs[pi].scratch_base` (that is the per-process demand-fill window).
 pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
-    match pi {
-        0 => 0x0000_0100_1074_0000,
-        1 => 0x0000_0100_1078_0000,
-        2 => WINLOGON_MAIN_TEB_MIRROR_VA, // 0x…107C_0000
-        3 => SERVICES_ENV_SCRATCH_VA,
-        4 => LSASS_ENV_SCRATCH_VA,
-        5 => USERINIT_ENV_SCRATCH_VA,
-        6 => EXPLORER_ENV_SCRATCH_VA,
-        _ => 0,
-    }
+    hosted_env_scratch_base_for_pi(pi)
 }
 
 // ═══ ★ BATCH 61 — `KeGdiFlushUserBatch`: THE MISSING KERNEL STEP THAT WAS EATING THE TEB ═══════
@@ -6828,15 +6819,7 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
 }
 
 fn heap_mirror_for_pi(pi: usize) -> u64 {
-    match pi {
-        1 => CSRSS_HEAP_MIRROR_VA,
-        2 => WINLOGON_HEAP_MIRROR_VA,
-        3 => SERVICES_HEAP_MIRROR_VA,
-        4 => LSASS_HEAP_MIRROR_VA,
-        5 => USERINIT_HEAP_MIRROR_VA,
-        6 => EXPLORER_HEAP_MIRROR_VA,
-        _ => SMSS_HEAP_MIRROR_VA,
-    }
+    hosted_heap_mirror_for_pi(pi)
 }
 
 fn vm_page_rights(protection: u32) -> u64 {

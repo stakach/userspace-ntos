@@ -133,7 +133,13 @@ fn hosted_main_stack_mirror_for_pi(pi: usize) -> u64 {
         .unwrap_or(SMSS_STACK_MIRROR_VA)
 }
 
-fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
+pub(crate) fn hosted_env_scratch_base_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.env_scratch_va)
+        .unwrap_or(0)
+}
+
+pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
     hosted_process_runtime_for_pi(pi)
         .map(|runtime| runtime.heap_mirror_va)
         .unwrap_or(SMSS_HEAP_MIRROR_VA)
