@@ -16,6 +16,8 @@ static USER_CALLBACK_EXPLORER_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_DEAD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_NCCREATE_FALSES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_NCCREATE_TRACES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
@@ -583,6 +585,153 @@ unsafe fn callback_payload_u32(frame: *mut nt_user_callback::CallbackFrame, offs
     callback_payload_u64(frame, offset) as u32
 }
 
+unsafe fn client_copyin_process_u64(
+    pi: u64,
+    scratch_base: u64,
+    va: u64,
+) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    crate::img_spawn::client_copyin_process_mapped(
+        pi,
+        va,
+        &mut bytes,
+        &[],
+        0,
+        scratch_base,
+        false,
+    )
+    .then_some(u64::from_le_bytes(bytes))
+}
+
+unsafe fn remember_explorer_atl_pthis(
+    client: crate::spawn_hosts::UserCallbackClient,
+    request: &nt_user_callback::CallbackHeader,
+    frame: *mut nt_user_callback::CallbackFrame,
+    message: u32,
+) {
+    const WM_GETMINMAXINFO: u32 = 0x0024;
+    const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
+    const EXPLORER_ATL_WIN_MODULE_RVA: u64 = 0x446b8;
+    const ATL_CREATE_WND_LIST_OFFSET: u64 = 0x30;
+
+    if client.pi != 6
+        || request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        || message != WM_GETMINMAXINFO
+        || (request.input_length as usize) < 8
+    {
+        return;
+    }
+
+    if callback_payload_u64(frame, 0) != EXPLORER_ATL_START_WINDOW_PROC {
+        return;
+    }
+    let list_head_va = crate::PE_LOAD_BASE + EXPLORER_ATL_WIN_MODULE_RVA + ATL_CREATE_WND_LIST_OFFSET;
+    let Some(head) = client_copyin_process_u64(client.pi as u64, client.scratch_base, list_head_va)
+    else {
+        return;
+    };
+    if head == 0 {
+        return;
+    }
+    let Some(p_this) = client_copyin_process_u64(client.pi as u64, client.scratch_base, head)
+    else {
+        return;
+    };
+    if p_this != 0 {
+        USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS.store(p_this, Ordering::Relaxed);
+    }
+}
+
+unsafe fn replay_missing_explorer_atl_wndproc_install(
+    request: &nt_user_callback::CallbackHeader,
+    frame: *mut nt_user_callback::CallbackFrame,
+    client_pi: u32,
+    client_badge: u64,
+    client_tid: u64,
+    request_window_message: u32,
+    request_window: u64,
+) {
+    const WM_GETMINMAXINFO: u32 = 0x0024;
+    const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
+    const GWLP_WNDPROC_ZERO_EXTENDED: u64 = 0xffff_fffc;
+
+    if client_pi != 6
+        || request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        || request_window_message != WM_GETMINMAXINFO
+        || request_window == 0
+        || callback_payload_u64(frame, 0) != EXPLORER_ATL_START_WINDOW_PROC
+    {
+        return;
+    }
+
+    let scratch_base = USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed);
+    let p_this = USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS.load(Ordering::Relaxed);
+    if p_this == 0 {
+        return;
+    }
+    let atl_hwnd =
+        client_copyin_process_u64(client_pi as u64, scratch_base, p_this + 0x08).unwrap_or(0);
+    if atl_hwnd != request_window {
+        return;
+    }
+
+    let thunk_proc =
+        client_copyin_process_u64(client_pi as u64, scratch_base, p_this + 0x10).unwrap_or(0);
+    if thunk_proc < 0x10000 || thunk_proc == EXPLORER_ATL_START_WINDOW_PROC {
+        return;
+    }
+    let thunk_first = client_copyin_process_u64(client_pi as u64, scratch_base, thunk_proc)
+        .unwrap_or(0);
+    let thunk_this = client_copyin_process_u64(client_pi as u64, scratch_base, thunk_proc + 2)
+        .unwrap_or(0);
+    if (thunk_first & 0xffff) != 0xb948 || thunk_this != p_this {
+        return;
+    }
+
+    let n = USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS.fetch_add(1, Ordering::Relaxed);
+    if n >= 4 {
+        return;
+    }
+
+    let client = Win32kClientContext {
+        pi: client_pi,
+        pid: USER_CALLBACK_CLIENT_PID.load(Ordering::Relaxed),
+        badge: client_badge,
+        tid: client_tid,
+        teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
+        peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
+        scratch_base,
+    };
+    let (ret, completed) = win32k_dispatch_wide(
+        nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN,
+        request_window,
+        GWLP_WNDPROC_ZERO_EXTENDED,
+        thunk_proc,
+        0,
+        0,
+        4,
+        &[],
+        client,
+    );
+    if completed {
+        USER_CALLBACK_WINDOW_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    }
+    print_str(b"[atl-replay] explorer GWLP_WNDPROC hwnd=0x");
+    print_hex(request_window as u32);
+    print_str(b" pThis=0x");
+    print_hex((p_this >> 32) as u32);
+    print_hex(p_this as u32);
+    print_str(b" thunk=0x");
+    print_hex((thunk_proc >> 32) as u32);
+    print_hex(thunk_proc as u32);
+    print_str(b" ret=0x");
+    print_hex((ret >> 32) as u32);
+    print_hex(ret as u32);
+    print_str(b" completed=");
+    print_u64(completed as u64);
+    print_str(b"\n");
+}
+
 unsafe fn callback_payload_result_u64(
     frame: *mut nt_user_callback::CallbackFrame,
     length: u32,
@@ -652,6 +801,7 @@ pub(crate) unsafe fn service_user_callback(
         } else {
             u32::MAX
         };
+    remember_explorer_atl_pthis(client, &request, frame, window_message);
     let sas_session_before = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
     );
@@ -1840,6 +1990,15 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     if !active_frame.is_redirected() {
         return None;
     }
+    replay_missing_explorer_atl_wndproc_install(
+        &request,
+        frame,
+        client_pi,
+        client_badge,
+        client_tid,
+        request_window_message,
+        request_window,
+    );
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
     let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
     if result_length > request.output_capacity as u64

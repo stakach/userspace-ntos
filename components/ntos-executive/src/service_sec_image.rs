@@ -6,6 +6,9 @@ use nt_io_abi::major;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
+static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
+static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn sec_image_forward_run() -> u64 {
     let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
@@ -219,6 +222,46 @@ fn hosted_process_pi_is_live(pi: usize) -> bool {
     }
 }
 
+unsafe fn defer_explorer_startup_quiesce(nt_handler: &ExecNtHandler) -> bool {
+    const MAX_DEFERS: u64 = 4;
+
+    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 1
+        || EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed) != 0
+    {
+        return false;
+    }
+
+    let process_connects =
+        EXPLORER_SSN_HIST[ssn_bucket(win32k_subsystem::SSN_NT_USER_INITIALIZE)]
+            .load(Ordering::Relaxed);
+    let create_window_calls = EXPLORER_SSN_HIST[ssn_bucket(0x1077)].load(Ordering::Relaxed);
+    if process_connects == 0 || create_window_calls != 0 {
+        return false;
+    }
+
+    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(6).unwrap_or(0);
+    if tcb <= 1 {
+        return false;
+    }
+
+    let n = EXPLORER_FRONTIER_QUIESCE_DEFERS.fetch_add(1, Ordering::Relaxed);
+    if n >= MAX_DEFERS {
+        return false;
+    }
+
+    let resume = tcb_resume(tcb);
+    print_str(b"[explorer-frontier] deferred quiesce after NtUserProcessConnect; kick=");
+    print_u64(n + 1);
+    print_str(b"/");
+    print_u64(MAX_DEFERS);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" resume=0x");
+    print_hex(resume as u32);
+    print_str(b"\n");
+    resume == 0
+}
+
 struct HostedExeSpawn<'a> {
     image: &'static nt_exe_image::HostedProcessImage,
     runtime: HostedProcessRuntime,
@@ -336,10 +379,14 @@ unsafe fn spawn_requested_hosted_exe(
     Ok(process_handle)
 }
 
-/// Populate one winlogon thread's client-side win32 state from the desktop facts published by the
-/// live win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the
-/// inline CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
-unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<(u64, u64, u64)> {
+/// Populate one GUI thread's client-side win32 state from the desktop facts published by the live
+/// win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the inline
+/// CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
+unsafe fn seed_gui_thread_client_info(
+    pi: usize,
+    teb_alias: u64,
+    pml4: u64,
+) -> Option<(u64, u64, u64)> {
     let server_deskinfo = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_DESKINFO) as *const u64,
     );
@@ -350,7 +397,7 @@ unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<
         return None;
     }
 
-    let pool_delta = win32k_glue::map_win32k_pool_into_csrss(pml4, 2);
+    let pool_delta = win32k_glue::map_win32k_pool_into_csrss(pml4, pi);
     let user_delta = win32k_subsystem::WIN32K_HEAP_VADDR
         - win32k_subsystem::CSRSS_W32_SHARED_VA;
     let client_deskinfo = server_deskinfo.checked_sub(pool_delta)?;
@@ -358,6 +405,53 @@ unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
     core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
     Some((client_deskinfo, pti, user_delta))
+}
+
+unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<(u64, u64, u64)> {
+    seed_gui_thread_client_info(2, teb_alias, pml4)
+}
+
+fn winlogon_thread_teb_alias_for(
+    badge: u64,
+    tp_worker_identity: Option<(usize, usize)>,
+    is_wl_worker: bool,
+) -> Option<u64> {
+    if let Some((2, tp_slot)) = tp_worker_identity {
+        return Some(tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000);
+    }
+    if is_wl_worker {
+        return Some(match badge {
+            WINLOGON_WORKER2_BADGE => {
+                WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
+            }
+            WINLOGON_WORKER3_BADGE => {
+                WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
+            }
+            _ => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+        });
+    }
+    Some(WINLOGON_MAIN_TEB_MIRROR_VA)
+}
+
+fn hosted_gui_thread_teb_alias_for(
+    pi: usize,
+    badge: u64,
+    current_tid: u64,
+    tp_worker_identity: Option<(usize, usize)>,
+    is_wl_worker: bool,
+) -> Option<u64> {
+    if pi == 2 {
+        return winlogon_thread_teb_alias_for(badge, tp_worker_identity, is_wl_worker);
+    }
+    if current_tid == 0
+        || pi >= PM_TIDS.len()
+        || current_tid != PM_TIDS[pi].load(Ordering::Relaxed)
+        || badge != hosted_top_badge_for_pi(pi)
+    {
+        return None;
+    }
+    let teb_alias = hosted_env_scratch_base_for_pi(pi);
+    (teb_alias != 0).then_some(teb_alias)
 }
 
 unsafe fn observe_winlogon_completed_dispatch(
@@ -1910,9 +2004,13 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_epoch = ep;
                 last_progress_t = now;
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
-                print_str(b"[quiesce] no forward progress for ~45s wall-clock (no new load/fill/event/paint) -> run gate\n");
-                stop = m1;
-                break;
+                if defer_explorer_startup_quiesce(&nt_handler) {
+                    last_progress_t = now;
+                } else {
+                    print_str(b"[quiesce] no forward progress for ~45s wall-clock (no new load/fill/event/paint) -> run gate\n");
+                    stop = m1;
+                    break;
+                }
             }
         }
         // TAIL WATCH — sample every hosted process' TEB tail on EVERY service-loop event, so the
@@ -6221,19 +6319,36 @@ pub(crate) unsafe fn service_sec_image(
                 // hosted client's process via the synthetic handle the DriverEntry attach used.
                 let mut d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_subsystem::FAKE_PROCESS_HANDLE } else { a0 };
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
-                // buffer is a csrss user pointer (its stack) NOT mapped in win32k's VSpace — passing it
-                // raw makes win32k's handler fault/spin on an address win32k_dispatch can't resolve.
-                // Copy csrss's input buffer into the shared ARG frame (mapped in BOTH), dispatch with
-                // the ARG-frame pointer, then copy win32k's out-params (the USERCONNECT) back to csrss.
+                // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
+                // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
+                // resolve. Copy the caller's input buffer into the shared ARG frame (mapped in BOTH),
+                // dispatch with the ARG-frame pointer, then copy win32k's out-params back to the same
+                // caller process.
                 let has_buf = m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
                 let (mut d_a1, blen) = if has_buf {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     let n = a2.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
                     core::ptr::write_bytes(arg as *mut u8, 0, (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize);
-                    let mut off = 0u64;
-                    while off + 8 <= n {
-                        core::ptr::write_volatile((arg + off) as *mut u64, smss_stack_read(a1 + off));
-                        off += 8;
+                    let input = core::slice::from_raw_parts_mut(arg as *mut u8, n as usize);
+                    if !img_spawn::client_copyin_mapped(
+                        pi as u64,
+                        a1,
+                        input,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        if failures < 8 {
+                            print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-in failed pi=");
+                            print_u64(pi as u64);
+                            print_str(b" buffer=0x");
+                            print_hex((a1 >> 32) as u32);
+                            print_hex(a1 as u32);
+                            print_str(b" bytes=");
+                            print_u64(n);
+                            print_str(b"\n");
+                        }
                     }
                     (arg, n)
                 } else {
@@ -6266,6 +6381,17 @@ pub(crate) unsafe fn service_sec_image(
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64, d_a1, false, filled_pages, faults as usize, scratch_base,
+                    );
+                    d_a2 = capture_client_string_arg(
+                        pi as u64, d_a2, false, filled_pages, faults as usize, scratch_base,
+                    );
+                } else if m0 == 0x10de && pi != 3 && pi != 4 {
+                    // NtGdiOpenDCW probes/copies the caller's optional device name before opening
+                    // the DC. Capture interactive clients' counted strings at the executive boundary
+                    // so nested GDI calls from user callbacks do not hand isolated win32k a foreign
+                    // user VA. Non-interactive services take the light path below.
+                    d_a0 = capture_client_string_arg(
+                        pi as u64, d_a0, false, filled_pages, faults as usize, scratch_base,
                     );
                     d_a2 = capture_client_string_arg(
                         pi as u64, d_a2, false, filled_pages, faults as usize, scratch_base,
@@ -6763,6 +6889,16 @@ pub(crate) unsafe fn service_sec_image(
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
                     (1, true)
+                } else if m0 == 0x10de && svc_noninteractive {
+                    // NtGdiOpenDCW is the DC-open half of the same non-interactive service GDI init
+                    // family as 0x106c/0x10b5. When lsass asks gdi32 for a DISPLAY DC during GUI-DLL
+                    // process attach, a real win32k HDC lets client-side gdi32 continue into DC_ATTR
+                    // state that this service process never initialized. A NULL HDC is the benign
+                    // "no suitable display PDEV" outcome ReactOS already returns for unsupported
+                    // devices, and lets non-interactive services continue their server work.
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) FAKED (non-interactive service, no display DC) -> NULL\n");
+                    (0, true)
                 } else if (m0 == 0x106c || m0 == 0x10b5) && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE GDI object-creation (0x106c NtGdiCreateBitmap /
                     // 0x10b5 NtGdiGetStockObject — w32ksvc64.h) for lsass. After 0x125b/0x11e0, lsass'
@@ -7218,11 +7354,31 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *mut u64, delta);
                     core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_PDISPINFO) as *mut u64, 0);
-                    // Copy the fixed-up USERCONNECT back to csrss's stack.
-                    let mut off = 0u64;
-                    while off + 8 <= blen {
-                        smss_stack_write(a1 + off, core::ptr::read_volatile((arg + off) as *const u64));
-                        off += 8;
+                    // Copy the fixed-up USERCONNECT back to the original caller, not a fixed bootstrap
+                    // mirror. Explorer and userinit use the same VA ranges as earlier clients in their
+                    // own VSpaces, so this must stay pi-keyed.
+                    let output = core::slice::from_raw_parts(arg as *const u8, blen as usize);
+                    if !img_spawn::client_write_mapped(
+                        pi as u64,
+                        a1,
+                        output,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        if failures < 8 {
+                            print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-out failed pi=");
+                            print_u64(pi as u64);
+                            print_str(b" buffer=0x");
+                            print_hex((a1 >> 32) as u32);
+                            print_hex(a1 as u32);
+                            print_str(b" bytes=");
+                            print_u64(blen);
+                            print_str(b"\n");
+                        }
+                        ok = false;
+                        st = 0xC000_0001;
                     }
                 }
                 // BATCH 43: throttle the status line for the same hot class-loop SSNs (WALL statuses ALWAYS
@@ -7234,60 +7390,53 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                // BATCH 39 — REASSERT winlogon's client CLIENTINFO.pDeskInfo after any win32k call.
-                // spawn_sec_image seeds TEB.Win32ClientInfo.pDeskInfo (TEB+0x820) with a valid client
-                // DESKTOPINFO so an interactive client's user32 GetThreadDesktopWnd() (RVA 0x50009,
-                // `mov rax,[pDeskInfo+0x10]`) doesn't NULL-deref. BUT win32k's real IntSetThreadDesktop
-                // (desktop.c:3456), run KeStackAttachProcess'd to winlogon during NtUserProcessConnect,
-                // takes its ELSE branch (winlogon's pti->rpdesk is NULL in our host — the per-thread
-                // desktop-heap view isn't wired) and CLEARS `pci->pDeskInfo = NULL`, re-introducing the
-                // crash. The executive still holds each winlogon TEB frame mapped at its env-scratch
-                // base, so re-write the faulting thread's client fields after every pi-2 win32k
-                // dispatch. (Only pi 2 is interactive + hits GetThreadDesktopWnd;
-                // the non-interactive services/lsass short-circuit before their user32 desktop path.)
-                if pi == 2 {
-                    let winlogon_teb_alias = if let Some((2, tp_slot)) = tp_worker_identity {
-                        tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000
-                    } else if is_wl_worker {
-                        match badge {
-                            WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
-                            WINLOGON_WORKER3_BADGE => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
-                            _ => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
-                        }
-                    } else {
-                        0x0000_0100_107C_0000
-                    };
-                    // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has bound the Default desktop it
-                    // publishes (per dispatch, via the coherent shared page) the DESKTOPINFO server VA
-                    // (SH_SAS_DESKINFO) + the dispatch THREADINFO server VA (SH_SAS_PTI == every window's
-                    // head.pti). Seed winlogon's TEB.Win32ClientInfo so user32's client-side
-                    // ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve a real heap-resident PWND
-                    // (the SAS window) into winlogon's RO-mapped heap view and run its real SASWindowProc
-                    // WITHOUT a syscall (DispatchMessageW message.c:1990 — the SAS-dispatch mechanism):
-                    //   - Win32ThreadInfo (TEB+0x78) = pti (server VA) — must EQUAL Wnd->head.pti so
-                    //     IntCallMessageProc's same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY).
-                    //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO − delta (its client VA in the
-                    //     RO-mapped heap window at CSRSS_W32_SHARED_VA).
-                    //   - CLIENTINFO.ulClientDelta (TEB+0x828) = delta, so DesktopPtrToUser maps every
-                    //     heap-resident server pointer (PWND/pcls/spwnd) → its client VA (server−delta).
-                    // The DESKTOPINFO's pvDesktopBase/pvDesktopLimit (win32k-side, RO-shared) bracket
-                    // the whole heap so the range check accepts any heap pointer. Do not manufacture a
-                    // placeholder THREADINFO: without published server state this thread is not ready
-                    // for client-side USER dispatch.
+                // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has bound the Default desktop it
+                // publishes (per dispatch, via the coherent shared page) the DESKTOPINFO server VA
+                // (SH_SAS_DESKINFO) + the dispatch THREADINFO server VA (SH_SAS_PTI == every window's
+                // head.pti). Seed the interactive GUI client's TEB.Win32ClientInfo so user32's
+                // client-side ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve real heap-
+                // resident PWNDs in the process' RO-mapped heap view without a syscall:
+                //   - Win32ThreadInfo (TEB+0x78) = pti (server VA), matching Wnd->head.pti.
+                //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO minus the pool-map delta.
+                //   - CLIENTINFO.ulClientDelta (TEB+0x828) = USER heap server->client delta.
+                // This used to be winlogon-only for the SAS path; explorer's real shell/ATL path uses
+                // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
+                // GUI main thread must be restated after win32k can clear the fields.
+                if let Some(teb_alias) =
+                    hosted_gui_thread_teb_alias_for(pi, badge, current_tid, tp_worker_identity, is_wl_worker)
+                {
                     if let Some((client_deskinfo, pti, delta)) =
-                        seed_winlogon_thread_client_info(winlogon_teb_alias, pml4)
+                        seed_gui_thread_client_info(pi, teb_alias, pml4)
                     {
-                        if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
-                            print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
-                            print_hex((client_deskinfo >> 32) as u32);
-                            print_hex(client_deskinfo as u32);
-                            print_str(b" pti=0x");
-                            print_hex((pti >> 32) as u32);
-                            print_hex(pti as u32);
-                            print_str(b" ulClientDelta=0x");
-                            print_hex((delta >> 32) as u32);
-                            print_hex(delta as u32);
-                            print_str(b"\n");
+                        if pi == 2 {
+                            if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                                print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
+                                print_hex((client_deskinfo >> 32) as u32);
+                                print_hex(client_deskinfo as u32);
+                                print_str(b" pti=0x");
+                                print_hex((pti >> 32) as u32);
+                                print_hex(pti as u32);
+                                print_str(b" ulClientDelta=0x");
+                                print_hex((delta >> 32) as u32);
+                                print_hex(delta as u32);
+                                print_str(b"\n");
+                            }
+                        } else {
+                            let bit = 1u64 << pi;
+                            if GUI_CLIENTINFO_SEED_LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                                print_str(b"[gui-clientinfo] pi=");
+                                print_u64(pi as u64);
+                                print_str(b" CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
+                                print_hex((client_deskinfo >> 32) as u32);
+                                print_hex(client_deskinfo as u32);
+                                print_str(b" pti=0x");
+                                print_hex((pti >> 32) as u32);
+                                print_hex(pti as u32);
+                                print_str(b" ulClientDelta=0x");
+                                print_hex((delta >> 32) as u32);
+                                print_hex(delta as u32);
+                                print_str(b"\n");
+                            }
                         }
                     }
                 }
