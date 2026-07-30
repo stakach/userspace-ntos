@@ -1353,6 +1353,34 @@ impl ExecNtHandler {
             })
     }
 
+    fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
+        if tid == 0 || tid > u32::MAX as u64 {
+            return None;
+        }
+        let tid32 = tid as nt_process::ThreadId;
+        self.thread_mechanisms.get_by_tid(tid32).or_else(|| {
+            for pi in 0..MAX_PI {
+                if PM_TIDS[pi].load(Ordering::Relaxed) == tid {
+                    return Some(nt_user_host::ThreadMechanism {
+                        pi,
+                        tid: tid32,
+                        kind: nt_user_host::ThreadMechanismKind::Main,
+                    });
+                }
+                for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                    if PM_POOL_TID[pi][slot].load(Ordering::Relaxed) == tid {
+                        return Some(nt_user_host::ThreadMechanism {
+                            pi,
+                            tid: tid32,
+                            kind: nt_user_host::ThreadMechanismKind::Pool { slot },
+                        });
+                    }
+                }
+            }
+            None
+        })
+    }
+
     fn hosted_mechanism_badge_for_pi(pi: usize) -> Option<u64> {
         nt_exe_image::hosted_top_badge_for_pi(pi)
     }
@@ -9525,35 +9553,37 @@ impl ExecNtHandler {
                         return status;
                     }
                 };
-                let Some((pi, slot)) = runtime_thread_slot(tid) else {
-                    let Some(main_pi) = (0..MAX_PI)
-                        .find(|&index| PM_TIDS[index].load(Ordering::Relaxed) == tid)
-                    else {
-                        return nt_process::STATUS_INVALID_HANDLE;
-                    };
-                    let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
-                        Ok(previous) => previous,
-                        Err(status) => return status,
-                    };
-                    print_str(b"[thread-life] resume main tid=");
-                    print_u64(tid);
-                    print_str(b" pi=");
-                    print_u64(main_pi as u64);
-                    print_str(b" previous=");
-                    print_u64(previous as u64);
-                    print_str(b"\n");
-                    if args[1] != 0 {
-                        if !self.xas_write_u32(args[1], previous) {
-                            return 0xC000_0005;
+                let Some(mechanism) = self.hosted_thread_mechanism_for_tid(tid) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                let (pi, slot) = match mechanism.kind {
+                    nt_user_host::ThreadMechanismKind::Main => {
+                        let main_pi = mechanism.pi;
+                        let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
+                            Ok(previous) => previous,
+                            Err(status) => return status,
+                        };
+                        print_str(b"[thread-life] resume main tid=");
+                        print_u64(tid);
+                        print_str(b" pi=");
+                        print_u64(main_pi as u64);
+                        print_str(b" previous=");
+                        print_u64(previous as u64);
+                        print_str(b"\n");
+                        if args[1] != 0 {
+                            if !self.xas_write_u32(args[1], previous) {
+                                return 0xC000_0005;
+                            }
                         }
-                    }
-                    if previous == 1 {
-                        let tcb = PM_MAIN_TCBS[main_pi].load(Ordering::Relaxed);
-                        if tcb <= 1 || tcb_resume(tcb) != 0 {
-                            return 0xC000_0001;
+                        if previous == 1 {
+                            let tcb = PM_MAIN_TCBS[main_pi].load(Ordering::Relaxed);
+                            if tcb <= 1 || tcb_resume(tcb) != 0 {
+                                return 0xC000_0001;
+                            }
                         }
+                        return 0;
                     }
-                    return 0;
+                    nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
                 };
                 // BATCH 35: the SCM per-connection worker is routed into the multiplex but left
                 // SUSPENDED (its trampoline-entry fault is unresolved — see the frontier note). rpcrt4
