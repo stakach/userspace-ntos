@@ -550,6 +550,26 @@ fn semaphore_family_uses_native_numbers_and_argument_contracts() {
 }
 
 #[test]
+fn mutant_family_uses_native_numbers_and_argument_contracts() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[
+            (NativeService::NtCreateMutant, 45),
+            (NativeService::NtOpenMutant, 126),
+            (NativeService::NtReleaseMutant, 196),
+        ],
+    );
+    for (service, ssn, argc) in [
+        (NativeService::NtCreateMutant, 45, (4, 4)),
+        (NativeService::NtOpenMutant, 126, (3, 3)),
+        (NativeService::NtReleaseMutant, 196, (2, 2)),
+    ] {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+        assert_eq!(service.arg_count(), argc);
+    }
+}
+
+#[test]
 fn io_completion_family_registers_at_reactos_numbers() {
     let pairs = [
         (NativeService::NtCreateIoCompletion, 40u32),
@@ -742,7 +762,12 @@ fn create_token_is_the_thirteen_argument_service_and_dispatch_preserves_every_sl
     // A SHORT argument vector (a failed client-stack copy-in) never reaches the handler: the
     // dispatcher rejects it on the arity bound.
     let mut capture = Capture(Vec::new());
-    let short = dispatcher.dispatch(57, &args[..9], &origin(ProcessorMode::UserMode), &mut capture);
+    let short = dispatcher.dispatch(
+        57,
+        &args[..9],
+        &origin(ProcessorMode::UserMode),
+        &mut capture,
+    );
     assert_eq!(short.status, STATUS_INVALID_PARAMETER);
     assert!(capture.0.is_empty());
 }

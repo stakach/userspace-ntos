@@ -21,6 +21,7 @@ mod interrupt;
 mod irql;
 pub mod kevent;
 mod lookaside;
+mod mutant;
 pub mod np_prefix;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
@@ -47,6 +48,7 @@ pub use lookaside::{
     general_lookaside, init_general_lookaside, DEFAULT_MAXIMUM_DEPTH, POOL_TYPE_NONPAGED,
     POOL_TYPE_PAGED,
 };
+pub use mutant::{map_mutant_access, MutantError, MutantStore};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use semaphore::{map_semaphore_access, SemaphoreError, SemaphoreStore};
 pub use spin::{SpinError, SpinLockTable};

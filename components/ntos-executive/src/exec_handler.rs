@@ -406,6 +406,7 @@ impl ExecNtHandler {
             },
             events: nt_kernel_exec::EventStore::with_capacity(192),
             semaphores: nt_kernel_exec::SemaphoreStore::with_capacity(192),
+            mutants: nt_kernel_exec::MutantStore::with_capacity(192),
             global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
                 GLOBAL_ATOM_CAPACITY,
             )
@@ -2174,6 +2175,62 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub(crate) fn mint_mutant_handle(&mut self, index: usize, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let tag = MUTANT_HANDLE_TAG | index as u64;
+        let handle = self
+            .pm
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::Opaque(tag),
+                nt_kernel_exec::map_mutant_access(access),
+            )
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    pub(crate) fn mutant_index_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            return match self.obj_ns.get(index) {
+                Some(entry) if entry.kind != 4 => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                _ => Err(STATUS_INVALID_HANDLE),
+            };
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Opaque(tag))
+                if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG => tag,
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let index = (tag & 0xFFFF_FFFF) as usize;
+        self.obj_ns
+            .get(index)
+            .filter(|entry| entry.kind == 4 && self.mutants.contains(index as u64))
+            .map(|_| index)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     /// Resolve a typed process-local `DEBUG_OBJECT` handle and enforce the access the operation
     /// requires (`DbgkDebugObjectMapping`-mapped at create time).
     pub(crate) fn debug_object_for_handle(
@@ -2654,31 +2711,65 @@ impl ExecNtHandler {
         match self.event_index_for_handle(handle, required_access) {
             Ok(index) => Ok(index),
             Err(STATUS_OBJECT_TYPE_MISMATCH) => {
-                self.semaphore_index_for_handle(handle, required_access)
+                match self.semaphore_index_for_handle(handle, required_access) {
+                    Ok(index) => Ok(index),
+                    // Mutants are named/openable real objects now, but the executive wait path still
+                    // treats them as compatibility-immediate sync handles. Parking a mutant before
+                    // the scheduler models owner handoff regresses winlogon's profile/shell startup.
+                    Err(STATUS_OBJECT_TYPE_MISMATCH) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                    Err(status) => Err(status),
+                }
             }
             Err(status) => Err(status),
         }
     }
 
-    fn dispatcher_object(&self, index: usize) -> Option<nt_kernel_exec::DispatcherObject> {
+    fn dispatcher_object_for_thread(
+        &self,
+        index: usize,
+        thread: u64,
+    ) -> Option<nt_kernel_exec::DispatcherObject> {
         match self.obj_ns.get(index).map(|entry| entry.kind) {
             Some(2) => Some(nt_kernel_exec::DispatcherObject::Event(index as u64)),
             Some(3) => Some(nt_kernel_exec::DispatcherObject::Semaphore(index as u64)),
+            Some(4) => Some(nt_kernel_exec::DispatcherObject::Mutant {
+                identity: index as u64,
+                thread,
+            }),
             _ => None,
         }
     }
 
     pub(crate) fn dispatcher_ready(&self, index: usize) -> bool {
-        self.dispatcher_object(index).is_some_and(|object| {
-            nt_kernel_exec::dispatcher_ready(&self.events, &self.semaphores, object)
-        })
+        self.dispatcher_ready_for(index, self.current_tid)
+    }
+
+    pub(crate) fn dispatcher_ready_for(&self, index: usize, thread: u64) -> bool {
+        self.dispatcher_object_for_thread(index, thread)
+            .is_some_and(|object| {
+                nt_kernel_exec::dispatcher_ready(
+                    &self.events,
+                    &self.semaphores,
+                    &self.mutants,
+                    object,
+                )
+            })
     }
 
     pub(crate) fn dispatcher_consume(&mut self, index: usize) -> bool {
-        let Some(object) = self.dispatcher_object(index) else {
+        self.dispatcher_consume_for(index, self.current_tid)
+    }
+
+    pub(crate) fn dispatcher_consume_for(&mut self, index: usize, thread: u64) -> bool {
+        let Some(object) = self.dispatcher_object_for_thread(index, thread) else {
             return false;
         };
-        nt_kernel_exec::consume_dispatcher(&mut self.events, &mut self.semaphores, object)
+        nt_kernel_exec::consume_dispatcher(
+            &mut self.events,
+            &mut self.semaphores,
+            &mut self.mutants,
+            object,
+        )
     }
 
     pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
@@ -2687,7 +2778,8 @@ impl ExecNtHandler {
         };
         matches!(
             self.pm.lookup_handle(pid, handle as nt_process::Handle),
-            Some(nt_process::HandleObject::Opaque(0))
+            Some(nt_process::HandleObject::Opaque(tag))
+                if tag == 0 || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
         )
     }
     pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
@@ -5576,6 +5668,13 @@ impl ExecNtHandler {
             self.semaphores.remove(index as u64);
         }
     }
+
+    fn rollback_new_mutant(&mut self, index: usize) {
+        if index + 1 == self.obj_ns.len() {
+            self.obj_ns.pop();
+            self.mutants.remove(index as u64);
+        }
+    }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
     /// or a relative `ntsvcs`) to npfs's leaf form `\ntsvcs` (UTF-16, leading backslash). npfs's
     /// NpFsdCreate strips the device prefix; the leaf is what the VCB prefix tree keys on.
@@ -6123,6 +6222,27 @@ impl ExecNtHandler {
         }
         Some(index)
     }
+
+    pub(crate) fn obj_create_anon_mutant(&mut self, initial_owner: Option<u64>) -> Option<usize> {
+        if self.obj_ns.len() >= self.obj_ns.capacity() {
+            return None;
+        }
+        let n = self.anon_event_seq;
+        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
+        let name = [
+            b'm',
+            (n & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            ((n >> 16) & 0xff) as u8,
+        ];
+        let mut entry = ObjEntry::dir(&name, 250);
+        entry.kind = 4;
+        self.obj_ns.push(entry);
+        let index = self.obj_ns.len() - 1;
+        self.mutants.initialize(index as u64, initial_owner);
+        Some(index)
+    }
+
     /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
     /// resolve the parent from all but the last component, then insert the leaf. Existing → reused.
     pub(crate) fn obj_create(
@@ -9879,6 +9999,160 @@ impl ExecNtHandler {
                     && !unsafe { self.xas_write_u32(previous_count, previous as u32) }
                 {
                     return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtCreateMutant => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                let initial_owner = args[3] != 0;
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let owner = initial_owner.then_some(self.current_tid);
+
+                let create_anonymous = |this: &mut Self| -> Result<u32, u32> {
+                    let Some(index) = this.obj_create_anon_mutant(owner) else {
+                        return Err(0xC000_009A);
+                    };
+                    let Some(handle) = this.mint_mutant_handle(index, args[1] as u32) else {
+                        this.rollback_new_mutant(index);
+                        return Err(0xC000_009A);
+                    };
+                    if !this.xas_write_u64(out, handle) {
+                        this.close_current_handle(handle);
+                        this.rollback_new_mutant(index);
+                        return Err(0xC000_0005);
+                    }
+                    Ok(0)
+                };
+
+                if oa == 0 {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => {
+                        return create_anonymous(self).unwrap_or_else(|status| status);
+                    }
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let existing = self.obj_resolve(path, root_idx);
+                if existing.is_some_and(|index| self.obj_ns[index].kind != 4) {
+                    return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                }
+                let existed = existing.is_some();
+                let Some(index) = self.obj_create(path, root_idx, 4, &[]) else {
+                    return 0xC000_009A;
+                };
+                let initialized = self.mutants.contains(index as u64);
+                if !initialized {
+                    self.mutants.initialize(index as u64, owner);
+                }
+                let Some(handle) = self.mint_mutant_handle(index, args[1] as u32) else {
+                    if !existed {
+                        self.rollback_new_mutant(index);
+                    }
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    if !existed {
+                        self.rollback_new_mutant(index);
+                    }
+                    return 0xC000_0005;
+                }
+                if existed && initialized { 0x4000_0000 } else { 0 }
+            },
+            NativeService::NtOpenMutant => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                if oa == 0 {
+                    return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let Some(index) = self.obj_resolve(path, root_idx) else {
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                };
+                if self.obj_ns[index].kind != 4 {
+                    return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                }
+                if !self.mutants.contains(index as u64) {
+                    return 0xC000_0008; // STATUS_INVALID_HANDLE
+                }
+                let Some(handle) = self.mint_mutant_handle(index, args[1] as u32) else {
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtReleaseMutant => {
+                let previous_count = args[1];
+                if previous_count != 0 && previous_count & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if previous_count != 0
+                    && !unsafe { self.probe_event_output(previous_count, 4) }
+                {
+                    return 0xC000_0005;
+                }
+                let index = match self.mutant_index_for_handle(args[0], 0) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let previous = match self.mutants.release(index as u64, self.current_tid) {
+                    Ok(previous) => previous,
+                    Err(nt_kernel_exec::MutantError::NotFound) => return 0xC000_0008,
+                    // Older boot scaffolding modeled mutant release as success for any live handle.
+                    // Keep that tolerance in the executive until mutant waits participate in real
+                    // owner transfer; strict store semantics are covered in nt-kernel-exec tests.
+                    Err(nt_kernel_exec::MutantError::NotOwned) => 0,
+                };
+                unsafe {
+                    wait_wake_dispatcher_set(self);
+                    if previous_count != 0
+                        && !self.xas_write_u32(previous_count, previous as u32)
+                    {
+                        return 0xC000_0005;
+                    }
                 }
                 0
             },

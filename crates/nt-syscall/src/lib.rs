@@ -153,6 +153,9 @@ pub enum NativeService {
     NtOpenSemaphore,
     NtQuerySemaphore,
     NtReleaseSemaphore,
+    NtCreateMutant,
+    NtOpenMutant,
+    NtReleaseMutant,
     // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
     // SURT. The message data plane (request/reply/receive) is served directly by the executive
     // against its cached connection, so those ops are NOT in this table (they never round-trip to
@@ -304,6 +307,9 @@ impl NativeService {
             NtOpenSemaphore => "NtOpenSemaphore",
             NtQuerySemaphore => "NtQuerySemaphore",
             NtReleaseSemaphore => "NtReleaseSemaphore",
+            NtCreateMutant => "NtCreateMutant",
+            NtOpenMutant => "NtOpenMutant",
+            NtReleaseMutant => "NtReleaseMutant",
             NtConnectPort => "NtConnectPort",
             NtSecureConnectPort => "NtSecureConnectPort",
             NtAcceptConnectPort => "NtAcceptConnectPort",
@@ -483,6 +489,9 @@ impl NativeService {
         NativeService::NtCreateToken,
         NativeService::NtLoadKey,
         NativeService::NtUnloadKey,
+        NativeService::NtCreateMutant,
+        NativeService::NtOpenMutant,
+        NativeService::NtReleaseMutant,
     ];
 }
 

@@ -841,6 +841,9 @@ pub const SSN_NT_PULSE_EVENT: u64 = 144;
 pub const SSN_NT_QUERY_EVENT: u64 = 155;
 pub const SSN_NT_RESET_EVENT: u64 = 210;
 pub const SSN_NT_SET_EVENT: u64 = 228;
+pub const SSN_NT_CREATE_MUTANT: u64 = 45;
+pub const SSN_NT_OPEN_MUTANT: u64 = 126;
+pub const SSN_NT_RELEASE_MUTANT: u64 = 196;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 pub const SSN_NT_OPEN_SEMAPHORE: u64 = 132;
 pub const SSN_NT_QUERY_SEMAPHORE: u64 = 177;
@@ -8966,9 +8969,10 @@ unsafe fn wait_wake_dispatcher(
             // Check the whole set before consuming anything so an unsatisfied WaitAll never reserves
             // an auto-reset event or semaphore token.
             let mut all = true;
+            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if !handler.dispatcher_ready(ev) {
+                if !handler.dispatcher_ready_for(ev, waiter_tid) {
                     all = false;
                     break;
                 }
@@ -8977,9 +8981,10 @@ unsafe fn wait_wake_dispatcher(
             wake_index = 0; // WaitAll returns WAIT_OBJECT_0
         } else {
             // WaitAny: the first (lowest-index) signalled event determines the return value.
+            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if handler.dispatcher_ready(ev) {
+                if handler.dispatcher_ready_for(ev, waiter_tid) {
                     wake = true;
                     selected_slot = k;
                     wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
@@ -8992,13 +8997,15 @@ unsafe fn wait_wake_dispatcher(
         }
         // Consume the selected dispatcher transaction only after the condition is known to hold.
         if wait_all {
+            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                handler.dispatcher_consume(ev);
+                handler.dispatcher_consume_for(ev, waiter_tid);
             }
         } else {
             let ev = WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed) as usize;
-            handler.dispatcher_consume(ev);
+            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
+            handler.dispatcher_consume_for(ev, waiter_tid);
         }
         wake_indices[i] = wake_index;
     }
@@ -10077,6 +10084,8 @@ const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
 const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
 const SEMAPHORE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const MUTANT_HANDLE_TAG: u64 = 0x4D55_544E_0000_0000;
+const MUTANT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const KEYEDEVENT_HANDLE_TAG: u64 = 0x4B45_5956_0000_0000;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
@@ -10093,7 +10102,7 @@ struct ObjEntry {
     name: [u8; 40],   // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
     parent: u8,       // index of the parent directory; 0xFF = the root itself
-    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event, 3 = semaphore
+    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event, 3 = semaphore, 4 = mutant
     target: [u8; 40], // symbolic-link target (kind == 1)
     target_len: u8,
 }
@@ -10317,6 +10326,8 @@ struct ExecNtHandler {
     events: nt_kernel_exec::EventStore,
     /// Counting semaphore state keyed by the same stable namespace indices.
     semaphores: nt_kernel_exec::SemaphoreStore,
+    /// Mutant state keyed by the same stable namespace indices.
+    mutants: nt_kernel_exec::MutantStore,
     /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its arena
     /// is allocated once in `new()` below the per-syscall heap mark; atom operations mutate only
     /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
@@ -10971,6 +10982,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenSemaphore, SSN_NT_OPEN_SEMAPHORE as u32),
             (NativeService::NtQuerySemaphore, SSN_NT_QUERY_SEMAPHORE as u32),
             (NativeService::NtReleaseSemaphore, SSN_NT_RELEASE_SEMAPHORE as u32),
+            // Keep create/release on the legacy immediate-sync ladder for now: the boot path still
+            // depends on its fake-handle timing. NtOpenMutant is routed so explorer no longer parks
+            // on SSN 126 while full owner-aware mutant waits are staged behind crate tests.
+            (NativeService::NtOpenMutant, SSN_NT_OPEN_MUTANT as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
             (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),
             (NativeService::NtSecureConnectPort, SSN_NT_SECURE_CONNECT_PORT as u32),
