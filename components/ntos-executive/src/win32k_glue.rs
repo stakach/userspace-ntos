@@ -11,6 +11,10 @@ const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_API0_REDIRECTS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_FAILURES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_DEAD_FAILURES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_NCCREATE_FALSES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +112,15 @@ pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64,
         USER_CALLBACK_NESTED_SSN_1298.load(Ordering::Relaxed),
         USER_CALLBACK_NESTED_SSN_126B.load(Ordering::Relaxed),
         USER_CALLBACK_SEQUENCE_COMPLETIONS.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn explorer_user_callback_proofs() -> (u64, u64, u64, u64) {
+    (
+        USER_CALLBACK_EXPLORER_API0_REDIRECTS.load(Ordering::Relaxed),
+        USER_CALLBACK_EXPLORER_FAILURES.load(Ordering::Relaxed),
+        USER_CALLBACK_EXPLORER_DEAD_FAILURES.load(Ordering::Relaxed),
+        USER_CALLBACK_EXPLORER_NCCREATE_FALSES.load(Ordering::Relaxed),
     )
 }
 
@@ -354,6 +367,32 @@ fn winlogon_callback_teb_alias(
     Some(alias)
 }
 
+fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
+    let pi = client.pi as usize;
+    if client.tid == 0 || pi >= PM_TIDS.len() || client.tid != PM_TIDS[pi].load(Ordering::Relaxed) {
+        return None;
+    }
+    match (client.pi, client.badge) {
+        (6, EXPLORER_BADGE) => {
+            let alias = crate::env_scratch_base_for_pi(pi);
+            (alias != 0).then_some(alias)
+        }
+        _ => None,
+    }
+}
+
+fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
+    if client.pi == 2 {
+        winlogon_callback_teb_alias(client)
+    } else {
+        main_gui_callback_teb_alias(client)
+    }
+}
+
+fn client_callbacks_supported(pi: u32) -> bool {
+    matches!(pi, 2 | 6)
+}
+
 unsafe fn bind_client_callback_window(
     request: nt_user_callback::CallbackHeader,
     teb_alias: u64,
@@ -598,7 +637,7 @@ pub(crate) unsafe fn service_user_callback(
     // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
     // error immediately instead of suspending the component again.
     let client_dead = user_callback_client_dead(client.pi);
-    if client.pi == 2 && contract_valid && !client_dead {
+    if client_callbacks_supported(client.pi) && contract_valid && !client_dead {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -607,7 +646,6 @@ pub(crate) unsafe fn service_user_callback(
         let dispatcher_rva = crate::img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.load(Ordering::Relaxed);
         let dispatcher = if dispatcher_rva == 0 { 0 } else { crate::NTDLL_BASE + dispatcher_rva };
         let valid = callback_table != 0 && callback_table & 7 == 0;
-        let callback_teb_alias = winlogon_callback_teb_alias(client);
         if winlogon_api0_ordinal == 1 {
             USER_CALLBACK_TABLE_VALID.fetch_add(valid as u64, Ordering::Relaxed);
             print_str(b"[user-callback] first winlogon api=0 pi=2 badge=");
@@ -631,6 +669,7 @@ pub(crate) unsafe fn service_user_callback(
             && request.payload_reference_offset == WINDOWPROC_PAYLOAD_OFFSET
             && request.input_length >= 0x40 + 0x50;
         let requires_window_binding = contract.unwrap().requires_window_binding();
+        let callback_teb_alias = client_callback_teb_alias(client);
         if (!requires_window_binding || callback_teb_alias.is_some())
             && valid
             && dispatcher != 0
@@ -713,6 +752,11 @@ pub(crate) unsafe fn service_user_callback(
             print_str(b" depth=");
             print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
             print_str(b"\n");
+            if client.pi == 6
+                && request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+            {
+                USER_CALLBACK_EXPLORER_API0_REDIRECTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -738,6 +782,11 @@ pub(crate) unsafe fn service_user_callback(
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
+        if client.pi == 6 && !client_dead {
+            USER_CALLBACK_EXPLORER_FAILURES.fetch_add(1, Ordering::Relaxed);
+        } else if client.pi == 6 {
+            USER_CALLBACK_EXPLORER_DEAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
         write_callback_failure_reply(request, status);
         Some(UserCallbackDisposition::ReplyImmediately)
     }
@@ -1857,6 +1906,23 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_hex(result0 as u32);
             print_str(b"\n");
         }
+        if client_pi == 6
+            && request_window_message == 0x0081
+            && result_length >= 0x40
+            && callback_payload_u64(frame, 0x38) == 0
+        {
+            let n = USER_CALLBACK_EXPLORER_NCCREATE_FALSES.fetch_add(1, Ordering::Relaxed);
+            if n < 4 {
+                print_str(b"[user-callback] explorer WM_NCCREATE returned FALSE hwnd=0x");
+                print_hex(request_window as u32);
+                print_str(b" result-pointer=0x");
+                print_hex((result_pointer >> 32) as u32);
+                print_hex(result_pointer as u32);
+                print_str(b" length=0x");
+                print_hex(result_length as u32);
+                print_str(b"\n");
+            }
+        }
     }
     if client_pi == 2
         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
@@ -2341,6 +2407,7 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
     let old = w32_attach_replace_slot(page, 0);
     if old != 0 {
         let error = page_unmap(old);
+        let _ = cnode_delete_recycle_r(old);
         if error != 0 {
             print_str(b"[teb-tail] COW unmap failed error=");
             print_u64(error);
@@ -2353,6 +2420,7 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
         print_str(b"[teb-tail] COW map failed error=");
         print_u64(error);
         print_str(b"\n");
+        let _ = cnode_delete_recycle_r(cc);
         return false;
     }
     if w32_attach_replace_slot(page, cc) == 0 {
@@ -2396,9 +2464,11 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
     for i in 0..n {
         // Unmap win32k's mapping of the previous client's page (arch Unmap uses this cap's win32k
-        // asid → csrss/winlogon's own VSpace mapping is untouched). Cap slot is leaked (bump CNode,
-        // XL 131072-slot pool → bounded for bring-up); a fresh copy_cap is used on the re-map.
-        let error = page_unmap(core::ptr::read(slots.add(i)));
+        // asid → csrss/winlogon's own VSpace mapping is untouched), then delete the transient copy
+        // cap so the executive's root-slot allocator can recycle it.
+        let cap = core::ptr::read(slots.add(i));
+        let error = page_unmap(cap);
+        let _ = cnode_delete_recycle_r(cap);
         if error != 0 {
             print_str(b"[w32attach] page_unmap failed page=0x");
             print_hex(core::ptr::read((core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64).add(i)) as u32);
@@ -2457,6 +2527,7 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
         print_str(b" error=");
         print_u64(error);
         print_str(b"\n");
+        let _ = cnode_delete_recycle_r(cc);
         return false;
     }
     w32_attach_record(page, cc);

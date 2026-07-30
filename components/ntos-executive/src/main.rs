@@ -1411,6 +1411,14 @@ static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(0);
 /// The first free root-CNode slot (`BootInfo.empty.start`), kept so the pool census can report
 /// root-CSpace occupancy as used/capacity rather than an opaque absolute CPtr.
 static ROOT_CSPACE_START: AtomicU64 = AtomicU64::new(0);
+const ROOT_SLOT_RECYCLE_CAP: usize = 32768;
+const ROOT_SLOT_LIVE_WORDS: usize = 4096;
+static mut ROOT_SLOT_RECYCLE: [u64; ROOT_SLOT_RECYCLE_CAP] = [0; ROOT_SLOT_RECYCLE_CAP];
+static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_RECYCLE_REUSED: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_RECYCLE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static mut ROOT_SLOT_LIVE_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -3309,6 +3317,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let create_window_string_captures =
         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
+    let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
+        win32k_glue::explorer_user_callback_proofs();
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3331,6 +3341,14 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(create_window_string_captures);
     print_str(b" win32k-pool-exhaustions=");
     print_u64(win32k_pool_exhaustions);
+    print_str(b" api0-redirects=");
+    print_u64(api0_redirects);
+    print_str(b" callback-failures=");
+    print_u64(callback_failures);
+    print_str(b" dead-callback-failures=");
+    print_u64(dead_callback_failures);
+    print_str(b" nccreate-false=");
+    print_u64(nccreate_false);
     print_str(b"\n");
     check(
         b"exec_explorer_process_spawned",
@@ -3353,6 +3371,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     check(
         b"exec_win32k_pool_no_exhaustion",
         win32k_pool_exhaustions == 0,
+        passed,
+    );
+    check(
+        b"exec_explorer_user_callbacks_redirected",
+        api0_redirects >= 1 && callback_failures == 0,
         passed,
     );
 }
@@ -3749,14 +3772,9 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
 fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
-    let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
-    let slots_free = if slots_total > slots_used {
-        slots_total - slots_used
-    } else {
-        0
-    };
+    let slots_available = root_slot_available_count();
     let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
     let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
@@ -3771,12 +3789,9 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
             && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
-            // ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT. The boot frontier now reaches dynamic
-            // services.exe/lsass.exe/userinit.exe/explorer.exe and late shell DLL loading, so a
-            // percentage threshold conflates real progress with pressure. Keep an explicit emergency
-            // reserve while `alloc_slot` remains a bump allocator; real slot recycling is the next
-            // capacity fix once the frontier needs it.
-            && slots_free >= 2048
+            // ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT. Measure real availability: slots left in
+            // the bump range plus deleted root slots returned through the recycle stack.
+            && slots_available >= 2048
             // … with nothing having been refused by any of them.
             && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
@@ -5337,6 +5352,9 @@ static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> =
     nt_fs::DirectoryOpenTable::new();
 
 fn try_alloc_slot() -> Option<u64> {
+    if let Some(slot) = try_recycled_root_slot() {
+        return Some(slot);
+    }
     let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
     let mut current = NEXT_SLOT.load(Ordering::Relaxed);
     loop {
@@ -5349,7 +5367,12 @@ fn try_alloc_slot() -> Option<u64> {
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => return Some(current),
+            Ok(_) => {
+                unsafe {
+                    let _ = root_slot_mark_live(current);
+                }
+                return Some(current);
+            }
             Err(observed) => current = observed,
         }
     }
@@ -5363,6 +5386,113 @@ fn alloc_slot() -> u64 {
             park()
         }
     }
+}
+
+fn root_slot_bit(slot: u64) -> Option<(usize, u64)> {
+    let start = ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
+    if slot < start || slot >= end {
+        return None;
+    }
+    let index = (slot - start) as usize;
+    let word = index / 64;
+    if word >= ROOT_SLOT_LIVE_WORDS {
+        return None;
+    }
+    Some((word, 1u64 << (index % 64)))
+}
+
+unsafe fn root_slot_mark_live(slot: u64) -> bool {
+    let Some((word, bit)) = root_slot_bit(slot) else {
+        return false;
+    };
+    let live = core::ptr::addr_of_mut!(ROOT_SLOT_LIVE_BITS) as *mut u64;
+    let old = core::ptr::read(live.add(word));
+    core::ptr::write(live.add(word), old | bit);
+    old & bit == 0
+}
+
+unsafe fn root_slot_clear_live(slot: u64) -> bool {
+    let Some((word, bit)) = root_slot_bit(slot) else {
+        return false;
+    };
+    let live = core::ptr::addr_of_mut!(ROOT_SLOT_LIVE_BITS) as *mut u64;
+    let old = core::ptr::read(live.add(word));
+    if old & bit == 0 {
+        return false;
+    }
+    core::ptr::write(live.add(word), old & !bit);
+    true
+}
+
+unsafe fn root_slot_remove_recycled(slot: u64) -> bool {
+    let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+    let stack = core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64;
+    let mut i = 0;
+    while i < n {
+        if core::ptr::read(stack.add(i as usize)) == slot {
+            let next = n - 1;
+            if i != next {
+                let last = core::ptr::read(stack.add(next as usize));
+                core::ptr::write(stack.add(i as usize), last);
+            }
+            core::ptr::write(stack.add(next as usize), 0);
+            ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+unsafe fn root_slot_note_occupied(slot: u64) {
+    if root_slot_mark_live(slot) {
+        let _ = root_slot_remove_recycled(slot);
+    }
+}
+
+fn try_recycled_root_slot() -> Option<u64> {
+    loop {
+        let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        let next = n - 1;
+        ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
+        let slot = unsafe {
+            core::ptr::read((core::ptr::addr_of!(ROOT_SLOT_RECYCLE) as *const u64).add(next as usize))
+        };
+        if unsafe { root_slot_mark_live(slot) } {
+            ROOT_SLOT_RECYCLE_REUSED.fetch_add(1, Ordering::Relaxed);
+            return Some(slot);
+        }
+        ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe fn recycle_deleted_root_slot(slot: u64) {
+    if !root_slot_clear_live(slot) {
+        return;
+    }
+    let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+    if n >= ROOT_SLOT_RECYCLE_CAP as u64 {
+        ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    core::ptr::write(
+        (core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64).add(n as usize),
+        slot,
+    );
+    let next = n + 1;
+    ROOT_SLOT_RECYCLE_N.store(next, Ordering::Relaxed);
+    note_high_water(&ROOT_SLOT_RECYCLE_HW, next);
+}
+
+fn root_slot_available_count() -> u64 {
+    let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
+    let bump = NEXT_SLOT.load(Ordering::Relaxed);
+    let bump_free = end.saturating_sub(bump);
+    bump_free + ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed)
 }
 
 // --- Shared executable-page cache (generic DLL loader) --------------------------------------------
@@ -5419,7 +5549,7 @@ unsafe fn dll_cache_put(va: u64, fr: u64) {
 // pi. Winlogon's runtime worker stacks are created late, after the former 8192-entry table could
 // already be full; silently dropping those entries made win32k attach an unrelated page at the same
 // user VA.
-const CSRSS_FRAME_CAP: usize = 16384;
+const CSRSS_FRAME_CAP: usize = 32768;
 static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
@@ -5735,6 +5865,16 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(slots_used);
     print_str(b"/");
     print_u64(slots_cap);
+    print_str(b" slot-free=");
+    print_u64(root_slot_available_count());
+    print_str(b" slot-recycle=");
+    print_u64(ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(ROOT_SLOT_RECYCLE_HW.load(Ordering::Relaxed));
+    print_str(b" reused=");
+    print_u64(ROOT_SLOT_RECYCLE_REUSED.load(Ordering::Relaxed));
+    print_str(b" dropped=");
+    print_u64(ROOT_SLOT_RECYCLE_DROPPED.load(Ordering::Relaxed));
     print_str(b" frame-reg=");
     print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");
@@ -6648,7 +6788,7 @@ unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
         return if error == 0 {
             Ok(frame)
         } else {
-            let _ = cnode_delete_r(frame);
+            let _ = cnode_delete_recycle_r(frame);
             Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
         };
     }
@@ -6672,7 +6812,7 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
     let _ = page_unmap_r(frame);
     if alias_cap != 0 {
         let _ = page_unmap_r(alias_cap);
-        let _ = cnode_delete_r(alias_cap);
+        let _ = cnode_delete_recycle_r(alias_cap);
     }
     let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
     if count < VM_FREE_FRAME_CAPACITY {
@@ -6683,7 +6823,7 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
         core::ptr::write(core::ptr::addr_of_mut!(VM_FREE_FRAME_N), count + 1);
         note_high_water(&VM_FREE_FRAME_HW, (count + 1) as u64);
     } else {
-        let _ = cnode_delete_r(frame);
+        let _ = cnode_delete_recycle_r(frame);
     }
 }
 
@@ -6735,12 +6875,12 @@ unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u3
     }
     let pt = alloc_slot();
     if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt) != 0 {
-        let _ = cnode_delete_r(pt);
+        let _ = cnode_delete_recycle_r(pt);
         VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     if paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, page & !0x1f_ffff, pml4) != 0 {
-        let _ = cnode_delete_r(pt);
+        let _ = cnode_delete_recycle_r(pt);
         VM_FAIL_PT.fetch_add(1, Ordering::Relaxed);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -6792,7 +6932,7 @@ unsafe fn vm_map_private_page(
         alias = heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA);
         let (copied, copy_error) = copy_cap_r(frame);
         if copy_error != 0 || page_map_r(copied, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-            let _ = cnode_delete_r(copied);
+            let _ = cnode_delete_recycle_r(copied);
             vm_frame_release(frame, 0);
             VM_FAIL_ALIAS.fetch_add(1, Ordering::Relaxed);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -6896,6 +7036,9 @@ unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u6
     );
     let label = reply >> 12;
     note_retype_error(untyped, obj, label);
+    if label == 0 {
+        root_slot_note_occupied(dest);
+    }
     label
 }
 unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
@@ -6929,7 +7072,11 @@ unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    reply >> 12
+    let label = reply >> 12;
+    if label == 0 {
+        root_slot_note_occupied(dest);
+    }
+    label
 }
 unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
     let reply: u64;
@@ -7083,6 +7230,14 @@ unsafe fn cnode_delete_r(idx: u64) -> u64 {
     );
     reply >> 12
 }
+
+unsafe fn cnode_delete_recycle_r(idx: u64) -> u64 {
+    let label = cnode_delete_r(idx);
+    if label == 0 {
+        recycle_deleted_root_slot(idx);
+    }
+    label
+}
 /// CNodeRevoke on the cap at `idx` under the root CNode: delete all its descendants (and, for an
 /// Untyped cap, roll its `free_index` back to 0 = full-capacity reclamation). Mirror of
 /// `cnode_delete_r`; used by the reclamation self-test to definitively reset a throwaway child
@@ -7121,7 +7276,11 @@ unsafe fn untyped_retype_from_r(untyped: u64, obj: u64, bits: u32, num: u32, des
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    reply >> 12
+    let label = reply >> 12;
+    if label == 0 {
+        root_slot_note_occupied(dest);
+    }
+    label
 }
 
 

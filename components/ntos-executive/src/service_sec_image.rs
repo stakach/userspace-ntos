@@ -2761,7 +2761,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     if frame != 0 {
-                        let _ = cnode_delete_r(frame);
+                        let _ = cnode_delete_recycle_r(frame);
                     }
                     print_str(b"[wl-worker] real stack growth failed page=0x");
                     print_hex((page >> 32) as u32);
@@ -3128,6 +3128,9 @@ pub(crate) unsafe fn service_sec_image(
                             // (preserving fixups). rights: per-process image pages are RW_NX here.
                             let (cc, ce) = copy_cap_r(existing);
                             let me = page_map_r(cc, bpage, RW_NX, pml4);
+                            if ce != 0 || me != 0 {
+                                let _ = cnode_delete_recycle_r(cc);
+                            }
                             let n = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
                             if n < 16 {
                                 print_str(b"[fixup-remap] pi=");
@@ -3270,6 +3273,7 @@ pub(crate) unsafe fn service_sec_image(
                 let (cc, ce) = copy_cap_r(frame);
                 let me = page_map_r(cc, bpage, rights, pml4);
                 if ce != 0 || me != 0 {
+                    let _ = cnode_delete_recycle_r(cc);
                     print_str(b"[map-fail] va=0x");
                     print_hex(bpage as u32);
                     print_str(b" copy=");
@@ -10133,7 +10137,9 @@ pub(crate) unsafe fn service_sec_image(
 
                     // Reclaim: suspend both throwaway client threads, then delete every cap this
                     // test made (child-first), leaving the TCBs + PML4s last. The executive's own
-                    // `fault_ep` is NOT in `slots` (it was passed in, not minted).
+                    // `fault_ep` is NOT in `slots` (it was passed in, not minted). These caps are
+                    // selftest-private, so their root slots can be returned to the allocator before
+                    // the next post-loop selftest starts.
                     let _ = tcb_suspend_r(client_tcb);
                     let _ = tcb_suspend_r(dbg_tcb);
                     for index in (0..nslots).rev() {
@@ -10142,12 +10148,12 @@ pub(crate) unsafe fn service_sec_image(
                         {
                             continue;
                         }
-                        let _ = cnode_delete_r(s);
+                        let _ = cnode_delete_recycle_r(s);
                     }
-                    let _ = cnode_delete_r(client_tcb);
-                    let _ = cnode_delete_r(dbg_tcb);
-                    let _ = cnode_delete_r(client_pml4);
-                    let _ = cnode_delete_r(dbg_pml4);
+                    let _ = cnode_delete_recycle_r(client_tcb);
+                    let _ = cnode_delete_recycle_r(dbg_tcb);
+                    let _ = cnode_delete_recycle_r(client_pml4);
+                    let _ = cnode_delete_recycle_r(dbg_pml4);
                     PM_PIDS[BLK_TEST_PI].store(0, Ordering::Relaxed);
                 }
             }
@@ -10690,7 +10696,10 @@ pub(crate) unsafe fn service_sec_image(
                         br_ok |= 0x0004;
                     }
                     let _ = sysc!(SSN_NT_CLOSE, &[dbg_handle, 0, 0, 0]);
-                    // Reclaim: suspend the remote thread, then drop every throwaway cap.
+                    // Reclaim: suspend the remote thread, then drop every throwaway cap. Keep
+                    // `target_pml4` out of the recycle path for now because its skeleton mappings are
+                    // not tracked in this local slot list; all other slots here are local aliases,
+                    // replies, endpoints, or throwaway frames.
                     let brk_tcb = TP_WORKER_TCB[BRK_TEST_PI][0].load(Ordering::Relaxed);
                     if brk_tcb > 1 {
                         let _ = tcb_suspend_r(brk_tcb);
@@ -10715,7 +10724,7 @@ pub(crate) unsafe fn service_sec_image(
             for i in (0..nslots).rev() {
                 let s = slots[i];
                 if s != 0 && s != target_pml4 {
-                    let _ = cnode_delete_r(s);
+                    let _ = cnode_delete_recycle_r(s);
                 }
             }
             PM_PIDS[BRK_TEST_PI].store(0, Ordering::Relaxed);
