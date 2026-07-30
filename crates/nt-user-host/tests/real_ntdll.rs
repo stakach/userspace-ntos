@@ -79,7 +79,14 @@ fn drive_real_ntdll_stubs_end_to_end() {
     assert_eq!(open.status, STATUS_SUCCESS);
     let kh = u64::from_le_bytes(open.output[..8].try_into().unwrap());
     // Real NtQueryValueKey stub (eax=0x14) → Answer == 42.
-    let q = img.invoke(&d, "NtQueryValueKey", &[kh, 0, 0, 0], &origin(), &mut ks);
+    let q = img.invoke(
+        &d,
+        "NtQueryValueKey",
+        &[kh, 0, 0, 0, 0, 0],
+        &origin(),
+        &mut ks,
+    );
+    assert_eq!(q.status, STATUS_SUCCESS);
     assert_eq!(u32::from_le_bytes(q.output[..4].try_into().unwrap()), 42);
     // Real NtQuerySystemInformation stub (eax=0x33) → full NT5 x64 basic information, and it
     // reached the service keyed by that real number.

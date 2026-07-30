@@ -7,6 +7,13 @@
 #![no_std]
 
 pub const MAX_EXE_LEAF: usize = 64;
+pub const SMSS_TOP_BADGE: u64 = 0;
+pub const CSRSS_TOP_BADGE: u64 = 2;
+pub const WINLOGON_TOP_BADGE: u64 = 4;
+pub const SERVICES_TOP_BADGE: u64 = 6;
+pub const LSASS_TOP_BADGE: u64 = 8;
+pub const USERINIT_TOP_BADGE: u64 = 27;
+pub const EXPLORER_TOP_BADGE: u64 = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageMetadata {
@@ -64,6 +71,7 @@ pub enum HostedImageRoot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedProcessImage {
     pub pi: usize,
+    pub top_badge: u64,
     pub leaf: &'static [u8],
     pub process_name: &'static str,
     pub nt_image_path: &'static [u8],
@@ -75,6 +83,7 @@ pub struct HostedProcessImage {
 pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     HostedProcessImage {
         pi: 0,
+        top_badge: SMSS_TOP_BADGE,
         leaf: b"smss.exe",
         process_name: "smss.exe",
         nt_image_path: b"\\SystemRoot\\System32\\smss.exe",
@@ -84,6 +93,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 1,
+        top_badge: CSRSS_TOP_BADGE,
         leaf: b"csrss.exe",
         process_name: "csrss.exe",
         nt_image_path: b"\\SystemRoot\\System32\\csrss.exe",
@@ -93,6 +103,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 2,
+        top_badge: WINLOGON_TOP_BADGE,
         leaf: b"winlogon.exe",
         process_name: "winlogon.exe",
         nt_image_path: b"\\SystemRoot\\System32\\winlogon.exe",
@@ -102,6 +113,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 3,
+        top_badge: SERVICES_TOP_BADGE,
         leaf: b"services.exe",
         process_name: "services.exe",
         nt_image_path: b"\\SystemRoot\\System32\\services.exe",
@@ -111,6 +123,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 4,
+        top_badge: LSASS_TOP_BADGE,
         leaf: b"lsass.exe",
         process_name: "lsass.exe",
         nt_image_path: b"\\SystemRoot\\System32\\lsass.exe",
@@ -120,6 +133,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 5,
+        top_badge: USERINIT_TOP_BADGE,
         leaf: b"userinit.exe",
         process_name: "userinit.exe",
         nt_image_path: b"\\SystemRoot\\System32\\userinit.exe",
@@ -129,6 +143,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
     HostedProcessImage {
         pi: 6,
+        top_badge: EXPLORER_TOP_BADGE,
         leaf: b"explorer.exe",
         process_name: "explorer.exe",
         nt_image_path: b"\\SystemRoot\\explorer.exe",
@@ -148,12 +163,26 @@ pub fn hosted_image_for_leaf(leaf: &[u8]) -> Option<&'static HostedProcessImage>
         .find(|image| eq_ascii_case(image.leaf, leaf))
 }
 
+pub fn hosted_image_for_top_badge(top_badge: u64) -> Option<&'static HostedProcessImage> {
+    HOSTED_PROCESS_IMAGES
+        .iter()
+        .find(|image| image.top_badge == top_badge)
+}
+
 pub fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
     hosted_image_for_pi(pi).map(|image| image.process_name)
 }
 
+pub fn hosted_top_badge_for_pi(pi: usize) -> Option<u64> {
+    hosted_image_for_pi(pi).map(|image| image.top_badge)
+}
+
 pub fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
     hosted_image_for_leaf(leaf).map(|image| image.pi)
+}
+
+pub fn hosted_pi_for_top_badge(top_badge: u64) -> Option<usize> {
+    hosted_image_for_top_badge(top_badge).map(|image| image.pi)
 }
 
 pub fn hosted_spawn_allowed(_creator_pi: usize, leaf: &[u8]) -> bool {
@@ -535,13 +564,18 @@ mod tests {
     fn hosted_catalog_resolves_current_boot_images() {
         assert_eq!(hosted_process_name_for_pi(0), Some("smss.exe"));
         assert_eq!(hosted_process_name_for_pi(6), Some("explorer.exe"));
+        assert_eq!(hosted_top_badge_for_pi(0), Some(SMSS_TOP_BADGE));
+        assert_eq!(hosted_top_badge_for_pi(6), Some(EXPLORER_TOP_BADGE));
         assert_eq!(hosted_pi_for_leaf(b"SERVICES.EXE"), Some(3));
+        assert_eq!(hosted_pi_for_top_badge(SERVICES_TOP_BADGE), Some(3));
         assert_eq!(hosted_pi_for_leaf(b"userinit2.exe"), None);
+        assert_eq!(hosted_pi_for_top_badge(13), None);
     }
 
     #[test]
     fn hosted_catalog_records_boot_paths_and_locations() {
         let services = hosted_image_for_pi(3).unwrap();
+        assert_eq!(services.top_badge, SERVICES_TOP_BADGE);
         assert_eq!(services.nt_image_path, b"\\SystemRoot\\System32\\services.exe");
         assert_eq!(services.command_line, b"services.exe");
         assert_eq!(services.image_root, HostedImageRoot::System32);

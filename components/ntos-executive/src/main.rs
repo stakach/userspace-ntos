@@ -10445,6 +10445,10 @@ struct ExecNtHandler {
     /// Allocation-free mirror of the hosted process mechanism slots keyed by NT PID/TID/badge.
     /// The old atomics remain synchronized for low-level code that has not moved yet.
     process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
+    /// Allocation-free mirror of hosted main/pool ETHREAD identities. The static TCB/cap cells stay
+    /// in the executive for now; this table makes PID/TID keyed thread lookup authoritative inside
+    /// the syscall handler before those low-level cells are moved.
+    thread_mechanisms: nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,

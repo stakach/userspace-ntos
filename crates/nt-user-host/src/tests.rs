@@ -93,13 +93,15 @@ fn dispatch_registry_and_memory_and_time() {
     let mut ks = build_services();
     // NtOpenKey → NtQueryValueKey Answer == 42 (registry subsystem).
     let open = d.dispatch_service(NativeService::NtOpenKey, &[0, 0, 0], &origin(), &mut ks);
+    assert_eq!(open.status, STATUS_SUCCESS);
     let key_handle = u64::from_le_bytes(open.output[..8].try_into().unwrap());
     let q = d.dispatch_service(
         NativeService::NtQueryValueKey,
-        &[key_handle, 0, 0, 0],
+        &[key_handle, 0, 0, 0, 0, 0],
         &origin(),
         &mut ks,
     );
+    assert_eq!(q.status, STATUS_SUCCESS);
     assert_eq!(u32::from_le_bytes(q.output[..4].try_into().unwrap()), 42);
     // NtAllocateVirtualMemory → a reserved base (address-space subsystem).
     let alloc = d.dispatch_service(
@@ -186,7 +188,7 @@ fn dispatch_file_create_write_read() {
     // NtCreateFile(path index 1, FILE_CREATE=2 at arg7) → a file handle.
     let create = d.dispatch_service(
         NativeService::NtCreateFile,
-        &[0, 0, 1, 0, 0, 0, 0, nt_fs::FILE_CREATE as u64],
+        &[0, 0, 1, 0, 0, 0, 0, nt_fs::FILE_CREATE as u64, 0, 0, 0],
         &origin(),
         &mut ks,
     );
@@ -195,14 +197,14 @@ fn dispatch_file_create_write_read() {
     // NtWriteFile writes the scratch buffer at offset 0.
     d.dispatch_service(
         NativeService::NtWriteFile,
-        &[fh, 0, 0, 0, 0, 0, 9, 0],
+        &[fh, 0, 0, 0, 0, 0, 9, 0, 0],
         &origin(),
         &mut ks,
     );
     // NtReadFile reads it back.
     let read = d.dispatch_service(
         NativeService::NtReadFile,
-        &[fh, 0, 0, 0, 0, 0, 9, 0],
+        &[fh, 0, 0, 0, 0, 0, 9, 0, 0],
         &origin(),
         &mut ks,
     );

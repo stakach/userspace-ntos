@@ -33,7 +33,6 @@ fn sec_image_forward_run() -> u64 {
 
 #[derive(Clone, Copy)]
 struct HostedProcessRuntime {
-    badge: u64,
     priority: u64,
     env_scratch_va: u64,
     stack_mirror_va: u64,
@@ -47,7 +46,6 @@ struct HostedProcessRuntime {
 fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
     match pi {
         0 => Some(HostedProcessRuntime {
-            badge: 0,
             priority: 100,
             env_scratch_va: 0x0000_0100_1074_0000,
             stack_mirror_va: SMSS_STACK_MIRROR_VA,
@@ -58,7 +56,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: None,
         }),
         1 => Some(HostedProcessRuntime {
-            badge: CSRSS_BADGE,
             priority: 101,
             env_scratch_va: 0x0000_0100_1078_0000,
             stack_mirror_va: CSRSS_STACK_MIRROR_VA,
@@ -69,7 +66,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: Some(&CSRSS_SPAWNED),
         }),
         2 => Some(HostedProcessRuntime {
-            badge: WINLOGON_BADGE,
             priority: 102,
             env_scratch_va: WINLOGON_MAIN_TEB_MIRROR_VA,
             stack_mirror_va: WINLOGON_STACK_MIRROR_VA,
@@ -80,7 +76,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: Some(&WINLOGON_SPAWNED),
         }),
         3 => Some(HostedProcessRuntime {
-            badge: SERVICES_BADGE,
             priority: 103,
             env_scratch_va: SERVICES_ENV_SCRATCH_VA,
             stack_mirror_va: SERVICES_STACK_MIRROR_VA,
@@ -91,7 +86,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: Some(&SERVICES_SPAWNED),
         }),
         4 => Some(HostedProcessRuntime {
-            badge: LSASS_BADGE,
             priority: 104,
             env_scratch_va: LSASS_ENV_SCRATCH_VA,
             stack_mirror_va: LSASS_STACK_MIRROR_VA,
@@ -102,7 +96,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: Some(&LSASS_SPAWNED),
         }),
         5 => Some(HostedProcessRuntime {
-            badge: USERINIT_BADGE,
             priority: 105,
             env_scratch_va: USERINIT_ENV_SCRATCH_VA,
             stack_mirror_va: USERINIT_STACK_MIRROR_VA,
@@ -113,7 +106,6 @@ fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
             spawned: Some(&USERINIT_SPAWNED),
         }),
         6 => Some(HostedProcessRuntime {
-            badge: EXPLORER_BADGE,
             priority: 106,
             env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
             stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
@@ -193,16 +185,13 @@ fn hosted_scratch_base_for_pi(pi: usize) -> u64 {
         .unwrap_or(SMSS_SCRATCH_BASE)
 }
 
-fn hosted_top_badge_for_pi(pi: usize) -> u64 {
-    hosted_process_runtime_for_pi(pi)
-        .map(|runtime| runtime.badge)
-        .unwrap_or(0)
+pub(crate) fn hosted_top_badge_for_pi(pi: usize) -> u64 {
+    nt_exe_image::hosted_top_badge_for_pi(pi).unwrap_or(0)
 }
 
 fn hosted_pi_for_top_badge(badge: u64) -> Option<usize> {
-    (0..MAX_PI).find(|&pi| {
-        hosted_process_runtime_for_pi(pi).is_some_and(|runtime| runtime.badge == badge)
-    })
+    nt_exe_image::hosted_pi_for_top_badge(badge)
+        .filter(|&pi| hosted_process_runtime_for_pi(pi).is_some())
 }
 
 fn hosted_pi_for_fault_badge(badge: u64) -> Option<usize> {
@@ -294,7 +283,7 @@ unsafe fn spawn_requested_hosted_exe(
     let child_pml4 = spawn_hosted_sec_image_for_pi(
         pi,
         spec.pe,
-        mint_badged(fault_ep, spec.runtime.badge),
+        mint_badged(fault_ep, spec.image.top_badge),
         NTDLL_BASE,
         true,
         0,
@@ -334,7 +323,7 @@ unsafe fn spawn_requested_hosted_exe(
     print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
     print_str(spec.image.leaf);
     print_str(b" (badge ");
-    print_u64(spec.runtime.badge);
+    print_u64(spec.image.top_badge);
     print_str(b") -> handle 0x");
     print_hex((process_handle >> 32) as u32);
     print_hex(process_handle as u32);
@@ -4551,7 +4540,8 @@ pub(crate) unsafe fn service_sec_image(
                     // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
                     // service EP tagged with that badge, so this loop multiplexes it against smss.
                     let cruntime = hosted_process_runtime_for_pi(1).unwrap();
-                    let cf_c = mint_badged(fault_ep, cruntime.badge);
+                    let csrss_badge = hosted_top_badge_for_pi(1);
+                    let cf_c = mint_badged(fault_ep, csrss_badge);
                     let cpe = csrss_pe.as_ref().unwrap();
                     // Priority 101 (above smss's 100) so csrss actually gets scheduled: at equal
                     // priority smss + the executive ping-pong and csrss never runs. csrss preempts
@@ -4637,7 +4627,9 @@ pub(crate) unsafe fn service_sec_image(
                     ) {
                         result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
                     }
-                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
+                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge ");
+                    print_u64(csrss_badge);
+                    print_str(b") -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
                     print_str(b"; its faults now multiplexed into this loop\n");
@@ -4651,7 +4643,8 @@ pub(crate) unsafe fn service_sec_image(
                 // here), handing the others their turns.
                 if nt_handler.winlogon_spawn_request {
                     let wruntime = hosted_process_runtime_for_pi(2).unwrap();
-                    let wf_c = mint_badged(fault_ep, wruntime.badge);
+                    let winlogon_badge = hosted_top_badge_for_pi(2);
+                    let wf_c = mint_badged(fault_ep, winlogon_badge);
                     let wpe = winlogon_pe.as_ref().unwrap();
                     let wpml4 = spawn_hosted_sec_image_for_pi(
                         2, wpe, wf_c, NTDLL_BASE, true,
@@ -4697,7 +4690,9 @@ pub(crate) unsafe fn service_sec_image(
                     ) {
                         result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
                     }
-                    print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge 4) -> handle 0x");
+                    print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge ");
+                    print_u64(winlogon_badge);
+                    print_str(b") -> handle 0x");
                     print_hex((winlogon_process_handle >> 32) as u32);
                     print_hex(winlogon_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");

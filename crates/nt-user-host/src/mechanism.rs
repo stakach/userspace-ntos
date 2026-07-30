@@ -49,6 +49,193 @@ impl<const N: usize> Default for ProcessMechanismTable<N> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ThreadMechanismKind {
+    Main,
+    Pool { slot: usize },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadMechanism {
+    pub pi: usize,
+    pub tid: u32,
+    pub kind: ThreadMechanismKind,
+}
+
+impl ThreadMechanism {
+    pub const fn empty() -> Self {
+        Self {
+            pi: 0,
+            tid: 0,
+            kind: ThreadMechanismKind::Main,
+        }
+    }
+
+    pub const fn is_live(self) -> bool {
+        self.tid != 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadMechanismTable<const P: usize, const S: usize> {
+    main: [ThreadMechanism; P],
+    pool: [[ThreadMechanism; S]; P],
+}
+
+impl<const P: usize, const S: usize> Default for ThreadMechanismTable<P, S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const P: usize, const S: usize> ThreadMechanismTable<P, S> {
+    pub const fn new() -> Self {
+        Self {
+            main: [ThreadMechanism::empty(); P],
+            pool: [[ThreadMechanism::empty(); S]; P],
+        }
+    }
+
+    pub fn claim_main(&mut self, pi: usize, tid: u32) -> Result<ThreadMechanism, MechanismError> {
+        if pi >= P {
+            return Err(MechanismError::SlotOutOfRange);
+        }
+        if tid == 0 {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        if self.main[pi].is_live() {
+            return Err(MechanismError::SlotOccupied);
+        }
+        if self.get_by_tid(tid).is_some() {
+            return Err(MechanismError::DuplicateTid);
+        }
+
+        let mechanism = ThreadMechanism {
+            pi,
+            tid,
+            kind: ThreadMechanismKind::Main,
+        };
+        self.main[pi] = mechanism;
+        Ok(mechanism)
+    }
+
+    pub fn claim_pool(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: u32,
+    ) -> Result<ThreadMechanism, MechanismError> {
+        if pi >= P || slot >= S {
+            return Err(MechanismError::SlotOutOfRange);
+        }
+        if tid == 0 {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        if self.pool[pi][slot].is_live() {
+            return Err(MechanismError::SlotOccupied);
+        }
+        if self.get_by_tid(tid).is_some() {
+            return Err(MechanismError::DuplicateTid);
+        }
+
+        let mechanism = ThreadMechanism {
+            pi,
+            tid,
+            kind: ThreadMechanismKind::Pool { slot },
+        };
+        self.pool[pi][slot] = mechanism;
+        Ok(mechanism)
+    }
+
+    pub fn release_main(&mut self, pi: usize) -> Option<ThreadMechanism> {
+        let slot = self.main.get_mut(pi)?;
+        if !slot.is_live() {
+            return None;
+        }
+        let previous = *slot;
+        *slot = ThreadMechanism::empty();
+        Some(previous)
+    }
+
+    pub fn release_pool(&mut self, pi: usize, pool_slot: usize) -> Option<ThreadMechanism> {
+        let slot = self.pool.get_mut(pi)?.get_mut(pool_slot)?;
+        if !slot.is_live() {
+            return None;
+        }
+        let previous = *slot;
+        *slot = ThreadMechanism::empty();
+        Some(previous)
+    }
+
+    pub fn release_tid(&mut self, tid: u32) -> Option<ThreadMechanism> {
+        let mechanism = self.get_by_tid(tid)?;
+        match mechanism.kind {
+            ThreadMechanismKind::Main => self.release_main(mechanism.pi),
+            ThreadMechanismKind::Pool { slot } => self.release_pool(mechanism.pi, slot),
+        }
+    }
+
+    pub fn main_for_pi(&self, pi: usize) -> Option<ThreadMechanism> {
+        self.main.get(pi).copied().filter(|slot| slot.is_live())
+    }
+
+    pub fn pool_for_slot(&self, pi: usize, pool_slot: usize) -> Option<ThreadMechanism> {
+        self.pool
+            .get(pi)?
+            .get(pool_slot)
+            .copied()
+            .filter(|slot| slot.is_live())
+    }
+
+    pub fn main_tid_for_pi(&self, pi: usize) -> Option<u32> {
+        self.main_for_pi(pi).map(|slot| slot.tid)
+    }
+
+    pub fn pool_tid_for_slot(&self, pi: usize, pool_slot: usize) -> Option<u32> {
+        self.pool_for_slot(pi, pool_slot).map(|slot| slot.tid)
+    }
+
+    pub fn get_by_tid(&self, tid: u32) -> Option<ThreadMechanism> {
+        (tid != 0).then_some(())?;
+        for slot in self.main.iter() {
+            if slot.tid == tid {
+                return Some(*slot);
+            }
+        }
+        for process in self.pool.iter() {
+            for slot in process.iter() {
+                if slot.tid == tid {
+                    return Some(*slot);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn pi_for_tid(&self, tid: u32) -> Option<usize> {
+        self.get_by_tid(tid).map(|slot| slot.pi)
+    }
+
+    pub fn pool_slot_for_tid(&self, tid: u32) -> Option<(usize, usize)> {
+        let mechanism = self.get_by_tid(tid)?;
+        match mechanism.kind {
+            ThreadMechanismKind::Main => None,
+            ThreadMechanismKind::Pool { slot } => Some((mechanism.pi, slot)),
+        }
+    }
+
+    pub fn live_len(&self) -> usize {
+        let main = self.main.iter().filter(|slot| slot.is_live()).count();
+        let pool = self
+            .pool
+            .iter()
+            .flat_map(|slots| slots.iter())
+            .filter(|slot| slot.is_live())
+            .count();
+        main + pool
+    }
+}
+
 impl<const N: usize> ProcessMechanismTable<N> {
     pub const fn new() -> Self {
         Self {
@@ -56,13 +243,13 @@ impl<const N: usize> ProcessMechanismTable<N> {
         }
     }
 
-    pub fn claim(
-        &mut self,
+    fn validate_identity(
+        &self,
         pi: usize,
         pid: u32,
         main_tid: u32,
         top_badge: u64,
-    ) -> Result<ProcessMechanism, MechanismError> {
+    ) -> Result<(), MechanismError> {
         if pi >= N {
             return Err(MechanismError::SlotOutOfRange);
         }
@@ -72,6 +259,17 @@ impl<const N: usize> ProcessMechanismTable<N> {
         if top_badge >= u64::BITS as u64 {
             return Err(MechanismError::InvalidBadge);
         }
+        Ok(())
+    }
+
+    pub fn claim(
+        &mut self,
+        pi: usize,
+        pid: u32,
+        main_tid: u32,
+        top_badge: u64,
+    ) -> Result<ProcessMechanism, MechanismError> {
+        self.validate_identity(pi, pid, main_tid, top_badge)?;
         if self.slots[pi].is_live() {
             return Err(MechanismError::SlotOccupied);
         }
@@ -93,6 +291,30 @@ impl<const N: usize> ProcessMechanismTable<N> {
         };
         self.slots[pi] = mechanism;
         Ok(mechanism)
+    }
+
+    pub fn claim_or_get(
+        &mut self,
+        pi: usize,
+        pid: u32,
+        main_tid: u32,
+        top_badge: u64,
+    ) -> Result<ProcessMechanism, MechanismError> {
+        self.validate_identity(pi, pid, main_tid, top_badge)?;
+        let requested = ProcessMechanism {
+            pi,
+            pid,
+            main_tid,
+            top_badge,
+        };
+        if let Some(existing) = self.get(pi) {
+            return if existing == requested {
+                Ok(existing)
+            } else {
+                Err(MechanismError::SlotOccupied)
+            };
+        }
+        self.claim(pi, pid, main_tid, top_badge)
     }
 
     pub fn release_pi(&mut self, pi: usize) -> Option<ProcessMechanism> {
@@ -208,6 +430,25 @@ mod tests {
     }
 
     #[test]
+    fn claim_or_get_is_idempotent_only_for_exact_identity() {
+        let mut table = ProcessMechanismTable::<4>::new();
+        let first = table.claim_or_get(1, 12, 20, 2).unwrap();
+        assert_eq!(table.claim_or_get(1, 12, 20, 2), Ok(first));
+        assert_eq!(
+            table.claim_or_get(1, 12, 21, 2),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(
+            table.claim_or_get(1, 13, 20, 2),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(
+            table.claim_or_get(1, 12, 20, 3),
+            Err(MechanismError::SlotOccupied)
+        );
+    }
+
+    #[test]
     fn release_frees_all_indexes() {
         let mut table = ProcessMechanismTable::<4>::new();
         table.claim(1, 12, 20, 2).unwrap();
@@ -218,5 +459,74 @@ mod tests {
         assert_eq!(table.pi_for_tid(20), None);
         assert_eq!(table.pi_for_badge(2), None);
         assert_eq!(table.claim(1, 14, 22, 2).unwrap().pid, 14);
+    }
+
+    #[test]
+    fn thread_claim_indexes_main_and_pool_slots() {
+        let mut table = ThreadMechanismTable::<3, 2>::new();
+        assert_eq!(
+            table.claim_main(1, 10).unwrap(),
+            ThreadMechanism {
+                pi: 1,
+                tid: 10,
+                kind: ThreadMechanismKind::Main
+            }
+        );
+        assert_eq!(
+            table.claim_pool(1, 0, 11).unwrap(),
+            ThreadMechanism {
+                pi: 1,
+                tid: 11,
+                kind: ThreadMechanismKind::Pool { slot: 0 }
+            }
+        );
+        assert_eq!(table.main_tid_for_pi(1), Some(10));
+        assert_eq!(table.pool_tid_for_slot(1, 0), Some(11));
+        assert_eq!(table.pi_for_tid(10), Some(1));
+        assert_eq!(table.pool_slot_for_tid(11), Some((1, 0)));
+        assert_eq!(table.pool_slot_for_tid(10), None);
+        assert_eq!(table.live_len(), 2);
+    }
+
+    #[test]
+    fn thread_claim_rejects_collisions() {
+        let mut table = ThreadMechanismTable::<3, 2>::new();
+        table.claim_main(1, 10).unwrap();
+        table.claim_pool(1, 0, 11).unwrap();
+        assert_eq!(table.claim_main(1, 12), Err(MechanismError::SlotOccupied));
+        assert_eq!(table.claim_main(2, 10), Err(MechanismError::DuplicateTid));
+        assert_eq!(
+            table.claim_pool(1, 0, 12),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(
+            table.claim_pool(1, 1, 11),
+            Err(MechanismError::DuplicateTid)
+        );
+        assert_eq!(
+            table.claim_pool(3, 0, 12),
+            Err(MechanismError::SlotOutOfRange)
+        );
+        assert_eq!(
+            table.claim_pool(1, 2, 12),
+            Err(MechanismError::SlotOutOfRange)
+        );
+        assert_eq!(
+            table.claim_pool(1, 1, 0),
+            Err(MechanismError::InvalidIdentity)
+        );
+    }
+
+    #[test]
+    fn thread_release_by_tid_frees_slot() {
+        let mut table = ThreadMechanismTable::<3, 2>::new();
+        table.claim_main(1, 10).unwrap();
+        table.claim_pool(1, 0, 11).unwrap();
+        assert_eq!(table.release_tid(11).unwrap().tid, 11);
+        assert_eq!(table.pool_tid_for_slot(1, 0), None);
+        assert_eq!(table.claim_pool(1, 0, 12).unwrap().tid, 12);
+        assert_eq!(table.release_main(1).unwrap().tid, 10);
+        assert_eq!(table.main_tid_for_pi(1), None);
+        assert_eq!(table.claim_main(1, 13).unwrap().tid, 13);
     }
 }

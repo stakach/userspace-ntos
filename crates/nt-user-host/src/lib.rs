@@ -17,7 +17,10 @@ mod services;
 
 use alloc::vec::Vec;
 
-pub use mechanism::{MechanismError, ProcessMechanism, ProcessMechanismTable};
+pub use mechanism::{
+    MechanismError, ProcessMechanism, ProcessMechanismTable, ThreadMechanism, ThreadMechanismKind,
+    ThreadMechanismTable,
+};
 pub use ntdll::{NtdllExport, NtdllImage};
 pub use profile::{
     build_kuser_shared_data, build_kuser_shared_data_with_cookie, build_peb, build_teb, kuser_off,
