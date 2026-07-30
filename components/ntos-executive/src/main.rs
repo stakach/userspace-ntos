@@ -3449,6 +3449,9 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     let default_opens = USER_DEFAULT_KEY_OPENED.load(Ordering::Relaxed);
     let root_opens = USER_ROOT_OPENED.load(Ordering::Relaxed);
     let readback = NT_LOAD_KEY_VALUE_READBACK.load(Ordering::Relaxed);
+    let volatile_provisioned = USER_VOLATILE_ENV_PROVISIONED.load(Ordering::Relaxed);
+    let volatile_opened = USER_VOLATILE_ENV_OPENED.load(Ordering::Relaxed);
+    let volatile_queried = USER_VOLATILE_ENV_QUERIED_EMPTY.load(Ordering::Relaxed);
     print_str(b"[cm-load] NtLoadKey calls=");
     print_u64(calls);
     print_str(b" mounted=");
@@ -3473,6 +3476,12 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     print_u64(user_opens);
     print_str(b" value-readback-ok=");
     print_u64(readback);
+    print_str(b" volatile-env provisioned=");
+    print_u64(volatile_provisioned);
+    print_str(b" opened=");
+    print_u64(volatile_opened);
+    print_str(b" query-empty=");
+    print_u64(volatile_queried);
     print_str(b"\n");
     check(
         b"exec_ntloadkey_serviced",
@@ -3491,6 +3500,10 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                 && root_opens >= 1
                 && user_opens >= 1
                 && readback == 1
+                && (!PROVISION_USER_VOLATILE_ENVIRONMENT
+                    || (volatile_provisioned >= 1
+                        && volatile_opened >= 1
+                        && volatile_queried >= 1))
                 // … and the unload really detached the mount.
                 && unloads >= 1
                 && detached >= 1),
@@ -9561,6 +9574,14 @@ pub(crate) const PROVISION_DEFAULT_USER_LOCALE: bool = true;
 /// `Control Panel\International\Locale` (0 = the step did not run).
 pub(crate) static DEFAULT_USER_LOCALE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEFAULT_USER_LOCALE_TYPE: AtomicU64 = AtomicU64::new(0);
+
+/// ★ BYPASS SWITCH for provisioning the per-logon `HKCU\Volatile Environment` key after
+/// `NtLoadKey` mounts the user's profile hive. `false` restores the observed post-profile miss in
+/// `userenv!CreateEnvironmentBlock`.
+pub(crate) const PROVISION_USER_VOLATILE_ENVIRONMENT: bool = true;
+pub(crate) static USER_VOLATILE_ENV_PROVISIONED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USER_VOLATILE_ENV_OPENED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USER_VOLATILE_ENV_QUERIED_EMPTY: AtomicU64 = AtomicU64::new(0);
 
 /// `NtLoadKey`/`NtUnloadKey` outcome counters, so the gate asserts what really happened.
 pub(crate) static NT_LOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);

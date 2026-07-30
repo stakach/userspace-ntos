@@ -10567,7 +10567,7 @@ pub unsafe fn rtl_create_process_parameters(
     runtime_data: *const u8,
 ) -> u32 {
     use nt_ntdll::rtl::process_params::{
-        create_process_parameters, denormalize, ParamString, ParamsInput,
+        create_process_parameters, denormalize, set_environment_pointer, ParamString, ParamsInput,
     };
     if process_parameters.is_null() || image_path.is_null() {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
@@ -10665,10 +10665,9 @@ pub unsafe fn rtl_create_process_parameters(
 
     let mut built = create_process_parameters(&input);
     // The pure builder produces a de-normalized block already (string Buffers = offsets); ensure it
-    // (idempotent). NOTE: the builder stores `Environment` as an OFFSET (it is VA-agnostic); the VA
-    // fix-up happens below once we know the heap `dst`.
+    // (idempotent). The builder stores an environment copy offset because it is VA-agnostic; the
+    // on-target export publishes the resolved source environment VA below.
     denormalize(&mut built.block, 0);
-    let env_off = built.environment_offset;
 
     // Copy onto the process heap.
     let total = built.block.len();
@@ -10680,14 +10679,12 @@ pub unsafe fn rtl_create_process_parameters(
     // SAFETY: dst is a fresh `total`-byte region.
     unsafe {
         core::ptr::copy_nonoverlapping(built.block.as_ptr(), dst, total);
-        // ★ ReactOS ppb.c: `Param->Environment = Dest` — Environment is a LIVE VA, never an offset,
-        // and normalize/denormalize NEVER touch it. The pure builder only knows the offset, so the
-        // export (which knows the heap VA) performs the VA fix-up here. `RtlpInitEnvironment` /
-        // `RtlCreateUserProcess` dereference this field directly; leaving it an offset (e.g. 0x668)
-        // faulted (#PF cr2=0x668). A zero offset means "no environment" → leave the field NULL.
-        if env_off != 0 {
-            core::ptr::write((dst as u64 + 0x80) as *mut u64, dst as u64 + env_off);
-        }
+        // `kernel32!BasePushProcessParameters` asserts that a caller-supplied environment remains the
+        // same pointer after RtlCreateProcessParameters. It then allocates and writes the child copy
+        // itself. `RtlCreateUserProcess` has the same requirement: it reads this live source pointer
+        // before copying the block into the new process. Normalize/denormalize leave Environment
+        // untouched, so record the source VA here instead of the private tail-copy VA.
+        set_environment_pointer(core::slice::from_raw_parts_mut(dst, total), env_ptr as u64);
         core::ptr::write(process_parameters, dst as u64);
     }
     0 // STATUS_SUCCESS

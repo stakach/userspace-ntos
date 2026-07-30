@@ -11,9 +11,10 @@
 //! This module is the PURE, host-tested builder: it lays out the exact same block into a `Vec<u8>`
 //! (the string bodies at the same offsets, the same `MAX_PATH` current-directory reserve, the same
 //! 8-byte alignment, the same trailing environment copy) and records where each `UNICODE_STRING`
-//! landed. The cdylib export ([`crate::rtl::process_params`]) copies this into a heap block. Because
-//! the layout math is identical, a consumer walking the block by the x64 offsets (below) recovers
-//! every string. `normalize`/`denormalize` implement the pointer↔offset rebase over a live base VA.
+//! landed. The cdylib export copies this into a heap block and then sets the Environment field to
+//! the resolved source environment VA expected by process-creation callers. Because the layout math
+//! is identical, a consumer walking the block by the x64 offsets (below) recovers every string.
+//! `normalize`/`denormalize` implement the pointer↔offset rebase over a live base VA.
 //!
 //! Category A (pure). Host-tested with I/O vectors derived from the ppb.c semantics (no ReactOS
 //! apitest exists for `RtlCreateProcessParameters`).
@@ -339,17 +340,24 @@ fn write_string_record(block: &mut [u8], field: usize, length: u16, max: u16, bu
     write_u64(block, field + US_BUFFER, buffer);
 }
 
+/// Write the Environment field. The field is not part of the normalized string-buffer set; callers
+/// that know the live source environment VA use this after the pure layout step.
+pub fn set_environment_pointer(block: &mut [u8], environment: u64) {
+    write_u64(block, OFF_ENVIRONMENT, environment);
+}
+
+/// Read the Environment field.
+pub fn environment_pointer(block: &[u8]) -> u64 {
+    read_u64(block, OFF_ENVIRONMENT)
+}
+
 /// `RtlNormalizeProcessParams` — rebase each non-null string `Buffer` offset to `base + offset`,
 /// setting the `NORMALIZED` flag. Idempotent (no-op if already normalized). Operates on the flat
 /// block in place.
 ///
-/// ★ The `Environment` field (`OFF_ENVIRONMENT`) is DELIBERATELY NOT rebased here — matching ReactOS
-/// `RtlNormalizeProcessParams`/`RtlDeNormalizeProcessParams` (sdk/lib/rtl/ppb.c), whose
-/// `NORMALIZE`/`DENORMALIZE` macros cover ONLY the 8 `UNICODE_STRING` Buffers. In real ntdll
-/// `Environment` is ALWAYS a live VA (`RtlCreateProcessParameters` sets `Param->Environment = Dest`,
-/// a VA, and denormalize leaves it untouched). Rebasing it here corrupted the field: a subsequently-
-/// denormalized block carried `Environment = offset` (e.g. `0x668`), which `RtlpInitEnvironment`
-/// then dereferenced as a VA → `#PF cr2=0x668`.
+/// The `Environment` field (`OFF_ENVIRONMENT`) is deliberately not rebased. ReactOS
+/// `BasePushProcessParameters` and `RtlCreateUserProcess` dereference it as a live source VA before
+/// copying the environment into the child process.
 pub fn normalize(block: &mut [u8], base: u64) {
     let flags = read_u32(block, OFF_FLAGS);
     if flags & RTL_USER_PROC_PARAMS_NORMALIZED != 0 {
@@ -366,7 +374,7 @@ pub fn normalize(block: &mut [u8], base: u64) {
 
 /// `RtlDeNormalizeProcessParams` — the inverse of [`normalize`]: subtract `base` from each non-null
 /// string `Buffer` and clear the `NORMALIZED` flag. No-op if already de-normalized. Like
-/// [`normalize`], the `Environment` field is NOT rebased (ReactOS ppb.c parity — see [`normalize`]).
+/// [`normalize`], the `Environment` field is not rebased.
 pub fn denormalize(block: &mut [u8], base: u64) {
     let flags = read_u32(block, OFF_FLAGS);
     if flags & RTL_USER_PROC_PARAMS_NORMALIZED == 0 {
@@ -618,6 +626,30 @@ mod tests {
         assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off);
         // A NULL buffer (RuntimeData) stays NULL through both.
         assert_eq!(read_u64(&built.block, OFF_RUNTIME_DATA + US_BUFFER), 0);
+    }
+
+    #[test]
+    fn environment_source_pointer_survives_normalization() {
+        let mut input = ParamsInput::default();
+        input.image_path_name = ParamString::new(&u("\\??\\C:\\Windows\\system32\\userinit.exe"));
+        input.command_line = input.image_path_name.clone();
+        input.dll_path = ParamString::empty();
+        input.current_directory = ParamString::empty();
+        input.window_title = ParamString::empty();
+        input.desktop_info = ParamString::empty();
+        input.shell_info = ParamString::empty();
+        input.runtime_data = ParamString::null_string();
+        input.environment = env_block(&["SystemRoot=C:\\Windows"]);
+
+        let mut built = create_process_parameters(&input);
+        const ENV_SOURCE: u64 = 0x0000_0100_3000_0000;
+        set_environment_pointer(&mut built.block, ENV_SOURCE);
+
+        const BASE: u64 = 0x0000_0100_4000_0000;
+        normalize(&mut built.block, BASE);
+        assert_eq!(environment_pointer(&built.block), ENV_SOURCE);
+        denormalize(&mut built.block, BASE);
+        assert_eq!(environment_pointer(&built.block), ENV_SOURCE);
     }
 
     #[test]

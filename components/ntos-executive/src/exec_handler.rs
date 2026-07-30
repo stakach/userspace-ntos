@@ -639,6 +639,37 @@ impl ExecNtHandler {
         print_u64(REG_SZ as u64);
         print_str(b", from HKLM\\SYSTEM\\...\\Nls\\Language\\Default)\n");
     }
+
+    /// `userenv!CreateEnvironmentBlock` opens `HKCU\Volatile Environment` after the profile hive is
+    /// loaded. ReactOS' profile creation path copies `config\default` into `ntuser.dat`, and that
+    /// prototype hive has `Environment` but not the logon-session volatile key. On NT the session
+    /// manager/profile machinery creates the key dynamically; model that as a write overlay child of
+    /// the mounted user hive, so normal `NtOpenKey`/`NtQueryKey` traffic sees an empty real key.
+    unsafe fn provision_user_volatile_environment(&mut self, mount_path: &str) {
+        if !PROVISION_USER_VOLATILE_ENVIRONMENT {
+            return;
+        }
+        let mut full = alloc::string::String::from(mount_path);
+        full.push_str("\\Volatile Environment");
+        let canon = self.overlay_canon(&full);
+        if self.overlay.find(&canon).is_none() && self.overlay.len() >= OVERLAY_KEY_MAX as usize {
+            print_str(b"[cm-load] volatile environment provision skipped: overlay full\n");
+            return;
+        }
+        let (_, created) = self.overlay.create(&canon);
+        self.overlay_dirty = true;
+        if created {
+            USER_VOLATILE_ENV_PROVISIONED.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-load] provisioned ");
+            print_ascii_str(&full);
+            print_str(b"\n");
+        }
+    }
+
+    fn is_dynamic_user_volatile_env_canon(canon: &str) -> bool {
+        canon.starts_with(r"\registry\user\s-") && canon.ends_with(r"\volatile environment")
+    }
+
     fn registry_map_access(desired: u32) -> u32 {
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -888,6 +919,9 @@ impl ExecNtHandler {
         // (b) A created key shadows the mount, exactly as it does for the machine hives.
         let canon = self.overlay_canon(&full);
         if let Some(index) = self.overlay.find(&canon) {
+            if Self::is_dynamic_user_volatile_env_canon(&canon) {
+                USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
             return Some(self.mint_registry_key(
                 OVERLAY_KEY_TAG | index as u32,
                 args[1] as u32,
@@ -1095,6 +1129,7 @@ impl ExecNtHandler {
         // Byte-for-byte equality of a non-empty value is what makes "a REAL hive is mounted here"
         // a measurement instead of a claim.
         let mount_path = self.hive_mounts[self.hive_mounts.len() - 1].mount.clone();
+        self.provision_user_volatile_environment(&mount_path);
         let mut env_path = mount_path;
         env_path.push_str("\\Environment");
         let mounted_temp = self
@@ -6480,7 +6515,11 @@ impl ExecNtHandler {
                     None
                 };
                 if let Some(ref full) = overlay_full {
-                    if let Some(index) = self.overlay.find(&self.overlay_canon(full)) {
+                    let canon = self.overlay_canon(full);
+                    if let Some(index) = self.overlay.find(&canon) {
+                        if Self::is_dynamic_user_volatile_env_canon(&canon) {
+                            USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
+                        }
                         return self.mint_registry_key(
                             OVERLAY_KEY_TAG | index as u32,
                             args[1] as u32,
@@ -7002,6 +7041,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let use_xas_write = self.pi == 2 || self.pi == 3 || self.pi == 4;
                 let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
                     if key == SYNTH_CPU_KEY {
                         // The synthetic CPU key has 2 values (Identifier, VendorIdentifier).
@@ -7021,11 +7061,24 @@ impl ExecNtHandler {
                     None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
                     Some((name, ty, data)) => {
                         let info = build_key_value_info(args[2], &name, ty, &data);
-                        smss_copyout(args[5], &(info.len() as u32).to_le_bytes()); // *ResultLength
+                        let total = (info.len() as u32).to_le_bytes();
+                        if use_xas_write {
+                            if !self.xas_try_write_buf(args[5], &total) {
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                        } else {
+                            smss_copyout(args[5], &total); // *ResultLength
+                        }
                         if info.len() > args[4] as usize {
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
-                            smss_copyout(args[3], &info);
+                            if use_xas_write {
+                                if !self.xas_try_write_buf(args[3], &info) {
+                                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                                }
+                            } else {
+                                smss_copyout(args[3], &info);
+                            }
                             0 // STATUS_SUCCESS
                         }
                     }
@@ -7076,14 +7129,14 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS
             },
             // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
-            // *ResultLength[4]). services' RegQueryInfoKeyW (KeyFullInformation) reads the subkey/value
-            // counts + max name lengths of a hive key to size its RegEnumKeyExW buffers. Scoped to
-            // pi==3 (services); other processes have no real NtQueryKey path today → stop as before.
+            // *ResultLength[4]). RegQueryInfoKeyW (KeyFullInformation) reads the subkey/value
+            // counts + max name lengths of a hive key to size its RegEnumKeyExW buffers.
             NativeService::NtQueryKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x1) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let use_xas_write = self.pi == 2 || self.pi == 3 || self.pi == 4;
                 let subs = self.registry_subkeys(key);
                 let vals = self.registry_values(key);
                 let subkeys = subs.len() as u32;
@@ -7110,11 +7163,32 @@ impl ExecNtHandler {
                 info[0x20..0x24].copy_from_slice(&values.to_le_bytes());
                 info[0x24..0x28].copy_from_slice(&max_vname.to_le_bytes());
                 info[0x28..0x2c].copy_from_slice(&max_vdata.to_le_bytes());
-                smss_copyout(args[4], &struct_size.to_le_bytes()); // *ResultLength (stack local)
+                if values == 0
+                    && self
+                        .registry_target_path(key)
+                        .as_deref()
+                        .is_some_and(Self::is_dynamic_user_volatile_env_canon)
+                {
+                    USER_VOLATILE_ENV_QUERIED_EMPTY.fetch_add(1, Ordering::Relaxed);
+                }
+                let total = struct_size.to_le_bytes();
+                if use_xas_write {
+                    if !self.xas_try_write_buf(args[4], &total) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                } else {
+                    smss_copyout(args[4], &total); // *ResultLength
+                }
                 if (args[3] as usize) < struct_size as usize {
                     return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
                 }
-                self.xas_write_buf(args[2], &info);
+                if use_xas_write {
+                    if !self.xas_try_write_buf(args[2], &info) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                } else {
+                    self.xas_write_buf(args[2], &info);
+                }
                 0 // STATUS_SUCCESS
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
