@@ -8,7 +8,8 @@ document for the ntdll effort. The blow-by-blow history (BATCH 1..54, §A..§F) 
 diagnosis story behind a specific decision.
 
 Every number below was **re-measured at `6dee67e`** against the built binary and the source tree (see
-§2 for how). Where a claim in `ntdll_plan.md` did not survive re-measurement it is corrected in §7.
+§2 for how), then updated for the 2026-07-30 Dbgk `Zw*` alias pickup. Where a claim in
+`ntdll_plan.md` did not survive re-measurement it is corrected in §7.
 
 ---
 
@@ -56,12 +57,12 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 
 ### 2.1 Exports in the built `.tmp/nt-ntdll.dll`
 
-**1337 exports, 0 forwarders.**
+**1342 exports, 0 forwarders.**
 
 | prefix | count | note |
 |---|---|---|
 | `Nt*` | 214 | 212 SSN trap stubs + `NtCurrentTeb` + `NtGetTickCount` |
-| `Zw*` | 207 | `zw_alias!` of the `Nt*` stubs — see §5 item 1 |
+| `Zw*` | 212 | `zw_alias!` of the `Nt*` stubs; the five Dbgk aliases are included |
 | `Rtl*` | 593 | incl. 13 `Rtlp*` |
 | `Ldr*` | 54 | incl. `LdrpInitialize` |
 | `Etw*` | 64 | 46 `etw_ok!` + 2 `etw_scenario_write!` no-ops + real ones |
@@ -70,7 +71,7 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 | `Ki*` | 4 | the user dispatchers |
 | CRT / crypto / Alpc / data | 167 | `mem*`/`str*`/`wcs*`/`sprintf`/`qsort`/math, `A_SHA*`/`MD4*`/`MD5*`, `Pfx*`, `Alpc*`, `__C_specific_handler`, `__chkstk`, `VerSetConditionMask`, the 3 `Nls*` data exports |
 
-Roughly: 866 hand-written `#[export_name]` items + 212 macro trap stubs + 207 `zw_alias!` + 48 ETW
+Roughly: 866 hand-written `#[export_name]` items + 212 macro trap stubs + 212 `zw_alias!` + 48 ETW
 macros + a handful of data exports.
 
 ### 2.2 Required imports — is anything missing?
@@ -123,12 +124,12 @@ completion. (`RtlCompactHeap` is **no longer** in this group — it has a real c
 Measured against `references/reactos/dll/ntdll/def/ntdll.spec`, excluding `-arch=i386`-only rows:
 
 * **1882** x64-applicable spec names; **397** of them are `-stub` in ReactOS itself.
-* We export **1337** names; **24** of ours are not in the spec at all (`LdrpInitialize`, `DllMain`,
+* We export **1342** names; **24** of ours are not in the spec at all (`LdrpInitialize`, `DllMain`,
   `RtlGetTickCount`, the `Rtl*_Ustr` helpers, `RtlUTF8ToUnicodeN`, `fma`/`fmaf`, …).
-* **569** spec names we do not export — **289 of which ReactOS `-stub`s too**. By prefix:
-  185 `Nt*`, 184 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*` (threadpool), 6 `Ldr*`, 22 other
+* **564** spec names we do not export — **289 of which ReactOS `-stub`s too**. By prefix:
+  185 `Nt*`, 179 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*` (threadpool), 6 `Ldr*`, 22 other
   (`Exp*` SList, setjmp/longjmp, `sscanf`, ARM helpers).
-* **None of the 569 is imported by anything we host** (§2.2).
+* **None of the 564 is imported by anything we host** (§2.2).
 
 ### 2.5 Host tests
 
@@ -255,23 +256,22 @@ Each batch was validated by a **BYPASS experiment** (one-line disable ⇒ the ne
 Prioritised. Each item states why it matters and what it needs. Everything here is **breadth or
 fidelity**; nothing here is a missing import or an unconditional stub.
 
-1. **The 5 `Zw*` dbgk aliases (`ZwCreateDebugObject`, `ZwDebugActiveProcess`, `ZwDebugContinue`,
-   `ZwRemoveProcessDebug`, `ZwWaitForDebugEvent`).** *Cheapest real item.* They already exist in
-   `ZW_ALIASES` (212 rows) — the executive can service their SSNs — but `exports.rs` has only 207
-   `zw_alias!` lines, so the DLL does not export them. Five mechanical lines. **This is the only
-   unexported `Zw*` name in the whole spec that already has an exported `Nt*` twin** — the log's
-   "~26 `Zw*` aliases" figure is wrong (§7).
-2. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 5 names
+**Completed pickup (2026-07-30):** the five Dbgk `Zw*` aliases
+(`ZwCreateDebugObject`, `ZwDebugActiveProcess`, `ZwDebugContinue`, `ZwRemoveProcessDebug`,
+`ZwWaitForDebugEvent`) are now exported, and `ntdll-dll-verify` checks the complete
+`ZW_ALIASES` table so alias drift is gated.
+
+1. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 5 names
    remain unexported: `RtlZeroHeap` (the only one ReactOS actually implements) plus
    `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`, `RtlSidEqualLevel` (all `-stub`
-   +Vista in ReactOS). The wider tail is 569 spec names (§2.4). **None is imported by anything we
+   +Vista in ReactOS). The wider tail is 564 spec names (§2.4). **None is imported by anything we
    host.** The rule that governs all of it:
    > **NEVER add a trap stub whose SSN the executive cannot service.** An unserviced SSN reaches
    > `park_and_log!(pi, b"unhandled-syscall", …)` and parks the process — a correct "not implemented"
    > answer would be replaced by a hang. This is why `RtlGetCurrentProcessorNumber` returns 0 rather
    > than forwarding to `NtGetCurrentProcessorNumber` (not in our table, not serviced), and why
    > `NtContinue`/`NtRaiseException` have no stubs.
-3. **Dbgk deferred event sources / fidelity gaps** — each real, none blocking:
+2. **Dbgk deferred event sources / fidelity gaps** — each real, none blocking:
    * **`#DB` single-step.** The mapping exists and is host-tested (trap 1 → `STATUS_SINGLE_STEP` →
      `DbgSingleStepStateChange`) but **nothing sets `EFLAGS.TF`** anywhere in the tree, so a `#DB` is
      never generated. Needs the continue path to honour a debugger-set TF + vector-1 classification.
@@ -297,14 +297,14 @@ fidelity**; nothing here is a missing import or an unconditional stub.
      debugger can still retrieve the final `ExitProcess` event.
    * **Nothing hosted drives any of this** — no binary in the current set issues the five debug
      syscalls; all 21 `exec_dbgk_*` specs are self-test-driven.
-4. **`DBG_EXCEPTION_NOT_HANDLED` at a fault is a bookkeeping difference.** The reporter is left
+3. **`DBG_EXCEPTION_NOT_HANDLED` at a fault is a bookkeeping difference.** The reporter is left
    *cooperatively wait-parked* rather than *crash-parked*: the fault site's `[parked]` bookkeeping is
    not re-run from the wake path (the dead-client callback unwind **is**). The process still never
    resumes; only the park ledger it lands in differs.
-5. **The contended critical-section path is structurally correct but never exercised.** `[cs-event]`
+4. **The contended critical-section path is structurally correct but never exercised.** `[cs-event]`
    is 0 on every boot, and the wait is issued with a NULL timeout (`RtlpTimeoutDisable`), so the
    `STATUS_POSSIBLE_DEADLOCK` arm cannot fire. Enabling a finite `RtlpTimeout` is a one-line change.
-6. **`RtlWow64EnableFsRedirection`/`Ex` return `STATUS_NOT_IMPLEMENTED` by design** — do not "fix"
+5. **`RtlWow64EnableFsRedirection`/`Ex` return `STATUS_NOT_IMPLEMENTED` by design** — do not "fix"
    them (§2.3).
 
 **Not an ntdll item:** the desktop/logon-UI frontier past the SAS/logon-dialog park is a **win32k**
@@ -774,9 +774,9 @@ authoritative values.
 | §A's whole completeness table (377 classified exports, 189 `Nt*`, 276 `Rtl*`, "6 explicit NOT_IMPLEMENTED", "1 truly-missing required import `RtlDeleteResource`") | **superseded** | §2 above. §A is flagged stale in the log itself; treat none of its numbers as current. |
 | §A: exports enumerated via `heap_noop_bool!`/`dbgui_noop!` macros | **stale** | those macros no longer exist. The live macros are `generate_trap_stubs!`, `zw_alias!`, `etw_ok!`, `etw_scenario_write!`. |
 | §E.0/§E.5: "97 raw `STATUS_NOT_IMPLEMENTED` tokens, 77 host-build fallback arms" | **moved** | now **108** raw tokens across 87 exported functions: 83 pure host arms + 2 host-arm-plus-real-error-arm + 2 deliberate unconditional. The *conclusion* (0 genuine unconditional stubs) still holds. |
-| §E.5/§F: "1303 spec names, 194 still unexported, 26 of them `Rtl*`/`Ldr*`" | **not reproducible; understated** | `ntdll.spec` minus `-arch=i386` rows = **1882** names; **569** unexported (185 `Nt*`, 184 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*`, 6 `Ldr*`, 22 other), 289 of which ReactOS `-stub`s too. I could not derive 1303/194 from the spec under any filter and cannot verify where it came from. |
-| §E.5: "add the ~26 spec `Zw*` aliases that already have an `Nt*` twin" | **wrong** | exactly **5** unexported `Zw*` names have an exported `Nt*` twin — the dbgk ones. Everything else would need its `Nt*` twin *and* an executive service first. |
-| §D: for the 5 dbgk SSNs, "`Zw*` aliases + `NT_ARGC` rows added alongside" | **half true** | added to `ZW_ALIASES` (212 rows, and `nt-syscall-abi`'s own test enforces the table's self-consistency) but **not exported**: `exports.rs` has 207 `zw_alias!` lines and the built PE exports 207 `Zw*`. See pickup item 1. |
+| §E.5/§F: "1303 spec names, 194 still unexported, 26 of them `Rtl*`/`Ldr*`" | **not reproducible; understated** | `ntdll.spec` minus `-arch=i386` rows = **1882** names; **564** unexported (185 `Nt*`, 179 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*`, 6 `Ldr*`, 22 other), 289 of which ReactOS `-stub`s too. I could not derive 1303/194 from the spec under any filter and cannot verify where it came from. |
+| §E.5: "add the ~26 spec `Zw*` aliases that already have an `Nt*` twin" | **wrong, now closed** | the only five unexported `Zw*` names with exported `Nt*` twins were the Dbgk aliases, and the 2026-07-30 alias pickup exported them. Everything else would need its `Nt*` twin *and* an executive service first. |
+| §D: for the 5 dbgk SSNs, "`Zw*` aliases + `NT_ARGC` rows added alongside" | **now true** | originally only added to `ZW_ALIASES`; the 2026-07-30 alias pickup exported all five Dbgk `Zw*` names and added a verifier gate over the complete alias table. |
 | §D: "`Thread->HideFromDebugger` — we have no such flag" | **false** | the flag exists (`crates/nt-process/src/lib.rs:429`), is set through `NtSetInformationThread` class 17 (`exec_handler.rs:2155`) and is queryable (class 17 read at `lib.rs:940`). What is true is that `dbgk.rs` never consults it. |
 | §E.5: "`RtlCompactHeap` (⇒ 0) already matches ReactOS's `@unimplemented`" | **stale** | it now has a real body (`heap_compact`: coalesce + return the largest free payload extent), with an `INVALID_PARAMETER` error path. |
 | §E.0: "546 distinct `ntdll` imports across the live-loaded set (38 binaries)" | **consistent, different population** | my 42-binary live list gives **554**; the whole-`system32` figure (**593**) reproduces exactly. Both are **0-missing**, which is the load-bearing claim. |

@@ -24713,6 +24713,11 @@ zw_alias!(
 );
 zw_alias!(zw_connect_port, "ZwConnectPort", nt_connect_port);
 zw_alias!(
+    zw_create_debug_object,
+    "ZwCreateDebugObject",
+    nt_create_debug_object
+);
+zw_alias!(
     zw_create_directory_object,
     "ZwCreateDirectoryObject",
     nt_create_directory_object
@@ -24768,6 +24773,12 @@ zw_alias!(
 zw_alias!(zw_create_thread, "ZwCreateThread", nt_create_thread);
 zw_alias!(zw_create_timer, "ZwCreateTimer", nt_create_timer);
 zw_alias!(zw_create_token, "ZwCreateToken", nt_create_token);
+zw_alias!(
+    zw_debug_active_process,
+    "ZwDebugActiveProcess",
+    nt_debug_active_process
+);
+zw_alias!(zw_debug_continue, "ZwDebugContinue", nt_debug_continue);
 zw_alias!(zw_delay_execution, "ZwDelayExecution", nt_delay_execution);
 zw_alias!(zw_delete_atom, "ZwDeleteAtom", nt_delete_atom);
 zw_alias!(zw_delete_key, "ZwDeleteKey", nt_delete_key);
@@ -25148,6 +25159,11 @@ zw_alias!(
     "ZwRemoveIoCompletion",
     nt_remove_io_completion
 );
+zw_alias!(
+    zw_remove_process_debug,
+    "ZwRemoveProcessDebug",
+    nt_remove_process_debug
+);
 zw_alias!(zw_replace_key, "ZwReplaceKey", nt_replace_key);
 zw_alias!(zw_reply_port, "ZwReplyPort", nt_reply_port);
 zw_alias!(
@@ -25321,6 +25337,11 @@ zw_alias!(
     zw_wait_for_keyed_event,
     "ZwWaitForKeyedEvent",
     nt_wait_for_keyed_event
+);
+zw_alias!(
+    zw_wait_for_debug_event,
+    "ZwWaitForDebugEvent",
+    nt_wait_for_debug_event
 );
 zw_alias!(
     zw_wait_for_multiple_objects,

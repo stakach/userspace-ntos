@@ -9,7 +9,7 @@
 use std::process::ExitCode;
 
 use nt_pe_loader::PeFile;
-use nt_syscall_abi::NT_SYSCALLS;
+use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL
 const IMAGE_FILE_DLL: u16 = 0x2000;
@@ -152,6 +152,24 @@ fn main() -> ExitCode {
     );
     if !missing.is_empty() {
         eprintln!("   missing Nt* exports: {missing:?}");
+    }
+
+    let mut missing_zw = Vec::new();
+    for alias in ZW_ALIASES {
+        if !names.contains(alias.zw_name) {
+            missing_zw.push(alias.zw_name);
+        }
+    }
+    check(
+        missing_zw.is_empty(),
+        &format!(
+            "all {} Zw* aliases exported ({} missing)",
+            ZW_ALIASES.len(),
+            missing_zw.len()
+        ),
+    );
+    if !missing_zw.is_empty() {
+        eprintln!("   missing Zw* exports: {missing_zw:?}");
     }
 
     // Spot-check the canonical few.
