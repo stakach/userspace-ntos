@@ -2687,7 +2687,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                         }
                     }
                     SSN_RESUME_THREAD => {
-                        let caller_pid = PM_PIDS[1].load(Ordering::Relaxed) as nt_process::ProcessId;
+                        let caller_pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0);
                         let tid = match nt_handler.pm.resolve_thread_handle(
                             caller_pid,
                             CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
@@ -2706,12 +2706,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                                 .thread(tid)
                                 .map(|thread| thread.suspend_count)
                                 .unwrap_or(0);
-                            let main_pi = (0..MAX_PI)
-                                .find(|&index| PM_TIDS[index].load(Ordering::Relaxed) == tid as u64);
                             if previous == 1 {
-                                let tcb = main_pi
-                                    .map(|index| PM_MAIN_TCBS[index].load(Ordering::Relaxed))
-                                    .unwrap_or(0);
+                                let tcb = nt_handler.hosted_thread_tcb(tid as u64).unwrap_or(0);
                                 if tcb <= 1 || tcb_resume(tcb) != 0 {
                                     result = 0xC0000001;
                                 }

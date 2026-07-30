@@ -540,6 +540,7 @@ impl ExecNtHandler {
             },
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
+            thread_runtime: HostedThreadRuntimes::reset(),
             token_store: nt_security::TokenStore::with_capacity(64),
             token_dirty: false,
             process_dirty: false,
@@ -556,6 +557,8 @@ impl ExecNtHandler {
         for pi in 0..3 {
             let _ = handler.claim_hosted_process_mechanism(pi);
             let _ = handler.claim_hosted_thread_mechanisms(pi);
+            let tcb = PM_MAIN_TCBS[pi].load(Ordering::Relaxed);
+            handler.register_main_thread_tcb(pi, tcb);
         }
         for pi in 0..MAX_PI {
             if let Some(pid) = handler.pm_pid_for_pi(pi) {
@@ -1360,6 +1363,70 @@ impl ExecNtHandler {
         self.thread_mechanisms
             .pool_slot_for_tid(tid as nt_process::ThreadId)
             .or_else(|| runtime_thread_slot(tid))
+    }
+
+    pub(crate) fn register_hosted_thread_tcb(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) {
+        let _ = self.thread_runtime.register(pi, tid, tcb, badge, role);
+    }
+
+    pub(crate) fn register_main_thread_tcb(&mut self, pi: usize, tcb: u64) {
+        if let Some(tid) = self.pm_main_tid_for_pi(pi) {
+            let badge = Self::hosted_mechanism_badge_for_pi(pi).unwrap_or(0);
+            self.register_hosted_thread_tcb(pi, u64::from(tid), tcb, badge, HostedThreadRole::Main);
+        }
+    }
+
+    pub(crate) fn hosted_thread_tcb(&self, tid: u64) -> Option<u64> {
+        self.thread_runtime.tcb_by_tid(tid).or_else(|| {
+            hosted_thread_tcb_cell(tid)
+                .map(|cell| cell.load(Ordering::Relaxed))
+                .filter(|&tcb| tcb > 1)
+        })
+    }
+
+    fn hosted_thread_tcb_for_nt_resume_thread(&self, tid: u64) -> Option<u64> {
+        if let Some(runtime) = self.thread_runtime.get_by_tid(tid) {
+            if !runtime.role.can_raw_resume_from_nt_resume_thread() {
+                return None;
+            }
+            return (runtime.tcb > 1).then_some(runtime.tcb);
+        }
+        hosted_thread_tcb_cell(tid)
+            .map(|cell| cell.load(Ordering::Relaxed))
+            .filter(|&tcb| tcb > 1)
+    }
+
+    pub(crate) fn hosted_main_thread_tcb_for_pi(&self, pi: usize) -> Option<u64> {
+        self.thread_runtime.tcb_for_main_pi(pi).or_else(|| {
+            PM_MAIN_TCBS
+                .get(pi)
+                .map(|cell| cell.load(Ordering::Relaxed))
+                .filter(|&tcb| tcb > 1)
+        })
+    }
+
+    pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
+        let tid = TP_WORKER_TID
+            .get(pi)
+            .and_then(|slots| slots.get(slot))
+            .map(|cell| cell.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.hosted_thread_tcb(tid)
+    }
+
+    pub(crate) fn hosted_named_thread_tcb(&self, tid_cell: &AtomicU64) -> Option<u64> {
+        self.hosted_thread_tcb(tid_cell.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn release_hosted_thread_runtime(&mut self, tid: u64) {
+        let _ = self.thread_runtime.release_tid(tid);
     }
 
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
@@ -8112,7 +8179,7 @@ impl ExecNtHandler {
                                 return status;
                             }
                         } else if let Some(target_pi) = self.pi_for_pid(target_pid) {
-                            let tcb = PM_MAIN_TCBS[target_pi].load(Ordering::Relaxed);
+                            let tcb = self.hosted_main_thread_tcb_for_pi(target_pi).unwrap_or(0);
                             if tcb <= 1 || tcb_resume(tcb) != 0 {
                                 return 0xC000_0001;
                             }
@@ -9585,7 +9652,7 @@ impl ExecNtHandler {
                             }
                         }
                         if previous == 1 {
-                            let tcb = PM_MAIN_TCBS[main_pi].load(Ordering::Relaxed);
+                            let tcb = self.hosted_main_thread_tcb_for_pi(main_pi).unwrap_or(0);
                             if tcb <= 1 || tcb_resume(tcb) != 0 {
                                 return 0xC000_0001;
                             }
@@ -9644,9 +9711,7 @@ impl ExecNtHandler {
                         print_str(b" previous=1\n");
                         return 0;
                     }
-                    let tcb = hosted_thread_tcb_cell(tid)
-                        .map(|cell| cell.load(Ordering::Relaxed))
-                        .unwrap_or(0);
+                    let tcb = self.hosted_thread_tcb_for_nt_resume_thread(tid).unwrap_or(0);
                     if tcb <= 1 {
                         return 0xC000_0001;
                     }

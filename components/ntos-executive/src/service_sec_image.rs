@@ -288,6 +288,7 @@ unsafe fn spawn_requested_hosted_exe(
         true,
         0,
     );
+    nt_handler.register_main_thread_tcb(pi, PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_pml4;
     PM_PML4S[pi].store(child_pml4, Ordering::Relaxed);
@@ -2208,7 +2209,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::WL_CPUEXC_DIAG_N.fetch_add(1, Ordering::Relaxed) < 4
             {
                 let tcb = if badge == WINLOGON_BADGE {
-                    crate::PM_MAIN_TCBS[2].load(Ordering::Relaxed)
+                    nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0)
                 } else {
                     0
                 };
@@ -2396,7 +2397,7 @@ pub(crate) unsafe fn service_sec_image(
         // and walk the stack for the raise site. m1 = fault_ip for a DebugException fault.
         if (mi >> 12) == 4 {
             let bp_ip = m1;
-            let tcb = crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed);
+            let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
             if tcb != 0 && ntdll.is_some() {
                 let mut regs = [0u64; 20];
                 crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -2562,7 +2563,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0
             {
                 let tcb = if owner_top_badge(badge) == WINLOGON_BADGE && badge == WINLOGON_BADGE {
-                    crate::PM_MAIN_TCBS[2].load(Ordering::Relaxed)
+                    nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0)
                 } else {
                     0
                 };
@@ -2708,8 +2709,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 let tcb = tp_worker_identity
-                    .map(|(tp_pi, tp_slot)| TP_WORKER_TCB[tp_pi][tp_slot].load(Ordering::Relaxed))
-                    .unwrap_or_else(|| PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
+                    .and_then(|(tp_pi, tp_slot)| nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot))
+                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
+                    .unwrap_or(0);
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
                     win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -2741,8 +2743,9 @@ pub(crate) unsafe fn service_sec_image(
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
                 let tcb = tp_worker_identity
-                    .map(|(tp_pi, tp_slot)| TP_WORKER_TCB[tp_pi][tp_slot].load(Ordering::Relaxed))
-                    .unwrap_or_else(|| PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
+                    .and_then(|(tp_pi, tp_slot)| nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot))
+                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
+                    .unwrap_or(0);
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
                     win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -2783,13 +2786,19 @@ pub(crate) unsafe fn service_sec_image(
                     };
                     let tcb = match badge {
                         _ if tp_worker_identity.is_some() => {
-                            let (_, tp_slot) = tp_worker_identity.unwrap();
-                            TP_WORKER_TCB[2][tp_slot].load(Ordering::Relaxed)
+                            let (tp_pi, tp_slot) = tp_worker_identity.unwrap();
+                            nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot).unwrap_or(0)
                         }
-                        WINLOGON_WORKER_BADGE => WL_LISTENER_TCB.load(Ordering::Relaxed),
-                        WINLOGON_WORKER2_BADGE => WL_WORKER2_TCB.load(Ordering::Relaxed),
-                        WINLOGON_WORKER3_BADGE => WL_WORKER3_TCB.load(Ordering::Relaxed),
-                        _ => PM_MAIN_TCBS[2].load(Ordering::Relaxed),
+                        WINLOGON_WORKER_BADGE => nt_handler
+                            .hosted_named_thread_tcb(&PM_LISTENER_TID)
+                            .unwrap_or(0),
+                        WINLOGON_WORKER2_BADGE => nt_handler
+                            .hosted_named_thread_tcb(&WL_WORKER2_TID)
+                            .unwrap_or(0),
+                        WINLOGON_WORKER3_BADGE => nt_handler
+                            .hosted_named_thread_tcb(&WL_WORKER3_TID)
+                            .unwrap_or(0),
+                        _ => nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0),
                     };
                     if let Some((client_deskinfo, pti, _)) =
                         seed_winlogon_thread_client_info(teb_alias, pml4)
@@ -3102,7 +3111,7 @@ pub(crate) unsafe fn service_sec_image(
                 // (module + RVA) whose indirect transfer landed on the bare RVA. General class-of-wall
                 // diagnostic (BATCH 24/25: lsass rpcrt4 `0x3a288`); applies to any process at quiescence.
                 if m0 == addr && addr < 0x8000_0000 {
-                    let tcb = crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed);
+                    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
                     if tcb != 0 {
                         let mut regs = [0u64; 20];
                         crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -3170,7 +3179,7 @@ pub(crate) unsafe fn service_sec_image(
                 // other wall.
                 win32k_glue::dump_client_callback_crash_state(
                     pi,
-                    crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed),
+                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0),
                 );
                 // ★ Checkpoint B containment: once lsass has signaled LSA_RPC_SERVER_ACTIVE (its
                 // essential init is done), an unrecoverable fault on lsass' MAIN thread (badge 8) —
@@ -4172,7 +4181,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(nt_handler.csr_start_request as u64);
                     print_str(b"\n");
                     if nt_handler.csr_start_request == 1 {
-                        let tcb = CSR_LOOP_TCB.load(Ordering::Relaxed);
+                        let tcb = nt_handler.hosted_named_thread_tcb(&CSR_API_TID).unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
                             let _ = csr_rendezvous(
@@ -4200,7 +4209,7 @@ pub(crate) unsafe fn service_sec_image(
                             result = 0xC000_0001;
                         }
                     } else if nt_handler.csr_start_request == 2 {
-                        let tcb = CSR_SB_LOOP_TCB.load(Ordering::Relaxed);
+                        let tcb = nt_handler.hosted_named_thread_tcb(&CSR_SB_TID).unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
                             if !csr_sb_startup(
@@ -4582,6 +4591,7 @@ pub(crate) unsafe fn service_sec_image(
                         1, cpe, cf_c, NTDLL_BASE, true,
                         0, // 0 → effective_ldrp_rva resolves to OUR ntdll's derived LdrpInitialize RVA
                     );
+                    nt_handler.register_main_thread_tcb(1, PM_MAIN_TCBS[1].load(Ordering::Relaxed));
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     procs[1].pid = nt_handler.pm_pid_for_pi(1).map(|pid| pid as u64).unwrap_or(0);
@@ -4650,6 +4660,7 @@ pub(crate) unsafe fn service_sec_image(
                         2, wpe, wf_c, NTDLL_BASE, true,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
+                    nt_handler.register_main_thread_tcb(2, PM_MAIN_TCBS[2].load(Ordering::Relaxed));
                     procs[2].pid = nt_handler.pm_pid_for_pi(2).map(|pid| pid as u64).unwrap_or(0);
                     procs[2].pml4 = wpml4;
                     PM_PML4S[2].store(wpml4, Ordering::Relaxed);
@@ -4745,6 +4756,13 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     let tcb = spawn_sm_loop_thread(pml4, entry_rip, port_handle);
                     SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        0,
+                        SM_LOOP_TID.load(Ordering::Relaxed),
+                        tcb,
+                        hosted_top_badge_for_pi(0),
+                        HostedThreadRole::SmLoop,
+                    );
                     print_str(b"[sm-loop] spawned tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to sm_fault_ep)\n");
@@ -4767,6 +4785,13 @@ pub(crate) unsafe fn service_sec_image(
                     let tid = CSR_API_TID.load(Ordering::Relaxed);
                     let tcb = spawn_csr_loop_thread(pml4, entry_rip, param, pid, tid);
                     CSR_LOOP_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        1,
+                        tid,
+                        tcb,
+                        hosted_top_badge_for_pi(1),
+                        HostedThreadRole::CsrApi,
+                    );
                     print_str(b"[csr-loop] spawned tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to csr_fault_ep)\n");
@@ -4787,6 +4812,13 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     let tcb = spawn_csr_sb_loop_thread(pml4, entry_rip, param, pid, tid);
                     CSR_SB_LOOP_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        1,
+                        tid,
+                        tcb,
+                        hosted_top_badge_for_pi(1),
+                        HostedThreadRole::CsrSbApi,
+                    );
                 }
                 // ★ GENERAL NtCreateThread: winlogon's first NtCreateThread (its RPC listener) — spawn
                 // the REAL thread in winlogon's VSpace (pi == 2 here → pml4 = winlogon's PML4,
@@ -4890,6 +4922,19 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     tcb_cell.store(tcb, Ordering::Relaxed);
+                    let (role, badge) = match slot {
+                        0 => (HostedThreadRole::WinlogonListener, WINLOGON_WORKER_BADGE),
+                        1 => (
+                            HostedThreadRole::WinlogonWorker { slot },
+                            WINLOGON_WORKER2_BADGE,
+                        ),
+                        2 => (
+                            HostedThreadRole::WinlogonWorker { slot },
+                            WINLOGON_WORKER3_BADGE,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    nt_handler.register_hosted_thread_tcb(2, tid, tcb, badge, role);
                     if slot == 0 {
                         // A LATCH of the seL4 TCB the general `NtCreateThread` service minted for
                         // this thread. `WL_LISTENER_TCB` is the LIVE cell — the thread-termination
@@ -4939,6 +4984,13 @@ pub(crate) unsafe fn service_sec_image(
                         !suspended,
                     );
                     SVC_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        3,
+                        tid,
+                        tcb,
+                        SVC_LISTENER_BADGE,
+                        HostedThreadRole::ServicesListener,
+                    );
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
                     print_str(b"[svc-thread] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
@@ -4972,6 +5024,13 @@ pub(crate) unsafe fn service_sec_image(
                         true,
                     );
                     SCM_WORKER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        3,
+                        tid,
+                        tcb,
+                        SCM_WORKER_BADGE,
+                        HostedThreadRole::ScmWorker,
+                    );
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
                     print_str(b"[scm-worker] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
@@ -5002,6 +5061,13 @@ pub(crate) unsafe fn service_sec_image(
                         !suspended,
                     );
                     LSASS_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        4,
+                        tid,
+                        tcb,
+                        LSASS_LISTENER_BADGE,
+                        HostedThreadRole::LsassListener,
+                    );
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
                     print_str(b"[lsass-thread] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
@@ -5030,6 +5096,13 @@ pub(crate) unsafe fn service_sec_image(
                         !suspended,
                     );
                     LSASS_LISTENER2_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        4,
+                        tid,
+                        tcb,
+                        LSASS_LISTENER2_BADGE,
+                        HostedThreadRole::LsassListener2,
+                    );
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                     print_str(b"[lsass-thread2] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
@@ -5064,6 +5137,13 @@ pub(crate) unsafe fn service_sec_image(
                         }),
                     );
                     LSASS_LISTENER3_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        4,
+                        tid,
+                        tcb,
+                        LSASS_LISTENER3_BADGE,
+                        HostedThreadRole::LsassListener3,
+                    );
                     nt_handler
                         .pm
                         .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER3_TEB_VA);
@@ -5096,6 +5176,13 @@ pub(crate) unsafe fn service_sec_image(
                         true,
                     );
                     LSA_WORKER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.register_hosted_thread_tcb(
+                        4,
+                        tid,
+                        tcb,
+                        LSA_WORKER_BADGE,
+                        HostedThreadRole::LsaWorker,
+                    );
                     nt_handler
                         .pm
                         .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
@@ -5342,7 +5429,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Only drive the real accept if csrss actually spawned its CsrApiRequestThread
                     // (CSR_LOOP_TCB is a real cap > 1). Otherwise recv_full_r12(CSR_FAULT_EP) would block
                     // forever with no faulter — fall back to a modeled accept so winlogon still connects.
-                    let have_thread = CSR_LOOP_TCB.load(Ordering::Relaxed) > 1
+                    let have_thread = nt_handler.hosted_named_thread_tcb(&CSR_API_TID).is_some()
                         && csrss_pe.is_some();
                     let client_handle = if have_thread {
                         print_str(b"[csr-rdv] winlogon NtSecureConnectPort pending (conn=");
@@ -7388,7 +7475,7 @@ pub(crate) unsafe fn service_sec_image(
             let winlogon_worker_can_signal = park_wait_event >= 0
                 && pi == 2
                 && badge == WINLOGON_BADGE
-                && WL_WORKER2_TCB.load(Ordering::Relaxed) != 0
+                && nt_handler.hosted_named_thread_tcb(&WL_WORKER2_TID).is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             if park_wait_event >= 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
@@ -10969,6 +11056,13 @@ unsafe fn spawn_requested_tp_worker(
         !suspended,
     );
     TP_WORKER_TCB[pi][worker_slot].store(tcb, Ordering::Relaxed);
+    nt_handler.register_hosted_thread_tcb(
+        pi,
+        tid,
+        tcb,
+        tp_worker_badge(pi, worker_slot),
+        HostedThreadRole::TpWorker { slot: worker_slot },
+    );
     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
 
     print_str(b"[tp-worker] spawned pi=");
@@ -11021,9 +11115,15 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     });
     TP_WORKER_TCB[request.target_pi][request.slot].store(tcb, Ordering::Relaxed);
     if tcb != 0 {
+        nt_handler.register_hosted_thread_tcb(
+            request.target_pi,
+            request.cid_thread,
+            tcb,
+            tp_worker_badge(request.target_pi, request.slot),
+            HostedThreadRole::TpWorker { slot: request.slot },
+        );
         PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
     }
-    let _ = nt_handler;
     print_str(b"[remote-thread] spawned target_pi=");
     print_u64(request.target_pi as u64);
     print_str(b" slot=");

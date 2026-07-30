@@ -8756,6 +8756,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
         cell.store(0, Ordering::Relaxed);
+        handler.release_hosted_thread_runtime(tid);
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -10449,6 +10450,10 @@ struct ExecNtHandler {
     /// in the executive for now; this table makes PID/TID keyed thread lookup authoritative inside
     /// the syscall handler before those low-level cells are moved.
     thread_mechanisms: nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>,
+    /// Executive-side seL4 mechanism runtime keyed by real NT TID. This is where live handler paths
+    /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
+    /// been threaded through `ExecNtHandler` yet.
+    thread_runtime: HostedThreadRuntimes,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,
@@ -10534,6 +10539,197 @@ enum ExecPostAction {
     TerminateRemoteThread { tid: u64 },
     CleanupProcessWaiters { process_index: u8 },
     CriticalTermination { code: u32, object: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedThreadRole {
+    Main,
+    TpWorker { slot: usize },
+    SmLoop,
+    CsrApi,
+    CsrSbApi,
+    WinlogonListener,
+    WinlogonWorker { slot: usize },
+    ServicesListener,
+    ScmWorker,
+    LsassListener,
+    LsassListener2,
+    LsassListener3,
+    LsaWorker,
+}
+
+impl HostedThreadRole {
+    const fn can_raw_resume_from_nt_resume_thread(self) -> bool {
+        match self {
+            // This worker is started eagerly and then parks on pipe/event waits. Before the runtime
+            // table existed it had no legacy TCB cell, so NtResumeThread cleared bookkeeping but did
+            // not raw-resume its TCB; the pipe/event redrive path owns wakeup ordering.
+            Self::LsaWorker => false,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedThreadRuntime {
+    pi: usize,
+    tid: u64,
+    tcb: u64,
+    badge: u64,
+    role: HostedThreadRole,
+}
+
+impl HostedThreadRuntime {
+    const fn empty() -> Self {
+        Self {
+            pi: 0,
+            tid: 0,
+            tcb: 0,
+            badge: 0,
+            role: HostedThreadRole::Main,
+        }
+    }
+
+    const fn is_live(self) -> bool {
+        self.tid != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedThreadRuntimeTable<const N: usize> {
+    entries: [HostedThreadRuntime; N],
+}
+
+impl<const N: usize> HostedThreadRuntimeTable<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [HostedThreadRuntime::empty(); N],
+        }
+    }
+
+    fn register(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || tcb <= 1 {
+            return None;
+        }
+        let runtime = HostedThreadRuntime {
+            pi,
+            tid,
+            tcb,
+            badge,
+            role,
+        };
+        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
+            *existing = runtime;
+            return Some(runtime);
+        }
+        if let Some(empty) = self.entries.iter_mut().find(|entry| !entry.is_live()) {
+            *empty = runtime;
+            return Some(runtime);
+        }
+        None
+    }
+
+    fn clear(&mut self) {
+        self.entries = [HostedThreadRuntime::empty(); N];
+    }
+
+    fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
+        (tid != 0).then_some(())?;
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.tid == tid)
+    }
+
+    fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
+        self.get_by_tid(tid)
+            .map(|entry| entry.tcb)
+            .filter(|&tcb| tcb > 1)
+    }
+
+    fn main_for_pi(&self, pi: usize) -> Option<HostedThreadRuntime> {
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.pi == pi && matches!(entry.role, HostedThreadRole::Main))
+    }
+
+    fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
+        self.main_for_pi(pi)
+            .map(|entry| entry.tcb)
+            .filter(|&tcb| tcb > 1)
+    }
+
+    fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {
+        let entry = self.entries.iter_mut().find(|entry| entry.tid == tid)?;
+        let previous = *entry;
+        *entry = HostedThreadRuntime::empty();
+        Some(previous)
+    }
+}
+
+const HOSTED_THREAD_RUNTIME_CAP: usize =
+    MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
+
+static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable<HOSTED_THREAD_RUNTIME_CAP> =
+    HostedThreadRuntimeTable::new();
+
+/// Exclusive pointer to the serialized executive's hosted TID -> seL4 TCB table.
+///
+/// The table is deliberately not stored inline in `ExecNtHandler`; that handler is constructed on the
+/// root task stack during the early SEC_IMAGE self-tests, and this fixed table is large enough to
+/// make stack pressure observable.
+struct HostedThreadRuntimes {
+    table: *mut HostedThreadRuntimeTable<HOSTED_THREAD_RUNTIME_CAP>,
+}
+
+impl HostedThreadRuntimes {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(HOSTED_THREAD_RUNTIME_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been
+        // dropped before a new one is constructed, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn register(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).register(pi, tid, tcb, badge, role) }
+    }
+
+    fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get_by_tid(tid) }
+    }
+
+    fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).tcb_by_tid(tid) }
+    }
+
+    fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).tcb_for_main_pi(pi) }
+    }
+
+    fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_tid(tid) }
+    }
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
