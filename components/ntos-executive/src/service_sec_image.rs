@@ -410,6 +410,166 @@ unsafe fn stage_unicode_string_descriptor_for_win32k(
     true
 }
 
+#[derive(Clone, Copy)]
+struct CapturedGetClassInfo {
+    wnd_client: u64,
+    menu_client: u64,
+    class_desc: u64,
+    wnd_out: u64,
+    menu_out: u64,
+    scrollbar: bool,
+}
+
+fn rc_arg_slot_base(slot: u64) -> u64 {
+    win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT
+}
+
+unsafe fn staged_unicode_string_is_scrollbar(desc: u64) -> bool {
+    const SCROLLBAR: [u16; 9] = [
+        b'S' as u16,
+        b'c' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        b'B' as u16,
+        b'a' as u16,
+        b'r' as u16,
+    ];
+    let length = core::ptr::read_unaligned(desc as *const u16) as usize;
+    if length != SCROLLBAR.len() * 2 {
+        return false;
+    }
+    let buffer = core::ptr::read_unaligned((desc + 8) as *const u64);
+    if buffer == 0 {
+        return false;
+    }
+    for (index, expected) in SCROLLBAR.iter().copied().enumerate() {
+        let actual = core::ptr::read_unaligned((buffer + index as u64 * 2) as *const u16);
+        if actual != expected {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn capture_get_class_info_graph(
+    pi: u64,
+    class_name: u64,
+    wnd_class: u64,
+    menu_name_ptr: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedGetClassInfo> {
+    use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
+
+    if class_name == 0 || wnd_class == 0 {
+        return None;
+    }
+    let class_slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let out_slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let class_base = rc_arg_slot_base(class_slot);
+    let out_base = rc_arg_slot_base(out_slot);
+    core::ptr::write_bytes(class_base as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    core::ptr::write_bytes(out_base as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    if !stage_unicode_string_descriptor_for_win32k(
+        pi,
+        class_name,
+        class_base,
+        class_base + 0x20,
+        RC_ARG_CAPTURE_SLOT - 0x20,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+
+    let mut wnd = [0u8; WNDCLASSEXW_SIZE];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        wnd_class,
+        &mut wnd,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    let wnd_out = out_base;
+    let menu_out = out_base + WNDCLASSEXW_SIZE as u64;
+    core::ptr::copy_nonoverlapping(wnd.as_ptr(), wnd_out as *mut u8, wnd.len());
+    core::ptr::write_unaligned(menu_out as *mut u64, 0);
+    let scrollbar = staged_unicode_string_is_scrollbar(class_base);
+    Some(CapturedGetClassInfo {
+        wnd_client: wnd_class,
+        menu_client: menu_name_ptr,
+        class_desc: class_base,
+        wnd_out,
+        menu_out,
+        scrollbar,
+    })
+}
+
+unsafe fn copy_back_get_class_info(
+    pi: u64,
+    capture: CapturedGetClassInfo,
+    atom: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
+
+    let wnd_bytes = core::slice::from_raw_parts(capture.wnd_out as *const u8, WNDCLASSEXW_SIZE);
+    let wnd_ok = img_spawn::client_write_mapped(
+        pi,
+        capture.wnd_client,
+        wnd_bytes,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    );
+    let menu_value = core::ptr::read_unaligned(capture.menu_out as *const u64);
+    let menu_ok = capture.menu_client == 0
+        || img_spawn::client_write_mapped(
+            pi,
+            capture.menu_client,
+            &menu_value.to_le_bytes(),
+            filled_pages,
+            nfilled,
+            scratch_base,
+        );
+    let copyout_ok = wnd_ok && menu_ok;
+    if pi == 5 && capture.scrollbar {
+        let style = core::ptr::read_unaligned((capture.wnd_out + 0x04) as *const u32);
+        let proc = core::ptr::read_unaligned((capture.wnd_out + 0x08) as *const u64);
+        let cb_wnd_extra = core::ptr::read_unaligned((capture.wnd_out + 0x14) as *const u32);
+        USERINIT_SCROLLBAR_CLASSINFO_ATOM.store(atom, Ordering::Relaxed);
+        USERINIT_SCROLLBAR_CLASSINFO_STYLE.store(style as u64, Ordering::Relaxed);
+        USERINIT_SCROLLBAR_CLASSINFO_EXTRA.store(cb_wnd_extra as u64, Ordering::Relaxed);
+        USERINIT_SCROLLBAR_CLASSINFO_PROC.store((proc != 0) as u64, Ordering::Relaxed);
+        if copyout_ok {
+            USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x");
+        print_hex(atom as u32);
+        print_str(b" copyout=");
+        print_u64(copyout_ok as u64);
+        print_str(b" style=0x");
+        print_hex(style);
+        print_str(b" cbWndExtra=0x");
+        print_hex(cb_wnd_extra);
+        print_str(b" proc=");
+        print_u64((proc != 0) as u64);
+        print_str(b"\n");
+    }
+    copyout_ok
+}
+
 unsafe fn capture_register_class_graph(
     pi: u64,
     wnd_class: u64,
@@ -5829,6 +5989,30 @@ pub(crate) unsafe fn service_sec_image(
                         scratch_base,
                     )
                 });
+                let get_class_info_capture = if m0 == 0x10bd {
+                    let capture = capture_get_class_info_graph(
+                        pi as u64,
+                        a1,
+                        a2,
+                        a3,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let Some(capture) = capture {
+                        d_a1 = capture.class_desc;
+                        d_a2 = capture.wnd_out;
+                        d_a3 = if a3 == 0 { 0 } else { capture.menu_out };
+                        if pi == 5 && capture.scrollbar {
+                            USERINIT_SCROLLBAR_CLASSINFO_QUERIES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(capture)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
@@ -6411,6 +6595,25 @@ pub(crate) unsafe fn service_sec_image(
                         let resumed = win32k_glue::cancel_suspended_user_callback();
                         st = resumed.0;
                         ok = resumed.1;
+                    }
+                }
+                if ok && !redirected_user_callback {
+                    if let Some(capture) = get_class_info_capture {
+                        if st != 0 {
+                            if !copy_back_get_class_info(
+                                pi as u64,
+                                capture,
+                                st as u32 as u64,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                st = 0;
+                            }
+                        } else if pi == 5 && capture.scrollbar {
+                            USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
+                            print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
+                        }
                     }
                 }
                 if pi == 2 && ok && !redirected_user_callback {

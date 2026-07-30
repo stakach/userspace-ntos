@@ -2026,6 +2026,13 @@ pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_QUERIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ATOM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_STYLE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_EXTRA: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_PROC: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.
@@ -3155,6 +3162,13 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
     let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
     let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
+    let scrollbar_queries = USERINIT_SCROLLBAR_CLASSINFO_QUERIES.load(Ordering::Relaxed);
+    let scrollbar_copyouts = USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.load(Ordering::Relaxed);
+    let scrollbar_errors = USERINIT_SCROLLBAR_CLASSINFO_ERRORS.load(Ordering::Relaxed);
+    let scrollbar_atom = USERINIT_SCROLLBAR_CLASSINFO_ATOM.load(Ordering::Relaxed);
+    let scrollbar_style = USERINIT_SCROLLBAR_CLASSINFO_STYLE.load(Ordering::Relaxed);
+    let scrollbar_extra = USERINIT_SCROLLBAR_CLASSINFO_EXTRA.load(Ordering::Relaxed);
+    let scrollbar_proc = USERINIT_SCROLLBAR_CLASSINFO_PROC.load(Ordering::Relaxed);
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3191,6 +3205,20 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(class_mask as u32);
     print_str(b" dialog-atom=0x");
     print_hex(dialog_atom as u32);
+    print_str(b" scrollbar-classinfo=");
+    print_u64(scrollbar_queries);
+    print_str(b"/");
+    print_u64(scrollbar_copyouts);
+    print_str(b"/");
+    print_u64(scrollbar_errors);
+    print_str(b" atom=0x");
+    print_hex(scrollbar_atom as u32);
+    print_str(b" style=0x");
+    print_hex(scrollbar_style as u32);
+    print_str(b" extra=0x");
+    print_hex(scrollbar_extra as u32);
+    print_str(b" proc=");
+    print_u64(scrollbar_proc);
     print_str(b"\n");
     check(
         b"exec_userinit_process_spawned",
@@ -3217,6 +3245,15 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && class_misses == 0
             && class_mask & 0x02ff == 0x02ff
             && dialog_atom == 0x8002,
+        passed,
+    );
+    check(
+        b"exec_userinit_scrollbar_classinfo",
+        scrollbar_queries >= 1
+            && scrollbar_copyouts >= 1
+            && scrollbar_errors == 0
+            && scrollbar_atom != 0
+            && scrollbar_proc != 0,
         passed,
     );
 }
