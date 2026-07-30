@@ -139,6 +139,15 @@ pub(crate) fn hosted_env_scratch_base_for_pi(pi: usize) -> u64 {
         .unwrap_or(0)
 }
 
+fn hosted_peb_mirror_for_pi(pi: usize) -> u64 {
+    let env_scratch = hosted_env_scratch_base_for_pi(pi);
+    if env_scratch == 0 {
+        0
+    } else {
+        env_scratch + 0x1000
+    }
+}
+
 pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
     hosted_process_runtime_for_pi(pi)
         .map(|runtime| runtime.heap_mirror_va)
@@ -5695,7 +5704,7 @@ pub(crate) unsafe fn service_sec_image(
                     // that stands in for Ctrl-Alt-Del), then let this GetMessage run — the queue is
                     // non-empty, so it returns instead of blocking win32k. When there is nothing
                     // left to type the blocking GetMessage is parked as before.
-                    let peb_mirror = 0x0000_0100_107C_1000u64;
+                    let peb_mirror = hosted_peb_mirror_for_pi(2);
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
@@ -5764,16 +5773,7 @@ pub(crate) unsafe fn service_sec_image(
                     // park, so the boot quiesces and the gate runs. This subsumes the special-cased
                     // parks above rather than competing with them: it is the LAST arm of the chain.
                     let sp = get_recv_mr(16);
-                    let peb_mirror = match pi {
-                        0 => 0x0000_0100_1074_1000,
-                        1 => 0x0000_0100_1078_1000,
-                        2 => 0x0000_0100_107C_1000,
-                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
-                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
-                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
-                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
-                        _ => 0,
-                    };
+                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
@@ -6542,16 +6542,7 @@ pub(crate) unsafe fn service_sec_image(
                         )
                         .unwrap_or(0);
                     }
-                    let peb_mirror = match pi {
-                        0 => 0x0000_0100_1074_1000,
-                        1 => 0x0000_0100_1078_1000,
-                        2 => 0x0000_0100_107C_1000,
-                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
-                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
-                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
-                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
-                        _ => 0,
-                    };
+                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
@@ -6751,16 +6742,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if callback_suspended {
-                    let peb_mirror = match pi {
-                        0 => 0x0000_0100_1074_1000,
-                        1 => 0x0000_0100_1078_1000,
-                        2 => 0x0000_0100_107C_1000,
-                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
-                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
-                        5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
-                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
-                        _ => 0,
-                    };
+                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
