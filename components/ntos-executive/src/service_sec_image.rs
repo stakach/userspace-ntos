@@ -145,6 +145,33 @@ pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
         .unwrap_or(SMSS_HEAP_MIRROR_VA)
 }
 
+pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
+    pi: usize,
+    pe: &nt_pe_loader::PeFile,
+    fault_ep_c: u64,
+    ntdll_base: u64,
+    setup_env: bool,
+    ldrpinit_rva: u64,
+) -> u64 {
+    let image = nt_exe_image::hosted_image_for_pi(pi).unwrap();
+    let runtime = hosted_process_runtime_for_pi(pi).unwrap();
+    spawn_sec_image(
+        pi as u64,
+        pe,
+        fault_ep_c,
+        ntdll_base,
+        setup_env,
+        runtime.priority,
+        runtime.env_scratch_va,
+        runtime.stack_mirror_va,
+        runtime.heap_mirror_va,
+        runtime.spawn_image_mirror_va,
+        image.nt_image_path,
+        image.command_line,
+        ldrpinit_rva,
+    )
+}
+
 fn hosted_active_image_mirror_for_pi(pi: usize) -> u64 {
     hosted_process_runtime_for_pi(pi)
         .map(|runtime| runtime.active_image_mirror_va)

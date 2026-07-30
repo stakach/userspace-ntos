@@ -13019,7 +13019,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(0, &pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", 0);
+        let pml4 = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0);
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -15442,7 +15442,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", smss_ldrp_rva);
+                    let pml4 = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, NTDLL_BASE, true, smss_ldrp_rva);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. BATCH 22: smss now uses its own 64 MiB
