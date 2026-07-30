@@ -5,6 +5,31 @@ use crate::*;
 use nt_io_abi::major;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
+static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+fn sec_image_forward_run() -> u64 {
+    let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let slot_pressure =
+        slots_cap != 0 && slots_used * 5 >= slots_cap * 4;
+    let frame_pressure = CSRSS_FRAME_HW.load(Ordering::Relaxed) * 10 >= CSRSS_FRAME_CAP as u64 * 7;
+    if slot_pressure || frame_pressure {
+        if SEC_IMAGE_PREFETCH_THROTTLE_LOGGED.swap(1, Ordering::Relaxed) == 0 {
+            print_str(b"[sec-image] forward prefetch throttled under pool pressure: cslots=");
+            print_u64(slots_used);
+            print_str(b"/");
+            print_u64(slots_cap);
+            print_str(b" frame-reg=");
+            print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+            print_str(b"/");
+            print_u64(CSRSS_FRAME_CAP as u64);
+            print_str(b"\n");
+        }
+        4
+    } else {
+        32
+    }
+}
 
 /// Populate one winlogon thread's client-side win32 state from the desktop facts published by the
 /// live win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the
@@ -2868,9 +2893,9 @@ pub(crate) unsafe fn service_sec_image(
             // each scratch mapping plus one for each process mapping. A broad LSASS dependency scan
             // therefore exhausted the finite root CSpace before those pages were ever referenced.
             // Thirty-two pages amortize the QEMU fault round-trip while preserving genuine demand
-            // paging and a fixed per-fault capability bound.
-            const FORWARD_RUN: u64 = 32;
-            let (batch_start, batch_pages) = (page, FORWARD_RUN);
+            // paging; once root-slot or frame-registry pressure approaches the gate, shrink the
+            // speculative run so late userinit DLL loads stop pre-residenting mostly untouched pages.
+            let (batch_start, batch_pages) = (page, sec_image_forward_run());
             let mut allocation_failed = false;
             let mut bi: u64 = 0;
             while bi < batch_pages {
