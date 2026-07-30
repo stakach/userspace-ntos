@@ -31,6 +31,170 @@ fn sec_image_forward_run() -> u64 {
     }
 }
 
+struct HostedExeSpawn<'a> {
+    pi: usize,
+    badge: u64,
+    priority: u64,
+    env_scratch_va: u64,
+    stack_mirror_va: u64,
+    heap_mirror_va: u64,
+    image_mirror_va: u64,
+    scratch_base: u64,
+    image_path: &'static [u8],
+    cmd_line: &'static [u8],
+    leaf: &'static [u8],
+    pe: &'a nt_pe_loader::PeFile<'static>,
+    spawned: &'static AtomicU64,
+}
+
+fn hosted_exe_spawn_for<'a>(
+    request: nt_exe_image::SpawnRequest,
+    services_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+    lsass_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+    userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+    explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+) -> Option<HostedExeSpawn<'a>> {
+    match request.child_pi {
+        3 => services_pe.as_ref().map(|pe| HostedExeSpawn {
+            pi: 3,
+            badge: SERVICES_BADGE,
+            priority: 103,
+            env_scratch_va: SERVICES_ENV_SCRATCH_VA,
+            stack_mirror_va: SERVICES_STACK_MIRROR_VA,
+            heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
+            image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
+            scratch_base: SERVICES_SCRATCH_BASE,
+            image_path: b"\\SystemRoot\\System32\\services.exe",
+            cmd_line: b"services.exe",
+            leaf: b"services.exe",
+            pe,
+            spawned: &SERVICES_SPAWNED,
+        }),
+        4 => lsass_pe.as_ref().map(|pe| HostedExeSpawn {
+            pi: 4,
+            badge: LSASS_BADGE,
+            priority: 104,
+            env_scratch_va: LSASS_ENV_SCRATCH_VA,
+            stack_mirror_va: LSASS_STACK_MIRROR_VA,
+            heap_mirror_va: LSASS_HEAP_MIRROR_VA,
+            image_mirror_va: LSASS_IMAGE_MIRROR_VA,
+            scratch_base: LSASS_SCRATCH_BASE,
+            image_path: b"\\SystemRoot\\System32\\lsass.exe",
+            cmd_line: b"lsass.exe",
+            leaf: b"lsass.exe",
+            pe,
+            spawned: &LSASS_SPAWNED,
+        }),
+        5 => userinit_pe.as_ref().map(|pe| HostedExeSpawn {
+            pi: 5,
+            badge: USERINIT_BADGE,
+            priority: 105,
+            env_scratch_va: USERINIT_ENV_SCRATCH_VA,
+            stack_mirror_va: USERINIT_STACK_MIRROR_VA,
+            heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
+            image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
+            scratch_base: USERINIT_SCRATCH_BASE,
+            image_path: b"\\SystemRoot\\System32\\userinit.exe",
+            cmd_line: b"userinit.exe",
+            leaf: b"userinit.exe",
+            pe,
+            spawned: &USERINIT_SPAWNED,
+        }),
+        6 => explorer_pe.as_ref().map(|pe| HostedExeSpawn {
+            pi: 6,
+            badge: EXPLORER_BADGE,
+            priority: 106,
+            env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
+            stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
+            heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
+            image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
+            scratch_base: EXPLORER_SCRATCH_BASE,
+            image_path: b"\\SystemRoot\\explorer.exe",
+            cmd_line: b"explorer.exe",
+            leaf: b"explorer.exe",
+            pe,
+            spawned: &EXPLORER_SPAWNED,
+        }),
+        _ => None,
+    }
+}
+
+unsafe fn spawn_requested_hosted_exe(
+    request: nt_exe_image::SpawnRequest,
+    spec: HostedExeSpawn<'_>,
+    fault_ep: u64,
+    procs: &mut [ProcExec; MAX_PI],
+    nt_handler: &mut ExecNtHandler,
+    exe_images: &mut nt_exe_image::ImageTable<8>,
+) -> Result<u64, u32> {
+    let child_pid = nt_handler
+        .pm_pid_for_pi(spec.pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let creator_pid = nt_handler
+        .pm_pid_for_pi(request.creator_pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let child_pml4 = spawn_sec_image(
+        spec.pi as u64,
+        spec.pe,
+        mint_badged(fault_ep, spec.badge),
+        NTDLL_BASE,
+        true,
+        spec.priority,
+        spec.env_scratch_va,
+        spec.stack_mirror_va,
+        spec.heap_mirror_va,
+        spec.image_mirror_va,
+        spec.image_path,
+        spec.cmd_line,
+        0,
+    );
+    procs[spec.pi].pid = child_pid as u64;
+    procs[spec.pi].pml4 = child_pml4;
+    PM_PML4S[spec.pi].store(child_pml4, Ordering::Relaxed);
+    procs[spec.pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
+    procs[spec.pi].scratch_base = spec.scratch_base;
+    map_demand_scratch_pts(spec.scratch_base);
+    nt_handler.bind_main_thread_entry(spec.pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
+
+    let process_handle = match nt_handler.pm.insert_handle(
+        creator_pid,
+        nt_process::HandleObject::Process(child_pid),
+        nt_process::map_process_access(request.desired_access),
+    ) {
+        Ok(handle) => {
+            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+            handle as u64
+        }
+        Err(status) => {
+            let _ = exe_images.rollback_spawn(request);
+            return Err(status);
+        }
+    };
+
+    if !nt_handler.publish_created_process(request.process_handle_out, process_handle, SMSS_PEB_VA) {
+        let _ = exe_images.rollback_spawn(request);
+        return Err(0xC000_0005);
+    }
+    if exe_images.publish(request, process_handle).is_err() {
+        return Err(0xC000_000D);
+    }
+    spec.spawned.store(1, Ordering::Relaxed);
+
+    print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
+    print_str(spec.leaf);
+    print_str(b" (badge ");
+    print_u64(spec.badge);
+    print_str(b") -> handle 0x");
+    print_hex((process_handle >> 32) as u32);
+    print_hex(process_handle as u32);
+    if spec.pi >= 5 {
+        print_str(b"; initial thread awaits NtCreateThread\n");
+    } else {
+        print_str(b"; its ntdll loader now multiplexed into this loop\n");
+    }
+    Ok(process_handle)
+}
+
 /// Populate one winlogon thread's client-side win32 state from the desktop facts published by the
 /// live win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the
 /// inline CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
@@ -989,13 +1153,8 @@ pub(crate) unsafe fn service_sec_image(
     let mut winlogon_file_handle = 0u64;
     let mut winlogon_section_handle = 0u64;
     let mut winlogon_process_handle = 0u64;
-    // Generic owner-local file/section/spawn state for Win32 children. services/lsass migrate first;
-    // userinit and later explorer use the same bounded state machine once runtime PE loading lands.
+    // Generic owner-local file/section/spawn state for Win32 children.
     let mut exe_images = nt_exe_image::ImageTable::<8>::new();
-    let mut services_process_handle = 0u64;
-    let mut lsass_process_handle = 0u64;
-    let mut userinit_process_handle = 0u64;
-    let mut explorer_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
@@ -4449,302 +4608,31 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                     WINLOGON_SPAWNED.store(1, Ordering::Relaxed);
                 }
-                // The generic Win32-child lane reserved a services.exe spawn after validating the
-                // owner-local file -> section -> process transition in `exe_images`.
-                if nt_handler
-                    .exe_spawn_request
-                    .is_some_and(|request| request.child_pi == 3)
-                    && SERVICES_SPAWNED.swap(1, Ordering::Relaxed) == 0
-                    && services_pe.is_some()
-                {
-                    let request = nt_handler.exe_spawn_request.unwrap();
-                    let sf_c = mint_badged(fault_ep, SERVICES_BADGE);
-                    let spe = services_pe.as_ref().unwrap();
-                    const SERVICES_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\services.exe";
-                    const SERVICES_CMD_LINE: &[u8] = b"services.exe";
-                    let spml4 = spawn_sec_image(
-                        3, spe, sf_c, NTDLL_BASE, true, 103, SERVICES_ENV_SCRATCH_VA,
-                        SERVICES_STACK_MIRROR_VA, SERVICES_HEAP_MIRROR_VA, SERVICES_IMAGE_MIRROR_VA,
-                        SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
-                        0, // pi>=1: real ntdll LdrpInitialize
-                    );
-                    procs[3].pid = nt_handler.pm_pid_for_pi(3).map(|pid| pid as u64).unwrap_or(0);
-                    procs[3].pml4 = spml4;
-                    PM_PML4S[3].store(spml4, Ordering::Relaxed);
-                    procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
-                    procs[3].scratch_base = SERVICES_SCRATCH_BASE;
-                    map_demand_scratch_pts(SERVICES_SCRATCH_BASE); // own 64 MiB scratch window PTs
-                    nt_handler.bind_main_thread_entry(3, PE_LOAD_BASE + spe.entry_point_rva() as u64);
-                    services_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(3)) {
-                        (Some(wl_pid), Some(sv_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                wl_pid,
-                                nt_process::HandleObject::Process(sv_pid),
-                                nt_process::map_process_access(
-                                    request.desired_access,
-                                ),
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle;
-                                nt_handler.next_handle += 1;
-                                g
-                            })
-                        }
-                        _ => {
-                            let g = nt_handler.next_handle;
-                            nt_handler.next_handle += 1;
-                            g
-                        }
-                    };
-                    let published = nt_handler.publish_created_process(
-                        request.process_handle_out,
-                        services_process_handle,
-                        SMSS_PEB_VA,
-                    );
-                    if !published {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                        let _ = exe_images.rollback_spawn(request);
-                    } else if exe_images.publish(request, services_process_handle).is_err() {
-                        result = 0xC000_000D; // STATUS_INVALID_PARAMETER
-                    }
-                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
-                    print_hex((services_process_handle >> 32) as u32);
-                    print_hex(services_process_handle as u32);
-                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                }
-                // The same generic lane for lsass.exe (the fifth hosted process).
-                if nt_handler
-                    .exe_spawn_request
-                    .is_some_and(|request| request.child_pi == 4)
-                    && LSASS_SPAWNED.swap(1, Ordering::Relaxed) == 0
-                    && lsass_pe.is_some()
-                {
-                    let request = nt_handler.exe_spawn_request.unwrap();
-                    let lf_c = mint_badged(fault_ep, LSASS_BADGE);
-                    let lpe = lsass_pe.as_ref().unwrap();
-                    const LSASS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\lsass.exe";
-                    const LSASS_CMD_LINE: &[u8] = b"lsass.exe";
-                    let lpml4 = spawn_sec_image(
-                        4, lpe, lf_c, NTDLL_BASE, true, 104, LSASS_ENV_SCRATCH_VA,
-                        LSASS_STACK_MIRROR_VA, LSASS_HEAP_MIRROR_VA, LSASS_IMAGE_MIRROR_VA,
-                        LSASS_IMAGE_PATH, LSASS_CMD_LINE,
-                        0, // pi>=1: real ntdll LdrpInitialize
-                    );
-                    procs[4].pid = nt_handler.pm_pid_for_pi(4).map(|pid| pid as u64).unwrap_or(0);
-                    procs[4].pml4 = lpml4;
-                    PM_PML4S[4].store(lpml4, Ordering::Relaxed);
-                    procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
-                    procs[4].scratch_base = LSASS_SCRATCH_BASE;
-                    map_demand_scratch_pts(LSASS_SCRATCH_BASE); // own 64 MiB scratch window PTs
-                    nt_handler.bind_main_thread_entry(4, PE_LOAD_BASE + lpe.entry_point_rva() as u64);
-                    lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
-                        (Some(wl_pid), Some(ls_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                wl_pid,
-                                nt_process::HandleObject::Process(ls_pid),
-                                nt_process::map_process_access(
-                                    request.desired_access,
-                                ),
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle; nt_handler.next_handle += 1; g
-                            })
-                        }
-                        _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
-                    };
-                    let published = nt_handler.publish_created_process(
-                        request.process_handle_out,
-                        lsass_process_handle,
-                        SMSS_PEB_VA,
-                    );
-                    if !published {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                        let _ = exe_images.rollback_spawn(request);
-                    } else if exe_images.publish(request, lsass_process_handle).is_err() {
-                        result = 0xC000_000D; // STATUS_INVALID_PARAMETER
-                    }
-                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
-                    print_hex((lsass_process_handle >> 32) as u32);
-                    print_hex(lsass_process_handle as u32);
-                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                }
-                // The first post-login process: winlogon's CreateProcessAsUserW has already driven
-                // userinit through the generic file -> SEC_IMAGE -> process reservation state
-                // machine. Build its real pi=5 VSpace, then publish only a typed process handle.
-                // Its initial TCB remains suspended until RtlCreateUserProcess creates/resumes the
-                // pre-created main ETHREAD, exactly like services and lsass.
-                if nt_handler
-                    .exe_spawn_request
-                    .is_some_and(|request| request.child_pi == 5)
-                    && USERINIT_SPAWNED.load(Ordering::Relaxed) == 0
-                    && userinit_pe.is_some()
-                {
-                    let request = nt_handler.exe_spawn_request.unwrap();
-                    let uf_c = mint_badged(fault_ep, USERINIT_BADGE);
-                    let upe = userinit_pe.as_ref().unwrap();
-                    const USERINIT_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\userinit.exe";
-                    const USERINIT_CMD_LINE: &[u8] = b"userinit.exe";
-                    let upml4 = spawn_sec_image(
-                        5,
-                        upe,
-                        uf_c,
-                        NTDLL_BASE,
-                        true,
-                        105,
-                        USERINIT_ENV_SCRATCH_VA,
-                        USERINIT_STACK_MIRROR_VA,
-                        USERINIT_HEAP_MIRROR_VA,
-                        USERINIT_IMAGE_MIRROR_VA,
-                        USERINIT_IMAGE_PATH,
-                        USERINIT_CMD_LINE,
-                        0,
-                    );
-                    procs[5].pid = nt_handler.pm_pid_for_pi(5).map(|pid| pid as u64).unwrap_or(0);
-                    procs[5].pml4 = upml4;
-                    PM_PML4S[5].store(upml4, Ordering::Relaxed);
-                    procs[5].img_end = PE_LOAD_BASE + image_extent(upe);
-                    procs[5].scratch_base = USERINIT_SCRATCH_BASE;
-                    map_demand_scratch_pts(USERINIT_SCRATCH_BASE);
-                    nt_handler.bind_main_thread_entry(
-                        5,
-                        PE_LOAD_BASE + upe.entry_point_rva() as u64,
-                    );
-
-                    let handle = match (
-                        nt_handler.pm_pid_for_pi(2),
-                        nt_handler.pm_pid_for_pi(5),
+                // The generic Win32-child lane reserved a spawn after validating the owner-local
+                // file -> section -> process transition in `exe_images`. The remaining per-image policy
+                // is the address-space descriptor; handle publication and ProcessManager wiring are
+                // common for services/lsass/userinit/explorer.
+                if let Some(request) = nt_handler.exe_spawn_request {
+                    if let Some(spec) = hosted_exe_spawn_for(
+                        request,
+                        &services_pe,
+                        &lsass_pe,
+                        &userinit_pe,
+                        &explorer_pe,
                     ) {
-                        (Some(wl_pid), Some(userinit_pid)) => nt_handler
-                            .pm
-                            .insert_handle(
-                                wl_pid,
-                                nt_process::HandleObject::Process(userinit_pid),
-                                nt_process::map_process_access(request.desired_access),
-                            )
-                            .map(u64::from),
-                        _ => Err(nt_process::STATUS_INVALID_HANDLE),
-                    };
-                    match handle {
-                        Ok(handle) => {
-                            userinit_process_handle = handle;
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            let published = nt_handler.publish_created_process(
-                                request.process_handle_out,
-                                userinit_process_handle,
-                                SMSS_PEB_VA,
-                            );
-                            if !published {
-                                result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                                let _ = exe_images.rollback_spawn(request);
-                            } else if exe_images
-                                .publish(request, userinit_process_handle)
-                                .is_err()
-                            {
-                                result = 0xC000_000D; // STATUS_INVALID_PARAMETER
-                            } else {
-                                USERINIT_SPAWNED.store(1, Ordering::Relaxed);
+                        if spec.spawned.load(Ordering::Relaxed) == 0 {
+                            if let Err(status) = spawn_requested_hosted_exe(
+                                request,
+                                spec,
+                                fault_ep,
+                                &mut procs,
+                                &mut nt_handler,
+                                &mut exe_images,
+                            ) {
+                                result = u64::from(status);
                             }
                         }
-                        Err(status) => {
-                            result = u64::from(status);
-                            let _ = exe_images.rollback_spawn(request);
-                        }
                     }
-                    print_str(
-                        b"[ntos-exec] NtCreateProcessEx: spawned userinit.exe (badge 27) -> handle 0x",
-                    );
-                    print_hex((userinit_process_handle >> 32) as u32);
-                    print_hex(userinit_process_handle as u32);
-                    print_str(b"; initial thread awaits NtCreateThread\n");
-                }
-                // userinit's StartShell now drives explorer.exe through the same generic
-                // file -> SEC_IMAGE -> process reservation state machine. Build the shell as pi=6
-                // and publish the process handle into userinit's handle table.
-                if nt_handler
-                    .exe_spawn_request
-                    .is_some_and(|request| request.child_pi == 6)
-                    && EXPLORER_SPAWNED.load(Ordering::Relaxed) == 0
-                    && explorer_pe.is_some()
-                {
-                    let request = nt_handler.exe_spawn_request.unwrap();
-                    let ef_c = mint_badged(fault_ep, EXPLORER_BADGE);
-                    let epe = explorer_pe.as_ref().unwrap();
-                    const EXPLORER_IMAGE_PATH: &[u8] = b"\\SystemRoot\\explorer.exe";
-                    const EXPLORER_CMD_LINE: &[u8] = b"explorer.exe";
-                    let epml4 = spawn_sec_image(
-                        6,
-                        epe,
-                        ef_c,
-                        NTDLL_BASE,
-                        true,
-                        106,
-                        EXPLORER_ENV_SCRATCH_VA,
-                        EXPLORER_STACK_MIRROR_VA,
-                        EXPLORER_HEAP_MIRROR_VA,
-                        EXPLORER_IMAGE_MIRROR_VA,
-                        EXPLORER_IMAGE_PATH,
-                        EXPLORER_CMD_LINE,
-                        0,
-                    );
-                    procs[6].pid = nt_handler.pm_pid_for_pi(6).map(|pid| pid as u64).unwrap_or(0);
-                    procs[6].pml4 = epml4;
-                    PM_PML4S[6].store(epml4, Ordering::Relaxed);
-                    procs[6].img_end = PE_LOAD_BASE + image_extent(epe);
-                    procs[6].scratch_base = EXPLORER_SCRATCH_BASE;
-                    map_demand_scratch_pts(EXPLORER_SCRATCH_BASE);
-                    nt_handler.bind_main_thread_entry(
-                        6,
-                        PE_LOAD_BASE + epe.entry_point_rva() as u64,
-                    );
-
-                    let handle = match (
-                        nt_handler.pm_pid_for_pi(5),
-                        nt_handler.pm_pid_for_pi(6),
-                    ) {
-                        (Some(userinit_pid), Some(explorer_pid)) => nt_handler
-                            .pm
-                            .insert_handle(
-                                userinit_pid,
-                                nt_process::HandleObject::Process(explorer_pid),
-                                nt_process::map_process_access(request.desired_access),
-                            )
-                            .map(u64::from),
-                        _ => Err(nt_process::STATUS_INVALID_HANDLE),
-                    };
-                    match handle {
-                        Ok(handle) => {
-                            explorer_process_handle = handle;
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            let published = nt_handler.publish_created_process(
-                                request.process_handle_out,
-                                explorer_process_handle,
-                                SMSS_PEB_VA,
-                            );
-                            if !published {
-                                result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                                let _ = exe_images.rollback_spawn(request);
-                            } else if exe_images
-                                .publish(request, explorer_process_handle)
-                                .is_err()
-                            {
-                                result = 0xC000_000D; // STATUS_INVALID_PARAMETER
-                            } else {
-                                EXPLORER_SPAWNED.store(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(status) => {
-                            result = u64::from(status);
-                            let _ = exe_images.rollback_spawn(request);
-                        }
-                    }
-                    print_str(
-                        b"[ntos-exec] NtCreateProcessEx: spawned explorer.exe (badge 28) -> handle 0x",
-                    );
-                    print_hex((explorer_process_handle >> 32) as u32);
-                    print_hex(explorer_process_handle as u32);
-                    print_str(b"; initial thread awaits NtCreateThread\n");
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
