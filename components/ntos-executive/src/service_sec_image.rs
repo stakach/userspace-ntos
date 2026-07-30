@@ -31,15 +31,129 @@ fn sec_image_forward_run() -> u64 {
     }
 }
 
-struct HostedExeSpawn<'a> {
-    image: &'static nt_exe_image::HostedProcessImage,
+#[derive(Clone, Copy)]
+struct HostedProcessRuntime {
     badge: u64,
     priority: u64,
     env_scratch_va: u64,
     stack_mirror_va: u64,
     heap_mirror_va: u64,
-    image_mirror_va: u64,
+    active_image_mirror_va: u64,
+    spawn_image_mirror_va: u64,
     scratch_base: u64,
+    spawned: Option<&'static AtomicU64>,
+}
+
+fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
+    match pi {
+        0 => Some(HostedProcessRuntime {
+            badge: 0,
+            priority: 100,
+            env_scratch_va: 0x0000_0100_1074_0000,
+            stack_mirror_va: SMSS_STACK_MIRROR_VA,
+            heap_mirror_va: SMSS_HEAP_MIRROR_VA,
+            active_image_mirror_va: IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: 0,
+            scratch_base: SMSS_SCRATCH_BASE,
+            spawned: None,
+        }),
+        1 => Some(HostedProcessRuntime {
+            badge: CSRSS_BADGE,
+            priority: 101,
+            env_scratch_va: 0x0000_0100_1078_0000,
+            stack_mirror_va: CSRSS_STACK_MIRROR_VA,
+            heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
+            active_image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: 0,
+            scratch_base: CSRSS_SCRATCH_BASE,
+            spawned: Some(&CSRSS_SPAWNED),
+        }),
+        2 => Some(HostedProcessRuntime {
+            badge: WINLOGON_BADGE,
+            priority: 102,
+            env_scratch_va: WINLOGON_MAIN_TEB_MIRROR_VA,
+            stack_mirror_va: WINLOGON_STACK_MIRROR_VA,
+            heap_mirror_va: WINLOGON_HEAP_MIRROR_VA,
+            active_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
+            scratch_base: WINLOGON_SCRATCH_BASE,
+            spawned: Some(&WINLOGON_SPAWNED),
+        }),
+        3 => Some(HostedProcessRuntime {
+            badge: SERVICES_BADGE,
+            priority: 103,
+            env_scratch_va: SERVICES_ENV_SCRATCH_VA,
+            stack_mirror_va: SERVICES_STACK_MIRROR_VA,
+            heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
+            active_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
+            scratch_base: SERVICES_SCRATCH_BASE,
+            spawned: Some(&SERVICES_SPAWNED),
+        }),
+        4 => Some(HostedProcessRuntime {
+            badge: LSASS_BADGE,
+            priority: 104,
+            env_scratch_va: LSASS_ENV_SCRATCH_VA,
+            stack_mirror_va: LSASS_STACK_MIRROR_VA,
+            heap_mirror_va: LSASS_HEAP_MIRROR_VA,
+            active_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
+            scratch_base: LSASS_SCRATCH_BASE,
+            spawned: Some(&LSASS_SPAWNED),
+        }),
+        5 => Some(HostedProcessRuntime {
+            badge: USERINIT_BADGE,
+            priority: 105,
+            env_scratch_va: USERINIT_ENV_SCRATCH_VA,
+            stack_mirror_va: USERINIT_STACK_MIRROR_VA,
+            heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
+            active_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
+            scratch_base: USERINIT_SCRATCH_BASE,
+            spawned: Some(&USERINIT_SPAWNED),
+        }),
+        6 => Some(HostedProcessRuntime {
+            badge: EXPLORER_BADGE,
+            priority: 106,
+            env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
+            stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
+            heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
+            active_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
+            spawn_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
+            scratch_base: EXPLORER_SCRATCH_BASE,
+            spawned: Some(&EXPLORER_SPAWNED),
+        }),
+        _ => None,
+    }
+}
+
+fn hosted_main_stack_mirror_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.stack_mirror_va)
+        .unwrap_or(SMSS_STACK_MIRROR_VA)
+}
+
+fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.heap_mirror_va)
+        .unwrap_or(SMSS_HEAP_MIRROR_VA)
+}
+
+fn hosted_active_image_mirror_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.active_image_mirror_va)
+        .unwrap_or(IMAGE_MIRROR_VA)
+}
+
+fn hosted_scratch_base_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.scratch_base)
+        .unwrap_or(SMSS_SCRATCH_BASE)
+}
+
+struct HostedExeSpawn<'a> {
+    image: &'static nt_exe_image::HostedProcessImage,
+    runtime: HostedProcessRuntime,
     pe: &'a nt_pe_loader::PeFile<'static>,
     spawned: &'static AtomicU64,
 }
@@ -52,54 +166,32 @@ fn hosted_exe_spawn_for<'a>(
     explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
 ) -> Option<HostedExeSpawn<'a>> {
     let image = nt_exe_image::hosted_image_for_pi(request.child_pi)?;
+    let runtime = hosted_process_runtime_for_pi(image.pi)?;
+    let spawned = runtime.spawned?;
     match image.pi {
         3 => services_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
-            badge: SERVICES_BADGE,
-            priority: 103,
-            env_scratch_va: SERVICES_ENV_SCRATCH_VA,
-            stack_mirror_va: SERVICES_STACK_MIRROR_VA,
-            heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
-            image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
-            scratch_base: SERVICES_SCRATCH_BASE,
+            runtime,
             pe,
-            spawned: &SERVICES_SPAWNED,
+            spawned,
         }),
         4 => lsass_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
-            badge: LSASS_BADGE,
-            priority: 104,
-            env_scratch_va: LSASS_ENV_SCRATCH_VA,
-            stack_mirror_va: LSASS_STACK_MIRROR_VA,
-            heap_mirror_va: LSASS_HEAP_MIRROR_VA,
-            image_mirror_va: LSASS_IMAGE_MIRROR_VA,
-            scratch_base: LSASS_SCRATCH_BASE,
+            runtime,
             pe,
-            spawned: &LSASS_SPAWNED,
+            spawned,
         }),
         5 => userinit_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
-            badge: USERINIT_BADGE,
-            priority: 105,
-            env_scratch_va: USERINIT_ENV_SCRATCH_VA,
-            stack_mirror_va: USERINIT_STACK_MIRROR_VA,
-            heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
-            image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
-            scratch_base: USERINIT_SCRATCH_BASE,
+            runtime,
             pe,
-            spawned: &USERINIT_SPAWNED,
+            spawned,
         }),
         6 => explorer_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
-            badge: EXPLORER_BADGE,
-            priority: 106,
-            env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
-            stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
-            heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
-            image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
-            scratch_base: EXPLORER_SCRATCH_BASE,
+            runtime,
             pe,
-            spawned: &EXPLORER_SPAWNED,
+            spawned,
         }),
         _ => None,
     }
@@ -123,14 +215,14 @@ unsafe fn spawn_requested_hosted_exe(
     let child_pml4 = spawn_sec_image(
         pi as u64,
         spec.pe,
-        mint_badged(fault_ep, spec.badge),
+        mint_badged(fault_ep, spec.runtime.badge),
         NTDLL_BASE,
         true,
-        spec.priority,
-        spec.env_scratch_va,
-        spec.stack_mirror_va,
-        spec.heap_mirror_va,
-        spec.image_mirror_va,
+        spec.runtime.priority,
+        spec.runtime.env_scratch_va,
+        spec.runtime.stack_mirror_va,
+        spec.runtime.heap_mirror_va,
+        spec.runtime.spawn_image_mirror_va,
         spec.image.nt_image_path,
         spec.image.command_line,
         0,
@@ -139,8 +231,8 @@ unsafe fn spawn_requested_hosted_exe(
     procs[pi].pml4 = child_pml4;
     PM_PML4S[pi].store(child_pml4, Ordering::Relaxed);
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
-    procs[pi].scratch_base = spec.scratch_base;
-    map_demand_scratch_pts(spec.scratch_base);
+    procs[pi].scratch_base = spec.runtime.scratch_base;
+    map_demand_scratch_pts(spec.runtime.scratch_base);
     nt_handler.bind_main_thread_entry(pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
 
     let process_handle = match nt_handler.pm.insert_handle(
@@ -170,7 +262,7 @@ unsafe fn spawn_requested_hosted_exe(
     print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
     print_str(spec.image.leaf);
     print_str(b" (badge ");
-    print_u64(spec.badge);
+    print_u64(spec.runtime.badge);
     print_str(b") -> handle 0x");
     print_hex((process_handle >> 32) as u32);
     print_hex(process_handle as u32);
@@ -1966,42 +2058,12 @@ pub(crate) unsafe fn service_sec_image(
                     _ => WINLOGON_WORKER_STACK_MIRROR_VA,
                 }
             } else {
-                match pi {
-                    1 => CSRSS_STACK_MIRROR_VA,
-                    2 => WINLOGON_STACK_MIRROR_VA,
-                    3 => SERVICES_STACK_MIRROR_VA,
-                    4 => LSASS_STACK_MIRROR_VA,
-                    5 => USERINIT_STACK_MIRROR_VA,
-                    6 => EXPLORER_STACK_MIRROR_VA,
-                    _ => SMSS_STACK_MIRROR_VA,
-                }
+                hosted_main_stack_mirror_for_pi(pi)
             },
             Ordering::Relaxed,
         );
-        ACTIVE_IMAGE_MIRROR.store(
-            match pi {
-                1 => CSRSS_IMAGE_MIRROR_VA,
-                2 => WINLOGON_IMAGE_MIRROR_VA,
-                3 => SERVICES_IMAGE_MIRROR_VA,
-                4 => LSASS_IMAGE_MIRROR_VA,
-                5 => USERINIT_IMAGE_MIRROR_VA,
-                6 => EXPLORER_IMAGE_MIRROR_VA,
-                _ => IMAGE_MIRROR_VA,
-            },
-            Ordering::Relaxed,
-        );
-        ACTIVE_HEAP_MIRROR.store(
-            match pi {
-                1 => CSRSS_HEAP_MIRROR_VA,
-                2 => WINLOGON_HEAP_MIRROR_VA,
-                3 => SERVICES_HEAP_MIRROR_VA,
-                4 => LSASS_HEAP_MIRROR_VA,
-                5 => USERINIT_HEAP_MIRROR_VA,
-                6 => EXPLORER_HEAP_MIRROR_VA,
-                _ => SMSS_HEAP_MIRROR_VA,
-            },
-            Ordering::Relaxed,
-        );
+        ACTIVE_IMAGE_MIRROR.store(hosted_active_image_mirror_for_pi(pi), Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hosted_heap_mirror_for_pi(pi), Ordering::Relaxed);
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -4437,7 +4499,9 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.spawn_request {
                     // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
                     // service EP tagged with that badge, so this loop multiplexes it against smss.
-                    let cf_c = mint_badged(fault_ep, CSRSS_BADGE);
+                    let cimage = nt_exe_image::hosted_image_for_pi(1).unwrap();
+                    let cruntime = hosted_process_runtime_for_pi(1).unwrap();
+                    let cf_c = mint_badged(fault_ep, cruntime.badge);
                     let cpe = csrss_pe.as_ref().unwrap();
                     // Priority 101 (above smss's 100) so csrss actually gets scheduled: at equal
                     // priority smss + the executive ping-pong and csrss never runs. csrss preempts
@@ -4448,7 +4512,6 @@ pub(crate) unsafe fn service_sec_image(
                     // csrss's OWN process parameters (not smss's): its System32 image path drives
                     // the loader's DLL search + ".local" SxS probe, and its Server command line
                     // (ObjectDirectory/ServerDll=…) is what csrss.exe's entry parses once loaded.
-                    const CSRSS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\csrss.exe";
                     // TEMP (Phase 0b): drop the two `ServerDll=winsrv:...` entries. winsrv is the
                     // Win32 GUI server; its UserServerDllInitialization issues win32k NtUser/NtGdi
                     // syscalls (SSN >= 0x1000) that we have no graphics subsystem to service — a
@@ -4475,10 +4538,10 @@ pub(crate) unsafe fn service_sec_image(
                     // executive maps win32k's gSharedInfo shared section RO into csrss + user32 derefs
                     // gHandleTable->handles) is the NEXT grind. Until then winsrv stays OUT so the gate is
                     // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
-                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
-                        1, cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
-                        CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, 0, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
+                        1, cpe, cf_c, NTDLL_BASE, true, cruntime.priority, cruntime.env_scratch_va,
+                        cruntime.stack_mirror_va, cruntime.heap_mirror_va, cruntime.spawn_image_mirror_va,
+                        cimage.nt_image_path, cimage.command_line,
                         0, // 0 → effective_ldrp_rva resolves to OUR ntdll's derived LdrpInitialize RVA
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
@@ -4488,8 +4551,8 @@ pub(crate) unsafe fn service_sec_image(
                     PM_PML4S[1].store(cpml4, Ordering::Relaxed);
                     CSRSS_SPAWNED.store(1, Ordering::Relaxed);
                     procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
-                    procs[1].scratch_base = CSRSS_SCRATCH_BASE;
-                    map_demand_scratch_pts(CSRSS_SCRATCH_BASE); // own 64 MiB scratch window PTs
+                    procs[1].scratch_base = cruntime.scratch_base;
+                    map_demand_scratch_pts(cruntime.scratch_base); // own 64 MiB scratch window PTs
                     // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
@@ -4539,22 +4602,22 @@ pub(crate) unsafe fn service_sec_image(
                 // smss 100) so it is actually scheduled; it blocks on every demand-fault (serviced
                 // here), handing the others their turns.
                 if nt_handler.winlogon_spawn_request {
-                    let wf_c = mint_badged(fault_ep, WINLOGON_BADGE);
+                    let wimage = nt_exe_image::hosted_image_for_pi(2).unwrap();
+                    let wruntime = hosted_process_runtime_for_pi(2).unwrap();
+                    let wf_c = mint_badged(fault_ep, wruntime.badge);
                     let wpe = winlogon_pe.as_ref().unwrap();
-                    const WINLOGON_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\winlogon.exe";
-                    const WINLOGON_CMD_LINE: &[u8] = b"winlogon.exe";
                     let wpml4 = spawn_sec_image(
-                        2, wpe, wf_c, NTDLL_BASE, true, 102, 0x0000_0100_107C_0000,
-                        WINLOGON_STACK_MIRROR_VA, WINLOGON_HEAP_MIRROR_VA, WINLOGON_IMAGE_MIRROR_VA,
-                        WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
+                        2, wpe, wf_c, NTDLL_BASE, true, wruntime.priority, wruntime.env_scratch_va,
+                        wruntime.stack_mirror_va, wruntime.heap_mirror_va, wruntime.spawn_image_mirror_va,
+                        wimage.nt_image_path, wimage.command_line,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[2].pid = nt_handler.pm_pid_for_pi(2).map(|pid| pid as u64).unwrap_or(0);
                     procs[2].pml4 = wpml4;
                     PM_PML4S[2].store(wpml4, Ordering::Relaxed);
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
-                    procs[2].scratch_base = WINLOGON_SCRATCH_BASE;
-                    map_demand_scratch_pts(WINLOGON_SCRATCH_BASE); // own 64 MiB scratch window PTs
+                    procs[2].scratch_base = wruntime.scratch_base;
+                    map_demand_scratch_pts(wruntime.scratch_base); // own 64 MiB scratch window PTs
                     // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
@@ -11010,46 +11073,13 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
             ),
             _ => {
                 // A top-level process MAIN thread — keyed by pi like the loop's default arm.
-                let smv = match pi {
-                    1 => CSRSS_STACK_MIRROR_VA,
-                    2 => WINLOGON_STACK_MIRROR_VA,
-                    3 => SERVICES_STACK_MIRROR_VA,
-                    4 => LSASS_STACK_MIRROR_VA,
-                    5 => USERINIT_STACK_MIRROR_VA,
-                    6 => EXPLORER_STACK_MIRROR_VA,
-                    _ => SMSS_STACK_MIRROR_VA,
-                };
-                (STACK_BASE, STACK_FRAMES, smv)
+                (STACK_BASE, STACK_FRAMES, hosted_main_stack_mirror_for_pi(pi))
             }
         }
     };
-    let heap_mirror = match pi {
-        1 => CSRSS_HEAP_MIRROR_VA,
-        2 => WINLOGON_HEAP_MIRROR_VA,
-        3 => SERVICES_HEAP_MIRROR_VA,
-        4 => LSASS_HEAP_MIRROR_VA,
-        5 => USERINIT_HEAP_MIRROR_VA,
-        6 => EXPLORER_HEAP_MIRROR_VA,
-        _ => SMSS_HEAP_MIRROR_VA,
-    };
-    let image_mirror = match pi {
-        1 => CSRSS_IMAGE_MIRROR_VA,
-        2 => WINLOGON_IMAGE_MIRROR_VA,
-        3 => SERVICES_IMAGE_MIRROR_VA,
-        4 => LSASS_IMAGE_MIRROR_VA,
-        5 => USERINIT_IMAGE_MIRROR_VA,
-        6 => EXPLORER_IMAGE_MIRROR_VA,
-        _ => IMAGE_MIRROR_VA,
-    };
-    let scratch_base = match pi {
-        1 => CSRSS_SCRATCH_BASE,
-        2 => WINLOGON_SCRATCH_BASE,
-        3 => SERVICES_SCRATCH_BASE,
-        4 => LSASS_SCRATCH_BASE,
-        5 => USERINIT_SCRATCH_BASE,
-        6 => EXPLORER_SCRATCH_BASE,
-        _ => SMSS_SCRATCH_BASE,
-    };
+    let heap_mirror = hosted_heap_mirror_for_pi(pi);
+    let image_mirror = hosted_active_image_mirror_for_pi(pi);
+    let scratch_base = hosted_scratch_base_for_pi(pi);
     (
         stack_base,
         stack_frames * 0x1000,
