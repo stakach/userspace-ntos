@@ -15,6 +15,61 @@ static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
+fn image_metadata_from_pe(
+    pe: &nt_pe_loader::PeFile<'static>,
+    pool_va: u64,
+) -> nt_exe_image::ImageMetadata {
+    let (major, minor) = pe.subsystem_version();
+    nt_exe_image::ImageMetadata {
+        pool_va,
+        file_size: pe.bytes().len() as u64,
+        image_size: pe.size_of_image() as u64,
+        entry_rva: pe.entry_point_rva(),
+        subsystem: pe.subsystem(),
+        subsystem_major: major,
+        subsystem_minor: minor,
+    }
+}
+
+unsafe fn record_hosted_child_exe_open(
+    ctx: ExecLoopCtx,
+    owner_pi: usize,
+    leaf: &[u8],
+    file_handle: u64,
+) -> bool {
+    let image = if leaf.eq_ignore_ascii_case(b"services.exe") {
+        unsafe { (&*ctx.services_pe).as_ref() }.map(|pe| (pe, ctx.services_pool_va))
+    } else if leaf.eq_ignore_ascii_case(b"lsass.exe") {
+        unsafe { (&*ctx.lsass_pe).as_ref() }.map(|pe| (pe, ctx.lsass_pool_va))
+    } else if leaf.eq_ignore_ascii_case(b"userinit.exe") {
+        unsafe { (&*ctx.userinit_pe).as_ref() }.map(|pe| (pe, ctx.userinit_pool_va))
+    } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
+        unsafe { (&*ctx.explorer_pe).as_ref() }.map(|pe| (pe, ctx.explorer_pool_va))
+    } else {
+        None
+    };
+
+    let Some((pe, pool_va)) = image else {
+        return false;
+    };
+    let opened = unsafe { &mut *ctx.exe_images }
+        .open(
+            owner_pi,
+            leaf,
+            file_handle,
+            image_metadata_from_pe(pe, pool_va),
+        )
+        .is_ok();
+    if opened {
+        if leaf.eq_ignore_ascii_case(b"userinit.exe") {
+            USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
+            EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    opened
+}
+
 /// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
 /// cross-address-space copy-in behind the pure `nt_security::ClientMemory` capture contract.
 /// `xas_read` resolves the stack/heap/image mirrors, the persistent frame aliases, and finally the
@@ -12670,12 +12725,17 @@ impl ExecNtHandler {
                 if self.pi == 2 && !want_dir && nb[..nlen].windows(8).any(|w| w == b"userinit") {
                     WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
                 }
-                let is_csrss = exe_exists && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                let is_winlogon = exe_exists && nb[..nlen].windows(8).any(|w| w == b"winlogon");
-                let is_services = exe_exists && nb[..nlen].windows(8).any(|w| w == b"services");
-                let is_lsass = exe_exists && nb[..nlen].windows(5).any(|w| w == b"lsass");
-                let is_userinit = exe_exists && nb[..nlen].windows(8).any(|w| w == b"userinit");
-                let is_explorer = explorer_exists;
+                let hosted_exe_leaf = if exe_exists {
+                    exe_canon
+                } else if explorer_exists {
+                    Some(b"explorer.exe" as &[u8])
+                } else {
+                    None
+                };
+                let is_csrss = hosted_exe_leaf
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(b"csrss.exe"));
+                let is_winlogon = hosted_exe_leaf
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(b"winlogon.exe"));
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -12722,10 +12782,7 @@ impl ExecNtHandler {
                 let status: u32 = if volume_directory.is_some()
                     || is_csrss
                     || is_winlogon
-                    || is_services
-                    || is_lsass
-                    || is_userinit
-                    || is_explorer
+                    || hosted_exe_leaf.is_some()
                     || dll_i.is_some()
                 {
                     let h = if let Some(first_cluster) = volume_directory {
@@ -12759,91 +12816,8 @@ impl ExecNtHandler {
                     if is_winlogon {
                         *ctx.winlogon_file_handle = h; // for NtCreateSection
                     }
-                    if is_services {
-                        if let Some(pe) = (&*ctx.services_pe).as_ref() {
-                            let (major, minor) = pe.subsystem_version();
-                            let _ = (&mut *ctx.exe_images).open(
-                                self.pi,
-                                b"services.exe",
-                                h,
-                                nt_exe_image::ImageMetadata {
-                                    pool_va: ctx.services_pool_va,
-                                    file_size: pe.bytes().len() as u64,
-                                    image_size: pe.size_of_image() as u64,
-                                    entry_rva: pe.entry_point_rva(),
-                                    subsystem: pe.subsystem(),
-                                    subsystem_major: major,
-                                    subsystem_minor: minor,
-                                },
-                            );
-                        }
-                    }
-                    if is_lsass {
-                        if let Some(pe) = (&*ctx.lsass_pe).as_ref() {
-                            let (major, minor) = pe.subsystem_version();
-                            let _ = (&mut *ctx.exe_images).open(
-                                self.pi,
-                                b"lsass.exe",
-                                h,
-                                nt_exe_image::ImageMetadata {
-                                    pool_va: ctx.lsass_pool_va,
-                                    file_size: pe.bytes().len() as u64,
-                                    image_size: pe.size_of_image() as u64,
-                                    entry_rva: pe.entry_point_rva(),
-                                    subsystem: pe.subsystem(),
-                                    subsystem_major: major,
-                                    subsystem_minor: minor,
-                                },
-                            );
-                        }
-                    }
-                    if is_userinit {
-                        if let Some(pe) = (&*ctx.userinit_pe).as_ref() {
-                            let (major, minor) = pe.subsystem_version();
-                            if (&mut *ctx.exe_images)
-                                .open(
-                                    self.pi,
-                                    b"userinit.exe",
-                                    h,
-                                    nt_exe_image::ImageMetadata {
-                                        pool_va: ctx.userinit_pool_va,
-                                        file_size: pe.bytes().len() as u64,
-                                        image_size: pe.size_of_image() as u64,
-                                        entry_rva: pe.entry_point_rva(),
-                                        subsystem: pe.subsystem(),
-                                        subsystem_major: major,
-                                        subsystem_minor: minor,
-                                    },
-                                )
-                                .is_ok()
-                            {
-                                USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    if is_explorer {
-                        if let Some(pe) = (&*ctx.explorer_pe).as_ref() {
-                            let (major, minor) = pe.subsystem_version();
-                            if (&mut *ctx.exe_images)
-                                .open(
-                                    self.pi,
-                                    b"explorer.exe",
-                                    h,
-                                    nt_exe_image::ImageMetadata {
-                                        pool_va: ctx.explorer_pool_va,
-                                        file_size: pe.bytes().len() as u64,
-                                        image_size: pe.size_of_image() as u64,
-                                        entry_rva: pe.entry_point_rva(),
-                                        subsystem: pe.subsystem(),
-                                        subsystem_major: major,
-                                        subsystem_minor: minor,
-                                    },
-                                )
-                                .is_ok()
-                            {
-                                EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+                    if let Some(leaf) = hosted_exe_leaf {
+                        let _ = record_hosted_child_exe_open(ctx, self.pi, leaf, h);
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
