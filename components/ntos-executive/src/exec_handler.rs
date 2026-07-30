@@ -13278,7 +13278,7 @@ impl ExecNtHandler {
                         Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
                         Err(status) => status,
                     }
-                } else if self.pi == 2 || self.pi == 5 {
+                } else {
                     let slot_info = {
                         let table = &*ctx.exe_images;
                         table.index_for_section(self.pi, sect).and_then(|index| {
@@ -13292,7 +13292,7 @@ impl ExecNtHandler {
                     };
                     if let Some((reserved_child_pi, state, leaf, leaf_len)) = slot_info {
                         let leaf = &leaf[..leaf_len];
-                        if !nt_exe_image::hosted_spawn_allowed(self.pi, leaf) {
+                        if nt_exe_image::hosted_image_for_leaf(leaf).is_none() {
                             self.stop = true;
                             return 0xC000_0002;
                         }
@@ -13306,19 +13306,16 @@ impl ExecNtHandler {
                                 Err(status) => return status,
                             }
                         };
-                        if child_pi == 5 || child_pi == 6 {
-                            if child_pi == 5 {
-                                USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // CreateProcessAsUserW must name winlogon itself as ParentProcess. The
-                            // shell launch likewise names userinit. The measured calls use
-                            // NtCurrentProcess; resolve it through the same typed
-                            // process-handle path rather than accepting an arbitrary parent scalar.
-                            if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
-                                return nt_process::STATUS_INVALID_HANDLE;
-                            }
+                        if child_pi == 5 {
+                            USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                        } else if child_pi == 6 {
+                            EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // RtlCreateUserProcess/CreateProcessAsUserW names the parent process with a
+                        // real process handle (commonly NtCurrentProcess). Keep image launch policy
+                        // out of the catalog; the parent check belongs to the handle table.
+                        if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
+                            return nt_process::STATUS_INVALID_HANDLE;
                         }
                         let table = &mut *ctx.exe_images;
                         match table.reserve_spawn(
@@ -13338,9 +13335,6 @@ impl ExecNtHandler {
                         self.stop = true;
                         0xC000_0002
                     }
-                } else {
-                    self.stop = true; // not a known section / not staged -> clean stop
-                    0xC0000002
                 }
             },
             // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route the

@@ -200,13 +200,9 @@ fn hosted_top_badge_for_pi(pi: usize) -> u64 {
 }
 
 fn hosted_pi_for_top_badge(badge: u64) -> Option<usize> {
-    nt_exe_image::HOSTED_PROCESS_IMAGES
-        .iter()
-        .find(|image| {
-            hosted_process_runtime_for_pi(image.pi)
-                .is_some_and(|runtime| runtime.badge == badge)
-        })
-        .map(|image| image.pi)
+    (0..MAX_PI).find(|&pi| {
+        hosted_process_runtime_for_pi(pi).is_some_and(|runtime| runtime.badge == badge)
+    })
 }
 
 fn hosted_pi_for_fault_badge(badge: u64) -> Option<usize> {
@@ -3667,12 +3663,13 @@ pub(crate) unsafe fn service_sec_image(
             // FORWARD-PROGRESS CENSUS: per-SSN histogram for the two processes that matter to the
             // starvation question — lsass (whose self-RPC is suspected of churning) and winlogon
             // (whose SAS window the paint depends on). A poll/retry livelock is unmistakable here.
-            if pi == 4 || pi == 2 || pi == 1 {
+            if pi == 4 || pi == 2 || pi == 1 || pi == 6 {
                 let bucket = ssn_bucket(ssn);
                 match pi {
                     4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                     2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                    _ => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                    1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                    _ => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                 };
             }
             if is_lsa_worker {
@@ -5868,6 +5865,11 @@ pub(crate) unsafe fn service_sec_image(
                     const W32_RESOURCE_CALLBACK_LIMIT: u64 = 1536;
                     const W32_POST_SAS_DIALOG_LIMIT: u64 = 2048;
                     const W32_IDD_LOGON_LIMIT: u64 = 4096;
+                    // Explorer's first real shell window startup legitimately crosses the generic
+                    // 500-dispatch budget now that userinit launches the real process and user32/ATL
+                    // run callbacks instead of the old synthetic create path. Keep it bounded, but
+                    // do not kill the shell midway through its WM_NCCREATE/WM_CREATE burst.
+                    const W32_EXPLORER_STARTUP_LIMIT: u64 = 2048;
                     // Typing credentials into the painted dialog is a second bounded burst: every
                     // character runs the real edit control's caret/invalidate/repaint cycle on top
                     // of the dialog's own pump. Grant the headroom only once keystrokes are in.
@@ -5885,6 +5887,8 @@ pub(crate) unsafe fn service_sec_image(
                         W32_POST_SAS_DIALOG_LIMIT
                     } else if pi == 2 && win32k_glue::real_resource_callback_started() {
                         W32_RESOURCE_CALLBACK_LIMIT
+                    } else if pi == 6 && EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0 {
+                        W32_EXPLORER_STARTUP_LIMIT
                     } else {
                         W32_TOTAL_LIMIT
                     };
@@ -5899,6 +5903,7 @@ pub(crate) unsafe fn service_sec_image(
                             4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                             2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                             1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                            6 => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                             _ => 0,
                         };
                         // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
@@ -12085,11 +12090,8 @@ fn pi_is_top_level(badge: u64) -> bool {
 /// process is crash-parked (so the loop's next `recv` would block on the fault-EP forever).
 #[inline]
 unsafe fn live_top_badges() -> u64 {
-    nt_exe_image::HOSTED_PROCESS_IMAGES
-        .iter()
-        .filter_map(|image| {
-            hosted_process_pi_is_live(image.pi).then_some(hosted_top_badge_for_pi(image.pi))
-        })
+    (0..MAX_PI)
+        .filter_map(|pi| hosted_process_pi_is_live(pi).then_some(hosted_top_badge_for_pi(pi)))
         .fold(0u64, |mask, badge| mask | (1u64 << badge))
 }
 

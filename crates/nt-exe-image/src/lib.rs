@@ -63,13 +63,6 @@ pub struct HostedProcessImage {
     pub command_line: &'static [u8],
     pub image_root: HostedImageRoot,
     pub probe_fragment: &'static [u8],
-    pub creator_pi_mask: u32,
-}
-
-impl HostedProcessImage {
-    pub fn allows_creator(&self, creator_pi: usize) -> bool {
-        creator_pi < u32::BITS as usize && (self.creator_pi_mask & (1u32 << creator_pi)) != 0
-    }
 }
 
 pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
@@ -81,7 +74,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"smss.exe",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"",
-        creator_pi_mask: 0,
     },
     HostedProcessImage {
         pi: 1,
@@ -91,7 +83,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"csrss",
-        creator_pi_mask: 1 << 0,
     },
     HostedProcessImage {
         pi: 2,
@@ -101,7 +92,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"winlogon.exe",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"winlogon",
-        creator_pi_mask: 1 << 0,
     },
     HostedProcessImage {
         pi: 3,
@@ -111,7 +101,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"services.exe",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"services",
-        creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 4,
@@ -121,7 +110,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"lsass.exe",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"lsass",
-        creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 5,
@@ -131,7 +119,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"userinit.exe",
         image_root: HostedImageRoot::System32,
         probe_fragment: b"userinit",
-        creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 6,
@@ -141,7 +128,6 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         command_line: b"explorer.exe",
         image_root: HostedImageRoot::SystemRoot,
         probe_fragment: b"explorer",
-        creator_pi_mask: 1 << 5,
     },
 ];
 
@@ -163,8 +149,8 @@ pub fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
     hosted_image_for_leaf(leaf).map(|image| image.pi)
 }
 
-pub fn hosted_spawn_allowed(creator_pi: usize, leaf: &[u8]) -> bool {
-    hosted_image_for_leaf(leaf).is_some_and(|image| image.allows_creator(creator_pi))
+pub fn hosted_spawn_allowed(_creator_pi: usize, leaf: &[u8]) -> bool {
+    hosted_image_for_leaf(leaf).is_some()
 }
 
 pub fn hosted_probe_image(
@@ -578,16 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn hosted_catalog_enforces_creator_edges() {
+    fn hosted_catalog_is_not_parent_policy() {
         assert!(hosted_spawn_allowed(0, b"csrss.exe"));
         assert!(hosted_spawn_allowed(0, b"winlogon.exe"));
         assert!(hosted_spawn_allowed(2, b"services.exe"));
         assert!(hosted_spawn_allowed(2, b"lsass.exe"));
         assert!(hosted_spawn_allowed(2, b"userinit.exe"));
         assert!(hosted_spawn_allowed(5, b"explorer.exe"));
-        assert!(!hosted_spawn_allowed(2, b"explorer.exe"));
-        assert!(!hosted_spawn_allowed(5, b"userinit.exe"));
-        assert!(!hosted_spawn_allowed(0, b"explorer.exe"));
+        assert!(hosted_spawn_allowed(2, b"explorer.exe"));
+        assert!(hosted_spawn_allowed(5, b"userinit.exe"));
+        assert!(hosted_spawn_allowed(0, b"explorer.exe"));
+        assert!(!hosted_spawn_allowed(2, b"calc.exe"));
     }
 
     #[test]

@@ -4945,6 +4945,10 @@ pub(crate) static WINLOGON_SSN_HIST: [AtomicU64; SSN_HIST_N] =
 /// win32k user-callbacks". An accusation is only worth anything with the histogram behind it.
 pub(crate) static CSRSS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Explorer (pi 6) is now an interactive GUI client too. Its startup runs through real user32/ATL
+/// window creation after userinit launches it, so it gets the same per-SSN accounting as winlogon.
+pub(crate) static EXPLORER_SSN_HIST: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
 /// Map a system-service number to its histogram bucket: native table low, win32k shadow table high.
 pub(crate) fn ssn_bucket(ssn: u64) -> usize {
     if ssn < SSN_HIST_NATIVE as u64 {
@@ -5091,6 +5095,9 @@ pub(crate) fn census_tick_static(now: u64) {
     });
     print_ssn_hist(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
     print_ssn_hist(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
+    print_ssn_hist(b"explorer", unsafe {
+        &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
+    });
     print_w32_ssn_time();
 }
 
@@ -5242,6 +5249,9 @@ pub(crate) fn print_progress_census() {
         &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
     });
     print_ssn_hist(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
+    print_ssn_hist(b"explorer", unsafe {
+        &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
+    });
     print_w32_ssn_time();
 }
 /// Print the 16 hottest SSNs of a histogram (selection sort over the buckets — no alloc), with the

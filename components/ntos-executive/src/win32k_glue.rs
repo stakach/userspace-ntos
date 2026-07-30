@@ -15,6 +15,7 @@ static USER_CALLBACK_EXPLORER_API0_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_DEAD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_NCCREATE_FALSES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_NCCREATE_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
@@ -454,6 +455,30 @@ unsafe fn bind_client_callback_window(
             print_hex(core::ptr::read_volatile((server_pwnd + 0x28) as *const u32));
             print_str(b" fnid=0x");
             print_hex(core::ptr::read_volatile((server_pwnd + 0x40) as *const u32));
+        }
+        if request.client_pi == 6 {
+            let n = USER_CALLBACK_EXPLORER_NCCREATE_TRACES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                let frame = (win32k_subsystem::WIN32K_SHARED_VADDR
+                    + win32k_subsystem::SH_USER_CALLBACK)
+                    as *mut nt_user_callback::CallbackFrame;
+                let wndproc = if request.input_length >= 8 {
+                    callback_payload_u64(frame, 0)
+                } else {
+                    0
+                };
+                let teb_tid = core::ptr::read_volatile((teb_alias + 0x48) as *const u64);
+                print_str(b" explorer-tid=");
+                print_u64(request.client_tid);
+                print_str(b" teb-tid=");
+                print_u64(teb_tid);
+                print_str(b" teb=0x");
+                print_hex((teb_alias >> 32) as u32);
+                print_hex(teb_alias as u32);
+                print_str(b" wndproc=0x");
+                print_hex((wndproc >> 32) as u32);
+                print_hex(wndproc as u32);
+            }
         }
         print_str(b"\n");
     }
@@ -1835,7 +1860,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
             result_length as usize,
         );
-        if client_pi == 2 && request_window_message == 0x0081 {
+        if (client_pi == 2 || client_pi == 6) && request_window_message == 0x0081 {
             let expected = nt_user_callback::UserCallbackStackLayout::below(
                 active_frame.saved_user_context()[nt_user_callback::USER_CONTEXT_RSP],
                 request.input_length as usize,
@@ -1867,6 +1892,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_str(b"[callback-result] WM_NCCREATE pointer=0x");
             print_hex((result_pointer >> 32) as u32);
             print_hex(result_pointer as u32);
+            print_str(b" pi=");
+            print_u64(client_pi as u64);
+            print_str(b" tid=");
+            print_u64(request.client_tid);
             print_str(b" expected=0x");
             print_hex((expected >> 32) as u32);
             print_hex(expected as u32);
