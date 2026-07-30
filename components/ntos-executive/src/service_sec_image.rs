@@ -286,19 +286,12 @@ unsafe fn spawn_requested_hosted_exe(
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let child_pml4 = spawn_sec_image(
-        pi as u64,
+    let child_pml4 = spawn_hosted_sec_image_for_pi(
+        pi,
         spec.pe,
         mint_badged(fault_ep, spec.runtime.badge),
         NTDLL_BASE,
         true,
-        spec.runtime.priority,
-        spec.runtime.env_scratch_va,
-        spec.runtime.stack_mirror_va,
-        spec.runtime.heap_mirror_va,
-        spec.runtime.spawn_image_mirror_va,
-        spec.image.nt_image_path,
-        spec.image.command_line,
         0,
     );
     procs[pi].pid = child_pid as u64;
@@ -4551,7 +4544,6 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.spawn_request {
                     // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
                     // service EP tagged with that badge, so this loop multiplexes it against smss.
-                    let cimage = nt_exe_image::hosted_image_for_pi(1).unwrap();
                     let cruntime = hosted_process_runtime_for_pi(1).unwrap();
                     let cf_c = mint_badged(fault_ep, cruntime.badge);
                     let cpe = csrss_pe.as_ref().unwrap();
@@ -4590,10 +4582,8 @@ pub(crate) unsafe fn service_sec_image(
                     // executive maps win32k's gSharedInfo shared section RO into csrss + user32 derefs
                     // gHandleTable->handles) is the NEXT grind. Until then winsrv stays OUT so the gate is
                     // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
-                    let cpml4 = spawn_sec_image(
-                        1, cpe, cf_c, NTDLL_BASE, true, cruntime.priority, cruntime.env_scratch_va,
-                        cruntime.stack_mirror_va, cruntime.heap_mirror_va, cruntime.spawn_image_mirror_va,
-                        cimage.nt_image_path, cimage.command_line,
+                    let cpml4 = spawn_hosted_sec_image_for_pi(
+                        1, cpe, cf_c, NTDLL_BASE, true,
                         0, // 0 → effective_ldrp_rva resolves to OUR ntdll's derived LdrpInitialize RVA
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
@@ -4654,14 +4644,11 @@ pub(crate) unsafe fn service_sec_image(
                 // smss 100) so it is actually scheduled; it blocks on every demand-fault (serviced
                 // here), handing the others their turns.
                 if nt_handler.winlogon_spawn_request {
-                    let wimage = nt_exe_image::hosted_image_for_pi(2).unwrap();
                     let wruntime = hosted_process_runtime_for_pi(2).unwrap();
                     let wf_c = mint_badged(fault_ep, wruntime.badge);
                     let wpe = winlogon_pe.as_ref().unwrap();
-                    let wpml4 = spawn_sec_image(
-                        2, wpe, wf_c, NTDLL_BASE, true, wruntime.priority, wruntime.env_scratch_va,
-                        wruntime.stack_mirror_va, wruntime.heap_mirror_va, wruntime.spawn_image_mirror_va,
-                        wimage.nt_image_path, wimage.command_line,
+                    let wpml4 = spawn_hosted_sec_image_for_pi(
+                        2, wpe, wf_c, NTDLL_BASE, true,
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[2].pid = nt_handler.pm_pid_for_pi(2).map(|pid| pid as u64).unwrap_or(0);
