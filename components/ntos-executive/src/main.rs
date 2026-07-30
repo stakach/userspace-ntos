@@ -258,12 +258,28 @@ pub const USERINIT_STACK_MIRROR_VA: u64 = 0x0000_0100_1480_0000;
 pub const USERINIT_ENV_SCRATCH_VA: u64 = 0x0000_0100_1490_0000;
 pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
 pub const USERINIT_IMAGE_MIRROR_VA: u64 = 0x0000_0100_14C0_0000;
+/// The 7th hosted process — explorer.exe, launched by userinit's StartShell. Its image is at
+/// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). The 0x3900 scratch window is
+/// the next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
+pub const EXPLORER_BADGE: u64 = 28;
+pub const EXPLORER_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 6 * DEMAND_SCRATCH_WINDOW;
+pub const EXPLORER_STACK_MIRROR_VA: u64 = 0x0000_0100_3D00_0000;
+pub const EXPLORER_ENV_SCRATCH_VA: u64 = 0x0000_0100_3D10_0000;
+pub const EXPLORER_HEAP_MIRROR_VA: u64 = 0x0000_0100_3D20_0000;
+pub const EXPLORER_IMAGE_MIRROR_VA: u64 = 0x0000_0100_3D40_0000;
 const _: () = {
     assert!(USERINIT_STACK_MIRROR_VA & 0x1f_ffff == 0);
     assert!(USERINIT_ENV_SCRATCH_VA >= USERINIT_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
     assert!(USERINIT_ENV_SCRATCH_VA + 0x9000 <= USERINIT_HEAP_MIRROR_VA);
     assert!(USERINIT_HEAP_MIRROR_VA + 0x20_0000 <= USERINIT_IMAGE_MIRROR_VA);
     assert!(USERINIT_IMAGE_MIRROR_VA + 0x10_0000 <= fs_loader::POOL_VADDR);
+    assert!(EXPLORER_SCRATCH_BASE == USERINIT_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW);
+    assert!(EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW <= EXPLORER_STACK_MIRROR_VA);
+    assert!(EXPLORER_STACK_MIRROR_VA & 0x1f_ffff == 0);
+    assert!(EXPLORER_ENV_SCRATCH_VA >= EXPLORER_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
+    assert!(EXPLORER_ENV_SCRATCH_VA + 0x9000 <= EXPLORER_HEAP_MIRROR_VA);
+    assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= EXPLORER_IMAGE_MIRROR_VA);
+    assert!(EXPLORER_IMAGE_MIRROR_VA + 0x20_0000 <= PRIVATE_VM_LIMIT);
 };
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
@@ -1045,7 +1061,7 @@ pub const CSRSS_BADGE: u64 = 2;
 // 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
 pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
 // Base sits PAST the executive's own heap (`allocator::HEAP_BASE` = 0x2000_0000, 2 MiB) and every
-// other executive mapping, and the 5 × 64 MiB windows (→ 0x3500_0000) stay inside the first 1 GiB
+// other executive mapping, and the 7 × 64 MiB windows (→ 0x3D00_0000) stay inside the first 1 GiB
 // page directory (0..0x4000_0000, already present — the heap + old scratch PTs live in it), so
 // `map_demand_scratch_pts` needs to create only PTs, not a fresh PD/PDPT.
 pub const SMSS_SCRATCH_BASE: u64 = 0x0000_0100_2100_0000;
@@ -1069,8 +1085,8 @@ pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDO
 pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WINDOW;
 /// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
 /// per-process arrays are sized for. The 6 current processes
-/// (smss/csrss/winlogon/services/lsass/userinit = pi 0..5) are live; the extra headroom is for
-/// later post-login processes (explorer, the
+/// (smss/csrss/winlogon/services/lsass/userinit/explorer = pi 0..6) are live; the extra headroom is
+/// for later post-login processes (the
 /// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
 /// (PM_PIDS/PM_TIDS/PM_POOL_TID, PFILLED, the service_sec_image `procs`/`dll_pd_created`/
 /// `dll_pt_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
@@ -3158,6 +3174,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
+    let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
     let cursor_identities = GLOBAL_CURSOR_IDENTITIES_OBSERVED.load(Ordering::Relaxed);
     let cursor_promotions = GLOBAL_CURSOR_PROMOTIONS.load(Ordering::Relaxed);
     let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
@@ -3198,6 +3215,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(explorer_attempts);
     print_str(b" wallpaper-spi-captures=");
     print_u64(wallpaper_spi_captures);
+    print_str(b" gdi-mapped=");
+    print_u64(gdi_mapped);
     print_str(b" cursor-identities=");
     print_u64(cursor_identities);
     print_str(b" promotions=");
@@ -3249,6 +3268,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
         shell_attempts >= 1 && explorer_attempts >= 1,
         passed,
     );
+    check(b"exec_userinit_gdi_shared_table_mapped", gdi_mapped != 0, passed);
     check(
         b"exec_userinit_global_cursor_reused",
         cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
@@ -3270,6 +3290,48 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && scrollbar_errors == 0
             && scrollbar_atom != 0
             && scrollbar_proc != 0,
+        passed,
+    );
+    explorer_image_pipeline_spec(passed);
+}
+
+/// ═══ userinit LAUNCHED THE REAL SHELL IMAGE THROUGH THE SAME EXE PIPELINE ═════════════════════
+fn explorer_image_pipeline_spec(passed: &mut u64) {
+    let opened = EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
+    let sectioned = EXPLORER_IMAGE_SECTIONS.load(Ordering::Relaxed);
+    let queried = EXPLORER_IMAGE_QUERIES.load(Ordering::Relaxed);
+    let creates = EXPLORER_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
+    let spawned_pid = PM_PIDS[6].load(Ordering::Relaxed);
+    let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
+    let pml4 = PM_PML4S[6].load(Ordering::Relaxed);
+    let tcb = PM_MAIN_TCBS[6].load(Ordering::Relaxed);
+    print_str(b"[explorer-image] opens=");
+    print_u64(opened);
+    print_str(b" sections=");
+    print_u64(sectioned);
+    print_str(b" image-info-queries=");
+    print_u64(queried);
+    print_str(b" create-process-requests=");
+    print_u64(creates);
+    print_str(b" pi6-pid=");
+    print_u64(spawned_pid);
+    print_str(b" spawned=");
+    print_u64(spawned);
+    print_str(b" pml4=0x");
+    print_hex(pml4 as u32);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b"\n");
+    check(
+        b"exec_explorer_process_spawned",
+        opened >= 1
+            && sectioned >= 1
+            && queried >= 1
+            && creates >= 1
+            && spawned_pid != 0
+            && spawned == 1
+            && pml4 != 0
+            && tcb > 1,
         passed,
     );
 }
@@ -5797,6 +5859,7 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
         3 => SERVICES_ENV_SCRATCH_VA,
         4 => LSASS_ENV_SCRATCH_VA,
         5 => USERINIT_ENV_SCRATCH_VA,
+        6 => EXPLORER_ENV_SCRATCH_VA,
         _ => 0,
     }
 }
@@ -6609,6 +6672,7 @@ fn heap_mirror_for_pi(pi: usize) -> u64 {
         3 => SERVICES_HEAP_MIRROR_VA,
         4 => LSASS_HEAP_MIRROR_VA,
         5 => USERINIT_HEAP_MIRROR_VA,
+        6 => EXPLORER_HEAP_MIRROR_VA,
         _ => SMSS_HEAP_MIRROR_VA,
     }
 }
@@ -9358,9 +9422,12 @@ pub(crate) static USERINIT_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_PRIMARY_TOKEN_ASSIGNED: AtomicU64 = AtomicU64::new(0);
-/// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. These are counted before
-/// the explorer image lane is implemented, so the boot gate can prove we reached the real shell
-/// frontier without fabricating an explorer process.
+pub(crate) static EXPLORER_IMAGE_OPEN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. The explorer counters above
+/// prove the attempt entered the generic file -> SEC_IMAGE -> process pipeline.
 pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_EXPLORER_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_WALLPAPER_SPI_CAPTURES: AtomicU64 = AtomicU64::new(0);
@@ -9870,6 +9937,10 @@ struct ExecLoopCtx {
     /// a separate checked mechanism step.
     userinit_pool_va: u64,
     userinit_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// explorer.exe is the first image launched by userinit itself; it uses the same generic EXE
+    /// lane, with pi=6 as the shell process.
+    explorer_pool_va: u64,
+    explorer_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 512],
@@ -11091,6 +11162,7 @@ static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
 static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static USERINIT_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass's lsasrv `LsapRmInitializeServer` NtConnectPort(\SeRmCommandPort) is modeled-accepted
 /// — i.e. lsass's LSA init (LsapInitLsa) has resolved lsasrv+samsrv (SERVICE 10 step 2) and is running
@@ -11546,7 +11618,7 @@ impl ProcExec {
 }
 /// Bit i set iff `procs[i]` (the folded EPROCESS-linked per-process struct) has a live pml4 AND its
 /// `pid` matches the ProcessManager's pid for pi=i — proves the consolidated per-process mechanism
-/// struct is EPROCESS-linked at runtime (path 3). Expected 0b11_1111 for the six live processes.
+/// struct is EPROCESS-linked at runtime (path 3). Expected 0b111_1111 for the seven live processes.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -11596,6 +11668,11 @@ static GDI_USERVM_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Latched (=1) the first time the executive seeds winlogon's PEB->GdiSharedHandleTable + gdi32's
 /// cached global with the client GDI handle-table VA (client-GDI mapping milestone). Read by the spec.
 pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// Same client-GDI shared-table mapping proof for userinit. Userinit imports gdi32 and validates real
+/// win32k-returned handles after `UpdatePerUserSystemParameters`/shell startup, so it must be a real
+/// GDI client too.
+pub(crate) static USERINIT_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
 /// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
 /// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
@@ -13456,6 +13533,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 userinit_mirror_pt,
                 LBL_X86_PAGE_TABLE_MAP,
                 USERINIT_STACK_MIRROR_VA,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            let explorer_mirror_pt = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                explorer_mirror_pt,
+            );
+            let _ = paging_struct_map(
+                explorer_mirror_pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                EXPLORER_STACK_MIRROR_VA,
                 CAP_INIT_THREAD_VSPACE,
             );
             let fb_start = alloc_frame();
@@ -15410,19 +15501,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WL_LISTENER_TEB_QUERIED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
-                    // nt-process convergence (first increment): the real Process Manager backs the 3
-                    // hosted processes with EPROCESS objects. `exec_process_manager_up` = 3 EPROCESSes
+                    // nt-process convergence (first increment): the real Process Manager backs the
+                    // hosted processes with EPROCESS objects. `exec_process_manager_up` = all EPROCESSes
                     // exist; `exec_eprocess_backs_badges` = each pi's EPROCESS names its hosted binary
                     // with a distinct pid (identity is real, not a scalar); `exec_eprocess_lookup_by_badge`
                     // = the live service loop resolved a fault badge → its EPROCESS through the manager.
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == 6,
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == 7,
                         &mut passed,
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b111_1111,
                         &mut passed,
                     );
                     check(
@@ -15454,17 +15545,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" reserved=0x");
                     print_hex(cap as u32);
                     print_str(b" (no realloc)\n");
-                    // Path 2 — lifecycle: real ETHREADs back the 3 main threads (bound to their image
+                    // Path 2 — lifecycle: real ETHREADs back the main threads (bound to their image
                     // entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm (proven
                     // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b111_1111,
                         &mut passed,
                     );
                     check(
                         b"exec_main_thread_bound_at_spawn",
-                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 6,
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 7,
                         &mut passed,
                     );
                     check(
@@ -15805,14 +15896,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         ALPC_XVIEW_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
-                    // Path 3 — the six ex-parallel per-pi identity arrays (pml4s/scratch_bases/
+                    // Path 3 — the ex-parallel per-pi identity arrays (pml4s/scratch_bases/
                     // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
                     // EPROCESS-linked via its `pid`. `exec_eprocess_linked_mechanism` = every hosted
                     // process's folded mechanism struct has a live pml4 AND its pid matches the
                     // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b111_1111,
                         &mut passed,
                     );
                     // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32

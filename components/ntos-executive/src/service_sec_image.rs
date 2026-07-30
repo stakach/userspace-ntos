@@ -994,6 +994,7 @@ pub(crate) unsafe fn service_sec_image(
     let mut services_process_handle = 0u64;
     let mut lsass_process_handle = 0u64;
     let mut userinit_process_handle = 0u64;
+    let mut explorer_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
@@ -1078,6 +1079,18 @@ pub(crate) unsafe fn service_sec_image(
         apply_relocations_to_buf(upe, userinit_va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((userinit_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((userinit_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
+    // explorer.exe — userinit's StartShell target. It lives at the ReactOS root (`C:\ReactOS` /
+    // hosted `C:\Windows`), not under System32, so source it by its real volume path.
+    let (explorer_pe, explorer_va) = if ntdll.is_some() {
+        load_dll_from_fs(br"reactos\explorer.exe", b"explorer.exe")
+    } else {
+        (None, 0)
+    };
+    if let Some(ref epe) = explorer_pe {
+        apply_relocations_to_buf(epe, explorer_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((explorer_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((explorer_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
@@ -1202,7 +1215,7 @@ pub(crate) unsafe fn service_sec_image(
         nt_handler.bind_main_thread_entry(0, PE_LOAD_BASE + smss_pe.entry_point_rva() as u64);
     }
     // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each). Path 3:
-    // the six ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
+    // the ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
     // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
     // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
     let mut procs = [ProcExec::empty(); MAX_PI];
@@ -1721,6 +1734,8 @@ pub(crate) unsafe fn service_sec_image(
             4
         } else if badge == USERINIT_BADGE {
             5
+        } else if badge == EXPLORER_BADGE {
+            6
         } else {
             0
         };
@@ -1811,6 +1826,7 @@ pub(crate) unsafe fn service_sec_image(
                     3 => SERVICES_STACK_MIRROR_VA,
                     4 => LSASS_STACK_MIRROR_VA,
                     5 => USERINIT_STACK_MIRROR_VA,
+                    6 => EXPLORER_STACK_MIRROR_VA,
                     _ => SMSS_STACK_MIRROR_VA,
                 }
             },
@@ -1823,6 +1839,7 @@ pub(crate) unsafe fn service_sec_image(
                 3 => SERVICES_IMAGE_MIRROR_VA,
                 4 => LSASS_IMAGE_MIRROR_VA,
                 5 => USERINIT_IMAGE_MIRROR_VA,
+                6 => EXPLORER_IMAGE_MIRROR_VA,
                 _ => IMAGE_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -1834,6 +1851,7 @@ pub(crate) unsafe fn service_sec_image(
                 3 => SERVICES_HEAP_MIRROR_VA,
                 4 => LSASS_HEAP_MIRROR_VA,
                 5 => USERINIT_HEAP_MIRROR_VA,
+                6 => EXPLORER_HEAP_MIRROR_VA,
                 _ => SMSS_HEAP_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -1849,6 +1867,7 @@ pub(crate) unsafe fn service_sec_image(
             3 => services_pe.as_ref().unwrap(),
             4 => lsass_pe.as_ref().unwrap(),
             5 => userinit_pe.as_ref().unwrap(),
+            6 => explorer_pe.as_ref().unwrap(),
             _ => pe,
         };
         faults = procs[pi].faults;
@@ -3844,6 +3863,8 @@ pub(crate) unsafe fn service_sec_image(
                     lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     userinit_pool_va: userinit_va,
                     userinit_pe: &userinit_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    explorer_pool_va: explorer_va,
+                    explorer_pe: &explorer_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
                     scratch_base,
@@ -4622,6 +4643,92 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     print_hex((userinit_process_handle >> 32) as u32);
                     print_hex(userinit_process_handle as u32);
+                    print_str(b"; initial thread awaits NtCreateThread\n");
+                }
+                // userinit's StartShell now drives explorer.exe through the same generic
+                // file -> SEC_IMAGE -> process reservation state machine. Build the shell as pi=6
+                // and publish the process handle into userinit's handle table.
+                if nt_handler
+                    .exe_spawn_request
+                    .is_some_and(|request| request.child_pi == 6)
+                    && EXPLORER_SPAWNED.load(Ordering::Relaxed) == 0
+                    && explorer_pe.is_some()
+                {
+                    let request = nt_handler.exe_spawn_request.unwrap();
+                    let ef_c = mint_badged(fault_ep, EXPLORER_BADGE);
+                    let epe = explorer_pe.as_ref().unwrap();
+                    const EXPLORER_IMAGE_PATH: &[u8] = b"\\SystemRoot\\explorer.exe";
+                    const EXPLORER_CMD_LINE: &[u8] = b"explorer.exe";
+                    let epml4 = spawn_sec_image(
+                        6,
+                        epe,
+                        ef_c,
+                        NTDLL_BASE,
+                        true,
+                        106,
+                        EXPLORER_ENV_SCRATCH_VA,
+                        EXPLORER_STACK_MIRROR_VA,
+                        EXPLORER_HEAP_MIRROR_VA,
+                        EXPLORER_IMAGE_MIRROR_VA,
+                        EXPLORER_IMAGE_PATH,
+                        EXPLORER_CMD_LINE,
+                        0,
+                    );
+                    procs[6].pml4 = epml4;
+                    PM_PML4S[6].store(epml4, Ordering::Relaxed);
+                    procs[6].img_end = PE_LOAD_BASE + image_extent(epe);
+                    procs[6].scratch_base = EXPLORER_SCRATCH_BASE;
+                    map_demand_scratch_pts(EXPLORER_SCRATCH_BASE);
+                    nt_handler.bind_main_thread_entry(
+                        6,
+                        PE_LOAD_BASE + epe.entry_point_rva() as u64,
+                    );
+
+                    let handle = match (
+                        nt_handler.pm_pid_for_pi(5),
+                        nt_handler.pm_pid_for_pi(6),
+                    ) {
+                        (Some(userinit_pid), Some(explorer_pid)) => nt_handler
+                            .pm
+                            .insert_handle(
+                                userinit_pid,
+                                nt_process::HandleObject::Process(explorer_pid),
+                                nt_process::map_process_access(request.desired_access),
+                            )
+                            .map(u64::from),
+                        _ => Err(nt_process::STATUS_INVALID_HANDLE),
+                    };
+                    match handle {
+                        Ok(handle) => {
+                            explorer_process_handle = handle;
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            let published = nt_handler.publish_created_process(
+                                request.process_handle_out,
+                                explorer_process_handle,
+                                SMSS_PEB_VA,
+                            );
+                            if !published {
+                                result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                                let _ = exe_images.rollback_spawn(request);
+                            } else if exe_images
+                                .publish(request, explorer_process_handle)
+                                .is_err()
+                            {
+                                result = 0xC000_000D; // STATUS_INVALID_PARAMETER
+                            } else {
+                                EXPLORER_SPAWNED.store(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(status) => {
+                            result = u64::from(status);
+                            let _ = exe_images.rollback_spawn(request);
+                        }
+                    }
+                    print_str(
+                        b"[ntos-exec] NtCreateProcessEx: spawned explorer.exe (badge 28) -> handle 0x",
+                    );
+                    print_hex((explorer_process_handle >> 32) as u32);
+                    print_hex(explorer_process_handle as u32);
                     print_str(b"; initial thread awaits NtCreateThread\n");
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
@@ -5528,6 +5635,7 @@ pub(crate) unsafe fn service_sec_image(
                     || badge == SERVICES_BADGE
                     || badge == LSASS_BADGE
                     || badge == USERINIT_BADGE
+                    || badge == EXPLORER_BADGE
                     || (is_tp_worker && pi != 0))
             {
                 let dialog_modal_expected_ssn = if pi == 2 {
@@ -5671,6 +5779,7 @@ pub(crate) unsafe fn service_sec_image(
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
+                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -6387,6 +6496,7 @@ pub(crate) unsafe fn service_sec_image(
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
+                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -6595,6 +6705,7 @@ pub(crate) unsafe fn service_sec_image(
                         3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         5 => USERINIT_ENV_SCRATCH_VA + 0x1000,
+                        6 => EXPLORER_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
                     let client_teb = nt_handler
@@ -6841,22 +6952,32 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b"\n");
                         }
                     }
-                    // ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE-TABLE MAPPING. The msgina logon dialog's
-                    // CreateWindowEx(#32770) → DC/font setup makes client-side gdi32 validate GDI handles
-                    // through `GdiSharedHandleTable[handle & 0xffff]` (base = PEB->GdiSharedHandleTable,
-                    // seeded at spawn in img_spawn.rs). Project win32k's coherent live handle-table
-                    // section and client-writable GDI attribute pool into winlogon. PEB+0xf8 was already
-                    // seeded pre-loader so gdi32's GdiProcessSetup cached this same VA.
+                }
+                // ★ CLIENT-GDI HANDLE-TABLE MAPPING. GUI clients whose PEB+0xf8 was seeded before
+                // gdi32's GdiProcessSetup must also have the live win32k GDI table projected into
+                // their VSpace before client-side GdiValidateHandle runs. Winlogon needs this for the
+                // msgina dialog DC/font setup; userinit reaches it after wallpaper/shell startup, and
+                // explorer is the real shell GUI client.
+                if pi == 2 || pi == 5 || pi == 6 {
                     let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
                     let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
-                    if gdi_va != 0
-                        && gdi_attributes
-                        && WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
-                    {
-                        print_str(b"[wl-main] winlogon client GDI handle table mapped @0x");
-                        print_hex((gdi_va >> 32) as u32);
-                        print_hex(gdi_va as u32);
-                        print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                    if gdi_va != 0 && gdi_attributes {
+                        if pi == 2 && WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                            print_str(b"[wl-main] winlogon client GDI handle table mapped @0x");
+                            print_hex((gdi_va >> 32) as u32);
+                            print_hex(gdi_va as u32);
+                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                        } else if pi == 5 && USERINIT_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                            print_str(b"[userinit-gdi] client GDI handle table mapped @0x");
+                            print_hex((gdi_va >> 32) as u32);
+                            print_hex(gdi_va as u32);
+                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                        } else if pi == 6 && EXPLORER_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                            print_str(b"[explorer-gdi] client GDI handle table mapped @0x");
+                            print_hex((gdi_va >> 32) as u32);
+                            print_hex(gdi_va as u32);
+                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                        }
                     }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
@@ -10580,6 +10701,8 @@ pub(crate) unsafe fn service_sec_image(
         b"lsass"
     } else if badge == USERINIT_BADGE {
         b"userinit"
+    } else if badge == EXPLORER_BADGE {
+        b"explorer"
     } else {
         b"smss"
     });
@@ -10899,6 +11022,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
                     3 => SERVICES_STACK_MIRROR_VA,
                     4 => LSASS_STACK_MIRROR_VA,
                     5 => USERINIT_STACK_MIRROR_VA,
+                    6 => EXPLORER_STACK_MIRROR_VA,
                     _ => SMSS_STACK_MIRROR_VA,
                 };
                 (STACK_BASE, STACK_FRAMES, smv)
@@ -10911,6 +11035,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         3 => SERVICES_HEAP_MIRROR_VA,
         4 => LSASS_HEAP_MIRROR_VA,
         5 => USERINIT_HEAP_MIRROR_VA,
+        6 => EXPLORER_HEAP_MIRROR_VA,
         _ => SMSS_HEAP_MIRROR_VA,
     };
     let image_mirror = match pi {
@@ -10919,6 +11044,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         3 => SERVICES_IMAGE_MIRROR_VA,
         4 => LSASS_IMAGE_MIRROR_VA,
         5 => USERINIT_IMAGE_MIRROR_VA,
+        6 => EXPLORER_IMAGE_MIRROR_VA,
         _ => IMAGE_MIRROR_VA,
     };
     let scratch_base = match pi {
@@ -10927,6 +11053,7 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         3 => SERVICES_SCRATCH_BASE,
         4 => LSASS_SCRATCH_BASE,
         5 => USERINIT_SCRATCH_BASE,
+        6 => EXPLORER_SCRATCH_BASE,
         _ => SMSS_SCRATCH_BASE,
     };
     (
@@ -11859,7 +11986,7 @@ unsafe fn prefill_client_large_string_pages(
 
 /// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's
 /// crash belongs to its parent process for quiesce accounting). Top-level: smss=0, csrss=2,
-/// winlogon=4, services=6, lsass=8, userinit=27.
+/// winlogon=4, services=6, lsass=8, userinit=27, explorer=28.
 #[inline]
 fn owner_top_badge(badge: u64) -> u64 {
     if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
@@ -11883,6 +12010,7 @@ fn owner_top_badge(badge: u64) -> u64 {
         | LSASS_LISTENER3_BADGE
         | LSA_WORKER_BADGE => LSASS_BADGE,
         USERINIT_BADGE => USERINIT_BADGE,
+        EXPLORER_BADGE => EXPLORER_BADGE,
         _ => 0, // smss (badge 0) + anything else
     }
 }
@@ -11928,6 +12056,7 @@ fn pi_is_top_level(badge: u64) -> bool {
     matches!(
         badge,
         0 | CSRSS_BADGE | WINLOGON_BADGE | SERVICES_BADGE | LSASS_BADGE | USERINIT_BADGE
+            | EXPLORER_BADGE
     )
 }
 
@@ -11951,6 +12080,9 @@ unsafe fn live_top_badges() -> u64 {
     }
     if USERINIT_SPAWNED.load(Ordering::Relaxed) == 1 {
         m |= 1u64 << USERINIT_BADGE;
+    }
+    if EXPLORER_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= 1u64 << EXPLORER_BADGE;
     }
     m
 }

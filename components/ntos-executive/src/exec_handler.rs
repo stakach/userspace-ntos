@@ -449,22 +449,25 @@ impl ExecNtHandler {
                 // CreateProcessW (the LSA subsystem), so its EPROCESS parent is winlogon too.
                 let lsass_pid = pm.create_process("lsass.exe", Some(winlogon_pid), None);
                 let userinit_pid = pm.create_process("userinit.exe", Some(winlogon_pid), None);
+                let explorer_pid = pm.create_process("explorer.exe", Some(userinit_pid), None);
                 PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
                 PM_PIDS[3].store(services_pid as u64, Ordering::Relaxed);
                 PM_PIDS[4].store(lsass_pid as u64, Ordering::Relaxed);
                 PM_PIDS[5].store(userinit_pid as u64, Ordering::Relaxed);
+                PM_PIDS[6].store(explorer_pid as u64, Ordering::Relaxed);
                 PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
                 // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
                 let mut ok = 0u64;
-                let expect: [(usize, u32, &str); 6] = [
+                let expect: [(usize, u32, &str); 7] = [
                     (0, smss_pid, "smss.exe"),
                     (1, csrss_pid, "csrss.exe"),
                     (2, winlogon_pid, "winlogon.exe"),
                     (3, services_pid, "services.exe"),
                     (4, lsass_pid, "lsass.exe"),
                     (5, userinit_pid, "userinit.exe"),
+                    (6, explorer_pid, "explorer.exe"),
                 ];
                 for (i, pid, name) in expect {
                     let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
@@ -492,6 +495,7 @@ impl ExecNtHandler {
                     services_pid,
                     lsass_pid,
                     userinit_pid,
+                    explorer_pid,
                 ];
                 for (i, &pid) in pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
@@ -537,10 +541,11 @@ impl ExecNtHandler {
                     services_pid,
                     lsass_pid,
                     userinit_pid,
+                    explorer_pid,
                 ] {
                     pm.reserve_handles(pid, PM_HANDLE_RESERVE);
                 }
-                // Record the reserved capacity (min across the 6) so the run can prove it never
+                // Record the reserved capacity (min across the hosted set) so the run can prove it never
                 // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
                 let cap = pm
                     .handle_capacity(smss_pid)
@@ -548,7 +553,9 @@ impl ExecNtHandler {
                     .min(pm.handle_capacity(winlogon_pid))
                     .min(pm.handle_capacity(services_pid))
                     .min(pm.handle_capacity(lsass_pid));
-                let cap = cap.min(pm.handle_capacity(userinit_pid));
+                let cap = cap
+                    .min(pm.handle_capacity(userinit_pid))
+                    .min(pm.handle_capacity(explorer_pid));
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
@@ -564,7 +571,7 @@ impl ExecNtHandler {
             dll_loaded_dirty: false,
             writable_fs_dirty: false,
         };
-        for pi in 0..6 {
+        for pi in 0..7 {
             let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
             let token = handler.token_store.insert(nt_security::AccessToken::system());
             let _ = handler.pm.replace_process_primary_token(pid, Some(token));
@@ -5654,9 +5661,37 @@ impl ExecNtHandler {
         };
         unsafe { sys32_exists(leaf) }
     }
+    /// Does `\reactos\<leaf>` exist as a regular file on the executive's mounted FAT volume?
+    /// `explorer.exe` is a shell image at `%SystemRoot%`, not System32, so its admission has to use
+    /// the same real-FS root lookup as the PE preloader instead of the caller's transient DOS path.
+    fn fs_reactos_root_has_file(leaf: &[u8]) -> bool {
+        if leaf.is_empty() {
+            return false;
+        }
+        unsafe {
+            let Some(fs) = exec_fs() else {
+                return false;
+            };
+            let mut path = [0u8; 96];
+            let mut n = 0usize;
+            for &c in b"reactos\\" {
+                path[n] = c;
+                n += 1;
+            }
+            for &c in leaf {
+                if n == path.len() {
+                    return false;
+                }
+                path[n] = c;
+                n += 1;
+            }
+            fat_open_path(&fs, &path[..n]).is_some()
+        }
+    }
     /// Classify a folded probe path as one of the hosted-process EXEs by substring and return its
-    /// CANONICAL System32 leaf (so existence resolves against the real file, not a possibly-malformed
-    /// extracted leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator).
+    /// canonical leaf (so existence resolves against the real file, not a possibly-malformed extracted
+    /// leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator). Most hosted
+    /// EXEs live under System32; explorer is admitted by the caller's real volume-path result.
     /// `None` if it isn't a recognized EXE probe or if it's an SxS/actctx probe (which must fail so
     /// the loader doesn't take the .Local\/manifest path). Purely a name→canonical-leaf classifier;
     /// the caller still confirms the leaf on the real FS.
@@ -5675,6 +5710,8 @@ impl ExecNtHandler {
             Some(b"lsass.exe")
         } else if folded.windows(8).any(|w| w == b"userinit") {
             Some(b"userinit.exe")
+        } else if folded.windows(8).any(|w| w == b"explorer") {
+            Some(b"explorer.exe")
         } else {
             None
         }
@@ -12497,23 +12534,23 @@ impl ExecNtHandler {
                 }
                 // Directory opens resolve authoritatively against the mounted FAT volume. The
                 // empty volume-relative path denotes the FAT root directory.
-                let volume_entry = if want_dir {
-                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos")
-                        .and_then(|path| {
-                            exec_fs().and_then(|fs| {
-                                if path.is_empty() {
-                                    Some((fs.root_cl, 0, 0x10))
-                                } else {
-                                    fat_open_path_entry(&fs, &path)
-                                }
-                            })
+                let volume_entry =
+                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos").and_then(|path| {
+                        exec_fs().and_then(|fs| {
+                            if path.is_empty() {
+                                Some((fs.root_cl, 0, 0x10))
+                            } else {
+                                fat_open_path_entry(&fs, &path)
+                            }
                         })
+                    });
+                let volume_directory = if want_dir {
+                    volume_entry
+                        .filter(|(_, _, attributes)| attributes & 0x10 != 0)
+                        .map(|(first_cluster, _, _)| first_cluster)
                 } else {
                     None
                 };
-                let volume_directory = volume_entry
-                    .filter(|(_, _, attributes)| attributes & 0x10 != 0)
-                    .map(|(first_cluster, _, _)| first_cluster);
                 let volume_not_directory = volume_entry
                     .is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
                 // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
@@ -12525,6 +12562,11 @@ impl ExecNtHandler {
                     .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
                     .flatten();
                 let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
+                let explorer_probe = !want_dir
+                    && !is_sxs
+                    && nb[..nlen].windows(8).any(|w| w == b"explorer");
+                let explorer_exists =
+                    explorer_probe && Self::fs_reactos_root_has_file(b"explorer.exe");
                 let userinit_shell_probe = if self.pi == 5 && !want_dir && !is_sxs {
                     if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                         Some(b"explorer.exe" as &[u8])
@@ -12566,6 +12608,7 @@ impl ExecNtHandler {
                 let is_services = exe_exists && nb[..nlen].windows(8).any(|w| w == b"services");
                 let is_lsass = exe_exists && nb[..nlen].windows(5).any(|w| w == b"lsass");
                 let is_userinit = exe_exists && nb[..nlen].windows(8).any(|w| w == b"userinit");
+                let is_explorer = explorer_exists;
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -12615,6 +12658,7 @@ impl ExecNtHandler {
                     || is_services
                     || is_lsass
                     || is_userinit
+                    || is_explorer
                     || dll_i.is_some()
                 {
                     let h = if let Some(first_cluster) = volume_directory {
@@ -12707,6 +12751,30 @@ impl ExecNtHandler {
                                 .is_ok()
                             {
                                 USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if is_explorer {
+                        if let Some(pe) = (&*ctx.explorer_pe).as_ref() {
+                            let (major, minor) = pe.subsystem_version();
+                            if (&mut *ctx.exe_images)
+                                .open(
+                                    self.pi,
+                                    b"explorer.exe",
+                                    h,
+                                    nt_exe_image::ImageMetadata {
+                                        pool_va: ctx.explorer_pool_va,
+                                        file_size: pe.bytes().len() as u64,
+                                        image_size: pe.size_of_image() as u64,
+                                        entry_rva: pe.entry_point_rva(),
+                                        subsystem: pe.subsystem(),
+                                        subsystem_major: major,
+                                        subsystem_minor: minor,
+                                    },
+                                )
+                                .is_ok()
+                            {
+                                EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -12822,6 +12890,8 @@ impl ExecNtHandler {
                     let (bytes, who) = info.unwrap();
                     if who == b"userinit.exe" {
                         USERINIT_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
+                    } else if who == b"explorer.exe" {
+                        EXPLORER_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
                     }
                     // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
                     for k in 0..8 {
@@ -12906,6 +12976,8 @@ impl ExecNtHandler {
                         LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
                     } else if leaf == b"userinit.exe" {
                         USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+                    } else if leaf == b"explorer.exe" {
+                        EXPLORER_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
                     }
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                     print_str(leaf);
@@ -13155,8 +13227,12 @@ impl ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let sp = get_recv_mr(16);
                 let sect = smss_stack_read(sp + 0x30); // SectionHandle
-                if self.pi == 2 {
-                    print_str(b"[wl-createproc] pi=2 sect=0x");
+                if self.pi == 2 || self.pi == 5 {
+                    print_str(if self.pi == 2 {
+                        b"[wl-createproc] pi=2 sect=0x" as &[u8]
+                    } else {
+                        b"[userinit-createproc] pi=5 sect=0x" as &[u8]
+                    });
                     print_hex(sect as u32);
                     print_str(b" exe-slot=");
                     print_u64(
@@ -13185,24 +13261,30 @@ impl ExecNtHandler {
                     self.process_spawn_desired_access = args[1] as u32;
                     self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
                     0
-                } else if self.pi == 2 {
+                } else if self.pi == 2 || self.pi == 5 {
                     let table = &mut *ctx.exe_images;
                     let child_pi = table
                         .index_for_section(self.pi, sect)
                         .and_then(|index| table.get(index))
-                        .and_then(|slot| match slot.leaf() {
-                            b"services.exe" => Some(3),
-                            b"lsass.exe" => Some(4),
-                            b"userinit.exe" => Some(5),
+                        .and_then(|slot| match (self.pi, slot.leaf()) {
+                            (2, b"services.exe") => Some(3),
+                            (2, b"lsass.exe") => Some(4),
+                            (2, b"userinit.exe") => Some(5),
+                            (5, b"explorer.exe") => Some(6),
                             _ => None,
                         });
                     if let Some(child_pi) = child_pi {
-                        if child_pi == 5 {
-                            USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                        if child_pi == 5 || child_pi == 6 {
+                            if child_pi == 5 {
+                                USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                            }
                             // CreateProcessAsUserW must name winlogon itself as ParentProcess. The
-                            // measured call uses NtCurrentProcess; resolve it through the same typed
+                            // shell launch likewise names userinit. The measured calls use
+                            // NtCurrentProcess; resolve it through the same typed
                             // process-handle path rather than accepting an arbitrary parent scalar.
-                            if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(2) {
+                            if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
                                 return nt_process::STATUS_INVALID_HANDLE;
                             }
                         }

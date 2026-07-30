@@ -672,10 +672,10 @@ pub(crate) unsafe fn spawn_sec_image(
         // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
         // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
         // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
-        // table base on its only run. Gated to winlogon (pi 2 — the interactive GUI client); the table
-        // frames are RO-mapped into winlogon lazily in service_sec_image's pi==2 reassert block. Other
-        // processes never touch GDI so seeding is unnecessary (and would map an unused 1.5 MiB table).
-        if pi == 2 {
+        // table base on its only run. Gate this to hosted GUI clients that import/use gdi32 before
+        // their first real GDI validation: winlogon (pi 2), userinit (pi 5), and explorer (pi 6).
+        // The table frames are RO-mapped lazily on that client's win32k dispatch path.
+        if pi == 2 || pi == 5 || pi == 6 {
             let gdi_server_base = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
                     as *const u64,
