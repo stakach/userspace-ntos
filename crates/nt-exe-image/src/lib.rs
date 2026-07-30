@@ -49,6 +49,87 @@ pub struct SpawnRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostedProcessImage {
+    pub pi: usize,
+    pub leaf: &'static [u8],
+    pub process_name: &'static str,
+    pub creator_pi_mask: u32,
+}
+
+impl HostedProcessImage {
+    pub fn allows_creator(&self, creator_pi: usize) -> bool {
+        creator_pi < u32::BITS as usize && (self.creator_pi_mask & (1u32 << creator_pi)) != 0
+    }
+}
+
+pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
+    HostedProcessImage {
+        pi: 0,
+        leaf: b"smss.exe",
+        process_name: "smss.exe",
+        creator_pi_mask: 0,
+    },
+    HostedProcessImage {
+        pi: 1,
+        leaf: b"csrss.exe",
+        process_name: "csrss.exe",
+        creator_pi_mask: 1 << 0,
+    },
+    HostedProcessImage {
+        pi: 2,
+        leaf: b"winlogon.exe",
+        process_name: "winlogon.exe",
+        creator_pi_mask: 1 << 0,
+    },
+    HostedProcessImage {
+        pi: 3,
+        leaf: b"services.exe",
+        process_name: "services.exe",
+        creator_pi_mask: 1 << 2,
+    },
+    HostedProcessImage {
+        pi: 4,
+        leaf: b"lsass.exe",
+        process_name: "lsass.exe",
+        creator_pi_mask: 1 << 2,
+    },
+    HostedProcessImage {
+        pi: 5,
+        leaf: b"userinit.exe",
+        process_name: "userinit.exe",
+        creator_pi_mask: 1 << 2,
+    },
+    HostedProcessImage {
+        pi: 6,
+        leaf: b"explorer.exe",
+        process_name: "explorer.exe",
+        creator_pi_mask: 1 << 5,
+    },
+];
+
+pub fn hosted_image_for_pi(pi: usize) -> Option<&'static HostedProcessImage> {
+    HOSTED_PROCESS_IMAGES.iter().find(|image| image.pi == pi)
+}
+
+pub fn hosted_image_for_leaf(leaf: &[u8]) -> Option<&'static HostedProcessImage> {
+    HOSTED_PROCESS_IMAGES
+        .iter()
+        .find(|image| eq_ascii_case(image.leaf, leaf))
+}
+
+pub fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
+    hosted_image_for_pi(pi).map(|image| image.process_name)
+}
+
+pub fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
+    hosted_image_for_leaf(leaf).map(|image| image.pi)
+}
+
+pub fn hosted_spawn_allowed(creator_pi: usize, leaf: &[u8]) -> bool {
+    hosted_image_for_leaf(leaf).is_some_and(|image| image.allows_creator(creator_pi))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseOutcome {
     NotFound,
     Retained(usize),
@@ -400,6 +481,27 @@ mod tests {
         assert_eq!(canonical_exe_leaf(br"x\userinit.exe.manifest"), None);
         assert_eq!(canonical_exe_leaf(br"x\bad name.exe"), None);
         assert_eq!(canonical_exe_leaf(br"x\"), None);
+    }
+
+    #[test]
+    fn hosted_catalog_resolves_current_boot_images() {
+        assert_eq!(hosted_process_name_for_pi(0), Some("smss.exe"));
+        assert_eq!(hosted_process_name_for_pi(6), Some("explorer.exe"));
+        assert_eq!(hosted_pi_for_leaf(b"SERVICES.EXE"), Some(3));
+        assert_eq!(hosted_pi_for_leaf(b"userinit2.exe"), None);
+    }
+
+    #[test]
+    fn hosted_catalog_enforces_creator_edges() {
+        assert!(hosted_spawn_allowed(0, b"csrss.exe"));
+        assert!(hosted_spawn_allowed(0, b"winlogon.exe"));
+        assert!(hosted_spawn_allowed(2, b"services.exe"));
+        assert!(hosted_spawn_allowed(2, b"lsass.exe"));
+        assert!(hosted_spawn_allowed(2, b"userinit.exe"));
+        assert!(hosted_spawn_allowed(5, b"explorer.exe"));
+        assert!(!hosted_spawn_allowed(2, b"explorer.exe"));
+        assert!(!hosted_spawn_allowed(5, b"userinit.exe"));
+        assert!(!hosted_spawn_allowed(0, b"explorer.exe"));
     }
 
     #[test]

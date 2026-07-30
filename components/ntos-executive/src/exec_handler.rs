@@ -1319,34 +1319,11 @@ impl ExecNtHandler {
     }
 
     fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
-        match pi {
-            0 => Some("smss.exe"),
-            1 => Some("csrss.exe"),
-            2 => Some("winlogon.exe"),
-            3 => Some("services.exe"),
-            4 => Some("lsass.exe"),
-            5 => Some("userinit.exe"),
-            6 => Some("explorer.exe"),
-            _ => None,
-        }
+        nt_exe_image::hosted_process_name_for_pi(pi)
     }
 
     fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
-        if leaf.eq_ignore_ascii_case(b"csrss.exe") {
-            Some(1)
-        } else if leaf.eq_ignore_ascii_case(b"winlogon.exe") {
-            Some(2)
-        } else if leaf.eq_ignore_ascii_case(b"services.exe") {
-            Some(3)
-        } else if leaf.eq_ignore_ascii_case(b"lsass.exe") {
-            Some(4)
-        } else if leaf.eq_ignore_ascii_case(b"userinit.exe") {
-            Some(5)
-        } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
-            Some(6)
-        } else {
-            None
-        }
+        nt_exe_image::hosted_pi_for_leaf(leaf)
     }
 
     fn refresh_process_manager_gates(&self) {
@@ -13328,12 +13305,7 @@ impl ExecNtHandler {
                     };
                     if let Some((reserved_child_pi, state, leaf, leaf_len)) = slot_info {
                         let leaf = &leaf[..leaf_len];
-                        let allowed = (self.pi == 2
-                            && (leaf.eq_ignore_ascii_case(b"services.exe")
-                                || leaf.eq_ignore_ascii_case(b"lsass.exe")
-                                || leaf.eq_ignore_ascii_case(b"userinit.exe")))
-                            || (self.pi == 5 && leaf.eq_ignore_ascii_case(b"explorer.exe"));
-                        if !allowed {
+                        if !nt_exe_image::hosted_spawn_allowed(self.pi, leaf) {
                             self.stop = true;
                             return 0xC000_0002;
                         }
