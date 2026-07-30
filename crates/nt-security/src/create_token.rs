@@ -167,6 +167,43 @@ pub const fn privilege_name_for_luid(luid: Luid) -> Option<&'static str> {
     })
 }
 
+/// Map a well-known privilege name back to its native LUID.
+pub fn luid_for_privilege_name(name: &str) -> Option<Luid> {
+    let low = match name {
+        SE_CREATE_TOKEN => 2,
+        SE_ASSIGN_PRIMARY_TOKEN => 3,
+        SE_LOCK_MEMORY => 4,
+        SE_INCREASE_QUOTA => 5,
+        SE_MACHINE_ACCOUNT => 6,
+        SE_TCB => 7,
+        SE_SECURITY => 8,
+        SE_TAKE_OWNERSHIP => 9,
+        SE_LOAD_DRIVER => 10,
+        SE_SYSTEM_PROFILE => 11,
+        SE_SYSTEM_TIME => 12,
+        SE_PROFILE_SINGLE_PROCESS => 13,
+        SE_INCREASE_BASE_PRIORITY => 14,
+        SE_CREATE_PAGEFILE => 15,
+        SE_CREATE_PERMANENT => 16,
+        SE_BACKUP => 17,
+        SE_RESTORE => 18,
+        SE_SHUTDOWN => 19,
+        SE_DEBUG => 20,
+        SE_AUDIT => 21,
+        SE_SYSTEM_ENVIRONMENT => 22,
+        SE_CHANGE_NOTIFY => 23,
+        SE_REMOTE_SHUTDOWN => 24,
+        SE_UNDOCK => 25,
+        SE_SYNC_AGENT => 26,
+        SE_ENABLE_DELEGATION => 27,
+        SE_MANAGE_VOLUME => 28,
+        SE_IMPERSONATE => 29,
+        SE_CREATE_GLOBAL => 30,
+        _ => return None,
+    };
+    Some(Luid::new(low))
+}
+
 /// Read one `PSID` **target** — the SID structure itself, at `va`.
 ///
 /// Validates the fixed 8-byte header (`Revision` must be 1, `SubAuthorityCount` at most 15) BEFORE

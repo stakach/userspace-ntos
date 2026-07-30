@@ -14,6 +14,7 @@ extern crate alloc;
 mod access;
 pub mod create_token;
 mod native_acl;
+mod native_sd;
 pub mod se_exports;
 mod sid;
 mod token;
@@ -29,10 +30,14 @@ pub use access::{
     TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_READ, TOKEN_WRITE,
 };
 pub use create_token::{
-    capture_token, ClientMemory, CapturedToken, CreateTokenArgs, MAX_CAPTURED_GROUPS,
-    MAX_CAPTURED_PRIVILEGES,
+    capture_token, luid_for_privilege_name, ClientMemory, CapturedToken, CreateTokenArgs,
+    MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
+pub use native_sd::{
+    capture_security_descriptor, native_acl_to_acl, STATUS_INVALID_SECURITY_DESCR,
+    STATUS_UNKNOWN_REVISION,
+};
 pub use sid::{Luid, Sid};
 pub use token::{
     AccessToken, PrivilegeAdjustment, PrivilegeAdjustmentSummary, SecurityImpersonationLevel,

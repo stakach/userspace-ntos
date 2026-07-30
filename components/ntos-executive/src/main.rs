@@ -874,6 +874,7 @@ pub const SSN_NT_CLOSE: u64 = 27;
 /// Registry writes aren't modelled (the regf hive is read-only) → best-effort no-op success.
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
+pub const SSN_NT_ACCESS_CHECK: u64 = 1;
 pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 /// NtCreateToken — lsasrv's `LsapLogonUser` mints the interactive logon token here
 /// (`references/reactos/dll/win32/lsasrv/authpackage.c:1655`). THIRTEEN arguments: 4 in registers,
@@ -10915,6 +10916,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),
             (NativeService::NtCreateToken, SSN_NT_CREATE_TOKEN as u32),
+            (NativeService::NtAccessCheck, SSN_NT_ACCESS_CHECK as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
             (NativeService::NtReadVirtualMemory, SSN_NT_READ_VM as u32),

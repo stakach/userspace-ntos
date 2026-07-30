@@ -3950,6 +3950,159 @@ impl ExecNtHandler {
             .is_some_and(|token| token.has_privilege(name))
     }
 
+    unsafe fn write_access_check_privilege_set(
+        &self,
+        privilege_set: u64,
+        privilege_set_length: u64,
+        captured_length: u32,
+        privileges_used: &[&'static str],
+    ) -> Result<(), u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        const PRIVILEGE_SET_MIN_SIZE: usize = 20; // sizeof(PRIVILEGE_SET), including ANYSIZE_ARRAY[1].
+        const PRIVILEGE_SET_HEADER_SIZE: usize = 8;
+        const LUID_AND_ATTRIBUTES_SIZE: usize = 12;
+        const SE_PRIVILEGE_USED_FOR_ACCESS: u32 = 0x8000_0000;
+
+        let mut luids = [nt_security::Luid::default(); 4];
+        let mut count = 0usize;
+        for name in privileges_used {
+            let Some(luid) = nt_security::luid_for_privilege_name(name) else {
+                continue;
+            };
+            let Some(slot) = luids.get_mut(count) else {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            *slot = luid;
+            count += 1;
+        }
+        let required = PRIVILEGE_SET_HEADER_SIZE
+            .checked_add(
+                count
+                    .checked_mul(LUID_AND_ATTRIBUTES_SIZE)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
+            )
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?
+            .max(PRIVILEGE_SET_MIN_SIZE);
+        if captured_length < required as u32 {
+            if !self.xas_write_u32(privilege_set_length, required as u32) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+
+        let mut output = [0u8; 64];
+        output[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+        for (index, luid) in luids[..count].iter().enumerate() {
+            let offset = PRIVILEGE_SET_HEADER_SIZE + index * LUID_AND_ATTRIBUTES_SIZE;
+            output[offset..offset + 4].copy_from_slice(&luid.low.to_le_bytes());
+            output[offset + 4..offset + 8].copy_from_slice(&luid.high.to_le_bytes());
+            output[offset + 8..offset + 12]
+                .copy_from_slice(&SE_PRIVILEGE_USED_FOR_ACCESS.to_le_bytes());
+        }
+        if !self.xas_try_write_buf(privilege_set, &output[..required]) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(())
+    }
+
+    /// `NtAccessCheck(SecurityDescriptor, ClientToken, DesiredAccess, GenericMapping, PrivilegeSet,
+    /// PrivilegeSetLength, GrantedAccess, AccessStatus)` — `ntoskrnl/se/accesschk.c:NtAccessCheck`.
+    unsafe fn nt_access_check(&mut self, ctx: &NativeCallContext, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_GENERIC_NOT_MAPPED: u32 = 0xC000_00E6;
+        const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const GENERIC_MASK: u32 = nt_security::GENERIC_ALL
+            | nt_security::GENERIC_EXECUTE
+            | nt_security::GENERIC_READ
+            | nt_security::GENERIC_WRITE;
+
+        if args.len() < 8 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut mapping_bytes = [0u8; 16];
+        if args[3] == 0 || !self.xas_read(args[3], &mut mapping_bytes) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut privilege_set_length_bytes = [0u8; 4];
+        if args[5] == 0 || !self.xas_read(args[5], &mut privilege_set_length_bytes) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let captured_privilege_set_length = u32::from_le_bytes(privilege_set_length_bytes);
+        if captured_privilege_set_length != 0
+            && !self.probe_user_output(args[4], captured_privilege_set_length as usize)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if !self.probe_user_output(args[6], 4) || !self.probe_user_output(args[7], 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let desired_access = args[2] as u32;
+        if desired_access & GENERIC_MASK != 0 {
+            return STATUS_GENERIC_NOT_MAPPED;
+        }
+
+        let token_id = match self.token_id_for_handle(args[1], TOKEN_QUERY) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let token = match self.token_store.get(token_id) {
+            Some(token) => token,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        if token.token_type != nt_security::TokenType::Impersonation {
+            return STATUS_NO_IMPERSONATION_TOKEN;
+        }
+        if token.impersonation_level < nt_security::SecurityImpersonationLevel::Identification {
+            return nt_security::STATUS_BAD_IMPERSONATION_LEVEL;
+        }
+
+        let mapping = nt_security::GenericMapping {
+            generic_read: u32::from_le_bytes(mapping_bytes[0..4].try_into().unwrap()),
+            generic_write: u32::from_le_bytes(mapping_bytes[4..8].try_into().unwrap()),
+            generic_execute: u32::from_le_bytes(mapping_bytes[8..12].try_into().unwrap()),
+            generic_all: u32::from_le_bytes(mapping_bytes[12..16].try_into().unwrap()),
+        };
+        let sd = {
+            let memory = ExecClientMemory { handler: &*self };
+            nt_security::capture_security_descriptor(&memory, args[0])
+        };
+        let sd = match sd {
+            Ok(sd) => sd,
+            Err(status) => return status,
+        };
+        if sd.owner.is_none() || sd.group.is_none() {
+            return nt_security::STATUS_INVALID_SECURITY_DESCR;
+        }
+
+        let mode = if ctx.previous_mode == nt_syscall::ProcessorMode::KernelMode {
+            nt_security::ProcessorMode::KernelMode
+        } else {
+            nt_security::ProcessorMode::UserMode
+        };
+        let result = nt_security::access_check(&sd, token, desired_access, &mapping, mode);
+        if let Err(status) = self.write_access_check_privilege_set(
+            args[4],
+            args[5],
+            captured_privilege_set_length,
+            &result.privileges_used,
+        ) {
+            return status;
+        }
+        if !self.xas_write_u32(args[6], result.granted_access)
+            || !self.xas_write_u32(args[7], result.status)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
     /// `NtSetInformationProcess(ProcessAccessToken)`: capture the native two-HANDLE structure, but
     /// assign only its Token member. ReactOS fills Thread in advapi32 and the kernel deliberately
     /// ignores it (`ntoskrnl/ps/query.c`, ProcessAccessToken), so resolving that handle here would
@@ -9719,6 +9872,7 @@ impl ExecNtHandler {
             NativeService::NtDuplicateToken => unsafe { self.nt_duplicate_token(args) },
             // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
+            NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
             NativeService::NtResumeThread => unsafe {
                 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
                 print_str(b"[thread-life] NtResumeThread pi=");

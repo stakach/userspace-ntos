@@ -895,6 +895,61 @@ fn luid_and_attributes(low: u32, high: i32, attributes: u32) -> Vec<u8> {
     entry
 }
 
+fn access_ace(ace_type: u8, mask: u32, sid: &[u8]) -> Vec<u8> {
+    let size = 8 + sid.len();
+    let mut ace = vec![0u8; size];
+    ace[0] = ace_type;
+    ace[2..4].copy_from_slice(&(size as u16).to_le_bytes());
+    ace[4..8].copy_from_slice(&mask.to_le_bytes());
+    ace[8..].copy_from_slice(sid);
+    ace
+}
+
+fn acl_with_aces(aces: &[Vec<u8>]) -> Vec<u8> {
+    let size = 8 + aces.iter().map(|ace| ace.len()).sum::<usize>();
+    let mut acl = vec![0u8; size];
+    acl[0] = 2;
+    acl[2..4].copy_from_slice(&(size as u16).to_le_bytes());
+    acl[4..6].copy_from_slice(&(aces.len() as u16).to_le_bytes());
+    let mut offset = 8;
+    for ace in aces {
+        acl[offset..offset + ace.len()].copy_from_slice(ace);
+        offset += ace.len();
+    }
+    acl
+}
+
+fn push_aligned(buffer: &mut Vec<u8>, payload: &[u8]) -> u32 {
+    let offset = buffer.len() as u32;
+    buffer.extend_from_slice(payload);
+    while buffer.len() & 3 != 0 {
+        buffer.push(0);
+    }
+    offset
+}
+
+fn self_relative_sd(owner: &[u8], group: &[u8], dacl: Option<&[u8]>) -> Vec<u8> {
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+
+    let mut sd = vec![0u8; 20];
+    sd[0] = 1;
+    let mut control = SE_SELF_RELATIVE;
+    let owner_offset = push_aligned(&mut sd, owner);
+    let group_offset = push_aligned(&mut sd, group);
+    let dacl_offset = if let Some(dacl) = dacl {
+        control |= SE_DACL_PRESENT;
+        push_aligned(&mut sd, dacl)
+    } else {
+        0
+    };
+    sd[2..4].copy_from_slice(&control.to_le_bytes());
+    sd[4..8].copy_from_slice(&owner_offset.to_le_bytes());
+    sd[8..12].copy_from_slice(&group_offset.to_le_bytes());
+    sd[16..20].copy_from_slice(&dacl_offset.to_le_bytes());
+    sd
+}
+
 // A mock layout mirroring exactly what lsasrv's `LsapLogonUser` hands `NtCreateToken` for
 // `LsaTokenInformationV1` (`dll/win32/lsasrv/authpackage.c:1655`).
 const USER_SID_VA: u64 = 0x0000_0007_0001_0000;
@@ -1204,6 +1259,82 @@ fn capture_acl_reads_exactly_acl_size_bytes() {
     client.map(0xA000, &[2, 0, 4, 0, 0, 0, 0, 0]);
     assert_eq!(capture_acl(&client, 0xA000), Err(STATUS_INVALID_ACL));
     assert_eq!(capture_acl(&client, 0), Err(STATUS_ACCESS_VIOLATION));
+}
+
+#[test]
+fn capture_self_relative_security_descriptor_drives_access_check() {
+    let mut client = MockClient::default();
+    let owner = native_sid(5, &[21, MACHINE, 1000]);
+    let group = native_sid(5, &[32, 545]);
+    let everyone = native_sid(1, &[0]);
+    let acl = acl_with_aces(&[access_ace(0, FILE_READ, &everyone)]);
+    let sd_bytes = self_relative_sd(&owner, &group, Some(&acl));
+    client.map(0xB000, &sd_bytes);
+
+    let sd = capture_security_descriptor(&client, 0xB000).unwrap();
+    assert_eq!(sd.owner, Some(Sid::local_account(MACHINE, 1000)));
+    assert_eq!(sd.group, Some(Sid::users()));
+    let result = access_check(
+        &sd,
+        &AccessToken::user(MACHINE),
+        FILE_READ,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+    );
+    assert!(result.granted());
+}
+
+#[test]
+fn capture_absolute_security_descriptor_dereferences_native_pointers() {
+    let mut client = MockClient::default();
+    let owner = native_sid(5, &[21, MACHINE, 1000]);
+    let group = native_sid(5, &[32, 545]);
+    let admins = native_sid(5, &[32, 544]);
+    let acl = acl_with_aces(&[access_ace(1, FILE_WRITE, &admins)]);
+
+    const SD_VA: u64 = 0x0000_0007_0003_0000;
+    const OWNER_VA: u64 = 0x0000_0007_0003_0100;
+    const GROUP_VA: u64 = 0x0000_0007_0003_0200;
+    const DACL_VA: u64 = 0x0000_0007_0003_0300;
+    let mut sd_bytes = vec![0u8; 40];
+    sd_bytes[0] = 1;
+    sd_bytes[2..4].copy_from_slice(&0x0004u16.to_le_bytes()); // SE_DACL_PRESENT
+    sd_bytes[8..16].copy_from_slice(&OWNER_VA.to_le_bytes());
+    sd_bytes[16..24].copy_from_slice(&GROUP_VA.to_le_bytes());
+    sd_bytes[32..40].copy_from_slice(&DACL_VA.to_le_bytes());
+    client.map(SD_VA, &sd_bytes);
+    client.map(OWNER_VA, &owner);
+    client.map(GROUP_VA, &group);
+    client.map(DACL_VA, &acl);
+
+    let sd = capture_security_descriptor(&client, SD_VA).unwrap();
+    assert_eq!(sd.owner, Some(Sid::local_account(MACHINE, 1000)));
+    assert_eq!(sd.group, Some(Sid::users()));
+    let result = access_check(
+        &sd,
+        &AccessToken::admin(MACHINE),
+        FILE_WRITE,
+        &file_mapping(),
+        ProcessorMode::UserMode,
+    );
+    assert_eq!(result.status, STATUS_ACCESS_DENIED);
+}
+
+#[test]
+fn capture_security_descriptor_reports_native_statuses() {
+    let mut client = MockClient::default();
+    client.map(
+        0xC000,
+        &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        capture_security_descriptor(&client, 0xC000),
+        Err(STATUS_UNKNOWN_REVISION)
+    );
+    assert_eq!(
+        capture_security_descriptor(&client, 0),
+        Err(STATUS_INVALID_SECURITY_DESCR)
+    );
 }
 
 #[test]
