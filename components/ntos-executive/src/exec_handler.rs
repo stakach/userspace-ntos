@@ -37,16 +37,15 @@ unsafe fn record_hosted_child_exe_open(
     leaf: &[u8],
     file_handle: u64,
 ) -> bool {
-    let image = if leaf.eq_ignore_ascii_case(b"services.exe") {
-        unsafe { (&*ctx.services_pe).as_ref() }.map(|pe| (pe, ctx.services_pool_va))
-    } else if leaf.eq_ignore_ascii_case(b"lsass.exe") {
-        unsafe { (&*ctx.lsass_pe).as_ref() }.map(|pe| (pe, ctx.lsass_pool_va))
-    } else if leaf.eq_ignore_ascii_case(b"userinit.exe") {
-        unsafe { (&*ctx.userinit_pe).as_ref() }.map(|pe| (pe, ctx.userinit_pool_va))
-    } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
-        unsafe { (&*ctx.explorer_pe).as_ref() }.map(|pe| (pe, ctx.explorer_pool_va))
-    } else {
-        None
+    let Some(hosted) = nt_exe_image::hosted_image_for_leaf(leaf) else {
+        return false;
+    };
+    let image = match hosted.pi {
+        3 => unsafe { (&*ctx.services_pe).as_ref() }.map(|pe| (pe, ctx.services_pool_va)),
+        4 => unsafe { (&*ctx.lsass_pe).as_ref() }.map(|pe| (pe, ctx.lsass_pool_va)),
+        5 => unsafe { (&*ctx.userinit_pe).as_ref() }.map(|pe| (pe, ctx.userinit_pool_va)),
+        6 => unsafe { (&*ctx.explorer_pe).as_ref() }.map(|pe| (pe, ctx.explorer_pool_va)),
+        _ => None,
     };
 
     let Some((pe, pool_va)) = image else {
@@ -61,10 +60,14 @@ unsafe fn record_hosted_child_exe_open(
         )
         .is_ok();
     if opened {
-        if leaf.eq_ignore_ascii_case(b"userinit.exe") {
-            USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-        } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
-            EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        match hosted.pi {
+            5 => {
+                USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+            }
+            6 => {
+                EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
     opened
@@ -5787,33 +5790,23 @@ impl ExecNtHandler {
             fat_open_path(&fs, &path[..n]).is_some()
         }
     }
+
+    fn hosted_image_exists(image: &nt_exe_image::HostedProcessImage) -> bool {
+        match image.image_root {
+            nt_exe_image::HostedImageRoot::System32 => unsafe { sys32_exists(image.leaf) },
+            nt_exe_image::HostedImageRoot::SystemRoot => Self::fs_reactos_root_has_file(image.leaf),
+        }
+    }
+
     /// Classify a folded probe path as one of the hosted-process EXEs by substring and return its
     /// canonical leaf (so existence resolves against the real file, not a possibly-malformed extracted
-    /// leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator). Most hosted
-    /// EXEs live under System32; explorer.exe is the shell and lives at the ReactOS root.
+    /// leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator). The shared
+    /// hosted-image catalog records whether that image lives under System32 or `%SystemRoot%`.
     /// `None` if it isn't a recognized EXE probe or if it's an SxS/actctx probe (which must fail so
     /// the loader doesn't take the .Local\/manifest path). Purely a name→canonical-leaf classifier;
     /// the caller still confirms the leaf on the real FS.
     fn exe_probe_canon(folded: &[u8], is_sxs: bool) -> Option<&'static [u8]> {
-        if is_sxs {
-            return None;
-        }
-        if folded.windows(5).any(|w| w == b"csrss") {
-            Some(b"csrss.exe")
-        } else if folded.windows(8).any(|w| w == b"winlogon") {
-            Some(b"winlogon.exe")
-        } else if folded.windows(8).any(|w| w == b"services") {
-            Some(b"services.exe")
-        } else if folded.windows(5).any(|w| w == b"lsass") {
-            // "lsass" is specific (lsasrv.dll folds to "lsasr", no match).
-            Some(b"lsass.exe")
-        } else if folded.windows(8).any(|w| w == b"userinit") {
-            Some(b"userinit.exe")
-        } else if folded.windows(8).any(|w| w == b"explorer") {
-            Some(b"explorer.exe")
-        } else {
-            None
-        }
+        nt_exe_image::hosted_probe_leaf(folded, is_sxs)
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
@@ -11086,14 +11079,16 @@ impl ExecNtHandler {
                 // The hosted-process EXE probes (csrss/winlogon/services/lsass) are the case where a
                 // pi==0 (smss) OR winlogon probe must resolve EXISTS even though the general DLL
                 // existence path below is gated pi>=1 (so smss's KnownDLLs probes fail → it launches
-                // csrss/winlogon). Existence comes from the REAL \reactos FS by-path (`sys32_exists`)
-                // — no hand-maintained list — but keyed on the CANONICAL leaf the substring
-                // classifies (ReactOS sometimes builds a malformed probe path, e.g.
+                // csrss/winlogon). Existence comes from the REAL \reactos FS by-path and the shared
+                // hosted-image catalog root — no hand-maintained list — keyed on the CANONICAL leaf
+                // the substring classifies (ReactOS sometimes builds a malformed probe path, e.g.
                 // `\??\C:\Windowsservices.exe` with no separator, so the extracted leaf is garbage;
                 // the substring reliably says WHICH EXE it wants). SxS probes are rejected (loader
                 // must not take the .Local\/manifest path). Content delivery stays on nt-dll-registry.
                 let exe_canon = Self::exe_probe_canon(&nb[..nlen], is_sxs);
-                let exe_exists = exe_canon.is_some_and(|leaf| unsafe { sys32_exists(leaf) });
+                let exe_exists = exe_canon
+                    .and_then(nt_exe_image::hosted_image_for_leaf)
+                    .is_some_and(Self::hosted_image_exists);
                 // General DLL existence (pi>=1) also comes from the real FS by-path.
                 let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
                 let status: u32 = if exe_exists {
@@ -12654,18 +12649,17 @@ impl ExecNtHandler {
                     .is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
                 // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
                 // RtlCreateUserProcess / winlogon's CreateProcessInternalW): the substring classifies
-                // WHICH EXE, existence resolves against its CANONICAL leaf on the real \reactos FS
-                // (`exe_probe_canon` + `sys32_exists`) — path-form/malformed-path independent, no
-                // hand-maintained list. Loader manifest opens are unaffected (SxS rejected).
+                // WHICH EXE, existence resolves against its CANONICAL leaf + root on the real
+                // \reactos FS (`exe_probe_canon` + hosted-image catalog) — path-form/malformed-path
+                // independent, no hand-maintained list. Loader manifest opens are unaffected (SxS
+                // rejected).
                 let exe_canon = (!want_dir)
                     .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
                     .flatten();
-                let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
-                let explorer_probe = !want_dir
-                    && !is_sxs
-                    && nb[..nlen].windows(8).any(|w| w == b"explorer");
-                let explorer_exists =
-                    explorer_probe && Self::fs_reactos_root_has_file(b"explorer.exe");
+                let hosted_exe_leaf = exe_canon.and_then(|leaf| {
+                    let image = nt_exe_image::hosted_image_for_leaf(leaf)?;
+                    Self::hosted_image_exists(image).then_some(image.leaf)
+                });
                 let userinit_shell_probe = if self.pi == 5 && !want_dir && !is_sxs {
                     if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                         Some(b"explorer.exe" as &[u8])
@@ -12702,13 +12696,6 @@ impl ExecNtHandler {
                 if self.pi == 2 && !want_dir && nb[..nlen].windows(8).any(|w| w == b"userinit") {
                     WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
                 }
-                let hosted_exe_leaf = if exe_exists {
-                    exe_canon
-                } else if explorer_exists {
-                    Some(b"explorer.exe" as &[u8])
-                } else {
-                    None
-                };
                 let is_csrss = hosted_exe_leaf
                     .is_some_and(|leaf| leaf.eq_ignore_ascii_case(b"csrss.exe"));
                 let is_winlogon = hosted_exe_leaf

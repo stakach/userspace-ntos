@@ -49,10 +49,20 @@ pub struct SpawnRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedImageRoot {
+    System32,
+    SystemRoot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedProcessImage {
     pub pi: usize,
     pub leaf: &'static [u8],
     pub process_name: &'static str,
+    pub nt_image_path: &'static [u8],
+    pub command_line: &'static [u8],
+    pub image_root: HostedImageRoot,
+    pub probe_fragment: &'static [u8],
     pub creator_pi_mask: u32,
 }
 
@@ -67,42 +77,70 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         pi: 0,
         leaf: b"smss.exe",
         process_name: "smss.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\smss.exe",
+        command_line: b"smss.exe",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"",
         creator_pi_mask: 0,
     },
     HostedProcessImage {
         pi: 1,
         leaf: b"csrss.exe",
         process_name: "csrss.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\csrss.exe",
+        command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"csrss",
         creator_pi_mask: 1 << 0,
     },
     HostedProcessImage {
         pi: 2,
         leaf: b"winlogon.exe",
         process_name: "winlogon.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\winlogon.exe",
+        command_line: b"winlogon.exe",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"winlogon",
         creator_pi_mask: 1 << 0,
     },
     HostedProcessImage {
         pi: 3,
         leaf: b"services.exe",
         process_name: "services.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\services.exe",
+        command_line: b"services.exe",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"services",
         creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 4,
         leaf: b"lsass.exe",
         process_name: "lsass.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\lsass.exe",
+        command_line: b"lsass.exe",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"lsass",
         creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 5,
         leaf: b"userinit.exe",
         process_name: "userinit.exe",
+        nt_image_path: b"\\SystemRoot\\System32\\userinit.exe",
+        command_line: b"userinit.exe",
+        image_root: HostedImageRoot::System32,
+        probe_fragment: b"userinit",
         creator_pi_mask: 1 << 2,
     },
     HostedProcessImage {
         pi: 6,
         leaf: b"explorer.exe",
         process_name: "explorer.exe",
+        nt_image_path: b"\\SystemRoot\\explorer.exe",
+        command_line: b"explorer.exe",
+        image_root: HostedImageRoot::SystemRoot,
+        probe_fragment: b"explorer",
         creator_pi_mask: 1 << 5,
     },
 ];
@@ -127,6 +165,23 @@ pub fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
 
 pub fn hosted_spawn_allowed(creator_pi: usize, leaf: &[u8]) -> bool {
     hosted_image_for_leaf(leaf).is_some_and(|image| image.allows_creator(creator_pi))
+}
+
+pub fn hosted_probe_image(
+    folded_path: &[u8],
+    is_sxs: bool,
+) -> Option<&'static HostedProcessImage> {
+    if is_sxs {
+        return None;
+    }
+    HOSTED_PROCESS_IMAGES
+        .iter()
+        .filter(|image| !image.probe_fragment.is_empty())
+        .find(|image| contains_ascii_case(folded_path, image.probe_fragment))
+}
+
+pub fn hosted_probe_leaf(folded_path: &[u8], is_sxs: bool) -> Option<&'static [u8]> {
+    hosted_probe_image(folded_path, is_sxs).map(|image| image.leaf)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,6 +544,37 @@ mod tests {
         assert_eq!(hosted_process_name_for_pi(6), Some("explorer.exe"));
         assert_eq!(hosted_pi_for_leaf(b"SERVICES.EXE"), Some(3));
         assert_eq!(hosted_pi_for_leaf(b"userinit2.exe"), None);
+    }
+
+    #[test]
+    fn hosted_catalog_records_boot_paths_and_locations() {
+        let services = hosted_image_for_pi(3).unwrap();
+        assert_eq!(services.nt_image_path, b"\\SystemRoot\\System32\\services.exe");
+        assert_eq!(services.command_line, b"services.exe");
+        assert_eq!(services.image_root, HostedImageRoot::System32);
+
+        let explorer = hosted_image_for_leaf(b"EXPLORER.EXE").unwrap();
+        assert_eq!(explorer.nt_image_path, b"\\SystemRoot\\explorer.exe");
+        assert_eq!(explorer.command_line, b"explorer.exe");
+        assert_eq!(explorer.image_root, HostedImageRoot::SystemRoot);
+    }
+
+    #[test]
+    fn hosted_probe_classifier_preserves_boot_quirks() {
+        assert_eq!(
+            hosted_probe_leaf(br"\??\C:\Windowsservices.exe", false),
+            Some(b"services.exe" as &[u8])
+        );
+        assert_eq!(
+            hosted_probe_leaf(br"\SystemRoot\explorer.exe", false),
+            Some(b"explorer.exe" as &[u8])
+        );
+        assert_eq!(hosted_probe_leaf(br"\SystemRoot\System32\smss.exe", false), None);
+        assert_eq!(hosted_probe_leaf(br"\SystemRoot\System32\lsasrv.dll", false), None);
+        assert_eq!(
+            hosted_probe_leaf(br"\SystemRoot\System32\userinit.exe.manifest", true),
+            None
+        );
     }
 
     #[test]

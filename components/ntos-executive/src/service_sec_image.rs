@@ -32,7 +32,7 @@ fn sec_image_forward_run() -> u64 {
 }
 
 struct HostedExeSpawn<'a> {
-    pi: usize,
+    image: &'static nt_exe_image::HostedProcessImage,
     badge: u64,
     priority: u64,
     env_scratch_va: u64,
@@ -40,9 +40,6 @@ struct HostedExeSpawn<'a> {
     heap_mirror_va: u64,
     image_mirror_va: u64,
     scratch_base: u64,
-    image_path: &'static [u8],
-    cmd_line: &'static [u8],
-    leaf: &'static [u8],
     pe: &'a nt_pe_loader::PeFile<'static>,
     spawned: &'static AtomicU64,
 }
@@ -54,9 +51,10 @@ fn hosted_exe_spawn_for<'a>(
     userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
 ) -> Option<HostedExeSpawn<'a>> {
-    match request.child_pi {
+    let image = nt_exe_image::hosted_image_for_pi(request.child_pi)?;
+    match image.pi {
         3 => services_pe.as_ref().map(|pe| HostedExeSpawn {
-            pi: 3,
+            image,
             badge: SERVICES_BADGE,
             priority: 103,
             env_scratch_va: SERVICES_ENV_SCRATCH_VA,
@@ -64,14 +62,11 @@ fn hosted_exe_spawn_for<'a>(
             heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
             image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
             scratch_base: SERVICES_SCRATCH_BASE,
-            image_path: b"\\SystemRoot\\System32\\services.exe",
-            cmd_line: b"services.exe",
-            leaf: b"services.exe",
             pe,
             spawned: &SERVICES_SPAWNED,
         }),
         4 => lsass_pe.as_ref().map(|pe| HostedExeSpawn {
-            pi: 4,
+            image,
             badge: LSASS_BADGE,
             priority: 104,
             env_scratch_va: LSASS_ENV_SCRATCH_VA,
@@ -79,14 +74,11 @@ fn hosted_exe_spawn_for<'a>(
             heap_mirror_va: LSASS_HEAP_MIRROR_VA,
             image_mirror_va: LSASS_IMAGE_MIRROR_VA,
             scratch_base: LSASS_SCRATCH_BASE,
-            image_path: b"\\SystemRoot\\System32\\lsass.exe",
-            cmd_line: b"lsass.exe",
-            leaf: b"lsass.exe",
             pe,
             spawned: &LSASS_SPAWNED,
         }),
         5 => userinit_pe.as_ref().map(|pe| HostedExeSpawn {
-            pi: 5,
+            image,
             badge: USERINIT_BADGE,
             priority: 105,
             env_scratch_va: USERINIT_ENV_SCRATCH_VA,
@@ -94,14 +86,11 @@ fn hosted_exe_spawn_for<'a>(
             heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
             image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
             scratch_base: USERINIT_SCRATCH_BASE,
-            image_path: b"\\SystemRoot\\System32\\userinit.exe",
-            cmd_line: b"userinit.exe",
-            leaf: b"userinit.exe",
             pe,
             spawned: &USERINIT_SPAWNED,
         }),
         6 => explorer_pe.as_ref().map(|pe| HostedExeSpawn {
-            pi: 6,
+            image,
             badge: EXPLORER_BADGE,
             priority: 106,
             env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
@@ -109,9 +98,6 @@ fn hosted_exe_spawn_for<'a>(
             heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
             image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
             scratch_base: EXPLORER_SCRATCH_BASE,
-            image_path: b"\\SystemRoot\\explorer.exe",
-            cmd_line: b"explorer.exe",
-            leaf: b"explorer.exe",
             pe,
             spawned: &EXPLORER_SPAWNED,
         }),
@@ -127,14 +113,15 @@ unsafe fn spawn_requested_hosted_exe(
     nt_handler: &mut ExecNtHandler,
     exe_images: &mut nt_exe_image::ImageTable<8>,
 ) -> Result<u64, u32> {
+    let pi = spec.image.pi;
     let child_pid = nt_handler
-        .pm_pid_for_pi(spec.pi)
+        .pm_pid_for_pi(pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let child_pml4 = spawn_sec_image(
-        spec.pi as u64,
+        pi as u64,
         spec.pe,
         mint_badged(fault_ep, spec.badge),
         NTDLL_BASE,
@@ -144,17 +131,17 @@ unsafe fn spawn_requested_hosted_exe(
         spec.stack_mirror_va,
         spec.heap_mirror_va,
         spec.image_mirror_va,
-        spec.image_path,
-        spec.cmd_line,
+        spec.image.nt_image_path,
+        spec.image.command_line,
         0,
     );
-    procs[spec.pi].pid = child_pid as u64;
-    procs[spec.pi].pml4 = child_pml4;
-    PM_PML4S[spec.pi].store(child_pml4, Ordering::Relaxed);
-    procs[spec.pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
-    procs[spec.pi].scratch_base = spec.scratch_base;
+    procs[pi].pid = child_pid as u64;
+    procs[pi].pml4 = child_pml4;
+    PM_PML4S[pi].store(child_pml4, Ordering::Relaxed);
+    procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
+    procs[pi].scratch_base = spec.scratch_base;
     map_demand_scratch_pts(spec.scratch_base);
-    nt_handler.bind_main_thread_entry(spec.pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
+    nt_handler.bind_main_thread_entry(pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
 
     let process_handle = match nt_handler.pm.insert_handle(
         creator_pid,
@@ -181,13 +168,13 @@ unsafe fn spawn_requested_hosted_exe(
     spec.spawned.store(1, Ordering::Relaxed);
 
     print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
-    print_str(spec.leaf);
+    print_str(spec.image.leaf);
     print_str(b" (badge ");
     print_u64(spec.badge);
     print_str(b") -> handle 0x");
     print_hex((process_handle >> 32) as u32);
     print_hex(process_handle as u32);
-    if spec.pi >= 5 {
+    if pi >= 5 {
         print_str(b"; initial thread awaits NtCreateThread\n");
     } else {
         print_str(b"; its ntdll loader now multiplexed into this loop\n");
