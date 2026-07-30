@@ -183,7 +183,7 @@ pub const SH_REQ_A0: u64 = 0x58; // in:  handler arg0 (rcx)
 pub const SH_REQ_A1: u64 = 0x60; // in:  handler arg1 (rdx)
 pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
 pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
-pub const SH_REQ_STATUS: u64 = 0x78; // out: handler NTSTATUS (i32)
+pub const SH_REQ_STATUS: u64 = 0x78; // out: handler return value (u64; low i32 remains NTSTATUS-compatible)
 pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
 // ★ BATCH 44 — STACK-ARG TAIL for WIDE win32k SSNs. The x64 win64 ABI passes args 1-4 in rcx/rdx/r8/r9
 // and args 5+ on the caller's stack. `dispatch_ssn` originally forwarded ONLY the 4 register args, so a
@@ -384,6 +384,7 @@ pub fn win32k_ssn_argc(ssn: u64) -> u64 {
         0x1277 => 5, // UserSetImeHotKey
         0x128a => 6, // UserTrackPopupMenuEx
         0x1291 => 10, // UserUpdateLayeredWindow
+        0x1298 => 4, // UserSetWindowLongPtr
         0x1299 => 6, // UserWin32PoolAllocationStats
         _ => 0,
     }
@@ -441,6 +442,13 @@ const THREADINFO_PPI_OFF: u64 = 0x58;
 /// `UserCreateObject(ht, Desktop, pi->ptiList, …)`). Our hosted PROCESSINFO leaves it NULL, so the
 /// class call-proc path deref'd a NULL thread (`pti->ppi`, pti+0x58) at RVA 0xfd3fd.
 const PROCESSINFO_PTILIST_OFF: u64 = 0xD8;
+/// WND->head.pti and WND->lpfnWndProc offsets (ntuser.h: THRDESKHEAD at +0, lpfnWndProc after
+/// rcWindow/rcClient). Used only for bounded diagnostics around SetWindowLongPtr(GWLP_WNDPROC).
+const WND_HEAD_PTI_OFF: u64 = 0x10;
+const WND_LPFNWNDPROC_OFF: u64 = 0x90;
+const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
+const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
+static WIN32K_EXPLORER_SETWNDPROC_TRACES: AtomicU64 = AtomicU64::new(0);
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
 /// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
 /// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
@@ -2489,8 +2497,8 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                         drv: 0,
                     });
+                    write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
-                    let _ = info;
                     // The nested completion IS the next receive.
                     out = W32_DISPATCH_LABEL << 12;
                 }
@@ -3166,8 +3174,8 @@ unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
 /// thread↔desktop re-assert,
 /// the SSN_TEST_FAULT self-test, NtUserInitialize event registration + the post-init font/winsta seed,
 /// and the SSDT dispatch via `dispatch_ssn` (which retains the exact-arity wide-arg transmute). Returns
-/// `(status, 0)` — win32k has no IoStatus.Information (its status@0x78 aliases the harness's info@0x78,
-/// so info=0 written first then status is byte-behaviour-correct — see `component_main`).
+/// `(low32, full_result)` — win32k uses pointer-width syscall returns, with the low 32 bits kept as
+/// status-compatible data for legacy harness readers.
 unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
     let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
@@ -3206,6 +3214,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // performed by co_UserFreeWindow.
     let t = read_volatile(SLOT_W32THREAD as *const u64);
     let t = if t == 0 { PH_W32THREAD_VA } else { t };
+    sync_threadinfo_process(t);
     // ★ Publish the dispatch THREADINFO into the CURRENT-THREAD OBJECT (`Thread->Tcb.Win32Thread`).
     // `PsGetCurrentThreadWin32Thread()` is an EXPORT we bind, but the MSVC win32k build also inlines
     // it as `PsGetCurrentThread(); mov rcx,[rax+0x250]` — and that inline read is the one
@@ -3299,13 +3308,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         register_event_object(a1);
         register_event_object(a2);
     }
-    let status = if ssn == SSN_TEST_FAULT {
+    let result = if ssn == SSN_TEST_FAULT {
         // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
         // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
         // page (observability into SH_REQ_A0) and report the sentinel status.
         let probe = read_volatile(TEST_FAULT_VA as *const u64);
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
-        TEST_FAULT_STATUS
+        TEST_FAULT_STATUS as u32 as u64
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
@@ -3320,7 +3329,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
     //       hWinSta=0x4, and gpdeskInputDesktop is set). A bRedraw=FALSE SwitchDesktop establishes the
     //       active desktop before co_IntGraphicsCheck creates the real device and surface.
-    if ssn == SSN_NT_USER_INITIALIZE_REAL && status == 0 && !DESKTOP_GFX_SEEDED {
+    if ssn == SSN_NT_USER_INITIALIZE_REAL && result as u32 == 0 && !DESKTOP_GFX_SEEDED {
         DESKTOP_GFX_SEEDED = true;
         load_system_font();
         create_winsta_and_desktop();
@@ -3339,14 +3348,14 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex(mdev as u32);
         print_str(b"\n");
     }
-    (status, 0)
+    (result as u32 as i32, result)
 }
 
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
-/// invoke its handler with up to four win64 register args. Returns the handler NTSTATUS (or
-/// `STATUS_INVALID_SYSTEM_SERVICE` if the SSN is out of range / unregistered).
-unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
-    const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
+/// invoke its handler with the correct win64 register/stack args. Returns the pointer-width handler
+/// result (or `STATUS_INVALID_SYSTEM_SERVICE` in the low 32 bits if the SSN is invalid).
+unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    const STATUS_INVALID_SYSTEM_SERVICE: u64 = 0xC000_001Cu32 as u64;
     let base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
     let count = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *const u32) as u64;
     if base == 0 || ssn < WIN32K_SERVICE_BASE {
@@ -3389,27 +3398,88 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
         print_hex(ngui);
         print_str(if gpdesk != 0 && gpdesk == target_body { b" [ALREADY-CURRENT!]\n" } else { b"\n" });
     }
+    let trace_setwndproc = ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR
+        && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
+        && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6;
+    let trace_no = if trace_setwndproc {
+        WIN32K_EXPLORER_SETWNDPROC_TRACES.fetch_add(1, Ordering::Relaxed)
+    } else {
+        u64::MAX
+    };
+    let trace_pwnd = if trace_no < 32 { hwnd_to_pwnd(a0) } else { 0 };
+    let trace_pti = if trace_pwnd != 0 {
+        read_volatile((trace_pwnd + WND_HEAD_PTI_OFF) as *const u64)
+    } else {
+        0
+    };
+    let trace_owner_ppi = if trace_pti != 0 {
+        read_volatile((trace_pti + THREADINFO_PPI_OFF) as *const u64)
+    } else {
+        0
+    };
+    let trace_current_ppi = if trace_no < 32 {
+        read_volatile(SLOT_W32PROCESS as *const u64)
+    } else {
+        0
+    };
+    let trace_old_proc = if trace_pwnd != 0 {
+        read_volatile((trace_pwnd + WND_LPFNWNDPROC_OFF) as *const u64)
+    } else {
+        0
+    };
+
     let ret = if nargs <= 4 {
-        let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
+        let f: extern "win64" fn(u64, u64, u64, u64) -> u64 = core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3)
     } else if nargs <= 8 {
-        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> i32 =
+        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3, s(4), s(5), s(6), s(7))
     } else if nargs <= 12 {
-        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> i32 =
+        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11))
     } else {
         // Up to 16 args (covers NtUserCreateWindowEx = 15). Extra tail entries are 0 (unused).
         let f: extern "win64" fn(
             u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
-        ) -> i32 = core::mem::transmute(handler as *const ());
+        ) -> u64 = core::mem::transmute(handler as *const ());
         f(
             a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11), s(12), s(13), s(14),
             s(15),
         )
     };
+    if trace_no < 32 {
+        let new_proc = if trace_pwnd != 0 {
+            read_volatile((trace_pwnd + WND_LPFNWNDPROC_OFF) as *const u64)
+        } else {
+            0
+        };
+        print_str(b"[win32k-setwndproc] explorer hwnd=0x");
+        print_hex(a0 as u32);
+        print_str(b" pwnd=0x");
+        print_hex((trace_pwnd >> 32) as u32);
+        print_hex(trace_pwnd as u32);
+        print_str(b" old=0x");
+        print_hex((trace_old_proc >> 32) as u32);
+        print_hex(trace_old_proc as u32);
+        print_str(b" requested=0x");
+        print_hex((a2 >> 32) as u32);
+        print_hex(a2 as u32);
+        print_str(b" new=0x");
+        print_hex((new_proc >> 32) as u32);
+        print_hex(new_proc as u32);
+        print_str(b" owner-ppi=0x");
+        print_hex((trace_owner_ppi >> 32) as u32);
+        print_hex(trace_owner_ppi as u32);
+        print_str(b" current-ppi=0x");
+        print_hex((trace_current_ppi >> 32) as u32);
+        print_hex(trace_current_ppi as u32);
+        print_str(b" ret=0x");
+        print_hex((ret >> 32) as u32);
+        print_hex(ret as u32);
+        print_str(b"\n");
+    }
 
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
     //
@@ -3680,6 +3750,7 @@ unsafe fn setup_dispatch_context() {
 /// the thread's CLIENTINFO. `pool_alloc` returns zeroed memory, so an already-initialized field is
 /// left as-is.
 unsafe fn init_threadinfo_placeholder(w32thread: u64) {
+    sync_threadinfo_process(w32thread);
     // THREADINFO LIST_ENTRY heads the window-manager / paint path touches (offsets from win32.h,
     // W32THREAD prefix = 0x50; anchored to the confirmed +0x88 pClientInfo / +0x90 TIF_flags):
     //   +0xB0  SentMessagesListHead   (message.c / co_MsqSendMessage)
@@ -3728,6 +3799,45 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
         if pcti != 0 {
             write_volatile((w32thread + 0x70) as *mut u64, pcti);
         }
+    }
+}
+
+unsafe fn sync_threadinfo_process(w32thread: u64) {
+    if w32thread == 0 {
+        return;
+    }
+    let ppi = read_volatile(SLOT_W32PROCESS as *const u64);
+    if ppi == 0 {
+        return;
+    }
+    let slot = (w32thread + THREADINFO_PPI_OFF) as *mut u64;
+    if read_volatile(slot) != ppi {
+        write_volatile(slot, ppi);
+    }
+    let pti_list = (ppi + PROCESSINFO_PTILIST_OFF) as *mut u64;
+    if read_volatile(pti_list) == 0 {
+        write_volatile(pti_list, w32thread);
+    }
+}
+
+unsafe fn hwnd_to_pwnd(hwnd: u64) -> u64 {
+    let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
+    if ahelist == 0 || (hwnd & 0xffff) < 0x20 {
+        return 0;
+    }
+    let handles = read_volatile(ahelist as *const u64);
+    let nb = read_volatile((ahelist + 0x10) as *const u32) as u64;
+    let index = ((hwnd & 0xffff) - 0x20) >> 1;
+    if handles == 0 || index >= nb {
+        return 0;
+    }
+    let entry = handles + index * 0x18;
+    if read_volatile((entry + 0x10) as *const u8) == 1
+        && read_volatile((entry + 0x12) as *const u16) == (hwnd >> 16) as u16
+    {
+        read_volatile(entry as *const u64)
+    } else {
+        0
     }
 }
 

@@ -61,7 +61,7 @@ pub(crate) struct CompletedWin32kDispatch {
     pub ssn: u64,
     pub args: [u64; 4],
     pub caller_sp: u64,
-    pub status: i32,
+    pub status: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1571,7 +1571,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     // The nested level returned ITS OWN result, the nesting really was >= 2 levels deep on ONE
     // reply object, and no reply along the way found that object unbound.
     if nested_ok
-        && nested_status == win32k_subsystem::TEST_FAULT_STATUS
+        && nested_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64
         && depth_before_nested >= 1
         && max_depth_after >= 2
         && reply_errors_after == reply_errors_before
@@ -1613,7 +1613,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         && depth_after == 0
         && suspended_after == 0
         && probe_ok
-        && probe_status == win32k_subsystem::TEST_FAULT_STATUS
+        && probe_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64
     {
         proof |= NESTED_SLIP_DRAINED_IDLE;
     }
@@ -1784,7 +1784,7 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     // round-trips and COMPLETES. Had the unwind not resumed + re-parked it, this would WALL — which
     // is exactly what the wedge looked like.
     let (probe_status, probe_ok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
-    if probe_ok && probe_status == win32k_subsystem::TEST_FAULT_STATUS {
+    if probe_ok && probe_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64 {
         proof |= DEAD_CLIENT_INJECT_WIN32K_IDLE;
     }
     print_str(b"[cb-inject] recovery: frames-unwound=");
@@ -2082,7 +2082,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     };
     let completed = nt_user_callback::completed_outer_context(
         completed_frame.saved_user_context(),
-        component.status as u32 as u64,
+        component.result,
         completed_frame.outer_resume_ip(),
     );
     if tcb_write_regs20(tcb, &completed, false) != 0 {
@@ -2097,7 +2097,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             ssn: dispatch_context.ssn,
             args: dispatch_context.args,
             caller_sp: dispatch_context.caller_sp,
-            status: component.status,
+            status: component.result,
         }),
     })
 }
@@ -2738,7 +2738,7 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
 /// fill the request in the shared page, reply (the Call returns → the component runs the handler),
 /// then demand-page the handler's faults until the component issues its NEXT dispatch Call = "done".
 /// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
-pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32, bool) {
+pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (u64, bool) {
     let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
     win32k_dispatch_wide(
         ssn, a0, a1, a2, a3, 0, 0, &[],
@@ -2772,11 +2772,11 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     nargs: u64,
     stack_args: &[u64],
     client: Win32kClientContext,
-) -> (i32, bool) {
+) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     if w_fault == 0 || WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
-        return (0xC000_0001u32 as i32, false);
+        return (0xC000_0001u64, false);
     }
     // A suspended callback only carries the compact pump identity. Latch the full dispatch's TEB
     // here so a callback-driven nested win32k call retains the same current-thread context.
@@ -2792,7 +2792,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
     }
     if !w32_client_attach(client_pi) {
-        return (0xC000_0001u32 as i32, false);
+        return (0xC000_0001u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2809,7 +2809,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
                 nt_user_callback::ContinuationError::Client => b"client identity mismatch\n",
                 nt_user_callback::ContinuationError::Correlation => b"dispatch correlation mismatch\n",
             });
-            return (0xC000_000Du32 as i32, false);
+            return (0xC000_000Du64, false);
         }
     };
     let callback_frame = (sh + win32k_subsystem::SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
@@ -2919,14 +2919,14 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
     if nested_user_callback {
         if pr.callback_suspended {
-            return (pr.status, false);
+            return (pr.result, false);
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
             print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
-            return (pr.status, false);
+            return (pr.result, false);
         }
     }
-    (pr.status, pr.completed)
+    (pr.result, pr.completed)
 }
 
 /// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's `(rip, rsp, rax)`.

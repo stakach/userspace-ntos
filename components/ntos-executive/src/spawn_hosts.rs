@@ -716,6 +716,9 @@ unsafe fn pump_resume_recv(ch: &PumpChannel, len: u64, r0: u64) -> (u64, u64, u6
 #[derive(Clone, Copy)]
 pub(crate) struct PumpResult {
     pub status: i32,
+    /// Pointer-width dispatch return. For IRP components this mirrors `status`; for win32k it is
+    /// the full handler RAX, needed by NtUser/NtGdi APIs that return handles or LONG_PTR values.
+    pub result: u64,
     pub completed: bool,
     pub callback_suspended: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
@@ -1072,24 +1075,32 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
         crate::print_u64(e);
         crate::print_str(b" (its reply object stays bound to a thread that will never run again)\n");
     }
-    let status = if completed {
+    let (status, result) = if completed {
         // Proof-of-wiring: count each serviced dispatch by kind.
         match ch.caps.kind {
             ReqKind::Irp => HARNESS_IRP_DISPATCHES.fetch_add(1, Ordering::Relaxed),
             ReqKind::Syscall => HARNESS_SYSCALL_DISPATCHES.fetch_add(1, Ordering::Relaxed),
         };
-        let so = match ch.caps.kind {
-            ReqKind::Irp => SH_REQ_STATUS_IRP,
-            ReqKind::Syscall => SH_REQ_STATUS_SYSCALL,
-        };
-        core::ptr::read_volatile((ch.shared_va + so) as *const i32)
+        match ch.caps.kind {
+            ReqKind::Irp => {
+                let status = core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_IRP) as *const i32);
+                (status, status as u32 as u64)
+            }
+            ReqKind::Syscall => {
+                let result = core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_SYSCALL) as *const u64);
+                (result as u32 as i32, result)
+            }
+        }
     } else if callback_suspended {
-        nt_user_callback::STATUS_PENDING
+        let status = nt_user_callback::STATUS_PENDING;
+        (status, status as u32 as u64)
     } else {
-        0xC000_0001u32 as i32 // STATUS_UNSUCCESSFUL
+        let status = 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
+        (status, status as u32 as u64)
     };
     PumpResult {
         status,
+        result,
         completed,
         callback_suspended,
         wall_ip,
@@ -1223,10 +1234,10 @@ pub(crate) unsafe fn component_main(
         let (_label, _tag, _, _, _) = crate::driver_launch::call_on(dispatch_label << 12);
         let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
         let (st, info) = dispatch(&DispatchReq { sel, drv });
-        // Write info FIRST, then status LAST: the FSD has distinct offsets (status@0x70, info@0x78)
-        // so order is irrelevant; win32k's status@0x78 ALIASES info@0x78, so writing info(0) first
-        // and status last means the status is what survives at 0x78 (win32k's closure returns
-        // info=0). Byte-behaviour-identical for the FSD and correct for the win32k alias.
+        // Write info/result FIRST, then status LAST. The FSD has distinct offsets
+        // (status@0x70, info@0x78). win32k's status@0x78 ALIASES info@0x78, so the first write
+        // preserves the high 32 bits of a pointer-width return and the second write commits the
+        // low 32 bits last, matching the existing NTSTATUS ordering.
         core::ptr::write_volatile((shared_va + SH_REQ_INFO_H) as *mut u64, info);
         core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
         let _ = CM_TRACE;

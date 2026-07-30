@@ -6516,14 +6516,14 @@ pub(crate) unsafe fn service_sec_image(
                 // it can only reach if its user32 process-attach class-registration loop COMPLETES
                 // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
                 let svc_noninteractive = pi == 3 || pi == 4;
-                let (mut st, mut ok) = if wl_milestone_park {
+                let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
-                    (0i32, false)
+                    (0, false)
                 } else if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
-                    (0x0409_0409i32, true)
+                    (0x0409_0409, true)
                 } else if m0 == 0x103d && (pi == 5 || pi == 6) {
                     // userinit/explorer are distinct interactive child processes, but the current
                     // win32k host still has one shared PROCESSINFO. Entering the real handler with
@@ -6549,7 +6549,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(pi as u64);
                         print_str(b" -> NULL\n");
                     }
-                    (hit.unwrap_or(0) as i32, true)
+                    (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x10b4 && (pi == 5 || pi == 6) && builtin_class_attempt {
                     // The hosted win32k currently has one shared PROCESSINFO, whose built-in class
                     // list was populated by winlogon. A second real registration from userinit or
@@ -6583,16 +6583,16 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(pi as u64);
                         print_str(b" -> atom 0\n");
                     }
-                    (hit.unwrap_or(0) as i32, true)
+                    (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x103d && svc_noninteractive {
                     // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    (0x0001_0005i32, true)
+                    (0x0001_0005, true)
                 } else if m0 == 0x10b4 && svc_noninteractive {
                     // NtUserRegisterClassExWOW -> a fresh class atom so RegisterSystemClasses advances.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
-                    ((atom & 0xFFFF) as i32, true)
+                    ((atom & 0xFFFF) as u64, true)
                 } else if m0 == 0x125b && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays (lsass, badge 8).
                     // THE win32k 0x125b TERMINUS FIX (diagnose-first, fork (b): non-interactive path).
@@ -6658,7 +6658,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b") FAKED (non-interactive service, no GDI blit) -> handle 0x");
                     print_hex(h as u32);
                     print_str(b"\n");
-                    (h as i32, true)
+                    (h as u64, true)
                 } else if m0 == 0x10bd && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtUserGetClassInfo (0x10bd — w32ksvc64.h) for lsass.
                     // ROOT of the whole GDI-blit family: win32k's class-lookup path
@@ -6923,7 +6923,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if !redirected_user_callback {
                         let resumed = win32k_glue::cancel_suspended_user_callback();
-                        st = resumed.0;
+                        st = resumed.0 as u32 as u64;
                         ok = resumed.1;
                     }
                 }
@@ -7187,7 +7187,7 @@ pub(crate) unsafe fn service_sec_image(
                 if redirected_user_callback {
                     result = nt_user_callback::STATUS_PENDING as u32 as u64;
                 } else if ok {
-                    result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
+                    result = st; // pointer-width NtUser/NtGdi return value back to the caller
                     if pi == 2 && m0 == 0x1077 && st != 0 {
                         observe_winlogon_completed_dispatch(
                             win32k_glue::CompletedWin32kDispatch {

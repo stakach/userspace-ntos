@@ -2599,7 +2599,7 @@ pub(crate) unsafe fn winlogon_dialog_modal_target_alive() -> bool {
 
 pub(crate) unsafe fn winlogon_dialog_modal_observe(
     ssn: u64,
-    result: i32,
+    result: u64,
     hwnd: u64,
     message: u32,
 ) -> bool {
@@ -2621,7 +2621,7 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
     } else {
         Some(message)
     };
-    if state.complete(ssn, result, message).is_err() {
+    if state.complete(ssn, result as u32 as i32, message).is_err() {
         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -14988,7 +14988,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b")\n");
                 check(
                     b"win32k_dispatch_fault_via_reply_cap",
-                    fok && fst == win32k_subsystem::TEST_FAULT_STATUS && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
+                    fok && fst == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64 && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
                     &mut passed,
                 );
             }
