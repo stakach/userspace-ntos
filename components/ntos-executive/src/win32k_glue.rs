@@ -44,6 +44,7 @@ static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0)
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PEB: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PID: AtomicU64 = AtomicU64::new(0);
@@ -801,6 +802,34 @@ pub(crate) unsafe fn service_user_callback(
         } else {
             u32::MAX
         };
+    let window_hwnd = if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        && request.input_length as usize >= 0x40
+    {
+        callback_payload_u64(frame, 0x10)
+    } else {
+        0
+    };
+    let window_owner_pi = if window_hwnd != 0 {
+        win32k_subsystem::win32k_window_owner_pi(window_hwnd)
+    } else {
+        None
+    };
+    let owner_mismatch = window_owner_pi.is_some_and(|owner| owner != client.pi);
+    if owner_mismatch {
+        let n = USER_CALLBACK_OWNER_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            print_str(b"[user-callback] api0 owner mismatch hwnd=0x");
+            print_hex((window_hwnd >> 32) as u32);
+            print_hex(window_hwnd as u32);
+            print_str(b" current-pi=");
+            print_u64(client.pi as u64);
+            print_str(b" owner-pi=");
+            print_u64(window_owner_pi.unwrap_or(u32::MAX) as u64);
+            print_str(b" msg=0x");
+            print_hex(window_message);
+            print_str(b" -> fail closed\n");
+        }
+    }
     remember_explorer_atl_pthis(client, &request, frame, window_message);
     let sas_session_before = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
@@ -812,7 +841,7 @@ pub(crate) unsafe fn service_user_callback(
     // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
     // error immediately instead of suspending the component again.
     let client_dead = user_callback_client_dead(client.pi);
-    if client_callbacks_supported(client.pi) && contract_valid && !client_dead {
+    if client_callbacks_supported(client.pi) && contract_valid && !client_dead && !owner_mismatch {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -861,7 +890,7 @@ pub(crate) unsafe fn service_user_callback(
                 && !bind_client_callback_window(
                     request,
                     callback_teb_alias.unwrap(),
-                    callback_payload_u64(frame, 0x10),
+                    window_hwnd,
                     window_message,
                 )
             {
@@ -945,6 +974,8 @@ pub(crate) unsafe fn service_user_callback(
         const STATUS_THREAD_IS_TERMINATING: i32 = 0xc000_004bu32 as i32;
         let status = if client_dead {
             STATUS_THREAD_IS_TERMINATING
+        } else if owner_mismatch {
+            STATUS_UNSUCCESSFUL
         } else if contract.is_none() || client.pi != 2 {
             STATUS_NOT_SUPPORTED
         } else if !contract_valid {
