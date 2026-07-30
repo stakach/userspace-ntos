@@ -5496,13 +5496,6 @@ pub(crate) unsafe fn service_sec_image(
                         result = 0; // no real event to park on → immediate WAIT_0 (documented)
                     }
                 }
-            } else if m0 == 98 && badge == WINLOGON_BADGE {
-                // NtIsProcessInJob(ProcessHandle=R10, JobHandle=RDX). kernel32's CreateProcessInternalW
-                // prologue (spawning services.exe) queries whether winlogon is in a job (JobHandle=NULL
-                // → "in ANY job"). Not modeled — winlogon is in no job. Return STATUS_SUCCESS (0):
-                // kernel32 treats a non-zero return as "in a job" (→ CREATE_SEPARATE_WOW_VDM, harmless
-                // for a native x64 app but avoided); 0 keeps it on the normal create path.
-                result = 0;
             } else if m0 == 19 {
                 // NtApphelpCacheControl(Command=R10, Data=RDX). kernel32's CreateProcessInternalW →
                 // BasepCheckBadapp → BaseCheckAppcompatCache → BasepShimCacheSearch does
@@ -5634,7 +5627,13 @@ pub(crate) unsafe fn service_sec_image(
                     if n == 0 {
                         print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
                     } else {
-                        print_str(b"[wl-main] SAS queue empty at main-loop GetMessage -> parking\n");
+                        wl_park_defer_quiesce =
+                            userinit_shell_frontier_pending(crash_parked, wait_parked);
+                        print_str(if wl_park_defer_quiesce {
+                            b"[wl-main] SAS queue empty at main-loop GetMessage -> parking while userinit advances to shell frontier\n"
+                        } else {
+                            b"[wl-main] SAS queue empty at main-loop GetMessage -> parking\n"
+                        });
                         handled = false;
                         wl_milestone_park = true;
                     }
@@ -5714,7 +5713,11 @@ pub(crate) unsafe fn service_sec_image(
                         // the grace is BOUNDED so a boot where nothing else can run still reaches
                         // the gate rather than blocking in the loop's recv forever.
                         const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
-                        let defer = badge != WINLOGON_BADGE && n < EMPTY_QUEUE_PARK_GRACE;
+                        let defer = (badge != WINLOGON_BADGE
+                            && badge != USERINIT_BADGE
+                            && n < EMPTY_QUEUE_PARK_GRACE)
+                            || (owner_top_badge(badge) != USERINIT_BADGE
+                                && userinit_shell_frontier_pending(crash_parked, wait_parked));
                         if n < 8 {
                             print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
                             print_u64(pi as u64);
@@ -5908,6 +5911,28 @@ pub(crate) unsafe fn service_sec_image(
                     d_a3 = capture_client_string_arg_if_main_image(
                         pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
                     );
+                } else if m0 == 0x1041 && a0 == 0x14 {
+                    // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
+                    // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph
+                    // at the executive boundary before isolated win32k's SpiSetWallpaper probes it.
+                    let captured = capture_client_string_arg(
+                        pi as u64, d_a2, false, filled_pages, faults as usize, scratch_base,
+                    );
+                    if captured != d_a2 {
+                        d_a2 = captured;
+                        if pi == 5 {
+                            let n = USERINIT_WALLPAPER_SPI_CAPTURES.fetch_add(1, Ordering::Relaxed);
+                            if n < 4 {
+                                print_str(b"[w32marshal] userinit captured SPI_SETDESKWALLPAPER UNICODE_STRING arg=0x");
+                                print_hex((a2 >> 32) as u32);
+                                print_hex(a2 as u32);
+                                print_str(b" -> 0x");
+                                print_hex((captured >> 32) as u32);
+                                print_hex(captured as u32);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
                 }
                 if m0 == 0x10b4 {
                     if let Some((class_arg, menu_arg)) = capture_register_class_graph(
@@ -6898,13 +6923,18 @@ pub(crate) unsafe fn service_sec_image(
                 if wl_milestone_park {
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     crash_parked |= 1u64 << owner_top_badge(badge);
+                    let userinit_shell_pending =
+                        userinit_shell_frontier_pending(crash_parked, wait_parked);
                     if !wl_park_defer_quiesce
+                        && !userinit_shell_pending
                         && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
                         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                     {
                         print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
                         stop = m0;
                         break;
+                    } else if userinit_shell_pending {
+                        print_str(b"[quiesce] winlogon milestone parked; deferring gate until userinit attempts its shell image\n");
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -11884,6 +11914,14 @@ fn trace_indefinite_wait_park(badge: u64, live: u64, crash_parked: u64, wait_par
     print_str(b" wait=0x");
     print_hex(wait_parked as u32);
     print_str(b"\n");
+}
+
+#[inline]
+fn userinit_shell_frontier_pending(crash_parked: u64, wait_parked: u64) -> bool {
+    let userinit_bit = 1u64 << USERINIT_BADGE;
+    USERINIT_SPAWNED.load(Ordering::Relaxed) == 1
+        && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
+        && (crash_parked | wait_parked) & userinit_bit == 0
 }
 
 fn pi_is_top_level(badge: u64) -> bool {

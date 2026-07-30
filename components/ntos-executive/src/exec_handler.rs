@@ -5762,6 +5762,15 @@ impl ExecNtHandler {
                     args[4],
                 )
             },
+            NativeService::NtIsProcessInJob => {
+                // No hosted process is currently assigned to a job object. Still validate the process
+                // handle so callers get a real handle-table answer before the "not in job" result.
+                const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+                match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
+                    Ok(_) => 0,
+                    Err(status) => status,
+                }
+            },
             // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
             // DesiredAccess, HandleAttributes, Options). Resolve both process handles in the
             // caller's table, then duplicate the typed object into the target EPROCESS table. This
@@ -12516,6 +12525,33 @@ impl ExecNtHandler {
                     .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
                     .flatten();
                 let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
+                let userinit_shell_probe = if self.pi == 5 && !want_dir && !is_sxs {
+                    if nb[..nlen].windows(8).any(|w| w == b"explorer") {
+                        Some(b"explorer.exe" as &[u8])
+                    } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
+                        Some(b"cmd.exe" as &[u8])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(leaf) = userinit_shell_probe {
+                    let attempt = USERINIT_SHELL_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        bump_progress();
+                    }
+                    if leaf == b"explorer.exe" {
+                        USERINIT_EXPLORER_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if attempt < 8 {
+                        print_str(b"[userinit-shell] NtOpenFile shell image probe ");
+                        print_str(leaf);
+                        print_str(b" raw=");
+                        print_str(&nb[..nlen.min(80)]);
+                        print_str(b"\n");
+                    }
+                }
                 // ★ THE 6TH PROCESS' IMAGE OPEN. `msgina!WlxActivateUserShell` →
                 // `WlxStartApplication` → `CreateProcessAsUserW` reaches
                 // `kernel32!CreateProcessInternalW`'s image open for `userinit.exe`

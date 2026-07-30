@@ -717,6 +717,8 @@ pub const SSN_NT_DELAY_EXECUTION: u64 = 61;
 pub const SSN_NT_QUERY_PERF_COUNTER: u64 = 173;
 /// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
 pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
+/// ntdll's NtIsProcessInJob SSN (kernel32 CreateProcessInternalW job-membership probe).
+pub const SSN_NT_IS_PROCESS_IN_JOB: u64 = 98;
 /// ntdll's NtOpenKey SSN (LdrpInitialize opens IFEO/options; we have no registry → not-found).
 pub const SSN_NT_OPEN_KEY: u64 = 125;
 /// ntdll's NtQueryValueKey SSN (registry value lookups; not-found → LdrpInitialize uses defaults).
@@ -3153,6 +3155,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let pml4 = PM_PML4S[5].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[5].load(Ordering::Relaxed);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
+    let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
+    let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
+    let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
     let cursor_identities = GLOBAL_CURSOR_IDENTITIES_OBSERVED.load(Ordering::Relaxed);
     let cursor_promotions = GLOBAL_CURSOR_PROMOTIONS.load(Ordering::Relaxed);
     let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
@@ -3187,6 +3192,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(tcb as u32);
     print_str(b" primary-token-assignments=");
     print_u64(token_assigned);
+    print_str(b" shell-image-attempts=");
+    print_u64(shell_attempts);
+    print_str(b" explorer-attempts=");
+    print_u64(explorer_attempts);
+    print_str(b" wallpaper-spi-captures=");
+    print_u64(wallpaper_spi_captures);
     print_str(b" cursor-identities=");
     print_u64(cursor_identities);
     print_str(b" promotions=");
@@ -3231,6 +3242,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && pml4 != 0
             && tcb > 1
             && token_assigned >= 1,
+        passed,
+    );
+    check(
+        b"exec_userinit_shell_image_attempted",
+        shell_attempts >= 1 && explorer_attempts >= 1,
         passed,
     );
     check(
@@ -9342,6 +9358,12 @@ pub(crate) static USERINIT_IMAGE_SECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_PRIMARY_TOKEN_ASSIGNED: AtomicU64 = AtomicU64::new(0);
+/// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. These are counted before
+/// the explorer image lane is implemented, so the boot gate can prove we reached the real shell
+/// frontier without fabricating an explorer process.
+pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_EXPLORER_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USERINIT_WALLPAPER_SPI_CAPTURES: AtomicU64 = AtomicU64::new(0);
 /// Every value the synthesized Winlogon key ANSWERED — the leak check for `AutoAdminLogon`.
 pub(crate) static WINLOGON_KEY_VALUES_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Groups in the token `NtCreateToken` minted that carry `SE_GROUP_LOGON_ID` — the logon SID
@@ -10406,6 +10428,7 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtQueryInformationThread,
                 SSN_NT_QUERY_INFORMATION_THREAD as u32,
             ),
+            (NativeService::NtIsProcessInJob, SSN_NT_IS_PROCESS_IN_JOB as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
             (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),
@@ -16670,7 +16693,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/99 executive->isolated-service checks passed]\n");
+    print_str(b"/100 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
