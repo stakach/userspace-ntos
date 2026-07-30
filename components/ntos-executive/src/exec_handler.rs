@@ -538,6 +538,7 @@ impl ExecNtHandler {
                 }
                 pm
             },
+            process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
             token_store: nt_security::TokenStore::with_capacity(64),
             token_dirty: false,
             process_dirty: false,
@@ -551,6 +552,9 @@ impl ExecNtHandler {
             dll_loaded_dirty: false,
             writable_fs_dirty: false,
         };
+        for pi in 0..3 {
+            let _ = handler.claim_hosted_process_mechanism(pi);
+        }
         for pi in 0..MAX_PI {
             if let Some(pid) = handler.pm_pid_for_pi(pi) {
                 let token = handler.token_store.insert(nt_security::AccessToken::system());
@@ -1317,8 +1321,50 @@ impl ExecNtHandler {
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
     /// link). Returns `None` before the ProcessManager has created that hosted process.
     pub(crate) fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
-        let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
-        (pid != 0).then_some(pid as nt_process::ProcessId)
+        self.process_mechanisms
+            .pid_for_pi(pi)
+            .or_else(|| {
+                let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
+                (pid != 0).then_some(pid as nt_process::ProcessId)
+            })
+    }
+
+    fn hosted_mechanism_badge_for_pi(pi: usize) -> Option<u64> {
+        match pi {
+            0 => Some(0),
+            1 => Some(CSRSS_BADGE),
+            2 => Some(WINLOGON_BADGE),
+            3 => Some(SERVICES_BADGE),
+            4 => Some(LSASS_BADGE),
+            5 => Some(USERINIT_BADGE),
+            6 => Some(EXPLORER_BADGE),
+            _ => None,
+        }
+    }
+
+    fn claim_hosted_process_mechanism(&mut self, pi: usize) -> Result<(), u32> {
+        let pid = PM_PIDS
+            .get(pi)
+            .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ProcessId)
+            .filter(|&pid| pid != 0)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let tid = PM_TIDS
+            .get(pi)
+            .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ThreadId)
+            .filter(|&tid| tid != 0)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let badge = Self::hosted_mechanism_badge_for_pi(pi)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+
+        match self.process_mechanisms.claim(pi, pid, tid, badge) {
+            Ok(_) => Ok(()),
+            Err(nt_user_host::MechanismError::SlotOccupied)
+                if self.process_mechanisms.pid_for_pi(pi) == Some(pid) =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
+        }
     }
 
     fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
@@ -1335,14 +1381,13 @@ impl ExecNtHandler {
         let mut main_threads_ok = 0u64;
         let mut min_handle_cap = usize::MAX;
         for pi in 0..MAX_PI {
-            let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
-            if pid == 0 {
+            let Some(pid) = self.pm_pid_for_pi(pi) else {
                 continue;
-            }
+            };
             process_count += 1;
             min_handle_cap = min_handle_cap.min(self.pm.handle_capacity(pid));
-            let distinct = PM_PIDS.iter().enumerate().all(|(other_pi, stored)| {
-                other_pi == pi || stored.load(Ordering::Relaxed) != pid as u64
+            let distinct = (0..MAX_PI).all(|other_pi| {
+                other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid)
             });
             if let Some(name) = Self::hosted_process_name_for_pi(pi) {
                 if distinct
@@ -1354,7 +1399,10 @@ impl ExecNtHandler {
                     identity_ok |= 1 << pi;
                 }
             }
-            let tid = PM_TIDS[pi].load(Ordering::Relaxed) as nt_process::ThreadId;
+            let tid = self
+                .process_mechanisms
+                .main_tid_for_pi(pi)
+                .unwrap_or_else(|| PM_TIDS[pi].load(Ordering::Relaxed) as nt_process::ThreadId);
             if tid != 0 {
                 let running = self
                     .pm
@@ -1426,6 +1474,7 @@ impl ExecNtHandler {
         self.token_dirty = true;
         self.process_dirty = true;
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        self.claim_hosted_process_mechanism(child_pi)?;
         self.refresh_process_manager_gates();
         unsafe {
             print_str(b"[pm-dynamic] allocated hosted process pi=");
@@ -3338,9 +3387,11 @@ impl ExecNtHandler {
         }
     }
     fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
-        PM_PIDS
-            .iter()
-            .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
+        self.process_mechanisms.pi_for_pid(pid).or_else(|| {
+            PM_PIDS
+                .iter()
+                .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
+        })
     }
 
     fn resolve_process_for_access(

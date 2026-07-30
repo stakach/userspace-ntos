@@ -10442,6 +10442,9 @@ struct ExecNtHandler {
     /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
     /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
     pm: nt_process::ProcessManager,
+    /// Allocation-free mirror of the hosted process mechanism slots keyed by NT PID/TID/badge.
+    /// The old atomics remain synchronized for low-level code that has not moved yet.
+    process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,

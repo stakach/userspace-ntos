@@ -10,17 +10,18 @@
 
 extern crate alloc;
 
+mod mechanism;
 mod ntdll;
 mod profile;
 mod services;
 
 use alloc::vec::Vec;
 
+pub use mechanism::{MechanismError, ProcessMechanism, ProcessMechanismTable};
 pub use ntdll::{NtdllExport, NtdllImage};
 pub use profile::{
     build_kuser_shared_data, build_kuser_shared_data_with_cookie, build_peb, build_teb, kuser_off,
-    peb_off, read_u32, read_u64, teb_off,
-    WindowsProfile, KUSER_SHARED_DATA_VA,
+    peb_off, read_u32, read_u64, teb_off, WindowsProfile, KUSER_SHARED_DATA_VA,
 };
 pub use services::KernelServices;
 
