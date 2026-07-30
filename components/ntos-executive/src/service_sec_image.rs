@@ -184,6 +184,47 @@ fn hosted_scratch_base_for_pi(pi: usize) -> u64 {
         .unwrap_or(SMSS_SCRATCH_BASE)
 }
 
+fn hosted_top_badge_for_pi(pi: usize) -> u64 {
+    hosted_process_runtime_for_pi(pi)
+        .map(|runtime| runtime.badge)
+        .unwrap_or(0)
+}
+
+fn hosted_pi_for_top_badge(badge: u64) -> Option<usize> {
+    nt_exe_image::HOSTED_PROCESS_IMAGES
+        .iter()
+        .find(|image| {
+            hosted_process_runtime_for_pi(image.pi)
+                .is_some_and(|runtime| runtime.badge == badge)
+        })
+        .map(|image| image.pi)
+}
+
+fn hosted_pi_for_fault_badge(badge: u64) -> Option<usize> {
+    if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
+        return Some(pi);
+    }
+    match badge {
+        WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => Some(2),
+        SVC_LISTENER_BADGE | SCM_WORKER_BADGE => Some(3),
+        LSASS_LISTENER_BADGE
+        | LSASS_LISTENER2_BADGE
+        | LSASS_LISTENER3_BADGE
+        | LSA_WORKER_BADGE => Some(4),
+        _ => hosted_pi_for_top_badge(badge),
+    }
+}
+
+fn hosted_process_pi_is_live(pi: usize) -> bool {
+    match hosted_process_runtime_for_pi(pi) {
+        Some(runtime) => runtime
+            .spawned
+            .map(|spawned| spawned.load(Ordering::Relaxed) == 1)
+            .unwrap_or(pi == 0),
+        None => false,
+    }
+}
+
 struct HostedExeSpawn<'a> {
     image: &'static nt_exe_image::HostedProcessImage,
     runtime: HostedProcessRuntime,
@@ -1905,7 +1946,6 @@ pub(crate) unsafe fn service_sec_image(
         // role orthogonal to the listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
-        let tp_worker_pi = tp_worker_identity.map(|(pi, _)| pi);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
         let is_tp_worker = tp_worker_identity.is_some();
         // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
@@ -1988,28 +2028,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 4 listener)\n");
             }
         }
-        let pi = if let Some(tp_pi) = tp_worker_pi {
-            tp_pi
-        } else if badge == CSRSS_BADGE {
-            1
-        } else if badge == WINLOGON_BADGE || is_wl_worker {
-            2
-        } else if badge == SERVICES_BADGE || is_svc_listener || is_scm_worker {
-            3
-        } else if badge == LSASS_BADGE
-            || is_lsass_listener
-            || is_lsass_listener2
-            || is_lsass_listener3
-            || is_lsa_worker
-        {
-            4
-        } else if badge == USERINIT_BADGE {
-            5
-        } else if badge == EXPLORER_BADGE {
-            6
-        } else {
-            0
-        };
+        let pi = hosted_pi_for_fault_badge(badge).unwrap_or(0);
         // This process is producing an event → it's running, not wait-parked. Clear its cooperative
         // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
         wait_parked &= !(1u64 << owner_top_badge(badge));
@@ -12046,30 +12065,9 @@ unsafe fn prefill_client_large_string_pages(
 /// winlogon=4, services=6, lsass=8, userinit=27, explorer=28.
 #[inline]
 fn owner_top_badge(badge: u64) -> u64 {
-    if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
-        return match pi {
-            1 => CSRSS_BADGE,
-            2 => WINLOGON_BADGE,
-            3 => SERVICES_BADGE,
-            4 => LSASS_BADGE,
-            _ => 0,
-        };
-    }
-    match badge {
-        CSRSS_BADGE => CSRSS_BADGE,
-        WINLOGON_BADGE | WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
-            WINLOGON_BADGE
-        }
-        SERVICES_BADGE | SVC_LISTENER_BADGE | SCM_WORKER_BADGE => SERVICES_BADGE,
-        LSASS_BADGE
-        | LSASS_LISTENER_BADGE
-        | LSASS_LISTENER2_BADGE
-        | LSASS_LISTENER3_BADGE
-        | LSA_WORKER_BADGE => LSASS_BADGE,
-        USERINIT_BADGE => USERINIT_BADGE,
-        EXPLORER_BADGE => EXPLORER_BADGE,
-        _ => 0, // smss (badge 0) + anything else
-    }
+    hosted_pi_for_fault_badge(badge)
+        .map(hosted_top_badge_for_pi)
+        .unwrap_or(0)
 }
 
 /// A top-level process badge (its MAIN thread), not a listener/worker sub-thread. Only a top-level
@@ -12110,11 +12108,7 @@ fn userinit_shell_frontier_pending(crash_parked: u64, wait_parked: u64) -> bool 
 }
 
 fn pi_is_top_level(badge: u64) -> bool {
-    matches!(
-        badge,
-        0 | CSRSS_BADGE | WINLOGON_BADGE | SERVICES_BADGE | LSASS_BADGE | USERINIT_BADGE
-            | EXPLORER_BADGE
-    )
+    hosted_pi_for_top_badge(badge).is_some()
 }
 
 /// The bitmask of LIVE top-level process badges (smss is always live; the rest once SPAWNED).
@@ -12122,26 +12116,12 @@ fn pi_is_top_level(badge: u64) -> bool {
 /// process is crash-parked (so the loop's next `recv` would block on the fault-EP forever).
 #[inline]
 unsafe fn live_top_badges() -> u64 {
-    let mut m = 1u64 << 0; // smss always live
-    if CSRSS_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << CSRSS_BADGE;
-    }
-    if WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << WINLOGON_BADGE;
-    }
-    if SERVICES_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << SERVICES_BADGE;
-    }
-    if LSASS_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << LSASS_BADGE;
-    }
-    if USERINIT_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << USERINIT_BADGE;
-    }
-    if EXPLORER_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= 1u64 << EXPLORER_BADGE;
-    }
-    m
+    nt_exe_image::HOSTED_PROCESS_IMAGES
+        .iter()
+        .filter_map(|image| {
+            hosted_process_pi_is_live(image.pi).then_some(hosted_top_badge_for_pi(image.pi))
+        })
+        .fold(0u64, |mask, badge| mask | (1u64 << badge))
 }
 
 /// One-line progress trace for the dbgk target-blocking self-test: which fault the throwaway client
