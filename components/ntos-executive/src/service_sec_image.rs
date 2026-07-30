@@ -3729,7 +3729,7 @@ pub(crate) unsafe fn service_sec_image(
                     _ => PM_LISTENER_TID.load(Ordering::Relaxed),
                 }
             } else {
-                PM_TIDS[pi].load(Ordering::Relaxed)
+                nt_handler.pm_main_tid_for_pi(pi).map(u64::from).unwrap_or(0)
             };
             if m0 == 22 {
                 if let Some(completion) = win32k_glue::complete_controlled_user_callback(
@@ -4931,7 +4931,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let suspended = runtime_thread_slot(tid)
+                    let suspended = nt_handler
+                        .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_svc_listener_thread(
                         procs[3].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
@@ -4993,7 +4994,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let suspended = runtime_thread_slot(tid)
+                    let suspended = nt_handler
+                        .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_lsass_listener_thread(
                         procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
@@ -5020,7 +5022,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let suspended = runtime_thread_slot(tid)
+                    let suspended = nt_handler
+                        .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_lsass_listener2_thread(
                         procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
@@ -5056,7 +5059,7 @@ pub(crate) unsafe fn service_sec_image(
                         cid_proc,
                         tid,
                         fault_ep,
-                        !runtime_thread_slot(tid).is_some_and(|(pi, slot)| {
+                        !nt_handler.pm_pool_slot_for_tid(tid).is_some_and(|(pi, slot)| {
                             PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0
                         }),
                     );
@@ -6655,7 +6658,9 @@ pub(crate) unsafe fn service_sec_image(
                         && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
                         && r.0 == 0
                         && badge == WINLOGON_BADGE
-                        && current_tid == PM_TIDS[pi].load(Ordering::Relaxed)
+                        && nt_handler
+                            .pm_main_tid_for_pi(pi)
+                            .is_some_and(|tid| current_tid == u64::from(tid))
                         && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
                         && WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
                         && win32k_glue::real_wm_paint_callback_returns()
@@ -10950,7 +10955,7 @@ unsafe fn spawn_requested_tp_worker(
     );
     let tid = TP_WORKER_TID[pi][worker_slot].load(Ordering::Relaxed);
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
-    let suspended = runtime_thread_slot(tid).is_some_and(|(pool_pi, slot)| {
+    let suspended = nt_handler.pm_pool_slot_for_tid(tid).is_some_and(|(pool_pi, slot)| {
         pool_pi == pi && PM_POOL_SUSPENDED[pool_pi].load(Ordering::Relaxed) & (1 << slot) != 0
     });
     let tcb = spawn_tp_worker_thread(

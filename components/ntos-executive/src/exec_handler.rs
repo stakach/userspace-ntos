@@ -1353,6 +1353,15 @@ impl ExecNtHandler {
             })
     }
 
+    pub(crate) fn pm_pool_slot_for_tid(&self, tid: u64) -> Option<(usize, usize)> {
+        if tid == 0 || tid > u32::MAX as u64 {
+            return None;
+        }
+        self.thread_mechanisms
+            .pool_slot_for_tid(tid as nt_process::ThreadId)
+            .or_else(|| runtime_thread_slot(tid))
+    }
+
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
         if tid == 0 || tid > u32::MAX as u64 {
             return None;
