@@ -43,9 +43,16 @@ pub enum ImageError {
 pub struct SpawnRequest {
     pub slot: usize,
     pub creator_pi: usize,
-    pub child_pi: usize,
     pub desired_access: u32,
     pub process_handle_out: u64,
+    leaf: [u8; MAX_EXE_LEAF],
+    leaf_len: u8,
+}
+
+impl SpawnRequest {
+    pub fn leaf(&self) -> &[u8] {
+        &self.leaf[..self.leaf_len as usize]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,7 +192,6 @@ pub struct ImageSlot {
     pub metadata: ImageMetadata,
     pub file_handle: u64,
     pub section_handle: u64,
-    pub child_pi: usize,
     pub desired_access: u32,
     pub process_handle_out: u64,
     pub process_handle: u64,
@@ -209,7 +215,6 @@ const EMPTY_SLOT: ImageSlot = ImageSlot {
     metadata: EMPTY_METADATA,
     file_handle: 0,
     section_handle: 0,
-    child_pi: 0,
     desired_access: 0,
     process_handle_out: 0,
     process_handle: 0,
@@ -222,12 +227,18 @@ impl ImageSlot {
     }
 
     pub fn spawn_request(&self, slot: usize) -> Option<SpawnRequest> {
-        (self.state == ImageState::SpawnReserved).then_some(SpawnRequest {
+        if self.state != ImageState::SpawnReserved {
+            return None;
+        }
+        let mut leaf = [0u8; MAX_EXE_LEAF];
+        leaf[..self.leaf_len as usize].copy_from_slice(self.leaf());
+        Some(SpawnRequest {
             slot,
             creator_pi: self.owner_pi,
-            child_pi: self.child_pi,
             desired_access: self.desired_access,
             process_handle_out: self.process_handle_out,
+            leaf,
+            leaf_len: self.leaf_len,
         })
     }
 }
@@ -357,7 +368,6 @@ impl<const N: usize> ImageTable<N> {
         &mut self,
         owner_pi: usize,
         section_handle: u64,
-        child_pi: usize,
         desired_access: u32,
         process_handle_out: u64,
     ) -> Result<SpawnRequest, ImageError> {
@@ -370,14 +380,12 @@ impl<const N: usize> ImageTable<N> {
         let slot = &mut self.slots[index];
         match slot.state {
             ImageState::Sectioned => {
-                slot.child_pi = child_pi;
                 slot.desired_access = desired_access;
                 slot.process_handle_out = process_handle_out;
                 slot.state = ImageState::SpawnReserved;
             }
             ImageState::SpawnReserved
-                if slot.child_pi == child_pi
-                    && slot.desired_access == desired_access
+                if slot.desired_access == desired_access
                     && slot.process_handle_out == process_handle_out => {}
             _ => return Err(ImageError::InvalidState),
         }
@@ -389,7 +397,6 @@ impl<const N: usize> ImageTable<N> {
         if slot.spawn_request(request.slot) != Some(request) {
             return Err(ImageError::InvalidState);
         }
-        slot.child_pi = 0;
         slot.desired_access = 0;
         slot.process_handle_out = 0;
         slot.state = ImageState::Sectioned;
@@ -594,8 +601,9 @@ mod tests {
         let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
         assert_eq!(table.create_section(2, 0x40, 0x44), Ok(slot));
         assert_eq!(table.create_section(2, 0x40, 0x44), Ok(slot));
-        let request = table.reserve_spawn(2, 0x44, 5, 0x1fffff, 0x1000).unwrap();
-        assert_eq!(table.reserve_spawn(2, 0x44, 5, 0x1fffff, 0x1000), Ok(request));
+        let request = table.reserve_spawn(2, 0x44, 0x1fffff, 0x1000).unwrap();
+        assert_eq!(request.leaf(), b"userinit.exe");
+        assert_eq!(table.reserve_spawn(2, 0x44, 0x1fffff, 0x1000), Ok(request));
         assert_eq!(table.get(slot).unwrap().state, ImageState::SpawnReserved);
         assert_eq!(table.publish(request, 0), Err(ImageError::InvalidHandle));
         assert_eq!(table.get(slot).unwrap().state, ImageState::SpawnReserved);
@@ -609,7 +617,7 @@ mod tests {
         let mut table = ImageTable::<1>::new();
         let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
         table.create_section(2, 0x40, 0x44).unwrap();
-        let request = table.reserve_spawn(2, 0x44, 5, 1, 0x1000).unwrap();
+        let request = table.reserve_spawn(2, 0x44, 1, 0x1000).unwrap();
         table.rollback_spawn(request).unwrap();
         assert_eq!(table.get(slot).unwrap().state, ImageState::Sectioned);
         assert_eq!(table.index_for_section(2, 0x44), Some(slot));

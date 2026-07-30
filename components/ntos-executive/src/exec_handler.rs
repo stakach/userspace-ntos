@@ -13286,25 +13286,19 @@ impl ExecNtHandler {
                                 let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
                                 let leaf_len = slot.leaf().len();
                                 leaf[..leaf_len].copy_from_slice(slot.leaf());
-                                (slot.child_pi, slot.state, leaf, leaf_len)
+                                (leaf, leaf_len)
                             })
                         })
                     };
-                    if let Some((reserved_child_pi, state, leaf, leaf_len)) = slot_info {
+                    if let Some((leaf, leaf_len)) = slot_info {
                         let leaf = &leaf[..leaf_len];
                         if nt_exe_image::hosted_image_for_leaf(leaf).is_none() {
                             self.stop = true;
                             return 0xC000_0002;
                         }
-                        let child_pi = if state == nt_exe_image::ImageState::SpawnReserved
-                            && reserved_child_pi != 0
-                        {
-                            reserved_child_pi
-                        } else {
-                            match self.allocate_hosted_process_slot(self.pi, leaf) {
-                                Ok(child_pi) => child_pi,
-                                Err(status) => return status,
-                            }
+                        let child_pi = match self.allocate_hosted_process_slot(self.pi, leaf) {
+                            Ok(child_pi) => child_pi,
+                            Err(status) => return status,
                         };
                         if child_pi == 5 {
                             USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -13321,7 +13315,6 @@ impl ExecNtHandler {
                         match table.reserve_spawn(
                             self.pi,
                             sect,
-                            child_pi,
                             args[1] as u32,
                             get_recv_mr(9),
                         ) {

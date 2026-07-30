@@ -244,7 +244,7 @@ fn hosted_exe_spawn_for<'a>(
     userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
 ) -> Option<HostedExeSpawn<'a>> {
-    let image = nt_exe_image::hosted_image_for_pi(request.child_pi)?;
+    let image = nt_exe_image::hosted_image_for_leaf(request.leaf())?;
     let runtime = hosted_process_runtime_for_pi(image.pi)?;
     let spawned = runtime.spawned?;
     match image.pi {
