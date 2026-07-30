@@ -1939,6 +1939,18 @@ unsafe fn process_index_for_ethread(thread: u64) -> Option<usize> {
     (thread == PH_ETHREAD).then_some(WIN32K_BOOTSTRAP_PI)
 }
 
+unsafe fn process_index_for_w32thread(thread: u64) -> Option<usize> {
+    if thread == 0 {
+        return None;
+    }
+    for pi in 0..MAX_PI {
+        if WIN32K_CLIENT_W32THREAD[pi].load(Ordering::Relaxed) == thread {
+            return Some(pi);
+        }
+    }
+    (thread == PH_W32THREAD_VA).then_some(WIN32K_BOOTSTRAP_PI)
+}
+
 unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
     if process_id == 0 {
         return current_eprocess();
@@ -2129,16 +2141,7 @@ pub(crate) unsafe fn win32k_window_owner_pi(hwnd: u64) -> Option<u32> {
     if pti == 0 {
         return None;
     }
-    let ppi = read_volatile((pti + THREADINFO_PPI_OFF) as *const u64);
-    if ppi == 0 {
-        return None;
-    }
-    for pi in 0..MAX_PI {
-        if WIN32K_CLIENT_W32PROCESS[pi].load(Ordering::Relaxed) == ppi {
-            return Some(pi as u32);
-        }
-    }
-    None
+    process_index_for_w32thread(pti).map(|pi| pi as u32)
 }
 
 /// `NTSTATUS ZwOpenFile(...)` — win32k's font init (IntLoadSystemFonts) opens `\SystemRoot\Fonts\`
