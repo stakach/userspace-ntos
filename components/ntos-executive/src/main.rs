@@ -823,9 +823,9 @@ pub const SSN_NT_SET_SYSTEM_INFORMATION: u64 = 249;
 /// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
 /// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
 pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
-/// ntdll's NtCreateKeyedEvent SSN (RtlpInitializeKeyedEvent, ldrinit.c:2436). Bare success — a
-/// NULL GlobalKeyedEventHandle makes ntdll use the non-keyed critical-section wait path. This is
-/// the last loader syscall before LdrpInitialize returns and the trampoline enters smss's entry.
+/// ntdll's NtCreateKeyedEvent SSN (RtlpInitializeKeyedEvent, ldrinit.c:2436). The syscall must
+/// publish a non-NULL handle because ReactOS condition variables assert that their process-global
+/// keyed-event handle was initialized before wake/close.
 pub const SSN_NT_CREATE_KEYED_EVENT: u64 = 289;
 /// Keyed-event wait/release used by ReactOS condition variables, run-once, and the critical-section
 /// fallback path. These are real blocking syscalls over the executive's reply-cap parking model.
@@ -10010,6 +10010,7 @@ const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
 const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
 const SEMAPHORE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const KEYEDEVENT_HANDLE_TAG: u64 = 0x4B45_5956_0000_0000;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const SEMAPHORE_QUERY_STATE: u32 = 0x0001;

@@ -1713,6 +1713,28 @@ impl ExecNtHandler {
         self.next_handle += 1;
         h
     }
+
+    /// Mint a process-local handle for an anonymous keyed event. The wait/release rendezvous is
+    /// currently keyed by the caller's raw `Key` value, so the object only needs durable handle-table
+    /// ownership plus a non-NULL value for ReactOS' per-process RTL keyed-event global.
+    pub(crate) fn mint_keyed_event_handle(&mut self, access: u32) -> u64 {
+        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+            if let Ok(h) = self.pm.insert_handle(
+                pid,
+                nt_process::HandleObject::Opaque(KEYEDEVENT_HANDLE_TAG),
+                access,
+            ) {
+                let c = self.pm.handle_count(pid) as u64;
+                if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+                    PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
+                }
+                PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                return h as u64;
+            }
+        }
+        self.mint_handle()
+    }
+
     /// Mint a process-local handle backed by a typed filesystem `FILE_OBJECT` identity.
     pub(crate) fn mint_file_handle(
         &mut self,
@@ -10011,6 +10033,37 @@ impl ExecNtHandler {
             // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
             // track permanence. Success no-op.
             NativeService::NtMakeTemporaryObject => 0,
+            // NtCreateKeyedEvent(*OutHandle, AccessMask, ObjectAttributes, Flags). ReactOS'
+            // RtlpInitializeKeyedEvent ignores the returned status and later asserts that its
+            // process-global keyed-event handle is non-NULL, so success must publish a real handle.
+            NativeService::NtCreateKeyedEvent => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+                let out_handle = args[0];
+                let desired_access = args[1] as u32;
+                let _object_attributes = args[2];
+                let flags = args[3];
+                if flags != 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if out_handle == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if out_handle & 7 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if !self.probe_event_output(out_handle, 8) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let handle = self.mint_keyed_event_handle(desired_access);
+                if !self.xas_write_u64(out_handle, handle) {
+                    self.close_current_handle(handle);
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                0
+            },
             // NtReleaseKeyedEvent(Handle, Key, Alertable, Timeout) — wake one waiter parked by
             // NtWaitForKeyedEvent on the same raw key. ReactOS condition variables call this with a
             // zero timeout and retry/skip on STATUS_TIMEOUT. A NULL timeout is the keyed-event
@@ -10208,7 +10261,6 @@ impl ExecNtHandler {
                 0
             }
             NativeService::NtTestAlert
-            | NativeService::NtCreateKeyedEvent
             | NativeService::NtInitializeRegistry
             | NativeService::NtSetSecurityObject
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
