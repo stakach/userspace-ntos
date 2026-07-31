@@ -10,6 +10,7 @@ static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_GETMESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -4241,6 +4242,39 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 nt_handler.pm_main_tid_for_pi(pi).map(u64::from).unwrap_or(0)
             };
+            if pi == 6 {
+                let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+                if active_depth != 0 {
+                    let n = EXPLORER_CALLBACK_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 96 {
+                        print_str(b"[explorer-cb-ssn] #");
+                        print_u64(n);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" tid=");
+                        print_u64(current_tid);
+                        print_str(b" ssn=0x");
+                        print_hex_u64(m0);
+                        print_str(b" depth=");
+                        print_u64(active_depth as u64);
+                        print_str(b"/");
+                        print_u64(continuation_depth as u64);
+                        print_str(b" rdx=0x");
+                        print_hex_u64(m3);
+                        print_str(b" r8=0x");
+                        print_hex_u64(get_recv_mr(7));
+                        print_str(b" r9=0x");
+                        print_hex_u64(get_recv_mr(8));
+                        print_str(b" r10=0x");
+                        print_hex_u64(get_recv_mr(9));
+                        print_str(b" r15=0x");
+                        print_hex_u64(get_recv_mr(14));
+                        print_str(b" resume-ip=0x");
+                        print_hex_u64(resume_ip);
+                        print_str(b"\n");
+                    }
+                }
+            }
             if pi == 6 && m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE {
                 let n = EXPLORER_FLUSH_ICACHE_TRACE.fetch_add(1, Ordering::Relaxed);
                 if n < 32 {

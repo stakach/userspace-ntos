@@ -13,7 +13,9 @@ const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_NCCREATE: u32 = 0x0081;
 const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
 const EXPLORER_ATL_WIN_MODULE_RVA: u64 = 0x446b8;
+const EXPLORER_SET_WINDOW_LONG_PTR_W_IMPORT_THUNK: u64 = crate::PE_LOAD_BASE + 0x365a6;
 const EXPLORER_SET_WINDOW_LONG_PTR_W_IAT: u64 = crate::PE_LOAD_BASE + 0x39a18;
+const USER32_SET_WINDOW_LONG_PTR_W_SYSCALL_STUB_DELTA: u64 = 0x47f68;
 const ATL_CREATE_WND_LIST_OFFSET: u64 = 0x30;
 const ATL_CREATE_WND_DATA_THIS_OFFSET: u64 = 0x00;
 const ATL_CREATE_WND_DATA_TID_OFFSET: u64 = 0x08;
@@ -806,6 +808,27 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     let set_window_long_ptr_w =
         client_copyin_process_u64(client_pi as u64, scratch_base, EXPLORER_SET_WINDOW_LONG_PTR_W_IAT)
             .unwrap_or(0);
+    let import_thunk0 = client_copyin_process_u64(
+        client_pi as u64,
+        scratch_base,
+        EXPLORER_SET_WINDOW_LONG_PTR_W_IMPORT_THUNK,
+    )
+    .unwrap_or(0);
+    let user32_setwnd0 =
+        client_copyin_process_u64(client_pi as u64, scratch_base, set_window_long_ptr_w)
+            .unwrap_or(0);
+    let user32_setwnd8 =
+        client_copyin_process_u64(client_pi as u64, scratch_base, set_window_long_ptr_w + 8)
+            .unwrap_or(0);
+    let user32_syscall_stub = set_window_long_ptr_w + USER32_SET_WINDOW_LONG_PTR_W_SYSCALL_STUB_DELTA;
+    let user32_stub0 =
+        client_copyin_process_u64(client_pi as u64, scratch_base, user32_syscall_stub).unwrap_or(0);
+    let user32_stub8 = client_copyin_process_u64(
+        client_pi as u64,
+        scratch_base,
+        user32_syscall_stub + 8,
+    )
+    .unwrap_or(0);
 
     let n = USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS.fetch_add(1, Ordering::Relaxed);
     if n >= 8 {
@@ -861,6 +884,27 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     print_hex(ret as u32);
     print_str(b" completed=");
     print_u64(completed as u64);
+    print_str(b"\n");
+    print_str(b"[atl-replay-code] hwnd=0x");
+    print_hex(request_window as u32);
+    print_str(b" import0=0x");
+    print_hex((import_thunk0 >> 32) as u32);
+    print_hex(import_thunk0 as u32);
+    print_str(b" target0=0x");
+    print_hex((user32_setwnd0 >> 32) as u32);
+    print_hex(user32_setwnd0 as u32);
+    print_str(b" target8=0x");
+    print_hex((user32_setwnd8 >> 32) as u32);
+    print_hex(user32_setwnd8 as u32);
+    print_str(b" stub=0x");
+    print_hex((user32_syscall_stub >> 32) as u32);
+    print_hex(user32_syscall_stub as u32);
+    print_str(b" stub0=0x");
+    print_hex((user32_stub0 >> 32) as u32);
+    print_hex(user32_stub0 as u32);
+    print_str(b" stub8=0x");
+    print_hex((user32_stub8 >> 32) as u32);
+    print_hex(user32_stub8 as u32);
     print_str(b"\n");
 }
 
