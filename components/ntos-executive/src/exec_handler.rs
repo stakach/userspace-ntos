@@ -1777,6 +1777,96 @@ impl ExecNtHandler {
         nt_exe_image::hosted_pi_for_leaf(leaf)
     }
 
+    fn current_pm_pid(&self) -> Option<nt_process::ProcessId> {
+        self.pm_pid_for_pi(self.pi)
+    }
+
+    fn current_process_image_name(&self) -> Option<&str> {
+        let pid = self.current_pm_pid()?;
+        self.pm.process(pid).map(|process| process.image_file_name.as_str())
+    }
+
+    fn current_hosted_process_image(&self) -> Option<&'static nt_exe_image::HostedProcessImage> {
+        nt_exe_image::hosted_image_for_path(self.current_process_image_name()?.as_bytes())
+    }
+
+    fn current_hosted_process_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
+        self.current_hosted_process_image().map(|image| image.role)
+    }
+
+    fn current_process_has_role(&self, role: nt_exe_image::HostedProcessRole) -> bool {
+        self.current_hosted_process_role() == Some(role)
+    }
+
+    fn current_process_is_hosted_leaf(&self, leaf: &[u8]) -> bool {
+        self.current_hosted_process_image()
+            .is_some_and(|image| image.leaf.eq_ignore_ascii_case(leaf))
+    }
+
+    fn current_process_is_noninteractive_service(&self) -> bool {
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::NonInteractiveService)
+    }
+
+    fn current_process_is_services(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"services.exe")
+    }
+
+    fn current_process_is_lsass(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"lsass.exe")
+    }
+
+    fn current_process_is_winlogon(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"winlogon.exe")
+    }
+
+    fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
+        matches!(
+            self.current_hosted_process_role(),
+            Some(
+                nt_exe_image::HostedProcessRole::InteractiveLogon
+                    | nt_exe_image::HostedProcessRole::NonInteractiveService
+                    | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                    | nt_exe_image::HostedProcessRole::InteractiveShell
+            )
+        )
+    }
+
+    fn hosted_thread_role_for_badge(badge: u64) -> Option<HostedThreadRole> {
+        match badge {
+            WINLOGON_WORKER_BADGE => Some(HostedThreadRole::WinlogonListener),
+            WINLOGON_WORKER2_BADGE => Some(HostedThreadRole::WinlogonWorker { slot: 1 }),
+            WINLOGON_WORKER3_BADGE => Some(HostedThreadRole::WinlogonWorker { slot: 2 }),
+            SVC_LISTENER_BADGE => Some(HostedThreadRole::ServicesListener),
+            SCM_WORKER_BADGE => Some(HostedThreadRole::ScmWorker),
+            LSASS_LISTENER_BADGE => Some(HostedThreadRole::LsassListener),
+            LSASS_LISTENER2_BADGE => Some(HostedThreadRole::LsassListener2),
+            LSASS_LISTENER3_BADGE => Some(HostedThreadRole::LsassListener3),
+            LSA_WORKER_BADGE => Some(HostedThreadRole::LsaWorker),
+            _ => None,
+        }
+    }
+
+    fn current_hosted_thread_role(&self) -> Option<HostedThreadRole> {
+        Self::hosted_thread_role_for_badge(self.current_badge)
+            .or_else(|| {
+                self.thread_runtime
+                    .get_by_tid(self.current_tid)
+                    .map(|runtime| runtime.role)
+            })
+            .or_else(|| {
+                let image = self.current_hosted_process_image()?;
+                (self.current_badge == image.top_badge).then_some(HostedThreadRole::Main)
+            })
+    }
+
+    fn current_thread_has_role(&self, role: HostedThreadRole) -> bool {
+        self.current_hosted_thread_role() == Some(role)
+    }
+
+    fn current_thread_is_main_process_thread(&self) -> bool {
+        self.current_thread_has_role(HostedThreadRole::Main)
+    }
+
     fn refresh_process_manager_gates(&self) {
         let mut process_count = 0u64;
         let mut identity_ok = 0u64;
@@ -5310,11 +5400,11 @@ impl ExecNtHandler {
     }
     /// Read `dst.len()` bytes from the current process's VA `va`, resolving a page OUTSIDE the
     /// stack/heap/image mirrors by reading the STATIC content straight from the backing PE image
-    /// (main image / ntdll / a registered DLL). The general cross-AS reader for services' registry
-    /// key-name strings: those are `RTL_CONSTANT_STRING` literals in a DLL `.rdata` page services
-    /// NEVER dereferences (the executive is the first reader), so the page is not demand-faulted and
-    /// not in any mirror or frame table — but its bytes are exactly the (relocation-free) `.rdata`
-    /// file content, which we read via the loaded PE. Handles a read that spans a page boundary.
+    /// (main image / ntdll / a registered DLL). Hosted GUI/service registry strings are often
+    /// `RTL_CONSTANT_STRING` literals in DLL `.rdata` pages the process never dereferences (the
+    /// executive is the first reader), so the page is not demand-faulted and not in any mirror or
+    /// frame table — but its bytes are exactly the (relocation-free) `.rdata` file content, which we
+    /// read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
@@ -5386,7 +5476,7 @@ impl ExecNtHandler {
     /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
     /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
     /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
-    /// No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
+    /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
         if let Some(ctx) = self.loop_ctx {
             let filled_pages = &mut *ctx.filled_pages;
@@ -5604,7 +5694,7 @@ impl ExecNtHandler {
     /// Cross-AS byte-buffer write to the current process's VA `va` — mirror first, else 8-byte chunks
     /// via [`xas_write_u64`] (each demand-fills a not-yet-faulted DLL/heap page as needed). The last
     /// partial word is read-modify-written so trailing bytes past `src` in that word are preserved.
-    /// Used for services (pi 3) registry info-structure copyout (KEY_*_INFORMATION into a heap buffer).
+    /// Used for hosted-process registry info-structure copyout (KEY_*_INFORMATION into a heap buffer).
     pub(crate) unsafe fn xas_write_buf(&self, va: u64, src: &[u8]) {
         let _ = self.xas_try_write_buf(va, src);
     }
@@ -5694,7 +5784,7 @@ impl ExecNtHandler {
     }
     /// Cross-AS UNICODE_STRING read (x64 {u16 Length, u16 Max, u32 pad, u64 Buffer}) via [`xas_read`],
     /// so a Buffer in a not-yet-faulted DLL `.rdata` page resolves from the backing PE. Used for
-    /// services (pi 3) registry name strings (key names + value names).
+    /// hosted-process registry name strings (key names + value names).
     pub(crate) unsafe fn read_ustr_pe(&self, ustr_va: u64) -> alloc::vec::Vec<u16> {
         if ustr_va == 0 {
             return alloc::vec::Vec::new();
@@ -5754,8 +5844,8 @@ impl ExecNtHandler {
         Ok(byte_len / 2)
     }
     /// Cross-AS OBJECT_ATTRIBUTES.ObjectName read (OA+0x10 → PUNICODE_STRING) via [`read_ustr_pe`],
-    /// so a name Buffer in a not-yet-faulted DLL `.rdata` page resolves from the PE. Used for services
-    /// (pi 3) registry key opens (see `read_objattr_name`, whose scratch-alias fallback only reaches
+    /// so a name Buffer in a not-yet-faulted DLL `.rdata` page resolves from the PE. Used for hosted
+    /// process registry key opens (see `read_objattr_name`, whose scratch-alias fallback only reaches
     /// already-faulted pages).
     pub(crate) unsafe fn read_objattr_name_pe(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
         let mut p = [0u8; 8];
@@ -6986,13 +7076,13 @@ impl ExecNtHandler {
                 let mut rd = [0u8; 8];
                 let _ = smss_copyin(oa + 8, &mut rd);
                 let root_dir = u64::from_le_bytes(rd);
-                // services (pi 3): its RegOpenKeyExW key-name strings are RTL_CONSTANT_STRING literals
-                // in a DLL `.rdata` page (advapi32 ~0x88000000) that services NEVER dereferences (the
+                // Noninteractive services: RegOpenKeyExW key-name strings are RTL_CONSTANT_STRING
+                // literals in DLL `.rdata` pages that the process NEVER dereferences (the
                 // executive is the first reader), so the page is not demand-faulted → unreachable by
                 // the mirror/frame table. Read the static content straight from the backing PE image
-                // (`read_objattr_name_pe`). Scoped to pi==3 so winlogon/csrss paint-time OA-name reads
-                // stay mirror-only (byte-identical).
-                let name16 = if self.pi == 3 || self.pi == 4 {
+                // (`read_objattr_name_pe`). Scoped by hosted image role so winlogon/csrss paint-time
+                // OA-name reads stay mirror-only (byte-identical).
+                let name16 = if self.current_process_is_noninteractive_service() {
                     self.read_objattr_name_pe(oa)
                 } else {
                     smss_read_objattr_name(oa)
@@ -7169,8 +7259,8 @@ impl ExecNtHandler {
                     // "WL: Failed to create SAS window" -> "WL: Failed to initialize SAS". This is
                     // the SAME hazard the keyboard-layout and Winlogon-key notes above record:
                     // broadly succeeding HKLM opens regress the paint. So this stays exact-name, in
-                    // the established pattern, and the general 4-slot mechanism serves SOFTWARE
-                    // everywhere else (absolute opens, pi 3/4, relative opens off a SOFTWARE handle,
+                    // the established pattern, and the general hosted-service mechanism serves SOFTWARE
+                    // everywhere else (absolute opens, noninteractive services, relative opens off a SOFTWARE handle,
                     // `registry_value(s)`, `registry_subkeys`, the overlay).
                     if is_profile_list_key(&eff_name) {
                         let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
@@ -7183,13 +7273,13 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
-                // the real SYSTEM hive (::ROSSYS.HIV). A predefined `\Registry\Machine` open → the
-                // sentinel machine-root handle; a subkey relative to it (RootDirectory ==
-                // the machine-root target) or an absolute `\Registry\Machine\...` path → `resolve_key`;
-                // a subkey relative to a real hive handle → `open_key_from`. Self-contained + returns,
-                // so the winlogon/csrss paint-time key hacks below are untouched (byte-identical).
-                if self.pi == 3 || self.pi == 4 {
+                // Noninteractive services: resolve HKLM predefined roots + machine-relative subkeys
+                // against the real hives. A predefined `\Registry\Machine` open → the sentinel
+                // machine-root handle; a subkey relative to it (RootDirectory == the machine-root target)
+                // or an absolute `\Registry\Machine\...` path → `resolve_key`; a subkey relative to a
+                // real hive handle → `open_key_from`. Self-contained + returns, so winlogon/csrss
+                // paint-time key hacks below are untouched (byte-identical).
+                if self.current_process_is_noninteractive_service() {
                     // Compute the FULL NT path being opened (predefined-root + overlay-relative
                     // cases). `None` = a hive-handle-relative open (path unknown, resolved below).
                     let full_opt: Option<alloc::string::String> = if root_target
@@ -7261,7 +7351,7 @@ impl ExecNtHandler {
                         return self.mint_registry_key(cell, args[1] as u32, args[0]);
                     }
                     // NOTE (SAM/SECURITY batch): `\Registry\Machine\{SECURITY,SAM}` used to be
-                    // AUTO-CREATED in the overlay here on any pi==4 open. That was a fabrication and
+                    // AUTO-CREATED in the overlay here on any lsass.exe open. That was a fabrication and
                     // it actively BROKE the LSA bring-up: lsasrv's `LsapIsDatabaseInstalled()` probes
                     // `SECURITY\Policy` with a plain open, so an auto-create made it answer TRUE, the
                     // real first-boot `LsapCreateDatabaseKeys`/`LsapCreateDatabaseObjects` install was
@@ -7273,11 +7363,11 @@ impl ExecNtHandler {
                         if is_lsa_hive_path(full) {
                             LSA_HIVE_OPEN_MISS.fetch_add(1, Ordering::Relaxed);
                             // BYPASS ARM ONLY (`SECURITY_SAM_HIVES_MOUNTED == false`): the PRE-BATCH
-                            // behaviour — fabricate an empty overlay hive root on any pi==4
+                            // behaviour — fabricate an empty overlay hive root on any lsass
                             // SECURITY/SAM open. Kept solely so the bypass experiment reproduces the
                             // old steady state (gate 220) instead of diverging into a hang; the live
                             // path never takes it.
-                            if !SECURITY_SAM_HIVES_MOUNTED && self.pi == 4 {
+                            if !SECURITY_SAM_HIVES_MOUNTED && self.current_process_is_lsass() {
                                 let canon = self.overlay_canon(full);
                                 let (oidx, _) = self.overlay.create(&canon);
                                 self.overlay_dirty = true;
@@ -7348,10 +7438,9 @@ impl ExecNtHandler {
             },
             // NtCreateKey(*KeyHandle[0], DesiredAccess[1], *ObjectAttributes[2], TitleIndex, *Class,
             // CreateOptions, *Disposition[sp+0x38]). The CM WRITE plane: create-or-open a key in the
-            // in-memory overlay ([`RegistryOverlay`]) that shadows the read-only base hive. services'
-            // (pi 3) ScmCreateServiceDatabase creates volatile keys (Control\ServiceCurrent, group
-            // list) here. Scoped to pi==3; pi 0-2 keep the prior behaviour (NtCreateKey was
-            // unregistered → the loop stopped on the SSN) so their boot is byte-identical.
+            // in-memory overlay ([`RegistryOverlay`]) that shadows the read-only base hive. services.exe's
+            // ScmCreateServiceDatabase creates volatile keys (Control\ServiceCurrent, group list) here;
+            // lsass.exe creates SECURITY/SAM policy state on first boot.
             NativeService::NtCreateKey => unsafe {
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
                     return 0xC000_0005;
@@ -7467,9 +7556,8 @@ impl ExecNtHandler {
             },
             // NtSetValueKey(KeyHandle[0], *ValueName[1], TitleIndex, Type[3], Data[sp+0x28],
             // DataSize[sp+0x30]). The CM WRITE plane: write a value into an overlay (created) key.
-            // Scoped to pi==3; pi 0-2 stay a no-op success (byte-identical — smss's SmpInit writes
-            // are still discarded). A write to a base-hive handle (not an overlay key) is a no-op
-            // success too (we don't shadow arbitrary base keys for writes yet).
+            // A write to a base-hive handle (not an overlay key) is a no-op success too (we don't
+            // shadow arbitrary base keys for writes yet).
             NativeService::NtSetValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -7627,10 +7715,9 @@ impl ExecNtHandler {
                 }
             },
             // NtEnumerateKey(KeyHandle[0], Index[1], KeyInformationClass[2], KeyInformation[3],
-            // Length[4], *ResultLength[5]). For services (pi 3) this enumerates the REAL subkeys of a
-            // hive key (ScmCreateServiceDatabase walks HKLM\SYSTEM\CurrentControlSet\Services). For
-            // winlogon/csrss (pi 0-2) it stays the empty-set stub (STATUS_NO_MORE_ENTRIES) — the RPC
-            // bring-up needs no subkeys and this keeps their paths byte-identical.
+            // Length[4], *ResultLength[5]). Hosted service processes enumerate REAL subkeys of hive
+            // keys here (for example, ScmCreateServiceDatabase walks
+            // HKLM\SYSTEM\CurrentControlSet\Services).
             NativeService::NtEnumerateKey => unsafe {
                 NT_ENUMERATE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
                 let key = match self.resolve_registry_key(args[0], 0x8) {
@@ -7748,12 +7835,13 @@ impl ExecNtHandler {
             // bring-up; the RPC listener thread (NtCreateThread is a no-op) never runs.
             NativeService::NtCreateNamedPipeFile => unsafe {
                 let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
-                // pi==3 (services' SCM RPC server): route the create through the REAL isolated npfs
-                // FSD → NpFsdCreateNamedPipe builds a real FCB/CCB + FILE_OBJECT (server end). pi 0-2
-                // keep the modeled-fake path (byte-identical: winlogon's \pipe\winreg never connects).
+                // Hosted noninteractive service RPC servers route creates through the REAL isolated npfs
+                // FSD → NpFsdCreateNamedPipe builds a real FCB/CCB + FILE_OBJECT (server end). Earlier
+                // GUI boot clients keep the modeled-fake path (byte-identical: winlogon's \pipe\winreg
+                // never connects).
                 let mut info: u64 = 2; // FILE_CREATED
                 let mut routed_file_id = 0;
-                if self.pi == 3 || self.pi == 4 {
+                if self.current_process_is_noninteractive_service() {
                     let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
                     let name16 = self.read_objattr_name_pe(oa);
                     let leaf = Self::pipe_leaf16(&name16);
@@ -7766,10 +7854,10 @@ impl ExecNtHandler {
                     // BATCH 38: bound the SCM `\ntsvcs` server-instance re-create loop so the boot
                     // quiesces after the (now-live) RPC round-trip. Past the cap, fail the create with
                     // STATUS_PIPE_NOT_AVAILABLE (0xC00000AC) → rpcrt4's re-listen fails → the listener
-                    // parks. Name-scoped to `\ntsvcs` (SCM), pi 3 only, so lsass/other pipes are unaffected.
+                    // parks. Name-scoped to `\ntsvcs` (SCM) and services.exe, so lsass/other pipes are unaffected.
                     let is_ntsvcs = leaf.len() >= 7
                         && leaf[1..7].iter().zip(b"ntsvcs".iter()).all(|(&w, &c)| w as u8 == c);
-                    if self.pi == 3 && is_ntsvcs {
+                    if self.current_process_is_services() && is_ntsvcs {
                         let n = SCM_NTSVCS_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
                         if n >= SCM_NTSVCS_CREATE_CAP {
                             if n == SCM_NTSVCS_CREATE_CAP {
@@ -7783,13 +7871,13 @@ impl ExecNtHandler {
                             return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
                         }
                     }
-                    // BATCH 40: same re-create cap for lsass' `\lsarpc` LSA RPC server (pi 4). Once
+                    // BATCH 40: same re-create cap for lsass' `\lsarpc` LSA RPC server. Once
                     // winlogon crosses msgina GINA init and drives its logon flow, lsass re-creates the
                     // `\lsarpc` server pipe unboundedly (no live terminating client under TCG) → the boot
                     // never quiesces. Cap → STATUS_PIPE_NOT_AVAILABLE → the LSA listener parks → gate.
                     let is_lsarpc = leaf.len() >= 7
                         && leaf[1..7].iter().zip(b"lsarpc".iter()).all(|(&w, &c)| w as u8 == c);
-                    if self.pi == 4 && is_lsarpc {
+                    if self.current_process_is_lsass() && is_lsarpc {
                         let n = LSA_LSARPC_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
                         if n >= LSA_LSARPC_CREATE_CAP {
                             if n == LSA_LSARPC_CREATE_CAP {
@@ -7853,9 +7941,9 @@ impl ExecNtHandler {
                 } else {
                     self.mint_handle()
                 };
-                // *FileHandle (R10): for services/lsass (pi 3/4) it's a DLL .data global → the cross-AS
-                // writer; for pi 0-2 the legacy stack write is byte-identical.
-                if self.pi == 3 || self.pi == 4 {
+                // *FileHandle (R10): for noninteractive services it's a DLL .data global → the
+                // cross-AS writer; earlier GUI boot clients keep the legacy stack write.
+                if self.current_process_is_noninteractive_service() {
                     self.queue_write(get_recv_mr(9), h);
                     if iosb != 0 {
                         self.xas_write_buf(iosb, &0u32.to_le_bytes()); // Status
@@ -7877,10 +7965,10 @@ impl ExecNtHandler {
             // client ever connects, so the actual pipe-listen semantics are irrelevant to bring-up.
             NativeService::NtFsControlFile => unsafe {
                 let iosb = args[4];
-                // pi==3: route the FSCTL (FSCTL_PIPE_LISTEN/WAIT/TRANSCEIVE) to npfs for the tracked
-                // pipe handle. npfs's NpFsdFileSystemControl runs the real state machine on the CCB.
-                // FSCTL_PIPE_LISTEN on a server pipe with no client returns STATUS_PIPE_LISTENING
-                // (0x00000000-ish PENDING); we surface npfs's status. pi 0-2 keep the modeled path.
+                // Hosted pipe clients route FSCTLs (LISTEN/WAIT/TRANSCEIVE) to npfs for tracked pipe
+                // handles. npfs's NpFsdFileSystemControl runs the real state machine on the CCB.
+                // FSCTL_PIPE_LISTEN on a server pipe with no client returns pending-listen semantics;
+                // early clients without real pipe handles keep the modeled path.
                 let fsctl = args[5];
                 let mut status: u64 = 0;
                 let mut information = 0u64;
@@ -7910,20 +7998,15 @@ impl ExecNtHandler {
                 // This is the correct pending-listen (no synchronous phantom client) that completes the
                 // rpcrt4 two-thread handshake without a real npfs connection.
                 //
-                // ★ BATCH 34 — the SAME invariant for the pi 3/4 REAL ncacn_np SERVER (services'/lsass'
-                // SCM/LSA listeners). rpcrt4_protseq_np_get_wait_array posts FSCTL_PIPE_LISTEN on EACH
-                // listener pipe; if it returns SUCCESS/STATUS_PIPE_CONNECTED it does `SetEvent(event)`
-                // IMMEDIATELY → wait_for_new_connection wakes → rpcrt4_spawn_connection → handoff →
-                // rpcrt4_conn_create_pipe creates a NEW instance → get_wait_array posts FSCTL_PIPE_LISTEN
-                // on it → SUCCESS again → SetEvent → an INFINITE create-instance runaway (observed: 894
-                // `\ntsvcs` creates). The listen MUST return STATUS_PENDING for a freshly-created server
-                // instance with no client — then the listener parks on NtWaitForMultipleObjects, and ONLY
-                // our explicit event-signal on a REAL client connect (pipe_listen_complete_named) wakes
-                // it with io_status.Status = SUCCESS → it spawns exactly ONE connection per real client.
-                // So force PENDING + arm the async listen for pi 3/4 too (don't route the LISTEN to
-                // npfs's state machine, which returns CONNECTED/SUCCESS for the just-handed-off instance).
+                // ★ BATCH 34 — the SAME invariant for REAL ncacn_np SCM/LSA listeners. rpcrt4 posts
+                // FSCTL_PIPE_LISTEN on EACH listener pipe; if it returns SUCCESS/STATUS_PIPE_CONNECTED
+                // it signals the listen event immediately and loops into an infinite create-instance
+                // runaway. A freshly-created server instance with no client must report STATUS_PENDING;
+                // only pipe_listen_complete_named wakes it with io_status.Status = SUCCESS.
                 let is_pipe_listen = (fsctl as u32) == 0x0011_0008;
-                let force_pending_listen = is_pipe_listen && (self.pi == 2 || self.pi == 3 || self.pi == 4);
+                let force_pending_listen = is_pipe_listen
+                    && (self.current_process_is_winlogon()
+                        || self.current_process_is_noninteractive_service());
                 if force_pending_listen {
                     status = 0x103; // STATUS_PENDING
                 }
@@ -7996,7 +8079,7 @@ impl ExecNtHandler {
                     self.pipe_park_event_obj_idx = event_obj_idx;
                     self.pipe_park_transceive = true;
                 }
-                // ★ BATCH 34 — the async ncacn_np SERVER completion edge. A server (pi 3/4) posting an
+                // ★ BATCH 34 — the async ncacn_np SERVER completion edge. A service server posting an
                 // OVERLAPPED FSCTL_PIPE_LISTEN (0x110008) that npfs returns STATUS_PENDING for (no client
                 // yet, NpSetListeningPipeState → IoMarkIrpPending) does NOT block on this syscall — the
                 // thread continues to NtWaitForMultipleObjects([mgr_event, listen_event]). Record the
@@ -8005,7 +8088,7 @@ impl ExecNtHandler {
                 // names the server) + the listen IOSB VA. On the peer connect/write the loop completes it
                 // (fills the IOSB SUCCESS + signals the event → the server's wait-array wakes). SUPPRESS
                 // the PENDING IOSB write here (overlapped: the IOSB is written at completion, not now).
-                if (self.pi == 3 || self.pi == 4)
+                if self.current_process_is_noninteractive_service()
                     && (fsctl as u32) == 0x0011_0008
                     && (status as u32) == 0x0000_0103
                     && fid != 0
@@ -8076,26 +8159,23 @@ impl ExecNtHandler {
                 {
                     return 0xC000_0005;
                 }
-                // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
-                // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).
-                // BATCH 41 — winlogon (pi 2) too: msgina's L"DefaultPassword" value name is a msgina.dll
-                // `.rdata` literal, so recover it cross-AS from the PE (the mirror-only smss_read_ustr
-                // returns empty for it). read_ustr_pe uses xas_read → resolves any resident/PE page.
+                // Hosted GUI/service processes commonly pass value names from DLL `.rdata` literals the
+                // stack/heap/image mirror can't reach, so read them from the backing PE (`read_ustr_pe`).
+                // read_ustr_pe uses xas_read → resolves any resident/PE page.
                 let key_path = self.registry_target_path(key);
                 let key_is_ifeo = key_path
                     .as_deref()
                     .is_some_and(|path| path.contains(r"\image file execution options\"));
-                let shell_com_inproc_bit = if self.pi == 6 {
+                let shell_com_inproc_bit = if self.current_process_is_hosted_leaf(b"explorer.exe") {
                     key_path
                         .as_deref()
                         .map_or(0, explorer_shell_com_inproc_class_bit_for_path)
                 } else {
                     0
                 };
-                let name16 = if self.pi == 2
-                    || self.pi == 3
-                    || self.pi == 4
-                    || self.pi >= 5
+                let pe_backed_registry_strings =
+                    self.current_process_uses_pe_backed_registry_strings();
+                let name16 = if pe_backed_registry_strings
                     || key_is_ifeo
                     || shell_com_inproc_bit != 0
                 {
@@ -8109,10 +8189,11 @@ impl ExecNtHandler {
                         name_lc.push(c.to_ascii_lowercase());
                     }
                 }
-                // Set for winlogon's real-hive Nls\Language `Default` read: its out-params (a heap/stack
-                // advapi allocation) need the cross-AS writer, whereas msgina's synth reads stay mirror-only
-                // (byte-identical). Local so no other value read's copyout method changes.
-                let mut use_xas_write = shell_com_inproc_bit != 0;
+                // Set for hosted processes reading real-hive values: their out-params are often
+                // advapi/userenv heap or stack buffers the plain mirror can't reach. Synth-key reads
+                // can stay mirror-only unless a call site below proves it needs cross-AS copyout.
+                let mut use_xas_write =
+                    shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
                 } else if self.pi == 2
@@ -8177,13 +8258,13 @@ impl ExecNtHandler {
                     }
                     value
                 } else {
-                    if (self.pi == 2 || self.pi >= 5) && !is_synth_key(key) {
+                    if pe_backed_registry_strings && !is_synth_key(key) {
                         // Hosted clients reading a value out of a REAL MOUNTED HIVE (not a synth
                         // handle): their out-params are advapi/userenv heap or stack the plain mirror
                         // can't reach, so the copyout below must go cross-AS. Early live cases:
                         //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
                         //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was:
-                        //     pi 0-2 → None → NOT_FOUND → SetDefaultLanguage FALSE →
+                        //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
                         //     InitializeSAS FALSE → ExitProcess(2).
                         //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
                         //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
@@ -8236,11 +8317,11 @@ impl ExecNtHandler {
                     Some((ty, data)) => {
                         // KeyValuePartialInformation (class 2) carries no name.
                         let info = build_key_value_info(args[2], "", ty, &data);
-                        // *ResultLength: use the cross-AS writer for pi 3/4 + the winlogon Nls read
-                        // (advapi's out-param may be a heap/stack the plain mirror can't reach — same
-                        // reason as the data write below); everything else stays mirror-only (byte-identical).
+                        // *ResultLength: use the cross-AS writer for hosted real-hive reads (advapi's
+                        // out-param may be a heap/stack the plain mirror can't reach — same reason as
+                        // the data write below); everything else stays mirror-only (byte-identical).
                         let result_length = (info.len() as u32).to_le_bytes();
-                        let result_length_written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                        let result_length_written = if use_xas_write {
                             self.xas_try_write_buf(args[5], &result_length)
                         } else {
                             smss_copyout(args[5], &result_length)
@@ -8256,7 +8337,7 @@ impl ExecNtHandler {
                             // SetDefaultLanguage bailed. Write the truncated prefix so the header lands.
                             let n = output_length;
                             if n > 0 {
-                                let written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                                let written = if use_xas_write {
                                     self.xas_try_write_buf(args[3], &info[..n])
                                 } else {
                                     smss_copyout(args[3], &info[..n])
@@ -8267,9 +8348,9 @@ impl ExecNtHandler {
                             }
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
-                            // services'/winlogon's out-buffer may be an advapi32 heap allocation the mirror
+                            // Hosted out-buffers may be advapi32 heap allocations the mirror
                             // can't reach → use the cross-AS writer so the value data actually lands.
-                            let written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                            let written = if use_xas_write {
                                 self.xas_try_write_buf(args[3], &info)
                             } else {
                                 smss_copyout(args[3], &info)
@@ -8763,7 +8844,7 @@ impl ExecNtHandler {
                 {
                     let mut nb = [0u8; 48];
                     let nlen = Self::fold_name(&name16, &mut nb);
-                    if self.pi == 4
+                    if self.current_process_is_lsass()
                         && nb[..nlen]
                             .windows(b"lsaauthenticationport".len())
                             .any(|w| w == b"lsaauthenticationport")
@@ -9014,13 +9095,13 @@ impl ExecNtHandler {
                     print_str(b"[thread-life] create caller=winlogon badge=4 status=c000009a (runtime thread pool exhausted)\n");
                     return 0xC000_009A;
                 }
-                // ★ N-threads multiplex: services' (pi 3) FIRST NtCreateThread = the SCM's RPC listener
+                // ★ N-threads multiplex: services.exe's FIRST NtCreateThread = the SCM's RPC listener
                 // (ScmStartRpcServer → rpcrt4 io_thread). Route it through the REAL ETHREAD lifecycle
                 // like winlogon's, but the LOOP spawns it RESUMED with a badged fault EP (it runs into
-                // the main multiplex). Its faults sub-select to (pi 3, listener) by SVC_LISTENER_BADGE.
+                // the main multiplex). Its faults sub-select by SVC_LISTENER_BADGE.
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 3
-                    && self.current_badge == SERVICES_BADGE
+                    && self.current_process_is_services()
+                    && self.current_thread_is_main_process_thread()
                     && SVC_LISTENER_TCB.load(Ordering::Relaxed) == 0
                     && SVC_LISTENER_TID.load(Ordering::Relaxed) == 0
                 {
@@ -9037,7 +9118,7 @@ impl ExecNtHandler {
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
-                            let pid = self.pm_pid_for_pi(3).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9050,13 +9131,13 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // ★ N-threads multiplex: lsass' (pi 4) FIRST NtCreateThread = an LSA server thread
+                // ★ N-threads multiplex: lsass.exe's FIRST NtCreateThread = an LSA server thread
                 // (LsapInitDatabase → StartAuthenticationPort / LsapRmServerThread). Route it through the
                 // REAL ETHREAD lifecycle + have the LOOP spawn it RESUMED with a badged fault EP, so it
-                // runs into the main multiplex; its faults sub-select to (pi 4, listener) by
+                // runs into the main multiplex; its faults sub-select to the LSA listener by
                 // LSASS_LISTENER_BADGE (its own stack mirror / TEB, distinct from lsass' main thread).
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 4
+                    && self.current_process_is_lsass()
                     && LSASS_LISTENER_TCB.load(Ordering::Relaxed) == 0
                     && LSASS_LISTENER_TID.load(Ordering::Relaxed) == 0
                 {
@@ -9073,7 +9154,7 @@ impl ExecNtHandler {
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
-                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9091,7 +9172,7 @@ impl ExecNtHandler {
                 // mapped TEB the subsequent NtQueryInformationThread(162) → kernel32 ActCtx copy
                 // (mov [newTEB+0x1728]) writes to a stale stack pointer and faults.
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 4
+                    && self.current_process_is_lsass()
                     && LSASS_LISTENER_TID.load(Ordering::Relaxed) != 0
                     && LSASS_LISTENER2_TCB.load(Ordering::Relaxed) == 0
                     && LSASS_LISTENER2_TID.load(Ordering::Relaxed) == 0
@@ -9108,7 +9189,7 @@ impl ExecNtHandler {
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
-                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9122,7 +9203,7 @@ impl ExecNtHandler {
                     }
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 4
+                    && self.current_process_is_lsass()
                     && LSASS_LISTENER2_TID.load(Ordering::Relaxed) != 0
                     && LSASS_LISTENER3_TCB.load(Ordering::Relaxed) == 0
                     && LSASS_LISTENER3_TID.load(Ordering::Relaxed) == 0
@@ -9142,7 +9223,7 @@ impl ExecNtHandler {
                                 tid as nt_process::ThreadId,
                                 LSASS_LISTENER3_TEB_VA,
                             );
-                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9177,7 +9258,7 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // ★ BATCH 35 — N-threads multiplex: services' (pi 3) SECOND NtCreateThread = the SCM
+                // ★ BATCH 35 — N-threads multiplex: services.exe's SECOND NtCreateThread = the SCM
                 // RPC listener's PER-CONNECTION worker (rpcrt4 `RPCRT4_new_client`, spawned on
                 // winlogon's accepted connection). BEFORE this batch it fell to the 0xC000_009A
                 // fallthrough below → the worker never spawned → nobody read winlogon's bind PDU / wrote
@@ -9185,7 +9266,7 @@ impl ExecNtHandler {
                 // ETHREAD (services' slot 1; slot 0 = listener), set its OWN TEB, queue *ThreadHandle +
                 // ClientId, and signal the LOOP to spawn it RESUMED with a badged fault EP
                 // (SCM_WORKER_BADGE) so it runs into the main multiplex — its faults sub-select to
-                // (pi 3, scm-worker) via its OWN stack mirror/TEB, and its blocking pipe reads park +
+                // the SCM worker role via its OWN stack mirror/TEB, and its blocking pipe reads park +
                 // re-drive on winlogon's write (the existing batch-33/34 edges, badge-general).
                 // ★ BATCH 36 FRONTIER GUARD. The full per-connection-worker routing (recognizer + spawn
                 // RESUMED into the multiplex at SCM_WORKER_BADGE with its own TEB/stack-mirror/fault-EP,
@@ -9233,8 +9314,8 @@ impl ExecNtHandler {
                 const SCM_WORKER_ROUTE_ENABLED: bool = true;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 3
-                    && self.current_badge == SVC_LISTENER_BADGE
+                    && self.current_process_is_services()
+                    && self.current_thread_has_role(HostedThreadRole::ServicesListener)
                     && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0
                     && SCM_WORKER_TCB.load(Ordering::Relaxed) == 0
                     && SCM_WORKER_TID.load(Ordering::Relaxed) == 0
@@ -9252,7 +9333,7 @@ impl ExecNtHandler {
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
-                            let pid = self.pm_pid_for_pi(3).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9271,7 +9352,7 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // ★ THE LSA SELF-RPC WORKER — lsass' (pi 4) `NtCreateThread` issued FROM its
+                // ★ THE LSA SELF-RPC WORKER — lsass.exe's `NtCreateThread` issued FROM its
                 // `\pipe\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3). In rpcrt4 that call is
                 // `RPCRT4_new_client(cconn)` → `CreateThread(RPCRT4_io_thread, conn)`
                 // (`rpc_server.c:626`), reached from `rpcrt4_protseq_np_wait_for_new_connection`
@@ -9282,8 +9363,8 @@ impl ExecNtHandler {
                 // Before this recognizer existed the call fell through to the generic paths and no
                 // per-connection worker was ever routed — which is why lsass' own `LsaOpenPolicy`
                 // (samsrv's `SampGetAccountDomainInfo`, a SELF-RPC into lsass' own LSA RPC surface)
-                // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (pi 4 + the
-                // \lsarpc server thread's badge), never by creation order.
+                // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (lsass.exe + the
+                // \lsarpc server thread role), never by creation order.
                 //
                 // ★★ ROUTE STILL GATED OFF — but for a NEWLY ISOLATED reason, no longer the
                 // dispatch-correlation one. With `LSA_WORKER_ROUTE_ENABLED = true` the whole
@@ -9316,8 +9397,8 @@ impl ExecNtHandler {
                 // `RPCRT4_new_client` was genuinely REACHED. No logon, token or RPC reply is
                 // fabricated.
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 4
-                    && self.current_badge == LSASS_LISTENER3_BADGE
+                    && self.current_process_is_lsass()
+                    && self.current_thread_has_role(HostedThreadRole::LsassListener3)
                     && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
                     && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
                     && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
@@ -9329,8 +9410,8 @@ impl ExecNtHandler {
                 }
                 if crate::LSA_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 4
-                    && self.current_badge == LSASS_LISTENER3_BADGE
+                    && self.current_process_is_lsass()
+                    && self.current_thread_has_role(HostedThreadRole::LsassListener3)
                     && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
                     && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
                     && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
@@ -9348,7 +9429,7 @@ impl ExecNtHandler {
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
-                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9393,8 +9474,8 @@ impl ExecNtHandler {
                         {
                             Some(1)
                         } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
-                            && self.pi == 4
-                            && self.current_badge == LSASS_LISTENER3_BADGE
+                            && self.current_process_is_lsass()
+                            && self.current_thread_has_role(HostedThreadRole::LsassListener3)
                             && LSA_WORKER_TID.load(Ordering::Relaxed) != 0
                         {
                             // ★ THE SECOND `\pipe\lsarpc` CLIENT. rpcrt4 spawns ONE per-connection
@@ -9414,9 +9495,9 @@ impl ExecNtHandler {
                             // the additional connection worker a real thread. It needs no new named
                             // slot — the generic `(pi, slot)` hosted-thread layout is already fully
                             // general (badge, target VAs, executive mirror + env scratch, multiplex
-                            // sub-select) and pi 4 has a free slot, so this claims one.
+                            // sub-select) and this process has a free slot, so this claims one.
                             let free = (0..TP_WORKER_SLOT_COUNT)
-                                .find(|slot| TP_WORKER_TID[4][*slot].load(Ordering::Relaxed) == 0);
+                                .find(|slot| TP_WORKER_TID[self.pi][*slot].load(Ordering::Relaxed) == 0);
                             if free.is_some() {
                                 crate::LSA_RPC_EXTRA_WORKERS_CLAIMED
                                     .fetch_add(1, Ordering::Relaxed);
@@ -9600,12 +9681,14 @@ impl ExecNtHandler {
                 // NtConnectPort's it during LsapInitLsa. We don't host a real SRM, so MODEL the port:
                 // mint a comm-port handle + return SUCCESS so LsapRmInitializeServer proceeds (its
                 // LsapRmServerThread only NtRequestWaitReplyPort's the SRM for logon/token events, which
-                // don't occur on this boot path). Scoped to lsass (pi 4) so it can't perturb the CSR/SM
+                // don't occur on this boot path). Scoped to lsass.exe so it can't perturb the CSR/SM
                 // LPC broker path (csrss/winlogon pi 1/2).
                 {
                     let mut nb = [0u8; 40];
                     let nlen = Self::fold_name(&name16, &mut nb);
-                    if self.pi == 4 && nb[..nlen].windows(15).any(|w| w == b"sermcommandport") {
+                    if self.current_process_is_lsass()
+                        && nb[..nlen].windows(15).any(|w| w == b"sermcommandport")
+                    {
                         let h = self.mint_handle();
                         self.queue_write(args[0], h);
                         LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
@@ -9613,19 +9696,19 @@ impl ExecNtHandler {
                         return 0;
                     }
                 }
-                // lsass (pi==4) LSA-init port connects: after \SeRmCommandPort (modeled above), lsass's
+                // lsass.exe LSA-init port connects: after \SeRmCommandPort (modeled above), lsass's
                 // LSA/RPC init connects to further ports. If the broker doesn't own the name, connecting
                 // returns OBJECT_NAME_NOT_FOUND → lsass (a CRITICAL process via RtlSetProcessIsCritical)
                 // terminates the WHOLE process with 0xC0000034 (see LsapInitLsa/LsarStartRpcServer).
                 // MODEL any lsass port connect the broker doesn't know as an accepted comm port (mint a
                 // handle + SUCCESS) so LSA init proceeds past the connect toward LsarStartRpcServer /
-                // LSA_RPC_SERVER_ACTIVE. Scoped to pi==4 (services/csrss/winlogon LPC unchanged).
+                // LSA_RPC_SERVER_ACTIVE. Scoped to lsass.exe (services/csrss/winlogon LPC unchanged).
                 // NOTE: this advances lsass PAST the connect into its LSA server-thread creation
                 // (NtCreateThread), which then WALLs at a bad thread-entry fetch (a bare RVA 0x3a288) —
                 // the flagged "N threads per process" lsass-listener multiplex frontier (same class as
                 // winlogon's RPC-listener thread). Kept because it advances lsass + is non-regressive
                 // (gate 165 held); the thread-entry wall is the NEXT batch's frontier.
-                if self.pi == 4 {
+                if self.current_process_is_lsass() {
                     let mut nb = [0u8; 48];
                     let nlen = Self::fold_name(&name16, &mut nb);
                     print_str(b"[lsass-connect] port=");
@@ -9701,7 +9784,7 @@ impl ExecNtHandler {
                 // accept carrying the server's OWN Accept decision (R9) and PortContext (RDX = the
                 // LSAP_LOGON_CONTEXT it just built). No override, no fabricated handle.
                 let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
-                if self.pi == 4 && lsa_conn != 0 {
+                if self.current_process_is_lsass() && lsa_conn != 0 {
                     let accept = args[3] != 0;
                     let port_context = args[1];
                     let server_handle = lpc_client()
@@ -9733,7 +9816,7 @@ impl ExecNtHandler {
                 // ★ LSA RENDEZVOUS: the real server finished its accept — complete through the broker
                 // and hand the LOOP the client comm-port handle to publish into winlogon's *PortHandle.
                 let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
-                if self.pi == 4 && lsa_conn != 0 {
+                if self.current_process_is_lsass() && lsa_conn != 0 {
                     match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
                         Some((client_handle, _)) => {
                             LSA_CLIENT_HANDLE.store(client_handle, Ordering::Relaxed);
@@ -9761,7 +9844,7 @@ impl ExecNtHandler {
             // The handle names the same real EventStore object used by NtSet/Reset/Query. Late DLL
             // globals are reached through their persistent cross-address-space page aliases.
             NativeService::NtCreateEvent => {
-                // Services (pi 3): CreateEventW(SCM_START_EVENT/AUTOSTARTCOMPLETE/LSA_RPC_SERVER_ACTIVE/
+                // Hosted services: CreateEventW(SCM_START_EVENT/AUTOSTARTCOMPLETE/LSA_RPC_SERVER_ACTIVE/
                 // SECURITY_SERVICES_STARTED). NtCreateEvent(*EventHandle[R10]=args[0], ACCESS,
                 // *OA[R8]=args[2], EVENT_TYPE, InitialState). Register a REAL named event object in the
                 // executive object namespace (kind==2) keyed by the OA name (rooted at the OA's
@@ -10073,12 +10156,12 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
-                // lsass (pi 4): \SeLsaInitEvent is created by ntoskrnl's SeRmInitPhase1 (the SRM), which
+                // lsass.exe: \SeLsaInitEvent is created by ntoskrnl's SeRmInitPhase1 (the SRM), which
                 // we don't host — lsass' LsapRmInitializeServer (srm.c:194) NtOpenEvent's it then
                 // NtSetEvent's it to signal the kernel it's ready, and treats an open failure as FATAL.
                 // Model it: auto-create the event so the open + set succeed (like \SeRmCommandPort). The
-                // name folds to "selsainitevent". Scoped pi==4 so services/paint reads are unchanged.
-                if self.pi == 4 && path == b"\\selsainitevent" {
+                // name folds to "selsainitevent". Scoped to lsass.exe so services/paint reads are unchanged.
+                if self.current_process_is_lsass() && path == b"\\selsainitevent" {
                     if let Some(i) = self.obj_create(path, root_idx, 2, &[]) {
                         let created = !self.events.contains(i as u64);
                         if !self.events.contains(i as u64) {
@@ -11228,7 +11311,7 @@ impl ExecNtHandler {
             // OBJECT_DIRECTORY_INFORMATION records (x64: {UNICODE_STRING Name; UNICODE_STRING
             // TypeName;} = 0x20 bytes each), terminated by a zero record, followed by the UTF-16
             // name/type strings; return STATUS_NO_MORE_ENTRIES when the directory has no more
-            // entries. Context is the next-child index (0 on RestartScan). Scoped to services (pi 3).
+            // entries. Context is the next-child index (0 on RestartScan).
             NativeService::NtQueryDirectoryObject => unsafe {
                 SERVICES_QUERY_DIR_OBJECT.fetch_add(1, Ordering::Relaxed);
                 let dir_handle = args[0];
@@ -12963,7 +13046,7 @@ impl ExecNtHandler {
                 // WORKER (badge LSA_WORKER_BADGE — bind_ack / the LsarOpenPolicy response) versus lsass'
                 // main thread acting as the CLIENT (advapi32's auto-bind + the request). Name-scoped via
                 // the fid→pipe-name map, so no other pipe traffic can inflate it.
-                if self.pi == 4
+                if self.current_process_is_lsass()
                     && payload_ok
                     && len >= 4
                     && payload.first() == Some(&5)
@@ -13228,7 +13311,7 @@ impl ExecNtHandler {
                                             // LSA self-RPC: a PDU delivered SYNCHRONOUSLY (npfs had
                                             // the peer's message already queued). Same attribution as
                                             // the parked-read re-drive path.
-                                            if self.pi == 4
+                                            if self.current_process_is_lsass()
                                                 && output.first() == Some(&5)
                                                 && crate::pipe_fid_name_hash(file_id)
                                                     == lsarpc_pipe_name_hash()
@@ -13417,7 +13500,7 @@ impl ExecNtHandler {
                 let status = match information_class {
                     23 => {
                         let file_id = self.npfs_file_id_for(args[0]);
-                        if self.pi != 2 && self.pi != 4 {
+                        if !self.current_process_is_winlogon() && !self.current_process_is_lsass() {
                             0xC000_0002 // STATUS_NOT_IMPLEMENTED
                         } else if length < 8 {
                             0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
@@ -13624,7 +13707,7 @@ impl ExecNtHandler {
                         return status;
                     }
                 }
-                // pi==3 pipe client-open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
+                // Named-pipe client open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
                 // npfs (IRP_MJ_CREATE = client connect → finds the FCB via the real prefix tree). Placed
                 // before the FS name-scope so a pipe path never falls into the DLL/System32 fakes.
                 {
@@ -13956,9 +14039,9 @@ impl ExecNtHandler {
                     }
                     0
                 } else {
-                    // DIAG (BATCH 23): log lsass's (pi==4) unresolved NtOpenFile — its LSA init opens a
+                    // DIAG (BATCH 23): log lsass.exe's unresolved NtOpenFile — its LSA init opens a
                     // named object we don't model and bails with OBJECT_NAME_NOT_FOUND. Surface the name.
-                    if self.pi == 4 {
+                    if self.current_process_is_lsass() {
                         print_str(b"[lsass-open-miss] name=");
                         print_str(&nb[..nlen.min(80)]);
                         print_str(b" -> 0xC0000034\n");
