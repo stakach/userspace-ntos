@@ -997,6 +997,15 @@ struct CapturedGetClassInfo {
     scrollbar: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CapturedGetClassName {
+    desc_client: u64,
+    buffer_client: u64,
+    desc_out: u64,
+    buffer_out: u64,
+    maximum: u16,
+}
+
 fn rc_arg_slot_base(slot: u64) -> u64 {
     win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT
 }
@@ -1145,6 +1154,91 @@ unsafe fn copy_back_get_class_info(
         print_str(b"\n");
     }
     copyout_ok
+}
+
+unsafe fn capture_get_class_name_out(
+    pi: u64,
+    class_name: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedGetClassName> {
+    if class_name == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        class_name,
+        &mut raw,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    let length = u16::from_le_bytes([raw[0], raw[1]]);
+    let maximum = u16::from_le_bytes([raw[2], raw[3]]);
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if length & 1 != 0 || maximum < length || maximum == 0 || buffer == 0 {
+        return None;
+    }
+    let staged_max = (maximum as u64).min(RC_ARG_BUF_CAP) as u16;
+    if staged_max < 2 {
+        return None;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc_out = rc_arg_slot_base(slot);
+    let buffer_out = desc_out + 0x20;
+    core::ptr::write_bytes(desc_out as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    raw[2..4].copy_from_slice(&staged_max.to_le_bytes());
+    raw[8..16].copy_from_slice(&buffer_out.to_le_bytes());
+    core::ptr::copy_nonoverlapping(raw.as_ptr(), desc_out as *mut u8, raw.len());
+    Some(CapturedGetClassName {
+        desc_client: class_name,
+        buffer_client: buffer,
+        desc_out,
+        buffer_out,
+        maximum,
+    })
+}
+
+unsafe fn copy_back_get_class_name(
+    pi: u64,
+    capture: CapturedGetClassName,
+    chars_returned: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    let byte_len = chars_returned.saturating_mul(2).min(RC_ARG_BUF_CAP);
+    let copy_len = (byte_len + 2)
+        .min(capture.maximum as u64)
+        .min(RC_ARG_BUF_CAP) as usize;
+    let text = core::slice::from_raw_parts(capture.buffer_out as *const u8, copy_len);
+    let text_ok = img_spawn::client_write_mapped(
+        pi,
+        capture.buffer_client,
+        text,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    );
+
+    let mut desc = [0u8; 16];
+    core::ptr::copy_nonoverlapping(capture.desc_out as *const u8, desc.as_mut_ptr(), desc.len());
+    desc[2..4].copy_from_slice(&capture.maximum.to_le_bytes());
+    desc[8..16].copy_from_slice(&capture.buffer_client.to_le_bytes());
+    let desc_ok = img_spawn::client_write_mapped(
+        pi,
+        capture.desc_client,
+        &desc,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    );
+    text_ok && desc_ok
 }
 
 unsafe fn capture_register_class_graph(
@@ -6827,6 +6921,23 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
+                let get_class_name_capture = if m0 == 0x107c {
+                    let capture = capture_get_class_name_out(
+                        pi as u64,
+                        a2,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let Some(capture) = capture {
+                        d_a2 = capture.desc_out;
+                        Some(capture)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
@@ -7432,6 +7543,20 @@ pub(crate) unsafe fn service_sec_image(
                         } else if pi == 5 && capture.scrollbar {
                             USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
                             print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
+                        }
+                    }
+                    if let Some(capture) = get_class_name_capture {
+                        if st != 0
+                            && !copy_back_get_class_name(
+                                pi as u64,
+                                capture,
+                                st,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            )
+                        {
+                            st = 0;
                         }
                     }
                 }
