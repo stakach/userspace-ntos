@@ -1924,6 +1924,19 @@ impl ExecNtHandler {
         })
     }
 
+    fn readonly_disk_open_miss_status(name16: &[u16]) -> Option<u32> {
+        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        let fs = unsafe { exec_fs() }?;
+        if path.is_empty() {
+            return Some(nt_fs::STATUS_NOT_A_DIRECTORY);
+        }
+        Some(match unsafe { fat_open_path_entry(&fs, &path) } {
+            Some((_, _, attributes)) if attributes & 0x10 != 0 => nt_fs::STATUS_NOT_A_DIRECTORY,
+            Some(_) => nt_fs::STATUS_NOT_SUPPORTED,
+            None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+        })
+    }
+
     fn unsupported_nt_create_file(&self, name16: &[u16]) -> u32 {
         // A file namespace this host has no service for. Answer HONESTLY with
         // STATUS_NOT_IMPLEMENTED: no fabricated handle, and the CALLER decides what to do. This
@@ -12460,6 +12473,24 @@ impl ExecNtHandler {
                                 status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                                 info = 0;
                             }
+                        }
+                    } else if let Some(miss_status) = Self::readonly_disk_open_miss_status(&name16) {
+                        status = miss_status;
+                        let count = NT_CREATE_FILE_READONLY_FAT_MISSES.fetch_add(1, Ordering::Relaxed);
+                        if count < 8 {
+                            print_str(b"[nt-create-file] pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" read-only FAT miss status=0x");
+                            print_hex(status);
+                            print_str(b" name=\"");
+                            for &unit in name16.iter().take(96) {
+                                debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                    unit as u8
+                                } else {
+                                    b'?'
+                                });
+                            }
+                            print_str(b"\"\n");
                         }
                     } else {
                         status = self.unsupported_nt_create_file(&name16);
