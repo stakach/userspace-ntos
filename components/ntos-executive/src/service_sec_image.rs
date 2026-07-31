@@ -8,8 +8,25 @@ const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_GETMESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
+
+const WIN32K_MSG_BYTES: usize = 48;
+const WM_QUIT: u32 = 0x0012;
+
+fn win32k_client_label(pi: usize) -> &'static [u8] {
+    match pi {
+        1 => b"csrss",
+        2 => b"winlogon",
+        3 => b"services",
+        4 => b"lsass",
+        5 => b"userinit",
+        6 => b"explorer",
+        _ => b"client",
+    }
+}
 
 fn sec_image_forward_run() -> u64 {
     let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
@@ -6640,6 +6657,44 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
+                let msg_syscall = pi == 6
+                    && a0 != 0
+                    && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                        || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+                        || m0 == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN);
+                let msg_returns_to_client = msg_syscall
+                    && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                        || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN);
+                if msg_syscall {
+                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                    if msg_returns_to_client {
+                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
+                        d_a0 = arg;
+                    } else {
+                        let input =
+                            core::slice::from_raw_parts_mut(arg as *mut u8, WIN32K_MSG_BYTES);
+                        if img_spawn::client_copyin_process_mapped(
+                            pi as u64,
+                            a0,
+                            input,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                            false,
+                        ) {
+                            d_a0 = arg;
+                        } else {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] explorer MSG copy-in failed ssn=0x");
+                                print_hex(m0 as u32);
+                                print_str(b" buffer=0x");
+                                print_hex_u64(a0);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
+                }
                 // BATCH 43: throttle the per-dispatch header for the HIGH-FREQUENCY class-registration
                 // loop SSNs (0x103d NtUserFindExistingCursorIcon / 0x10b4 NtUserRegisterClassExWOW), which
                 // each fire dozens of times during user32 RegisterSystemClasses. Serial writes dominate the
@@ -6648,7 +6703,9 @@ pub(crate) unsafe fn service_sec_image(
                 let w32_hot = m0 == 0x103d || m0 == 0x10b4;
                 let w32_log = !w32_hot || W32_HOT_LOG.fetch_add(1, Ordering::Relaxed) < 12;
                 if w32_log {
-                    print_str(b"[win32k-svc] csrss -> SSN 0x");
+                    print_str(b"[win32k-svc] ");
+                    print_str(win32k_client_label(pi));
+                    print_str(b" -> SSN 0x");
                     print_hex(m0 as u32);
                     print_str(b" (dispatch)\n");
                 }
@@ -7515,6 +7572,86 @@ pub(crate) unsafe fn service_sec_image(
                         ok = resumed.1;
                     }
                 }
+                if ok && !redirected_user_callback && msg_returns_to_client {
+                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                    let staged_message = core::ptr::read_unaligned((arg + 8) as *const u32);
+                    let should_copy_msg = st != 0
+                        || (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                            && staged_message == WM_QUIT);
+                    if should_copy_msg {
+                        let output = core::slice::from_raw_parts(
+                            arg as *const u8,
+                            WIN32K_MSG_BYTES,
+                        );
+                        if !img_spawn::client_copyout_mapped(
+                            pi as u64,
+                            a0,
+                            output,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            let failures =
+                                WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] explorer MSG copy-out failed ssn=0x");
+                                print_hex(m0 as u32);
+                                print_str(b" buffer=0x");
+                                print_hex_u64(a0);
+                                print_str(b"\n");
+                            }
+                            st = 0;
+                        }
+                    }
+                }
+                if msg_syscall && ok && !redirected_user_callback {
+                    let n = EXPLORER_GETMESSAGE_DIAG_N.fetch_add(1, Ordering::Relaxed);
+                    if n < 128 || n.is_power_of_two() {
+                        let mut msg = [0u8; WIN32K_MSG_BYTES];
+                        let copy_ok = img_spawn::client_copyin_process_mapped(
+                            pi as u64,
+                            a0,
+                            &mut msg,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                            false,
+                        );
+                        let hwnd = u64::from_le_bytes(msg[0..8].try_into().unwrap_or([0; 8]));
+                        let message = u32::from_le_bytes(msg[8..12].try_into().unwrap_or([0; 4]));
+                        let wparam =
+                            u64::from_le_bytes(msg[0x10..0x18].try_into().unwrap_or([0; 8]));
+                        let lparam =
+                            u64::from_le_bytes(msg[0x18..0x20].try_into().unwrap_or([0; 8]));
+                        let time =
+                            u32::from_le_bytes(msg[0x20..0x24].try_into().unwrap_or([0; 4]));
+                        print_str(b"[explorer-msg] ssn=0x");
+                        print_hex(m0 as u32);
+                        print_str(b" ret=0x");
+                        print_hex(st as u32);
+                        print_str(b" msgptr=0x");
+                        print_hex_u64(a0);
+                        print_str(b" hfilter=0x");
+                        print_hex_u64(a1);
+                        print_str(b" min=0x");
+                        print_hex(a2 as u32);
+                        print_str(b" max=0x");
+                        print_hex(a3 as u32);
+                        print_str(b" copy=");
+                        print_u64(if copy_ok { 1 } else { 0 });
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(hwnd);
+                        print_str(b" message=0x");
+                        print_hex(message);
+                        print_str(b" wParam=0x");
+                        print_hex_u64(wparam);
+                        print_str(b" lParam=0x");
+                        print_hex_u64(lparam);
+                        print_str(b" time=");
+                        print_u64(time as u64);
+                        print_str(b"\n");
+                    }
+                }
                 if ok && !redirected_user_callback {
                     if m0 == 0x10ad && st == 0 && !class_atom_name_pre_served {
                         if let Some(fallback) = copy_class_atom_name_fallback(
@@ -7670,7 +7807,9 @@ pub(crate) unsafe fn service_sec_image(
                 // BATCH 43: throttle the status line for the same hot class-loop SSNs (WALL statuses ALWAYS
                 // print — a wall is never suppressed).
                 if !redirected_user_callback && (!ok || w32_log) {
-                    print_str(b"[win32k-svc] csrss SSN 0x");
+                    print_str(b"[win32k-svc] ");
+                    print_str(win32k_client_label(pi));
+                    print_str(b" SSN 0x");
                     print_hex(m0 as u32);
                     print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
                     print_hex(st as u32);
