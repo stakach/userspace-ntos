@@ -6577,6 +6577,26 @@ pub(crate) unsafe fn service_sec_image(
                     d_a2 = capture_client_string_arg(
                         pi as u64, d_a2, false, filled_pages, faults as usize, scratch_base,
                     );
+                } else if m0 == 0x1036 {
+                    // NtUserRegisterWindowMessage takes one client PUNICODE_STRING. ReactOS probes and
+                    // captures it before adding the atom; isolated win32k needs the same cross-VSpace
+                    // capture or shell message registration can fault on a foreign user pointer while
+                    // inside an explorer callback.
+                    let captured = capture_client_string_arg(
+                        pi as u64,
+                        d_a0,
+                        false,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if captured != d_a0 {
+                        d_a0 = captured;
+                        if pi == 6 {
+                            EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 } else if m0 == 0x10de && pi != 3 && pi != 4 {
                     // NtGdiOpenDCW probes/copies the caller's optional device name before opening
                     // the DC. Capture interactive clients' counted strings at the executive boundary

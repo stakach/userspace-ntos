@@ -569,7 +569,25 @@ impl ExecNtHandler {
         }
         handler.refresh_process_manager_gates();
         unsafe { handler.provision_default_user_locale() };
+        handler.provision_reactos_explorer_shell_com_classes();
         handler
+    }
+
+    /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback
+    /// `CoCreateInstance` calls. A normal installed system would have these under HKCR; the staged
+    /// LiveCD SOFTWARE hive does not, so the executive supplies the missing setup output through the
+    /// same volatile overlay used by real registry writes.
+    fn provision_reactos_explorer_shell_com_classes(&mut self) {
+        let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes(
+            &mut self.overlay,
+            r"\Registry\Machine\Software\Classes",
+        );
+        EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
+        if mask != 0 {
+            print_str(b"[shell-com] provisioned explorer HKCR classes mask=0x");
+            print_hex(mask as u32);
+            print_str(b"\n");
+        }
     }
 
     /// ═══ THE SECOND SETUP STEP THE LIVECD SKIPS — the default user's LOCALE ═══════════════════
@@ -958,6 +976,94 @@ impl ExecNtHandler {
                 Some(0xC000_0034) // STATUS_OBJECT_NAME_NOT_FOUND
             }
         }
+    }
+
+    /// Explorer's COM activation path uses HKCR, which ReactOS maps to
+    /// `\Registry\Machine\Software\Classes`. Resolve that subtree for pi 6 with PE-backed
+    /// OBJECT_ATTRIBUTES reads so DLL `.rdata` literals work the same way as they do for services.
+    ///
+    /// # Safety
+    /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader and mints a
+    /// handle into the current process's own EPROCESS handle table.
+    unsafe fn open_explorer_classes_key(
+        &mut self,
+        root_target: Option<KeyRef>,
+        path: &str,
+        oa: u64,
+        args: &[u64],
+    ) -> Option<u32> {
+        if self.pi != 6 {
+            return None;
+        }
+        let name = self.effective_objattr_name(path, oa);
+        if root_target.is_none() {
+            let comps = Self::key_components(&name);
+            if comps.len() == 2
+                && comps[0].eq_ignore_ascii_case("Registry")
+                && comps[1].eq_ignore_ascii_case("Machine")
+            {
+                return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
+            }
+        }
+
+        let full = if root_target == Some(MACHINE_ROOT_KEY) {
+            let mut full = alloc::string::String::from(r"\Registry\Machine");
+            if !name.is_empty() {
+                full.push('\\');
+                full.push_str(&name);
+            }
+            Some(full)
+        } else if let Some(parent_path) =
+            root_target.and_then(|target| self.registry_target_path(target))
+        {
+            if parent_path != r"\registry\machine"
+                && !parent_path.starts_with(r"\registry\machine\")
+            {
+                return None;
+            }
+            let mut full = parent_path;
+            if !name.is_empty() {
+                full.push('\\');
+                full.push_str(&name);
+            }
+            Some(full)
+        } else if root_target.is_none() {
+            Some(name)
+        } else {
+            None
+        }?;
+
+        let canon = self.overlay_canon(&full);
+        if canon != r"\registry\machine\software\classes"
+            && !canon.starts_with(r"\registry\machine\software\classes\")
+        {
+            return None;
+        }
+
+        if let Some(index) = self.overlay.find(&canon) {
+            let bit = explorer_shell_com_class_bit_for_path(&canon);
+            if bit != 0 {
+                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(
+                OVERLAY_KEY_TAG | index as u32,
+                args[1] as u32,
+                args[0],
+            ));
+        }
+
+        if let Some(key) = self.resolve_key(&full) {
+            if hive_sel(key) == HIVE_SEL_SOFTWARE {
+                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            let bit = explorer_shell_com_class_bit_for_path(&canon);
+            if bit != 0 {
+                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(key, args[1] as u32, args[0]));
+        }
+
+        Some(0xC000_0034)
     }
 
     /// Bounded trace of a registry MISS in winlogon's post-profile window: which key, which value.
@@ -6785,6 +6891,9 @@ impl ExecNtHandler {
                         }
                     }
                 }
+                if let Some(status) = self.open_explorer_classes_key(root_target, &path, oa, args) {
+                    return status;
+                }
                 // Registry overlays are machine-global, so keys created by configuration code must
                 // be openable by every process. This is especially important for loader IFEO keys:
                 // a configured image option may be created by services/setup and consumed while
@@ -7827,10 +7936,23 @@ impl ExecNtHandler {
                 // BATCH 41 — winlogon (pi 2) too: msgina's L"DefaultPassword" value name is a msgina.dll
                 // `.rdata` literal, so recover it cross-AS from the PE (the mirror-only smss_read_ustr
                 // returns empty for it). read_ustr_pe uses xas_read → resolves any resident/PE page.
-                let key_is_ifeo = self
-                    .registry_target_path(key)
+                let key_path = self.registry_target_path(key);
+                let key_is_ifeo = key_path
+                    .as_deref()
                     .is_some_and(|path| path.contains(r"\image file execution options\"));
-                let name16 = if self.pi == 2 || self.pi == 3 || self.pi == 4 || key_is_ifeo {
+                let shell_com_inproc_bit = if self.pi == 6 {
+                    key_path
+                        .as_deref()
+                        .map_or(0, explorer_shell_com_inproc_class_bit_for_path)
+                } else {
+                    0
+                };
+                let name16 = if self.pi == 2
+                    || self.pi == 3
+                    || self.pi == 4
+                    || key_is_ifeo
+                    || shell_com_inproc_bit != 0
+                {
                     self.read_ustr_pe(args[1])
                 } else {
                     smss_read_ustr(args[1])
@@ -7844,7 +7966,7 @@ impl ExecNtHandler {
                 // Set for winlogon's real-hive Nls\Language `Default` read: its out-params (a heap/stack
                 // advapi allocation) need the cross-AS writer, whereas msgina's synth reads stay mirror-only
                 // (byte-identical). Local so no other value read's copyout method changes.
-                let mut use_xas_write = false;
+                let mut use_xas_write = shell_com_inproc_bit != 0;
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
                 } else if self.pi == 2
@@ -7955,6 +8077,15 @@ impl ExecNtHandler {
                 // produced the desktop paint) never leaks through this key.
                 if key == SYNTH_WINLOGON_KEY && val.is_some() {
                     WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
+                }
+                if val.is_some() && shell_com_inproc_bit != 0 {
+                    if name_lc.is_empty() {
+                        EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK
+                            .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                    } else if name_lc == "threadingmodel" {
+                        EXPLORER_SHELL_COM_THREADING_MODEL_MASK
+                            .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                    }
                 }
                 match val {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults

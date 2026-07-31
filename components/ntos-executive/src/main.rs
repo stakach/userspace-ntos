@@ -3336,11 +3336,20 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     let create_window_string_captures =
         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
+    let register_window_message_captures =
+        EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
     let class_atom_fallbacks = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.load(Ordering::Relaxed);
     let class_atom_fallback_failures =
         GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.load(Ordering::Relaxed);
+    let shell_com_provisioned =
+        EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
+    let shell_com_opened = EXPLORER_SHELL_COM_CLASS_OPEN_MASK.load(Ordering::Relaxed);
+    let shell_com_inproc_default =
+        EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
+    let shell_com_threading =
+        EXPLORER_SHELL_COM_THREADING_MODEL_MASK.load(Ordering::Relaxed);
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
     let process_self_term =
@@ -3367,6 +3376,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(process_self_term as u64);
     print_str(b" create-window-string-captures=");
     print_u64(create_window_string_captures);
+    print_str(b" register-window-message-captures=");
+    print_u64(register_window_message_captures);
     print_str(b" win32k-pool-exhaustions=");
     print_u64(win32k_pool_exhaustions);
     print_str(b" class-atom-names=");
@@ -3383,6 +3394,14 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(dead_callback_failures);
     print_str(b" nccreate-false=");
     print_u64(nccreate_false);
+    print_str(b" shell-com-provisioned=0x");
+    print_hex(shell_com_provisioned as u32);
+    print_str(b" shell-com-opened=0x");
+    print_hex(shell_com_opened as u32);
+    print_str(b" shell-com-inproc/default/threading=0x");
+    print_hex(shell_com_inproc_default as u32);
+    print_str(b"/0x");
+    print_hex(shell_com_threading as u32);
     print_str(b"\n");
     check(
         b"exec_explorer_process_spawned",
@@ -3402,6 +3421,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         passed,
     );
     check(
+        b"exec_explorer_register_window_messages_captured",
+        register_window_message_captures >= 1,
+        passed,
+    );
+    check(
         b"exec_win32k_pool_no_exhaustion",
         win32k_pool_exhaustions == 0,
         passed,
@@ -3409,6 +3433,16 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     check(
         b"exec_explorer_user_callbacks_redirected",
         api0_redirects >= 1 && callback_failures == 0,
+        passed,
+    );
+    check(
+        b"exec_explorer_shell_com_classes_served",
+        shell_com_provisioned & EXPLORER_SHELL_COM_REQUIRED_MASK == EXPLORER_SHELL_COM_REQUIRED_MASK
+            && shell_com_opened & EXPLORER_SHELL_COM_REQUIRED_MASK == EXPLORER_SHELL_COM_REQUIRED_MASK
+            && shell_com_inproc_default & EXPLORER_SHELL_COM_REQUIRED_MASK
+                == EXPLORER_SHELL_COM_REQUIRED_MASK
+            && shell_com_threading & EXPLORER_SHELL_COM_REQUIRED_MASK
+                == EXPLORER_SHELL_COM_REQUIRED_MASK,
         passed,
     );
 }
@@ -9704,6 +9738,14 @@ pub(crate) static EXPLORER_IMAGE_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_CREATE_PROCESS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_IMAGE_PAGE_TABLES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_CREATE_WINDOW_STRING_CAPTURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) const EXPLORER_SHELL_COM_REQUIRED_MASK: u64 =
+    nt_hive_core::REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU
+        | nt_hive_core::REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE;
+pub(crate) static EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_SHELL_COM_CLASS_OPEN_MASK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_SHELL_COM_THREADING_MODEL_MASK: AtomicU64 = AtomicU64::new(0);
 /// Userinit's own `StartShell` -> `CreateProcessW` image-open attempts. The explorer counters above
 /// prove the attempt entered the generic file -> SEC_IMAGE -> process pipeline.
 pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -9732,6 +9774,30 @@ fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
         Some((kr - OVERLAY_KEY_TAG) as usize)
     } else {
         None
+    }
+}
+
+pub(crate) fn explorer_shell_com_class_bit_for_path(path: &str) -> u64 {
+    let lc = path.to_ascii_lowercase();
+    if lc.contains(
+        r"\registry\machine\software\classes\clsid\{4622ad11-ff23-11d0-8d34-00a0c90f2719}",
+    ) {
+        nt_hive_core::REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU
+    } else if lc.contains(
+        r"\registry\machine\software\classes\clsid\{ecd4fc4d-521c-11d0-b792-00a0c90312e1}",
+    ) {
+        nt_hive_core::REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE
+    } else {
+        0
+    }
+}
+
+pub(crate) fn explorer_shell_com_inproc_class_bit_for_path(path: &str) -> u64 {
+    let bit = explorer_shell_com_class_bit_for_path(path);
+    if bit == 0 || !path.to_ascii_lowercase().ends_with(r"\inprocserver32") {
+        0
+    } else {
+        bit
     }
 }
 /// NtCreateKey SSN (ReactOS ntdll — `sysfuncs.lst` line 44). services' SCM creates volatile keys
