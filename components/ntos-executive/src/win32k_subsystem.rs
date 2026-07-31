@@ -4485,6 +4485,10 @@ unsafe fn prepare_set_thread_desktop(hdesk: u64) {
     let old_rpdesk = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
     let old_pdeskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
     let old_hdesk = read_volatile((pti + THREADINFO_HDESK_OFF) as *const u64);
+    let requested_rpdesk = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
+    if requested_rpdesk != 0 && requested_rpdesk == old_rpdesk {
+        return;
+    }
     if old_rpdesk == 0 && old_pdeskinfo == 0 && old_hdesk == 0 {
         ensure_list_head_initialized(pti + THREADINFO_PTI_LINK_OFF);
         return;

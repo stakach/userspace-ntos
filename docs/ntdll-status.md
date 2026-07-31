@@ -28,9 +28,10 @@ Every number below was **re-measured at `6dee67e`** against the built binary and
 `Call` on the process's fault endpoint (`CT_FAULT`), label `NT_NATIVE_SYSCALL_LABEL = 0x4E54` ("NT"),
 6 message registers (SSN, caller RSP, arg1..arg4); reply = 1 MR (NTSTATUS). Wire format and the pure
 pack/unpack live in `crates/nt-ntdll/src/native_call.rs`; the seam abstraction is
-`crates/nt-ntdll/src/transport.rs`. Because our ntdll owns *every* syscall, the per-thread
-`TCBSetHostedSyscalls` flag is simply left clear — **this needed no kernel change**. Out-params ride
-on the existing client stack/heap/image mirror (MR1 = rsp).
+`crates/nt-ntdll/src/transport.rs`. Hosted ReactOS threads still set rust-micro's
+`TCBSetHostedSyscalls` flag in hybrid mode: this exact native ntdll envelope is allowed through as a
+real seL4 Call, while raw ReactOS DLL syscall stubs fault as NT syscalls even when `rdx` collides with
+seL4 syscall numbers. Out-params ride on the existing client stack/heap/image mirror (MR1 = rsp).
 
 **The loader** is ours end to end: `crates/nt-ntdll/src/loader/` (module graph, import resolution
 incl. forwarders, dependency-ordered `DLL_PROCESS_ATTACH`, `PEB->Ldr` construction and the three

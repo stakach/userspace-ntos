@@ -6736,28 +6736,51 @@ impl ExecNtHandler {
                     target_pid_for_peak = Some(target_pid);
                     let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
                         .then_some(args[4] as u32);
-                    match self.duplicate_process_handle_with_access(
+                    let user_same_process_duplicate =
+                        source_pid == target_pid && options & DUPLICATE_SAME_ACCESS != 0;
+                    if user_same_process_duplicate {
+                        if let Some(handle) = unsafe {
+                            crate::win32k_subsystem::duplicate_user_object_handle(args[1])
+                        } {
+                            Ok(Some(handle))
+                        } else {
+                            match self.duplicate_process_handle_with_access(
+                                source_pid,
+                                args[1] as nt_process::Handle,
+                                target_pid,
+                                desired_access,
+                            ) {
+                                Ok(handle) => {
+                                    native_duplicate = true;
+                                    Ok(Some(handle as u64))
+                                }
+                                Err(status) => Err(status),
+                            }
+                        }
+                    } else {
+                        match self.duplicate_process_handle_with_access(
                             source_pid,
                             args[1] as nt_process::Handle,
                             target_pid,
                             desired_access,
                         ) {
-                        Ok(handle) => {
-                            native_duplicate = true;
-                            Ok(Some(handle as u64))
-                        }
-                        Err(status)
-                            if status == STATUS_INVALID_HANDLE
-                                && source_pid == target_pid
-                                && options & DUPLICATE_SAME_ACCESS != 0 =>
-                        {
-                            unsafe {
-                                crate::win32k_subsystem::duplicate_user_object_handle(args[1])
+                            Ok(handle) => {
+                                native_duplicate = true;
+                                Ok(Some(handle as u64))
                             }
-                            .map(Some)
-                            .ok_or(STATUS_INVALID_HANDLE)
+                            Err(status)
+                                if status == STATUS_INVALID_HANDLE
+                                    && source_pid == target_pid
+                                    && options & DUPLICATE_SAME_ACCESS != 0 =>
+                            {
+                                unsafe {
+                                    crate::win32k_subsystem::duplicate_user_object_handle(args[1])
+                                }
+                                .map(Some)
+                                .ok_or(STATUS_INVALID_HANDLE)
+                            }
+                            Err(status) => Err(status),
                         }
-                        Err(status) => Err(status),
                     }
                 };
 

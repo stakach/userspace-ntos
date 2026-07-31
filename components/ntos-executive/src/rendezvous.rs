@@ -10,9 +10,9 @@ use crate::*;
 /// `SM_FAULT_EP` (no standing receiver) and is resumed at spawn → PARKS on its first fault.
 pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
     // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
-    // thread must too — DON'T set TCBSetHostedSyscalls (native Call → MR0=SSN). Its private IPC
-    // frame lives at the VA ntdll derives from the active TEB; otherwise the Call faults as an
-    // UnknownSyscall with m0=RAX garbage → `[sm-rdv] WALL: unexpected SSN`.
+    // thread must too. The hosted-syscalls flag is hybrid now: OUR ntdll's `Call(CT_FAULT,
+    // label=0x4E54)` still arrives natively with MR0=SSN, while raw Windows syscall stubs fault as NT
+    // syscalls. Its private IPC frame lives at the VA ntdll derives from the active TEB.
     spawn_hosted_thread(&HostedThread {
         pml4: smss_pml4,
         client_pi: 0,
@@ -1396,14 +1396,11 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         resume,
         prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
         // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
-        // server WORKER thread must too — mirror the BATCH-6 SM/CSR pattern: DON'T set
-        // TCBSetHostedSyscalls (native Call → MR0=SSN, not an UnknownSyscall trap whose m0=RAX is
-        // garbage). All three worker slots run in winlogon's VSpace (pi 2) with distinct TEB-derived
-        // IPC buffers. Their faults still arrive on the badged MAIN fault-EP (the loop's
-        // NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them into the shared servicing body), so the
-        // worker actually RUNS its rpcrt4 RPC-server init + NtSetEvent(s) the event winlogon's main
-        // parks on. Without native:true the worker's first native Call faulted as UnknownSyscall with
-        // SSN=garbage → `[wl-worker] PARK` (never ran its RPC init) → winlogon main stuck on the SAS wait.
+        // server WORKER thread must too. All three worker slots run in winlogon's VSpace (pi 2) with
+        // distinct TEB-derived IPC buffers. Their faults still arrive on the badged MAIN fault-EP (the
+        // loop's NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them into the shared servicing body),
+        // so the worker actually RUNS its rpcrt4 RPC-server init + NtSetEvent(s) the event winlogon's
+        // main parks on.
         native: true,
         diag: false,
     })
@@ -1462,8 +1459,8 @@ pub(crate) struct RemoteThreadSpawn {
     pub fault_ep: u64,
     /// Enter `LdrInitializeThunk` first (a real hosted process) or the start routine directly.
     pub use_loader: bool,
-    /// NATIVE seL4-Call transport (our ntdll). `false` sets `TCBSetHostedSyscalls`, so a raw
-    /// `syscall` faults as UnknownSyscall instead of dispatching natively.
+    /// NATIVE seL4-Call transport (our ntdll). Hosted threads still get rust-micro's hybrid
+    /// hosted-syscalls flag; this tells the executive-side spawn which ntdll entry path to use.
     pub native: bool,
     /// Resume immediately, or leave suspended (`CreateSuspended`).
     pub resume: bool,
@@ -1588,11 +1585,8 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         resume,
         prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
         // BATCH 33: services (pi 3) runs on OUR ntdll's NATIVE seL4-Call transport, so its SCM RPC
-        // listener thread must too — mirror the BATCH 24 lsass-listener fix (was BATCH-6 native:false,
-        // whose first native Call faulted as UnknownSyscall with SSN=garbage 0x100_105f_b000 →
-        // `[svc-listener] blocking server syscall -> PARK (drop)` before it ever created/read its
-        // \pipe\ntsvcs server end). native:true plus its TEB-derived private IPC buffer makes its
-        // Call dispatch (MR0=r10=SSN), so it runs its rpcrt4 ncacn_np receive loop
+        // listener thread must too. native:true plus its TEB-derived private IPC buffer makes its
+        // Call dispatch (MR0=SSN), so it runs its rpcrt4 ncacn_np receive loop
         // (FSCTL_PIPE_LISTEN + NtReadFile on the server pipe) — the reads the pipe-pending
         // park/re-drive edge then completes.
         native: true,
@@ -1736,10 +1730,8 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         resume,
         prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
         // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
-        // thread must too — mirror BATCH 6/19 (winlogon's RPC listener). Without native:true the thread's
-        // first native Call faulted as UnknownSyscall with SSN=garbage (0x100_0080_0000 = RAX at trap) →
-        // `[lsass-listener] PARK (unserviced)` → then a stray fault at a garbage stack RIP. Set
-        // native → its Call dispatches (MR0=r10=SSN) through its TEB-derived private IPC buffer.
+        // thread must too. native:true makes its Call dispatch (MR0=SSN) through its TEB-derived
+        // private IPC buffer.
         // Its faults still arrive on the badged MAIN fault-EP (the loop's NT_NATIVE_SYSCALL_LABEL
         // NORMALIZE arm re-labels them), so it actually RUNS LsarStartRpcServer →
         // SetEvent(LSA_RPC_SERVER_ACTIVE).

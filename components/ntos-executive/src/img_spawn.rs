@@ -955,26 +955,17 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
     }
     let _ = tcb_set_priority(tcb, prio);
-    // Transport selection (ntdll_plan Step 6.A):
-    //  * TRAP transport (real ntdll, or OUR ntdll on the trap path): mark this a HOSTED thread so the
-    //    kernel turns EVERY `syscall` it issues into an UnknownSyscall fault to the executive, never a
-    //    native seL4 dispatch. Without this, NT syscalls whose arg2 (RDX) collides with a seL4 syscall
-    //    number are misdispatched — e.g. NtMapViewOfSection passes ProcessHandle=NtCurrentProcess()=-1
-    //    in RDX, and the kernel reads RDX as the syscall number where -1==SysCall, so the map silently
-    //    never faults here.
-    //  * NATIVE seL4-Call transport (OUR ntdll, Step 6.A): DON'T set the hosted flag. OUR ntdll's Nt*
-    //    stubs issue a real native seL4 `Call(CT_FAULT)` (rdx=-1=SysCall → dispatched natively by the
-    //    kernel), carrying SSN+args in the message; the executive Recv's it on the same fault EP. Since
-    //    OUR ntdll owns EVERY syscall (each stub is our code doing a seL4_Call, never a raw Windows
-    //    `syscall`), the process never issues a syscall that would need the hosted-fault path. NO
-    //    kernel change — the per-thread hosted flag simply stays clear.
-    // Our ntdll is THE ntdll for every hosted process, so the NATIVE seL4-Call transport is selected
-    // uniformly (the effective LdrpInitialize RVA is non-zero for every SEC_IMAGE spawn once derived).
-    let native_transport = effective_ldrp_rva(ldrpinit_rva) != 0;
+    // Transport selection (ntdll_plan Step 6.A): every hosted Windows thread gets the rust-micro
+    // hosted-syscalls flag. The kernel now treats that flag as HYBRID:
+    //   * OUR ntdll's explicit `Call(CT_FAULT, label=0x4E54)` envelope still dispatches natively and
+    //     arrives here as a normal IPC message with MR0=SSN.
+    //   * Any raw Windows DLL `syscall` stub becomes an UnknownSyscall fault, even when its arg2/RDX
+    //     collides with a legal seL4 syscall number. Explorer's
+    //     `SetWindowLongPtrW(hwnd, GWLP_WNDPROC=-4, ...)` depends on this; without the flag, -4 is
+    //     `SysNBSendWait` and win32k never sees NtUserSetWindowLongPtr.
+    let _native_transport = effective_ldrp_rva(ldrpinit_rva) != 0;
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    if !native_transport {
-        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
-    }
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
     if (pi as usize) < MAX_PI {
         PM_MAIN_TCBS[pi as usize].store(tcb, Ordering::Relaxed);

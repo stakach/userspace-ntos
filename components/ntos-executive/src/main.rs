@@ -11360,9 +11360,10 @@ struct HostedThread {
     /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
     prio: u8,
     /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this thread runs on
-    /// OUR ntdll's native transport: don't set the per-thread `TCBSetHostedSyscalls` flag, so its
-    /// `seL4_Call` dispatches natively with MR0=SSN. Every thread still owns a distinct IPC frame at
-    /// `ipcbuf_va`; ntdll derives that VA from the active TEB through `gs:[0x30]`.
+    /// OUR ntdll's native transport: its explicit `Call(CT_FAULT, label=0x4E54)` dispatches natively
+    /// with MR0=SSN even though the thread also has rust-micro's hosted-syscalls flag. Raw ReactOS DLL
+    /// syscall stubs still fault as NT syscalls. Every thread owns a distinct IPC frame at `ipcbuf_va`;
+    /// ntdll derives that VA from the active TEB through `gs:[0x30]`.
     native: bool,
     /// BATCH 36 DIAG: when true, `spawn_hosted_thread` uses the SYS_CALL/`_r` variants for the
     /// resource-critical invocations (retype/copy/map/set_space/write_registers/set_ipc/resume)
@@ -11692,14 +11693,13 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         print_hex(t.fault_ep as u32);
         print_str(b"\n");
     }
-    // Transport (ntdll_plan Step 6.A / BATCH 6): a NATIVE thread must NOT get the hosted-syscalls
-    // flag — with it set the kernel forces its native `seL4_Call` into an UnknownSyscall fault whose
-    // m0=RAX (garbage), so the rendezvous reads a bogus SSN. Cleared, the Call dispatches natively
-    // (MR0=r10=SSN) exactly like the process's MAIN thread. Trap threads keep the flag (byte-id).
+    // Transport (ntdll_plan Step 6.A / BATCH 6): all hosted Windows threads get the hosted-syscalls
+    // flag. rust-micro now treats it as hybrid: OUR ntdll's `Call(CT_FAULT, label=0x4E54)` envelope
+    // still dispatches natively (MR0=SSN), while raw ReactOS DLL syscall stubs fault to the executive
+    // instead of colliding with seL4 syscall numbers such as `GWLP_WNDPROC=-4`.
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    if !t.native {
-        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
-    }
+    let _native_transport = t.native;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
     if t.resume {
         let _ = tcb_resume(tcb);
