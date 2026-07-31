@@ -6666,6 +6666,29 @@ pub(crate) unsafe fn service_sec_image(
                             pi as u64, d_a3, true, filled_pages, faults as usize, scratch_base,
                         );
                     }
+                } else if m0 == 0x1080 && (pi == 5 || pi == 6) {
+                    // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from
+                    // DefWindowProc while win32k is parked in a user callback; capture the counted
+                    // string before isolated win32k probes the client's raw pointer graph.
+                    if pi == 6 {
+                        prefill_client_large_string_pages(
+                            pi as u64,
+                            d_a1,
+                            scratch_base,
+                            &mut faults,
+                            filled_pages,
+                            &reg,
+                            &dll_pes,
+                        );
+                    }
+                    d_a1 = capture_client_string_arg(
+                        pi as u64,
+                        d_a1,
+                        true,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
                 } else if m0 == 0x1041 && a0 == 0x14 {
                     // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
                     // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph
