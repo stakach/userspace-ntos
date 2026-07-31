@@ -765,10 +765,10 @@ impl Default for SasWmCreateNestedSequence {
 /// Hard bound for the alternating win32k-dispatch / user-callback continuation stack.
 ///
 /// ReactOS callbacks are synchronous and may re-enter win32k, but an invalid client must not be
-/// able to grow executive state without limit. Sixteen alternating frames permit eight complete
-/// dispatch/callback levels. Real ComboBox/ComboLBox construction reaches a fifth dispatch level
-/// while delivering nested window-position and size messages.
-pub const MAX_CONTINUATION_DEPTH: usize = 16;
+/// able to grow executive state without limit. Thirty-two alternating frames permit sixteen
+/// complete dispatch/callback levels. Real explorer shell-window construction has reached a ninth
+/// callback level while delivering nested create/position/window-proc messages.
+pub const MAX_CONTINUATION_DEPTH: usize = 32;
 pub const MAX_ACTIVE_CALLBACK_DEPTH: usize = MAX_CONTINUATION_DEPTH / 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2519,7 +2519,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_stack_models_five_nested_callback_levels() {
+    fn continuation_stack_models_nine_nested_callback_levels() {
         let client = ClientThreadIdentity::new(2, 44, 4);
         let mut stack = ContinuationStack::<MAX_CONTINUATION_DEPTH>::new();
         let mut callbacks = [CallbackCorrelation {
@@ -2528,14 +2528,14 @@ mod tests {
             client_pi: 2,
             client_tid: 44,
             client_badge: 4,
-        }; 5];
+        }; 9];
 
         for (depth, callback) in callbacks.iter_mut().enumerate() {
             callback.dispatch_id = 7 + depth as u64;
             stack.push_dispatch(client, callback.dispatch_id).unwrap();
             stack.push_callback(*callback).unwrap();
         }
-        assert_eq!(stack.len(), 10);
+        assert_eq!(stack.len(), 18);
 
         for callback in callbacks.iter().rev() {
             stack.return_callback(*callback).unwrap();

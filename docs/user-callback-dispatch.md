@@ -210,7 +210,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | Directly-bound component stub copies input and enters the callback Send/receive loop | ✅ Phase 3A transport, still used by Phase 4 |
 | Executive pump correlates the active client and either redirects supported callbacks or fails closed | ✅ active api0/3/11/15/16 contracts gate-verified |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
-| Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ 16 continuation frames / 8 active callbacks, correlation-tested and gate-wired |
+| Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ 32 continuation frames / 16 active callbacks, correlation-tested and gate-wired |
 | win32k **nested-dispatch** / re-entrant component transport (3b) | ✅ parked callbacks accept nested USER/GDI dispatches; round57 recorded 1327 nested dispatches |
 | **buffer marshalling** in/out across VSpaces (client-visible only) | ✅ api0 client stack copy/reference scrub plus fixed/LPK resource contracts are live and tested |
 | Real user32 resource callbacks | ✅ api3/api11/api15/api16 selected, redirected, and returned with exact result lengths |
@@ -333,10 +333,10 @@ success.
   callback rendezvous (117 winlogon api0), kept the login-dialog creation frontier, painted 768/768,
   passed 187 pre-existing checks plus the new Phase-2B check, and reached `[microtest done]`.
 - **Phase 3A — bounded continuation + re-entrant component transport (implemented).**
-  `nt-user-callback::ContinuationStack` holds at most sixteen pointer-free alternating
+  `nt-user-callback::ContinuationStack` holds at most thirty-two pointer-free alternating
   `Win32kDispatch`/`UserCallback` frames. Push/pop operations require the exact process, badge,
   thread, dispatch, and callback identity; a child suspends its parent and only an exact correlated
-  unwind makes that parent runnable. Runtime active callbacks are additionally capped at eight
+  unwind makes that parent runnable. Runtime active callbacks are additionally capped at sixteen
   simultaneous reverse transitions. Host tests cover multi-level callback nesting, overflow, illegal
   alternation, stale callback IDs, cross-thread returns, and wrong-dispatch requests. The controlled
   api7 path is wired through this stack and its gate requires exactly two pushes and two unwinds.

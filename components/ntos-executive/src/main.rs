@@ -17166,10 +17166,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // dying mid-callback instead of stranding win32k in its callback receive loop.
     let dead_client_unwinds = win32k_glue::dead_client_callback_unwinds();
     let dead_client_unwind_redirects = win32k_glue::dead_client_callback_unwind_redirects();
+    let callback_continuation_overflows = win32k_glue::user_callback_continuation_overflows();
     print_str(b" dead-client-unwinds=");
     print_u64(dead_client_unwinds);
     print_str(b" dead-client-unwind-redirects=");
     print_u64(dead_client_unwind_redirects);
+    print_str(b" continuation-overflows=");
+    print_u64(callback_continuation_overflows);
     // Callback-window bridge invariant: how often the executive restated the client's
     // CLIENTINFO.CallbackWnd for the in-flight callback, and how often it had actually been clobbered
     // (win32k's own untranslated DesktopHeapAddressToUser pointer) and needed repair.
@@ -17197,6 +17200,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && callback_nested_dispatches >= 1 + callback_nested_ssn_126b
             && callback_continuation_pushes >= callback_nested_dispatches + 2
             && callback_continuation_unwinds == callback_continuation_pushes
+            && callback_continuation_overflows == 0
             && callback_sequence_completions == 1,
         &mut passed,
     );
@@ -17231,8 +17235,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     //
     // win32k's Syscall substrate is the hard case: its dispatch loop legitimately RE-ENTERS. An
     // outer dispatch parks inside `KeUserModeCallback`, the client's redirected `WndProc` issues
-    // NESTED `NtUser*`/`NtGdi*` syscalls, and the levels unwind innermost-first — live nesting on
-    // this boot reaches depth 5. That is what made the old transport need a 32-deep LIFO token
+    // NESTED `NtUser*`/`NtGdi*` syscalls, and the levels unwind innermost-first — live explorer
+    // shell-window construction has reached depth 9. That is what made the old transport need a
+    // 32-deep LIFO token
     // stack: a shared-memory sequence counter cannot even NAME the level a completion belongs to.
     //
     // Under `Call` ⇄ MCS reply object the whole plane collapses to ONE object and ZERO bookkeeping,

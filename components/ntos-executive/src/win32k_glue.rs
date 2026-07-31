@@ -39,6 +39,7 @@ static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CONTINUATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_126B: AtomicU64 = AtomicU64::new(0);
@@ -152,6 +153,10 @@ pub(crate) fn dead_client_callback_unwinds() -> u64 {
 /// never produce a `real-return`. See [`USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS`].
 pub(crate) fn dead_client_callback_unwind_redirects() -> u64 {
     USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn user_callback_continuation_overflows() -> u64 {
+    USER_CALLBACK_CONTINUATION_OVERFLOWS.load(Ordering::Relaxed)
 }
 
 /// `(active callback depth, continuation-stack depth)`. Both ZERO = win32k holds no suspended
@@ -3112,6 +3117,9 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
         Ok(nested) => nested,
         Err(error) => {
+            if error == nt_user_callback::ContinuationError::Overflow {
+                USER_CALLBACK_CONTINUATION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+            }
             print_str(b"[user-callback] rejected nested win32k dispatch: ");
             print_str(match error {
                 nt_user_callback::ContinuationError::Overflow => b"continuation stack overflow\n",
