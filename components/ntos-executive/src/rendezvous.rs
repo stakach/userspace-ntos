@@ -4,6 +4,29 @@
 #![allow(clippy::all)]
 use crate::*;
 
+fn live_hosted_pid_for_leaf(
+    nt_handler: &ExecNtHandler,
+    leaf: &[u8],
+) -> Option<nt_process::ProcessId> {
+    for pi in 0..MAX_PI {
+        let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
+            continue;
+        };
+        let Some(process) = nt_handler.pm.process(pid) else {
+            continue;
+        };
+        let Some(image) =
+            nt_exe_image::hosted_image_for_path(process.image_file_name.as_bytes())
+        else {
+            continue;
+        };
+        if image.leaf.eq_ignore_ascii_case(leaf) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// Spawn the AUTHENTIC SM-loop thread (path B): the general hosted thread running smss's real
 /// `SmpApiLoop` (`entry_rip`) with RCX = the `\SmApiPort` handle (`port_handle`). Its stack is
 /// MIRRORED into the executive so `sm_rendezvous` can write its syscall out-params. It faults to
@@ -2679,7 +2702,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                         }
                     }
                     SSN_RESUME_THREAD => {
-                        let caller_pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0);
+                        let caller_pid =
+                            live_hosted_pid_for_leaf(nt_handler, b"csrss.exe").unwrap_or(0);
                         let tid = match nt_handler.pm.resolve_thread_handle(
                             caller_pid,
                             CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
