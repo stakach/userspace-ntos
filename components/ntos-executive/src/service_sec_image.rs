@@ -30,6 +30,18 @@ fn win32k_client_label(pi: usize) -> &'static [u8] {
     }
 }
 
+fn hosted_process_is_noninteractive_service_gui_client(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+) -> bool {
+    let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
+        return false;
+    };
+    nt_handler.pm.process(pid).is_some_and(|process| {
+        nt_exe_image::hosted_path_is_noninteractive_service(process.image_file_name.as_bytes())
+    })
+}
+
 fn sec_image_forward_run() -> u64 {
     let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
@@ -7208,7 +7220,7 @@ pub(crate) unsafe fn service_sec_image(
                 // `if (LoadKeyboardLayoutW(...))`), so return the US layout HKL MAKELONG(0x0409,0x0409)
                 // WITHOUT dispatching — win32k's post-paint window state stays clean (the counted paint
                 // already fired at SSN 0x1288 above).
-                // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake (services=6 / lsass=8).
+                // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake.
                 // A service's user32 DllMain runs RegisterSystemClasses, but win32k's shared system
                 // cursors (gasyscur) are ONLY loaded by winlogon's INTERACTIVE SwitchDesktop ->
                 // co_IntLoadDefaultCursors -> NtUserSetSystemCursor. A service on a non-interactive
@@ -7221,22 +7233,13 @@ pub(crate) unsafe fn service_sec_image(
                 // preconditions here (do NOT route to win32k, which drags in the interactive-winsta
                 // cursor fork winlogon owns): 0x103d -> a non-NULL synthetic HCURSOR so user32's
                 // LoadCursor short-circuits; 0x10b4 -> a fresh RTL_ATOM (0xC1xx) so the class registers.
-                // Gated to services/lsass ONLY — winlogon's real GUI path is untouched.
-                // ★ BATCH 32: extend the gate to SERVICES (badge 6) as well as LSASS (badge 8). Both
-                // are NON-INTERACTIVE services on a WSS_NOIO window station — neither creates a real
-                // window nor does GDI drawing, so both must take the light non-interactive user32-init
-                // path instead of tripping win32k's interactive cursor/class/stock-object EngCopyBits
-                // runaway blit (RVA 0x1cbdd8). The prior LSASS-only gate was because, in an EARLIER
-                // batch, lsass had not yet spawned and faking services' calls perturbed the multiplex
-                // timing that let winlogon's StartLsass run. That concern is now STALE: lsass fully
-                // spawns AND signals LSA_RPC_SERVER_ACTIVE BEFORE services even reaches its user32
-                // init (verified in the boot log — winlogon's WaitForLsass wakes, then loads
-                // sfc/msgina, then opens \pipe\ntsvcs), so faking services' GDI-blit family no longer
-                // races lsass spawn. services.exe is now ON the critical path: it is the SCM and must
-                // run its main thread to ScmStartRpcServer → NtCreateNamedPipeFile(\pipe\ntsvcs), which
-                // it can only reach if its user32 process-attach class-registration loop COMPLETES
-                // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
-                let svc_noninteractive = pi == 3 || pi == 4;
+                // The gate is driven by the live EPROCESS image role, not the launch slot: services.exe
+                // and lsass.exe are both non-interactive service hosts on a WSS_NOIO window station, and
+                // neither creates a real window nor does GDI drawing. They must take the light
+                // non-interactive user32-init path instead of tripping win32k's interactive
+                // cursor/class/stock-object EngCopyBits runaway blit (RVA 0x1cbdd8).
+                let svc_noninteractive =
+                    hosted_process_is_noninteractive_service_gui_client(&nt_handler, pi);
                 let mut class_atom_name_pre_served = false;
                 // Explorer asks win32k for class atom names from inside nested user callbacks. The
                 // hosted win32k still has one shared PROCESSINFO, so those exact lookups can fault
@@ -7347,7 +7350,7 @@ pub(crate) unsafe fn service_sec_image(
                     let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
                     ((atom & 0xFFFF) as u64, true)
                 } else if m0 == 0x125b && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays (lsass, badge 8).
+                    // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays.
                     // THE win32k 0x125b TERMINUS FIX (diagnose-first, fork (b): non-interactive path).
                     // The REAL wall (root-caused by reading win32k's OWN faulting RIP at the hang): win32k
                     // spins forever in the GDI scanline-copy loop `EngCopyBits` at RVA 0x1cbdd8 (the
@@ -7368,16 +7371,16 @@ pub(crate) unsafe fn service_sec_image(
                     // TRUE from winlogon's interactive 0x125b); the CLIENT only checks the returned
                     // NTSTATUS. So SATISFY it here with STATUS_SUCCESS WITHOUT dispatching into win32k —
                     // exactly the same reasoning already applied+documented for 0x103d/0x10b4 above.
-                    // Scoped to lsass ONLY (badge 8) so winlogon's REAL interactive 0x125b + paint path
-                    // is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it moved the
-                    // hang to 0x11e0 by breaking winlogon's interactive init).
+                    // Scoped to non-interactive service images so winlogon's REAL interactive 0x125b +
+                    // paint path is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it
+                    // moved the hang to 0x11e0 by breaking winlogon's interactive init).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) FAKED (non-interactive service, no GDI blit) -> STATUS_SUCCESS\n");
                     (0, true)
                 } else if m0 == 0x11e0 && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h) for lsass.
-                    // The 0x125b fix advanced lsass to its NEXT interactive win32k SSN = NtGdiInit, which
-                    // hit the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit spin (win32k's GDI stock-object /
+                    // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h).
+                    // The 0x125b fix advanced a service image to its NEXT interactive win32k SSN =
+                    // NtGdiInit, which hit the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit spin (win32k's GDI stock-object /
                     // DDB bitmap-init blit — the source SURFOBJ dimensions are garbage for our faked
                     // service cursor/class/GDI state). This is the EXACT "moved the hang to 0x11e0" BATCH 28
                     // saw — now understood: a non-interactive service issues a SEQUENCE of interactive
@@ -7387,14 +7390,14 @@ pub(crate) unsafe fn service_sec_image(
                     // state → no runaway blit). A non-interactive service does NO GDI drawing, so returning
                     // TRUE(1) WITHOUT dispatching is byte-behavior-identical for the client (gdi32
                     // GdiProcessSetup checks the BOOL) and skips the interactive stock-object blit. Scoped
-                    // to lsass (badge 8) — winlogon's real NtGdiInit path is untouched.
+                    // to non-interactive service images — winlogon's real NtGdiInit path is untouched.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
                     (1, true)
                 } else if m0 == 0x10de && svc_noninteractive {
                     // NtGdiOpenDCW is the DC-open half of the same non-interactive service GDI init
-                    // family as 0x106c/0x10b5. When lsass asks gdi32 for a DISPLAY DC during GUI-DLL
-                    // process attach, a real win32k HDC lets client-side gdi32 continue into DC_ATTR
+                    // family as 0x106c/0x10b5. When a service image asks gdi32 for a DISPLAY DC during
+                    // GUI-DLL process attach, a real win32k HDC lets client-side gdi32 continue into DC_ATTR
                     // state that this service process never initialized. A NULL HDC is the benign
                     // "no suitable display PDEV" outcome ReactOS already returns for unsupported
                     // devices, and lets non-interactive services continue their server work.
@@ -7403,15 +7406,15 @@ pub(crate) unsafe fn service_sec_image(
                     (0, true)
                 } else if (m0 == 0x106c || m0 == 0x10b5) && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE GDI object-creation (0x106c NtGdiCreateBitmap /
-                    // 0x10b5 NtGdiGetStockObject — w32ksvc64.h) for lsass. After 0x125b/0x11e0, lsass'
+                    // 0x10b5 NtGdiGetStockObject — w32ksvc64.h). After 0x125b/0x11e0, service-image
                     // GUI-DLL DllMains (comctl32/uxtheme) create cached GDI objects; routing these into
                     // win32k trips the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit (a fault-FREE spin the
                     // executive cannot interrupt — it's blocked in win32k_dispatch's recv). A non-interactive
                     // service creates these objects but NEVER draws with them, so return a synthetic non-NULL
                     // GDI handle (mimicking the interactive path's 0x00050048/0x0010004a GDI-handle shape) so
                     // the client's DllMain stores a plausible handle and proceeds — the same
-                    // non-interactive-service short-circuit as 0x103d/0x10b4/0x125b/0x11e0. Scoped to lsass
-                    // (badge 8); the interactive clients' real routed 0x106c/0x10b5 (BATCH 16, bounded via
+                    // non-interactive-service short-circuit as 0x103d/0x10b4/0x125b/0x11e0. Scoped to
+                    // non-interactive service images; the interactive clients' real routed 0x106c/0x10b5 (BATCH 16, bounded via
                     // zero-fill) are untouched. If a service later performs a REAL blit with the handle that
                     // is the next diagnosed wall (a service normally does not).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -7423,7 +7426,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     (h as u64, true)
                 } else if m0 == 0x10bd && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtUserGetClassInfo (0x10bd — w32ksvc64.h) for lsass.
+                    // ★ NON-INTERACTIVE SERVICE NtUserGetClassInfo (0x10bd — w32ksvc64.h).
                     // ROOT of the whole GDI-blit family: win32k's class-lookup path
                     // (IntGetAndReferenceClass, class.c:1461) does
                     //   `if (!(pti->ppi->W32PF_flags & W32PF_CLASSESREGISTERED)) UserRegisterSystemClasses();`
@@ -7437,7 +7440,8 @@ pub(crate) unsafe fn service_sec_image(
                     // NtUserGetClassInfo → FALSE (0, class-not-found) WITHOUT dispatching: user32's
                     // GetClassInfoExW treats it as an unregistered class (benign for a non-interactive
                     // service that never creates windows) and does NOT reach the class-lookup that runs
-                    // UserRegisterSystemClasses. Scoped to lsass (badge 8); winlogon's real 0x10bd untouched.
+                    // UserRegisterSystemClasses. Scoped to non-interactive service images; winlogon's
+                    // real 0x10bd untouched.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
                     (0, true)

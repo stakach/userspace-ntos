@@ -69,11 +69,22 @@ pub enum HostedImageRoot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedProcessRole {
+    NativeSession,
+    Win32Subsystem,
+    InteractiveLogon,
+    NonInteractiveService,
+    InteractiveShellBootstrap,
+    InteractiveShell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostedProcessImage {
     pub pi: usize,
     pub top_badge: u64,
     pub leaf: &'static [u8],
     pub process_name: &'static str,
+    pub role: HostedProcessRole,
     pub nt_image_path: &'static [u8],
     pub command_line: &'static [u8],
     pub image_root: HostedImageRoot,
@@ -86,6 +97,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: SMSS_TOP_BADGE,
         leaf: b"smss.exe",
         process_name: "smss.exe",
+        role: HostedProcessRole::NativeSession,
         nt_image_path: b"\\SystemRoot\\System32\\smss.exe",
         command_line: b"smss.exe",
         image_root: HostedImageRoot::System32,
@@ -96,6 +108,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: CSRSS_TOP_BADGE,
         leaf: b"csrss.exe",
         process_name: "csrss.exe",
+        role: HostedProcessRole::Win32Subsystem,
         nt_image_path: b"\\SystemRoot\\System32\\csrss.exe",
         command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
         image_root: HostedImageRoot::System32,
@@ -106,6 +119,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: WINLOGON_TOP_BADGE,
         leaf: b"winlogon.exe",
         process_name: "winlogon.exe",
+        role: HostedProcessRole::InteractiveLogon,
         nt_image_path: b"\\SystemRoot\\System32\\winlogon.exe",
         command_line: b"winlogon.exe",
         image_root: HostedImageRoot::System32,
@@ -116,6 +130,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: SERVICES_TOP_BADGE,
         leaf: b"services.exe",
         process_name: "services.exe",
+        role: HostedProcessRole::NonInteractiveService,
         nt_image_path: b"\\SystemRoot\\System32\\services.exe",
         command_line: b"services.exe",
         image_root: HostedImageRoot::System32,
@@ -126,6 +141,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: LSASS_TOP_BADGE,
         leaf: b"lsass.exe",
         process_name: "lsass.exe",
+        role: HostedProcessRole::NonInteractiveService,
         nt_image_path: b"\\SystemRoot\\System32\\lsass.exe",
         command_line: b"lsass.exe",
         image_root: HostedImageRoot::System32,
@@ -136,6 +152,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: USERINIT_TOP_BADGE,
         leaf: b"userinit.exe",
         process_name: "userinit.exe",
+        role: HostedProcessRole::InteractiveShellBootstrap,
         nt_image_path: b"\\SystemRoot\\System32\\userinit.exe",
         command_line: b"userinit.exe",
         image_root: HostedImageRoot::System32,
@@ -146,6 +163,7 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
         top_badge: EXPLORER_TOP_BADGE,
         leaf: b"explorer.exe",
         process_name: "explorer.exe",
+        role: HostedProcessRole::InteractiveShell,
         nt_image_path: b"\\SystemRoot\\explorer.exe",
         command_line: b"explorer.exe",
         image_root: HostedImageRoot::SystemRoot,
@@ -161,6 +179,10 @@ pub fn hosted_image_for_leaf(leaf: &[u8]) -> Option<&'static HostedProcessImage>
     HOSTED_PROCESS_IMAGES
         .iter()
         .find(|image| eq_ascii_case(image.leaf, leaf))
+}
+
+pub fn hosted_image_for_path(path: &[u8]) -> Option<&'static HostedProcessImage> {
+    hosted_image_for_leaf(canonical_exe_leaf(path)?)
 }
 
 pub fn hosted_image_for_top_badge(top_badge: u64) -> Option<&'static HostedProcessImage> {
@@ -179,6 +201,14 @@ pub fn hosted_top_badge_for_pi(pi: usize) -> Option<u64> {
 
 pub fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
     hosted_image_for_leaf(leaf).map(|image| image.pi)
+}
+
+pub fn hosted_process_role_for_path(path: &[u8]) -> Option<HostedProcessRole> {
+    hosted_image_for_path(path).map(|image| image.role)
+}
+
+pub fn hosted_path_is_noninteractive_service(path: &[u8]) -> bool {
+    hosted_process_role_for_path(path) == Some(HostedProcessRole::NonInteractiveService)
 }
 
 pub fn hosted_pi_for_top_badge(top_badge: u64) -> Option<usize> {
@@ -573,14 +603,33 @@ mod tests {
     }
 
     #[test]
+    fn hosted_catalog_classifies_noninteractive_service_images_by_path() {
+        assert_eq!(
+            hosted_process_role_for_path(br"\SystemRoot\System32\SERVICES.EXE"),
+            Some(HostedProcessRole::NonInteractiveService)
+        );
+        assert_eq!(
+            hosted_process_role_for_path(br"\??\C:\ReactOS\System32\lsass.exe"),
+            Some(HostedProcessRole::NonInteractiveService)
+        );
+        assert!(hosted_path_is_noninteractive_service(b"services.exe"));
+        assert!(hosted_path_is_noninteractive_service(b"LSASS.EXE"));
+        assert!(!hosted_path_is_noninteractive_service(b"winlogon.exe"));
+        assert!(!hosted_path_is_noninteractive_service(b"explorer.exe"));
+        assert!(!hosted_path_is_noninteractive_service(b"service-helper.exe"));
+    }
+
+    #[test]
     fn hosted_catalog_records_boot_paths_and_locations() {
         let services = hosted_image_for_pi(3).unwrap();
         assert_eq!(services.top_badge, SERVICES_TOP_BADGE);
+        assert_eq!(services.role, HostedProcessRole::NonInteractiveService);
         assert_eq!(services.nt_image_path, b"\\SystemRoot\\System32\\services.exe");
         assert_eq!(services.command_line, b"services.exe");
         assert_eq!(services.image_root, HostedImageRoot::System32);
 
         let explorer = hosted_image_for_leaf(b"EXPLORER.EXE").unwrap();
+        assert_eq!(explorer.role, HostedProcessRole::InteractiveShell);
         assert_eq!(explorer.nt_image_path, b"\\SystemRoot\\explorer.exe");
         assert_eq!(explorer.command_line, b"explorer.exe");
         assert_eq!(explorer.image_root, HostedImageRoot::SystemRoot);

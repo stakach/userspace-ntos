@@ -10096,7 +10096,7 @@ pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
 /// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
-/// Count of faked non-interactive-service (services/lsass) user32-init class/cursor calls
+/// Count of faked non-interactive-service user32-init class/cursor calls
 /// (NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4). A NON-interactive
 /// service's user32 DllMain still runs RegisterSystemClasses, but win32k's shared system cursors
 /// (gasyscur) are NEVER loaded for it (only winlogon's INTERACTIVE SwitchDesktop → co_IntLoadDefaultCursors
@@ -10104,14 +10104,15 @@ static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 /// fallback + RegisterClassExWOW never satisfy their "have a system cursor" precondition → the loop
 /// never advances → the service never finishes process-attach → lsass never reaches LsaInitializeRpcServer
 /// → never SetEvent(lsa_rpc_server_active) → winlogon's WaitForLsass parks forever (the deadlock).
-/// FIX: for services/lsass (badges 6/8 — NOT winlogon, whose real GUI path is untouched) SATISFY the
-/// loop's precondition without dragging in the interactive-winsta cursor fork: return a non-NULL
-/// HCURSOR from 0x103d and a fresh class atom from 0x10b4, so user32's RegisterSystemClasses completes
-/// and the service advances to its real (LSA/SCM) init. Mirrors the winlogon 0x125c keyboard-layout fake.
+/// FIX: for hosted non-interactive service images — NOT winlogon, whose real GUI path is untouched —
+/// SATISFY the loop's precondition without dragging in the interactive-winsta cursor fork: return a
+/// non-NULL HCURSOR from 0x103d and a fresh class atom from 0x10b4, so user32's RegisterSystemClasses
+/// completes and the service advances to its real (LSA/SCM) init. Mirrors the winlogon 0x125c
+/// keyboard-layout fake.
 pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the services/lsass 0x10b4 fake.
+/// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the service-image 0x10b4 fake.
 pub(crate) static SVC_FAKE_CLASS_ATOM: AtomicU64 = AtomicU64::new(0xC100);
-/// Monotonic fake GDI-handle allocator for the non-interactive-service (lsass) GDI-object-creation
+/// Monotonic fake GDI-handle allocator for the non-interactive-service GDI-object-creation
 /// SSNs (0x106c NtGdiCreateBitmap / 0x10b5 NtGdiGetStockObject). A non-interactive service's GUI-DLL
 /// DllMains (comctl32/uxtheme) create cached GDI objects but never draw with them; routing these into
 /// win32k trips the same EngCopyBits (RVA 0x1cbdd8) runaway blit that 0x125b/0x11e0 did (garbage
