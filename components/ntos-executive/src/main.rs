@@ -17135,9 +17135,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     // The redirect LEDGER must balance EXACTLY: every real redirect either came back through
     // `NtCallbackReturn` (a real return) or was torn down because its client died mid-callback (a
-    // dead-client unwind, deliberately NOT counted as a return — it is a failure completion). Both
+    // dead-client unwind, deliberately NOT counted as a return - it is a failure completion). Both
     // terms are load-bearing: `real_returns` must still dominate (the live paint/dialog flow), and the
-    // injected unwind must be accounted for rather than silently tolerated.
+    // injected unwind must be accounted for rather than silently tolerated. The SAS WM_CREATE prefix
+    // remains exact through `sequence_completions`; the global 0x126b counter is only a lower-bound
+    // proof now that later winlogon/explorer callbacks can legitimately register hotkeys too.
     check(
         b"exec_user_callback_real_api0_nested_roundtrip",
         callback_table_valid != 0
@@ -17145,7 +17147,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && callback_real_returns >= 1
             && callback_real_returns + dead_client_unwind_redirects == callback_real_redirects
             && callback_nested_ssn_1298 >= 1
-            && (1..=4).contains(&callback_nested_ssn_126b)
+            && callback_nested_ssn_126b >= 1
             && callback_nested_dispatches >= 1 + callback_nested_ssn_126b
             && callback_continuation_pushes >= callback_nested_dispatches + 2
             && callback_continuation_unwinds == callback_continuation_pushes

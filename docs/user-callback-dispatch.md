@@ -382,12 +382,15 @@ success.
   an exact sequence state, not a broad allowlist: one `0x1298`, then one through four `0x126b`, with
   every other SSN, wrong order, fifth hotkey, or premature SSN 22 rejected.
 
-  The green serialized acceptance run observed the full four-hotkey path: payload `0xca`, one real
-  api0 redirect/return, nested `0x1298` once, nested `0x126b` four times, sequence completion once,
-  and continuation pushes/unwinds `7/7`. The component then completed the remaining callbacks and
-  restored the original client context. `exec_user_callback_real_api0_nested_roundtrip` passed,
-  desktop paint remained `768/768`, the summary remained `188/99`, and `[microtest done]` completed
-  with no FAIL lines.
+  The green serialized acceptance run observed the full four-hotkey SAS prefix: payload `0xca`, one
+  real api0 redirect/return, nested `0x1298` once, nested `0x126b` four times, sequence completion
+  once, and continuation pushes/unwinds `7/7`. The component then completed the remaining callbacks
+  and restored the original client context. Later login/desktop runs can legitimately add more
+  global `0x126b` observations after this prefix, so the final gate treats `nested-ssn-126b` as a
+  lower-bound liveness counter and keeps the one-through-four exactness in
+  `SasWmCreateNestedSequence` plus `sequence-completions == 1`. `exec_user_callback_real_api0_nested_roundtrip`
+  passed, desktop paint remained `768/768`, the summary remained `188/99`, and `[microtest done]`
+  completed with no FAIL lines.
 - **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
   dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
   and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0
