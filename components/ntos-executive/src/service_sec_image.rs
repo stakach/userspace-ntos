@@ -343,6 +343,46 @@ fn hosted_pi_for_fault_badge(badge: u64) -> Option<usize> {
     }
 }
 
+fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
+    for pi in 0..MAX_PI {
+        let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
+            continue;
+        };
+        let Some(process) = nt_handler.pm.process(pid) else {
+            continue;
+        };
+        let Some(image) =
+            nt_exe_image::hosted_image_for_path(process.image_file_name.as_bytes())
+        else {
+            continue;
+        };
+        if image.leaf.eq_ignore_ascii_case(leaf) {
+            return Some(pi);
+        }
+    }
+    None
+}
+
+fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
+    let leaf: &[u8] = match badge {
+        WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
+            b"winlogon.exe"
+        }
+        SVC_LISTENER_BADGE | SCM_WORKER_BADGE => b"services.exe",
+        LSASS_LISTENER_BADGE
+        | LSASS_LISTENER2_BADGE
+        | LSASS_LISTENER3_BADGE
+        | LSA_WORKER_BADGE => b"lsass.exe",
+        _ => return None,
+    };
+    live_hosted_pi_for_leaf(nt_handler, leaf)
+}
+
+fn live_hosted_pi_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
+    live_hosted_pi_for_thread_badge(nt_handler, badge)
+        .or_else(|| hosted_pi_for_fault_badge(badge))
+}
+
 fn hosted_process_pi_is_live(pi: usize) -> bool {
     match hosted_process_runtime_for_pi(pi) {
         Some(runtime) => runtime
@@ -2530,7 +2570,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 4 listener)\n");
             }
         }
-        let pi = hosted_pi_for_fault_badge(badge).unwrap_or(0);
+        let pi = live_hosted_pi_for_fault_badge(&nt_handler, badge).unwrap_or(0);
         // This process is producing an event → it's running, not wait-parked. Clear its cooperative
         // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
         wait_parked &= !(1u64 << owner_top_badge(badge));
@@ -5498,7 +5538,9 @@ pub(crate) unsafe fn service_sec_image(
                         2 => WL_WORKER3_TEB_VA,
                         _ => 0,
                     };
-                    let cid_proc = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
+                    let wl_pi = live_hosted_pi_for_leaf(&nt_handler, b"winlogon.exe")
+                        .expect("winlogon.exe EPROCESS missing before worker spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(wl_pi).unwrap_or(0) as u64;
                     print_str(b"[wl-thread] spawning REAL worker slot=");
                     print_u64(slot as u64);
                     print_str(b" (multiplexed): entry=0x");
@@ -5513,10 +5555,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let suspended = PM_POOL_SUSPENDED[2].load(Ordering::Relaxed) & (1 << slot) != 0;
+                    let suspended =
+                        PM_POOL_SUSPENDED[wl_pi].load(Ordering::Relaxed) & (1 << slot) != 0;
                     let tcb = spawn_wl_listener_thread(
                         slot,
-                        procs[2].pml4,
+                        procs[wl_pi].pml4,
                         start,
                         initial_teb,
                         cid_proc,
@@ -5530,7 +5573,7 @@ pub(crate) unsafe fn service_sec_image(
                         2 => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
                         _ => 0,
                     };
-                    if seed_winlogon_thread_client_info(teb_alias, procs[2].pml4).is_none() {
+                    if seed_winlogon_thread_client_info(teb_alias, procs[wl_pi].pml4).is_none() {
                         print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
                     }
                     if slot == 0 {
@@ -5542,7 +5585,7 @@ pub(crate) unsafe fn service_sec_image(
                                     && initial_teb.stack_base & 0xfff == 0
                                     && initial_teb.allocated_stack_base <= low
                                     && low < initial_teb.stack_base
-                                    && csrss_frame_get_exact(2, low).0 != 0
+                                    && csrss_frame_get_exact(wl_pi as u64, low).0 != 0
                             })
                             .unwrap_or(0);
                         if mapped_low != 0 {
@@ -5573,7 +5616,7 @@ pub(crate) unsafe fn service_sec_image(
                         ),
                         _ => unreachable!(),
                     };
-                    nt_handler.register_hosted_thread_tcb(2, tid, tcb, badge, role);
+                    nt_handler.register_hosted_thread_tcb(wl_pi, tid, tcb, badge, role);
                     if slot == 0 {
                         // A LATCH of the seL4 TCB the general `NtCreateThread` service minted for
                         // this thread. `WL_LISTENER_TCB` is the LIVE cell — the thread-termination
@@ -5608,7 +5651,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = SVC_LISTENER_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(3).unwrap_or(0) as u64;
+                    let svc_pi = live_hosted_pi_for_leaf(&nt_handler, b"services.exe")
+                        .expect("services.exe EPROCESS missing before listener spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(svc_pi).unwrap_or(0) as u64;
                     print_str(b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x");
                     print_hex((start.rip >> 32) as u32);
                     print_hex(start.rip as u32);
@@ -5619,12 +5664,12 @@ pub(crate) unsafe fn service_sec_image(
                         .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_svc_listener_thread(
-                        procs[3].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        procs[svc_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
                         !suspended,
                     );
                     SVC_LISTENER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        3,
+                        svc_pi,
                         tid,
                         tcb,
                         SVC_LISTENER_BADGE,
@@ -5646,7 +5691,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = SCM_WORKER_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(3).unwrap_or(0) as u64;
+                    let svc_pi = live_hosted_pi_for_leaf(&nt_handler, b"services.exe")
+                        .expect("services.exe EPROCESS missing before SCM worker spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(svc_pi).unwrap_or(0) as u64;
                     // Spawn RESUMED into the multiplex, like the SVC/LSASS listeners. This block only
                     // runs when the recognizer sets `scm_worker_spawn` (gated by SCM_WORKER_ROUTE_ENABLED
                     // in exec_handler.rs — currently OFF pending the trampoline-entry fault; see the
@@ -5659,12 +5706,12 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(tid);
                     print_str(b"\n");
                     let tcb = spawn_scm_worker_thread(
-                        procs[3].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        procs[svc_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
                         true,
                     );
                     SCM_WORKER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        3,
+                        svc_pi,
                         tid,
                         tcb,
                         SCM_WORKER_BADGE,
@@ -5685,7 +5732,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = LSASS_LISTENER_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
+                        .expect("lsass.exe EPROCESS missing before listener spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x");
                     print_hex((start.rip >> 32) as u32);
                     print_hex(start.rip as u32);
@@ -5696,12 +5745,12 @@ pub(crate) unsafe fn service_sec_image(
                         .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_lsass_listener_thread(
-                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
                         !suspended,
                     );
                     LSASS_LISTENER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        4,
+                        lsass_pi,
                         tid,
                         tcb,
                         LSASS_LISTENER_BADGE,
@@ -5720,7 +5769,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = LSASS_LISTENER2_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
+                        .expect("lsass.exe EPROCESS missing before second listener spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x");
                     print_hex((start.rip >> 32) as u32);
                     print_hex(start.rip as u32);
@@ -5731,12 +5782,12 @@ pub(crate) unsafe fn service_sec_image(
                         .pm_pool_slot_for_tid(tid)
                         .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
                     let tcb = spawn_lsass_listener2_thread(
-                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
                         !suspended,
                     );
                     LSASS_LISTENER2_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        4,
+                        lsass_pi,
                         tid,
                         tcb,
                         LSASS_LISTENER2_BADGE,
@@ -5756,7 +5807,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = LSASS_LISTENER3_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
+                        .expect("lsass.exe EPROCESS missing before third listener spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x");
                     print_hex((start.rip >> 32) as u32);
                     print_hex(start.rip as u32);
@@ -5764,7 +5817,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(tid);
                     print_str(b"\n");
                     let tcb = spawn_lsass_listener3_thread(
-                        procs[4].pml4,
+                        procs[lsass_pi].pml4,
                         start.rip,
                         start.rcx,
                         start.rdx,
@@ -5777,7 +5830,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     LSASS_LISTENER3_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        4,
+                        lsass_pi,
                         tid,
                         tcb,
                         LSASS_LISTENER3_BADGE,
@@ -5803,7 +5856,9 @@ pub(crate) unsafe fn service_sec_image(
                         ctx_va,
                     );
                     let tid = LSA_WORKER_TID.load(Ordering::Relaxed);
-                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
+                        .expect("lsass.exe EPROCESS missing before LSA worker spawn");
+                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
                     print_str(b"[lsa-worker] spawning + RESUMING REAL per-connection LSA RPC worker: entry=0x");
                     print_hex((start.rip >> 32) as u32);
                     print_hex(start.rip as u32);
@@ -5811,12 +5866,12 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(tid);
                     print_str(b"\n");
                     let tcb = spawn_lsa_worker_thread(
-                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
                         true,
                     );
                     LSA_WORKER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        4,
+                        lsass_pi,
                         tid,
                         tcb,
                         LSA_WORKER_BADGE,
@@ -11829,29 +11884,45 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() {
         loader_trace_dump(&reg);
     }
-    // Record winlogon's (slot 2) demand-fault count for the spec check + report line.
-    WINLOGON_FAULTS.store(procs[2].faults, Ordering::Relaxed);
-    print_str(b"[ntos-exec] winlogon (slot 2) demand-faulted ");
-    print_u64(procs[2].faults);
-    print_str(b" page(s), first=0x");
-    print_hex((procs[2].first >> 32) as u32);
-    print_hex(procs[2].first as u32);
-    print_str(b"\n");
-    // Record services.exe's (slot 3) demand-fault count for the milestone spec + report line.
-    SERVICES_FAULTS.store(procs[3].faults, Ordering::Relaxed);
-    print_str(b"[ntos-exec] services (slot 3) demand-faulted ");
-    print_u64(procs[3].faults);
-    print_str(b" page(s), first=0x");
-    print_hex((procs[3].first >> 32) as u32);
-    print_hex(procs[3].first as u32);
-    print_str(b"\n");
-    LSASS_FAULTS.store(procs[4].faults, Ordering::Relaxed);
-    print_str(b"[ntos-exec] lsass (slot 4) demand-faulted ");
-    print_u64(procs[4].faults);
-    print_str(b" page(s), first=0x");
-    print_hex((procs[4].first >> 32) as u32);
-    print_hex(procs[4].first as u32);
-    print_str(b"\n");
+    if let Some(winlogon_pi) = live_hosted_pi_for_leaf(&nt_handler, b"winlogon.exe") {
+        WINLOGON_FAULTS.store(procs[winlogon_pi].faults, Ordering::Relaxed);
+        print_str(b"[ntos-exec] winlogon (pi ");
+        print_u64(winlogon_pi as u64);
+        print_str(b") demand-faulted ");
+        print_u64(procs[winlogon_pi].faults);
+        print_str(b" page(s), first=0x");
+        print_hex((procs[winlogon_pi].first >> 32) as u32);
+        print_hex(procs[winlogon_pi].first as u32);
+        print_str(b"\n");
+    } else {
+        WINLOGON_FAULTS.store(0, Ordering::Relaxed);
+    }
+    if let Some(services_pi) = live_hosted_pi_for_leaf(&nt_handler, b"services.exe") {
+        SERVICES_FAULTS.store(procs[services_pi].faults, Ordering::Relaxed);
+        print_str(b"[ntos-exec] services (pi ");
+        print_u64(services_pi as u64);
+        print_str(b") demand-faulted ");
+        print_u64(procs[services_pi].faults);
+        print_str(b" page(s), first=0x");
+        print_hex((procs[services_pi].first >> 32) as u32);
+        print_hex(procs[services_pi].first as u32);
+        print_str(b"\n");
+    } else {
+        SERVICES_FAULTS.store(0, Ordering::Relaxed);
+    }
+    if let Some(lsass_pi) = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe") {
+        LSASS_FAULTS.store(procs[lsass_pi].faults, Ordering::Relaxed);
+        print_str(b"[ntos-exec] lsass (pi ");
+        print_u64(lsass_pi as u64);
+        print_str(b") demand-faulted ");
+        print_u64(procs[lsass_pi].faults);
+        print_str(b" page(s), first=0x");
+        print_hex((procs[lsass_pi].first >> 32) as u32);
+        print_hex(procs[lsass_pi].first as u32);
+        print_str(b"\n");
+    } else {
+        LSASS_FAULTS.store(0, Ordering::Relaxed);
+    }
     // Path 3: record that each folded per-process ProcExec is EPROCESS-linked (live pml4 + its pid
     // matches the ProcessManager's pid for that pi). Read by `exec_eprocess_linked_mechanism`.
     let mut link_ok = 0u64;
@@ -12750,7 +12821,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the
             // bind / request it must service) or to lsass' main thread as the CLIENT (the bind_ack /
             // response that unblocks `LsaOpenPolicy`). Name-scoped via the fid->pipe-name map.
-            if w.pi == 4
+            let lsass_pi = live_hosted_pi_for_leaf(nt_handler, b"lsass.exe");
+            if lsass_pi == Some(w.pi as usize)
                 && output.first() == Some(&5)
                 && pipe_fid_name_hash(w.file_id) == lsarpc_pipe_name_hash()
             {
