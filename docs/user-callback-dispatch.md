@@ -398,6 +398,12 @@ success.
   tagged `origin=replay`; the `[explorer-image]` line recorded `setwndproc-client/replay=0/6`. This
   proves the ATL WndProc replay remains load-bearing and that there is not yet a natural explorer
   client-side `GWLP_WNDPROC` replacement for that scaffold.
+
+  A follow-up explorer trace proved ATL thunk initialization reaches native ntdll from inside the
+  parked user callback: every replayed ATL create callback first issues `NtFlushInstructionCache`
+  for the generated thunk bytes with a non-zero callback depth. That narrows the remaining gap to
+  the post-thunk-install path between the flush return and the expected `SetWindowLongPtrW`
+  `GWLP_WNDPROC` syscall, not to missing thunk generation or a missing native flush export.
 - **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
   dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
   and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0
