@@ -1811,6 +1811,10 @@ impl ExecNtHandler {
         self.current_process_is_hosted_leaf(b"services.exe")
     }
 
+    fn current_process_is_csrss(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"csrss.exe")
+    }
+
     fn current_process_is_lsass(&self) -> bool {
         self.current_process_is_hosted_leaf(b"lsass.exe")
     }
@@ -8871,7 +8875,7 @@ impl ExecNtHandler {
                 // real ETHREADs and typed handles so ReactOS's NtResumeThread calls control their
                 // actual TCBs. Slot 0 is CsrApiRequestThread; slot 1 is CsrSbApiRequestThread.
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 1
+                    && self.current_process_is_csrss()
                     && args[3] == u64::MAX
                     && CSR_SB_TID.load(Ordering::Relaxed) == 0
                 {
@@ -8892,7 +8896,7 @@ impl ExecNtHandler {
                                 _ => return 0xC000_009A,
                             };
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
-                            let pid = self.pm_pid_for_pi(1).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
                             let cid_ptr = smss_stack_read(sp + 0x28);
                             if cid_ptr != 0 {
@@ -9009,7 +9013,7 @@ impl ExecNtHandler {
                     }
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 2
+                    && self.current_process_is_winlogon()
                     && args[3] == u64::MAX
                     && WL_WORKER3_TID.load(Ordering::Relaxed) == 0
                 {
@@ -9037,7 +9041,7 @@ impl ExecNtHandler {
                                 _ => return 0xC000_009A,
                             };
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
-                            let pid = self.pm_pid_for_pi(2).unwrap_or(0);
+                            let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle = R10
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
