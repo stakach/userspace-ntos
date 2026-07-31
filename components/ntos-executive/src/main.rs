@@ -12217,8 +12217,9 @@ static WINLOGON_NATURAL_PAINT: AtomicU64 = AtomicU64::new(0);
 /// Once-guard (BATCH 46): winlogon issues its interactive NtUserSwitchDesktop TWICE (both to the same
 /// Default desktop). Only the FIRST is a real transition that drives the InitVideo + IntPaintDesktop
 /// paint; the SECOND is win32k's `pdesk == gpdeskInputDesktop` already-current early-return (zero paint
-/// work). The magenta-clear + readback must run ONLY on the painting switch, else the second switch wipes
-/// the fb back to magenta and re-reads 0/768. Set to 1 once the paint has been sampled.
+/// work). The magenta-clear must run only before an unobserved painting switch, and the readback is
+/// latched either immediately or after NtCallbackReturn resumes a suspended switch; otherwise the second
+/// switch wipes the fb back to magenta and re-reads 0/768. Set to 1 once the paint has been sampled.
 pub(crate) static WINLOGON_PAINT_DONE: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
 /// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This

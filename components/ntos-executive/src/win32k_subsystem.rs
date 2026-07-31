@@ -454,6 +454,13 @@ const PROCESSINFO_PTILIST_OFF: u64 = 0xD8;
 const PROCESSINFO_PTIMAINTHREAD_OFF: u64 = 0xE0;
 const PROCESSINFO_RPDESK_STARTUP_OFF: u64 = 0xE8;
 const PROCESSINFO_HDESK_STARTUP_OFF: u64 = 0x110;
+const PROCESSINFO_PRPWINSTA_OFF: u64 = 0x220;
+const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
+const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
+const W32PROCESS_PEPROCESS_OFF: u64 = 0x00;
+const W32PROCESS_FLAGS_OFF: u64 = 0x0C;
+const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
+const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
 /// WND->head.pti and WND->lpfnWndProc offsets (ntuser.h: THRDESKHEAD at +0, lpfnWndProc after
 /// rcWindow/rcClient). Used only for bounded diagnostics around SetWindowLongPtr(GWLP_WNDPROC).
 const WND_HEAD_PTI_OFF: u64 = 0x10;
@@ -1861,6 +1868,8 @@ static WIN32K_CLIENT_W32THREAD: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0)
 static WIN32K_CLIENT_PROCESS_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_SYSTEM_FONT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 
@@ -2098,7 +2107,56 @@ unsafe fn ensure_win32k_process_attached(pi: u64) -> bool {
         SLOT_W32PROCESS as *mut u64,
         WIN32K_CLIENT_W32PROCESS[pi].load(Ordering::Relaxed),
     );
+    seed_inherited_process_window_station(pi);
     true
+}
+
+unsafe fn seed_inherited_process_window_station(pi: usize) {
+    let ppi = WIN32K_CLIENT_W32PROCESS[pi].load(Ordering::Relaxed);
+    if ppi == 0 {
+        return;
+    }
+    let table = &*core::ptr::addr_of!(OBJ_TABLE);
+    let winsta_handle = table.cached_winsta_handle();
+    let winsta_body = table.cached_winsta_body();
+    if winsta_handle == 0 || winsta_body == 0 {
+        return;
+    }
+
+    let eprocess = WIN32K_CLIENT_EPROCESS[pi].load(Ordering::Relaxed);
+    if eprocess != 0 && read_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *const u64) == 0 {
+        write_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *mut u64, eprocess);
+    }
+    if eprocess != 0 && s_ps_get_process_winsta(eprocess) == 0 {
+        s_ps_set_process_winsta(eprocess, winsta_handle);
+    }
+
+    if read_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *const u64) != 0 {
+        return;
+    }
+    write_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *mut u64, winsta_body);
+    write_volatile((ppi + PROCESSINFO_HWINSTA_OFF) as *mut u64, winsta_handle);
+    write_volatile((ppi + PROCESSINFO_AMWINSTA_OFF) as *mut u32, WINSTA_ALL_ACCESS);
+    let flags = read_volatile((ppi + W32PROCESS_FLAGS_OFF) as *const u32);
+    write_volatile(
+        (ppi + W32PROCESS_FLAGS_OFF) as *mut u32,
+        flags | W32PF_READSCREENACCESSGRANTED,
+    );
+
+    let n = WIN32K_INHERITED_WINSTA_SEEDS.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        print_str(b"[win32k-host] inherited WinSta0 for pi=");
+        print_u64(pi as u64);
+        print_str(b" ppi=0x");
+        print_hex((ppi >> 32) as u32);
+        print_hex(ppi as u32);
+        print_str(b" hWinSta=0x");
+        print_hex(winsta_handle as u32);
+        print_str(b" body=0x");
+        print_hex((winsta_body >> 32) as u32);
+        print_hex(winsta_body as u32);
+        print_str(b"\n");
+    }
 }
 
 unsafe fn ensure_win32k_threadinfo(pi: u64) -> bool {
@@ -3547,6 +3605,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     }
+    if matches!(client_pi, 2 | 5 | 6) {
+        load_system_font_for_client(client_pi as usize);
+    }
     let trace = WIN32K_CLIENT_CONTEXT_TRACES.fetch_add(1, Ordering::Relaxed);
     if trace < 32 {
         let eprocess = current_eprocess();
@@ -3710,7 +3771,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     //       active desktop before co_IntGraphicsCheck creates the real device and surface.
     if ssn == SSN_NT_USER_INITIALIZE_REAL && result as u32 == 0 && !DESKTOP_GFX_SEEDED {
         DESKTOP_GFX_SEEDED = true;
-        load_system_font();
+        load_system_font_for_client(current_client_index());
         create_winsta_and_desktop();
         print_str(b"[win32k-gfx] creating display PDEV before user32 resources...\n");
         let change_display: extern "win64" fn(u64, u64, u64, *mut u64, u64) -> i32 =
@@ -4308,6 +4369,20 @@ unsafe fn hwnd_to_pwnd(hwnd: u64) -> u64 {
 /// the whole `'FTYP'` arena in a churn loop (our ExFreePoolWithTag is a no-op, so the bump pointer
 /// never rewound). Those blocks are logically free, so resetting the bump pointer gives
 /// `FT_New_Memory_Face` room to parse this face without OOM.
+unsafe fn load_system_font_for_client(pi: usize) {
+    if pi >= 64 {
+        return;
+    }
+    let bit = 1u64 << pi;
+    if WIN32K_CLIENT_SYSTEM_FONT_SEEDS.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    print_str(b"[win32k-host] seeding private system font for pi=");
+    print_u64(pi as u64);
+    print_str(b"\n");
+    load_system_font();
+}
+
 unsafe fn load_system_font() {
     let size = read_volatile((WIN32K_SHARED_VADDR + SH_FONT_SIZE) as *const u32) as u64;
     if size == 0 {

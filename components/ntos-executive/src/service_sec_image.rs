@@ -34,6 +34,105 @@ fn sec_image_forward_run() -> u64 {
     }
 }
 
+unsafe fn post_winlogon_second_sas_after_welcome_drain(
+    pi: usize,
+    badge: u64,
+    current_tid: u64,
+    main_tid: u64,
+    pid: u64,
+    client_teb: u64,
+    peb_mirror: u64,
+    scratch_base: u64,
+) -> bool {
+    let sas1 = WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed);
+    let sas2 = WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed);
+    let paint_now = win32k_glue::real_wm_paint_callback_returns();
+    let paint_at_sas1 = WINLOGON_PAINT_RETURNS_AT_SAS1.load(Ordering::Relaxed);
+    let paint_hwnd = win32k_glue::last_real_wm_paint_hwnd();
+    let paint_pwnd = if paint_hwnd != 0 {
+        winlogon_pwnd_for_hwnd(paint_hwnd)
+    } else {
+        0
+    };
+    if pi != 2
+        || badge != WINLOGON_BADGE
+        || current_tid == 0
+        || main_tid != current_tid
+        || sas1 == 0
+        || sas2 != 0
+    {
+        return false;
+    }
+    if paint_now <= paint_at_sas1 {
+        return false;
+    }
+    if paint_pwnd == 0 {
+        return false;
+    }
+
+    let session = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+    );
+    let mut logon_state = 0u32;
+    if session != 0 {
+        const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
+        let mut bytes = [0u8; 4];
+        if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut bytes) {
+            logon_state = u32::from_le_bytes(bytes);
+        }
+    }
+    print_str(b"[wl-main] welcome queue drained after real paint; Session->LogonState=0x");
+    print_hex(logon_state);
+    print_str(b"\n");
+    if logon_state != nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
+        return false;
+    }
+
+    WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
+    let _ = winlogon_dialog_observe_logged_off(session, logon_state);
+    let hwnd = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
+    );
+    if hwnd == 0 {
+        return false;
+    }
+    WINLOGON_KEY_OPENED_AT_INJECT.store(
+        WINLOGON_KEY_OPENED.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    print_str(b"[wl-main] posting simulated Ctrl-Alt-Del through real NtUserPostMessage hwnd=0x");
+    print_hex(hwnd as u32);
+    print_str(b"\n");
+    let post = win32k_glue::win32k_dispatch_wide(
+        0x100e,
+        hwnd,
+        nt_user_callback::WLX_WM_SAS as u64,
+        nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL,
+        0,
+        0,
+        4,
+        &[],
+        win32k_glue::Win32kClientContext {
+            pi: pi as u32,
+            pid,
+            badge,
+            tid: current_tid,
+            teb: client_teb,
+            peb_mirror,
+            scratch_base,
+        },
+    );
+    print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
+    print_hex(post.0 as u32);
+    print_str(b"\n");
+    if post.1 && post.0 != 0 {
+        WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HostedProcessRuntime {
     priority: u64,
@@ -460,6 +559,10 @@ unsafe fn observe_winlogon_completed_dispatch(
     faults: usize,
     scratch_base: u64,
 ) {
+    if dispatch.ssn == 0x1288 {
+        observe_winlogon_natural_switch_desktop(dispatch.status);
+        return;
+    }
     if dispatch.ssn != 0x1077 || dispatch.status == 0 {
         return;
     }
@@ -588,6 +691,68 @@ unsafe fn observe_winlogon_completed_dispatch(
     print_str(b" correlated=");
     print_u64(correlated as u64);
     print_str(b"\n");
+}
+
+unsafe fn observe_winlogon_natural_switch_desktop(status: u64) {
+    if status == 0 {
+        return;
+    }
+    if WINLOGON_PAINT_DONE.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+
+    // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
+    // painted to the WC_DESKTOP background. This can run either immediately after a
+    // non-callback switch or after NtCallbackReturn resumes the suspended switch.
+    let fb = FB_VADDR as *const u32;
+    let mut matched = 0u32;
+    let mut changed = 0u32;
+    let mut non_bg_count = 0u32;
+    let mut non_bg_index = 0u64;
+    let mut non_bg_value = 0u32;
+    let mut sample0 = 0u32;
+    for r in 0..24u64 {
+        for c in 0..32u64 {
+            let idx = r * 32 * 1024 + c * 32;
+            let px = core::ptr::read_volatile(fb.add(idx as usize));
+            if r == 0 && c == 0 {
+                sample0 = px;
+            }
+            if px != 0x00FF_00FF {
+                changed += 1;
+            }
+            if px == FB_DESKTOP_BG {
+                matched += 1;
+            } else {
+                non_bg_count += 1;
+                non_bg_index = idx;
+                non_bg_value = px;
+            }
+        }
+    }
+    WINLOGON_NATURAL_PAINT.store(matched as u64, Ordering::Relaxed);
+    FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
+    FB_PIXELS_MATCH.store(matched as u64, Ordering::Relaxed);
+    FB_PIXELS_CHANGED.store(changed as u64, Ordering::Relaxed);
+    FB_NON_BG_COUNT.store(non_bg_count as u64, Ordering::Relaxed);
+    FB_NON_BG_INDEX.store(non_bg_index, Ordering::Relaxed);
+    FB_NON_BG_VALUE.store(non_bg_value as u64, Ordering::Relaxed);
+    FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
+    print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
+    print_hex(status as u32);
+    print_str(b" -> NATURAL fb readback: changed ");
+    print_u64(changed as u64);
+    print_str(b"/768, desktop-bg ");
+    print_u64(matched as u64);
+    print_str(b"/768 (px0=0x");
+    print_hex(sample0);
+    print_str(b", non-bg ");
+    print_u64(non_bg_count as u64);
+    print_str(b" at 0x");
+    print_hex(non_bg_index as u32);
+    print_str(b" value=0x");
+    print_hex(non_bg_value);
+    print_str(b")\n");
 }
 
 unsafe fn observe_completed_dialog_modal_dispatch(
@@ -6164,38 +6329,53 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
                     if peek.0 == 0 {
-                        let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
-                        // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
-                        // of messages is the established terminal condition — it is the thread that
-                        // drives the logon, so its empty SAS loop means winlogon has nothing left.
-                        // A WORKER thread's pump running dry does NOT: measured, the profile copy
-                        // runs on the MAIN thread while worker badge 13 pumps the desktop, so
-                        // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
-                        // Park the worker and keep the loop running so the main thread advances;
-                        // the grace is BOUNDED so a boot where nothing else can run still reaches
-                        // the gate rather than blocking in the loop's recv forever.
-                        const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
-                        let defer = (badge != WINLOGON_BADGE
-                            && badge != USERINIT_BADGE
-                            && n < EMPTY_QUEUE_PARK_GRACE)
-                            || (owner_top_badge(badge) != USERINIT_BADGE
-                                && userinit_shell_frontier_pending(crash_parked, wait_parked));
-                        if n < 8 {
-                            print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
-                            print_u64(pi as u64);
-                            print_str(b" badge=");
-                            print_u64(badge);
-                            print_str(b" hwnd-filter=0x");
-                            print_hex(m3 as u32);
-                            print_str(if defer {
-                                b") -> parking this thread, loop continues\n"
-                            } else {
-                                b") -> parking instead of hanging win32k\n"
-                            });
+                        let main_tid = nt_handler
+                            .pm_main_tid_for_pi(pi)
+                            .map(u64::from)
+                            .unwrap_or(0);
+                        if !post_winlogon_second_sas_after_welcome_drain(
+                            pi,
+                            badge,
+                            current_tid,
+                            main_tid,
+                            nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                            client_teb,
+                            peb_mirror,
+                            scratch_base,
+                        ) {
+                            let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
+                            // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
+                            // of messages is the established terminal condition — it is the thread that
+                            // drives the logon, so its empty SAS loop means winlogon has nothing left.
+                            // A WORKER thread's pump running dry does NOT: measured, the profile copy
+                            // runs on the MAIN thread while worker badge 13 pumps the desktop, so
+                            // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
+                            // Park the worker and keep the loop running so the main thread advances;
+                            // the grace is BOUNDED so a boot where nothing else can run still reaches
+                            // the gate rather than blocking in the loop's recv forever.
+                            const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
+                            let defer = (badge != WINLOGON_BADGE
+                                && badge != USERINIT_BADGE
+                                && n < EMPTY_QUEUE_PARK_GRACE)
+                                || (owner_top_badge(badge) != USERINIT_BADGE
+                                    && userinit_shell_frontier_pending(crash_parked, wait_parked));
+                            if n < 8 {
+                                print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
+                                print_u64(pi as u64);
+                                print_str(b" badge=");
+                                print_u64(badge);
+                                print_str(b" hwnd-filter=0x");
+                                print_hex(m3 as u32);
+                                print_str(if defer {
+                                    b") -> parking this thread, loop continues\n"
+                                } else {
+                                    b") -> parking instead of hanging win32k\n"
+                                });
+                            }
+                            handled = false;
+                            wl_milestone_park = true;
+                            wl_park_defer_quiesce = defer;
                         }
-                        handled = false;
-                        wl_milestone_park = true;
-                        wl_park_defer_quiesce = defer;
                     }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
@@ -6719,9 +6899,10 @@ pub(crate) unsafe fn service_sec_image(
                 // WM_ERASEBKGND -> IntPaintDesktop re-painted 0x003a6ea5 by the AUTHENTIC boot flow
                 // (BOOTBOOT -> kernel -> smss -> csrss -> winlogon -> win32k), not a stale scaffold paint.
                 // ★ BATCH 46 — only the FIRST winlogon switch is the real (painting) transition; the second
-                // is win32k's `pdesk == gpdeskInputDesktop` already-current no-op (zero paint work). Gate the
-                // magenta-clear + readback on WINLOGON_PAINT_DONE so the already-current second switch does
-                // NOT wipe the painted fb back to magenta and re-read 0/768.
+                // is win32k's `pdesk == gpdeskInputDesktop` already-current no-op (zero paint work). The
+                // first switch can park in user callbacks before the paint completes, so the readback is
+                // latched either here for a non-callback dispatch or later from NtCallbackReturn's completed
+                // outer-dispatch observer. Once latched, the already-current second switch must not clear the fb.
                 let winlogon_switch =
                     m0 == 0x1288 && badge == WINLOGON_BADGE && WINLOGON_PAINT_DONE.load(Ordering::Relaxed) == 0;
                 if winlogon_switch {
@@ -7072,79 +7253,21 @@ pub(crate) unsafe fn service_sec_image(
                     if pi == 2
                         && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
                         && r.0 == 0
-                        && badge == WINLOGON_BADGE
-                        && nt_handler
-                            .pm_main_tid_for_pi(pi)
-                            .is_some_and(|tid| current_tid == u64::from(tid))
-                        && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
-                        && WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
-                        && win32k_glue::real_wm_paint_callback_returns()
-                            > WINLOGON_PAINT_RETURNS_AT_SAS1.load(Ordering::Relaxed)
-                        && winlogon_pwnd_for_hwnd(win32k_glue::last_real_wm_paint_hwnd()) != 0
                     {
-                        let session = core::ptr::read_volatile(
-                            (win32k_subsystem::WIN32K_SHARED_VADDR
-                                + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+                        let main_tid = nt_handler
+                            .pm_main_tid_for_pi(pi)
+                            .map(u64::from)
+                            .unwrap_or(0);
+                        let _ = post_winlogon_second_sas_after_welcome_drain(
+                            pi,
+                            badge,
+                            current_tid,
+                            main_tid,
+                            nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                            client_teb,
+                            peb_mirror,
+                            scratch_base,
                         );
-                        let mut logon_state = 0u32;
-                        if session != 0 {
-                            const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
-                            let mut bytes = [0u8; 4];
-                            if img_spawn::smss_copyin(
-                                session + WLSESSION_LOGONSTATE_OFF,
-                                &mut bytes,
-                            ) {
-                                logon_state = u32::from_le_bytes(bytes);
-                            }
-                        }
-                        print_str(b"[wl-main] welcome queue drained after real paint; Session->LogonState=0x");
-                        print_hex(logon_state);
-                        print_str(b"\n");
-                        if logon_state == nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
-                            WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
-                            let _ = winlogon_dialog_observe_logged_off(session, logon_state);
-                            let hwnd = core::ptr::read_volatile(
-                                (win32k_subsystem::WIN32K_SHARED_VADDR
-                                    + win32k_subsystem::SH_SAS_HWND) as *const u64,
-                            );
-                            if hwnd != 0 {
-                                WINLOGON_KEY_OPENED_AT_INJECT.store(
-                                    WINLOGON_KEY_OPENED.load(Ordering::Relaxed),
-                                    Ordering::Relaxed,
-                                );
-                                print_str(b"[wl-main] posting simulated Ctrl-Alt-Del through real NtUserPostMessage hwnd=0x");
-                                print_hex(hwnd as u32);
-                                print_str(b"\n");
-                                let post = win32k_glue::win32k_dispatch_wide(
-                                    0x100e,
-                                    hwnd,
-                                    nt_user_callback::WLX_WM_SAS as u64,
-                                    nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL,
-                                    0,
-                                    0,
-                                    4,
-                                    &[],
-                                    win32k_glue::Win32kClientContext {
-                                        pi: pi as u32,
-                                        pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
-                                        badge,
-                                        tid: nt_handler.current_tid,
-                                        teb: client_teb,
-                                        peb_mirror,
-                                        scratch_base,
-                                    },
-                                );
-                                print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
-                                print_hex(post.0 as u32);
-                                print_str(b"\n");
-                                if post.1 && post.0 != 0 {
-                                    WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
-                                } else {
-                                    handled = false;
-                                    wl_milestone_park = true;
-                                }
-                            }
-                        }
                     }
                     r
                 };
@@ -7244,62 +7367,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if winlogon_switch && !redirected_user_callback {
-                    // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
-                    // painted to the WC_DESKTOP background. This drives the counted paint gate.
-                    let fb = FB_VADDR as *const u32;
-                    let mut matched = 0u32;
-                    let mut changed = 0u32;
-                    let mut non_bg_count = 0u32;
-                    let mut non_bg_index = 0u64;
-                    let mut non_bg_value = 0u32;
-                    let mut sample0 = 0u32;
-                    for r in 0..24u64 {
-                        for c in 0..32u64 {
-                            let idx = r * 32 * 1024 + c * 32;
-                            let px = core::ptr::read_volatile(fb.add(idx as usize));
-                            if r == 0 && c == 0 {
-                                sample0 = px;
-                            }
-                            if px != 0x00FF_00FF {
-                                changed += 1;
-                            }
-                            if px == FB_DESKTOP_BG {
-                                matched += 1;
-                            } else {
-                                non_bg_count += 1;
-                                non_bg_index = idx;
-                                non_bg_value = px;
-                            }
-                        }
-                    }
-                    WINLOGON_NATURAL_PAINT.store(matched as u64, Ordering::Relaxed);
-                    // Feed the counted `exec_win32k_desktop_painted` gate from winlogon's NATURAL paint
-                    // (the scaffold no longer paints — the m0==0x125a arm keeps only InitVideo/surface).
-                    FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
-                    FB_PIXELS_MATCH.store(matched as u64, Ordering::Relaxed);
-                    FB_PIXELS_CHANGED.store(changed as u64, Ordering::Relaxed);
-                    FB_NON_BG_COUNT.store(non_bg_count as u64, Ordering::Relaxed);
-                    FB_NON_BG_INDEX.store(non_bg_index, Ordering::Relaxed);
-                    FB_NON_BG_VALUE.store(non_bg_value as u64, Ordering::Relaxed);
-                    FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
-                    print_hex(st as u32);
-                    print_str(b" -> NATURAL fb readback: changed ");
-                    print_u64(changed as u64);
-                    print_str(b"/768, desktop-bg ");
-                    print_u64(matched as u64);
-                    print_str(b"/768 (px0=0x");
-                    print_hex(sample0);
-                    print_str(b", non-bg ");
-                    print_u64(non_bg_count as u64);
-                    print_str(b" at 0x");
-                    print_hex(non_bg_index as u32);
-                    print_str(b" value=0x");
-                    print_hex(non_bg_value);
-                    print_str(b")\n");
-                    // Latch: this painting switch is done. The next winlogon 0x1288 (already-current no-op)
-                    // must NOT clear/re-read the fb (it would wipe the paint we just sampled).
-                    WINLOGON_PAINT_DONE.store(1, Ordering::Relaxed);
+                    observe_winlogon_natural_switch_desktop(st);
                 }
                 if has_buf && ok && st == 0 && !redirected_user_callback {
                     // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client —

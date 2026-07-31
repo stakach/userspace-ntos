@@ -7,6 +7,7 @@ use crate::*;
 
 const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
 const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
+const WND_DWUSERDATA_OFFSET: u64 = 0x110;
 
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
@@ -921,6 +922,13 @@ pub(crate) unsafe fn service_user_callback(
                 let sas_hwnd = callback_payload_u64(frame, 0x10);
                 let sas_session = callback_payload_u64(frame, WINDOWPROC_PAYLOAD_OFFSET as usize);
                 if sas_hwnd != 0 && sas_session != 0 {
+                    let sas_pwnd = crate::winlogon_pwnd_for_hwnd(sas_hwnd);
+                    if sas_pwnd != 0 {
+                        core::ptr::write_volatile(
+                            (sas_pwnd + WND_DWUSERDATA_OFFSET) as *mut u64,
+                            sas_session,
+                        );
+                    }
                     core::ptr::write_volatile(
                         (win32k_subsystem::WIN32K_SHARED_VADDR
                             + win32k_subsystem::SH_SAS_HWND) as *mut u64,
@@ -936,6 +944,11 @@ pub(crate) unsafe fn service_user_callback(
                     print_str(b" session=0x");
                     print_hex((sas_session >> 32) as u32);
                     print_hex(sas_session as u32);
+                    print_str(b" pwnd=0x");
+                    print_hex((sas_pwnd >> 32) as u32);
+                    print_hex(sas_pwnd as u32);
+                    print_str(b" dwUserData=");
+                    print_u64((sas_pwnd != 0) as u64);
                     print_str(b"\n");
                 }
                 core::ptr::write(
