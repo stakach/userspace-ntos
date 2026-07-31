@@ -6986,10 +6986,42 @@ pub(crate) unsafe fn service_sec_image(
                 // it can only reach if its user32 process-attach class-registration loop COMPLETES
                 // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
                 let svc_noninteractive = pi == 3 || pi == 4;
+                let mut class_atom_name_pre_served = false;
+                // Explorer asks win32k for class atom names from inside nested user callbacks. The
+                // hosted win32k still has one shared PROCESSINFO, so those exact lookups can fault
+                // before the old post-dispatch fallback runs; complete only mirror-backed names here.
+                let class_atom_name_pre_result = if m0 == 0x10ad && (pi == 5 || pi == 6) {
+                    let client_teb = nt_handler
+                        .pm
+                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .filter(|teb| *teb != 0)
+                        .unwrap_or(SMSS_TEB_VA);
+                    crate::ke_gdi_flush_user_batch(pi, client_teb);
+                    copy_class_atom_name_fallback(
+                        pi as u64,
+                        a0 as u16,
+                        a1,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                } else {
+                    None
+                };
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0, false)
+                } else if let Some(fallback) = class_atom_name_pre_result {
+                    class_atom_name_pre_served = true;
+                    print_str(b"[win32k-svc] post-winlogon NtUserGetAtomName(0x10ad) MIRROR pi=");
+                    print_u64(pi as u64);
+                    print_str(b" atom=0x");
+                    print_hex(a0 as u32);
+                    print_str(b" -> bytes=");
+                    print_u64(fallback);
+                    print_str(b"\n");
+                    (fallback, true)
                 } else if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
@@ -7350,7 +7382,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if ok && !redirected_user_callback {
-                    if m0 == 0x10ad && st == 0 {
+                    if m0 == 0x10ad && st == 0 && !class_atom_name_pre_served {
                         if let Some(fallback) = copy_class_atom_name_fallback(
                             pi as u64,
                             a0 as u16,
