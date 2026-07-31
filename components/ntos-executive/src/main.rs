@@ -3472,6 +3472,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         passed,
     );
     check(
+        b"exec_explorer_wndproc_installed_by_client",
+        setwndproc_client >= 1 && setwndproc_replay == 0,
+        passed,
+    );
+    check(
         b"exec_explorer_shell_com_classes_served",
         shell_com_provisioned & EXPLORER_SHELL_COM_REQUIRED_MASK == EXPLORER_SHELL_COM_REQUIRED_MASK
             && shell_com_opened & EXPLORER_SHELL_COM_REQUIRED_MASK == EXPLORER_SHELL_COM_REQUIRED_MASK

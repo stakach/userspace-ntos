@@ -1,6 +1,7 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **Phase 4 login-dialog paint path is implemented and gate-verified.** The
+Status: **Phase 4 login-dialog paint path and natural explorer ATL WndProc installs are implemented
+and gate-verified.** The
 executive + isolated win32k component + `nt-ntdll` now run the real reverse-callback transport:
 win32k requests `KeUserModeCallback`, the executive redirects winlogon into
 `KiUserCallbackDispatcher`, and `NtCallbackReturn` resumes the parked win32k continuation. The
@@ -8,13 +9,17 @@ component callback stub uses Send + an explicit receive loop, so the single win3
 nested USER/GDI dispatches while an outer callback is parked. Supported active callbacks are no
 longer completed by synthetic success replies: api0 WINDOWPROC plus api3 default cursors, api11
 window icons, api15 OBM/menu bitmaps, and api16 LPK text output are contract-validated and executed
-in winlogon; unsupported or malformed callbacks fail closed.
+in winlogon and explorer; unsupported or malformed callbacks fail closed.
 
 The current gate creates and correlates the IDD_LOGON `#32770`/`Logon` dialog, drives the modal
 `WM_PAINT` path through real user32/dialog/control procedures, drains real paint dispatches, and
-proves the credential box with a framebuffer readback over the dialog rectangle. Round57 validated
-269 real callback redirects/returns, balanced continuation pushes/unwinds, no fallback callback
-successes, `exec_msgina_logon_dialog_painted`, and a cursor-aware desktop framebuffer proof.
+proves the credential box with a framebuffer readback over the dialog rectangle. The current explorer
+gate also proves ReactOS ATL thunk installation without replay: `SetWindowLongPtrW(...,
+GWLP_WNDPROC, thunk)` now arrives from the client path (`setwndproc-client/replay=10/0`) because raw
+ReactOS DLL syscall stubs are forced through the NT fault path while our ntdll native Call envelope is
+still dispatched natively. The latest gate validated 755 real callback redirects, balanced
+continuation pushes/unwinds, no fallback callback successes, `exec_msgina_logon_dialog_painted`,
+`exec_explorer_wndproc_installed_by_client`, and a cursor-aware desktop framebuffer proof.
 
 ## 0. Why
 
@@ -215,6 +220,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | **buffer marshalling** in/out across VSpaces (client-visible only) | ✅ api0 client stack copy/reference scrub plus fixed/LPK resource contracts are live and tested |
 | Real user32 resource callbacks | ✅ api3/api11/api15/api16 selected, redirected, and returned with exact result lengths |
 | IDD_LOGON modal paint + framebuffer proof | ✅ 12 real paints drained; credential dialog rectangle has non-desktop, multi-color pixels |
+| Explorer ATL `GWLP_WNDPROC` install | ✅ natural client `NtUserSetWindowLongPtr` path, replay scaffold removed and gated at `10/0` |
 
 `KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
 Phase 2A created the interception substrate with a fixed shared frame and callback rendezvous. The
@@ -393,24 +399,16 @@ success.
   completed with no FAIL lines.
 
   Later explorer diagnostics split both `NtUserSetWindowLongPtr` (`0x1298`) and `NtUserSetWindowLong`
-  (`0x105b`) calls by origin. The serialized proof run reported normal client `0x1298` extra-byte
-  writes and client `0x105b` style writes, but all six explorer `GWLP_WNDPROC` installs were still
-  tagged `origin=replay`; the `[explorer-image]` line recorded `setwndproc-client/replay=0/6`. This
-  proves the ATL WndProc replay remains load-bearing and that there is not yet a natural explorer
-  client-side `GWLP_WNDPROC` replacement for that scaffold.
-
-  A follow-up explorer trace proved ATL thunk initialization reaches native ntdll from inside the
-  parked user callback: every replayed ATL create callback first issues `NtFlushInstructionCache`
-  for the generated thunk bytes with a non-zero callback depth. A narrower code/IAT trace then showed
-  explorer's live import thunk (`PE_LOAD_BASE+0x365a6`, `ff 25 6c 34 00 00`), live
-  `SetWindowLongPtrW` slot (`PE_LOAD_BASE+0x39a18`), user32 export body (`user32_base+0x58da0`), and
-  the user32 `NtUserSetWindowLongPtr` syscall stub (`user32_base+0xa0d08`, `mov eax,0x1298; mov
-  r10,rcx; syscall; ret`) intact in each replayed ATL create callback. The same trace recorded the
-  first ATL create callback returning from native `NtFlushInstructionCache` directly to SSN `0x16`
-  (`NtCallbackReturn`), with no intervening natural `0x1298`; the `[explorer-image]` line remained
-  `setwndproc-client/replay=0/6`. That narrows the remaining gap to the post-native-flush resume path
-  before explorer's call to `SetWindowLongPtrW`, not to missing thunk generation, a missing native
-  flush export, a bad explorer import snap, or a missing user32 syscall stub.
+  (`0x105b`) calls by origin. The blocking bug was below win32k: hosted ReactOS threads had the
+  `TCBSetHostedSyscalls` flag clear, so raw user32 syscall stubs could dispatch as native seL4 calls
+  when arg2/RDX matched a seL4 syscall number. `GWLP_WNDPROC == -4`, which matched
+  `SysNBSendWait`, so the natural ATL `SetWindowLongPtrW` call disappeared before win32k could see
+  it. rust-micro now treats hosted-syscalls as hybrid: our ntdll's exact `Call(CT_FAULT,
+  label=0x4E54)` envelope still dispatches natively, while raw ReactOS DLL `syscall` stubs fault as
+  NT syscalls. The serialized gate now records explorer `GWLP_WNDPROC` installs as natural client
+  calls, with `[explorer-image] ... setwndproc-client/replay=10/0`; the executive ATL replay helper
+  has been removed and `exec_explorer_wndproc_installed_by_client` enforces that the replay count
+  stays zero.
 - **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
   dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
   and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0
