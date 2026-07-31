@@ -3213,6 +3213,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let scrollbar_style = USERINIT_SCROLLBAR_CLASSINFO_STYLE.load(Ordering::Relaxed);
     let scrollbar_extra = USERINIT_SCROLLBAR_CLASSINFO_EXTRA.load(Ordering::Relaxed);
     let scrollbar_proc = USERINIT_SCROLLBAR_CLASSINFO_PROC.load(Ordering::Relaxed);
+    let (font_seeds, font_successes, font_failures) =
+        win32k_subsystem::client_system_font_proofs();
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3277,6 +3279,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(scrollbar_extra as u32);
     print_str(b" proc=");
     print_u64(scrollbar_proc);
+    print_str(b" system-font seeds/successes/failures=0x");
+    print_hex(font_seeds as u32);
+    print_str(b"/0x");
+    print_hex(font_successes as u32);
+    print_str(b"/0x");
+    print_hex(font_failures as u32);
     print_str(b"\n");
     check(
         b"exec_userinit_process_spawned",
@@ -3297,6 +3305,13 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
         passed,
     );
     check(b"exec_userinit_gdi_shared_table_mapped", gdi_mapped != 0, passed);
+    check(
+        b"exec_userinit_system_font_seeded",
+        (font_seeds & (1u64 << 5)) != 0
+            && (font_successes & (1u64 << 5)) != 0
+            && (font_failures & (1u64 << 5)) == 0,
+        passed,
+    );
     check(
         b"exec_userinit_global_cursor_reused",
         cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
@@ -3350,6 +3365,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
     let shell_com_threading =
         EXPLORER_SHELL_COM_THREADING_MODEL_MASK.load(Ordering::Relaxed);
+    let (font_seeds, font_successes, font_failures) =
+        win32k_subsystem::client_system_font_proofs();
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
     let process_self_term =
@@ -3402,6 +3419,12 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_hex(shell_com_inproc_default as u32);
     print_str(b"/0x");
     print_hex(shell_com_threading as u32);
+    print_str(b" system-font seeds/successes/failures=0x");
+    print_hex(font_seeds as u32);
+    print_str(b"/0x");
+    print_hex(font_successes as u32);
+    print_str(b"/0x");
+    print_hex(font_failures as u32);
     print_str(b"\n");
     check(
         b"exec_explorer_process_spawned",
@@ -3428,6 +3451,13 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     check(
         b"exec_win32k_pool_no_exhaustion",
         win32k_pool_exhaustions == 0,
+        passed,
+    );
+    check(
+        b"exec_userinit_explorer_system_fonts_seeded",
+        (font_seeds & ((1u64 << 5) | (1u64 << 6))) == ((1u64 << 5) | (1u64 << 6))
+            && (font_successes & ((1u64 << 5) | (1u64 << 6))) == ((1u64 << 5) | (1u64 << 6))
+            && (font_failures & ((1u64 << 5) | (1u64 << 6))) == 0,
         passed,
     );
     check(

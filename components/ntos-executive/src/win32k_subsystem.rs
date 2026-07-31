@@ -621,30 +621,153 @@ unsafe fn pool_alloc(size: u64) -> u64 {
     start
 }
 
-/// A SEPARATE bump arena for FreeType (ftfd) allocations. FreeType's font-subsystem init allocates
-/// unboundedly (it allocates until the arena OOMs, then truncates + returns success — the same graceful
-/// behaviour the shared 1 MiB pool gave in the committed baseline). Isolating its `'FTYP'`-tagged
-/// allocations here means it can't starve the MAIN pool that the gray-brush / PDEV / primary-surface
-/// creation in the rest of NtUserInitialize needs. (Root cause — a FreeType loop fed a bad count via a
-/// win32k font-init path — is a deeper ftfd-hosting fix; this bounds the blast radius.) Counter at +0.
+/// A SEPARATE arena for FreeType (ftfd) allocations. FreeType's ReactOS glue allocates through
+/// `EngAllocMem(TAG_FREETYPE)` and frees through `EngFreeMem`, so unlike the main win32k pool this
+/// arena must reclaim blocks or each GUI client consumes the whole window while probing fonts.
+/// Counter at +0, address-ordered free-list head at +8, payload starts at +0x1000.
 pub const WIN32K_FTYP_VADDR: u64 = 0x0000_0100_0B00_0000;
 pub const WIN32K_FTYP_FRAMES: u64 = 512; // 2 MiB (own window, pre-mapped)
 /// FreeType's `EngAllocMem` tag ('FTYP', little-endian) — see the ftfd ft_alloc disasm.
 pub const FTYP_TAG: u64 = 0x5059_5446;
 
+const FTYP_HDR_SIZE: u64 = 16;
+const FTYP_ALLOC_MARKER: u64 = 0xffff_ffff_ffff_fffe;
+
+fn align16(size: u64) -> u64 {
+    (size + 15) & !15
+}
+
 unsafe fn ftyp_alloc(size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    let want = align16(size);
+    let head = (WIN32K_FTYP_VADDR + 8) as *mut u64;
+    let mut prev = 0u64;
+    let mut cur = read_volatile(head);
+    let mut scanned = 0usize;
+    while cur != 0 && scanned < 4096 {
+        let cap = read_volatile(cur as *const u64);
+        let next = read_volatile((cur + 8) as *const u64);
+        if cap >= want {
+            if prev == 0 {
+                write_volatile(head, next);
+            } else {
+                write_volatile((prev + 8) as *mut u64, next);
+            }
+            if cap >= want + FTYP_HDR_SIZE + 16 {
+                let split = cur + FTYP_HDR_SIZE + want;
+                write_volatile(split as *mut u64, cap - want - FTYP_HDR_SIZE);
+                write_volatile((split + 8) as *mut u64, next);
+                if prev == 0 {
+                    write_volatile(head, split);
+                } else {
+                    write_volatile((prev + 8) as *mut u64, split);
+                }
+                write_volatile(cur as *mut u64, want);
+            }
+            write_volatile((cur + 8) as *mut u64, FTYP_ALLOC_MARKER);
+            return cur + FTYP_HDR_SIZE;
+        }
+        prev = cur;
+        cur = next;
+        scanned += 1;
+    }
+
     let ctr = WIN32K_FTYP_VADDR as *mut u64;
     let mut cur = read_volatile(ctr);
     if cur < POOL_DATA_OFF {
         cur = POOL_DATA_OFF;
     }
-    let start = (WIN32K_FTYP_VADDR + cur + 15) & !15;
+    let hdr = align16(WIN32K_FTYP_VADDR + cur);
     let cap = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
-    if size == 0 || start + size > cap {
+    if hdr + FTYP_HDR_SIZE + want > cap {
         return 0; // OOM → FreeType truncates gracefully (matches the baseline)
     }
-    write_volatile(ctr, (start + size) - WIN32K_FTYP_VADDR);
-    start
+    write_volatile(ctr, (hdr + FTYP_HDR_SIZE + want) - WIN32K_FTYP_VADDR);
+    write_volatile(hdr as *mut u64, want);
+    write_volatile((hdr + 8) as *mut u64, FTYP_ALLOC_MARKER);
+    hdr + FTYP_HDR_SIZE
+}
+
+unsafe fn ftyp_free(p: u64) {
+    let arena_start = WIN32K_FTYP_VADDR + POOL_DATA_OFF;
+    let arena_end = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
+    if p < arena_start + FTYP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
+        return;
+    }
+    let hdr = p - FTYP_HDR_SIZE;
+    let cap = read_volatile(hdr as *const u64);
+    let marker = read_volatile((hdr + 8) as *const u64);
+    if marker != FTYP_ALLOC_MARKER || cap == 0 || (cap & 15) != 0 {
+        return;
+    }
+    if hdr < arena_start || hdr + FTYP_HDR_SIZE + cap > arena_end {
+        return;
+    }
+
+    let head = (WIN32K_FTYP_VADDR + 8) as *mut u64;
+    let mut prev = 0u64;
+    let mut cur = read_volatile(head);
+    let mut scanned = 0usize;
+    while cur != 0 && cur < hdr && scanned < 4096 {
+        prev = cur;
+        cur = read_volatile((cur + 8) as *const u64);
+        scanned += 1;
+    }
+    if scanned >= 4096 {
+        return;
+    }
+
+    write_volatile(hdr as *mut u64, cap);
+    write_volatile((hdr + 8) as *mut u64, cur);
+    if prev == 0 {
+        write_volatile(head, hdr);
+    } else {
+        write_volatile((prev + 8) as *mut u64, hdr);
+    }
+
+    let mut block = hdr;
+    let mut block_cap = cap;
+    if cur != 0 && block + FTYP_HDR_SIZE + block_cap == cur {
+        let cur_cap = read_volatile(cur as *const u64);
+        let cur_next = read_volatile((cur + 8) as *const u64);
+        block_cap += FTYP_HDR_SIZE + cur_cap;
+        write_volatile(block as *mut u64, block_cap);
+        write_volatile((block + 8) as *mut u64, cur_next);
+    }
+    if prev != 0 {
+        let prev_cap = read_volatile(prev as *const u64);
+        if prev + FTYP_HDR_SIZE + prev_cap == block {
+            let next = read_volatile((block + 8) as *const u64);
+            block = prev;
+            block_cap += FTYP_HDR_SIZE + prev_cap;
+            write_volatile(block as *mut u64, block_cap);
+            write_volatile((block + 8) as *mut u64, next);
+        }
+    }
+
+    let ctr = WIN32K_FTYP_VADDR as *mut u64;
+    let high = WIN32K_FTYP_VADDR + read_volatile(ctr);
+    if block + FTYP_HDR_SIZE + block_cap == high {
+        let mut list_prev = 0u64;
+        let mut list_cur = read_volatile(head);
+        let mut scanned = 0usize;
+        while list_cur != 0 && list_cur != block && scanned < 4096 {
+            list_prev = list_cur;
+            list_cur = read_volatile((list_cur + 8) as *const u64);
+            scanned += 1;
+        }
+        if list_cur == block {
+            let next = read_volatile((block + 8) as *const u64);
+            if list_prev == 0 {
+                write_volatile(head, next);
+            } else {
+                write_volatile((list_prev + 8) as *mut u64, next);
+            }
+            write_volatile(ctr, block - WIN32K_FTYP_VADDR);
+        }
+    }
 }
 
 /// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute
@@ -1661,8 +1784,13 @@ extern "win64" fn s_vdbg_print_ex_with_prefix(
 // memcpy / memmove / memset are the pure, driver-agnostic byte-loop primitives —
 // shared with the FSD class in [`crate::ntoskrnl_shared`] (registered by name below).
 
-/// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (pure bump arena).
-extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
+/// `VOID ExFreePoolWithTag(PVOID, ULONG)`. The main pool remains a bump arena, but FreeType's
+/// dedicated FTYP arena has real frees because ReactOS ftfd alloc/free churns heavily per client.
+extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
+    unsafe {
+        ftyp_free(p);
+    }
+}
 
 // --- ZwAllocateVirtualMemory + RTL_BITMAP (GDI DC_ATTR / RGN_ATTR pool) -----------------------
 
@@ -1879,6 +2007,8 @@ static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SEEDS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 
@@ -4397,10 +4527,8 @@ unsafe fn hwnd_to_pwnd(hwnd: u64) -> u64 {
 /// real font instead of null-derefing at RVA 0x4d7eb ("no fonts loaded at all"). Runs once, after
 /// the dispatch context is established (win32k's font code reads gs:/current-process).
 ///
-/// Reclaims the FreeType arena first: ftfd's FreeType probe during InitFontSupport alloc-then-freed
-/// the whole `'FTYP'` arena in a churn loop (our ExFreePoolWithTag is a no-op, so the bump pointer
-/// never rewound). Those blocks are logically free, so resetting the bump pointer gives
-/// `FT_New_Memory_Face` room to parse this face without OOM.
+/// The FTYP arena has its own free list, so the per-client FreeType probe churn should leave room
+/// for `FT_New_Memory_Face` to parse the staged system font instead of hitting arena OOM.
 unsafe fn load_system_font_for_client(pi: usize) {
     if pi >= 64 {
         return;
@@ -4412,14 +4540,18 @@ unsafe fn load_system_font_for_client(pi: usize) {
     print_str(b"[win32k-host] seeding private system font for pi=");
     print_u64(pi as u64);
     print_str(b"\n");
-    load_system_font();
+    if load_system_font() {
+        WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        WIN32K_CLIENT_SYSTEM_FONT_FAILURES.fetch_or(bit, Ordering::Relaxed);
+    }
 }
 
-unsafe fn load_system_font() {
+unsafe fn load_system_font() -> bool {
     let size = read_volatile((WIN32K_SHARED_VADDR + SH_FONT_SIZE) as *const u32) as u64;
     if size == 0 {
         print_str(b"[win32k-host] no system font staged - font realize will fail\n");
-        return;
+        return false;
     }
     let ftyp_hw = read_volatile(WIN32K_FTYP_VADDR as *const u64);
     print_str(b"[win32k-host] FTYP arena high-water=0x");
@@ -4456,6 +4588,15 @@ unsafe fn load_system_font() {
     print_str(b" numAdded=");
     print_hex(num_added);
     print_str(b"\n");
+    handle != 0 && num_added != 0
+}
+
+pub(crate) fn client_system_font_proofs() -> (u64, u64, u64) {
+    (
+        WIN32K_CLIENT_SYSTEM_FONT_SEEDS.load(Ordering::Relaxed),
+        WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES.load(Ordering::Relaxed),
+        WIN32K_CLIENT_SYSTEM_FONT_FAILURES.load(Ordering::Relaxed),
+    )
 }
 
 /// Build a minimal OBJECT_ATTRIBUTES (Length=0x30) naming `name` (a null-terminated wide string
