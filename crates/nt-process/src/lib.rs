@@ -37,6 +37,7 @@ pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
 
 pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
 pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
@@ -301,6 +302,9 @@ pub struct NtProcess {
     pub win32_window_station: Option<u64>,
     /// Lazy, stable `ProcessCookie` returned by `NtQueryInformationProcess` class 36.
     process_cookie: u32,
+    /// `EPROCESS.DefaultHardErrorProcessing`, queried/set by
+    /// `ProcessDefaultHardErrorMode`.
+    default_hard_error_processing: u32,
     /// `ProcessBreakOnTermination`, initially clear and mutable through the native info class.
     break_on_termination: bool,
     /// `EPROCESS.SectionBaseAddress` — the mapped base of the process image. Reported to a
@@ -578,6 +582,10 @@ impl ProcessManager {
         } else {
             ProcessState::Created
         };
+        let default_hard_error_processing = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.default_hard_error_processing)
+            .unwrap_or(SEM_FAILCRITICALERRORS);
         self.processes.insert(
             pid,
             NtProcess {
@@ -594,6 +602,7 @@ impl ProcessManager {
                 win32_process: None,
                 win32_window_station: None,
                 process_cookie: 0,
+                default_hard_error_processing,
                 break_on_termination: false,
                 image_base: 0,
                 debug_port: None,
@@ -1152,6 +1161,21 @@ impl ProcessManager {
     pub fn process_break_on_termination(&self, pid: ProcessId) -> Option<bool> {
         self.process(pid)
             .map(|process| process.break_on_termination)
+    }
+
+    pub fn process_default_hard_error_processing(&self, pid: ProcessId) -> Option<u32> {
+        self.process(pid)
+            .map(|process| process.default_hard_error_processing)
+    }
+
+    pub fn set_process_default_hard_error_processing(
+        &mut self,
+        pid: ProcessId,
+        mode: u32,
+    ) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.default_hard_error_processing = mode;
+        Ok(())
     }
 
     pub fn set_process_break_on_termination(

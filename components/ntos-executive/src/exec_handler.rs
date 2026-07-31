@@ -8414,6 +8414,33 @@ impl ExecNtHandler {
                         return STATUS_ACCESS_VIOLATION;
                     }
                     0
+                } else if class == 12 {
+                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+                    if args[3] != 4 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let retlen = args[4];
+                    if buf == 0
+                        || !self.probe_event_output(buf, 4)
+                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
+                    {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    let (pid, _) =
+                        match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
+                            Ok(target) => target,
+                            Err(status) => return status,
+                        };
+                    let mode = match self.pm.process_default_hard_error_processing(pid) {
+                        Some(mode) => mode,
+                        None => return 0xC000_0008,
+                    };
+                    if !self.xas_write_u32(buf, mode)
+                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
+                    {
+                        return 0xC000_0005;
+                    }
+                    0
                 } else if class == 29 {
                     const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
                     if args[3] != 4 {
@@ -10652,13 +10679,41 @@ impl ExecNtHandler {
                 self.keyed_wait_key = key;
                 0x102
             }
-            // No-op → STATUS_SUCCESS: the bump allocator never frees, we don't model thread/process
-            // attribute sets, per-object security, or a real handle table. (277
-            // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
-            // 236 NtSetInformationObject.)
+            // Model the process information classes now used on the live boot route. Unknown classes
+            // still degrade as success for compatibility with existing callers that only probe whether
+            // the setter exists.
             NativeService::NtSetInformationProcess => unsafe {
                 if args[1] == 9 {
                     return self.nt_set_process_access_token(args);
+                }
+                if args[1] == 12 {
+                    const PROCESS_SET_INFORMATION: u32 = 0x0200;
+                    if args[3] != 4 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let mut value = [0u8; 4];
+                    if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    let caller = match self.pm_pid_for_pi(self.pi) {
+                        Some(pid) => pid,
+                        None => return 0xC000_0008,
+                    };
+                    let pid = match self.pm.resolve_process_handle(
+                        caller,
+                        args[0],
+                        PROCESS_SET_INFORMATION,
+                    ) {
+                        Ok(pid) => pid,
+                        Err(status) => return status,
+                    };
+                    return match self.pm.set_process_default_hard_error_processing(
+                        pid,
+                        u32::from_le_bytes(value),
+                    ) {
+                        Ok(()) => 0,
+                        Err(status) => status,
+                    };
                 }
                 if args[1] != 29 {
                     return 0;

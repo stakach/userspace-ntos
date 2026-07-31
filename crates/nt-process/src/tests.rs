@@ -231,6 +231,35 @@ fn open_process_by_client_id_rejects_invalid_ids_without_minting() {
 }
 
 #[test]
+fn process_default_hard_error_mode_defaults_sets_and_inherits() {
+    let mut pm = ProcessManager::new();
+    let root = pm.create_process("smss.exe", None, None);
+
+    assert_eq!(
+        pm.process_default_hard_error_processing(root),
+        Some(SEM_FAILCRITICALERRORS)
+    );
+    pm.set_process_default_hard_error_processing(root, 0x0003)
+        .unwrap();
+    assert_eq!(pm.process_default_hard_error_processing(root), Some(0x0003));
+
+    let child = pm.create_process("csrss.exe", Some(root), None);
+    assert_eq!(
+        pm.process_default_hard_error_processing(child),
+        Some(0x0003)
+    );
+
+    pm.set_process_default_hard_error_processing(child, 0)
+        .unwrap();
+    assert_eq!(pm.process_default_hard_error_processing(child), Some(0));
+    assert_eq!(pm.process_default_hard_error_processing(root), Some(0x0003));
+    assert_eq!(
+        pm.set_process_default_hard_error_processing(0xDEAD, 0),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
 fn process_generic_access_mapping_matches_nt_object_policy() {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
