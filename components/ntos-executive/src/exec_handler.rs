@@ -968,7 +968,7 @@ impl ExecNtHandler {
                 Some(self.mint_registry_key(key, args[1] as u32, args[0]))
             }
             None => {
-                if self.pi == 2 && post_profile_phase() && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64 {
+                if self.current_process_is_winlogon() && post_profile_phase() && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64 {
                     print_str(b"[post-profile] open MISS ");
                     print_ascii_str(&full);
                     print_str(b"\n");
@@ -992,7 +992,7 @@ impl ExecNtHandler {
         oa: u64,
         args: &[u64],
     ) -> Option<u32> {
-        if self.pi != 6 {
+        if !self.current_process_is_explorer() {
             return None;
         }
         let name = self.effective_objattr_name(path, oa);
@@ -1811,6 +1811,10 @@ impl ExecNtHandler {
         self.current_process_is_hosted_leaf(b"services.exe")
     }
 
+    fn current_process_is_smss(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"smss.exe")
+    }
+
     fn current_process_is_csrss(&self) -> bool {
         self.current_process_is_hosted_leaf(b"csrss.exe")
     }
@@ -1821,6 +1825,14 @@ impl ExecNtHandler {
 
     fn current_process_is_winlogon(&self) -> bool {
         self.current_process_is_hosted_leaf(b"winlogon.exe")
+    }
+
+    fn current_process_is_userinit(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"userinit.exe")
+    }
+
+    fn current_process_is_explorer(&self) -> bool {
+        self.current_process_is_hosted_leaf(b"explorer.exe")
     }
 
     fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
@@ -3826,7 +3838,7 @@ impl ExecNtHandler {
                     .query_thread_basic(caller_pid, current_tid, handle)?;
                 let teb = if basic.teb_base_address != 0 {
                     basic.teb_base_address
-                } else if self.pi == 0 {
+                } else if self.current_process_is_smss() {
                     SMSS_TEB_VA
                 } else {
                     TEB_VA
@@ -4216,7 +4228,7 @@ impl ExecNtHandler {
                 remote_copied
             };
             if !copied {
-                if self.pi == 2 && target_pi != self.pi {
+                if self.current_process_is_winlogon() && target_pi != self.pi {
                     let (frame, _) =
                         csrss_frame_get_exact(target_pi as u64, remote_address & !0xfff);
                     print_str(b"[remote-vm] write failed target_pi=");
@@ -5194,7 +5206,7 @@ impl ExecNtHandler {
         let teb = if teb != 0 {
             teb
         } else if tid == self.current_tid as nt_process::ThreadId {
-            if self.pi == 0 { SMSS_TEB_VA } else { TEB_VA }
+            if self.current_process_is_smss() { SMSS_TEB_VA } else { TEB_VA }
         } else {
             0
         };
@@ -5413,7 +5425,8 @@ impl ExecNtHandler {
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
-        let dynamic_stack = self.pi == 2 && wl_listener_stack_contains(va, dst.len());
+        let dynamic_stack =
+            self.current_process_is_winlogon() && wl_listener_stack_contains(va, dst.len());
         if dynamic_stack {
             let Some(ctx) = self.loop_ctx.as_ref() else {
                 return false;
@@ -5600,7 +5613,7 @@ impl ExecNtHandler {
             return true;
         };
         let end = va + len as u64;
-        if self.pi == 2 && wl_listener_stack_contains(va, len) {
+        if self.current_process_is_winlogon() && wl_listener_stack_contains(va, len) {
             return client_range_has_backing(self.pi as u64, va, len);
         }
         let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
@@ -5704,7 +5717,8 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        let dynamic_stack = self.pi == 2 && wl_listener_stack_contains(va, src.len());
+        let dynamic_stack =
+            self.current_process_is_winlogon() && wl_listener_stack_contains(va, src.len());
         if dynamic_stack {
             let Some(ctx) = self.loop_ctx.as_ref() else {
                 return false;
@@ -6245,7 +6259,7 @@ impl ExecNtHandler {
                 // spin the nested accept loop forever. services+ take the MODELED accept (a minted
                 // client handle + the mapped CSR view/static-data below) so their bring-up proceeds;
                 // wiring a per-client CSR acceptor for services is the SCM batch's frontier.
-                if self.pi == 2 && r.pending && r.connection_id != 0 {
+                if self.current_process_is_winlogon() && r.pending && r.connection_id != 0 {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
                     pending = true;
@@ -7190,7 +7204,7 @@ impl ExecNtHandler {
                 // Both are EXACT-name matches scoped to pi==2, so no other paint-time HKLM open outcome
                 // changes (broadly succeeding HKLM opens regressed the desktop paint; see the
                 // keyboard-layout note on the machine-root target).
-                if self.pi == 2 {
+                if self.current_process_is_winlogon() {
                     let eff_name = if !path.is_empty() {
                         path.clone()
                     } else {
@@ -8133,7 +8147,7 @@ impl ExecNtHandler {
                 if fid != 0 && is_pipe_transceive && (status as u32) != 0x0000_0103 {
                     self.pipe_write_redrive = true;
                 }
-                if self.pi == 2 && fsctl as u32 == 0x0011_0018
+                if self.current_process_is_winlogon() && fsctl as u32 == 0x0011_0018
                     && NT_PIPE_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8
                 {
                     print_str(b"[nt-pipe-wait] fid=0x");
@@ -8200,7 +8214,7 @@ impl ExecNtHandler {
                     shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
-                } else if self.pi == 2
+                } else if self.current_process_is_winlogon()
                     && key == SYNTH_WINLOGON_KEY
                     && name_lc == "defaultpassword"
                 {
@@ -8297,7 +8311,7 @@ impl ExecNtHandler {
                 // `AllowAccessOnSession` → `StartUserShell`) fail through `WARN`, which the shipped
                 // binary does not print. A missed value read is the only externally visible
                 // evidence of which step gave up, so name the KEY and the VALUE.
-                if self.pi == 2 && val.is_none() && post_profile_phase() {
+                if self.current_process_is_winlogon() && val.is_none() && post_profile_phase() {
                     self.trace_post_profile_registry(b"query-value", key, &name_lc);
                 }
                 // Every value the synthesized Winlogon key ever ANSWERS. The gate asserts this
@@ -8368,7 +8382,9 @@ impl ExecNtHandler {
                             // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
                             if !is_synth_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE {
                                 SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
-                                if self.pi == 2 && name_lc == "profilesdirectory" {
+                                if self.current_process_is_winlogon()
+                                    && name_lc == "profilesdirectory"
+                                {
                                     WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
@@ -8826,7 +8842,7 @@ impl ExecNtHandler {
                 // exactly two ports, in a fixed order: CsrApiPortInitialize(\Windows\ApiPort) then
                 // CsrSbApiPortInitialize(\Windows\SbApiPort). Assign the canonical name by order so the
                 // ports register correctly → the authentic CSR accept can find the pending connection.
-                if self.pi == 1 && name16.is_empty() {
+                if self.current_process_is_csrss() && name16.is_empty() {
                     let n = CSR_CREATEPORT_N.fetch_add(1, Ordering::Relaxed);
                     let canon: &str = if n == 0 { "\\Windows\\ApiPort" } else { "\\Windows\\SbApiPort" };
                     name16 = canon.encode_utf16().collect();
@@ -9557,7 +9573,7 @@ impl ExecNtHandler {
                     }
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 0
+                    && self.current_process_is_smss()
                     && SM_LOOP_TID.load(Ordering::Relaxed) == 0
                 {
                     unsafe {
@@ -9578,7 +9594,7 @@ impl ExecNtHandler {
                             if client_id != 0 {
                                 self.queue_write(
                                     client_id,
-                                    self.pm_pid_for_pi(0).unwrap_or(0) as u64,
+                                    self.current_pm_pid().unwrap_or(0) as u64,
                                 );
                                 self.queue_write(client_id + 8, tid);
                             }
@@ -9624,7 +9640,9 @@ impl ExecNtHandler {
             // LpcConnRecord — never a round-trip to the isolated broker. (Interim: a real acceptor would
             // be csrss's CsrApiRequestThread; this models it, like SM path A.)
             NativeService::NtRequestWaitReplyPort => unsafe {
-                if self.pi == 0 && self.lpc_connection_is(args[0], 0, b"\\smapiport") {
+                if self.current_process_is_smss()
+                    && self.lpc_connection_is(args[0], 0, b"\\smapiport")
+                {
                     self.sm_request_port = args[0];
                     self.sm_request_message = args[1];
                     self.sm_reply_message = args[2];
@@ -11084,7 +11102,7 @@ impl ExecNtHandler {
                 // DUPLICATE_CLOSE_SOURCE)`, authpackage.c:1712). Count winlogon (pi 2) querying THAT
                 // token object — proof the handle crossed processes and resolves to the same object
                 // the `NtCreateToken` service inserted, not to winlogon's own primary token.
-                if self.pi == 2
+                if self.current_process_is_winlogon()
                     && token_id.raw() as u64 == SE_CREATE_TOKEN_ID.load(Ordering::Relaxed)
                     && SE_CREATE_TOKEN_ID.load(Ordering::Relaxed) != 0
                 {
@@ -11959,11 +11977,15 @@ impl ExecNtHandler {
                             ctx.dll_pes()[index]
                                 .as_ref()
                                 .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.pi == 0 && args[0] == *ctx.csrss_file_handle {
+                        } else if self.current_process_is_smss()
+                            && args[0] == *ctx.csrss_file_handle
+                        {
                             (&*ctx.csrss_pe)
                                 .as_ref()
                                 .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.pi == 0 && args[0] == *ctx.winlogon_file_handle {
+                        } else if self.current_process_is_smss()
+                            && args[0] == *ctx.winlogon_file_handle
+                        {
                             (&*ctx.winlogon_pe)
                                 .as_ref()
                                 .map(|pe| (pe.bytes().len() as u64, false))
@@ -12120,7 +12142,7 @@ impl ExecNtHandler {
                 {
                     return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
                 }
-                if self.pi == 2
+                if self.current_process_is_winlogon()
                     && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
                 {
                     print_str(b"[winlogon-vm] base_ptr=0x");
@@ -12775,7 +12797,7 @@ impl ExecNtHandler {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                 }
-                if self.pi == 2
+                if self.current_process_is_winlogon()
                     && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 40
                 {
                     print_str(b"[nt-create-file-winlogon] status=0x"); print_hex(status);
@@ -13910,7 +13932,7 @@ impl ExecNtHandler {
                     let image = nt_exe_image::hosted_image_for_leaf(leaf)?;
                     Self::hosted_image_exists(image).then_some(image.leaf)
                 });
-                let userinit_shell_probe = if self.pi == 5 && !want_dir && !is_sxs {
+                let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
                     if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                         Some(b"explorer.exe" as &[u8])
                     } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
@@ -13943,7 +13965,10 @@ impl ExecNtHandler {
                 // (`proc.c:2745`). Counted separately from success: the generic image table now
                 // accepts the real file and carries it through SectionImageInformation, while pi=5
                 // process publication remains the next mechanism boundary.
-                if self.pi == 2 && !want_dir && nb[..nlen].windows(8).any(|w| w == b"userinit") {
+                if self.current_process_is_winlogon()
+                    && !want_dir
+                    && nb[..nlen].windows(8).any(|w| w == b"userinit")
+                {
                     WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
                 }
                 let is_csrss = hosted_exe_leaf
@@ -13979,7 +14004,7 @@ impl ExecNtHandler {
                         // Pin the heap mark past the load's registry allocations (service loop consumes).
                         self.dll_loaded_dirty = true;
                         dll_i = Some(slot);
-                    } else if self.pi != 2
+                    } else if !self.current_process_is_winlogon()
                         && (nb[..nlen].ends_with(b".dll")
                             || nb[..nlen].windows(4).any(|w| w == b".dll"))
                     {
@@ -14085,7 +14110,10 @@ impl ExecNtHandler {
                 let winlogon_pe = &*ctx.winlogon_pe;
                 let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(self.pi, sect) {
                     reg.image_info(i).map(|b| (b, reg.name(i)))
-                } else if self.pi == 0 && csrss_section_handle != 0 && sect == csrss_section_handle {
+                } else if self.current_process_is_smss()
+                    && csrss_section_handle != 0
+                    && sect == csrss_section_handle
+                {
                     // The csrss.exe SEC_IMAGE section is created + queried ONLY by smss (pi 0) inside
                     // RtlCreateUserProcess. Scope to pi 0 so a DIFFERENT process's dense handle with
                     // the same value (path 1b) can never alias it (reg is matched first regardless).
@@ -14100,7 +14128,10 @@ impl ExecNtHandler {
                             b"csrss.exe" as &[u8],
                         )
                     })
-                } else if self.pi == 0 && winlogon_section_handle != 0 && sect == winlogon_section_handle {
+                } else if self.current_process_is_smss()
+                    && winlogon_section_handle != 0
+                    && sect == winlogon_section_handle
+                {
                     // smss's RtlCreateUserProcess(winlogon) queries SectionImageInformation on the
                     // winlogon SEC_IMAGE section to size the initial thread's stack + find the entry.
                     // Unrecognized before, this stopped the whole demo (the ONLY reason winlogon
@@ -14207,14 +14238,20 @@ impl ExecNtHandler {
                 // The csrss.exe / winlogon.exe EXE sections are created ONLY by smss (pi 0). Scope
                 // to pi 0 so a csrss/winlogon DLL section create with a same-valued dense file handle
                 // (path 1b) can't spuriously match these (the per-pi reg lookup handles DLLs below).
-                if self.pi == 0 && *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
+                if self.current_process_is_smss()
+                    && *ctx.csrss_file_handle != 0
+                    && sec_file == *ctx.csrss_file_handle
+                {
                     *ctx.csrss_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
                     print_hex(h as u32);
                     print_str(b"\n");
                 }
-                if self.pi == 0 && *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
+                if self.current_process_is_smss()
+                    && *ctx.winlogon_file_handle != 0
+                    && sec_file == *ctx.winlogon_file_handle
+                {
                     *ctx.winlogon_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
@@ -14244,7 +14281,7 @@ impl ExecNtHandler {
                 // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
                 if let Some(i) = registry_slot {
                     reg.set_section_handle(self.pi, i, h);
-                    if self.pi != 2 {
+                    if !self.current_process_is_winlogon() {
                         print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                         print_str(reg.name(i));
                         print_str(b" -> handle 0x");
@@ -14254,7 +14291,10 @@ impl ExecNtHandler {
                 }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
                 // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
-                if sec_file == 0 && self.pi == 1 && *ctx.csrss_anon_section_handle == 0 {
+                if sec_file == 0
+                    && self.current_process_is_csrss()
+                    && *ctx.csrss_anon_section_handle == 0
+                {
                     let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
                     let size = if let Some(m) = smss_mirror(maxsize_ptr, 8) {
                         core::ptr::read_volatile(m as *const u64)
@@ -14336,7 +14376,7 @@ impl ExecNtHandler {
                         if vs_ptr != 0 {
                             csrss_out_write(vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                         }
-                        if self.pi != 2 {
+                        if !self.current_process_is_winlogon() {
                             print_str(b"[ntos-exec] NtMapViewOfSection ");
                             print_str(reg.name(i));
                             print_str(b" -> base 0x");
@@ -14384,7 +14424,10 @@ impl ExecNtHandler {
                         );
                         0xC0000002
                     }
-                } else if self.pi == 1 && *ctx.csrss_anon_section_handle != 0 && sect == *ctx.csrss_anon_section_handle {
+                } else if self.current_process_is_csrss()
+                    && *ctx.csrss_anon_section_handle != 0
+                    && sect == *ctx.csrss_anon_section_handle
+                {
                     // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
                     // (page tables only) and let the fault router demand-page zero frames on touch.
                     const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
@@ -14482,8 +14525,8 @@ impl ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let sp = get_recv_mr(16);
                 let sect = smss_stack_read(sp + 0x30); // SectionHandle
-                if self.pi == 2 || self.pi == 5 {
-                    print_str(if self.pi == 2 {
+                if self.current_process_is_winlogon() || self.current_process_is_userinit() {
+                    print_str(if self.current_process_is_winlogon() {
                         b"[wl-createproc] pi=2 sect=0x" as &[u8]
                     } else {
                         b"[userinit-createproc] pi=5 sect=0x" as &[u8]
@@ -14500,7 +14543,7 @@ impl ExecNtHandler {
                 }
                 // NtCreateProcess(csrss/winlogon) is issued ONLY by smss (pi 0); scope so a dense
                 // section handle of the same value in another process can't trigger a spawn (1b).
-                if self.pi == 0
+                if self.current_process_is_smss()
                     && *ctx.csrss_section_handle != 0
                     && sect == *ctx.csrss_section_handle
                     && (*ctx.csrss_pe).is_some()
@@ -14514,7 +14557,7 @@ impl ExecNtHandler {
                         Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
                         Err(status) => status,
                     }
-                } else if self.pi == 0
+                } else if self.current_process_is_smss()
                     && *ctx.winlogon_section_handle != 0
                     && sect == *ctx.winlogon_section_handle
                     && (*ctx.winlogon_pe).is_some()
@@ -14702,7 +14745,9 @@ impl ExecNtHandler {
                     return 0;
                 }
                 let exit_time = nt_system_time_100ns() as i64;
-                let outcome = if self.pi == 1 && self.pm.main_thread(caller_pid) == Some(target) {
+                let outcome = if self.current_process_is_csrss()
+                    && self.pm.main_thread(caller_pid) == Some(target)
+                {
                     self.pm.exit_thread_at(target, status, exit_time)
                 } else {
                     self.pm.terminate_thread_at(target, status, exit_time)
