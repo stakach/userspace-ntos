@@ -363,6 +363,14 @@ fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<us
     None
 }
 
+fn live_hosted_pid_for_leaf(
+    nt_handler: &ExecNtHandler,
+    leaf: &[u8],
+) -> Option<nt_process::ProcessId> {
+    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    nt_handler.pm_pid_for_pi(pi)
+}
+
 fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     let leaf: &[u8] = match badge {
         WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
@@ -5460,15 +5468,18 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" param=0x");
                     print_hex(param as u32);
                     print_str(b"\n");
-                    let pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0) as u64;
+                    let csrss_pi = live_hosted_pi_for_leaf(&nt_handler, b"csrss.exe")
+                        .expect("csrss.exe EPROCESS missing before CSR API thread spawn");
+                    let pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
+                        .unwrap_or(0) as u64;
                     let tid = CSR_API_TID.load(Ordering::Relaxed);
                     let tcb = spawn_csr_loop_thread(pml4, entry_rip, param, pid, tid);
                     CSR_LOOP_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        1,
+                        csrss_pi,
                         tid,
                         tcb,
-                        hosted_top_badge_for_pi(1),
+                        hosted_top_badge_for_pi(csrss_pi),
                         HostedThreadRole::CsrApi,
                     );
                     print_str(b"[csr-loop] spawned tcb=0x");
@@ -5481,7 +5492,10 @@ pub(crate) unsafe fn service_sec_image(
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let entry_rip = smss_stack_read(ctx_va + 0xF8);
                     let param = smss_stack_read(ctx_va + 0x80);
-                    let pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0) as u64;
+                    let csrss_pi = live_hosted_pi_for_leaf(&nt_handler, b"csrss.exe")
+                        .expect("csrss.exe EPROCESS missing before CSR/SB thread spawn");
+                    let pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
+                        .unwrap_or(0) as u64;
                     let tid = CSR_SB_TID.load(Ordering::Relaxed);
                     print_str(b"[csr-sb] spawning REAL CsrSbApiRequestThread: entry=0x");
                     print_hex((entry_rip >> 32) as u32);
@@ -5492,10 +5506,10 @@ pub(crate) unsafe fn service_sec_image(
                     let tcb = spawn_csr_sb_loop_thread(pml4, entry_rip, param, pid, tid);
                     CSR_SB_LOOP_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
-                        1,
+                        csrss_pi,
                         tid,
                         tcb,
-                        hosted_top_badge_for_pi(1),
+                        hosted_top_badge_for_pi(csrss_pi),
                         HostedThreadRole::CsrSbApi,
                     );
                 }
