@@ -1,9 +1,9 @@
 //! ReactOS registry registrations that setup normally materializes into HKCR.
 //!
 //! The LiveCD image we boot is intentionally sparse: some COM class registrations that ReactOS
-//! explorer expects are not present in the staged SOFTWARE hive. Keep the data here pure and
-//! host-testable so the executive can seed its volatile registry overlay without embedding string
-//! assembly in the syscall handler.
+//! explorer expects are not present in the staged SOFTWARE hive. Keep the materialization here pure
+//! and host-testable so the executive consumes ReactOS registration data instead of embedding COM
+//! string assembly in the syscall handler.
 
 extern crate alloc;
 
@@ -20,29 +20,30 @@ pub const CLSID_START_MENU: &str = "{4622AD11-FF23-11D0-8D34-00A0C90F2719}";
 pub const CLSID_REBAR_BAND_SITE: &str = "{ECD4FC4D-521C-11D0-B792-00A0C90312E1}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReactOsComClassRegistration {
+pub struct ReactOsComClassRegistrationScript {
     pub clsid: &'static str,
-    pub description: &'static str,
     pub module: &'static str,
-    pub threading_model: &'static str,
+    pub source_path: &'static str,
+    pub rgs: &'static str,
     pub mask_bit: u64,
 }
 
 /// COM classes explorer reaches through `base/shell/explorer/rshell.cpp` when `rshell.dll` is not
-/// present beside the shell image.
-pub const REACTOS_EXPLORER_SHELL_COM_CLASSES: &[ReactOsComClassRegistration] = &[
-    ReactOsComClassRegistration {
+/// present beside the shell image. The source strings are the modules' own ATL/Wine `.rgs`
+/// registration resources; `%MODULE%` is the setup-time module substitution.
+pub const REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS: &[ReactOsComClassRegistrationScript] = &[
+    ReactOsComClassRegistrationScript {
         clsid: CLSID_START_MENU,
-        description: "Start Menu",
         module: "shell32.dll",
-        threading_model: "Apartment",
+        source_path: "references/reactos/dll/win32/shell32/res/rgs/startmenu.rgs",
+        rgs: include_str!("../../../references/reactos/dll/win32/shell32/res/rgs/startmenu.rgs"),
         mask_bit: REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU,
     },
-    ReactOsComClassRegistration {
+    ReactOsComClassRegistrationScript {
         clsid: CLSID_REBAR_BAND_SITE,
-        description: "Shell Rebar BandSite",
         module: "browseui.dll",
-        threading_model: "Apartment",
+        source_path: "references/reactos/dll/win32/browseui/res/rebarbandsite.rgs",
+        rgs: include_str!("../../../references/reactos/dll/win32/browseui/res/rebarbandsite.rgs"),
         mask_bit: REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     },
 ];
@@ -61,31 +62,168 @@ fn class_key(classes_root: &str, clsid: &str) -> String {
     format!(r"{}\CLSID\{}", root, clsid)
 }
 
+fn join_key_path(parent: &str, child: &str) -> String {
+    let root = parent.trim_end_matches('\\');
+    if root.is_empty() {
+        canon_path(child)
+    } else {
+        canon_path(&format!(r"{}\{}", root, child))
+    }
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    line.split_once("//").map_or(line, |(head, _)| head)
+}
+
+fn take_rgs_name(input: &str) -> Option<(&str, &str)> {
+    let s = input.trim_start();
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\'' {
+        let end = s[1..].find('\'')? + 2;
+        return Some((&s[1..end - 1], &s[end..]));
+    }
+    if first == '{' {
+        let end = s.find('}')? + 1;
+        return Some((&s[..end], &s[end..]));
+    }
+
+    let end = s
+        .char_indices()
+        .find_map(|(i, c)| (c.is_whitespace() || c == '=').then_some(i))
+        .unwrap_or(s.len());
+    (end != 0).then_some((&s[..end], &s[end..]))
+}
+
+fn parse_rgs_reg_sz(rest: &str, module: &str) -> Option<Vec<u8>> {
+    let (_, after_equals) = rest.split_once('=')?;
+    let after_equals = after_equals.trim_start();
+    let after_type = after_equals.strip_prefix('s')?.trim_start();
+    let value = after_type.strip_prefix('\'')?;
+    let end = value.find('\'')?;
+    let value = value[..end].replace("%MODULE%", module);
+    Some(utf16le_sz(&value))
+}
+
+fn overlay_create(overlay: &mut RegistryOverlay, path: &str) -> usize {
+    let (index, _) = overlay.create(&canon_path(path));
+    index
+}
+
+fn seed_key_line(
+    overlay: &mut RegistryOverlay,
+    current: &str,
+    line: &str,
+    module: &str,
+) -> Option<String> {
+    let (name, rest) = take_rgs_name(line)?;
+    let path = join_key_path(current, name);
+    let index = overlay_create(overlay, &path);
+    if let Some(data) = parse_rgs_reg_sz(rest, module) {
+        overlay.set_value(index, "", REG_SZ, &data);
+    }
+    Some(path)
+}
+
+fn seed_rgs_script_to_overlay(
+    overlay: &mut RegistryOverlay,
+    classes_root: &str,
+    module: &str,
+    rgs: &str,
+) -> bool {
+    let classes_root = canon_path(classes_root);
+    let mut stack = Vec::<String>::new();
+    let mut pending_key: Option<String> = None;
+    let mut wrote_anything = false;
+
+    for raw_line in rgs.lines() {
+        let line = strip_line_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        match line {
+            "{" => {
+                let path = pending_key
+                    .take()
+                    .unwrap_or_else(|| stack.last().cloned().unwrap_or_default());
+                if !path.is_empty() {
+                    overlay_create(overlay, &path);
+                    wrote_anything = true;
+                }
+                stack.push(path);
+            }
+            "}" => {
+                stack.pop();
+            }
+            "HKCR" => {
+                pending_key = Some(classes_root.clone());
+            }
+            _ => {
+                let current = stack.last().map(String::as_str).unwrap_or("");
+                if let Some(rest) = line.strip_prefix("NoRemove ") {
+                    pending_key = seed_key_line(overlay, current, rest, module);
+                    wrote_anything |= pending_key.is_some();
+                } else if let Some(rest) = line.strip_prefix("ForceRemove ") {
+                    pending_key = seed_key_line(overlay, current, rest, module);
+                    wrote_anything |= pending_key.is_some();
+                } else if let Some(rest) = line.strip_prefix("val ") {
+                    if let Some((name, value_rest)) = take_rgs_name(rest) {
+                        let index = overlay_create(overlay, current);
+                        if let Some(data) = parse_rgs_reg_sz(value_rest, module) {
+                            overlay.set_value(index, name, REG_SZ, &data);
+                            wrote_anything = true;
+                        }
+                    }
+                } else {
+                    pending_key = seed_key_line(overlay, current, line, module);
+                    wrote_anything |= pending_key.is_some();
+                }
+            }
+        }
+    }
+
+    wrote_anything
+}
+
+fn rgs_script_materialized_expected_class(
+    overlay: &RegistryOverlay,
+    classes_root: &str,
+    clsid: &str,
+) -> bool {
+    let class_path = canon_path(&class_key(classes_root, clsid));
+    let inproc_path = canon_path(&format!(
+        r"{}\InprocServer32",
+        class_key(classes_root, clsid)
+    ));
+    let Some(class_index) = overlay.find(&class_path) else {
+        return false;
+    };
+    let Some(inproc_index) = overlay.find(&inproc_path) else {
+        return false;
+    };
+    overlay.value(class_index, "").is_some()
+        && overlay.value(inproc_index, "").is_some()
+        && overlay.value(inproc_index, "ThreadingModel").is_some()
+}
+
 /// Seed explorer's shell COM classes under `classes_root` (normally
 /// `\Registry\Machine\Software\Classes`) into the volatile overlay.
 ///
 /// Returns the ORed class mask for every class written. The operation is idempotent: existing
-/// overlay keys are opened and their values are replaced with the ReactOS registration values.
+/// overlay keys are opened and their values are replaced with values parsed from ReactOS `.rgs`
+/// registration resources.
 pub fn seed_reactos_explorer_shell_com_classes(
     overlay: &mut RegistryOverlay,
     classes_root: &str,
 ) -> u64 {
     let mut mask = 0;
-    for reg in REACTOS_EXPLORER_SHELL_COM_CLASSES {
-        let class_path = class_key(classes_root, reg.clsid);
-        let class_canon = canon_path(&class_path);
-        let (class_index, _) = overlay.create(&class_canon);
-        let description = utf16le_sz(reg.description);
-        overlay.set_value(class_index, "", REG_SZ, &description);
-
-        let inproc_path = format!(r"{}\InprocServer32", class_path);
-        let inproc_canon = canon_path(&inproc_path);
-        let (inproc_index, _) = overlay.create(&inproc_canon);
-        let module = utf16le_sz(reg.module);
-        let threading_model = utf16le_sz(reg.threading_model);
-        overlay.set_value(inproc_index, "", REG_SZ, &module);
-        overlay.set_value(inproc_index, "ThreadingModel", REG_SZ, &threading_model);
-        mask |= reg.mask_bit;
+    for script in REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS {
+        if seed_rgs_script_to_overlay(overlay, classes_root, script.module, script.rgs)
+            && rgs_script_materialized_expected_class(overlay, classes_root, script.clsid)
+        {
+            mask |= script.mask_bit;
+        }
     }
     mask
 }
@@ -105,7 +243,48 @@ mod tests {
     }
 
     #[test]
-    fn seeds_explorer_shell_com_classes() {
+    fn rgs_subset_parser_materializes_hkcr_keys_and_values() {
+        let mut overlay = RegistryOverlay::new();
+        assert!(seed_rgs_script_to_overlay(
+            &mut overlay,
+            r"\Registry\Machine\Software\Classes",
+            "sample.dll",
+            r"
+                HKCR
+                {
+                    NoRemove CLSID
+                    {
+                        ForceRemove {11111111-2222-3333-4444-555555555555} = s 'Sample Class'
+                        {
+                            InprocServer32 = s '%MODULE%'
+                            {
+                                val ThreadingModel = s 'Apartment'
+                            }
+                        }
+                    }
+                }
+            ",
+        ));
+
+        let (ty, data) = value_bytes(
+            &overlay,
+            r"\Registry\Machine\Software\Classes\CLSID\{11111111-2222-3333-4444-555555555555}",
+            "",
+        );
+        assert_eq!(ty, REG_SZ);
+        assert_eq!(data, utf16le_sz("Sample Class"));
+
+        let (ty, data) = value_bytes(
+            &overlay,
+            r"\Registry\Machine\Software\Classes\CLSID\{11111111-2222-3333-4444-555555555555}\InprocServer32",
+            "",
+        );
+        assert_eq!(ty, REG_SZ);
+        assert_eq!(data, utf16le_sz("sample.dll"));
+    }
+
+    #[test]
+    fn seeds_explorer_shell_com_classes_from_reactos_rgs() {
         let mut overlay = RegistryOverlay::new();
         let mask = seed_reactos_explorer_shell_com_classes(
             &mut overlay,
@@ -140,6 +319,14 @@ mod tests {
         );
         assert_eq!(ty, REG_SZ);
         assert_eq!(data, utf16le_sz("browseui.dll"));
+
+        let (ty, data) = value_bytes(
+            &overlay,
+            r"\Registry\Machine\Software\Classes\CLSID\{ECD4FC4D-521C-11D0-B792-00A0C90312E1}",
+            "",
+        );
+        assert_eq!(ty, REG_SZ);
+        assert_eq!(data, utf16le_sz("Shell Rebar BandSite"));
 
         let (ty, data) = value_bytes(
             &overlay,

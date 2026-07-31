@@ -574,9 +574,9 @@ impl ExecNtHandler {
     }
 
     /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback
-    /// `CoCreateInstance` calls. A normal installed system would have these under HKCR; the staged
-    /// LiveCD SOFTWARE hive does not, so the executive supplies the missing setup output through the
-    /// same volatile overlay used by real registry writes.
+    /// `CoCreateInstance` calls. A normal installed system would have these under HKCR after COM
+    /// registration; the staged LiveCD SOFTWARE hive does not, so the executive imports the
+    /// ReactOS `.rgs` setup output through the same volatile overlay used by real registry writes.
     fn provision_reactos_explorer_shell_com_classes(&mut self) {
         let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes(
             &mut self.overlay,
