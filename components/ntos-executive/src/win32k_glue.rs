@@ -13,6 +13,7 @@ const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_NCCREATE: u32 = 0x0081;
 const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
 const EXPLORER_ATL_WIN_MODULE_RVA: u64 = 0x446b8;
+const EXPLORER_SET_WINDOW_LONG_PTR_W_IAT: u64 = crate::PE_LOAD_BASE + 0x39a18;
 const ATL_CREATE_WND_LIST_OFFSET: u64 = 0x30;
 const ATL_CREATE_WND_DATA_THIS_OFFSET: u64 = 0x00;
 const ATL_CREATE_WND_DATA_TID_OFFSET: u64 = 0x08;
@@ -802,6 +803,9 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     if current_wndproc != EXPLORER_ATL_START_WINDOW_PROC {
         return;
     }
+    let set_window_long_ptr_w =
+        client_copyin_process_u64(client_pi as u64, scratch_base, EXPLORER_SET_WINDOW_LONG_PTR_W_IAT)
+            .unwrap_or(0);
 
     let n = USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS.fetch_add(1, Ordering::Relaxed);
     if n >= 8 {
@@ -843,6 +847,12 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     print_str(b" thunk=0x");
     print_hex((thunk_proc >> 32) as u32);
     print_hex(thunk_proc as u32);
+    print_str(b" thunk-target=0x");
+    print_hex((thunk_target >> 32) as u32);
+    print_hex(thunk_target as u32);
+    print_str(b" iat-setwndlongptrw=0x");
+    print_hex((set_window_long_ptr_w >> 32) as u32);
+    print_hex(set_window_long_ptr_w as u32);
     print_str(b" old=0x");
     print_hex((current_wndproc >> 32) as u32);
     print_hex(current_wndproc as u32);

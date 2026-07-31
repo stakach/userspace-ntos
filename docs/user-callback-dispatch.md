@@ -401,9 +401,12 @@ success.
 
   A follow-up explorer trace proved ATL thunk initialization reaches native ntdll from inside the
   parked user callback: every replayed ATL create callback first issues `NtFlushInstructionCache`
-  for the generated thunk bytes with a non-zero callback depth. That narrows the remaining gap to
-  the post-thunk-install path between the flush return and the expected `SetWindowLongPtrW`
-  `GWLP_WNDPROC` syscall, not to missing thunk generation or a missing native flush export.
+  for the generated thunk bytes with a non-zero callback depth. A narrower IAT trace then showed
+  explorer's live `SetWindowLongPtrW` slot (`PE_LOAD_BASE+0x39a18`) resolving to user32's export
+  body (`user32_base+0x58da0`) in each replayed ATL create callback. That narrows the remaining gap
+  to the post-thunk-install path between the flush return and the expected `SetWindowLongPtrW`
+  `GWLP_WNDPROC` syscall, not to missing thunk generation, a missing native flush export, or a bad
+  explorer import snap.
 - **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
   dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
   and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0
