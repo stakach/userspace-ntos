@@ -9,6 +9,7 @@ static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 
 fn sec_image_forward_run() -> u64 {
     let slots_cap = ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
@@ -697,7 +698,7 @@ unsafe fn observe_winlogon_natural_switch_desktop(status: u64) {
     if status == 0 {
         return;
     }
-    if WINLOGON_PAINT_DONE.swap(1, Ordering::Relaxed) != 0 {
+    if WINLOGON_PAINT_DONE.load(Ordering::Relaxed) != 0 {
         return;
     }
 
@@ -738,6 +739,17 @@ unsafe fn observe_winlogon_natural_switch_desktop(status: u64) {
     FB_NON_BG_INDEX.store(non_bg_index, Ordering::Relaxed);
     FB_NON_BG_VALUE.store(non_bg_value as u64, Ordering::Relaxed);
     FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
+    let cursor_overlay = matched as u64 + 1 == FB_SAMPLE_COUNT
+        && non_bg_count == 1
+        && non_bg_index == FB_CURSOR_SAMPLE_INDEX
+        && non_bg_value != 0x00FF_00FF;
+    let full_desktop = changed as u64 == FB_SAMPLE_COUNT
+        && sample0 == FB_DESKTOP_BG
+        && (matched as u64 == FB_SAMPLE_COUNT || cursor_overlay);
+    if full_desktop {
+        WINLOGON_PAINT_DONE.store(1, Ordering::Relaxed);
+        WINLOGON_DESKTOP_PAINT_PENDING.store(0, Ordering::Relaxed);
+    }
     print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
     print_hex(status as u32);
     print_str(b" -> NATURAL fb readback: changed ");
@@ -6903,9 +6915,15 @@ pub(crate) unsafe fn service_sec_image(
                 // first switch can park in user callbacks before the paint completes, so the readback is
                 // latched either here for a non-callback dispatch or later from NtCallbackReturn's completed
                 // outer-dispatch observer. Once latched, the already-current second switch must not clear the fb.
-                let winlogon_switch =
+                let winlogon_switch_requested =
                     m0 == 0x1288 && badge == WINLOGON_BADGE && WINLOGON_PAINT_DONE.load(Ordering::Relaxed) == 0;
-                if winlogon_switch {
+                let winlogon_switch_transitions = winlogon_switch_requested
+                    && win32k_subsystem::switch_desktop_would_change_input_desktop(a0);
+                let winlogon_switch_observe_after = winlogon_switch_requested
+                    && (winlogon_switch_transitions
+                        || WINLOGON_DESKTOP_PAINT_PENDING.load(Ordering::Relaxed) != 0);
+                if winlogon_switch_transitions {
+                    WINLOGON_DESKTOP_PAINT_PENDING.store(1, Ordering::Relaxed);
                     let fb = FB_VADDR as *mut u32;
                     for i in 0..(1024u64 * 768) {
                         core::ptr::write_volatile(fb.add(i as usize), 0x00FF_00FF);
@@ -7366,7 +7384,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if winlogon_switch && !redirected_user_callback {
+                if winlogon_switch_observe_after && !redirected_user_callback {
                     observe_winlogon_natural_switch_desktop(st);
                 }
                 if has_buf && ok && st == 0 && !redirected_user_callback {

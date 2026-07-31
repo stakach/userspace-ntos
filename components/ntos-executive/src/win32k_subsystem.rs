@@ -948,6 +948,15 @@ pub(crate) unsafe fn close_user_object_handle(handle: u64) -> bool {
     (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).close(handle)
 }
 
+pub(crate) unsafe fn switch_desktop_would_change_input_desktop(hdesk: u64) -> bool {
+    let target_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
+    if target_body == 0 {
+        return false;
+    }
+    let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
+    gpdesk != target_body
+}
+
 /// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`] (`None` = an unrecognized
 /// type). The pointer is the value held in win32k's imported `ExDesktopObjectType` /
 /// `ExWindowStationObjectType` data cell — now the address of a **real** `OBJECT_TYPE` static (see
@@ -3989,6 +3998,24 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
             let hwnd_desktop = if spwnd != 0 { read_volatile(spwnd as *const u64) } else { 0 }; // WND HEAD.h
             if hwnd_desktop != 0 {
+                // Per-client THREADINFO isolation means the desktop window can still carry the bootstrap
+                // desktop-thread owner while this repaint runs in winlogon's isolated thread. In this
+                // single-threaded host that turns DesktopWindowProc delivery into a queued cross-thread send
+                // that no desktop thread will pump. Rebind the desktop WND to the current dispatch thread so
+                // co_UserRedrawWindow dispatches WM_ERASEBKGND synchronously, as the original shared-thread
+                // model did.
+                let current_pti = current_w32thread();
+                let owner_pti = read_volatile((spwnd + WND_HEAD_PTI_OFF) as *const u64);
+                if current_pti != 0 && owner_pti != current_pti {
+                    write_volatile((spwnd + WND_HEAD_PTI_OFF) as *mut u64, current_pti);
+                    print_str(b"[win32k-paint] rebound desktop WND owner pti=0x");
+                    print_hex((owner_pti >> 32) as u32);
+                    print_hex(owner_pti as u32);
+                    print_str(b" -> 0x");
+                    print_hex((current_pti >> 32) as u32);
+                    print_hex(current_pti as u32);
+                    print_str(b"\n");
+                }
                 // RDW_INVALIDATE(0x1)|RDW_ERASE(0x4)|RDW_UPDATENOW(0x100)|RDW_ALLCHILDREN(0x80) = 0x185.
                 const RDW_FULL: u64 = 0x1 | 0x4 | 0x100 | 0x80;
                 let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
@@ -4268,7 +4295,12 @@ unsafe fn sync_threadinfo_process(w32thread: u64) {
 }
 
 unsafe fn prepare_set_thread_desktop(hdesk: u64) {
-    seed_process_startup_desktop(hdesk);
+    // Winlogon's first SetThreadDesktop must take ReactOS' own "assign startup desktop"
+    // branch. Pre-seeding a fresh per-client PROCESSINFO skips that path and leaves the
+    // following SwitchDesktop without the natural desktop redraw.
+    if current_client_index() != 2 {
+        seed_process_startup_desktop(hdesk);
+    }
     if hdesk == 0 {
         return;
     }
