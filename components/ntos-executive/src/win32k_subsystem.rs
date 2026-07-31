@@ -239,11 +239,13 @@ pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Ma
 pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
 pub const SH_REQ_CLIENT_PI: u64 = 0x148; // in: executive hosted-process index for this dispatch
 pub const SH_REQ_CLIENT_TEB: u64 = 0x150; // in: routed caller's current-thread TEB user VA
+pub const SH_REQ_DEBUG_FLAGS: u64 = 0x158; // in: executive-only diagnostic flags for this dispatch
+pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
-const _: () = assert!(SH_REQ_CLIENT_TEB < SH_USER_CALLBACK);
+const _: () = assert!(SH_REQ_DEBUG_FLAGS < SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
@@ -468,6 +470,8 @@ const WND_LPFNWNDPROC_OFF: u64 = 0x90;
 const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
 static WIN32K_EXPLORER_SETWNDPROC_TRACES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
 /// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
 /// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
@@ -3955,6 +3959,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     // args 5..N on the stack per win64 — delivering hMenu et al. correctly instead of garbage.
     let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
     let sh = WIN32K_SHARED_VADDR;
+    let debug_flags = read_volatile((sh + SH_REQ_DEBUG_FLAGS) as *const u64);
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
     // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
     // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
@@ -3981,6 +3986,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
         && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6;
     let trace_no = if trace_setwndproc {
+        if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
+            WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         WIN32K_EXPLORER_SETWNDPROC_TRACES.fetch_add(1, Ordering::Relaxed)
     } else {
         u64::MAX
@@ -4039,6 +4049,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         };
         print_str(b"[win32k-setwndproc] explorer hwnd=0x");
         print_hex(a0 as u32);
+        print_str(if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
+            b" origin=replay"
+        } else {
+            b" origin=client"
+        });
         print_str(b" pwnd=0x");
         print_hex((trace_pwnd >> 32) as u32);
         print_hex(trace_pwnd as u32);
@@ -4596,6 +4611,13 @@ pub(crate) fn client_system_font_proofs() -> (u64, u64, u64) {
         WIN32K_CLIENT_SYSTEM_FONT_SEEDS.load(Ordering::Relaxed),
         WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES.load(Ordering::Relaxed),
         WIN32K_CLIENT_SYSTEM_FONT_FAILURES.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn explorer_setwndproc_proofs() -> (u64, u64) {
+    (
+        WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.load(Ordering::Relaxed),
+        WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.load(Ordering::Relaxed),
     )
 }
 

@@ -97,6 +97,7 @@ type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
+static WIN32K_NEXT_DISPATCH_DEBUG_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// Times the bridge invariant was re-asserted, and times it had actually been CLOBBERED (a foreign
 /// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
 static USER_CALLBACK_WINDOW_REASSERTS: AtomicU64 = AtomicU64::new(0);
@@ -816,6 +817,10 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         scratch_base,
     };
+    WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.fetch_or(
+        win32k_subsystem::SH_REQ_DEBUG_ATL_REPLAY,
+        Ordering::Relaxed,
+    );
     let (ret, completed) = win32k_dispatch_wide(
         nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN,
         request_window,
@@ -3093,6 +3098,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
 ) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
+    let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);
     if w_fault == 0 || WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
         return (0xC000_0001u64, false);
     }
@@ -3168,6 +3174,10 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_CLIENT_TEB) as *mut u64,
         client.teb,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_DEBUG_FLAGS) as *mut u64,
+        debug_flags,
     );
     // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
     // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.

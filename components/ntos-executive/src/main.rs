@@ -3367,6 +3367,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         EXPLORER_SHELL_COM_THREADING_MODEL_MASK.load(Ordering::Relaxed);
     let (font_seeds, font_successes, font_failures) =
         win32k_subsystem::client_system_font_proofs();
+    let (setwndproc_client, setwndproc_replay) =
+        win32k_subsystem::explorer_setwndproc_proofs();
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
     let process_self_term =
@@ -3411,6 +3413,10 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(dead_callback_failures);
     print_str(b" nccreate-false=");
     print_u64(nccreate_false);
+    print_str(b" setwndproc-client/replay=");
+    print_u64(setwndproc_client);
+    print_str(b"/");
+    print_u64(setwndproc_replay);
     print_str(b" shell-com-provisioned=0x");
     print_hex(shell_com_provisioned as u32);
     print_str(b" shell-com-opened=0x");
