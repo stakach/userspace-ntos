@@ -1066,6 +1066,95 @@ impl ExecNtHandler {
         Some(0xC000_0034)
     }
 
+    /// Hosted user processes after logon should resolve the mounted machine hives through the same
+    /// overlay-first path services/LSA use. Earlier boot clients stay on their exact-name arms because
+    /// broad pre-SAS HKLM success changes user32/winmm initialization order and regresses paint.
+    ///
+    /// # Safety
+    /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader and mints a
+    /// handle into the current process's own EPROCESS handle table.
+    unsafe fn open_hosted_machine_key(
+        &mut self,
+        root_target: Option<KeyRef>,
+        path: &str,
+        oa: u64,
+        args: &[u64],
+    ) -> Option<u32> {
+        if self.pi < 5 {
+            return None;
+        }
+        let name = self.effective_objattr_name(path, oa);
+        if root_target.is_none() {
+            let comps = Self::key_components(&name);
+            if comps.len() == 2
+                && comps[0].eq_ignore_ascii_case("Registry")
+                && comps[1].eq_ignore_ascii_case("Machine")
+            {
+                return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
+            }
+        }
+
+        let full = if root_target == Some(MACHINE_ROOT_KEY) {
+            let mut full = alloc::string::String::from(r"\Registry\Machine");
+            if !name.is_empty() {
+                full.push('\\');
+                full.push_str(&name);
+            }
+            Some(full)
+        } else if let Some(parent_path) =
+            root_target.and_then(|target| self.registry_target_path(target))
+        {
+            if parent_path != r"\registry\machine"
+                && !parent_path.starts_with(r"\registry\machine\")
+            {
+                return None;
+            }
+            let mut full = parent_path;
+            if !name.is_empty() {
+                full.push('\\');
+                full.push_str(&name);
+            }
+            Some(full)
+        } else if root_target.is_none() {
+            Some(name)
+        } else {
+            None
+        }?;
+
+        let canon = self.overlay_canon(&full);
+        if canon != r"\registry\machine" && !canon.starts_with(r"\registry\machine\") {
+            return None;
+        }
+        if canon == r"\registry\machine" {
+            return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
+        }
+
+        if let Some(index) = self.overlay.find(&canon) {
+            let bit = explorer_shell_com_class_bit_for_path(&canon);
+            if bit != 0 {
+                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(
+                OVERLAY_KEY_TAG | index as u32,
+                args[1] as u32,
+                args[0],
+            ));
+        }
+
+        if let Some(key) = self.resolve_key(&full) {
+            if hive_sel(key) == HIVE_SEL_SOFTWARE {
+                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            let bit = explorer_shell_com_class_bit_for_path(&canon);
+            if bit != 0 {
+                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(key, args[1] as u32, args[0]));
+        }
+
+        Some(0xC000_0034)
+    }
+
     /// Bounded trace of a registry MISS in winlogon's post-profile window: which key, which value.
     fn trace_post_profile_registry(&self, what: &[u8], key: KeyRef, name: &str) {
         if POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) >= 64 {
@@ -1206,6 +1295,16 @@ impl ExecNtHandler {
         };
         let root_subkeys = hive.subkeys(hive.root()).len() as u64;
         USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
+        let reattached = self.overlay.reattach_subtree(&canon);
+        if reattached != 0 {
+            NT_LOAD_KEY_OVERLAY_REATTACHED.fetch_add(reattached as u64, Ordering::Relaxed);
+            self.overlay_dirty = true;
+            print_str(b"[cm-load] reattached ");
+            print_u64(reattached as u64);
+            print_str(b" overlay key(s) for ");
+            print_ascii_str(&full);
+            print_str(b"\n");
+        }
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
             canon,
@@ -6907,6 +7006,9 @@ impl ExecNtHandler {
                 if let Some(status) = self.open_explorer_classes_key(root_target, &path, oa, args) {
                     return status;
                 }
+                if let Some(status) = self.open_hosted_machine_key(root_target, &path, oa, args) {
+                    return status;
+                }
                 // Registry overlays are machine-global, so keys created by configuration code must
                 // be openable by every process. This is especially important for loader IFEO keys:
                 // a configured image option may be created by services/setup and consumed while
@@ -7458,7 +7560,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let use_xas_write = self.pi == 2 || self.pi == 3 || self.pi == 4;
+                let use_xas_write = self.pi >= 2;
                 let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
                     if key == SYNTH_CPU_KEY {
                         // The synthetic CPU key has 2 values (Identifier, VendorIdentifier).
@@ -7538,7 +7640,14 @@ impl ExecNtHandler {
                     info.extend_from_slice(&w.to_le_bytes());
                 }
                 let total = info.len() as u32;
-                smss_copyout(args[5], &total.to_le_bytes()); // *ResultLength (stack local)
+                let total_bytes = total.to_le_bytes();
+                if self.pi >= 2 {
+                    if !self.xas_try_write_buf(args[5], &total_bytes) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                } else {
+                    smss_copyout(args[5], &total_bytes); // *ResultLength (stack local)
+                }
                 if (args[4] as usize) < info.len() {
                     return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
                 }
@@ -7553,7 +7662,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let use_xas_write = self.pi == 2 || self.pi == 3 || self.pi == 4;
+                let use_xas_write = self.pi >= 2;
                 let subs = self.registry_subkeys(key);
                 let vals = self.registry_values(key);
                 let subkeys = subs.len() as u32;
@@ -7963,6 +8072,7 @@ impl ExecNtHandler {
                 let name16 = if self.pi == 2
                     || self.pi == 3
                     || self.pi == 4
+                    || self.pi >= 5
                     || key_is_ifeo
                     || shell_com_inproc_bit != 0
                 {
@@ -8044,20 +8154,18 @@ impl ExecNtHandler {
                     }
                     value
                 } else {
-                    if self.pi == 2 && !is_synth_key(key) {
-                    // winlogon (pi 2) reading a value out of a REAL MOUNTED HIVE (not a synth handle):
-                    // its out-params are advapi/userenv heap or stack the plain mirror can't reach, so
-                    // the copyout below must go cross-AS. Two live cases:
-                    //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
-                    //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was: pi 0-2 →
-                    //     None → NOT_FOUND → SetDefaultLanguage FALSE → InitializeSAS FALSE →
-                    //     ExitProcess(2).
-                    //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
-                    //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
-                    // Scoped by `!is_synth_key`, so every paint-time msgina value read is unchanged
-                    // (those hit SYNTH_WINLOGON_KEY / SYNTH_KBD_KEY, excluded here). Before the
-                    // SOFTWARE mount the ONLY non-synth pi==2 key was the Nls one, so widening the
-                    // name test from `"default"` to "any name" changes nothing that already existed.
+                    if (self.pi == 2 || self.pi >= 5) && !is_synth_key(key) {
+                        // Hosted clients reading a value out of a REAL MOUNTED HIVE (not a synth
+                        // handle): their out-params are advapi/userenv heap or stack the plain mirror
+                        // can't reach, so the copyout below must go cross-AS. Early live cases:
+                        //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
+                        //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was:
+                        //     pi 0-2 → None → NOT_FOUND → SetDefaultLanguage FALSE →
+                        //     InitializeSAS FALSE → ExitProcess(2).
+                        //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
+                        //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
+                        // Scoped by `!is_synth_key`, so every paint-time msgina value read is
+                        // unchanged (those hit SYNTH_WINLOGON_KEY / SYNTH_KBD_KEY, excluded here).
                         use_xas_write = true;
                     }
                     self.registry_value(key, &name_lc)

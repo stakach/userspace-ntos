@@ -3512,6 +3512,7 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     let subkeys = NT_LOAD_KEY_ROOT_SUBKEYS.load(Ordering::Relaxed);
     let unloads = NT_UNLOAD_KEY_CALLS.load(Ordering::Relaxed);
     let detached = NT_UNLOAD_KEY_DETACHED.load(Ordering::Relaxed);
+    let reattached = NT_LOAD_KEY_OVERLAY_REATTACHED.load(Ordering::Relaxed);
     let user_opens = USER_HIVE_KEY_OPENED.load(Ordering::Relaxed);
     let default_opens = USER_DEFAULT_KEY_OPENED.load(Ordering::Relaxed);
     let root_opens = USER_ROOT_OPENED.load(Ordering::Relaxed);
@@ -3535,6 +3536,8 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     print_u64(unloads);
     print_str(b" detached=");
     print_u64(detached);
+    print_str(b" reattached-overlay-keys=");
+    print_u64(reattached);
     print_str(b" | \\Registry\\User opens: root=");
     print_u64(root_opens);
     print_str(b" .Default=");
@@ -3573,7 +3576,11 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                         && volatile_queried >= 1))
                 // … and the unload really detached the mount.
                 && unloads >= 1
-                && detached >= 1),
+                && detached >= 1
+                // CreateUserProfileExW initializes the hive, flushes/unloads it, then
+                // LoadUserProfileW mounts it again; without reattaching the saved writes, HKCU shell
+                // folder values disappear before explorer asks for CSIDL_STARTMENU.
+                && reattached >= detached),
         passed,
     );
 }
@@ -9701,6 +9708,7 @@ pub(crate) static USER_VOLATILE_ENV_QUERIED_EMPTY: AtomicU64 = AtomicU64::new(0)
 /// `NtLoadKey`/`NtUnloadKey` outcome counters, so the gate asserts what really happened.
 pub(crate) static NT_LOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_MOUNTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_LOAD_KEY_OVERLAY_REATTACHED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_UNLOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_UNLOAD_KEY_DETACHED: AtomicU64 = AtomicU64::new(0);

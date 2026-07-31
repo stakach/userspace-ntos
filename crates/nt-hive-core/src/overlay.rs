@@ -63,7 +63,8 @@ struct OverlayValue {
 ///
 /// `detached` is the `NtUnloadKey` state: the key's *slot* stays in place (so an already-minted
 /// `KeyRef` that encodes this index can never silently start naming a DIFFERENT key) but the key
-/// is invisible to every lookup, exactly as if the hive it shadowed had never been mounted.
+/// is invisible to every lookup while the hive it shadows is unloaded. The values are retained so
+/// a later `NtLoadKey` can model the prior `RegFlushKey`/unload by reattaching the write set.
 struct OverlayKey {
     path: String,
     values: Vec<OverlayValue>,
@@ -120,9 +121,9 @@ impl RegistryOverlay {
     /// Create-or-open a key at the canonical `canon` path. Returns `(index, created)` where
     /// `created` is `true` only if the key did not already exist in the overlay.
     ///
-    /// A DETACHED slot with the same path is re-attached in place (and emptied): re-mounting a
-    /// hive at a path that was unloaded must start from the mounted hive's own contents, not from
-    /// the writes the previous mount accumulated, and re-using the slot keeps indices dense.
+    /// A DETACHED slot with the same path is re-attached in place and emptied for an explicit new
+    /// create. The `NtLoadKey` remount path uses [`Self::reattach_subtree`] instead, because a prior
+    /// `RegFlushKey`/unload must make those retained writes visible again.
     pub fn create(&mut self, canon: &str) -> (usize, bool) {
         if let Some(i) = self.find(canon) {
             return (i, false);
@@ -154,8 +155,10 @@ impl RegistryOverlay {
 
     /// DETACH every key at or below `canon` — the write-plane half of `NtUnloadKey`. Without this
     /// an unload would leave the writes made through the mounted hive still resolving at the same
-    /// path, so the "unloaded" key would keep answering opens. Returns how many keys were
-    /// detached (0 = nothing was mounted there, which the caller must report as a refusal).
+    /// path, so the "unloaded" key would keep answering opens. Values are kept hidden, not erased:
+    /// the registry hive write path has no on-disk writer, so this retained overlay is the durable
+    /// state a later `NtLoadKey` reattaches. Returns how many keys were detached (0 = nothing was
+    /// mounted there, which the caller must report as a refusal).
     pub fn detach_subtree(&mut self, canon: &str) -> usize {
         let mut detached = 0;
         for key in self.keys.iter_mut() {
@@ -168,11 +171,32 @@ impl RegistryOverlay {
                     && key.path.as_bytes()[canon.len()] == b'\\');
             if under {
                 key.detached = true;
-                key.values.clear();
                 detached += 1;
             }
         }
         detached
+    }
+
+    /// REATTACH every detached key at or below `canon`, restoring the overlay writes hidden by
+    /// [`Self::detach_subtree`]. This models a hive that was flushed/unloaded and then mounted again
+    /// from the same path: while unloaded it answered nothing, but its prior writes are still the
+    /// volatile backing store once the mount returns.
+    pub fn reattach_subtree(&mut self, canon: &str) -> usize {
+        let mut reattached = 0;
+        for key in self.keys.iter_mut() {
+            if !key.detached {
+                continue;
+            }
+            let under = key.path == canon
+                || (key.path.len() > canon.len()
+                    && key.path.starts_with(canon)
+                    && key.path.as_bytes()[canon.len()] == b'\\');
+            if under {
+                key.detached = false;
+                reattached += 1;
+            }
+        }
+        reattached
     }
 
     /// Set (create-or-replace) a value on an overlay key. `name` may be `""` (the default value).
@@ -412,6 +436,13 @@ mod tests {
         assert_eq!(ov.live_len(), 2);
         assert_eq!(ov.find(r"\registry\user\s-1-5-21-11"), Some(other));
         assert_eq!(ov.find(r"\registry\user\.default"), Some(keep));
+
+        assert_eq!(ov.reattach_subtree(r"\registry\user\s-1-5-21-1"), 2);
+        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1"), Some(root));
+        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1\environment"), Some(child));
+        assert_eq!(ov.value(root, "Loaded"), Some((4, &1u32.to_le_bytes()[..])));
+        assert_eq!(ov.value(child, "TEMP"), Some((1, &b"t"[..])));
+        assert_eq!(ov.live_len(), 4);
     }
 
     #[test]
@@ -419,6 +450,7 @@ mod tests {
         let mut ov = RegistryOverlay::new();
         ov.create(r"\registry\user\.default");
         assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-9"), 0);
+        assert_eq!(ov.reattach_subtree(r"\registry\user\s-1-5-21-9"), 0);
         assert_eq!(ov.live_len(), 1);
     }
 
