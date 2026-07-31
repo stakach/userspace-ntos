@@ -392,11 +392,12 @@ success.
   passed, desktop paint remained `768/768`, the summary remained `188/99`, and `[microtest done]`
   completed with no FAIL lines.
 
-  A later explorer diagnostic split `NtUserSetWindowLongPtr(GWLP_WNDPROC)` calls by origin. The
-  serialized proof run reported six explorer `GWLP_WNDPROC` installs and all six were tagged
-  `origin=replay`; the `[explorer-image]` line recorded `setwndproc-client/replay=0/6`. This
+  Later explorer diagnostics split both `NtUserSetWindowLongPtr` (`0x1298`) and `NtUserSetWindowLong`
+  (`0x105b`) calls by origin. The serialized proof run reported normal client `0x1298` extra-byte
+  writes and client `0x105b` style writes, but all six explorer `GWLP_WNDPROC` installs were still
+  tagged `origin=replay`; the `[explorer-image]` line recorded `setwndproc-client/replay=0/6`. This
   proves the ATL WndProc replay remains load-bearing and that there is not yet a natural explorer
-  client-side `0x1298` replacement for that scaffold.
+  client-side `GWLP_WNDPROC` replacement for that scaffold.
 - **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
   dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
   and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0

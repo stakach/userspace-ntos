@@ -467,8 +467,10 @@ const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
 /// rcWindow/rcClient). Used only for bounded diagnostics around SetWindowLongPtr(GWLP_WNDPROC).
 const WND_HEAD_PTI_OFF: u64 = 0x10;
 const WND_LPFNWNDPROC_OFF: u64 = 0x90;
+const SSN_NT_USER_SET_WINDOW_LONG: u64 = 0x105b;
 const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
+static WIN32K_EXPLORER_SETWINDOWLONG_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -3982,9 +3984,35 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         print_hex(ngui);
         print_str(if gpdesk != 0 && gpdesk == target_body { b" [ALREADY-CURRENT!]\n" } else { b"\n" });
     }
-    let trace_setwndproc = ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR
+    let trace_setwndproc = (ssn == SSN_NT_USER_SET_WINDOW_LONG
+        || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
         && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
         && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6;
+    if (ssn == SSN_NT_USER_SET_WINDOW_LONG || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
+        && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6
+    {
+        let n = WIN32K_EXPLORER_SETWINDOWLONG_TRACES.fetch_add(1, Ordering::Relaxed);
+        if n < 64 {
+            print_str(b"[win32k-setwindowlong] explorer hwnd=0x");
+            print_hex(a0 as u32);
+            print_str(b" ssn=0x");
+            print_hex(ssn as u32);
+            print_str(if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
+                b" origin=replay"
+            } else {
+                b" origin=client"
+            });
+            print_str(b" index=0x");
+            print_hex((a1 >> 32) as u32);
+            print_hex(a1 as u32);
+            print_str(b" value=0x");
+            print_hex((a2 >> 32) as u32);
+            print_hex(a2 as u32);
+            print_str(b" ansi=");
+            print_u64(a3 & 1);
+            print_str(b"\n");
+        }
+    }
     let trace_no = if trace_setwndproc {
         if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
             WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.fetch_add(1, Ordering::Relaxed);
