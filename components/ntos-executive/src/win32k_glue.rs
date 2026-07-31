@@ -8,6 +8,15 @@ use crate::*;
 const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
 const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
 const WND_DWUSERDATA_OFFSET: u64 = 0x110;
+const WND_LPFNWNDPROC_OFFSET: u64 = 0x90;
+const WM_GETMINMAXINFO: u32 = 0x0024;
+const WM_NCCREATE: u32 = 0x0081;
+const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
+const EXPLORER_ATL_WIN_MODULE_RVA: u64 = 0x446b8;
+const ATL_CREATE_WND_LIST_OFFSET: u64 = 0x30;
+const ATL_CREATE_WND_DATA_THIS_OFFSET: u64 = 0x00;
+const ATL_CREATE_WND_DATA_TID_OFFSET: u64 = 0x08;
+const ATL_CREATE_WND_DATA_NEXT_OFFSET: u64 = 0x10;
 
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
@@ -18,6 +27,11 @@ static USER_CALLBACK_EXPLORER_DEAD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_NCCREATE_FALSES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_NCCREATE_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_LAST_HWND: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_LAST_TID: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_LAST_DISPATCH: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_LAST_CALLBACK: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_EXPLORER_ATL_CREATE_DATA_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
@@ -605,20 +619,72 @@ unsafe fn client_copyin_process_u64(
     .then_some(u64::from_le_bytes(bytes))
 }
 
+unsafe fn client_copyin_process_u32(
+    pi: u64,
+    scratch_base: u64,
+    va: u64,
+) -> Option<u32> {
+    let mut bytes = [0u8; 4];
+    crate::img_spawn::client_copyin_process_mapped(
+        pi,
+        va,
+        &mut bytes,
+        &[],
+        0,
+        scratch_base,
+        false,
+    )
+    .then_some(u32::from_le_bytes(bytes))
+}
+
+unsafe fn explorer_atl_create_data_for_tid(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> Option<(u64, u64)> {
+    let list_head_va =
+        crate::PE_LOAD_BASE + EXPLORER_ATL_WIN_MODULE_RVA + ATL_CREATE_WND_LIST_OFFSET;
+    let mut entry =
+        client_copyin_process_u64(client.pi as u64, client.scratch_base, list_head_va)?;
+
+    for _ in 0..8 {
+        if entry == 0 {
+            break;
+        }
+        let entry_tid = client_copyin_process_u32(
+            client.pi as u64,
+            client.scratch_base,
+            entry + ATL_CREATE_WND_DATA_TID_OFFSET,
+        )
+        .unwrap_or(u32::MAX);
+        let p_this = client_copyin_process_u64(
+            client.pi as u64,
+            client.scratch_base,
+            entry + ATL_CREATE_WND_DATA_THIS_OFFSET,
+        )
+        .unwrap_or(0);
+        if p_this != 0 && entry_tid as u64 == client.tid {
+            return Some((entry, p_this));
+        }
+        entry = client_copyin_process_u64(
+            client.pi as u64,
+            client.scratch_base,
+            entry + ATL_CREATE_WND_DATA_NEXT_OFFSET,
+        )
+        .unwrap_or(0);
+    }
+    None
+}
+
 unsafe fn remember_explorer_atl_pthis(
     client: crate::spawn_hosts::UserCallbackClient,
     request: &nt_user_callback::CallbackHeader,
     frame: *mut nt_user_callback::CallbackFrame,
     message: u32,
+    hwnd: u64,
 ) {
-    const WM_GETMINMAXINFO: u32 = 0x0024;
-    const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
-    const EXPLORER_ATL_WIN_MODULE_RVA: u64 = 0x446b8;
-    const ATL_CREATE_WND_LIST_OFFSET: u64 = 0x30;
-
     if client.pi != 6
         || request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC
-        || message != WM_GETMINMAXINFO
+        || !matches!(message, WM_GETMINMAXINFO | WM_NCCREATE)
+        || hwnd == 0
         || (request.input_length as usize) < 8
     {
         return;
@@ -627,20 +693,32 @@ unsafe fn remember_explorer_atl_pthis(
     if callback_payload_u64(frame, 0) != EXPLORER_ATL_START_WINDOW_PROC {
         return;
     }
-    let list_head_va = crate::PE_LOAD_BASE + EXPLORER_ATL_WIN_MODULE_RVA + ATL_CREATE_WND_LIST_OFFSET;
-    let Some(head) = client_copyin_process_u64(client.pi as u64, client.scratch_base, list_head_va)
-    else {
-        return;
-    };
-    if head == 0 {
-        return;
-    }
-    let Some(p_this) = client_copyin_process_u64(client.pi as u64, client.scratch_base, head)
-    else {
+    let Some((entry, p_this)) = explorer_atl_create_data_for_tid(client) else {
         return;
     };
     if p_this != 0 {
         USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS.store(p_this, Ordering::Relaxed);
+        USER_CALLBACK_EXPLORER_ATL_LAST_HWND.store(hwnd, Ordering::Relaxed);
+        USER_CALLBACK_EXPLORER_ATL_LAST_TID.store(client.tid, Ordering::Relaxed);
+        USER_CALLBACK_EXPLORER_ATL_LAST_DISPATCH.store(request.dispatch_id, Ordering::Relaxed);
+        USER_CALLBACK_EXPLORER_ATL_LAST_CALLBACK
+            .store(request.callback_id as u64, Ordering::Relaxed);
+        let n = USER_CALLBACK_EXPLORER_ATL_CREATE_DATA_TRACES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[atl-create] explorer tid=");
+            print_u64(client.tid);
+            print_str(b" hwnd=0x");
+            print_hex(hwnd as u32);
+            print_str(b" msg=0x");
+            print_hex(message);
+            print_str(b" entry=0x");
+            print_hex((entry >> 32) as u32);
+            print_hex(entry as u32);
+            print_str(b" pThis=0x");
+            print_hex((p_this >> 32) as u32);
+            print_hex(p_this as u32);
+            print_str(b"\n");
+        }
     }
 }
 
@@ -653,13 +731,11 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     request_window_message: u32,
     request_window: u64,
 ) {
-    const WM_GETMINMAXINFO: u32 = 0x0024;
-    const EXPLORER_ATL_START_WINDOW_PROC: u64 = crate::PE_LOAD_BASE + 0x13060;
     const GWLP_WNDPROC_ZERO_EXTENDED: u64 = 0xffff_fffc;
 
     if client_pi != 6
         || request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC
-        || request_window_message != WM_GETMINMAXINFO
+        || !matches!(request_window_message, WM_GETMINMAXINFO | WM_NCCREATE)
         || request_window == 0
         || callback_payload_u64(frame, 0) != EXPLORER_ATL_START_WINDOW_PROC
     {
@@ -668,7 +744,13 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
 
     let scratch_base = USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed);
     let p_this = USER_CALLBACK_EXPLORER_ATL_LAST_PTHIS.load(Ordering::Relaxed);
-    if p_this == 0 {
+    if p_this == 0
+        || USER_CALLBACK_EXPLORER_ATL_LAST_HWND.load(Ordering::Relaxed) != request_window
+        || USER_CALLBACK_EXPLORER_ATL_LAST_TID.load(Ordering::Relaxed) != client_tid
+        || USER_CALLBACK_EXPLORER_ATL_LAST_DISPATCH.load(Ordering::Relaxed) != request.dispatch_id
+        || USER_CALLBACK_EXPLORER_ATL_LAST_CALLBACK.load(Ordering::Relaxed)
+            != request.callback_id as u64
+    {
         return;
     }
     let atl_hwnd =
@@ -686,12 +768,37 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
         .unwrap_or(0);
     let thunk_this = client_copyin_process_u64(client_pi as u64, scratch_base, thunk_proc + 2)
         .unwrap_or(0);
-    if (thunk_first & 0xffff) != 0xb948 || thunk_this != p_this {
+    let thunk_mov_rax = client_copyin_process_u32(client_pi as u64, scratch_base, thunk_proc + 10)
+        .unwrap_or(0);
+    let thunk_target = client_copyin_process_u64(client_pi as u64, scratch_base, thunk_proc + 12)
+        .unwrap_or(0);
+    let thunk_jmp = client_copyin_process_u32(client_pi as u64, scratch_base, thunk_proc + 20)
+        .unwrap_or(0);
+    if (thunk_first & 0xffff) != 0xb948
+        || thunk_this != p_this
+        || (thunk_mov_rax & 0xffff) != 0xb848
+        || thunk_target == 0
+        || thunk_target == EXPLORER_ATL_START_WINDOW_PROC
+        || (thunk_jmp & 0xffff) != 0xe0ff
+    {
+        return;
+    }
+
+    let pwnd = crate::winlogon_pwnd_for_hwnd(request_window);
+    let current_wndproc = if pwnd != 0 {
+        core::ptr::read_volatile((pwnd + WND_LPFNWNDPROC_OFFSET) as *const u64)
+    } else {
+        0
+    };
+    if current_wndproc == thunk_proc {
+        return;
+    }
+    if current_wndproc != EXPLORER_ATL_START_WINDOW_PROC {
         return;
     }
 
     let n = USER_CALLBACK_EXPLORER_ATL_WNDPROC_REPLAYS.fetch_add(1, Ordering::Relaxed);
-    if n >= 4 {
+    if n >= 8 {
         return;
     }
 
@@ -726,6 +833,9 @@ unsafe fn replay_missing_explorer_atl_wndproc_install(
     print_str(b" thunk=0x");
     print_hex((thunk_proc >> 32) as u32);
     print_hex(thunk_proc as u32);
+    print_str(b" old=0x");
+    print_hex((current_wndproc >> 32) as u32);
+    print_hex(current_wndproc as u32);
     print_str(b" ret=0x");
     print_hex((ret >> 32) as u32);
     print_hex(ret as u32);
@@ -831,7 +941,7 @@ pub(crate) unsafe fn service_user_callback(
             print_str(b" -> fail closed\n");
         }
     }
-    remember_explorer_atl_pthis(client, &request, frame, window_message);
+    remember_explorer_atl_pthis(client, &request, frame, window_message, window_hwnd);
     let sas_session_before = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
     );
