@@ -44,10 +44,19 @@ pub const PROCESS_GENERIC_READ: u32 = 0x0002_0410;
 pub const PROCESS_GENERIC_WRITE: u32 = 0x0002_0BEB;
 pub const PROCESS_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const PROCESS_SET_INFORMATION: u32 = 0x0200;
+pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 pub const THREAD_GENERIC_READ: u32 = 0x0002_0048;
 pub const THREAD_GENERIC_WRITE: u32 = 0x0002_0037;
 pub const THREAD_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const PROCESS_PRIORITY_CLASS_INVALID: u8 = 0;
+pub const PROCESS_PRIORITY_CLASS_IDLE: u8 = 1;
+pub const PROCESS_PRIORITY_CLASS_NORMAL: u8 = 2;
+pub const PROCESS_PRIORITY_CLASS_HIGH: u8 = 3;
+pub const PROCESS_PRIORITY_CLASS_REALTIME: u8 = 4;
+pub const PROCESS_PRIORITY_CLASS_BELOW_NORMAL: u8 = 5;
+pub const PROCESS_PRIORITY_CLASS_ABOVE_NORMAL: u8 = 6;
 
 /// Expand generic process access bits using the NT process-object generic mapping. Until process
 /// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full process mask.
@@ -163,6 +172,17 @@ pub struct ThreadBasicInformation {
     pub base_priority: i32,
 }
 
+/// The architecture-neutral fields returned for `ProcessBasicInformation`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessBasicInformation {
+    pub exit_status: u32,
+    pub peb_base_address: u64,
+    pub affinity_mask: u64,
+    pub base_priority: i32,
+    pub unique_process_id: ProcessId,
+    pub inherited_from_unique_process_id: ProcessId,
+}
+
 /// What a successful [`ProcessManager::wait_for_debug_event`] hands back: the rendered
 /// `DBGUI_WAIT_STATE_CHANGE` plus the handles/`CLIENT_ID` the host needs to finish the call.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -216,6 +236,15 @@ pub const DEFAULT_TRACKED_MODULES: usize = 64;
 /// Architecture-neutral fields returned for `ThreadTimes` (`KERNEL_USER_TIMES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThreadTimes {
+    pub create_time: i64,
+    pub exit_time: i64,
+    pub kernel_time: i64,
+    pub user_time: i64,
+}
+
+/// Architecture-neutral fields returned for process `KERNEL_USER_TIMES`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessTimes {
     pub create_time: i64,
     pub exit_time: i64,
     pub kernel_time: i64,
@@ -311,6 +340,11 @@ pub struct NtProcess {
     /// `EPROCESS.SectionBaseAddress` — the mapped base of the process image. Reported to a
     /// debugger in the `DbgKmCreateProcessApi` message. `0` until the host records it.
     pub image_base: u64,
+    /// `PEB` base reported by `NtQueryInformationProcess(ProcessBasicInformation)`. The kernel host
+    /// sets this when it maps the process environment.
+    peb_base_address: u64,
+    /// `EPROCESS.PriorityClass`. ReactOS initializes new processes to NORMAL (2).
+    priority_class: u8,
     /// `EPROCESS.DebugPort` — the `DEBUG_OBJECT` a debugger attached to this process, if any.
     debug_port: Option<DebugObjectId>,
     /// `PEB.BeingDebugged` — mirrors `DebugPort != NULL` (`DbgkpMarkProcessPeb`).
@@ -340,6 +374,10 @@ impl NtProcess {
     /// `PSF_CREATE_REPORTED_BIT`.
     pub fn create_reported(&self) -> bool {
         self.create_reported
+    }
+    /// `EPROCESS.PriorityClass`.
+    pub fn priority_class(&self) -> u8 {
+        self.priority_class
     }
 }
 
@@ -615,6 +653,8 @@ impl ProcessManager {
                 default_hard_error_processing,
                 break_on_termination: false,
                 image_base: 0,
+                peb_base_address: 0,
+                priority_class: PROCESS_PRIORITY_CLASS_NORMAL,
                 debug_port: None,
                 being_debugged: false,
                 create_reported: false,
@@ -674,6 +714,119 @@ impl ProcessManager {
             process.process_cookie = candidate;
         }
         (process.process_cookie != 0).then_some(process.process_cookie)
+    }
+
+    /// Resolve a caller-local process handle (or `NtCurrentProcess`) and return the policy fields
+    /// used by `NtQueryInformationProcess(ProcessBasicInformation)`.
+    pub fn query_process_basic(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<ProcessBasicInformation, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(ProcessBasicInformation {
+            exit_status: if process.state == ProcessState::Terminated {
+                process.exit_status.unwrap_or(STATUS_SUCCESS)
+            } else {
+                STATUS_PENDING
+            },
+            peb_base_address: process.peb_base_address,
+            affinity_mask: 1,
+            base_priority: 13,
+            unique_process_id: pid,
+            inherited_from_unique_process_id: process.parent.unwrap_or(0),
+        })
+    }
+
+    /// Return process-level timing by aggregating the ETHREAD accounting already tracked for the
+    /// process. This mirrors the kernel's process counters without introducing a second clock model.
+    pub fn query_process_times(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<ProcessTimes, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let mut create_time = 0;
+        let mut exit_time = 0;
+        let mut kernel_time = 0i64;
+        let mut user_time = 0i64;
+        for tid in &process.threads {
+            let Some(thread) = self.threads.get(tid) else {
+                continue;
+            };
+            if thread.create_time_100ns != 0
+                && (create_time == 0 || thread.create_time_100ns < create_time)
+            {
+                create_time = thread.create_time_100ns;
+            }
+            if process.state == ProcessState::Terminated && thread.exit_time_100ns > exit_time {
+                exit_time = thread.exit_time_100ns;
+            }
+            kernel_time = kernel_time.saturating_add(thread.kernel_time_100ns);
+            user_time = user_time.saturating_add(thread.user_time_100ns);
+        }
+        Ok(ProcessTimes {
+            create_time,
+            exit_time,
+            kernel_time,
+            user_time,
+        })
+    }
+
+    pub fn query_process_handle_count(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<u32, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        Ok(self.handle_count(pid) as u32)
+    }
+
+    pub fn query_process_debug_port(&self, caller_pid: ProcessId, handle: u64) -> Result<u64, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        Ok(if self.process_debug_port(pid).is_some() {
+            u64::MAX
+        } else {
+            0
+        })
+    }
+
+    pub fn query_process_debug_flags(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<u32, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok((process.state != ProcessState::Terminated && process.debug_port.is_none()) as u32)
+    }
+
+    pub fn query_process_priority_class(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<u8, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        self.process(pid)
+            .map(|process| process.priority_class)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn set_process_priority_class(
+        &mut self,
+        pid: ProcessId,
+        priority_class: u8,
+    ) -> Result<(), u32> {
+        if !(PROCESS_PRIORITY_CLASS_INVALID..=PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
+            .contains(&priority_class)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.priority_class = priority_class;
+        Ok(())
     }
     pub fn thread(&self, tid: ThreadId) -> Option<&NtThread> {
         self.threads.get(&tid)
@@ -1634,12 +1787,31 @@ impl ProcessManager {
         self.dbgk.len()
     }
 
+    /// Account a removed debug-object handle-table entry. Returns whether that was the last handle.
+    pub fn release_debug_object_handle(&mut self, object: DebugObjectId) -> Option<bool> {
+        self.dbgk
+            .get_mut(object)
+            .map(|debug_object| debug_object.release_handle() == 0)
+    }
+
     /// Record `EPROCESS.SectionBaseAddress` for `pid` (reported to a debugger in the
     /// `DbgKmCreateProcessApi` message). Returns `false` for an unknown process.
     pub fn set_image_base(&mut self, pid: ProcessId, base: u64) -> bool {
         match self.processes.get_mut(&pid) {
             Some(p) => {
                 p.image_base = base;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record the user-mode PEB base for `pid` (reported by
+    /// `NtQueryInformationProcess(ProcessBasicInformation)`). Returns `false` for an unknown process.
+    pub fn set_peb_base(&mut self, pid: ProcessId, base: u64) -> bool {
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.peb_base_address = base;
                 true
             }
             None => false,
@@ -2189,27 +2361,34 @@ impl ProcessManager {
         object: HandleObject,
         granted_access: u32,
     ) -> Result<Handle, u32> {
-        let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-        let entry = HandleEntry {
-            object,
-            granted_access,
-            flags: HandleFlags::default(),
-        };
-        let free = if self.no_reuse {
-            None // append-only: never recycle a freed value (see `no_reuse`)
-        } else {
-            proc.handles.iter().position(|e| e.is_none())
-        };
-        let slot = match free {
-            Some(i) => {
-                proc.handles[i] = Some(entry);
-                i
+        let slot = {
+            let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+            let entry = HandleEntry {
+                object,
+                granted_access,
+                flags: HandleFlags::default(),
+            };
+            let free = if self.no_reuse {
+                None // append-only: never recycle a freed value (see `no_reuse`)
+            } else {
+                proc.handles.iter().position(|e| e.is_none())
+            };
+            match free {
+                Some(i) => {
+                    proc.handles[i] = Some(entry);
+                    i
+                }
+                None => {
+                    proc.handles.push(Some(entry));
+                    proc.handles.len() - 1
+                }
             }
-            None => {
-                proc.handles.push(Some(entry));
-                proc.handles.len() - 1
-            }
         };
+        if let HandleObject::DebugObject(object) = object {
+            if let Some(debug_object) = self.dbgk.get_mut(object) {
+                debug_object.add_handle();
+            }
+        }
         Ok(slot_to_handle(slot))
     }
     /// Resolve a handle in `pid`'s table (spec §8.1).

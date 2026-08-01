@@ -2095,6 +2095,14 @@ pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
+/// Exact GDI stock-object handles learned from real win32k `NtGdiGetStockObject` calls. Stock
+/// objects are session-global (`ProcessId == 0` in the shared GDI table), so these handles can be
+/// reused by non-interactive service clients after the real interactive path has created them.
+pub(crate) static mut GLOBAL_GDI_STOCK_OBJECT_MIRROR: nt_kernel_exec::user_gdi::StockObjectMirror =
+    nt_kernel_exec::user_gdi::StockObjectMirror::new();
+pub(crate) static GLOBAL_GDI_STOCK_OBJECTS_OBSERVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SVC_GDI_STOCK_OBJECT_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SVC_GDI_STOCK_OBJECT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Exact dynamic class atom names learned from successful real NtUserRegisterClassExWOW calls.
 pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
     nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
@@ -3243,6 +3251,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
     let cursor_handle = USERINIT_GLOBAL_CURSOR_HANDLE.load(Ordering::Relaxed);
     let classes_observed = GLOBAL_BUILTIN_CLASSES_OBSERVED.load(Ordering::Relaxed);
+    let stock_observed = GLOBAL_GDI_STOCK_OBJECTS_OBSERVED.load(Ordering::Relaxed);
+    let stock_hits = SVC_GDI_STOCK_OBJECT_HITS.load(Ordering::Relaxed);
+    let stock_misses = SVC_GDI_STOCK_OBJECT_MISSES.load(Ordering::Relaxed);
     let class_hits = USERINIT_BUILTIN_CLASS_HITS.load(Ordering::Relaxed);
     let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
     let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
@@ -3297,6 +3308,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(cursor_handle as u32);
     print_str(b" classes-observed=");
     print_u64(classes_observed);
+    print_str(b" gdi-stock-observed=");
+    print_u64(stock_observed);
+    print_str(b" svc-stock-hits/misses=");
+    print_u64(stock_hits);
+    print_str(b"/");
+    print_u64(stock_misses);
     print_str(b" class-hits/misses=");
     print_u64(class_hits);
     print_str(b"/");
@@ -3366,6 +3383,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     check(
         b"exec_userinit_global_cursor_reused",
         cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
+        passed,
+    );
+    check(
+        b"exec_gdi_stock_objects_observed",
+        stock_observed >= 1,
         passed,
     );
     check(
@@ -10319,13 +10341,10 @@ static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the service-image 0x10b4 fake.
 pub(crate) static SVC_FAKE_CLASS_ATOM: AtomicU64 = AtomicU64::new(0xC100);
-/// Monotonic fake GDI-handle allocator for the non-interactive-service GDI-object-creation
-/// SSNs (0x106c NtGdiCreateBitmap / 0x10b5 NtGdiGetStockObject). A non-interactive service's GUI-DLL
-/// DllMains (comctl32/uxtheme) create cached GDI objects but never draw with them; routing these into
-/// win32k trips the same EngCopyBits (RVA 0x1cbdd8) runaway blit that 0x125b/0x11e0 did (garbage
-/// SURFOBJ dims for our faked service GDI state). Return a synthetic non-NULL GDI handle (upper byte
-/// mimics the interactive path's 0x00050048/0x0010004a GDI-handle shape) so the client stores a
-/// plausible handle and its DllMain proceeds — the same non-interactive-service short-circuit pattern.
+/// Monotonic fake GDI-handle allocator for non-interactive-service GDI object creation
+/// (`NtGdiCreateBitmap` 0x106c / `NtGdiCreatePatternBrushInternal` 0x10b5). Service
+/// `NtGdiGetStockObject` (0x10d4) reuses real stock handles observed from win32k instead of this
+/// synthetic source.
 pub(crate) static SVC_FAKE_GDI_HANDLE: AtomicU64 = AtomicU64::new(0x0050_0100);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);

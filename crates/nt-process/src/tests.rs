@@ -818,6 +818,150 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
 }
 
 #[test]
+fn process_query_classes_use_access_checked_state_and_real_times() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let caller_thread = pm.create_thread(caller, 0x1000, 0, false).unwrap();
+    let target = pm.create_process("target.exe", Some(caller), None);
+    assert!(pm.set_peb_base(target, 0x0000_0100_0053_0000));
+    assert!(!pm.set_peb_base(0xffff_ffff, 0x1234));
+    let target_main = pm.create_thread(target, 0x2000, 0, false).unwrap();
+    let target_worker = pm.create_thread(target, 0x3000, 0, false).unwrap();
+    assert!(pm.set_thread_times(target_main, 100, 0, 30, 40));
+    assert!(pm.set_thread_times(target_worker, 120, 0, 3, 4));
+    pm.insert_handle(target, HandleObject::Opaque(0xabc), 0)
+        .unwrap();
+    pm.insert_handle(target, HandleObject::Opaque(0xdef), 0)
+        .unwrap();
+
+    let handle = pm
+        .insert_handle(
+            caller,
+            HandleObject::Process(target),
+            PROCESS_QUERY_INFORMATION,
+        )
+        .unwrap();
+    let denied = pm
+        .insert_handle(caller, HandleObject::Process(target), 0)
+        .unwrap();
+
+    let basic = pm.query_process_basic(caller, handle as u64).unwrap();
+    assert_eq!(basic.exit_status, STATUS_PENDING);
+    assert_eq!(basic.peb_base_address, 0x0000_0100_0053_0000);
+    assert_eq!(basic.unique_process_id, target);
+    assert_eq!(basic.inherited_from_unique_process_id, caller);
+    assert_eq!(
+        pm.query_process_basic(caller, denied as u64),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        pm.query_process_times(caller, handle as u64).unwrap(),
+        ProcessTimes {
+            create_time: 100,
+            exit_time: 0,
+            kernel_time: 33,
+            user_time: 44,
+        }
+    );
+    assert_eq!(pm.query_process_handle_count(caller, handle as u64), Ok(2));
+    assert_eq!(pm.query_process_debug_port(caller, handle as u64), Ok(0));
+    assert_eq!(pm.query_process_debug_flags(caller, handle as u64), Ok(1));
+    assert_eq!(
+        pm.query_process_priority_class(caller, handle as u64),
+        Ok(PROCESS_PRIORITY_CLASS_NORMAL)
+    );
+    pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
+        .unwrap();
+    assert_eq!(
+        pm.query_process_priority_class(caller, handle as u64),
+        Ok(PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
+    );
+    pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_INVALID)
+        .unwrap();
+    assert_eq!(
+        pm.query_process_priority_class(caller, handle as u64),
+        Ok(PROCESS_PRIORITY_CLASS_INVALID)
+    );
+    assert_eq!(
+        pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+
+    let debug = pm
+        .create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT)
+        .unwrap();
+    pm.debug_active_process(
+        target,
+        debug,
+        ClientId {
+            unique_process: caller,
+            unique_thread: caller_thread,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.query_process_debug_port(caller, handle as u64),
+        Ok(u64::MAX)
+    );
+    assert_eq!(pm.query_process_debug_flags(caller, handle as u64), Ok(0));
+
+    pm.terminate_process_at(target, 0x55aa, 700).unwrap();
+    assert_eq!(
+        pm.query_process_basic(caller, handle as u64)
+            .unwrap()
+            .exit_status,
+        0x55aa
+    );
+    assert_eq!(
+        pm.query_process_times(caller, handle as u64)
+            .unwrap()
+            .exit_time,
+        700
+    );
+    assert_eq!(pm.query_process_debug_flags(caller, handle as u64), Ok(0));
+}
+
+#[test]
+fn debug_object_handles_report_last_reference() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("debugger.exe", None, None);
+    let object = pm.create_debug_object(0).unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().handle_count(), 0);
+
+    let first = pm
+        .insert_handle(
+            pid,
+            HandleObject::DebugObject(object),
+            dbgk::DEBUG_OBJECT_ALL_ACCESS,
+        )
+        .unwrap();
+    let second = pm
+        .insert_handle(
+            pid,
+            HandleObject::DebugObject(object),
+            dbgk::DEBUG_OBJECT_ALL_ACCESS,
+        )
+        .unwrap();
+    assert_eq!(pm.debug_object(object).unwrap().handle_count(), 2);
+
+    assert_eq!(
+        pm.take_handle_for_close(pid, first).unwrap(),
+        HandleObject::DebugObject(object)
+    );
+    assert_eq!(pm.release_debug_object_handle(object), Some(false));
+    assert!(pm.debug_object(object).is_some());
+    assert_eq!(pm.debug_object(object).unwrap().handle_count(), 1);
+
+    assert_eq!(
+        pm.take_handle_for_close(pid, second).unwrap(),
+        HandleObject::DebugObject(object)
+    );
+    assert_eq!(pm.release_debug_object_handle(object), Some(true));
+    assert_eq!(pm.destroy_debug_object(object), 0);
+    assert!(pm.debug_object(object).is_none());
+}
+
+#[test]
 fn terminate_thread_handle_resolution_checks_identity_type_and_access() {
     const THREAD_TERMINATE: u32 = 0x0001;
     let mut pm = ProcessManager::new();
@@ -1366,7 +1510,7 @@ fn dbgk_attach_installs_the_debug_port_and_posts_fake_create_messages() {
 #[test]
 fn dbgk_attach_rejects_self_double_attach_and_dead_targets() {
     let mut pm = ProcessManager::new();
-    let (target, _main, debugger, object) = attach_debugger(&mut pm);
+    let (target, _main, debugger, _object) = attach_debugger(&mut pm);
     // Already attached.
     let second = pm.create_debug_object(0).unwrap();
     assert_eq!(

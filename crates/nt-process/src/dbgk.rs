@@ -535,6 +535,8 @@ impl DebugEvent {
 pub struct DebugObject {
     /// The `Flags` union: `DebuggerInactive:1 | KillProcessOnExit:1`.
     pub flags: u32,
+    /// Number of process-handle-table entries currently referencing this object.
+    handle_count: u32,
     /// `DebugObject->EventsPresent` (a notification `KEVENT`) — set while a readable event exists.
     events_present: bool,
     /// `DebugObject->EventList`, head-to-tail.
@@ -555,10 +557,27 @@ impl DebugObject {
             } else {
                 0
             },
+            handle_count: 0,
             events_present: false,
             events: Vec::new(),
             host_event: 0,
         }
+    }
+
+    /// Current number of open handles referencing this debug object.
+    pub fn handle_count(&self) -> u32 {
+        self.handle_count
+    }
+
+    /// Account one newly inserted handle-table entry for this debug object.
+    pub fn add_handle(&mut self) {
+        self.handle_count = self.handle_count.saturating_add(1);
+    }
+
+    /// Account one removed handle-table entry and return the remaining handle count.
+    pub fn release_handle(&mut self) -> u32 {
+        self.handle_count = self.handle_count.saturating_sub(1);
+        self.handle_count
     }
 
     /// `DebugObject->DebuggerInactive`.

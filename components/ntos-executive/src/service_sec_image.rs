@@ -680,6 +680,7 @@ unsafe fn spawn_requested_hosted_exe(
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
     nt_handler.bind_main_thread_entry(pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
+    let _ = nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA);
 
     let process_handle = match nt_handler.pm.insert_handle(
         creator_pid,
@@ -7198,7 +7199,7 @@ pub(crate) unsafe fn service_sec_image(
                     (1, true)
                 } else if m0 == 0x10de && svc_noninteractive {
                     // NtGdiOpenDCW is the DC-open half of the same non-interactive service GDI init
-                    // family as 0x106c/0x10b5. When a service image asks gdi32 for a DISPLAY DC during
+                    // family as 0x106c/0x10b5/0x10d4. When a service image asks gdi32 for a DISPLAY DC during
                     // GUI-DLL process attach, a real win32k HDC lets client-side gdi32 continue into DC_ATTR
                     // state that this service process never initialized. A NULL HDC is the benign
                     // "no suitable display PDEV" outcome ReactOS already returns for unsupported
@@ -7206,24 +7207,71 @@ pub(crate) unsafe fn service_sec_image(
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) FAKED (non-interactive service, no display DC) -> NULL\n");
                     (0, true)
-                } else if (m0 == 0x106c || m0 == 0x10b5) && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE GDI object-creation (0x106c NtGdiCreateBitmap /
-                    // 0x10b5 NtGdiGetStockObject — w32ksvc64.h). After 0x125b/0x11e0, service-image
+                } else if m0 == 0x10d4 && svc_noninteractive {
+                    // NtGdiGetStockObject returns session-global stock handles. Reuse only handles
+                    // learned from real win32k calls, so service-side gdi32 validates them through
+                    // the live shared GDI table instead of receiving an invented handle index.
+                    let object_id = a0 as u32;
+                    let hit = GLOBAL_GDI_STOCK_OBJECT_MIRROR.lookup(object_id);
+                    if let Some(handle) = hit {
+                        SVC_GDI_STOCK_OBJECT_HITS.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR object=");
+                        print_u64(object_id as u64);
+                        print_str(b" -> real handle 0x");
+                        print_hex(handle);
+                        print_str(b"\n");
+                    } else {
+                        SVC_GDI_STOCK_OBJECT_MISSES.fetch_add(1, Ordering::Relaxed);
+                        print_str(
+                            b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR MISS object=",
+                        );
+                        print_u64(object_id as u64);
+                        print_str(b" -> NULL\n");
+                    }
+                    (hit.unwrap_or(0) as u64, true)
+                } else if m0 == 0x106c && svc_noninteractive {
+                    // ★ NON-INTERACTIVE SERVICE NtGdiCreateBitmap (0x106c — w32ksvc64.h).
+                    // After 0x125b/0x11e0, service-image
                     // GUI-DLL DllMains (comctl32/uxtheme) create cached GDI objects; routing these into
                     // win32k trips the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit (a fault-FREE spin the
                     // executive cannot interrupt — it's blocked in win32k_dispatch's recv). A non-interactive
-                    // service creates these objects but NEVER draws with them, so return a synthetic non-NULL
-                    // GDI handle (mimicking the interactive path's 0x00050048/0x0010004a GDI-handle shape) so
+                    // service creates these objects but NEVER draws with them. For ReactOS' zero-sized
+                    // bitmap case, return the real DEFAULT_BITMAP stock handle if it has already been
+                    // observed; otherwise return a synthetic non-NULL GDI handle (mimicking the
+                    // interactive path's 0x00050048 GDI-handle shape) so
                     // the client's DllMain stores a plausible handle and proceeds — the same
                     // non-interactive-service short-circuit as 0x103d/0x10b4/0x125b/0x11e0. Scoped to
-                    // non-interactive service images; the interactive clients' real routed 0x106c/0x10b5 (BATCH 16, bounded via
+                    // non-interactive service images; the interactive clients' real routed 0x106c (BATCH 16, bounded via
                     // zero-fill) are untouched. If a service later performs a REAL blit with the handle that
                     // is the next diagnosed wall (a service normally does not).
+                    let zero_size_default_bitmap = if a0 == 0 || a1 == 0 {
+                        GLOBAL_GDI_STOCK_OBJECT_MIRROR
+                            .lookup(nt_kernel_exec::user_gdi::DEFAULT_BITMAP)
+                    } else {
+                        None
+                    };
+                    if let Some(handle) = zero_size_default_bitmap {
+                        SVC_GDI_STOCK_OBJECT_HITS.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) MIRROR zero-size -> DEFAULT_BITMAP 0x");
+                        print_hex(handle);
+                        print_str(b"\n");
+                        (handle as u64, true)
+                    } else {
+                        SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) FAKED (non-interactive service, no GDI blit) -> handle 0x");
+                        print_hex(h as u32);
+                        print_str(b"\n");
+                        (h as u64, true)
+                    }
+                } else if m0 == 0x10b5 && svc_noninteractive {
+                    // NtGdiCreatePatternBrushInternal is another non-interactive service
+                    // process-attach object creation. It is not a stock-object lookup, so keep it on
+                    // the bounded service-only synthetic-handle path until service PROCESSINFO/GDI
+                    // state is independent enough to run the real blit path.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtGdi obj-create(0x");
-                    print_hex(m0 as u32);
-                    print_str(b") FAKED (non-interactive service, no GDI blit) -> handle 0x");
+                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) FAKED (non-interactive service, no GDI blit) -> handle 0x");
                     print_hex(h as u32);
                     print_str(b"\n");
                     (h as u64, true)
@@ -7594,6 +7642,20 @@ pub(crate) unsafe fn service_sec_image(
                             GLOBAL_CLASS_ATOM_NAMES_OBSERVED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                }
+                if ok
+                    && !redirected_user_callback
+                    && m0 == 0x10d4
+                    && st != 0
+                    && !svc_noninteractive
+                    && GLOBAL_GDI_STOCK_OBJECT_MIRROR.observe(a0 as u32, st as u32)
+                {
+                    GLOBAL_GDI_STOCK_OBJECTS_OBSERVED.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] NtGdiGetStockObject(0x10d4) OBSERVED object=");
+                    print_u64(a0 as u32 as u64);
+                    print_str(b" -> real handle 0x");
+                    print_hex(st as u32);
+                    print_str(b"\n");
                 }
                 if pi == 2 && ok && !redirected_user_callback {
                     if m0 == 0x10a8 && st != 0 {
@@ -9421,10 +9483,14 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         sc_ok |= 0x0040;
                     }
-                    // 0x0400 — NtClose (SSN 27) on the debug handle, through the same dispatch route,
-                    // runs DbgkpCloseObject: the object is destroyed and the STILL-ATTACHED second
-                    // debuggee is detached.
+                    // 0x0400 — NtClose (SSN 27) on the last debug-object handle, through the same
+                    // dispatch route, runs DbgkpCloseObject: the object is destroyed and the
+                    // STILL-ATTACHED second debuggee is detached.
+                    let aux_closed = h_dbg_noaccess == 0
+                        || (sysc!(SSN_NT_CLOSE, &[h_dbg_noaccess]) == 0
+                            && nt_handler.pm.debug_object(object).is_some());
                     if nt_handler.pm.process_debug_port(target2) == Some(object)
+                        && aux_closed
                         && sysc!(SSN_NT_CLOSE, &[dbg_handle]) == 0
                         && nt_handler.pm.debug_object(object).is_none()
                         && nt_handler.pm.process_debug_port(target2).is_none()

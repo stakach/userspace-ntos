@@ -512,6 +512,7 @@ impl ExecNtHandler {
                 let bootstrap_pids = [smss_pid, csrss_pid, winlogon_pid];
                 for (pi, &pid) in bootstrap_pids.iter().enumerate() {
                     PM_PIDS[pi].store(pid as u64, Ordering::Relaxed);
+                    let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
                 }
                 // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
                 // identity sequence. Later hosted processes get the same setup at successful
@@ -4120,6 +4121,516 @@ impl ExecNtHandler {
         }
         status
     }
+
+    fn process_query_length(information_class: u32, information_length: u32) -> Result<usize, u32> {
+        let exact = |expected: usize| {
+            if information_length as usize == expected {
+                Ok(expected)
+            } else {
+                Err(nt_process::STATUS_INFO_LENGTH_MISMATCH)
+            }
+        };
+        match information_class {
+            0 => exact(0x30), // PROCESS_BASIC_INFORMATION
+            1 => match information_length {
+                // QUOTA_LIMITS / QUOTA_LIMITS_EX
+                0x30 | 0x58 => Ok(information_length as usize),
+                _ => Err(nt_process::STATUS_INFO_LENGTH_MISMATCH),
+            },
+            2 => exact(0x30), // IO_COUNTERS
+            3 => match information_length {
+                // VM_COUNTERS / VM_COUNTERS_EX
+                0x58 | 0x60 => Ok(information_length as usize),
+                _ => Err(nt_process::STATUS_INFO_LENGTH_MISMATCH),
+            },
+            4 => exact(0x20),  // KERNEL_USER_TIMES
+            7 => exact(0x08),  // ProcessDebugPort
+            12 => exact(0x04), // ProcessDefaultHardErrorMode
+            18 => exact(0x02), // PROCESS_PRIORITY_CLASS
+            20 => exact(0x04), // ProcessHandleCount
+            23 => exact(0x24), // PROCESS_DEVICEMAP_INFORMATION
+            24 => exact(0x04), // PROCESS_SESSION_INFORMATION
+            26 => exact(0x08), // ProcessWow64Information
+            28 => exact(0x04), // ProcessLUIDDeviceMapsEnabled
+            29 => exact(0x04), // ProcessBreakOnTermination
+            30 => exact(0x08), // ProcessDebugObjectHandle
+            31 => exact(0x04), // ProcessDebugFlags
+            33 => exact(0x04), // ProcessIoPriority
+            34 => exact(0x04), // ProcessExecuteFlags
+            36 => exact(0x04), // ProcessCookie
+            37 => exact(0x40), // SECTION_IMAGE_INFORMATION
+            38 => exact(0x08), // ProcessCycleTime
+            39 => exact(0x04), // ProcessPagePriority
+            _ => Err(nt_process::STATUS_INVALID_INFO_CLASS),
+        }
+    }
+
+    fn process_virtual_footprint(&self, pid: nt_process::ProcessId) -> u64 {
+        if self.pm_pid_for_pi(self.pi) == Some(pid) {
+            if let Some(ctx) = self.loop_ctx {
+                return ctx.img_end.saturating_sub(PE_LOAD_BASE).max(0x1000);
+            }
+        }
+        let section = self
+            .pm
+            .process(pid)
+            .and_then(|process| process.image_section)
+            .and_then(|section| self.pm.image_section(section));
+        section
+            .map(|section| section.size_of_image() as u64)
+            .unwrap_or(0x1000)
+            .max(0x1000)
+    }
+
+    unsafe fn current_process_image_information(&self) -> Option<[u8; 0x40]> {
+        let ctx = self.loop_ctx?;
+        if ctx.pe.is_null() {
+            return None;
+        }
+        let pe = &*ctx.pe;
+        let metadata = image_metadata_from_pe(pe, PE_LOAD_BASE);
+        let mut info = nt_dll_registry::image_info(
+            PE_LOAD_BASE,
+            metadata.entry_rva,
+            metadata.image_size as u32,
+            false,
+        );
+        info[0x20..0x24].copy_from_slice(&(metadata.subsystem as u32).to_le_bytes());
+        info[0x24..0x26].copy_from_slice(&metadata.subsystem_minor.to_le_bytes());
+        info[0x26..0x28].copy_from_slice(&metadata.subsystem_major.to_le_bytes());
+        Some(info)
+    }
+
+    fn process_image_name_units(
+        &self,
+        pid: nt_process::ProcessId,
+        win32_path: bool,
+        out: &mut [u16],
+    ) -> usize {
+        let Some(process) = self.pm.process(pid) else {
+            return 0;
+        };
+        let hosted = nt_exe_image::hosted_image_for_leaf(process.image_file_name.as_bytes());
+        let system32 = hosted
+            .map(|image| image.image_root == nt_exe_image::HostedImageRoot::System32)
+            .unwrap_or(true);
+        let prefix = if win32_path {
+            if system32 {
+                b"C:\\ReactOS\\System32\\" as &[u8]
+            } else {
+                b"C:\\ReactOS\\"
+            }
+        } else if system32 {
+            b"\\Device\\Harddisk0\\Partition1\\reactos\\system32\\" as &[u8]
+        } else {
+            b"\\Device\\Harddisk0\\Partition1\\reactos\\" as &[u8]
+        };
+        let mut n = 0usize;
+        for &byte in prefix.iter().chain(process.image_file_name.as_bytes()) {
+            if n == out.len() {
+                break;
+            }
+            out[n] = byte as u16;
+            n += 1;
+        }
+        n
+    }
+
+    unsafe fn nt_query_process_image_name(
+        &self,
+        handle: u64,
+        information_class: u32,
+        information: u64,
+        information_length: u32,
+        return_length: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        const UNICODE_STRING_SIZE: usize = 0x10;
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let pid = match self.pm.resolve_process_handle(
+            caller_pid,
+            handle,
+            nt_process::PROCESS_QUERY_INFORMATION,
+        ) {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
+        let mut units = [0u16; 300];
+        let units_len = self.process_image_name_units(pid, information_class == 43, &mut units);
+        let byte_len = (units_len * 2) as u16;
+        let max_len = byte_len.saturating_add(2);
+        let required = UNICODE_STRING_SIZE + max_len as usize;
+        if return_length != 0 && !self.probe_user_output(return_length, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if (information_length as usize) < required {
+            if return_length != 0 {
+                let _ = self.xas_write_u32(return_length, required as u32);
+            }
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if information == 0 || information & 1 != 0 {
+            return if information & 1 != 0 {
+                STATUS_DATATYPE_MISALIGNMENT
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
+        }
+        if !self.probe_user_output(information, required) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut output = [0u8; UNICODE_STRING_SIZE + 300 * 2 + 2];
+        output[0..2].copy_from_slice(&byte_len.to_le_bytes());
+        output[2..4].copy_from_slice(&max_len.to_le_bytes());
+        output[8..16].copy_from_slice(&information.wrapping_add(0x10).to_le_bytes());
+        for (index, unit) in units[..units_len].iter().enumerate() {
+            let off = UNICODE_STRING_SIZE + index * 2;
+            output[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let mut status = if self.xas_try_write_buf(information, &output[..required]) {
+            0
+        } else {
+            STATUS_ACCESS_VIOLATION
+        };
+        if return_length != 0 && !self.xas_write_u32(return_length, required as u32) {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
+
+    unsafe fn query_process_information_captured(
+        &mut self,
+        handle: u64,
+        information_class: u32,
+        information_length: usize,
+    ) -> Result<([u8; 0x60], usize, Option<nt_process::Handle>), u32> {
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let mut output = [0u8; 0x60];
+        let mut published_handle = None;
+        fn put_u32(output: &mut [u8], off: usize, value: u32) {
+            output[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put_i32(output: &mut [u8], off: usize, value: i32) {
+            output[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put_u64(output: &mut [u8], off: usize, value: u64) {
+            output[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put_i64(output: &mut [u8], off: usize, value: i64) {
+            output[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let length = match information_class {
+            0 => {
+                let basic = self.pm.query_process_basic(caller_pid, handle)?;
+                put_u32(&mut output, 0, basic.exit_status);
+                put_u64(&mut output, 8, basic.peb_base_address);
+                put_u64(&mut output, 0x10, basic.affinity_mask);
+                put_i32(&mut output, 0x18, basic.base_priority);
+                put_u64(&mut output, 0x20, basic.unique_process_id as u64);
+                put_u64(
+                    &mut output,
+                    0x28,
+                    basic.inherited_from_unique_process_id as u64,
+                );
+                0x30
+            }
+            1 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u64(&mut output, 0x10, 204_800);
+                put_u64(&mut output, 0x18, 1_413_120);
+                put_u64(&mut output, 0x20, u64::MAX);
+                put_u64(&mut output, 0x28, u64::MAX);
+                if information_length == 0x58 {
+                    put_u64(&mut output, 0x30, 0);
+                    put_u64(&mut output, 0x38, 0);
+                    put_u64(&mut output, 0x40, 0);
+                    put_u64(&mut output, 0x48, 0);
+                    put_u32(&mut output, 0x50, 0);
+                    put_u32(&mut output, 0x54, 0);
+                }
+                information_length
+            }
+            2 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                0x30
+            }
+            3 => {
+                let pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                let virtual_size = self.process_virtual_footprint(pid);
+                let working_set = virtual_size.max(0x4000);
+                put_u64(&mut output, 0x00, virtual_size);
+                put_u64(&mut output, 0x08, virtual_size);
+                put_u32(&mut output, 0x10, 0);
+                put_u64(&mut output, 0x18, working_set);
+                put_u64(&mut output, 0x20, working_set);
+                put_u64(&mut output, 0x48, virtual_size);
+                put_u64(&mut output, 0x50, virtual_size);
+                if information_length == 0x60 {
+                    put_u64(&mut output, 0x58, virtual_size);
+                }
+                information_length
+            }
+            4 => {
+                let times = self.pm.query_process_times(caller_pid, handle)?;
+                put_i64(&mut output, 0x00, times.create_time);
+                put_i64(&mut output, 0x08, times.exit_time);
+                put_i64(&mut output, 0x10, times.kernel_time);
+                put_i64(&mut output, 0x18, times.user_time);
+                0x20
+            }
+            7 => {
+                let value = self.pm.query_process_debug_port(caller_pid, handle)?;
+                put_u64(&mut output, 0, value);
+                0x08
+            }
+            12 => {
+                let pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                let mode = self
+                    .pm
+                    .process_default_hard_error_processing(pid)
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+                put_u32(&mut output, 0, mode);
+                0x04
+            }
+            18 => {
+                let priority = self.pm.query_process_priority_class(caller_pid, handle)?;
+                output[0] = 0;
+                output[1] = priority;
+                0x02
+            }
+            20 => {
+                put_u32(
+                    &mut output,
+                    0,
+                    self.pm.query_process_handle_count(caller_pid, handle)?,
+                );
+                0x04
+            }
+            23 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                0x24
+            }
+            24 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u32(&mut output, 0, 0);
+                0x04
+            }
+            26 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u64(&mut output, 0, 0);
+                0x08
+            }
+            28 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u32(&mut output, 0, 0);
+                0x04
+            }
+            29 => {
+                let pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                let enabled = self
+                    .pm
+                    .process_break_on_termination(pid)
+                    .ok_or(nt_process::STATUS_INVALID_HANDLE)? as u32;
+                put_u32(&mut output, 0, enabled);
+                0x04
+            }
+            30 => {
+                let pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                let Some(object) = self.pm.process_debug_port(pid) else {
+                    return Err(nt_process::dbgk::STATUS_PORT_NOT_SET);
+                };
+                let debug_handle = self.pm.insert_handle(
+                    caller_pid,
+                    nt_process::HandleObject::DebugObject(object),
+                    nt_process::dbgk::DEBUG_OBJECT_ALL_ACCESS,
+                )?;
+                self.account_published_pm_handle(caller_pid);
+                published_handle = Some(debug_handle);
+                put_u64(&mut output, 0, debug_handle as u64);
+                0x08
+            }
+            31 => {
+                put_u32(
+                    &mut output,
+                    0,
+                    self.pm.query_process_debug_flags(caller_pid, handle)?,
+                );
+                0x04
+            }
+            33 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u32(&mut output, 0, 2);
+                0x04
+            }
+            34 => {
+                if handle != u64::MAX {
+                    return Err(nt_process::STATUS_INVALID_PARAMETER);
+                }
+                put_u32(&mut output, 0, 0);
+                0x04
+            }
+            36 => {
+                if handle != u64::MAX {
+                    return Err(nt_process::STATUS_INVALID_PARAMETER);
+                }
+                let time = nt_system_time_100ns();
+                let mut candidate = time as u32
+                    ^ (time >> 32) as u32
+                    ^ caller_pid
+                    ^ self.current_tid as u32
+                    ^ (self.pi as u32).wrapping_mul(0x9E37_79B9);
+                if candidate == 0 {
+                    candidate = 0xBB40_E64E;
+                }
+                let cookie = self
+                    .pm
+                    .get_or_initialize_process_cookie(caller_pid, candidate)
+                    .ok_or(0xC000_009Au32)?;
+                put_u32(&mut output, 0, cookie);
+                0x04
+            }
+            37 => {
+                if handle != u64::MAX {
+                    return Err(nt_process::STATUS_INVALID_PARAMETER);
+                }
+                let Some(info) = self.current_process_image_information() else {
+                    return Err(nt_process::STATUS_INVALID_HANDLE);
+                };
+                output[..0x40].copy_from_slice(&info);
+                0x40
+            }
+            38 => {
+                let times = self.pm.query_process_times(caller_pid, handle)?;
+                put_u64(
+                    &mut output,
+                    0,
+                    times.kernel_time.saturating_add(times.user_time) as u64,
+                );
+                0x08
+            }
+            39 => {
+                let _pid = self.pm.resolve_process_handle(
+                    caller_pid,
+                    handle,
+                    nt_process::PROCESS_QUERY_INFORMATION,
+                )?;
+                put_u32(&mut output, 0, 5);
+                0x04
+            }
+            _ => return Err(nt_process::STATUS_INVALID_INFO_CLASS),
+        };
+        Ok((output, length, published_handle))
+    }
+
+    unsafe fn nt_query_information_process(
+        &mut self,
+        handle: u64,
+        information_class: u32,
+        information: u64,
+        information_length: u32,
+        return_length: u64,
+    ) -> u32 {
+        if information_class == 27 || information_class == 43 {
+            return self.nt_query_process_image_name(
+                handle,
+                information_class,
+                information,
+                information_length,
+                return_length,
+            );
+        }
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+        let expected = match Self::process_query_length(information_class, information_length) {
+            Ok(length) => length,
+            Err(status) => return status,
+        };
+        if information == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !self.probe_user_output(information, expected) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if return_length != 0 && !self.probe_user_output(return_length, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut status =
+            match self.query_process_information_captured(handle, information_class, expected) {
+                Ok((output, length, published_handle)) => {
+                    if self.xas_try_write_buf(information, &output[..length]) {
+                        0
+                    } else {
+                        if let Some(handle) = published_handle {
+                            if let Some(caller_pid) = self.pm_pid_for_pi(self.pi) {
+                                let _ = self.close_process_handle(caller_pid, handle as u64);
+                            }
+                        }
+                        STATUS_ACCESS_VIOLATION
+                    }
+                }
+                Err(status) => status,
+            };
+        if return_length != 0 && !self.xas_write_u32(return_length, expected as u32) {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        status
+    }
     /// Resolve a `NtTerminateProcess`/`NtOpenProcess`-style ProcessHandle to the target EPROCESS pid.
     /// `NtCurrentProcess()` (`-1`) → the caller (self-terminate). A real child ProcessHandle is now
     /// resolved via path 1b's value→object index: process handles are dense typed `Process(pid)`
@@ -5577,19 +6088,20 @@ impl ExecNtHandler {
                 unsafe { crate::writable_fs::close(file_id) };
                 self.writable_fs_dirty = true;
             }
-            // DbgkpCloseObject: the debugger's handle went away — mark the object inactive, detach
-            // every debuggee, and drop it. (Debug-object handles are never duplicated on this path,
-            // so a single close is the last reference.)
+            // DbgkpCloseObject: the debugger's last handle went away — mark the object inactive,
+            // detach every debuggee, and drop it.
             nt_process::HandleObject::DebugObject(object) => {
-                // ★ ESCAPE HATCH: the DEBUGGER IS GONE. Release every target still blocked on one
-                // of this object's events before the object (and its event list) is dropped —
-                // otherwise a debugger that dies mid-event would leave a reporter parked forever
-                // and the boot could never quiesce.
-                unsafe { self.dbgk_release_blocked_reporters(object, None) };
-                // `DbgkpMarkProcessPeb(Process, FALSE)` for every debuggee this object still holds —
-                // done BEFORE the detach, while the attachment is still resolvable.
-                unsafe { self.dbgk_clear_peb_marks_for_object(object) };
-                self.pm.destroy_debug_object(object);
+                if self.pm.release_debug_object_handle(object).unwrap_or(false) {
+                    // ★ ESCAPE HATCH: the DEBUGGER IS GONE. Release every target still blocked on
+                    // one of this object's events before the object (and its event list) is dropped
+                    // — otherwise a debugger that dies mid-event would leave a reporter parked
+                    // forever and the boot could never quiesce.
+                    unsafe { self.dbgk_release_blocked_reporters(object, None) };
+                    // `DbgkpMarkProcessPeb(Process, FALSE)` for every debuggee this object still
+                    // holds — done BEFORE the detach, while the attachment is still resolvable.
+                    unsafe { self.dbgk_clear_peb_marks_for_object(object) };
+                    self.pm.destroy_debug_object(object);
+                }
             }
             _ => {}
         }
@@ -7216,7 +7728,9 @@ impl ExecNtHandler {
             reqmsg + 0x04,
             &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
         );
-        print_str(b"[lpc-msg] NtRequestWaitReplyPort -> modeled reply Status=SUCCESS (non-CSR port)\n");
+        print_str(
+            b"[lpc-msg] NtRequestWaitReplyPort -> modeled reply Status=SUCCESS (non-CSR port)\n",
+        );
         0
     }
 
@@ -9577,186 +10091,15 @@ impl ExecNtHandler {
                 };
                 if wrote { 0 } else { STATUS_ACCESS_VIOLATION }
             },
-            // NtQueryInformationProcess(Handle[R10]=args[0], Class[RDX]=args[1], Buffer[R8]=args[2],
-            // Len[R9]=args[3], *RetLen[arg5]=args[4]).
+            // NtQueryInformationProcess(Handle, Class, Buffer, Len, *RetLen).
             NativeService::NtQueryInformationProcess => unsafe {
-                let class = args[1]; // ProcessInformationClass
-                let buf = args[2]; // R8 = ProcessInformation buffer (a stack local)
-                if class == 0 {
-                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
-                    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                    if args[3] != 48 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let retlen = args[4]; // *ReturnLength
-                    if buf == 0
-                        || !self.probe_user_output(buf, 48)
-                        || retlen != 0 && !self.probe_user_output(retlen, 4)
-                    {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    let (pid, _) =
-                        match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
-                            Ok(target) => target,
-                            Err(status) => return status,
-                        };
-                    let process = match self.pm.process(pid) {
-                        Some(process) => process,
-                        None => return nt_process::STATUS_INVALID_HANDLE,
-                    };
-                    let mut information = [0u8; 48];
-                    information[0..4]
-                        .copy_from_slice(&process.exit_status.unwrap_or(0).to_le_bytes());
-                    let peb = if self.loop_ctx.is_some() {
-                        SMSS_PEB_VA
-                    } else {
-                        PEB_VA
-                    };
-                    information[8..16].copy_from_slice(&peb.to_le_bytes());
-                    information[16..24].copy_from_slice(&1u64.to_le_bytes()); // AffinityMask
-                    information[24..28].copy_from_slice(&13i32.to_le_bytes()); // BasePriority
-                    information[32..40].copy_from_slice(&(pid as u64).to_le_bytes());
-                    information[40..48]
-                        .copy_from_slice(&(process.parent.unwrap_or(0) as u64).to_le_bytes());
-                    if !self.xas_try_write_buf(buf, &information) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    if retlen != 0 && !self.xas_write_u32(retlen, 48) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                    0
-                } else if class == 12 {
-                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
-                    if args[3] != 4 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let retlen = args[4];
-                    if buf == 0
-                        || !self.probe_event_output(buf, 4)
-                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
-                    {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    let (pid, _) =
-                        match self.resolve_process_for_access(args[0], PROCESS_QUERY_INFORMATION) {
-                            Ok(target) => target,
-                            Err(status) => return status,
-                        };
-                    let mode = match self.pm.process_default_hard_error_processing(pid) {
-                        Some(mode) => mode,
-                        None => return 0xC000_0008,
-                    };
-                    if !self.xas_write_u32(buf, mode)
-                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
-                    {
-                        return 0xC000_0005;
-                    }
-                    0
-                } else if class == 29 {
-                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
-                    if args[3] != 4 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let retlen = args[4];
-                    if buf == 0
-                        || !self.probe_event_output(buf, 4)
-                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
-                    {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    let caller = match self.pm_pid_for_pi(self.pi) {
-                        Some(pid) => pid,
-                        None => return 0xC000_0008,
-                    };
-                    let pid = match self.pm.resolve_process_handle(
-                        caller,
-                        args[0],
-                        PROCESS_QUERY_INFORMATION,
-                    ) {
-                        Ok(pid) => pid,
-                        Err(status) => return status,
-                    };
-                    let enabled = self
-                        .pm
-                        .process_break_on_termination(pid)
-                        .unwrap_or(false) as u32;
-                    if !self.xas_write_u32(buf, enabled)
-                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
-                    {
-                        return 0xC000_0005;
-                    }
-                    0
-                } else if class == 36 {
-                    // ProcessCookie is a stable per-process ULONG and is queryable only through the
-                    // current-process pseudo handle, matching ReactOS's XP-compatible contract.
-                    if args[0] != u64::MAX {
-                        return 0xC000_000D; // STATUS_INVALID_PARAMETER
-                    }
-                    if args[3] != 4 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let retlen = args[4];
-                    if buf == 0
-                        || !self.probe_event_output(buf, 4)
-                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
-                    {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    let Some(pid) = self.pm_pid_for_pi(self.pi) else {
-                        return 0xC000_0008; // STATUS_INVALID_HANDLE
-                    };
-                    let time = nt_system_time_100ns();
-                    let mut candidate = time as u32
-                        ^ (time >> 32) as u32
-                        ^ pid
-                        ^ self.current_tid as u32
-                        ^ (self.pi as u32).wrapping_mul(0x9E37_79B9);
-                    if candidate == 0 {
-                        candidate = 0xBB40_E64E;
-                    }
-                    let Some(cookie) = self.pm.get_or_initialize_process_cookie(pid, candidate) else {
-                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                    };
-                    if !self.xas_write_u32(buf, cookie)
-                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
-                    {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    0
-                } else if class == 28 {
-                    // ProcessLUIDDeviceMapsEnabled — a ULONG BOOL. Not enabled → 0.
-                    smss_stack_write32(buf, 0);
-                    let retlen = args[4];
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 4);
-                    }
-                    0
-                } else if class == 23 {
-                    // ProcessDeviceMap — an EMPTY drive map (no drives) so SmpCreatePagingFiles
-                    // finds no boot volume and smss proceeds without a paging file.
-                    for k in 0..(36u64 / 4) {
-                        smss_stack_write32(buf + k * 4, 0);
-                    }
-                    let retlen = args[4];
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 36);
-                    }
-                    0
-                } else {
-                    print_str(b"[ntos-exec] NtQueryInformationProcess class=");
-                    print_u64(class);
-                    print_str(b" len=");
-                    print_u64(args[3]);
-                    print_str(b"\n");
-                    // BATCH 10: do NOT stop the whole boot on an unmodeled class. Returning
-                    // STATUS_INVALID_INFO_CLASS lets the CALLER degrade gracefully and, crucially,
-                    // keeps the single service loop multiplexing so a HIGHER-priority process's
-                    // pending fault gets serviced. Previously `self.stop=true` here broke the loop on
-                    // smss's terminal ProcessImageInformation(class 44) query, leaving winlogon's
-                    // pending user32-init fetch-fault (user32+0x8a940) forever unserviced — the
-                    // BATCH 9/10 "silent spin". The class print still surfaces the gap for follow-up.
-                    0xC000_0003 // STATUS_INVALID_INFO_CLASS
-                }
+                self.nt_query_information_process(
+                    args[0],
+                    args[1] as u32,
+                    args[2],
+                    args[3] as u32,
+                    args[4],
+                )
             },
             // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect[arg5]=args[4]).
             // The common helper keeps the normal process and CSR worker user-memory views aligned.
@@ -11768,6 +12111,38 @@ impl ExecNtHandler {
                         pid,
                         u32::from_le_bytes(value),
                     ) {
+                        Ok(()) => 0,
+                        Err(status) => status,
+                    };
+                }
+                if args[1] == 18 {
+                    const PROCESS_SET_INFORMATION: u32 = 0x0200;
+                    if args[3] != 2 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let mut value = [0u8; 2];
+                    if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    let priority_class = value[1];
+                    if priority_class == nt_process::PROCESS_PRIORITY_CLASS_REALTIME
+                        && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
+                    {
+                        return 0xC000_0061; // STATUS_PRIVILEGE_NOT_HELD
+                    }
+                    let caller = match self.pm_pid_for_pi(self.pi) {
+                        Some(pid) => pid,
+                        None => return 0xC000_0008,
+                    };
+                    let pid = match self.pm.resolve_process_handle(
+                        caller,
+                        args[0],
+                        PROCESS_SET_INFORMATION,
+                    ) {
+                        Ok(pid) => pid,
+                        Err(status) => return status,
+                    };
+                    return match self.pm.set_process_priority_class(pid, priority_class) {
                         Ok(()) => 0,
                         Err(status) => status,
                     };

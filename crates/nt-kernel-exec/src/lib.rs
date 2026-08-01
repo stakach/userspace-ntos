@@ -34,6 +34,7 @@ mod timer;
 pub mod timezone;
 pub mod user_class;
 pub mod user_cursor;
+pub mod user_gdi;
 mod work_item;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};

@@ -1893,10 +1893,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                             0
                                         }
                                         Ok(handle) => {
-                                            let _ = nt_handler.close_process_handle(
-                                                target_pid,
-                                                handle as u64,
-                                            );
+                                            let _ = nt_handler
+                                                .close_process_handle(target_pid, handle as u64);
                                             0xC000_0005
                                         }
                                         Err(status) => status as u64,
