@@ -106,9 +106,7 @@ fn captured_source_bytes(packed: u64) -> [u8; 8] {
 pub(crate) fn native_processor_information(
 ) -> nt_syscall::system_information::SystemProcessorInformation {
     use core::arch::x86_64::__cpuid;
-    use nt_syscall::system_information::{
-        amd64_processor_information_from_cpuid, X86Vendor,
-    };
+    use nt_syscall::system_information::{amd64_processor_information_from_cpuid, X86Vendor};
 
     // SAFETY: CPUID is available in the x86_64 execution environment.
     let vendor_leaf = unsafe { __cpuid(0) };
@@ -343,7 +341,11 @@ impl ExecNtHandler {
             print_str(b"B(root=");
             print_u64(sam_hive.as_ref().map_or(0, |h| u64::from(h.root())));
             print_str(b" subkeys=");
-            print_u64(sam_hive.as_ref().map_or(0, |h| h.subkeys(h.root()).len() as u64));
+            print_u64(
+                sam_hive
+                    .as_ref()
+                    .map_or(0, |h| h.subkeys(h.root()).len() as u64),
+            );
             print_str(b") SOFTWARE=");
             print_u64(SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed));
             print_str(b"B(root=");
@@ -462,6 +464,9 @@ impl ExecNtHandler {
             sm_request_port: 0,
             sm_request_message: 0,
             sm_reply_message: 0,
+            csr_request_port: 0,
+            csr_request_message: 0,
+            csr_reply_message: 0,
             csr_start_request: 0,
             csr_rendezvous_conn: 0,
             csr_rendezvous_out: 0,
@@ -553,7 +558,9 @@ impl ExecNtHandler {
         }
         for pi in 0..MAX_PI {
             if let Some(pid) = handler.pm_pid_for_pi(pi) {
-                let token = handler.token_store.insert(nt_security::AccessToken::system());
+                let token = handler
+                    .token_store
+                    .insert(nt_security::AccessToken::system());
                 let _ = handler.pm.replace_process_primary_token(pid, Some(token));
             }
         }
@@ -619,7 +626,9 @@ impl ExecNtHandler {
             .resolve_key(NLS_LANGUAGE)
             .and_then(|key| self.registry_value(key, "Default"))
         else {
-            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n");
+            print_str(
+                b"[locale-setup] HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
+            );
             return;
         };
         // `SetDefaultLanguage` rejects every other type, and setup's
@@ -637,12 +646,17 @@ impl ExecNtHandler {
         }
         let canon = self.overlay_canon(USER_INTERNATIONAL);
         let (index, _) = self.overlay.create(&canon);
-        self.overlay.set_value(index, "Locale", REG_SZ, &language_id);
+        self.overlay
+            .set_value(index, "Locale", REG_SZ, &language_id);
         DEFAULT_USER_LOCALE_BYTES.store(language_id.len() as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
         for &byte in language_id.iter().step_by(2) {
-            debug_put_char(if (0x20..0x7f).contains(&byte) { byte } else { b'.' });
+            debug_put_char(if (0x20..0x7f).contains(&byte) {
+                byte
+            } else {
+                b'.'
+            });
         }
         print_str(b" (REG type ");
         print_u64(REG_SZ as u64);
@@ -958,7 +972,10 @@ impl ExecNtHandler {
                 Some(self.mint_registry_key(key, args[1] as u32, args[0]))
             }
             None => {
-                if self.current_process_is_winlogon() && post_profile_phase() && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64 {
+                if self.current_process_is_winlogon()
+                    && post_profile_phase()
+                    && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64
+                {
                     print_str(b"[post-profile] open MISS ");
                     print_ascii_str(&full);
                     print_str(b"\n");
@@ -1594,21 +1611,17 @@ impl ExecNtHandler {
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
     /// link). Returns `None` before the ProcessManager has created that hosted process.
     pub(crate) fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
-        self.process_mechanisms
-            .pid_for_pi(pi)
-            .or_else(|| {
-                let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
-                (pid != 0).then_some(pid as nt_process::ProcessId)
-            })
+        self.process_mechanisms.pid_for_pi(pi).or_else(|| {
+            let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
+            (pid != 0).then_some(pid as nt_process::ProcessId)
+        })
     }
 
     pub(crate) fn pm_main_tid_for_pi(&self, pi: usize) -> Option<nt_process::ThreadId> {
-        self.thread_mechanisms
-            .main_tid_for_pi(pi)
-            .or_else(|| {
-                let tid = PM_TIDS.get(pi)?.load(Ordering::Relaxed);
-                (tid != 0).then_some(tid as nt_process::ThreadId)
-            })
+        self.thread_mechanisms.main_tid_for_pi(pi).or_else(|| {
+            let tid = PM_TIDS.get(pi)?.load(Ordering::Relaxed);
+            (tid != 0).then_some(tid as nt_process::ThreadId)
+        })
     }
 
     pub(crate) fn pm_pool_tid_for_slot(
@@ -1740,8 +1753,8 @@ impl ExecNtHandler {
             .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ThreadId)
             .filter(|&tid| tid != 0)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let badge = Self::hosted_mechanism_badge_for_pi(pi)
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let badge =
+            Self::hosted_mechanism_badge_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
 
         match self.process_mechanisms.claim_or_get(pi, pid, tid, badge) {
             Ok(_) => Ok(()),
@@ -1810,7 +1823,9 @@ impl ExecNtHandler {
 
     fn current_process_image_name(&self) -> Option<&str> {
         let pid = self.current_pm_pid()?;
-        self.pm.process(pid).map(|process| process.image_file_name.as_str())
+        self.pm
+            .process(pid)
+            .map(|process| process.image_file_name.as_str())
     }
 
     fn current_hosted_process_image(&self) -> Option<&'static nt_exe_image::HostedProcessImage> {
@@ -1874,6 +1889,18 @@ impl ExecNtHandler {
         )
     }
 
+    fn current_process_uses_csr_client_connect(&self) -> bool {
+        matches!(
+            self.current_hosted_process_role(),
+            Some(
+                nt_exe_image::HostedProcessRole::InteractiveLogon
+                    | nt_exe_image::HostedProcessRole::NonInteractiveService
+                    | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                    | nt_exe_image::HostedProcessRole::InteractiveShell
+            )
+        )
+    }
+
     fn hosted_thread_role_for_badge(badge: u64) -> Option<HostedThreadRole> {
         match badge {
             WINLOGON_WORKER_BADGE => Some(HostedThreadRole::WinlogonListener),
@@ -1921,9 +1948,8 @@ impl ExecNtHandler {
             };
             process_count += 1;
             min_handle_cap = min_handle_cap.min(self.pm.handle_capacity(pid));
-            let distinct = (0..MAX_PI).all(|other_pi| {
-                other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid)
-            });
+            let distinct = (0..MAX_PI)
+                .all(|other_pi| other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid));
             if let Some(name) = Self::hosted_process_name_for_pi(pi) {
                 if distinct
                     && self
@@ -1968,13 +1994,15 @@ impl ExecNtHandler {
         creator_pi: usize,
         leaf: &[u8],
     ) -> Result<usize, u32> {
-        let child_pi = Self::hosted_pi_for_leaf(leaf).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let name =
-            Self::hosted_process_name_for_pi(child_pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let child_pi =
+            Self::hosted_pi_for_leaf(leaf).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let name = Self::hosted_process_name_for_pi(child_pi)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if let Some(existing_pid) = self.pm_pid_for_pi(child_pi) {
-            let matches_existing = self.pm.process(existing_pid).is_some_and(|process| {
-                process.image_file_name.eq_ignore_ascii_case(name)
-            });
+            let matches_existing = self
+                .pm
+                .process(existing_pid)
+                .is_some_and(|process| process.image_file_name.eq_ignore_ascii_case(name));
             if matches_existing {
                 return Ok(child_pi);
             }
@@ -2085,16 +2113,17 @@ impl ExecNtHandler {
         self.file_completion
             .insert_file(file_id, synchronous)
             .ok()?;
-        let handle = match self
-            .pm
-            .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
-        {
-            Ok(handle) => handle,
-            Err(_) => {
-                self.release_file_reference(file_id);
-                return None;
-            }
-        };
+        let handle =
+            match self
+                .pm
+                .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
+            {
+                Ok(handle) => handle,
+                Err(_) => {
+                    self.release_file_reference(file_id);
+                    return None;
+                }
+            };
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
@@ -2151,9 +2180,8 @@ impl ExecNtHandler {
         {
             return None;
         }
-        nt_fs::nt_path_to_volume_relative(name16, b"reactos").and_then(|path| unsafe {
-            exec_fs().and_then(|fs| fat_open_path(&fs, &path))
-        })
+        nt_fs::nt_path_to_volume_relative(name16, b"reactos")
+            .and_then(|path| unsafe { exec_fs().and_then(|fs| fat_open_path(&fs, &path)) })
     }
 
     fn readonly_disk_open_miss_status(name16: &[u16]) -> Option<u32> {
@@ -2182,7 +2210,11 @@ impl ExecNtHandler {
                 b" unsupported file namespace -> STATUS_NOT_IMPLEMENTED (honest miss, no park) name=\"",
             );
             for &unit in name16.iter().take(96) {
-                debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+                debug_put_char(if (0x20..0x7f).contains(&unit) {
+                    unit as u8
+                } else {
+                    b'?'
+                });
             }
             print_str(b"\"\n");
         }
@@ -2191,11 +2223,7 @@ impl ExecNtHandler {
     }
 
     /// Mint a process-local handle for a directory on the mounted FAT volume.
-    pub(crate) fn mint_directory_handle(
-        &mut self,
-        first_cluster: u32,
-        access: u32,
-    ) -> Option<u64> {
+    pub(crate) fn mint_directory_handle(&mut self, first_cluster: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let object_id = self.directory_opens.create(first_cluster).ok()?;
         let handle = match self.pm.insert_handle(
@@ -2229,10 +2257,7 @@ impl ExecNtHandler {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return Ok(None);
         };
-        let Some(object) = self
-            .pm
-            .lookup_handle(pid, handle as nt_process::Handle)
-        else {
+        let Some(object) = self.pm.lookup_handle(pid, handle as nt_process::Handle) else {
             return Ok(None);
         };
         match object {
@@ -2260,17 +2285,18 @@ impl ExecNtHandler {
             unsafe { crate::writable_fs::close(file_id) };
             return None;
         };
-        let handle = match self
-            .pm
-            .insert_handle(pid, nt_process::HandleObject::OverlayFile(file_id), access)
-        {
-            Ok(handle) => handle,
-            Err(_) => {
-                // The volume owns the file object until a handle takes it; give it back.
-                unsafe { crate::writable_fs::close(file_id) };
-                return None;
-            }
-        };
+        let handle =
+            match self
+                .pm
+                .insert_handle(pid, nt_process::HandleObject::OverlayFile(file_id), access)
+            {
+                Ok(handle) => handle,
+                Err(_) => {
+                    // The volume owns the file object until a handle takes it; give it back.
+                    unsafe { crate::writable_fs::close(file_id) };
+                    return None;
+                }
+            };
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
@@ -2519,7 +2545,10 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::Opaque(tag))
-                if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG => tag,
+                if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG =>
+            {
+                tag
+            }
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => return Err(STATUS_INVALID_HANDLE),
         };
@@ -2575,7 +2604,10 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::Opaque(tag))
-                if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG => tag,
+                if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG =>
+            {
+                tag
+            }
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => return Err(STATUS_INVALID_HANDLE),
         };
@@ -2723,7 +2755,11 @@ impl ExecNtHandler {
             0 => self.pm.main_thread(pid).unwrap_or(0),
             hint => hint as nt_process::ThreadId,
         };
-        if self.pm.report_exception(pid, tid, record, first_chance).is_none() {
+        if self
+            .pm
+            .report_exception(pid, tid, record, first_chance)
+            .is_none()
+        {
             return false;
         }
         DBGK_EXCEPTIONS_FORWARDED.fetch_add(1, Ordering::Relaxed);
@@ -3186,9 +3222,9 @@ impl ExecNtHandler {
         object_id: u32,
         packet: nt_io_completion::CompletionPacket,
     ) -> u32 {
-        if let Some(waiter) = unsafe {
-            (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id)
-        } {
+        if let Some(waiter) =
+            unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id) }
+        {
             let wake_packet = match self
                 .io_completion_ports
                 .remove(object_id, nt_io_completion::RemoveMode::Poll)
@@ -3296,11 +3332,17 @@ impl ExecNtHandler {
                 nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
             )
         }) {
-            reject!(b"target-terminating", nt_process::STATUS_PROCESS_IS_TERMINATING);
+            reject!(
+                b"target-terminating",
+                nt_process::STATUS_PROCESS_IS_TERMINATING
+            );
         }
         let pml4 = PM_PML4S[target_pi].load(Ordering::Relaxed);
         if pml4 == 0 {
-            reject!(b"no-target-vspace", nt_process::STATUS_PROCESS_IS_TERMINATING);
+            reject!(
+                b"no-target-vspace",
+                nt_process::STATUS_PROCESS_IS_TERMINATING
+            );
         }
         // The caller's remaining NtCreateThread arguments live on its stack (x64: 5th..8th).
         let sp = unsafe { get_recv_mr(16) };
@@ -3324,7 +3366,8 @@ impl ExecNtHandler {
         else {
             reject!(b"no-free-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         };
-        let Some((_pool_slot, tid)) = self.claim_pool_thread(target_pi, start.rip, create_suspended)
+        let Some((_pool_slot, tid)) =
+            self.claim_pool_thread(target_pi, start.rip, create_suspended)
         else {
             reject!(b"no-pool-ethread", STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -3625,14 +3668,11 @@ impl ExecNtHandler {
         let Some(object_attributes) = self.capture_object_attributes(object_attributes) else {
             return STATUS_ACCESS_VIOLATION;
         };
-        let (owner, handle) = match self.open_process_captured(
-            object_attributes,
-            client_id,
-            desired_access,
-        ) {
-            Ok(opened) => opened,
-            Err(status) => return status,
-        };
+        let (owner, handle) =
+            match self.open_process_captured(object_attributes, client_id, desired_access) {
+                Ok(opened) => opened,
+                Err(status) => return status,
+            };
         if !self.xas_write_u64(process_handle, handle as u64) {
             let _ = self.pm.take_handle(owner, handle);
             return STATUS_ACCESS_VIOLATION;
@@ -3703,14 +3743,11 @@ impl ExecNtHandler {
         let Some(object_attributes) = self.capture_object_attributes(object_attributes) else {
             return STATUS_ACCESS_VIOLATION;
         };
-        let (owner, handle) = match self.open_thread_captured(
-            object_attributes,
-            client_id,
-            desired_access,
-        ) {
-            Ok(opened) => opened,
-            Err(status) => return status,
-        };
+        let (owner, handle) =
+            match self.open_thread_captured(object_attributes, client_id, desired_access) {
+                Ok(opened) => opened,
+                Err(status) => return status,
+            };
         if !self.xas_write_u64(thread_handle, handle as u64) {
             let _ = self.pm.take_handle(owner, handle);
             return STATUS_ACCESS_VIOLATION;
@@ -3767,16 +3804,15 @@ impl ExecNtHandler {
             9 => self.pm.set_thread_win32_start_address(tid, value),
             14 => self.pm.set_thread_disable_boost(tid, value != 0),
             17 => self.pm.set_thread_hide_from_debugger(tid),
-            18 => self.pm.set_thread_break_on_termination(tid, value as u32 != 0),
+            18 => self
+                .pm
+                .set_thread_break_on_termination(tid, value as u32 != 0),
             _ => return nt_process::STATUS_INVALID_INFO_CLASS,
         };
         update.map_or_else(|status| status, |()| 0)
     }
 
-    pub(crate) fn resolve_thread_for_set(
-        &self,
-        handle: u64,
-    ) -> Result<nt_process::ThreadId, u32> {
+    pub(crate) fn resolve_thread_for_set(&self, handle: u64) -> Result<nt_process::ThreadId, u32> {
         const THREAD_SET_INFORMATION: u32 = 0x0020;
         let caller = self
             .pm_pid_for_pi(self.pi)
@@ -3817,8 +3853,7 @@ impl ExecNtHandler {
         if information == 0 || !self.xas_read(information, &mut descriptor) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let raw_byte_length =
-            u16::from_le_bytes(descriptor[0..2].try_into().unwrap()) as usize;
+        let raw_byte_length = u16::from_le_bytes(descriptor[0..2].try_into().unwrap()) as usize;
         let byte_length = raw_byte_length & !1;
         let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
 
@@ -3923,12 +3958,9 @@ impl ExecNtHandler {
                 8
             }
             12 | 14 | 18 | 20 => {
-                let value = self.pm.query_thread_u32(
-                    caller_pid,
-                    current_tid,
-                    handle,
-                    information_class,
-                )?;
+                let value =
+                    self.pm
+                        .query_thread_u32(caller_pid, current_tid, handle, information_class)?;
                 output[..4].copy_from_slice(&value.to_le_bytes());
                 4
             }
@@ -3948,9 +3980,9 @@ impl ExecNtHandler {
                 4
             }
             17 => {
-                let value = self
-                    .pm
-                    .query_thread_u32(caller_pid, current_tid, handle, information_class)?;
+                let value =
+                    self.pm
+                        .query_thread_u32(caller_pid, current_tid, handle, information_class)?;
                 output[0] = value as u8;
                 1
             }
@@ -4113,7 +4145,7 @@ impl ExecNtHandler {
         })
     }
 
-    fn resolve_process_for_access(
+    pub(crate) fn resolve_process_for_access(
         &self,
         handle: u64,
         required_access: u32,
@@ -4128,6 +4160,886 @@ impl ExecNtHandler {
             .pi_for_pid(pid)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         Ok((pid, pi))
+    }
+
+    unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => self.xas_read(va, dst),
+            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_copyin(sb, va, dst),
+        }
+    }
+
+    unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
+            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_copyout(sb, va, src),
+        }
+    }
+
+    unsafe fn user_memory_probe_output(
+        &self,
+        memory: SyscallUserMemory,
+        va: u64,
+        len: usize,
+    ) -> bool {
+        match memory {
+            SyscallUserMemory::CurrentProcess => self.probe_user_output(va, len),
+            SyscallUserMemory::CsrThreadStack { sb } => csr_thread_stack_has_range(sb, va, len),
+        }
+    }
+
+    pub(crate) unsafe fn nt_resume_thread_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+        let thread_handle = args[0];
+        let previous_count = args[1];
+        print_str(b"[thread-life] NtResumeThread pi=");
+        print_u64(self.pi as u64);
+        print_str(b" handle=0x");
+        print_hex(thread_handle as u32);
+        print_str(b" previous_ptr=0x");
+        print_hex((previous_count >> 32) as u32);
+        print_hex(previous_count as u32);
+        print_str(b"\n");
+
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => {
+                print_str(b"[thread-life] resume failed: caller has no EPROCESS\n");
+                return nt_process::STATUS_INVALID_HANDLE;
+            }
+        };
+        let tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            thread_handle,
+            THREAD_SUSPEND_RESUME,
+        ) {
+            Ok(tid) => tid as u64,
+            Err(status) => {
+                print_str(b"[thread-life] resume failed: handle resolution status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return status;
+            }
+        };
+        let Some(mechanism) = self.hosted_thread_mechanism_for_tid(tid) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let (pi, slot) = match mechanism.kind {
+            nt_user_host::ThreadMechanismKind::Main => {
+                let main_pi = mechanism.pi;
+                let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
+                    Ok(previous) => previous,
+                    Err(status) => return status,
+                };
+                print_str(b"[thread-life] resume main tid=");
+                print_u64(tid);
+                print_str(b" pi=");
+                print_u64(main_pi as u64);
+                print_str(b" previous=");
+                print_u64(previous as u64);
+                print_str(b"\n");
+                if previous_count != 0
+                    && !self.user_memory_write(memory, previous_count, &previous.to_le_bytes())
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if previous == 1 {
+                    let tcb = self.hosted_main_thread_tcb_for_pi(main_pi).unwrap_or(0);
+                    if tcb <= 1 || tcb_resume(tcb) != 0 {
+                        return STATUS_UNSUCCESSFUL;
+                    }
+                }
+                return 0;
+            }
+            nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
+        };
+
+        let scm_worker_tid = SCM_WORKER_TID.load(Ordering::Relaxed);
+        if scm_worker_tid != 0 && tid == scm_worker_tid {
+            let bit = 1u64 << slot;
+            PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed);
+            if previous_count != 0
+                && !self.user_memory_write(memory, previous_count, &1u32.to_le_bytes())
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            print_str(b"[scm-worker] NtResumeThread -> SUCCESS (not resumed; trampoline-entry fault, see frontier)\n");
+            return 0;
+        }
+
+        let bit = 1u64 << slot;
+        let previous = if PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
+            1
+        } else {
+            0
+        };
+        if previous_count != 0
+            && !self.user_memory_write(memory, previous_count, &(previous as u32).to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if previous != 0 {
+            let _ = self
+                .pm
+                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Ready);
+            let csr_role = if tid == CSR_API_TID.load(Ordering::Relaxed) {
+                1
+            } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
+                2
+            } else {
+                0
+            };
+            if csr_role != 0 {
+                self.csr_start_request = csr_role;
+                print_str(b"[csr-thread] resume scheduled role=");
+                print_u64(csr_role as u64);
+                print_str(b" tid=");
+                print_u64(tid);
+                print_str(b" previous=1\n");
+                return 0;
+            }
+            let tcb = self
+                .hosted_thread_tcb_for_nt_resume_thread(tid)
+                .unwrap_or(0);
+            if tcb <= 1 {
+                return STATUS_UNSUCCESSFUL;
+            }
+            let result = tcb_resume(tcb);
+            print_str(b"[thread-life] resume pi=");
+            print_u64(pi as u64);
+            print_str(b" slot=");
+            print_u64(slot as u64);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b" tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" previous=1 result=");
+            print_u64(result);
+            print_str(b"\n");
+            if result != 0 {
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
+        0
+    }
+
+    fn query_object_type_name(
+        &self,
+        object: nt_process::HandleObject,
+        namespace_kind: Option<u8>,
+    ) -> &'static [u8] {
+        match namespace_kind {
+            Some(0) => b"Directory",
+            Some(1) => b"SymbolicLink",
+            Some(2) => b"Event",
+            Some(3) => b"Semaphore",
+            Some(4) => b"Mutant",
+            _ => match object {
+                nt_process::HandleObject::Process(_) => b"Process",
+                nt_process::HandleObject::Thread(_) => b"Thread",
+                nt_process::HandleObject::Section(_) => b"Section",
+                nt_process::HandleObject::File(_)
+                | nt_process::HandleObject::DiskFile { .. }
+                | nt_process::HandleObject::Directory { .. }
+                | nt_process::HandleObject::OverlayFile(_)
+                | nt_process::HandleObject::BootStatusFile => b"File",
+                nt_process::HandleObject::IoCompletion(_) => b"IoCompletion",
+                nt_process::HandleObject::RegistryKey(_) => b"Key",
+                nt_process::HandleObject::Token(_) | nt_process::HandleObject::TokenObject(_) => {
+                    b"Token"
+                }
+                nt_process::HandleObject::DebugObject(_) => b"DebugObject",
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
+                {
+                    b"Event"
+                }
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG =>
+                {
+                    b"Semaphore"
+                }
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG =>
+                {
+                    b"Mutant"
+                }
+                nt_process::HandleObject::Opaque(tag) if tag == KEYEDEVENT_HANDLE_TAG => {
+                    b"KeyedEvent"
+                }
+                nt_process::HandleObject::Opaque(_) => b"Object",
+            },
+        }
+    }
+
+    fn query_object_namespace_index(
+        &self,
+        object: nt_process::HandleObject,
+        direct_index: Option<usize>,
+    ) -> Option<usize> {
+        if let Some(index) = direct_index {
+            return self.obj_ns.get(index).map(|_| index);
+        }
+        let tag = match object {
+            nt_process::HandleObject::Opaque(tag) => tag,
+            _ => return None,
+        };
+        let index = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG
+            || tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG
+            || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
+        {
+            (tag & 0xFFFF_FFFF) as usize
+        } else {
+            return None;
+        };
+        self.obj_ns.get(index).map(|_| index)
+    }
+
+    fn query_object_resolve(
+        &self,
+        handle: u64,
+    ) -> Result<(nt_process::HandleObject, u32, Option<usize>), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const PSEUDO_GRANTED_ACCESS: u32 = 0x001F_FFFF;
+        let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        if handle == u64::MAX {
+            return Ok((
+                nt_process::HandleObject::Process(caller),
+                PSEUDO_GRANTED_ACCESS,
+                None,
+            ));
+        }
+        if handle == u64::MAX - 1 {
+            let tid = self.current_tid as nt_process::ThreadId;
+            self.pm.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+            return Ok((
+                nt_process::HandleObject::Thread(tid),
+                PSEUDO_GRANTED_ACCESS,
+                None,
+            ));
+        }
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
+            return Ok((
+                nt_process::HandleObject::Opaque(handle),
+                PSEUDO_GRANTED_ACCESS,
+                Some(index),
+            ));
+        }
+        if handle > u32::MAX as u64 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let handle32 = handle as nt_process::Handle;
+        let object = self
+            .pm
+            .lookup_handle(caller, handle32)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let access = self
+            .pm
+            .handle_access(caller, handle32)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok((object, access, None))
+    }
+
+    fn query_object_handle_flags(&self, handle: u64) -> Result<nt_process::HandleFlags, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if handle == u64::MAX || handle == u64::MAX - 1 || handle >= OBJ_HANDLE_BASE {
+            self.query_object_resolve(handle)?;
+            return Ok(nt_process::HandleFlags::default());
+        }
+        if handle > u32::MAX as u64 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        self.pm
+            .handle_flags(caller, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    fn query_object_namespace_path(&self, index: usize, out: &mut [u8]) -> usize {
+        let mut chain = [0usize; 16];
+        let mut count = 0usize;
+        let mut cur = Some(index);
+        while let Some(i) = cur {
+            if count == chain.len() || self.obj_ns.get(i).is_none() {
+                break;
+            }
+            chain[count] = i;
+            count += 1;
+            let parent = self.obj_ns[i].parent;
+            cur = if parent == 0xFF {
+                None
+            } else {
+                Some(parent as usize)
+            };
+        }
+        if out.is_empty() {
+            return 0;
+        }
+        let mut n = 0usize;
+        out[n] = b'\\';
+        n += 1;
+        for pos in (0..count).rev() {
+            let entry = &self.obj_ns[chain[pos]];
+            if entry.parent == 0xFF {
+                continue;
+            }
+            if n > 1 {
+                if n == out.len() {
+                    break;
+                }
+                out[n] = b'\\';
+                n += 1;
+            }
+            for &b in entry.name() {
+                if n == out.len() {
+                    return n;
+                }
+                out[n] = b;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn write_ascii_utf16le(src: &[u8], dst: &mut [u8]) -> usize {
+        let mut n = 0usize;
+        for &b in src {
+            if n + 1 >= dst.len() {
+                break;
+            }
+            dst[n] = b;
+            dst[n + 1] = 0;
+            n += 2;
+        }
+        n
+    }
+
+    unsafe fn write_query_object_return_length(
+        &self,
+        memory: SyscallUserMemory,
+        return_length: u64,
+        needed: u32,
+    ) -> Result<(), u32> {
+        if return_length == 0 {
+            return Ok(());
+        }
+        if !self.user_memory_write(memory, return_length, &needed.to_le_bytes()) {
+            return Err(0xC000_0005);
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn nt_query_object_with_user_memory(
+        &self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        const OBJECT_BASIC_INFORMATION_SIZE: usize = 56;
+        const OBJECT_NAME_INFORMATION_SIZE: usize = 16;
+        const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
+        const OBJECT_HANDLE_FLAG_INFORMATION_SIZE: usize = 2;
+
+        let handle = args.first().copied().unwrap_or(0);
+        let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
+        let information = args.get(2).copied().unwrap_or(0);
+        let length = args.get(3).copied().unwrap_or(0) as usize;
+        let return_length = args.get(4).copied().unwrap_or(0);
+
+        if return_length != 0 && !self.user_memory_probe_output(memory, return_length, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if class == 3 || class == 5 {
+            let _ = self.write_query_object_return_length(
+                memory,
+                return_length,
+                length.min(u32::MAX as usize) as u32,
+            );
+            return STATUS_NOT_IMPLEMENTED;
+        }
+
+        let (object, granted_access, namespace_index) = match self.query_object_resolve(handle) {
+            Ok(target) => target,
+            Err(status) => return status,
+        };
+        let namespace_kind =
+            namespace_index.and_then(|index| self.obj_ns.get(index).map(|e| e.kind));
+        let type_name = self.query_object_type_name(object, namespace_kind);
+
+        match class {
+            0 => {
+                let mut name_ascii = [0u8; 256];
+                let name_len = self
+                    .query_object_namespace_index(object, namespace_index)
+                    .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
+                    .unwrap_or(0);
+                let type_info_len = (OBJECT_TYPE_INFORMATION_SIZE + type_name.len() * 2 + 2) as u32;
+                let name_info_len = if name_len == 0 {
+                    OBJECT_NAME_INFORMATION_SIZE as u32
+                } else {
+                    (OBJECT_NAME_INFORMATION_SIZE + name_len * 2 + 2) as u32
+                };
+                if self
+                    .write_query_object_return_length(
+                        memory,
+                        return_length,
+                        OBJECT_BASIC_INFORMATION_SIZE as u32,
+                    )
+                    .is_err()
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if length != OBJECT_BASIC_INFORMATION_SIZE
+                    || !self.user_memory_probe_output(memory, information, length)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut output = [0u8; OBJECT_BASIC_INFORMATION_SIZE];
+                output[4..8].copy_from_slice(&granted_access.to_le_bytes());
+                output[8..12].copy_from_slice(&1u32.to_le_bytes()); // HandleCount
+                output[12..16].copy_from_slice(&1u32.to_le_bytes()); // PointerCount
+                output[36..40].copy_from_slice(&name_info_len.to_le_bytes());
+                output[40..44].copy_from_slice(&type_info_len.to_le_bytes());
+                if self.user_memory_write(memory, information, &output) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            }
+            1 => {
+                let mut name_ascii = [0u8; 256];
+                let name_len = self
+                    .query_object_namespace_index(object, namespace_index)
+                    .map(|index| self.query_object_namespace_path(index, &mut name_ascii))
+                    .unwrap_or(0);
+                let name_bytes = name_len * 2;
+                let needed = if name_len == 0 {
+                    OBJECT_NAME_INFORMATION_SIZE
+                } else {
+                    OBJECT_NAME_INFORMATION_SIZE + name_bytes + 2
+                };
+                if self
+                    .write_query_object_return_length(
+                        memory,
+                        return_length,
+                        needed.min(u32::MAX as usize) as u32,
+                    )
+                    .is_err()
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if length < needed || !self.user_memory_probe_output(memory, information, needed) {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut output = [0u8; OBJECT_NAME_INFORMATION_SIZE + 256 * 2 + 2];
+                if name_len != 0 {
+                    output[0..2].copy_from_slice(&(name_bytes as u16).to_le_bytes());
+                    output[2..4].copy_from_slice(&((name_bytes + 2) as u16).to_le_bytes());
+                    output[8..16].copy_from_slice(&(information + 16).to_le_bytes());
+                    Self::write_ascii_utf16le(
+                        &name_ascii[..name_len],
+                        &mut output[OBJECT_NAME_INFORMATION_SIZE..],
+                    );
+                }
+                if self.user_memory_write(memory, information, &output[..needed]) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            }
+            2 => {
+                let type_bytes = type_name.len() * 2;
+                let needed = OBJECT_TYPE_INFORMATION_SIZE + type_bytes + 2;
+                if self
+                    .write_query_object_return_length(
+                        memory,
+                        return_length,
+                        needed.min(u32::MAX as usize) as u32,
+                    )
+                    .is_err()
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if length < needed || !self.user_memory_probe_output(memory, information, needed) {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut output = [0u8; OBJECT_TYPE_INFORMATION_SIZE + 64];
+                output[0..2].copy_from_slice(&(type_bytes as u16).to_le_bytes());
+                output[2..4].copy_from_slice(&((type_bytes + 2) as u16).to_le_bytes());
+                output[8..16].copy_from_slice(&(information + 104).to_le_bytes());
+                output[16..20].copy_from_slice(&1u32.to_le_bytes()); // TotalNumberOfObjects
+                output[20..24].copy_from_slice(&1u32.to_le_bytes()); // TotalNumberOfHandles
+                output[84..88].copy_from_slice(&0x001F_FFFFu32.to_le_bytes());
+                output[89] = 1; // MaintainHandleCount
+                Self::write_ascii_utf16le(type_name, &mut output[OBJECT_TYPE_INFORMATION_SIZE..]);
+                if self.user_memory_write(memory, information, &output[..needed]) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            }
+            4 => {
+                let flags = match self.query_object_handle_flags(handle) {
+                    Ok(flags) => flags,
+                    Err(status) => return status,
+                };
+                if self
+                    .write_query_object_return_length(
+                        memory,
+                        return_length,
+                        OBJECT_HANDLE_FLAG_INFORMATION_SIZE as u32,
+                    )
+                    .is_err()
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if length != OBJECT_HANDLE_FLAG_INFORMATION_SIZE
+                    || !self.user_memory_probe_output(memory, information, length)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let output = [flags.inherit as u8, flags.protect_from_close as u8];
+                if self.user_memory_write(memory, information, &output) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
+            }
+            _ => {
+                let _ = self.write_query_object_return_length(
+                    memory,
+                    return_length,
+                    length.min(u32::MAX as usize) as u32,
+                );
+                STATUS_INVALID_INFO_CLASS
+            }
+        }
+    }
+
+    pub(crate) unsafe fn nt_set_information_object_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+        const OBJECT_HANDLE_FLAG_INFORMATION: u32 = 4;
+        const OBJECT_SESSION_INFORMATION: u32 = 5;
+        const OBJECT_HANDLE_FLAG_INFORMATION_SIZE: usize = 2;
+
+        let handle = args.first().copied().unwrap_or(0);
+        let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
+        let information = args.get(2).copied().unwrap_or(0);
+        let length = args.get(3).copied().unwrap_or(0) as usize;
+
+        match class {
+            OBJECT_HANDLE_FLAG_INFORMATION => {
+                if length != OBJECT_HANDLE_FLAG_INFORMATION_SIZE {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut encoded = [0u8; OBJECT_HANDLE_FLAG_INFORMATION_SIZE];
+                if information == 0 || !self.user_memory_read(memory, information, &mut encoded) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if handle == u64::MAX || handle == u64::MAX - 1 || handle >= OBJ_HANDLE_BASE {
+                    return STATUS_INVALID_HANDLE;
+                }
+                if handle > u32::MAX as u64 {
+                    return STATUS_INVALID_HANDLE;
+                }
+                let Some(caller) = self.pm_pid_for_pi(self.pi) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let flags = nt_process::HandleFlags {
+                    inherit: encoded[0] != 0,
+                    protect_from_close: encoded[1] != 0,
+                };
+                self.pm
+                    .set_handle_flags(caller, handle as nt_process::Handle, flags)
+                    .map_or_else(|status| status, |_| 0)
+            }
+            OBJECT_SESSION_INFORMATION => {
+                if handle < OBJ_HANDLE_BASE {
+                    return STATUS_INVALID_HANDLE;
+                }
+                let index = (handle - OBJ_HANDLE_BASE) as usize;
+                match self.obj_ns.get(index) {
+                    Some(entry) if entry.kind == 0 => 0,
+                    Some(_) => STATUS_INVALID_HANDLE,
+                    None => STATUS_INVALID_HANDLE,
+                }
+            }
+            _ => STATUS_INVALID_INFO_CLASS,
+        }
+    }
+
+    pub(crate) unsafe fn nt_allocate_virtual_memory_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
+        let ctx = self.loop_ctx.unwrap();
+        let base_ptr = args[1];
+        let size_ptr = args[3];
+        let zero_bits = args[2];
+        let allocation_type = args[4] as u32;
+        let protection = args[5] as u32;
+        if let Err(status) =
+            nt_address_space::validate_allocate_parameters(zero_bits, allocation_type, protection)
+        {
+            return status;
+        }
+        if !self.user_memory_probe_output(memory, base_ptr, 8)
+            || !self.user_memory_probe_output(memory, size_ptr, 8)
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut word = [0u8; 8];
+        if !self.user_memory_read(memory, base_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let base_in = u64::from_le_bytes(word);
+        if !self.user_memory_read(memory, size_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let want = u64::from_le_bytes(word);
+        if base_in > HIGHEST_VAD_ADDRESS {
+            return nt_address_space::STATUS_INVALID_PARAMETER_2;
+        }
+        if HIGHEST_VAD_ADDRESS + 1 - base_in < want || want == 0 {
+            return nt_address_space::STATUS_INVALID_PARAMETER_4;
+        }
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        if allocation_type & nt_address_space::MEM_LARGE_PAGES != 0 {
+            if !self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY) {
+                return STATUS_PRIVILEGE_NOT_HELD;
+            }
+            return STATUS_INVALID_PARAMETER;
+        }
+        if allocation_type & (nt_address_space::MEM_PHYSICAL | nt_address_space::MEM_WRITE_WATCH)
+            != 0
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let copy_on_write = matches!(
+            protection & 0xff,
+            nt_address_space::PAGE_WRITECOPY | nt_address_space::PAGE_EXECUTE_WRITECOPY
+        );
+        let created_vad = base_in == 0 || allocation_type & nt_address_space::MEM_RESERVE != 0;
+        if created_vad && copy_on_write {
+            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
+        let placement_limit = if base_in == 0 && zero_bits != 0 {
+            let highest = u64::MAX >> zero_bits;
+            if highest > HIGHEST_VAD_ADDRESS {
+                return nt_address_space::STATUS_INVALID_PARAMETER_3;
+            }
+            PRIVATE_VM_LIMIT.min(highest + 1)
+        } else {
+            PRIVATE_VM_LIMIT
+        };
+        let procs = &mut *ctx.procs;
+        let target = procs[target_pi];
+        if target.pml4 == 0 || target.scratch_base == 0 {
+            return nt_process::STATUS_INVALID_HANDLE;
+        }
+        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+            .add(target_pi);
+        // STATIC scratch, not stack — see the matching note in the free path.
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = core::ptr::read(vm_map);
+        *after = *before;
+        let plan = match after.allocate_below(
+            (base_in != 0).then_some(base_in),
+            want,
+            allocation_type,
+            protection,
+            placement_limit,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
+        if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
+            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
+        if self.current_process_is_winlogon()
+            && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
+        {
+            print_str(b"[winlogon-vm] base_ptr=0x");
+            print_hex((base_ptr >> 32) as u32);
+            print_hex(base_ptr as u32);
+            print_str(b" size_ptr=0x");
+            print_hex((size_ptr >> 32) as u32);
+            print_hex(size_ptr as u32);
+            print_str(b" base_in=0x");
+            print_hex((base_in >> 32) as u32);
+            print_hex(base_in as u32);
+            print_str(b" want=0x");
+            print_hex((want >> 32) as u32);
+            print_hex(want as u32);
+            print_str(b" type=0x");
+            print_hex(args[4] as u32);
+            print_str(b" selected=0x");
+            print_hex((plan.base >> 32) as u32);
+            print_hex(plan.base as u32);
+            print_str(b"\n");
+        }
+
+        let mut page = plan.base;
+        let mut changed_end = plan.base;
+        let mut map_status = 0u32;
+        while page < plan.base + plan.size {
+            let old = before.extent_at(page);
+            let new = after.extent_at(page);
+            if new.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
+            {
+                if old
+                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
+                {
+                    if let Err(status) = vm_map_private_page(
+                        target_pi,
+                        page,
+                        new.unwrap().protection,
+                        target.pml4,
+                        target.scratch_base,
+                    ) {
+                        map_status = status;
+                        break;
+                    }
+                } else if old.unwrap().protection != new.unwrap().protection {
+                    if let Err(status) = vm_reprotect_private_page(
+                        target_pi,
+                        page,
+                        old.unwrap().protection,
+                        new.unwrap().protection,
+                        target.pml4,
+                    ) {
+                        map_status = status;
+                        break;
+                    }
+                }
+            }
+            page += 0x1000;
+            changed_end = page;
+        }
+        if map_status != 0 {
+            page = plan.base;
+            while page < changed_end {
+                let old = before.extent_at(page);
+                let new = after.extent_at(page);
+                if old
+                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
+                    && new.is_some_and(|extent| {
+                        extent.state == nt_address_space::VmExtentState::Committed
+                    })
+                {
+                    vm_unmap_private_page(target_pi, page);
+                } else if let (Some(old), Some(new)) = (old, new) {
+                    if old.state == nt_address_space::VmExtentState::Committed
+                        && new.state == nt_address_space::VmExtentState::Committed
+                        && old.protection != new.protection
+                    {
+                        let _ = vm_reprotect_private_page(
+                            target_pi,
+                            page,
+                            new.protection,
+                            old.protection,
+                            target.pml4,
+                        );
+                    }
+                }
+                page += 0x1000;
+            }
+            return map_status;
+        }
+        core::ptr::write(vm_map, *after);
+        let size_written = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
+        let base_written = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
+        if !created_vad && (!size_written || !base_written) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    pub(crate) unsafe fn nt_protect_virtual_memory_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        let base_ptr = args[1];
+        let size_ptr = args[2];
+        let oldprot_ptr = args[4];
+        if !self.user_memory_probe_output(memory, base_ptr, 8)
+            || !self.user_memory_probe_output(memory, size_ptr, 8)
+            || (oldprot_ptr != 0 && !self.user_memory_probe_output(memory, oldprot_ptr, 4))
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut word = [0u8; 8];
+        if !self.user_memory_read(memory, base_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let base = u64::from_le_bytes(word);
+        if !self.user_memory_read(memory, size_ptr, &mut word) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let size = u64::from_le_bytes(word);
+        if oldprot_ptr != 0 && !self.user_memory_write(memory, oldprot_ptr, &0x04u32.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let registry_slot = self
+            .loop_ctx
+            .and_then(|ctx| (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot));
+        loader_trace_record(
+            self.pi,
+            LoaderOp::ProtectVirtualMemory,
+            0,
+            registry_slot,
+            base,
+            size,
+            b"",
+        );
+        0
     }
 
     unsafe fn nt_copy_virtual_memory(&mut self, args: &[u64], read: bool) -> u32 {
@@ -4605,11 +5517,10 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return STATUS_INVALID_HANDLE,
         };
-        let target = match self.pm.resolve_process_handle(
-            caller,
-            args[0],
-            PROCESS_SET_INFORMATION,
-        ) {
+        let target = match self
+            .pm
+            .resolve_process_handle(caller, args[0], PROCESS_SET_INFORMATION)
+        {
             Ok(pid) => pid,
             Err(status) => return status,
         };
@@ -4684,15 +5595,28 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
-        match self.pm.take_handle(pid, handle as nt_process::Handle) {
+    pub(crate) fn close_process_handle_checked(
+        &mut self,
+        pid: nt_process::ProcessId,
+        handle: u64,
+    ) -> Result<bool, u32> {
+        match self
+            .pm
+            .take_handle_for_close(pid, handle as nt_process::Handle)
+        {
             Ok(object) => {
                 self.release_handle_object(object);
                 PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                true
+                Ok(true)
             }
-            Err(_) => false,
+            Err(nt_process::STATUS_INVALID_HANDLE) => Ok(false),
+            Err(status) => Err(status),
         }
+    }
+
+    pub(crate) fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
+        self.close_process_handle_checked(pid, handle)
+            .unwrap_or(false)
     }
 
     fn release_process_handles(&mut self, pid: nt_process::ProcessId) {
@@ -4731,9 +5655,7 @@ impl ExecNtHandler {
                 .retain(token)
                 .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
             nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
-            nt_process::HandleObject::File(file_id) => {
-                self.file_completion.retain_file(file_id)
-            }
+            nt_process::HandleObject::File(file_id) => self.file_completion.retain_file(file_id),
             nt_process::HandleObject::Directory { object_id, .. } => {
                 self.directory_opens.retain(object_id)
             }
@@ -4864,9 +5786,9 @@ impl ExecNtHandler {
                 if u32::from_le_bytes(captured[0..4].try_into().unwrap()) != 12 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                level = match nt_security::SecurityImpersonationLevel::try_from(
-                    u32::from_le_bytes(captured[4..8].try_into().unwrap()),
-                ) {
+                level = match nt_security::SecurityImpersonationLevel::try_from(u32::from_le_bytes(
+                    captured[4..8].try_into().unwrap(),
+                )) {
                     Ok(level) => level,
                     Err(status) => return status,
                 };
@@ -4892,15 +5814,14 @@ impl ExecNtHandler {
         } else {
             args[1] as u32
         };
-        let duplicate = match self.token_store.duplicate(
-            source,
-            token_type,
-            level,
-            (args[3] as u8) != 0,
-        ) {
-            Ok(token) => token,
-            Err(status) => return status,
-        };
+        let duplicate =
+            match self
+                .token_store
+                .duplicate(source, token_type, level, (args[3] as u8) != 0)
+            {
+                Ok(token) => token,
+                Err(status) => return status,
+            };
         let status = self.insert_owned_token_handle(caller_pid, duplicate, desired_access, out);
         if status == 0 {
             self.token_dirty = true;
@@ -5241,19 +6162,26 @@ impl ExecNtHandler {
             }
         };
 
-        let teb = self.pm.thread(tid).map(|thread| thread.teb_base).unwrap_or(0);
+        let teb = self
+            .pm
+            .thread(tid)
+            .map(|thread| thread.teb_base)
+            .unwrap_or(0);
         let teb = if teb != 0 {
             teb
         } else if tid == self.current_tid as nt_process::ThreadId {
-            if self.current_process_is_smss() { SMSS_TEB_VA } else { TEB_VA }
+            if self.current_process_is_smss() {
+                SMSS_TEB_VA
+            } else {
+                TEB_VA
+            }
         } else {
             0
         };
         if teb != 0 {
             let mut state = [0u8; 8];
-            state[..4].copy_from_slice(
-                &(if replacement.is_some() { u32::MAX } else { 0 }).to_le_bytes(),
-            );
+            state[..4]
+                .copy_from_slice(&(if replacement.is_some() { u32::MAX } else { 0 }).to_le_bytes());
             state[4] = u8::from(replacement.is_some());
             if !self.xas_try_write_buf(
                 teb + nt_ntdll_layout::TEB_IMPERSONATION_LOCALE_OFFSET,
@@ -5330,8 +6258,8 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
 
-        let required_access = TOKEN_ADJUST_PRIVILEGES
-            | if previous_state != 0 { TOKEN_QUERY } else { 0 };
+        let required_access =
+            TOKEN_ADJUST_PRIVILEGES | if previous_state != 0 { TOKEN_QUERY } else { 0 };
         let token_id = match self.token_id_for_handle(args[0], required_access) {
             Ok(token) => token,
             Err(status) => return status,
@@ -5368,8 +6296,7 @@ impl ExecNtHandler {
             for (index, privilege) in previous[..result.changed].iter().enumerate() {
                 let offset = 4 + index * 12;
                 output[offset..offset + 4].copy_from_slice(&privilege.luid.low.to_le_bytes());
-                output[offset + 4..offset + 8]
-                    .copy_from_slice(&privilege.luid.high.to_le_bytes());
+                output[offset + 4..offset + 8].copy_from_slice(&privilege.luid.high.to_le_bytes());
                 output[offset + 8..offset + 12]
                     .copy_from_slice(&privilege.attributes.to_le_bytes());
             }
@@ -5712,7 +6639,8 @@ impl ExecNtHandler {
             loop {
                 let has_alias = unsafe { csrss_frame_alias_get(pi, page) } != 0;
                 if !has_alias
-                    && unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }.is_none()
+                    && unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }
+                        .is_none()
                 {
                     if !may_fill {
                         return false;
@@ -6252,23 +7180,48 @@ impl ExecNtHandler {
                     .iter()
                     .zip(name.iter())
                     .all(|(&wide, &ascii)| {
-                        wide <= 0x7f && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
+                        wide <= 0x7f
+                            && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
                     })
         })
     }
-    /// Service winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
+
+    pub(crate) unsafe fn model_csr_request_reply(&mut self, reqmsg: u64) -> u32 {
+        let api_number = {
+            let mut b = [0u8; 4];
+            if self.xas_read(reqmsg + 0x30, &mut b) {
+                u32::from_le_bytes(b)
+            } else {
+                0xFFFF_FFFF
+            }
+        };
+        // CSR_API_MESSAGE.Status = STATUS_SUCCESS and Header.u2.s2.Type = LPC_REPLY.
+        let _ = self.xas_try_write_buf(reqmsg + 0x34, &0u32.to_le_bytes());
+        let _ = self.xas_try_write_buf(
+            reqmsg + 0x04,
+            &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
+        );
+        print_str(b"[csr-msg] CsrClientCallServer ApiNumber=0x");
+        print_hex(api_number);
+        print_str(b" -> modeled reply Status=SUCCESS (direct message fallback)\n");
+        CSR_API_MODELED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
-    /// csrss owns \Windows\ApiPort but its real CsrApiRequestThread doesn't run yet, so the executive
-    /// MODELS the CSR acceptor (interim, mirroring SM path A): auto-accept through the broker + fill the
-    /// reply the client reads back. kernel32's BaseDllInitialize is FATAL on a failed connect and then
+    /// csrss owns \Windows\ApiPort and pending connects are completed by the real
+    /// CsrApiRequestThread rendezvous. The executive still fills the CSR connect reply payload the
+    /// client reads back, because the isolated LPC broker does not carry that payload yet.
+    /// kernel32's BaseDllInitialize is FATAL on a failed connect and then
     /// dereferences the shared static server data (`Peb->ReadOnlyStaticServerData[BASESRV]->
     /// WindowsDirectory`), so this must hand back real, mapped memory:
     ///  - `ClientView` (PORT_VIEW LpcWrite) ViewBase = a 64 KiB RW region kernel32 RtlCreateHeaps over.
     ///  - `ConnectionInfo` (CSR_API_CONNECTINFO) SharedSectionBase/Heap, SharedStaticServerData (→ an
     ///    array whose [BASESRV=1] slot points at a BASE_STATIC_SERVER_DATA with valid Windows dirs),
     ///    and ServerProcessId.
-    /// All out-params are winlogon STACK locals (ConnectionInfo/LpcWrite) reached via the mirror; the
-    /// backing regions are mapped into winlogon's own VSpace (lazily, once). Returns STATUS_SUCCESS.
+    /// All out-params are client STACK locals (ConnectionInfo/LpcWrite) reached via the mirror; the
+    /// backing regions are mapped into the client's own VSpace (lazily, once). Returns STATUS_SUCCESS.
     pub(crate) unsafe fn csr_client_connect(
         &mut self,
         name16: &[u16],
@@ -6286,19 +7239,16 @@ impl ExecNtHandler {
         // *PortHandle so the LOOP drives `csr_rendezvous` — csrss's REAL CsrApiRequestThread issues the
         // NtReplyWaitReceivePort → CsrApiHandleConnectionRequest → NtAcceptConnectPort →
         // NtCompleteConnectPort. The loop overrides the client handle + writes *PortHandle after the
-        // rendezvous. Only if the broker connect is NOT pending (no live named port) do we fall back to
-        // a modeled handle + write it here. IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
+        // rendezvous. Only if the broker connect is NOT pending do we write a modeled handle here.
+        // IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
         let mut client_handle = 0u64;
         let mut pending = false;
         if let Some(c) = lpc_client() {
             if let Ok(r) = c.connect_port(name16, 2, &[]) {
-                // ★ AUTHENTIC rendezvous accept is scoped to winlogon (pi 2) — csrss's REAL
-                // CsrApiRequestThread accepts ONE pending connect (winlogon's) then parks; there is no
-                // second acceptor for services (pi 3) yet, so driving `csr_rendezvous` for pi>=3 would
-                // spin the nested accept loop forever. services+ take the MODELED accept (a minted
-                // client handle + the mapped CSR view/static-data below) so their bring-up proceeds;
-                // wiring a per-client CSR acceptor for services is the SCM batch's frontier.
-                if self.current_process_is_winlogon() && r.pending && r.connection_id != 0 {
+                if self.current_process_uses_csr_client_connect()
+                    && r.pending
+                    && r.connection_id != 0
+                {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
                     pending = true;
@@ -6440,7 +7390,7 @@ impl ExecNtHandler {
         print_str(b"[csr] pi=");
         print_u64(self.pi as u64);
         print_str(if pending {
-            b" NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(fallback)=0x".as_slice()
+            b" NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(deferred)=0x".as_slice()
         } else {
             b" NtSecureConnectPort(\\Windows\\ApiPort) -> modeled accept; client=0x".as_slice()
         });
@@ -6667,7 +7617,10 @@ impl ExecNtHandler {
             return self.hive.as_ref()?.open_key(&comps[3..].join("\\"));
         }
         if comps[2].eq_ignore_ascii_case("SECURITY") {
-            let cell = self.security_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
+            let cell = self
+                .security_hive
+                .as_ref()?
+                .open_key(&comps[3..].join("\\"))?;
             return Some(HIVE_SEL_SECURITY | cell);
         }
         if comps[2].eq_ignore_ascii_case("SAM") {
@@ -6698,7 +7651,10 @@ impl ExecNtHandler {
         // last so no pre-existing resolution changes: before it, every non-Winlogon Software key
         // fell out of this function as `None`.
         if comps[2].eq_ignore_ascii_case("SOFTWARE") {
-            let cell = self.software_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
+            let cell = self
+                .software_hive
+                .as_ref()?
+                .open_key(&comps[3..].join("\\"))?;
             return Some(HIVE_SEL_SOFTWARE | cell);
         }
         None
@@ -6793,10 +7749,10 @@ impl ExecNtHandler {
             // table by its SLOT (path 1b — the value IS the dense per-process table handle now, so
             // close by value directly; no value-tag scan). Append-only allocation means the freed
             // slot is NOT recycled, so a later open never reuses a closed value (keeping external
-            // bindings — the per-pi DLL registry — consistent). We still return SUCCESS
-            // unconditionally (matching the prior no-op) so a close of a handle the executive
-            // doesn't own stays benign. A win32k USER-object handle is closed through that owning
-            // table so a duplicated desktop handle has an independent lifetime.
+            // bindings — the per-pi DLL registry — consistent). Handles explicitly marked
+            // protect-from-close now fail like NT; a close of a handle the executive doesn't own
+            // stays benign for the hosted boot path. A win32k USER-object handle is closed through
+            // that owning table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
                 let mut closed = false;
                 if let Some(loop_ctx) = self.loop_ctx {
@@ -6805,7 +7761,10 @@ impl ExecNtHandler {
                     }
                 }
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                    closed = self.close_process_handle(pid, args[0]);
+                    match self.close_process_handle_checked(pid, args[0]) {
+                        Ok(was_closed) => closed = was_closed,
+                        Err(status) => return status,
+                    }
                 }
                 if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
                 {
@@ -8722,39 +9681,12 @@ impl ExecNtHandler {
                 }
             },
             // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect[arg5]=args[4]).
-            // We don't model per-page protection yet — report success + a plausible previous
-            // protection so LdrpInitialize's protect/restore pairs proceed.
+            // The common helper keeps the normal process and CSR worker user-memory views aligned.
             NativeService::NtProtectVirtualMemory => unsafe {
-                let oldprot_ptr = args[4]; // *OldAccessProtection
-                if oldprot_ptr != 0 {
-                    // DWORD write: OldProtect is a ULONG; an 8-byte write clobbers the caller's
-                    // adjacent local (in LdrpSetProtection that is the section-header pointer).
-                    smss_stack_write32(oldprot_ptr, 0x04); // PAGE_READWRITE
-                }
-                let mut word = [0u8; 8];
-                let base = if self.xas_read(args[1], &mut word) {
-                    u64::from_le_bytes(word)
-                } else {
-                    0
-                };
-                let size = if self.xas_read(args[2], &mut word) {
-                    u64::from_le_bytes(word)
-                } else {
-                    0
-                };
-                let registry_slot = self.loop_ctx.and_then(|ctx| {
-                    (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot)
-                });
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::ProtectVirtualMemory,
-                    0,
-                    registry_slot,
-                    base,
-                    size,
-                    b"",
-                );
-                0
+                self.nt_protect_virtual_memory_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
             },
             // NtDisplayString(*String[R10]=args[0] = PUNICODE_STRING). smss prints boot/status text;
             // route it to the serial console.
@@ -9671,14 +10603,12 @@ impl ExecNtHandler {
                 0xC000_009A // STATUS_INSUFFICIENT_RESOURCES
             }
             // NtSecureConnectPort — the CSR client connect (kernel32's CsrClientConnectToServer →
-            // \Windows\ApiPort, from winlogon's BaseDllInitialize). The SECURE variant (SecurityQos +
+            // \Windows\ApiPort, from each Win32 client's BaseDllInitialize). The SECURE variant (SecurityQos +
             // ServerSid) is CSR-only in this system: SmConnectToSm uses plain NtConnectPort(33), so 218
-            // unambiguously means "a Win32 client connecting to CSR". csrss OWNS \Windows\ApiPort but
-            // its real CsrApiRequestThread doesn't run (interim), so the executive MODELS the CSR
-            // acceptor: auto-accept in the broker + fill the CSR_API_CONNECTINFO reply (SharedSection
-            // pointers + a BASE_STATIC_SERVER_DATA) + the LpcWrite PORT_VIEW, so kernel32's DllMain
-            // proceeds. See `csr_client_connect`. (Authentic swap: drive csrss's real
-            // CsrApiRequestThread via a csr_rendezvous, mirroring the SM path A→B.)
+            // unambiguously means "a Win32 client connecting to CSR". A client's pending broker
+            // connect is completed by the real CsrApiRequestThread rendezvous; the executive fills
+            // CSR_API_CONNECTINFO (SharedSection pointers + BASE_STATIC_SERVER_DATA) and the LpcWrite
+            // PORT_VIEW because that connect payload is not carried by the isolated broker yet.
             // x64 ABI: PortHandle=R10=args[0], PortName=RDX=args[1], SecurityQos=R8, ClientView=R9,
             // ServerSid=[sp+0x28], ServerView=[sp+0x30], MaxMsgLen=[sp+0x38], ConnInfo=[sp+0x40],
             // ConnInfoLen=[sp+0x48].
@@ -9691,13 +10621,11 @@ impl ExecNtHandler {
                 self.csr_client_connect(&name16, porthandle_ptr, clientview_ptr, conninfo_ptr)
             },
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
-            // message DATA plane. kernel32's CsrClientCallServer sends the CsrpClientConnect message
-            // (ApiNumber 0, ServerId=BASESRV) right after the port connect; its reply Status must be
-            // STATUS_SUCCESS or BaseDllInitialize fails. Serviced by the DIRECT cross-badge message
-            // plane: the executive reads the CSR_API_MESSAGE off the caller's stack (mirror) and models
-            // csrss's reply in place (Status=SUCCESS), against the cached winlogon↔\Windows\ApiPort
-            // LpcConnRecord — never a round-trip to the isolated broker. (Interim: a real acceptor would
-            // be csrss's CsrApiRequestThread; this models it, like SM path A.)
+            // message DATA plane. SM requests are already driven through real SmpApiLoop. CSR API
+            // requests now use the same shape when csrss's CsrApiRequestThread is parked on
+            // \Windows\ApiPort; if the real worker cannot service a particular message yet, the loop
+            // falls back to the historical modeled success reply for that message rather than wedging
+            // the boot.
             NativeService::NtRequestWaitReplyPort => unsafe {
                 if self.current_process_is_smss()
                     && self.lpc_connection_is(args[0], 0, b"\\smapiport")
@@ -9708,25 +10636,16 @@ impl ExecNtHandler {
                     print_str(b"[sm-api] routing SMSS request to real SmpApiLoop\n");
                     return 0;
                 }
-                let reqmsg = args[1]; // RDX = &ApiMessage.Header (request, in/out = same buffer)
-                // CSR_API_MESSAGE: PORT_MESSAGE Header(0x28), CsrCaptureData@0x28, ApiNumber@0x30,
-                // Status@0x34. Read ApiNumber, model the CSR server: every call → STATUS_SUCCESS.
-                let api_number = {
-                    let mut b = [0u8; 4];
-                    if smss_copyin(reqmsg + 0x30, &mut b) {
-                        u32::from_le_bytes(b)
-                    } else {
-                        0xFFFF_FFFF
-                    }
-                };
-                // Reply in place: Status@+0x34 = STATUS_SUCCESS + mark the PORT_MESSAGE Type = LPC_REPLY.
-                smss_stack_write32(reqmsg + 0x34, 0); // ApiMessage.Status = STATUS_SUCCESS
-                smss_stack_write16(reqmsg + 0x04, nt_lpc_abi::msg_type::LPC_REPLY); // Header.u2.s2.Type
-                print_str(b"[csr-msg] winlogon CsrClientCallServer ApiNumber=0x");
-                print_hex(api_number);
-                print_str(b" -> modeled reply Status=SUCCESS (direct message plane)\n");
-                CSR_MSGS.fetch_add(1, Ordering::Relaxed);
-                0
+                if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport")
+                    && CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0
+                {
+                    self.csr_request_port = args[0];
+                    self.csr_request_message = args[1];
+                    self.csr_reply_message = args[2];
+                    print_str(b"[csr-api] routing CSR request to real CsrApiRequestThread\n");
+                    return 0;
+                }
+                self.model_csr_request_reply(args[1])
             },
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
@@ -10636,139 +11555,7 @@ impl ExecNtHandler {
             NativeService::NtCreateToken => unsafe { self.nt_create_token(args) },
             NativeService::NtAccessCheck => unsafe { self.nt_access_check(ctx, args) },
             NativeService::NtResumeThread => unsafe {
-                const THREAD_SUSPEND_RESUME: u32 = 0x0002;
-                print_str(b"[thread-life] NtResumeThread pi=");
-                print_u64(self.pi as u64);
-                print_str(b" handle=0x");
-                print_hex(args[0] as u32);
-                print_str(b" previous_ptr=0x");
-                print_hex((args[1] >> 32) as u32);
-                print_hex(args[1] as u32);
-                print_str(b"\n");
-                let caller_pid = match self.pm_pid_for_pi(self.pi) {
-                    Some(pid) => pid,
-                    None => {
-                        print_str(b"[thread-life] resume failed: caller has no EPROCESS\n");
-                        return nt_process::STATUS_INVALID_HANDLE;
-                    }
-                };
-                let tid = match self.pm.resolve_thread_handle(
-                    caller_pid,
-                    self.current_tid as nt_process::ThreadId,
-                    args[0],
-                    THREAD_SUSPEND_RESUME,
-                ) {
-                    Ok(tid) => tid as u64,
-                    Err(status) => {
-                        print_str(b"[thread-life] resume failed: handle resolution status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        return status;
-                    }
-                };
-                let Some(mechanism) = self.hosted_thread_mechanism_for_tid(tid) else {
-                    return nt_process::STATUS_INVALID_HANDLE;
-                };
-                let (pi, slot) = match mechanism.kind {
-                    nt_user_host::ThreadMechanismKind::Main => {
-                        let main_pi = mechanism.pi;
-                        let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
-                            Ok(previous) => previous,
-                            Err(status) => return status,
-                        };
-                        print_str(b"[thread-life] resume main tid=");
-                        print_u64(tid);
-                        print_str(b" pi=");
-                        print_u64(main_pi as u64);
-                        print_str(b" previous=");
-                        print_u64(previous as u64);
-                        print_str(b"\n");
-                        if args[1] != 0 {
-                            if !self.xas_write_u32(args[1], previous) {
-                                return 0xC000_0005;
-                            }
-                        }
-                        if previous == 1 {
-                            let tcb = self.hosted_main_thread_tcb_for_pi(main_pi).unwrap_or(0);
-                            if tcb <= 1 || tcb_resume(tcb) != 0 {
-                                return 0xC000_0001;
-                            }
-                        }
-                        return 0;
-                    }
-                    nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
-                };
-                // BATCH 35: the SCM per-connection worker is routed into the multiplex but left
-                // SUSPENDED (its trampoline-entry fault is unresolved — see the frontier note). rpcrt4
-                // calls NtResumeThread on it; report SUCCESS with previous=1 (so rpcrt4 believes the
-                // worker resumed) but DON'T actually tcb_resume it (that would run the broken trampoline
-                // and destabilise the boot). Clears its suspended bit so the ETHREAD state stays coherent.
-                let scm_worker_tid = SCM_WORKER_TID.load(Ordering::Relaxed);
-                if scm_worker_tid != 0 && tid == scm_worker_tid {
-                    let bit = 1u64 << slot;
-                    PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed);
-                    if args[1] != 0 {
-                        if !self.xas_write_u32(args[1], 1) {
-                            return 0xC000_0005;
-                        }
-                    }
-                    print_str(b"[scm-worker] NtResumeThread -> SUCCESS (not resumed; trampoline-entry fault, see frontier)\n");
-                    return 0;
-                }
-                let bit = 1u64 << slot;
-                let previous = if PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
-                    1
-                } else {
-                    0
-                };
-                if args[1] != 0 {
-                    if !self.xas_write_u32(args[1], previous as u32) {
-                        return 0xC000_0005;
-                    }
-                }
-                if previous != 0 {
-                    let _ = self
-                        .pm
-                        .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Ready);
-                    let csr_role = if tid == CSR_API_TID.load(Ordering::Relaxed) {
-                        1
-                    } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
-                        2
-                    } else {
-                        0
-                    };
-                    if csr_role != 0 {
-                        // The outer loop owns CSRSS's shared native IPC frame. It resumes this TCB,
-                        // drives it to a blocked port receive, then replies to the main thread.
-                        self.csr_start_request = csr_role;
-                        print_str(b"[csr-thread] resume scheduled role=");
-                        print_u64(csr_role as u64);
-                        print_str(b" tid=");
-                        print_u64(tid);
-                        print_str(b" previous=1\n");
-                        return 0;
-                    }
-                    let tcb = self.hosted_thread_tcb_for_nt_resume_thread(tid).unwrap_or(0);
-                    if tcb <= 1 {
-                        return 0xC000_0001;
-                    }
-                    let result = tcb_resume(tcb);
-                    print_str(b"[thread-life] resume pi=");
-                    print_u64(pi as u64);
-                    print_str(b" slot=");
-                    print_u64(slot as u64);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b" tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" previous=1 result=");
-                    print_u64(result);
-                    print_str(b"\n");
-                    if result != 0 {
-                        return 0xC000_0001;
-                    }
-                }
-                0
+                self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
             // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
             // track permanence. Success no-op.
@@ -11034,8 +11821,13 @@ impl ExecNtHandler {
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
             // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
             // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
-            | NativeService::NtSetDefaultLocale
-            | NativeService::NtSetInformationObject => 0,
+            | NativeService::NtSetDefaultLocale => 0,
+            NativeService::NtSetInformationObject => unsafe {
+                self.nt_set_information_object_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
+            },
             NativeService::NtAdjustPrivilegesToken => unsafe {
                 self.nt_adjust_privileges_token(args)
             },
@@ -11265,33 +12057,9 @@ impl ExecNtHandler {
                 }
             },
             // NtQueryObject(Handle[R10]=args[0], class[RDX]=args[1], buf[R8]=args[2], len[R9]=args[3],
-            // *RetLen[arg5]=args[4]). DIAGNOSTIC: log + return a zeroed buffer + retlen.
+            // *RetLen[arg5]=args[4]).
             NativeService::NtQueryObject => unsafe {
-                let class = args[1];
-                let handle = args[0];
-                let buf = args[2];
-                let len = args[3];
-                let retlen_ptr = args[4];
-                print_str(b"[ntos-exec] NtQueryObject handle=0x");
-                print_hex(handle as u32);
-                print_str(b" class=");
-                print_u64(class);
-                print_str(b" len=");
-                print_u64(len);
-                print_str(b"\n");
-                if len > 0 {
-                    if let Some(m) = smss_mirror(buf, len.min(64)) {
-                        for i in 0..len.min(64) {
-                            core::ptr::write_volatile((m + i) as *mut u8, 0);
-                        }
-                    }
-                }
-                if retlen_ptr != 0 {
-                    if let Some(m) = smss_mirror(retlen_ptr, 4) {
-                        core::ptr::write_volatile(m as *mut u32, 0);
-                    }
-                }
-                0
+                self.nt_query_object_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
             // NtWaitForSingleObject(Handle=R10=args[0], Alertable=RDX, *Timeout=R8).
             //
@@ -12078,215 +12846,10 @@ impl ExecNtHandler {
             // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). The fixed VAD policy selects
             // the target process's range; newly committed pages are mapped into that target PML4.
             NativeService::NtAllocateVirtualMemory => unsafe {
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-                const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
-                const PROCESS_VM_OPERATION: u32 = 0x0008;
-                const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
-                let ctx = self.loop_ctx.unwrap();
-                let base_ptr = args[1]; // RDX
-                let size_ptr = args[3]; // R9
-                let zero_bits = args[2];
-                let allocation_type = args[4] as u32;
-                let protection = args[5] as u32;
-                if let Err(status) = nt_address_space::validate_allocate_parameters(
-                    zero_bits,
-                    allocation_type,
-                    protection,
-                ) {
-                    return status;
-                }
-                if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 8) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let mut word = [0u8; 8];
-                if !self.xas_read(base_ptr, &mut word) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let base_in = u64::from_le_bytes(word);
-                if !self.xas_read(size_ptr, &mut word) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                let want = u64::from_le_bytes(word);
-                if base_in > HIGHEST_VAD_ADDRESS {
-                    return nt_address_space::STATUS_INVALID_PARAMETER_2;
-                }
-                if HIGHEST_VAD_ADDRESS + 1 - base_in < want || want == 0 {
-                    return nt_address_space::STATUS_INVALID_PARAMETER_4;
-                }
-                let (target_pid, target_pi) =
-                    match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
-                        Ok(target) => target,
-                        Err(status) => return status,
-                    };
-                if self.pm.process(target_pid).is_some_and(|process| {
-                    matches!(
-                        process.state,
-                        nt_process::ProcessState::Exiting
-                            | nt_process::ProcessState::Terminated
-                    )
-                }) {
-                    return nt_process::STATUS_PROCESS_IS_TERMINATING;
-                }
-                if allocation_type & nt_address_space::MEM_LARGE_PAGES != 0 {
-                    if !self.current_token_has_privilege(nt_security::SE_LOCK_MEMORY) {
-                        return STATUS_PRIVILEGE_NOT_HELD;
-                    }
-                    return STATUS_INVALID_PARAMETER;
-                }
-                if allocation_type
-                    & (nt_address_space::MEM_PHYSICAL | nt_address_space::MEM_WRITE_WATCH)
-                    != 0
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-                let copy_on_write = matches!(
-                    protection & 0xff,
-                    nt_address_space::PAGE_WRITECOPY
-                        | nt_address_space::PAGE_EXECUTE_WRITECOPY
-                );
-                let created_vad =
-                    base_in == 0 || allocation_type & nt_address_space::MEM_RESERVE != 0;
-                if created_vad && copy_on_write {
-                    return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
-                }
-                let placement_limit = if base_in == 0 && zero_bits != 0 {
-                    let highest = u64::MAX >> zero_bits;
-                    if highest > HIGHEST_VAD_ADDRESS {
-                        return nt_address_space::STATUS_INVALID_PARAMETER_3;
-                    }
-                    PRIVATE_VM_LIMIT.min(highest + 1)
-                } else {
-                    PRIVATE_VM_LIMIT
-                };
-                let procs = &mut *ctx.procs;
-                let target = procs[target_pi];
-                if target.pml4 == 0 || target.scratch_base == 0 {
-                    return nt_process::STATUS_INVALID_HANDLE;
-                }
-                let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-                    as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-                    .add(target_pi);
-                // STATIC scratch, not stack — see the matching note in the free path.
-                let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-                let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                *before = core::ptr::read(vm_map);
-                *after = *before;
-                let plan = match after.allocate_below(
-                    (base_in != 0).then_some(base_in),
-                    want,
-                    allocation_type,
-                    protection,
-                    placement_limit,
-                ) {
-                    Ok(plan) => plan,
-                    Err(status) => return status,
-                };
-                crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
-                if !created_vad
-                    && allocation_type != nt_address_space::MEM_RESET
-                    && copy_on_write
-                {
-                    return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
-                }
-                if self.current_process_is_winlogon()
-                    && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
-                {
-                    print_str(b"[winlogon-vm] base_ptr=0x");
-                    print_hex((base_ptr >> 32) as u32);
-                    print_hex(base_ptr as u32);
-                    print_str(b" size_ptr=0x");
-                    print_hex((size_ptr >> 32) as u32);
-                    print_hex(size_ptr as u32);
-                    print_str(b" base_in=0x");
-                    print_hex((base_in >> 32) as u32);
-                    print_hex(base_in as u32);
-                    print_str(b" want=0x");
-                    print_hex((want >> 32) as u32);
-                    print_hex(want as u32);
-                    print_str(b" type=0x");
-                    print_hex(args[4] as u32);
-                    print_str(b" selected=0x");
-                    print_hex((plan.base >> 32) as u32);
-                    print_hex(plan.base as u32);
-                    print_str(b"\n");
-                }
-
-                let mut page = plan.base;
-                let mut changed_end = plan.base;
-                let mut map_status = 0u32;
-                while page < plan.base + plan.size {
-                    let old = before.extent_at(page);
-                    let new = after.extent_at(page);
-                    if new.is_some_and(|extent| {
-                        extent.state == nt_address_space::VmExtentState::Committed
-                    }) {
-                        if old.is_none_or(|extent| {
-                            extent.state != nt_address_space::VmExtentState::Committed
-                        }) {
-                            if let Err(status) = vm_map_private_page(
-                                target_pi,
-                                page,
-                                new.unwrap().protection,
-                                target.pml4,
-                                target.scratch_base,
-                            ) {
-                                map_status = status;
-                                break;
-                            }
-                        } else if old.unwrap().protection != new.unwrap().protection {
-                            if let Err(status) = vm_reprotect_private_page(
-                                target_pi,
-                                page,
-                                old.unwrap().protection,
-                                new.unwrap().protection,
-                                target.pml4,
-                            ) {
-                                map_status = status;
-                                break;
-                            }
-                        }
-                    }
-                    page += 0x1000;
-                    changed_end = page;
-                }
-                if map_status != 0 {
-                    page = plan.base;
-                    while page < changed_end {
-                        let old = before.extent_at(page);
-                        let new = after.extent_at(page);
-                        if old.is_none_or(|extent| {
-                            extent.state != nt_address_space::VmExtentState::Committed
-                        }) && new.is_some_and(|extent| {
-                            extent.state == nt_address_space::VmExtentState::Committed
-                        }) {
-                            vm_unmap_private_page(target_pi, page);
-                        } else if let (Some(old), Some(new)) = (old, new) {
-                            if old.state == nt_address_space::VmExtentState::Committed
-                                && new.state == nt_address_space::VmExtentState::Committed
-                                && old.protection != new.protection
-                            {
-                                let _ = vm_reprotect_private_page(
-                                    target_pi,
-                                    page,
-                                    new.protection,
-                                    old.protection,
-                                    target.pml4,
-                                );
-                            }
-                        }
-                        page += 0x1000;
-                    }
-                    return map_status;
-                }
-                core::ptr::write(vm_map, *after);
-                let size_written = self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes());
-                let base_written = self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes());
-                if !created_vad && (!size_written || !base_written) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-                NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-                0
+                self.nt_allocate_virtual_memory_with_user_memory(
+                    args,
+                    SyscallUserMemory::CurrentProcess,
+                )
             },
             // NtOpenSection(*SectionHandle[R10]=args[0], DesiredAccess, *ObjectAttributes[R8]=args[2]).
             // Provide the US-ASCII NLS code-page section \Nls\NlsSectionCP20127 (csrss's Win32 stack

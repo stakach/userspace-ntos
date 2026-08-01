@@ -12,8 +12,7 @@ fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<us
         let Some(process) = nt_handler.pm.process(pid) else {
             continue;
         };
-        let Some(image) =
-            nt_exe_image::hosted_image_for_path(process.image_file_name.as_bytes())
+        let Some(image) = nt_exe_image::hosted_image_for_path(process.image_file_name.as_bytes())
         else {
             continue;
         };
@@ -45,6 +44,206 @@ fn live_hosted_cid_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> (u64, u64) {
         nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
         nt_handler.pm_main_tid_for_pi(pi).unwrap_or(0) as u64,
     )
+}
+
+unsafe fn csr_api_worker_create_thread(
+    nt_handler: &mut ExecNtHandler,
+    csrss_pml4: u64,
+    main_fault_ep: u64,
+    thread_handle_out: u64,
+    desired_access: u32,
+    process_handle: u64,
+    sp: u64,
+) -> u32 {
+    const PROCESS_CREATE_THREAD: u32 = 0x0002;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+    if thread_handle_out == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if thread_handle_out & 7 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if !csr_stack_has_range(thread_handle_out, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    let Some(client_id_out) = sp
+        .checked_add(0x28)
+        .and_then(|address| csr_stack_read(address))
+    else {
+        return STATUS_ACCESS_VIOLATION;
+    };
+    let Some(context_va) = sp
+        .checked_add(0x30)
+        .and_then(|address| csr_stack_read(address))
+    else {
+        return STATUS_ACCESS_VIOLATION;
+    };
+    let Some(create_suspended_raw) = sp
+        .checked_add(0x40)
+        .and_then(|address| csr_stack_read(address))
+    else {
+        return STATUS_ACCESS_VIOLATION;
+    };
+    if client_id_out != 0 && !csr_stack_has_range(client_id_out, 16) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if context_va == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let start = nt_thread_start::Amd64ThreadContext::read(
+        |address| {
+            let mut bytes = [0u8; 8];
+            if unsafe { csr_stack_copyin(address, &mut bytes) } {
+                u64::from_le_bytes(bytes)
+            } else {
+                0
+            }
+        },
+        context_va,
+    );
+    if start.rip == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let create_suspended = create_suspended_raw != 0;
+
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    nt_handler.pi = 1;
+    nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+
+    let status = (|| {
+        let caller_pid = nt_handler.pm_pid_for_pi(1).ok_or(STATUS_INVALID_HANDLE)?;
+        let (target_pid, target_pi) = if process_handle == u64::MAX {
+            (caller_pid, 1usize)
+        } else {
+            nt_handler.resolve_process_for_access(process_handle, PROCESS_CREATE_THREAD)?
+        };
+        if target_pi >= TP_WORKER_PI_COUNT {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let target_pml4 = if target_pi == 1 {
+            csrss_pml4
+        } else {
+            PM_PML4S[target_pi].load(Ordering::Relaxed)
+        };
+        if target_pml4 == 0 || main_fault_ep == 0 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let Some(worker_slot) = (0..TP_WORKER_SLOT_COUNT).find(|slot| {
+            TP_WORKER_TID[target_pi][*slot].load(Ordering::Relaxed) == 0
+                && TP_WORKER_TCB[target_pi][*slot].load(Ordering::Relaxed) == 0
+        }) else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let Some((pool_slot, tid)) =
+            nt_handler.claim_pool_thread(target_pi, start.rip, create_suspended)
+        else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let tid_id = tid as nt_process::ThreadId;
+        let handle = match nt_handler.pm.insert_handle(
+            caller_pid,
+            nt_process::HandleObject::Thread(tid_id),
+            desired_access,
+        ) {
+            Ok(handle) => handle as u64,
+            Err(status) => {
+                let _ = nt_handler
+                    .pm
+                    .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
+                PM_POOL_USED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
+                return Err(status);
+            }
+        };
+        let badged_fault_ep = mint_badged(main_fault_ep, tp_worker_badge(target_pi, worker_slot));
+        let tcb = spawn_slot_thread(&RemoteThreadSpawn {
+            target_pi,
+            slot: worker_slot,
+            pml4: target_pml4,
+            start,
+            cid_proc: target_pid as u64,
+            cid_thread: tid,
+            fault_ep: badged_fault_ep,
+            use_loader: true,
+            native: true,
+            resume: !create_suspended,
+        });
+        if tcb == 0 {
+            let _ = nt_handler.close_process_handle(caller_pid, handle);
+            let _ = nt_handler
+                .pm
+                .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
+            PM_POOL_USED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+
+        if create_suspended {
+            PM_POOL_SUSPENDED[target_pi].fetch_or(1 << pool_slot, Ordering::Relaxed);
+        } else {
+            PM_POOL_SUSPENDED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
+        }
+        TP_WORKER_TID[target_pi][worker_slot].store(tid, Ordering::Relaxed);
+        TP_WORKER_TCB[target_pi][worker_slot].store(tcb, Ordering::Relaxed);
+        nt_handler
+            .pm
+            .set_thread_teb(tid_id, tp_worker_teb_va(worker_slot));
+        let _ = nt_handler
+            .pm
+            .set_thread_create_time(tid_id, nt_system_time_100ns() as i64);
+        nt_handler.register_hosted_thread_tcb(
+            target_pi,
+            tid,
+            tcb,
+            tp_worker_badge(target_pi, worker_slot),
+            HostedThreadRole::TpWorker { slot: worker_slot },
+        );
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        if target_pi == 1 {
+            PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+        }
+        if !csr_stack_copyout(thread_handle_out, &handle.to_le_bytes()) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if client_id_out != 0 {
+            if !csr_stack_copyout(client_id_out, &(target_pid as u64).to_le_bytes())
+                || !csr_stack_copyout(client_id_out + 8, &tid.to_le_bytes())
+            {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+        }
+        print_str(b"[csr-api] worker NtCreateThread target_pi=");
+        print_u64(target_pi as u64);
+        print_str(b" worker_slot=");
+        print_u64(worker_slot as u64);
+        print_str(b" pool_slot=");
+        print_u64(pool_slot as u64);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" entry=0x");
+        print_hex((start.rip >> 32) as u32);
+        print_hex(start.rip as u32);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
+        print_str(b"\n");
+        Ok(0)
+    })()
+    .unwrap_or_else(|status| status);
+
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    status
 }
 
 /// Spawn the AUTHENTIC SM-loop thread (path B): the general hosted thread running smss's real
@@ -152,9 +351,7 @@ unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
     true
 }
 
-unsafe fn sm_capture_object_attributes(
-    address: u64,
-) -> Option<nt_ntdll_layout::ObjectAttributes> {
+unsafe fn sm_capture_object_attributes(address: u64) -> Option<nt_ntdll_layout::ObjectAttributes> {
     let mut value = core::mem::MaybeUninit::<nt_ntdll_layout::ObjectAttributes>::uninit();
     let bytes = core::slice::from_raw_parts_mut(
         value.as_mut_ptr().cast::<u8>(),
@@ -203,22 +400,19 @@ unsafe fn sm_open_process_call(
     };
     let saved_pi = nt_handler.pi;
     nt_handler.pi = 0;
-    let result = match nt_handler.open_process_captured(
-        object_attributes,
-        client_id,
-        desired_access,
-    ) {
-        Ok((owner, handle)) => {
-            if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
-                nt_handler.account_published_pm_handle(owner);
-                0
-            } else {
-                let _ = nt_handler.pm.take_handle(owner, handle);
-                STATUS_ACCESS_VIOLATION
+    let result =
+        match nt_handler.open_process_captured(object_attributes, client_id, desired_access) {
+            Ok((owner, handle)) => {
+                if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
+                    nt_handler.account_published_pm_handle(owner);
+                    0
+                } else {
+                    let _ = nt_handler.pm.take_handle(owner, handle);
+                    STATUS_ACCESS_VIOLATION
+                }
             }
-        }
-        Err(status) => status as u64,
-    };
+            Err(status) => status as u64,
+        };
     nt_handler.pi = saved_pi;
     result
 }
@@ -254,11 +448,8 @@ unsafe fn sm_open_thread_call(
     };
     let saved_pi = nt_handler.pi;
     nt_handler.pi = 0;
-    let result = match nt_handler.open_thread_captured(
-        object_attributes,
-        client_id,
-        desired_access,
-    ) {
+    let result = match nt_handler.open_thread_captured(object_attributes, client_id, desired_access)
+    {
         Ok((owner, handle)) => {
             if sm_stack_copyout(thread_handle, &(handle as u64).to_le_bytes()) {
                 nt_handler.account_published_pm_handle(owner);
@@ -456,9 +647,7 @@ unsafe fn sm_query_thread_information_call(
     };
     nt_handler.pi = saved_pi;
     nt_handler.current_tid = saved_tid;
-    if return_length != 0
-        && !sm_stack_copyout(return_length, &(expected as u32).to_le_bytes())
-    {
+    if return_length != 0 && !sm_stack_copyout(return_length, &(expected as u32).to_le_bytes()) {
         status = STATUS_ACCESS_VIOLATION;
     }
     status
@@ -493,7 +682,12 @@ pub(crate) unsafe fn sm_fill_page(
     if SM_FILL_PT_DONE.swap(1, Ordering::Relaxed) == 0 {
         let spt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
-        let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, SM_FILL_SCRATCH_BASE, CAP_INIT_THREAD_VSPACE);
+        let _ = paging_struct_map(
+            spt,
+            LBL_X86_PAGE_TABLE_MAP,
+            SM_FILL_SCRATCH_BASE,
+            CAP_INIT_THREAD_VSPACE,
+        );
     }
     // Monotonic scratch slot (one PT = 512 pages; the SM-loop thread faults far fewer, so no wrap).
     let scratch = SM_FILL_SCRATCH_BASE + (*fill_idx).min(511) * 0x1000;
@@ -568,7 +762,12 @@ pub(crate) unsafe fn sm_rendezvous(
             sm_stack_write(recvmsg + 0x08, connector_pid);
             sm_stack_write(recvmsg + 0x10, connector_tid);
             sm_stack_write32(recvmsg + 0x28, received.subsystem_type);
-            for (i, chunk) in received.connection_info.chunks_exact(2).take(120).enumerate() {
+            for (i, chunk) in received
+                .connection_info
+                .chunks_exact(2)
+                .take(120)
+                .enumerate()
+            {
                 sm_stack_write16(
                     recvmsg + 0x2c + i as u64 * 2,
                     u16::from_le_bytes([chunk[0], chunk[1]]),
@@ -620,7 +819,18 @@ pub(crate) unsafe fn sm_rendezvous(
         if label == 6 {
             // VMFault: demand-fill an smss/ntdll code or data page for the SM-loop thread.
             let page = m1 & !0xFFFu64;
-            if m1 < 0x10000 || !sm_fill_page(page, smss_pml4, smss_pe, img_end, nt_base, nt_end, ntdll_pe, &mut fill_idx) {
+            if m1 < 0x10000
+                || !sm_fill_page(
+                    page,
+                    smss_pml4,
+                    smss_pe,
+                    img_end,
+                    nt_base,
+                    nt_end,
+                    ntdll_pe,
+                    &mut fill_idx,
+                )
+            {
                 print_str(b"[sm-rdv] WALL: unresolved fault ip=0x");
                 print_hex((m0 >> 32) as u32);
                 print_hex(m0 as u32);
@@ -632,7 +842,11 @@ pub(crate) unsafe fn sm_rendezvous(
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
             continue;
         }
         if label == 3 {
@@ -640,10 +854,17 @@ pub(crate) unsafe fn sm_rendezvous(
             // like the main loop. m0 = FaultIP.
             let fip = m0;
             if let Some(p) = ntdll_pe {
-                if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
+                if fip >= nt_base
+                    && fip < nt_end
+                    && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD)
+                {
                     client_reply_on(reply, 3, fip + 3, m1, m2, 0);
                     let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
                     continue;
                 }
             }
@@ -741,7 +962,9 @@ pub(crate) unsafe fn sm_rendezvous(
                             sm_stack_write(recvmsg + 0x08, connector_pid);
                             sm_stack_write(recvmsg + 0x10, connector_tid);
                             sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
-                            for (i, chunk) in r.connection_info.chunks_exact(2).take(120).enumerate() {
+                            for (i, chunk) in
+                                r.connection_info.chunks_exact(2).take(120).enumerate()
+                            {
                                 sm_stack_write16(
                                     recvmsg + 0x2c + i as u64 * 2,
                                     u16::from_le_bytes([chunk[0], chunk[1]]),
@@ -779,7 +1002,9 @@ pub(crate) unsafe fn sm_rendezvous(
                     sm_stack_write(porthandle_out, sh);
                 }
                 SSN_COMPLETE_CONNECT => {
-                    if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
+                    if let Some((ch, _)) =
+                        lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                    {
                         client_handle = ch;
                     }
                     print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
@@ -787,7 +1012,8 @@ pub(crate) unsafe fn sm_rendezvous(
                 }
                 SSN_CONNECT_PORT => {
                     let out = get_recv_mr(9);
-                    let sb_name: alloc::vec::Vec<u16> = "\\Windows\\SbApiPort".encode_utf16().collect();
+                    let sb_name: alloc::vec::Vec<u16> =
+                        "\\Windows\\SbApiPort".encode_utf16().collect();
                     let reverse = lpc_client().and_then(|c| c.connect_port(&sb_name, 0, &[]).ok());
                     match reverse {
                         Some(r) if r.pending => {
@@ -821,19 +1047,22 @@ pub(crate) unsafe fn sm_rendezvous(
                     let event_handle = get_recv_mr(9);
                     let saved_pi = nt_handler.pi;
                     nt_handler.pi = 0;
-                    result = match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
-                        Ok(index) => match nt_handler.events.set_existing(index as u64) {
-                            Some(previous) => {
-                                if !previous {
-                                    wait_wake_dispatcher_set(nt_handler);
+                    result =
+                        match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
+                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
+                                Some(previous) => {
+                                    if !previous {
+                                        wait_wake_dispatcher_set(nt_handler);
+                                    }
+                                    print_str(
+                                        b"[sm-rdv] real NtSetEvent completed subsystem readiness\n",
+                                    );
+                                    0
                                 }
-                                print_str(b"[sm-rdv] real NtSetEvent completed subsystem readiness\n");
-                                0
-                            }
-                            None => 0xC000_0008,
-                        },
-                        Err(status) => status as u64,
-                    };
+                                None => 0xC000_0008,
+                            },
+                            Err(status) => status as u64,
+                        };
                     nt_handler.pi = saved_pi;
                 }
                 SSN_CLOSE => {
@@ -857,7 +1086,11 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
             continue;
         }
         print_str(b"[sm-rdv] WALL: unexpected label=");
@@ -932,7 +1165,11 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
         print_str(b"\n");
     }
     let sent = lpc_client()
-        .and_then(|client| client.request_wait_reply(client_port, &request[..request_len]).ok())
+        .and_then(|client| {
+            client
+                .request_wait_reply(client_port, &request[..request_len])
+                .ok()
+        })
         .is_some();
     if !sent {
         SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
@@ -940,7 +1177,8 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     }
 
     let listen_port = SM_RECVPORT.load(Ordering::Relaxed);
-    let Some(received) = lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
+    let Some(received) =
+        lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
     else {
         SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return false;
@@ -987,7 +1225,13 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 let page = m1 & !0xfff;
                 if m1 < 0x10000
                     || !sm_fill_page(
-                        page, smss_pml4, smss_pe, img_end, nt_base, nt_end, ntdll_pe,
+                        page,
+                        smss_pml4,
+                        smss_pe,
+                        img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll_pe,
                         &mut fill_idx,
                     )
                 {
@@ -1146,11 +1390,14 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         };
                         let _ = lpc_client().and_then(|client| {
                             client
-                                .reply_wait_receive_with_reply(listen_port, &reply_bytes[..reply_len])
+                                .reply_wait_receive_with_reply(
+                                    listen_port,
+                                    &reply_bytes[..reply_len],
+                                )
                                 .ok()
                         });
-                        let Some(response) =
-                            lpc_client().and_then(|client| client.reply_wait_receive(client_port).ok())
+                        let Some(response) = lpc_client()
+                            .and_then(|client| client.reply_wait_receive(client_port).ok())
                         else {
                             return false;
                         };
@@ -1176,6 +1423,479 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                     }
                 }
                 set_reply_mr(15, 0);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+                client_reply_on(reply, 18, result, 0, 0, rdx);
+            }
+            _ => return false,
+        }
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    false
+}
+
+/// Drive one ordinary `\Windows\ApiPort` request through the real CsrApiRequestThread. The worker
+/// receives the brokered bytes on its listen port, executes csrsrv's dispatcher, sends the reply from
+/// its next NtReplyWaitReceivePort, and remains parked for the following CSR API request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn csr_api_request_rendezvous(
+    client_port: u64,
+    request_va: u64,
+    reply_va: u64,
+    csrss_pml4: u64,
+    main_fault_ep: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    nt_handler: &mut ExecNtHandler,
+) -> bool {
+    const CSR_API_MSG_MAX: usize = 0x178;
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_MAP_VIEW: u64 = 113;
+    const SSN_SET_EVENT: u64 = 228;
+    const SSN_CLOSE: u64 = 27;
+    const SSN_QUERY_OBJECT: u64 = 170;
+    const SSN_SET_INFO_OBJECT: u64 = 236;
+    const SSN_RESUME_THREAD: u64 = 214;
+
+    let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
+    let was_parked = CSR_API_RECEIVE_PARKED.swap(0, Ordering::Relaxed);
+    if ep == 0 || reply == 0 || was_parked == 0 {
+        if was_parked != 0 {
+            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        }
+        return false;
+    }
+
+    let mut length_bytes = [0u8; 4];
+    if !nt_handler.xas_read(request_va, &mut length_bytes) {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let request_len = u16::from_le_bytes([length_bytes[2], length_bytes[3]]) as usize;
+    if !(0x28..=CSR_API_MSG_MAX).contains(&request_len) {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let mut request = [0u8; CSR_API_MSG_MAX];
+    if !nt_handler.xas_read(request_va, &mut request[..request_len]) {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+
+    let client_pid = nt_handler.pm_pid_for_pi(nt_handler.pi).unwrap_or(0) as u64;
+    let client_tid = nt_handler.current_tid;
+    request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes());
+    request[8..16].copy_from_slice(&client_pid.to_le_bytes());
+    request[16..24].copy_from_slice(&client_tid.to_le_bytes());
+    let api_number = if request_len >= 0x34 {
+        u32::from_le_bytes(request[0x30..0x34].try_into().unwrap())
+    } else {
+        0xFFFF_FFFF
+    };
+
+    if lpc_client()
+        .and_then(|client| {
+            client
+                .request_wait_reply(client_port, &request[..request_len])
+                .ok()
+        })
+        .is_none()
+    {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let listen_port = CSR_API_RECVPORT.load(Ordering::Relaxed);
+    let Some(received) =
+        lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
+    else {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    };
+    let delivered_recvmsg = CSR_API_RECVMSG.load(Ordering::Relaxed);
+    if received.connection_info.len() != request_len
+        || !csr_stack_copyout(delivered_recvmsg, &received.connection_info)
+    {
+        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    csr_stack_write16(delivered_recvmsg + 4, nt_lpc_abi::msg_type::LPC_DATAGRAM);
+    csr_stack_write(delivered_recvmsg + 8, client_pid);
+    csr_stack_write(delivered_recvmsg + 16, client_tid);
+    let context_out = CSR_API_RECV_RDX.load(Ordering::Relaxed);
+    if context_out != 0 {
+        csr_stack_write(context_out, received.port_context);
+    }
+
+    print_str(b"[csr-api] delivered ApiNumber=0x");
+    print_hex(api_number);
+    print_str(b" bytes=");
+    print_u64(request_len as u64);
+    print_str(b" to real CsrApiRequestThread\n");
+
+    set_reply_mr(15, 0);
+    set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
+    set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
+    client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
+
+    let mut fill_idx = 0;
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    for _ in 0..8000 {
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0;
+            let rsp = m1;
+            let arg1 = m2;
+            let arg3 = get_recv_mr(4);
+            let arg4 = get_recv_mr(5);
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn;
+            m2 = 0;
+            mi = (2u64 << 12) | (mi & 0x7f);
+        }
+        match mi >> 12 {
+            6 => {
+                let page = m1 & !0xfff;
+                if m1 < 0x10000
+                    || !csr_fill_page(
+                        page,
+                        csrss_pml4,
+                        csrss_pe,
+                        img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll_pe,
+                        reg,
+                        dll_pes,
+                        &mut fill_idx,
+                    )
+                {
+                    print_str(b"[csr-api] unresolved worker fault\n");
+                    return false;
+                }
+                client_reply_on(reply, 0, 0, 0, 0, 0);
+            }
+            3 => {
+                let Some(pe) = ntdll_pe else { return false };
+                if m0 < nt_base
+                    || m0 >= nt_end
+                    || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
+                {
+                    return false;
+                }
+                client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
+            }
+            2 => {
+                let ssn = m0;
+                let resume_ip = m2;
+                let sp = get_recv_mr(16);
+                let flags = get_recv_mr(17);
+                let rdx = m3;
+                let mut result = 0u64;
+                match ssn {
+                    SSN_NT_ALLOCATE_VM => {
+                        let stack_arg4 = sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_stack_read(address));
+                        let stack_arg5 = sp
+                            .checked_add(0x30)
+                            .and_then(|address| csr_stack_read(address));
+                        result = match (stack_arg4, stack_arg5) {
+                            (Some(allocation_type), Some(protection)) => {
+                                let alloc_args = [
+                                    get_recv_mr(9),
+                                    rdx,
+                                    get_recv_mr(7),
+                                    get_recv_mr(8),
+                                    allocation_type,
+                                    protection,
+                                ];
+                                let saved_pi = nt_handler.pi;
+                                let saved_tid = nt_handler.current_tid;
+                                nt_handler.pi = 1;
+                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                let status = nt_handler
+                                    .nt_allocate_virtual_memory_with_user_memory(
+                                        &alloc_args,
+                                        SyscallUserMemory::CsrThreadStack { sb: false },
+                                    );
+                                nt_handler.pi = saved_pi;
+                                nt_handler.current_tid = saved_tid;
+                                print_str(
+                                    b"[csr-api] serviced worker NtAllocateVirtualMemory status=0x",
+                                );
+                                print_hex(status);
+                                print_str(b"\n");
+                                status as u64
+                            }
+                            _ => 0xC000_0005,
+                        };
+                    }
+                    SSN_NT_PROTECT_VM => {
+                        let stack_arg4 = sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_stack_read(address));
+                        result = match stack_arg4 {
+                            Some(old_protect) => {
+                                let protect_args = [
+                                    get_recv_mr(9),
+                                    rdx,
+                                    get_recv_mr(7),
+                                    get_recv_mr(8),
+                                    old_protect,
+                                ];
+                                let saved_pi = nt_handler.pi;
+                                let saved_tid = nt_handler.current_tid;
+                                nt_handler.pi = 1;
+                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
+                                    &protect_args,
+                                    SyscallUserMemory::CsrThreadStack { sb: false },
+                                );
+                                nt_handler.pi = saved_pi;
+                                nt_handler.current_tid = saved_tid;
+                                print_str(
+                                    b"[csr-api] serviced worker NtProtectVirtualMemory status=0x",
+                                );
+                                print_hex(status);
+                                print_str(b"\n");
+                                status as u64
+                            }
+                            None => 0xC000_0005,
+                        };
+                    }
+                    SSN_NT_CREATE_THREAD => {
+                        result = csr_api_worker_create_thread(
+                            nt_handler,
+                            csrss_pml4,
+                            main_fault_ep,
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(8),
+                            sp,
+                        ) as u64;
+                        print_str(b"[csr-api] serviced worker NtCreateThread status=0x");
+                        print_hex(result as u32);
+                        print_str(b"\n");
+                    }
+                    SSN_SET_EVENT => {
+                        let event_handle = get_recv_mr(9);
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 1;
+                        result = match nt_handler
+                            .event_index_for_handle(event_handle, EVENT_MODIFY_STATE)
+                        {
+                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
+                                Some(previous) => {
+                                    if rdx != 0 {
+                                        let _ = csr_stack_write32(rdx, previous as u32);
+                                    }
+                                    if !previous {
+                                        wait_wake_dispatcher_set(nt_handler);
+                                    }
+                                    0
+                                }
+                                None => 0xC000_0008,
+                            },
+                            Err(status) => status as u64,
+                        };
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_NT_SET_INFO_THREAD => {
+                        result = csr_set_thread_information_call(
+                            nt_handler,
+                            false,
+                            CSR_API_TID.load(Ordering::Relaxed),
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(7),
+                            get_recv_mr(8) as u32,
+                        );
+                    }
+                    SSN_NT_QUERY_INFORMATION_THREAD => {
+                        result = match sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_stack_read(address))
+                        {
+                            Some(return_length) => csr_query_thread_call(
+                                nt_handler,
+                                get_recv_mr(9),
+                                rdx as u32,
+                                get_recv_mr(7),
+                                get_recv_mr(8) as u32,
+                                return_length,
+                            ),
+                            None => 0xC000_0005,
+                        };
+                    }
+                    SSN_QUERY_OBJECT => {
+                        result = match sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_stack_read(address))
+                        {
+                            Some(return_length) => {
+                                let query_args = [
+                                    get_recv_mr(9),
+                                    rdx,
+                                    get_recv_mr(7),
+                                    get_recv_mr(8),
+                                    return_length,
+                                ];
+                                let saved_pi = nt_handler.pi;
+                                let saved_tid = nt_handler.current_tid;
+                                nt_handler.pi = 1;
+                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                let status = nt_handler.nt_query_object_with_user_memory(
+                                    &query_args,
+                                    SyscallUserMemory::CsrThreadStack { sb: false },
+                                );
+                                nt_handler.pi = saved_pi;
+                                nt_handler.current_tid = saved_tid;
+                                print_str(b"[csr-api] serviced worker NtQueryObject status=0x");
+                                print_hex(status);
+                                print_str(b"\n");
+                                status as u64
+                            }
+                            None => 0xC000_0005,
+                        };
+                    }
+                    SSN_SET_INFO_OBJECT => {
+                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        let status = nt_handler.nt_set_information_object_with_user_memory(
+                            &set_args,
+                            SyscallUserMemory::CsrThreadStack { sb: false },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-api] serviced worker NtSetInformationObject status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
+                    SSN_RESUME_THREAD => {
+                        let resume_args = [get_recv_mr(9), rdx];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        let status = nt_handler.nt_resume_thread_with_user_memory(
+                            &resume_args,
+                            SyscallUserMemory::CsrThreadStack { sb: false },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-api] serviced worker NtResumeThread status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
+                    }
+                    SSN_MAP_VIEW => {}
+                    SSN_CLOSE => {
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 1;
+                        nt_handler.close_current_handle(get_recv_mr(9));
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_REPLY_WAIT_RECV => {
+                        let reply_msg = get_recv_mr(7);
+                        let recv_msg = get_recv_mr(8);
+                        let mut reply_bytes = [0u8; CSR_API_MSG_MAX];
+                        let reply_source = if reply_msg != 0 {
+                            reply_msg
+                        } else {
+                            // Hosted clients are not CSR-registered yet, so requests are delivered as
+                            // LPC_DATAGRAM to avoid CsrLocateThreadByClientId rejecting them. ReactOS'
+                            // datagram branch runs the real dispatch but leaves ReplyMsg=NULL. Return
+                            // the worker-mutated ReceiveMsg frame so the parked client observes the real
+                            // csrsrv/basesrv side effects instead of the old blind success fallback.
+                            delivered_recvmsg
+                        };
+                        let reply_len = if reply_source != 0 {
+                            let Some(header_word) = csr_stack_read(reply_source) else {
+                                return false;
+                            };
+                            let total = ((header_word >> 16) as u16) as usize;
+                            if !(0x28..=CSR_API_MSG_MAX).contains(&total)
+                                || !csr_stack_copyin(reply_source, &mut reply_bytes[..total])
+                            {
+                                return false;
+                            }
+                            reply_bytes[4..6]
+                                .copy_from_slice(&nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes());
+                            total
+                        } else {
+                            0
+                        };
+                        if reply_msg == 0 {
+                            print_str(b"[csr-api] worker returned datagram ReplyMsg=NULL; using executed ReceiveMsg ApiNumber=0x");
+                            print_hex(api_number);
+                            print_str(b" bytes=");
+                            print_u64(reply_len as u64);
+                            print_str(b"\n");
+                        }
+                        let _ = lpc_client().and_then(|client| {
+                            client
+                                .reply_wait_receive_with_reply(
+                                    listen_port,
+                                    &reply_bytes[..reply_len],
+                                )
+                                .ok()
+                        });
+                        let response = lpc_client()
+                            .and_then(|client| client.reply_wait_receive(client_port).ok());
+                        CSR_API_RECVMSG.store(recv_msg, Ordering::Relaxed);
+                        CSR_API_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                        CSR_API_RECV_SP.store(sp, Ordering::Relaxed);
+                        CSR_API_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                        CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
+                        CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                        let Some(response) = response else {
+                            print_str(b"[csr-api] worker produced no reply for ApiNumber=0x");
+                            print_hex(api_number);
+                            print_str(b"\n");
+                            return false;
+                        };
+                        if response.connection_info.is_empty()
+                            || !nt_handler.xas_try_write_buf(reply_va, &response.connection_info)
+                        {
+                            return false;
+                        }
+                        CSR_MSGS.fetch_add(1, Ordering::Relaxed);
+                        CSR_API_REAL_REPLIES.fetch_add(1, Ordering::Relaxed);
+                        print_str(
+                            b"[csr-api] real CsrApiRequestThread reply completed ApiNumber=0x",
+                        );
+                        print_hex(api_number);
+                        print_str(b" bytes=");
+                        print_u64(response.connection_info.len() as u64);
+                        print_str(b"\n");
+                        return true;
+                    }
+                    _ => {
+                        print_str(b"[csr-api] unexpected worker SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        return false;
+                    }
+                }
+                set_reply_mr(15, resume_ip);
                 set_reply_mr(16, sp);
                 set_reply_mr(17, flags);
                 client_reply_on(reply, 18, result, 0, 0, rdx);
@@ -1311,8 +2031,16 @@ pub(crate) unsafe fn csr_sb_startup(
                 let page = m1 & !0xfff;
                 if m1 < 0x10000
                     || !csr_fill_page(
-                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
-                        reg, dll_pes, &mut fill_idx,
+                        page,
+                        csrss_pml4,
+                        csrss_pe,
+                        img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll_pe,
+                        reg,
+                        dll_pes,
+                        &mut fill_idx,
                     )
                 {
                     print_str(b"[csr-sb] unresolved startup fault\n");
@@ -1934,14 +2662,6 @@ unsafe fn csr_sb_stack_write16(va: u64, v: u16) {
         );
     }
 }
-unsafe fn csr_sb_stack_write32(va: u64, v: u32) {
-    if va >= CSR_SB_STACK_BASE && va + 4 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile(
-            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *mut u32,
-            v,
-        );
-    }
-}
 unsafe fn csr_sb_stack_read(va: u64) -> u64 {
     csr_sb_stack_read_checked(va).unwrap_or(0)
 }
@@ -1986,11 +2706,27 @@ unsafe fn csr_sb_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
     true
 }
 
-unsafe fn csr_thread_stack_copyin(sb: bool, va: u64, bytes: &mut [u8]) -> bool {
+pub(crate) fn csr_thread_stack_has_range(sb: bool, va: u64, len: usize) -> bool {
+    if sb {
+        csr_sb_stack_has_range(va, len)
+    } else {
+        csr_stack_has_range(va, len)
+    }
+}
+
+pub(crate) unsafe fn csr_thread_stack_copyin(sb: bool, va: u64, bytes: &mut [u8]) -> bool {
     if sb {
         csr_sb_stack_copyin(va, bytes)
     } else {
         csr_stack_copyin(va, bytes)
+    }
+}
+
+pub(crate) unsafe fn csr_thread_stack_copyout(sb: bool, va: u64, bytes: &[u8]) -> bool {
+    if sb {
+        csr_sb_stack_copyout(va, bytes)
+    } else {
+        csr_stack_copyout(va, bytes)
     }
 }
 
@@ -2030,14 +2766,9 @@ unsafe fn csr_set_thread_information_call(
         match nt_handler.resolve_thread_for_set(handle) {
             Err(status) => status,
             Ok(target) => {
-                let raw_byte_length =
-                    u16::from_le_bytes(value[..2].try_into().unwrap()) as usize;
+                let raw_byte_length = u16::from_le_bytes(value[..2].try_into().unwrap()) as usize;
                 let buffer = u64::from_le_bytes(value[8..16].try_into().unwrap());
-                let byte_length = if buffer == 0 {
-                    0
-                } else {
-                    raw_byte_length & !1
-                };
+                let byte_length = if buffer == 0 { 0 } else { raw_byte_length & !1 };
                 let source_valid = if buffer == 0 || raw_byte_length == 0 {
                     true
                 } else if buffer & 1 != 0 {
@@ -2046,9 +2777,7 @@ unsafe fn csr_set_thread_information_call(
                     let mut last = [0u8; 1];
                     buffer
                         .checked_add(raw_byte_length as u64 - 1)
-                        .is_some_and(|address| {
-                            csr_thread_stack_copyin(sb, address, &mut last)
-                        })
+                        .is_some_and(|address| csr_thread_stack_copyin(sb, address, &mut last))
                 };
                 if buffer != 0 && raw_byte_length != 0 && buffer & 1 != 0 {
                     STATUS_DATATYPE_MISALIGNMENT as u32
@@ -2059,22 +2788,15 @@ unsafe fn csr_set_thread_information_call(
                 } else {
                     let mut bytes = [0u8; nt_process::THREAD_NAME_MAX_UNITS * 2];
                     if byte_length != 0
-                        && !csr_thread_stack_copyin(
-                            sb,
-                            buffer,
-                            &mut bytes[..byte_length],
-                        )
+                        && !csr_thread_stack_copyin(sb, buffer, &mut bytes[..byte_length])
                     {
                         STATUS_ACCESS_VIOLATION as u32
                     } else {
                         let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
-                        for (index, chunk) in
-                            bytes[..byte_length].chunks_exact(2).enumerate()
-                        {
+                        for (index, chunk) in bytes[..byte_length].chunks_exact(2).enumerate() {
                             name[index] = u16::from_le_bytes([chunk[0], chunk[1]]);
                         }
-                        nt_handler
-                            .set_thread_name_resolved(target, &name[..byte_length / 2])
+                        nt_handler.set_thread_name_resolved(target, &name[..byte_length / 2])
                     }
                 }
             }
@@ -2146,8 +2868,7 @@ unsafe fn csr_sb_query_thread_call(
         }
         Err(status) => status as u64,
     };
-    if return_length != 0
-        && !csr_sb_stack_copyout(return_length, &(expected as u32).to_le_bytes())
+    if return_length != 0 && !csr_sb_stack_copyout(return_length, &(expected as u32).to_le_bytes())
     {
         status = STATUS_ACCESS_VIOLATION;
     }
@@ -2213,9 +2934,7 @@ unsafe fn csr_sb_query_thread_name_call(
         }
         Err(status) => status as u64,
     };
-    if return_length != 0
-        && !csr_sb_stack_copyout(return_length, &required.to_le_bytes())
-    {
+    if return_length != 0 && !csr_sb_stack_copyout(return_length, &required.to_le_bytes()) {
         status = STATUS_ACCESS_VIOLATION;
     }
     status
@@ -2276,9 +2995,7 @@ unsafe fn csr_query_thread_call(
         }
         Err(status) => status as u64,
     };
-    if return_length != 0
-        && !csr_stack_copyout(return_length, &(expected as u32).to_le_bytes())
-    {
+    if return_length != 0 && !csr_stack_copyout(return_length, &(expected as u32).to_le_bytes()) {
         status = STATUS_ACCESS_VIOLATION;
     }
     nt_handler.pi = saved_pi;
@@ -2384,7 +3101,12 @@ pub(crate) unsafe fn csr_fill_page(
     if CSR_FILL_PT_DONE.swap(1, Ordering::Relaxed) == 0 {
         let spt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
-        let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, CSR_FILL_SCRATCH_BASE, CAP_INIT_THREAD_VSPACE);
+        let _ = paging_struct_map(
+            spt,
+            LBL_X86_PAGE_TABLE_MAP,
+            CSR_FILL_SCRATCH_BASE,
+            CAP_INIT_THREAD_VSPACE,
+        );
     }
     let scratch_index = CSR_FILL_NEXT.fetch_add(1, Ordering::Relaxed);
     if scratch_index >= 512 {
@@ -2438,14 +3160,7 @@ unsafe fn csr_sb_accept_connection(
     set_reply_mr(15, 0);
     set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
     set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
-    client_reply_on(
-        reply,
-        18,
-        0,
-        0,
-        0,
-        CSR_SB_RECV_RDX.load(Ordering::Relaxed),
-    );
+    client_reply_on(reply, 18, 0, 0, 0, CSR_SB_RECV_RDX.load(Ordering::Relaxed));
 
     let mut client_handle = 0;
     let mut fill_idx = 0;
@@ -2471,8 +3186,16 @@ unsafe fn csr_sb_accept_connection(
                 let page = m1 & !0xfff;
                 if m1 < 0x10000
                     || !csr_fill_page(
-                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
-                        reg, dll_pes, &mut fill_idx,
+                        page,
+                        csrss_pml4,
+                        csrss_pe,
+                        img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll_pe,
+                        reg,
+                        dll_pes,
+                        &mut fill_idx,
                     )
                 {
                     return 0;
@@ -2517,7 +3240,9 @@ unsafe fn csr_sb_accept_connection(
                         CSR_SB_RECV_FLAGS.store(flags, Ordering::Relaxed);
                         CSR_SB_RECV_RDX.store(rdx, Ordering::Relaxed);
                         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
-                        print_str(b"[csr-sb] authentic reverse connection accepted; worker re-parked\n");
+                        print_str(
+                            b"[csr-sb] authentic reverse connection accepted; worker re-parked\n",
+                        );
                         return client_handle;
                     }
                     _ => {
@@ -2568,7 +3293,6 @@ unsafe fn csr_sb_api_request_rendezvous(
     const SSN_RESUME_THREAD: u64 = 214;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_CLOSE: u64 = 27;
-    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 
     let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSR_SB_SLOT.load(Ordering::Relaxed);
@@ -2607,7 +3331,11 @@ unsafe fn csr_sb_api_request_rendezvous(
     request[8..16].copy_from_slice(&smss_pid.to_le_bytes());
     request[16..24].copy_from_slice(&smss_tid.to_le_bytes());
     if lpc_client()
-        .and_then(|client| client.request_wait_reply(client_port, &request[..request_len]).ok())
+        .and_then(|client| {
+            client
+                .request_wait_reply(client_port, &request[..request_len])
+                .ok()
+        })
         .is_none()
     {
         print_str(b"[csr-sb-api] broker request send failed\n");
@@ -2615,7 +3343,8 @@ unsafe fn csr_sb_api_request_rendezvous(
         return false;
     }
     let listen_port = CSR_SB_RECVPORT.load(Ordering::Relaxed);
-    let Some(received) = lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
+    let Some(received) =
+        lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
     else {
         print_str(b"[csr-sb-api] broker listen receive failed\n");
         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
@@ -2666,8 +3395,16 @@ unsafe fn csr_sb_api_request_rendezvous(
                 let page = m1 & !0xfff;
                 if m1 < 0x10000
                     || !csr_fill_page(
-                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
-                        reg, dll_pes, &mut fill_idx,
+                        page,
+                        csrss_pml4,
+                        csrss_pe,
+                        img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll_pe,
+                        reg,
+                        dll_pes,
+                        &mut fill_idx,
                     )
                 {
                     print_str(b"[csr-sb-api] unresolved worker fault\n");
@@ -2695,7 +3432,40 @@ unsafe fn csr_sb_api_request_rendezvous(
                 print_u64(ssn);
                 print_str(b"\n");
                 match ssn {
-                    SSN_SET_INFO_PROCESS | SSN_SET_INFO_OBJECT => {}
+                    SSN_SET_INFO_PROCESS => {}
+                    SSN_NT_PROTECT_VM => {
+                        let stack_arg4 = sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_sb_stack_read_checked(address));
+                        result = match stack_arg4 {
+                            Some(old_protect) => {
+                                let protect_args = [
+                                    get_recv_mr(9),
+                                    rdx,
+                                    get_recv_mr(7),
+                                    get_recv_mr(8),
+                                    old_protect,
+                                ];
+                                let saved_pi = nt_handler.pi;
+                                let saved_tid = nt_handler.current_tid;
+                                nt_handler.pi = 1;
+                                nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                                let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
+                                    &protect_args,
+                                    SyscallUserMemory::CsrThreadStack { sb: true },
+                                );
+                                nt_handler.pi = saved_pi;
+                                nt_handler.current_tid = saved_tid;
+                                print_str(
+                                    b"[csr-sb-api] serviced worker NtProtectVirtualMemory status=0x",
+                                );
+                                print_hex(status);
+                                print_str(b"\n");
+                                status as u64
+                            }
+                            None => 0xC000_0005,
+                        };
+                    }
                     SSN_NT_SET_INFO_THREAD => {
                         result = csr_set_thread_information_call(
                             nt_handler,
@@ -2724,56 +3494,69 @@ unsafe fn csr_sb_api_request_rendezvous(
                         };
                     }
                     SSN_QUERY_OBJECT => {
-                        let buffer = get_recv_mr(7);
-                        csr_sb_stack_write16(buffer, 0);
-                        let result_len = csr_sb_stack_read(sp + 0x28);
-                        if result_len != 0 {
-                            csr_sb_stack_write32(result_len, 2);
-                        }
+                        result = match sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_sb_stack_read_checked(address))
+                        {
+                            Some(return_length) => {
+                                let query_args = [
+                                    get_recv_mr(9),
+                                    rdx,
+                                    get_recv_mr(7),
+                                    get_recv_mr(8),
+                                    return_length,
+                                ];
+                                let saved_pi = nt_handler.pi;
+                                let saved_tid = nt_handler.current_tid;
+                                nt_handler.pi = 1;
+                                nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                                let status = nt_handler.nt_query_object_with_user_memory(
+                                    &query_args,
+                                    SyscallUserMemory::CsrThreadStack { sb: true },
+                                );
+                                nt_handler.pi = saved_pi;
+                                nt_handler.current_tid = saved_tid;
+                                print_str(b"[csr-sb-api] serviced worker NtQueryObject status=0x");
+                                print_hex(status);
+                                print_str(b"\n");
+                                status as u64
+                            }
+                            None => 0xC000_0005,
+                        };
+                    }
+                    SSN_SET_INFO_OBJECT => {
+                        let set_args = [get_recv_mr(9), rdx, get_recv_mr(7), get_recv_mr(8)];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                        let status = nt_handler.nt_set_information_object_with_user_memory(
+                            &set_args,
+                            SyscallUserMemory::CsrThreadStack { sb: true },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-sb-api] serviced worker NtSetInformationObject status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
                     }
                     SSN_RESUME_THREAD => {
-                        let caller_pid =
-                            live_hosted_pid_for_leaf(nt_handler, b"csrss.exe").unwrap_or(0);
-                        let tid = match nt_handler.pm.resolve_thread_handle(
-                            caller_pid,
-                            CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
-                            get_recv_mr(9),
-                            THREAD_SUSPEND_RESUME,
-                        ) {
-                            Ok(tid) => tid,
-                            Err(status) => {
-                                result = status as u64;
-                                0
-                            }
-                        };
-                        if tid != 0 {
-                            let previous = nt_handler
-                                .pm
-                                .thread(tid)
-                                .map(|thread| thread.suspend_count)
-                                .unwrap_or(0);
-                            if previous == 1 {
-                                let tcb = nt_handler.hosted_thread_tcb(tid as u64).unwrap_or(0);
-                                if tcb <= 1 || tcb_resume(tcb) != 0 {
-                                    result = 0xC0000001;
-                                }
-                            }
-                            if result == 0 {
-                                match nt_handler.pm.resume_thread(tid) {
-                                    Ok(previous) => {
-                                        if rdx != 0 {
-                                            csr_sb_stack_write32(rdx, previous);
-                                        }
-                                        print_str(b"[csr-sb-api] resumed main tid=");
-                                        print_u64(tid as u64);
-                                        print_str(b" previous=");
-                                        print_u64(previous as u64);
-                                        print_str(b"\n");
-                                    }
-                                    Err(status) => result = status as u64,
-                                }
-                            }
-                        }
+                        let resume_args = [get_recv_mr(9), rdx];
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                        let status = nt_handler.nt_resume_thread_with_user_memory(
+                            &resume_args,
+                            SyscallUserMemory::CsrThreadStack { sb: true },
+                        );
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-sb-api] serviced worker NtResumeThread status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        result = status as u64;
                     }
                     SSN_CLOSE => {
                         let saved_pi = nt_handler.pi;
@@ -2797,11 +3580,14 @@ unsafe fn csr_sb_api_request_rendezvous(
                         };
                         let _ = lpc_client().and_then(|client| {
                             client
-                                .reply_wait_receive_with_reply(listen_port, &reply_bytes[..reply_len])
+                                .reply_wait_receive_with_reply(
+                                    listen_port,
+                                    &reply_bytes[..reply_len],
+                                )
                                 .ok()
                         });
-                        let Some(response) =
-                            lpc_client().and_then(|client| client.reply_wait_receive(client_port).ok())
+                        let Some(response) = lpc_client()
+                            .and_then(|client| client.reply_wait_receive(client_port).ok())
                         else {
                             return false;
                         };
@@ -2843,29 +3629,29 @@ unsafe fn csr_sb_api_request_rendezvous(
     false
 }
 
-/// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one connection accept for
-/// winlogon's `NtSecureConnectPort(\Windows\ApiPort)`. Mirrors `sm_rendezvous`: a nested loop on
+/// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one pending client
+/// `NtSecureConnectPort(\Windows\ApiPort)`. Mirrors `sm_rendezvous`: a nested loop on
 /// `CSR_FAULT_EP`/`REPLY_CSRLOOP` services the thread's real syscalls until `NtCompleteConnectPort`.
 /// The thread's pre-loop `CsrConnectToUser` is in-process (no syscalls; ClientThreadSetup is a stub
 /// returning TRUE, and CsrLocateThreadInProcess returns non-NULL since csrss registered its static
 /// threads at init → no spin). On the connection: NtSetEvent (signal the real hRequestEvent) →
 /// NtReplyWaitReceivePort (drain the broker's pending connection + marshal the PORT_MESSAGE:
-/// Type=LPC_CONNECTION_REQUEST, ClientId = the self-connect CID so CsrLocateThreadByClientId matches a
+/// Type=LPC_CONNECTION_REQUEST, ClientId = the CSR worker CID so CsrLocateThreadByClientId matches a
 /// registered CSR_THREAD → CsrProcess=CsrRootProcess → AllowConnection=TRUE) → [NtMapViewOfSection of
 /// the CSR shared section — no-op success] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
-/// (broker complete). Returns the client comm-port handle (0 on wall). Leaves the thread re-parked on
-/// its next NtReplyWaitReceivePort (break-after-complete, like SM).
+/// (broker complete). Returns the client comm-port handle (0 on wall). After the accept reply, the
+/// worker is left to run into its next receive and the next rendezvous drains that state if needed.
 ///
 /// ★ FLAGGED RESIDUALS (host limitations, NOT the accept mechanism — the real thread runs + issues the
 /// real receive/accept syscalls): (a) THE ACCEPT DECISION — CsrApiHandleConnectionRequest's
-/// CsrLocateThreadByClientId (hash table, exact CID) finds NO thread for winlogon because winlogon is
-/// not a registered CSR_PROCESS (that needs the SM→SB→CsrSrvCreateProcess *session-registration* plane,
-/// a separate fork), so the real thread computes AllowConnection=FALSE and passes Accept=FALSE. The
-/// executive OVERRIDES the broker to accept+complete at the NtAcceptConnectPort syscall so winlogon
-/// connects; (b) the CSR_API_CONNECTINFO reply payload + shared-section mapping into winlogon are still
+/// CsrLocateThreadByClientId (hash table, exact CID) finds no registered CSR_PROCESS for hosted
+/// clients yet (that needs the SM→SB→CsrSrvCreateProcess *session-registration* plane, a separate
+/// fork), so the real thread can compute AllowConnection=FALSE and pass Accept=FALSE. The
+/// executive OVERRIDES the broker to accept+complete at the NtAcceptConnectPort syscall so the client
+/// connects; (b) the CSR_API_CONNECTINFO reply payload + shared-section mapping into clients are still
 /// executive-modeled (in `csr_client_connect`) because the isolated LPC broker carries no message
-/// payload across the connect. (The marshaled connection-request ClientId is now cosmetic — no hashed
-/// CSR_THREAD can match it either way.)
+/// payload across the connect. (The marshaled connection-request ClientId is now cosmetic for hosted
+/// clients until CSR process registration lands.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn csr_rendezvous(
     conn_id: u64,
@@ -2912,14 +3698,7 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(15, 0);
             set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
-            client_reply_on(
-                reply,
-                18,
-                0,
-                0,
-                0,
-                CSR_API_RECV_RDX.load(Ordering::Relaxed),
-            );
+            client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
             recv_full_r12(ep, reply)
         } else {
             recv_full_r12(ep, reply)
@@ -2955,7 +3734,18 @@ pub(crate) unsafe fn csr_rendezvous(
         if label == 6 {
             let page = m1 & !0xFFFu64;
             if m1 < 0x10000
-                || !csr_fill_page(page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe, reg, dll_pes, &mut fill_idx)
+                || !csr_fill_page(
+                    page,
+                    csrss_pml4,
+                    csrss_pe,
+                    img_end,
+                    nt_base,
+                    nt_end,
+                    ntdll_pe,
+                    reg,
+                    dll_pes,
+                    &mut fill_idx,
+                )
             {
                 print_str(b"[csr-rdv] WALL: unresolved fault ip=0x");
                 print_hex((m0 >> 32) as u32);
@@ -2968,16 +3758,27 @@ pub(crate) unsafe fn csr_rendezvous(
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
             continue;
         }
         if label == 3 {
             let fip = m0;
             if let Some(p) = ntdll_pe {
-                if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
+                if fip >= nt_base
+                    && fip < nt_end
+                    && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD)
+                {
                     client_reply_on(reply, 3, fip + 3, m1, m2, 0);
                     let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
                     continue;
                 }
             }
@@ -2996,7 +3797,6 @@ pub(crate) unsafe fn csr_rendezvous(
             let flags = get_recv_mr(17);
             let rdx = m3;
             let mut result = 0u64;
-            let mut done = false;
             match ssn {
                 SSN_SET_EVENT => {
                     let event_handle = get_recv_mr(9); // R10
@@ -3008,11 +3808,17 @@ pub(crate) unsafe fn csr_rendezvous(
                             || rdx < CSR_STACK_BASE
                             || rdx > CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 - 4)
                     {
-                        result = if rdx & 3 != 0 { 0x8000_0002 } else { 0xC000_0005 };
+                        result = if rdx & 3 != 0 {
+                            0x8000_0002
+                        } else {
+                            0xC000_0005
+                        };
                     } else {
                         let saved_pi = nt_handler.pi;
                         nt_handler.pi = 1;
-                        result = match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
+                        result = match nt_handler
+                            .event_index_for_handle(event_handle, EVENT_MODIFY_STATE)
+                        {
                             Ok(index) => match nt_handler.events.set_existing(index as u64) {
                                 Some(previous) => {
                                     if rdx != 0 {
@@ -3029,6 +3835,39 @@ pub(crate) unsafe fn csr_rendezvous(
                         };
                         nt_handler.pi = saved_pi;
                     }
+                }
+                SSN_NT_PROTECT_VM => {
+                    let stack_arg4 = sp
+                        .checked_add(0x28)
+                        .and_then(|address| csr_stack_read(address));
+                    result = match stack_arg4 {
+                        Some(old_protect) => {
+                            let protect_args = [
+                                get_recv_mr(9),
+                                rdx,
+                                get_recv_mr(7),
+                                get_recv_mr(8),
+                                old_protect,
+                            ];
+                            let saved_pi = nt_handler.pi;
+                            let saved_tid = nt_handler.current_tid;
+                            nt_handler.pi = 1;
+                            nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                            let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
+                                &protect_args,
+                                SyscallUserMemory::CsrThreadStack { sb: false },
+                            );
+                            nt_handler.pi = saved_pi;
+                            nt_handler.current_tid = saved_tid;
+                            print_str(
+                                b"[csr-rdv] serviced worker NtProtectVirtualMemory status=0x",
+                            );
+                            print_hex(status);
+                            print_str(b"\n");
+                            status as u64
+                        }
+                        None => 0xC000_0005,
+                    };
                 }
                 SSN_NT_SET_INFO_THREAD => {
                     result = csr_set_thread_information_call(
@@ -3069,7 +3908,10 @@ pub(crate) unsafe fn csr_rendezvous(
                             // client). This is genuine winlogon↔csrss CSR message-plane traffic on the
                             // real path (NtReplyWaitReceivePort returning a real connection) — count it.
                             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
-                            csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
+                            csr_stack_write16(
+                                recvmsg + 0x04,
+                                nt_lpc_client::LPC_CONNECTION_REQUEST,
+                            );
                             csr_stack_write(recvmsg + 0x08, csrss_pid);
                             csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
                         }
@@ -3089,33 +3931,31 @@ pub(crate) unsafe fn csr_rendezvous(
                     }
                 }
                 SSN_ACCEPT_CONNECT => {
-                    // The REAL CsrApiHandleConnectionRequest reached NtAcceptConnectPort. ★ FLAGGED
-                    // OVERRIDE: in our host winlogon is NOT a registered CSR_PROCESS (that needs the
-                    // SM→SB→CsrSrvCreateProcess session plane we don't model), so CsrLocateThreadByClientId
-                    // returned NULL → the thread passes Accept=FALSE (R9) and will SKIP NtCompleteConnectPort.
-                    // Force the broker to ACCEPT + COMPLETE here so winlogon's connect succeeds — the real
-                    // thread issued the accept syscall; only the accept DECISION is executive-supplied.
+                    // The REAL CsrApiHandleConnectionRequest reached NtAcceptConnectPort. Hosted
+                    // clients are not registered CSR_PROCESSes yet, so ReactOS may pass Accept=FALSE
+                    // and skip NtCompleteConnectPort. Force the broker accept+complete here and return
+                    // the completed client comm-port handle to the blocked client.
                     let porthandle_out = get_recv_mr(9); // R10 = *ServerPort
                     let sh = lpc_client()
                         .and_then(|c| c.accept_connect(conn_id, true, rdx).ok())
                         .unwrap_or(0);
                     csr_stack_write(porthandle_out, sh);
-                    if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
-                        client_handle = ch;
-                    }
-                    // Reply the accept, then break: the thread resumes into its (rejecting) tail +
-                    // re-parks on its next NtReplyWaitReceivePort. Single winlogon connect → done.
-                    done = true;
-                }
-                SSN_COMPLETE_CONNECT => {
-                    // Defensive: if the accept were ever ALLOWED (a future registered CSR process),
-                    // the thread would call this — complete through the broker.
                     if client_handle == 0 {
-                        if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
+                        if let Some((ch, _)) =
+                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                        {
                             client_handle = ch;
                         }
                     }
-                    done = true;
+                }
+                SSN_COMPLETE_CONNECT => {
+                    if client_handle == 0 {
+                        if let Some((ch, _)) =
+                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                        {
+                            client_handle = ch;
+                        }
+                    }
                 }
                 _ => {
                     // An incidental syscall on the accept path (NtDelayExecution retry,
@@ -3129,11 +3969,12 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
-            if done {
-                break;
-            }
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
-            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
             continue;
         }
         print_str(b"[csr-rdv] WALL: unexpected label=");

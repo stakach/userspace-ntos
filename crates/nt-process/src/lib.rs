@@ -21,7 +21,7 @@ use nt_security::TokenId;
 
 pub mod dbgk;
 
-use dbgk::{DebugEvent, DebugObjectId, DebugObjectStore, DbgKmMessage};
+use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -35,6 +35,7 @@ pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
+pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
@@ -382,9 +383,17 @@ pub enum HandleObject {
     Opaque(u64),
 }
 
+/// Per-handle attributes controlled by `NtSetInformationObject(ObjectHandleFlagInformation)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandleFlags {
+    pub inherit: bool,
+    pub protect_from_close: bool,
+}
+
 struct HandleEntry {
     object: HandleObject,
     granted_access: u32,
+    flags: HandleFlags,
 }
 
 /// The NT handle-value ↔ table-slot mapping: handle `h` (a non-zero multiple of 4) indexes slot
@@ -513,7 +522,8 @@ impl ProcessManager {
     /// later [`report_module_load`](Self::report_module_load) never reallocates (the same
     /// reserve-up-front discipline a bump-allocating host needs for every durable table).
     pub fn reserve_modules(&mut self, capacity: usize) {
-        self.modules.reserve_exact(capacity.saturating_sub(self.modules.len()));
+        self.modules
+            .reserve_exact(capacity.saturating_sub(self.modules.len()));
         self.module_limit = capacity;
     }
 
@@ -2183,6 +2193,7 @@ impl ProcessManager {
         let entry = HandleEntry {
             object,
             granted_access,
+            flags: HandleFlags::default(),
         };
         let free = if self.no_reuse {
             None // append-only: never recycle a freed value (see `no_reuse`)
@@ -2216,6 +2227,31 @@ impl ProcessManager {
             .as_ref()
             .map(|e| e.granted_access)
     }
+    /// Return the mutable per-handle attributes for `handle`.
+    pub fn handle_flags(&self, pid: ProcessId, handle: Handle) -> Option<HandleFlags> {
+        let proc = self.processes.get(&pid)?;
+        proc.handles
+            .get(handle_to_slot(handle)?)?
+            .as_ref()
+            .map(|e| e.flags)
+    }
+    /// Update the mutable per-handle attributes for `handle`.
+    pub fn set_handle_flags(
+        &mut self,
+        pid: ProcessId,
+        handle: Handle,
+        flags: HandleFlags,
+    ) -> Result<(), u32> {
+        let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let entry = proc
+            .handles
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        entry.flags = flags;
+        Ok(())
+    }
     /// Remove a handle and return its object identity so the owning subsystem can release object
     /// references after the table entry is gone.
     pub fn take_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<HandleObject, u32> {
@@ -2227,9 +2263,33 @@ impl ProcessManager {
             .map(|entry| entry.object)
             .ok_or(STATUS_INVALID_HANDLE)
     }
+    /// User-mode `NtClose`: remove a handle unless it is protected from close.
+    pub fn take_handle_for_close(
+        &mut self,
+        pid: ProcessId,
+        handle: Handle,
+    ) -> Result<HandleObject, u32> {
+        let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let slot = handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
+        if proc
+            .handles
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .flags
+            .protect_from_close
+        {
+            return Err(STATUS_HANDLE_NOT_CLOSABLE);
+        }
+        proc.handles
+            .get_mut(slot)
+            .and_then(Option::take)
+            .map(|entry| entry.object)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
     /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
     pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
-        self.take_handle(pid, handle).map(|_| ())
+        self.take_handle_for_close(pid, handle).map(|_| ())
     }
     /// Remove one arbitrary handle from `pid`. Hosts use this during process teardown to release
     /// backing-object references owned outside the process manager.
@@ -2277,16 +2337,18 @@ impl ProcessManager {
         dst_pid: ProcessId,
         desired_access: Option<u32>,
     ) -> Result<Handle, u32> {
-        let (object, access) = {
+        let (object, access, flags) = {
             let e = self
                 .processes
                 .get(&src_pid)
                 .and_then(|p| p.handles.get(handle_to_slot(handle)?))
                 .and_then(|e| e.as_ref())
                 .ok_or(STATUS_INVALID_HANDLE)?;
-            (e.object, e.granted_access)
+            (e.object, e.granted_access, e.flags)
         };
-        self.insert_handle(dst_pid, object, desired_access.unwrap_or(access))
+        let new_handle = self.insert_handle(dst_pid, object, desired_access.unwrap_or(access))?;
+        self.set_handle_flags(dst_pid, new_handle, flags)?;
+        Ok(new_handle)
     }
     pub fn handle_count(&self, pid: ProcessId) -> usize {
         self.processes

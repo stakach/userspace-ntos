@@ -1214,6 +1214,63 @@ fn registry_key_handles_have_independent_process_local_lifetimes() {
 }
 
 #[test]
+fn handle_flags_are_process_local_and_duplicated() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let target = HandleObject::Opaque(0x44);
+
+    let first_handle = pm.insert_handle(first, target, 0x3).unwrap();
+    let second_handle = pm.insert_handle(second, target, 0x3).unwrap();
+    assert_eq!(first_handle, second_handle);
+    assert_eq!(
+        pm.handle_flags(first, first_handle),
+        Some(HandleFlags::default())
+    );
+
+    let flags = HandleFlags {
+        inherit: true,
+        protect_from_close: true,
+    };
+    pm.set_handle_flags(first, first_handle, flags).unwrap();
+    assert_eq!(pm.handle_flags(first, first_handle), Some(flags));
+    assert_eq!(
+        pm.handle_flags(second, second_handle),
+        Some(HandleFlags::default())
+    );
+
+    let duplicate = pm.duplicate_handle(first, first_handle, second).unwrap();
+    assert_eq!(pm.lookup_handle(second, duplicate), Some(target));
+    assert_eq!(pm.handle_flags(second, duplicate), Some(flags));
+}
+
+#[test]
+fn protected_handle_close_fails_without_releasing_slot() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let object = HandleObject::Opaque(0x5150);
+    let handle = pm.insert_handle(pid, object, 0).unwrap();
+
+    pm.set_handle_flags(
+        pid,
+        handle,
+        HandleFlags {
+            inherit: false,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.close_handle(pid, handle),
+        Err(STATUS_HANDLE_NOT_CLOSABLE)
+    );
+    assert_eq!(pm.lookup_handle(pid, handle), Some(object));
+
+    assert_eq!(pm.take_handle(pid, handle), Ok(object));
+    assert_eq!(pm.lookup_handle(pid, handle), None);
+}
+
+#[test]
 fn append_only_handles_never_recycle_a_closed_value() {
     // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
     // executive's per-process DLL registry relies on (a recycled value would collide with a stale
@@ -1266,7 +1323,9 @@ fn attach_debugger(pm: &mut ProcessManager) -> (ProcessId, ThreadId, ProcessId, 
         p.image_base = 0x0000_0001_4000_0000;
     }
     let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
-    let object = pm.create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT).unwrap();
+    let object = pm
+        .create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT)
+        .unwrap();
     let posted = pm
         .debug_active_process(
             target,
@@ -1277,7 +1336,10 @@ fn attach_debugger(pm: &mut ProcessManager) -> (ProcessId, ThreadId, ProcessId, 
             },
         )
         .unwrap();
-    assert_eq!(posted, 1, "one live thread → one fake create-process message");
+    assert_eq!(
+        posted, 1,
+        "one live thread → one fake create-process message"
+    );
     (target, main, debugger, object)
 }
 
@@ -1398,7 +1460,7 @@ fn dbgk_wait_opens_handles_and_renders_the_state_change() {
     assert_eq!(u64_at(0x20), result.handle_to_thread as u64);
     assert_eq!(u64_at(0x38), 0x0000_0001_4000_0000); // BaseOfImage
     assert_eq!(u64_at(0x50), 0x2000); // InitialThread.StartAddress
-    // A second wait with the event still outstanding reports nothing.
+                                      // A second wait with the event still outstanding reports nothing.
     assert!(pm.wait_for_debug_event(object, debugger).unwrap().is_none());
 }
 
@@ -1629,7 +1691,10 @@ fn dbgk_module_load_duplicates_the_image_file_handle_into_the_debugger() {
         result.handle_to_file, debuggee_handle,
         "the debugger gets its OWN handle value"
     );
-    assert_eq!(pm.lookup_handle(debugger, result.handle_to_file), Some(file));
+    assert_eq!(
+        pm.lookup_handle(debugger, result.handle_to_file),
+        Some(file)
+    );
     // DUPLICATE_SAME_ACCESS.
     assert_eq!(
         pm.handle_access(debugger, result.handle_to_file),
@@ -1725,12 +1790,21 @@ fn dbgk_attach_posts_fake_module_messages_after_the_thread_messages() {
     assert_eq!(posted, 4);
     let events = pm.debug_object(object).unwrap().events();
     assert_eq!(events.len(), 4);
-    assert_eq!(events[0].message.state(), dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
-    assert_eq!(events[1].message.state(), dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+    assert_eq!(
+        events[0].message.state(),
+        dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+    );
+    assert_eq!(
+        events[1].message.state(),
+        dbgk::DBG_CREATE_THREAD_STATE_CHANGE
+    );
     assert_eq!(events[1].client_id.unique_thread, second);
     // The module messages come LAST and are attributed to the FIRST reported thread.
     for (index, base) in [(2usize, A), (3, B)] {
-        assert_eq!(events[index].message.state(), dbgk::DBG_LOAD_DLL_STATE_CHANGE);
+        assert_eq!(
+            events[index].message.state(),
+            dbgk::DBG_LOAD_DLL_STATE_CHANGE
+        );
         assert_eq!(events[index].client_id.unique_thread, main);
         assert_eq!(
             events[index].message,
@@ -1747,7 +1821,10 @@ fn dbgk_attach_posts_fake_module_messages_after_the_thread_messages() {
         assert!(events[index].is_inactive());
         assert!(events[index].backout_thread.is_none());
     }
-    assert!(!events[0].is_inactive(), "the create-process message is activated first");
+    assert!(
+        !events[0].is_inactive(),
+        "the create-process message is activated first"
+    );
 
     // Retrieving them: one event per debuggee process at a time, in queue order.
     for expected in [
@@ -1826,7 +1903,11 @@ fn dbgk_forward_exception_queues_a_first_chance_exception_event() {
     // A REAL page fault: STATUS_ACCESS_VIOLATION at RIP 0x7FFE_1000 touching 0x0000_0018 for write.
     let record = dbgk::ExceptionRecord::access_violation(0x7FFE_1000, 1, 0x18);
     let posted = pm.report_exception(target, main, record, true);
-    assert_eq!(posted, Some(object), "a debugged process reports to its port");
+    assert_eq!(
+        posted,
+        Some(object),
+        "a debugged process reports to its port"
+    );
     let debug_object = pm.debug_object(object).unwrap();
     assert_eq!(debug_object.len(), 1);
     // Queuing a non-NOWAIT event signals the debugger awake.
@@ -1849,7 +1930,11 @@ fn dbgk_forward_exception_queues_a_first_chance_exception_event() {
     assert_eq!(u64_at(0x28), 0x7FFE_1000, "ExceptionAddress");
     assert_eq!(u32_at(0x30), 2, "NumberParameters");
     assert_eq!(u64_at(0x38), 1, "ExceptionInformation[0] = write access");
-    assert_eq!(u64_at(0x40), 0x18, "ExceptionInformation[1] = fault address");
+    assert_eq!(
+        u64_at(0x40),
+        0x18,
+        "ExceptionInformation[1] = fault address"
+    );
     assert_eq!(u32_at(0xb0), 1, "FirstChance");
 
     // DBG_CONTINUE resolves it and its returned status is recorded on the event.
@@ -1876,11 +1961,15 @@ fn dbgk_forward_exception_refines_breakpoint_single_step_and_second_chance() {
         unique_process: target,
         unique_thread: main,
     };
-    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
 
     // int3 → DbgBreakpointStateChange; a second-chance report clears FirstChance.
     let record = dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x4010_00);
-    assert_eq!(pm.report_exception(target, main, record, false), Some(object));
+    assert_eq!(
+        pm.report_exception(target, main, record, false),
+        Some(object)
+    );
     let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
     assert_eq!(result.state, dbgk::DBG_BREAKPOINT_STATE_CHANGE);
     assert_eq!(
@@ -1895,7 +1984,12 @@ fn dbgk_forward_exception_refines_breakpoint_single_step_and_second_chance() {
     let code = dbgk::exception_code_for_trap(1);
     assert_eq!(code, dbgk::STATUS_SINGLE_STEP);
     assert_eq!(
-        pm.report_exception(target, main, dbgk::ExceptionRecord::new(code, 0x401002), true),
+        pm.report_exception(
+            target,
+            main,
+            dbgk::ExceptionRecord::new(code, 0x401002),
+            true
+        ),
         Some(object)
     );
     let result = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
@@ -1911,7 +2005,11 @@ fn dbgk_forward_exception_is_inert_without_a_debug_port() {
     let plain_tid = pm.create_thread(plain, 0x1000, 0, false).unwrap();
     let record = dbgk::ExceptionRecord::new(dbgk::STATUS_ACCESS_VIOLATION, 0x1234);
     assert_eq!(pm.report_exception(plain, plain_tid, record, true), None);
-    assert_eq!(pm.debug_object(object).unwrap().len(), 1, "only the fake create");
+    assert_eq!(
+        pm.debug_object(object).unwrap().len(),
+        1,
+        "only the fake create"
+    );
 
     // ...and neither does a DETACHED one — this is the live-boot shape (no debugger anywhere), the
     // gate the fault path checks before it diverts anything.
@@ -1927,7 +2025,9 @@ fn dbgk_debug_object_ids_enumerates_every_live_object() {
     let mut ids = [0u32; 4];
     assert_eq!(pm.debug_object_ids_into(&mut ids), 0);
     let a = pm.create_debug_object(0).unwrap();
-    let b = pm.create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT).unwrap();
+    let b = pm
+        .create_debug_object(dbgk::DBGK_KILL_PROCESS_ON_EXIT)
+        .unwrap();
     assert_eq!(pm.debug_object_ids_into(&mut ids), 2);
     assert_eq!(&ids[..2], &[a, b]);
     // A short output buffer truncates rather than overflowing.
@@ -1941,15 +2041,24 @@ fn dbgk_debug_object_ids_enumerates_every_live_object() {
 #[test]
 fn dbgk_trap_vectors_map_to_the_ntstatus_kidispatchexception_reports() {
     use super::dbgk as d;
-    assert_eq!(d::exception_code_for_trap(0), d::STATUS_INTEGER_DIVIDE_BY_ZERO);
+    assert_eq!(
+        d::exception_code_for_trap(0),
+        d::STATUS_INTEGER_DIVIDE_BY_ZERO
+    );
     assert_eq!(d::exception_code_for_trap(1), d::STATUS_SINGLE_STEP);
     assert_eq!(d::exception_code_for_trap(3), d::STATUS_BREAKPOINT);
     assert_eq!(d::exception_code_for_trap(4), d::STATUS_INTEGER_OVERFLOW);
-    assert_eq!(d::exception_code_for_trap(5), d::STATUS_ARRAY_BOUNDS_EXCEEDED);
+    assert_eq!(
+        d::exception_code_for_trap(5),
+        d::STATUS_ARRAY_BOUNDS_EXCEEDED
+    );
     assert_eq!(d::exception_code_for_trap(6), d::STATUS_ILLEGAL_INSTRUCTION);
     assert_eq!(d::exception_code_for_trap(13), d::STATUS_ACCESS_VIOLATION);
     assert_eq!(d::exception_code_for_trap(14), d::STATUS_ACCESS_VIOLATION);
-    assert_eq!(d::exception_code_for_trap(17), d::STATUS_DATATYPE_MISALIGNMENT);
+    assert_eq!(
+        d::exception_code_for_trap(17),
+        d::STATUS_DATATYPE_MISALIGNMENT
+    );
     // Unclassified vectors report the generic user-fault code, never panic.
     assert_eq!(d::exception_code_for_trap(0xFF), d::STATUS_ACCESS_VIOLATION);
     // The record builders clamp at EXCEPTION_MAXIMUM_PARAMETERS.
@@ -1986,11 +2095,15 @@ fn dbgk_reporter_block_rides_on_the_debug_event_and_comes_back_from_continue() {
     // Drain the attach-time fake create message (a NOWAIT event — never blocks a reporter).
     let create = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
     assert_eq!(create.state, dbgk::DBG_CREATE_PROCESS_STATE_CHANGE);
-    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
 
     // The fault path: post the exception, then park the reporting thread on it.
     let record = dbgk::ExceptionRecord::access_violation(0x7FFE_1000, 1, 0x18);
-    assert_eq!(pm.report_exception(target, main, record, true), Some(object));
+    assert_eq!(
+        pm.report_exception(target, main, record, true),
+        Some(object)
+    );
     assert_eq!(pm.blocked_reporter_count(object), 0, "not blocked yet");
     let block = reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0xBEEF);
     assert!(pm.block_reporter(object, client, block));
@@ -2028,7 +2141,10 @@ fn dbgk_wake_action_maps_every_continue_status_for_both_flavours() {
     // DBG_CONTINUE / DBG_EXCEPTION_HANDLED resume both flavours.
     for status in [dbgk::DBG_CONTINUE, dbgk::DBG_EXCEPTION_HANDLED] {
         assert_eq!(dbgk::wake_action(&fault, status), dbgk::WakeAction::Resume);
-        assert_eq!(dbgk::wake_action(&syscall, status), dbgk::WakeAction::Resume);
+        assert_eq!(
+            dbgk::wake_action(&syscall, status),
+            dbgk::WakeAction::Resume
+        );
     }
     // NOT_HANDLED: a FAULT reporter is left blocked (the fault site's own handling stands); a
     // syscall-reported event has no exception to decline, so the syscall completes.
@@ -2068,10 +2184,14 @@ fn dbgk_teardown_releases_every_blocked_reporter() {
         unique_thread: main,
     };
     let _ = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
-    pm.debug_continue(object, client, dbgk::DBG_CONTINUE).unwrap();
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
 
     let record = dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x401000);
-    assert_eq!(pm.report_exception(target, main, record, true), Some(object));
+    assert_eq!(
+        pm.report_exception(target, main, record, true),
+        Some(object)
+    );
     let block = reporter(dbgk::DBGK_BLOCK_DEBUG_EXCEPTION, main, 0xC0DE);
     assert!(pm.block_reporter(object, client, block));
 
@@ -2145,7 +2265,11 @@ fn dbgk_block_reporter_refuses_nowait_and_unblocked_events() {
     assert_eq!(pm.blocked_reporter_count(object), 0);
     // The real block lands, and a SECOND block for the same event does not double-park.
     assert!(pm.block_reporter(object, client, block));
-    assert!(!pm.block_reporter(object, client, reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0x33)));
+    assert!(!pm.block_reporter(
+        object,
+        client,
+        reporter(dbgk::DBGK_BLOCK_VM_FAULT, main, 0x33)
+    ));
     assert_eq!(pm.blocked_reporter_count(object), 1);
     // An unknown object is a no-op, never a panic.
     assert!(!pm.block_reporter(object + 99, client, block));
