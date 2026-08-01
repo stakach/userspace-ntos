@@ -10428,6 +10428,18 @@ pub(crate) struct RemoteThreadRequest {
     pub resume: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedThreadSpawnRequest {
+    SmLoop,
+    Csr { slot: usize },
+    Winlogon { slot: usize },
+    ServicesListener,
+    ScmWorker,
+    LsassListener { slot: usize },
+    LsaWorker,
+    TpWorker { pi: usize, slot: usize },
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -10512,10 +10524,10 @@ struct ExecNtHandler {
     /// consumes it after dispatch, builds the seL4 mechanism, then publishes or rolls back the
     /// reservation. This covers csrss/winlogon and later Win32 children.
     exe_spawn_request: Option<nt_exe_image::SpawnRequest>,
-    /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
-    /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
-    /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.
-    sm_spawn_request: bool,
+    /// Local hosted-thread mechanism request produced by NtCreateThread policy and consumed by the
+    /// loop after dispatch. The handler owns NT policy (ETHREAD, TEB, handles, ClientId copyout);
+    /// the loop owns seL4 TCB construction because it holds the target VSpace + fault endpoint.
+    thread_spawn_request: Option<HostedThreadSpawnRequest>,
     /// Path B: when csrss's `NtConnectPort` leaves the connection Pending (Manual policy), the handler
     /// records the broker connection id + the caller's `*PortHandle` VA (arg0) here; the loop then
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
@@ -10527,42 +10539,8 @@ struct ExecNtHandler {
     sm_request_port: u64,
     sm_request_message: u64,
     sm_reply_message: u64,
-    /// One-based CSRSS runtime-thread slot awaiting TCB construction. Slots 1 and 2 are the real
-    /// CsrApiRequestThread and CsrSbApiRequestThread respectively.
-    csr_spawn_request: u8,
     /// One-based CSRSS worker to run, serialized, from its initial resume to its first port receive.
     csr_start_request: u8,
-    /// General NtCreateThread: set by winlogon's FIRST `NtCreateThread` (its RPC listener) so the LOOP
-    /// spawns the REAL listener thread (`spawn_wl_listener_thread`, which needs winlogon's PML4 + the
-    /// caller's SP to read the CONTEXT — loop-resident). Parks on `WL_LISTENER_FAULT_EP`.
-    /// One-based winlogon runtime-thread slot awaiting mechanism construction; zero means none.
-    wl_spawn_request: u8,
-    /// General NtCreateThread: set by services' (pi 3) FIRST `NtCreateThread` (the SCM's RPC listener /
-    /// rpcrt4 io_thread) so the LOOP spawns + RESUMES the REAL listener thread
-    /// (`spawn_svc_listener_thread`, needs services' PML4 + the caller's SP for the CONTEXT). Unlike
-    /// the winlogon listener this one runs into the main multiplex (badge SVC_LISTENER_BADGE).
-    svc_listener_spawn: bool,
-    /// BATCH 35: set by services' (pi 3) SECOND `NtCreateThread` (the SCM listener's per-connection
-    /// rpcrt4 worker, `RPCRT4_new_client`) so the LOOP spawns + RESUMES the REAL worker thread
-    /// (`spawn_scm_worker_thread`) into the main multiplex (badge SCM_WORKER_BADGE). This is the
-    /// thread that reads winlogon's bind PDU and writes bind_ack (closing the SCM RPC round-trip).
-    scm_worker_spawn: bool,
-    /// General NtCreateThread: set by lsass' (pi 4) FIRST `NtCreateThread` (an LSA server thread —
-    /// StartAuthenticationPort / LsapRmServerThread) so the LOOP spawns + RESUMES the REAL thread
-    /// (`spawn_lsass_listener_thread`) into the main multiplex (badge LSASS_LISTENER_BADGE).
-    lsass_listener_spawn: bool,
-    /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
-    lsass_listener2_spawn: bool,
-    lsass_listener3_spawn: bool,
-    /// Set by lsass' (pi 4) `NtCreateThread` issued FROM its `\lsarpc` `RPCRT4_server_thread`
-    /// (badge LSASS_LISTENER3) — i.e. `RPCRT4_new_client` on an accepted connection — so the LOOP
-    /// spawns + RESUMES the REAL per-connection worker (`spawn_lsa_worker_thread`) into the main
-    /// multiplex at [`LSA_WORKER_BADGE`]. This is the thread that reads the LSA RPC bind PDU and
-    /// answers `LsarOpenPolicy` for lsass' own self-RPC.
-    lsa_worker_spawn: bool,
-    /// Encoded generic ntdll worker identity awaiting mechanism construction. Zero means none;
-    /// `1 + slot * TP_WORKER_PI_COUNT + pi` identifies the process and worker role.
-    tp_worker_spawn_request: u8,
     /// ★ CROSS-VSPACE `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`):
     /// the handler did the POLICY (handle + `PROCESS_CREATE_THREAD` access check, the target's real
     /// ETHREAD, the `*ThreadHandle`/`*ClientId` out-params) and asks the LOOP to build the

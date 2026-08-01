@@ -4720,13 +4720,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
-                nt_handler.sm_spawn_request = false;
-                nt_handler.wl_spawn_request = 0;
-                nt_handler.svc_listener_spawn = false;
-                nt_handler.lsass_listener_spawn = false;
-                nt_handler.lsass_listener2_spawn = false;
-                nt_handler.lsass_listener3_spawn = false;
-                nt_handler.tp_worker_spawn_request = 0;
+                nt_handler.thread_spawn_request = None;
                 nt_handler.wait_park_event = -1;
                 nt_handler.wait_deadline_100ns = u64::MAX;
                 nt_handler.keyed_wait_key = u64::MAX;
@@ -4759,7 +4753,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.sm_request_port = 0;
                 nt_handler.sm_request_message = 0;
                 nt_handler.sm_reply_message = 0;
-                nt_handler.csr_spawn_request = 0;
                 nt_handler.csr_start_request = 0;
                 nt_handler.csr_rendezvous_conn = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
@@ -5300,12 +5293,15 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
+                let thread_spawn_request = nt_handler.thread_spawn_request.take();
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
                 // has Context* at [sp+0x30] (arg6), and RtlInitializeContext(amd64) set CONTEXT.Rip@0xF8
                 // = StartAddress (SmpApiLoop) and CONTEXT.Rcx@0x80 = Parameter (the \SmApiPort handle).
                 // (pi == 0 here so ACTIVE_STACK_MIRROR = smss's mirror; pml4 = smss's PML4.)
-                if nt_handler.sm_spawn_request && SM_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(thread_spawn_request, Some(HostedThreadSpawnRequest::SmLoop))
+                    && SM_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let entry_rip = smss_stack_read(ctx_va + 0xF8);
                     let port_handle = smss_stack_read(ctx_va + 0x80);
@@ -5337,7 +5333,11 @@ pub(crate) unsafe fn service_sec_image(
                 // the REAL CSR API thread in csrss's VSpace (pi == 1 here → pml4 = csrss's PML4,
                 // ACTIVE_STACK_MIRROR = csrss's mirror). Same CONTEXT ABI as SM: Context* at [sp+0x30],
                 // CONTEXT.Rip@0xF8 = CsrApiRequestThread, CONTEXT.Rcx@0x80 = Parameter (hRequestEvent).
-                if nt_handler.csr_spawn_request == 1 && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::Csr { slot: 0 })
+                ) && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let entry_rip = smss_stack_read(ctx_va + 0xF8);
                     let param = smss_stack_read(ctx_va + 0x80);
@@ -5365,7 +5365,10 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to csr_fault_ep)\n");
                 }
-                if nt_handler.csr_spawn_request == 2
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::Csr { slot: 1 })
+                )
                     && CSR_SB_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
                 {
                     let ctx_va = smss_stack_read(sp + 0x30);
@@ -5400,8 +5403,7 @@ pub(crate) unsafe fn service_sec_image(
                 // seL4 TCB + real TEB and record the TEB base on the ETHREAD (alloc-free). The TCB is
                 // spawned SUSPENDED (a parked listener) — its TEB is mapped + queryable by the main
                 // thread's NtQueryInformationThread(162), which is what unblocks StartRpcServer.
-                if nt_handler.wl_spawn_request != 0 {
-                    let slot = nt_handler.wl_spawn_request as usize - 1;
+                if let Some(HostedThreadSpawnRequest::Winlogon { slot }) = thread_spawn_request {
                     let tcb_cell = match slot {
                         0 => &WL_LISTENER_TCB,
                         1 => &WL_WORKER2_TCB,
@@ -5532,12 +5534,15 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
                     });
-                    nt_handler.wl_spawn_request = 0;
                 }
                 // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
                 // service loop (badge SVC_LISTENER_BADGE). Its faults/syscalls interleave with services'
                 // main thread; the loop sub-selects it by badge → the listener's own stack mirror/TEB.
-                if nt_handler.svc_listener_spawn && SVC_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::ServicesListener)
+                ) && SVC_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let start = nt_thread_start::Amd64ThreadContext::read(
                         |address| smss_stack_read(address),
@@ -5577,7 +5582,11 @@ pub(crate) unsafe fn service_sec_image(
                 // main service loop (badge SCM_WORKER_BADGE). Its faults sub-select to (pi 3, scm-worker)
                 // by badge → its OWN stack mirror/TEB. This is the thread that reads winlogon's bind PDU
                 // and writes bind_ack; its pipe reads park (pipe_wait_park) + re-drive on winlogon's write.
-                if nt_handler.scm_worker_spawn && SCM_WORKER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::ScmWorker)
+                ) && SCM_WORKER_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let start = nt_thread_start::Amd64ThreadContext::read(
                         |address| smss_stack_read(address),
@@ -5588,7 +5597,7 @@ pub(crate) unsafe fn service_sec_image(
                         .expect("services.exe EPROCESS missing before SCM worker spawn");
                     let cid_proc = nt_handler.pm_pid_for_pi(svc_pi).unwrap_or(0) as u64;
                     // Spawn RESUMED into the multiplex, like the SVC/LSASS listeners. This block only
-                    // runs when the recognizer sets `scm_worker_spawn` (gated by SCM_WORKER_ROUTE_ENABLED
+                    // runs when the recognizer requests the SCM worker (gated by SCM_WORKER_ROUTE_ENABLED
                     // in exec_handler.rs — currently OFF pending the trampoline-entry fault; see the
                     // BATCH 35 frontier note). When enabled, the worker runs into the loop at badge 15
                     // (own stack mirror/TEB), reads winlogon's bind PDU, and writes bind_ack.
@@ -5618,7 +5627,11 @@ pub(crate) unsafe fn service_sec_image(
                 // ★ N-threads multiplex: lsass' (pi 4) LSA server thread — spawned RESUMED into the main
                 // service loop (badge LSASS_LISTENER_BADGE). Same shape as the svc listener; its faults
                 // sub-select to (pi 4, listener) by badge → the listener's own stack mirror/TEB.
-                if nt_handler.lsass_listener_spawn && LSASS_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::LsassListener { slot: 0 })
+                ) && LSASS_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let start = nt_thread_start::Amd64ThreadContext::read(
                         |address| smss_stack_read(address),
@@ -5655,7 +5668,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" (runs into the main multiplex, badge 9)\n");
                 }
                 // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, badge 10.
-                if nt_handler.lsass_listener2_spawn && LSASS_LISTENER2_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::LsassListener { slot: 1 })
+                ) && LSASS_LISTENER2_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let start = nt_thread_start::Amd64ThreadContext::read(
                         |address| smss_stack_read(address),
@@ -5691,7 +5708,10 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 10)\n");
                 }
-                if nt_handler.lsass_listener3_spawn
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::LsassListener { slot: 2 })
+                )
                     && LSASS_LISTENER3_TCB.swap(1, Ordering::Relaxed) == 0
                 {
                     let ctx_va = smss_stack_read(sp + 0x30);
@@ -5742,7 +5762,11 @@ pub(crate) unsafe fn service_sec_image(
                 // for pi 4: its faults sub-select to (pi 4, lsa-worker) via its OWN stack mirror/TEB,
                 // and its blocking pipe reads park (`pipe_wait_park`) + re-drive on the peer's write.
                 // It is the SERVER half of lsass' self-RPC — the client is lsass' own main thread.
-                if nt_handler.lsa_worker_spawn && LSA_WORKER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if matches!(
+                    thread_spawn_request,
+                    Some(HostedThreadSpawnRequest::LsaWorker)
+                ) && LSA_WORKER_TCB.swap(1, Ordering::Relaxed) == 0
+                {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let start = nt_thread_start::Amd64ThreadContext::read(
                         |address| smss_stack_read(address),
@@ -5777,12 +5801,12 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 26)\n");
                 }
-                let tp_request = core::mem::replace(&mut nt_handler.tp_worker_spawn_request, 0);
-                if tp_request != 0 {
-                    let identity = tp_request as usize - 1;
-                    let tp_pi = identity % TP_WORKER_PI_COUNT;
-                    let tp_slot = identity / TP_WORKER_PI_COUNT;
-                    if tp_slot < TP_WORKER_SLOT_COUNT {
+                if let Some(HostedThreadSpawnRequest::TpWorker {
+                    pi: tp_pi,
+                    slot: tp_slot,
+                }) = thread_spawn_request
+                {
+                    if tp_pi < TP_WORKER_PI_COUNT && tp_slot < TP_WORKER_SLOT_COUNT {
                         spawn_requested_tp_worker(
                             &mut nt_handler,
                             tp_pi,
