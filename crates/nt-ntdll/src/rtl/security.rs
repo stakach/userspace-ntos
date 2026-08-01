@@ -25,6 +25,12 @@ pub use nt_security::{Ace, Acl, GenericMapping, SecurityDescriptor, Sid};
 pub const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
 /// `ACL_REVISION`.
 pub const ACL_REVISION: u8 = 2;
+/// `SECURITY_MANDATORY_LABEL_AUTHORITY` (`S-1-16-*`).
+pub const SECURITY_MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+/// `SECURITY_CREATOR_SID_AUTHORITY` (`S-1-3-*`).
+pub const SECURITY_CREATOR_SID_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 3];
+/// `SECURITY_CREATOR_OWNER_RIGHTS_RID` (`S-1-3-4`).
+pub const SECURITY_CREATOR_OWNER_RIGHTS_RID: u32 = 4;
 
 /// `RtlLengthSid(Sid)` — the byte length of a SID: `1 (rev) + 1 (subcount) + 6 (authority) +
 /// 4*subcount`. Matches the on-wire `SID` structure size.
@@ -82,6 +88,40 @@ pub fn equal_prefix_sid(a: &Sid, b: &Sid) -> bool {
     }
     a.sub_authorities[..a.sub_authorities.len() - 1]
         == b.sub_authorities[..b.sub_authorities.len() - 1]
+}
+
+/// Integrity-level RID for a mandatory-label SID (`S-1-16-<level>`).
+pub fn mandatory_integrity_level(sid: &Sid) -> Option<u32> {
+    if sid.revision == 1
+        && sid.identifier_authority == SECURITY_MANDATORY_LABEL_AUTHORITY
+        && sid.sub_authorities.len() == 1
+    {
+        Some(sid.sub_authorities[0])
+    } else {
+        None
+    }
+}
+
+/// `RtlSidDominates(Sid1, Sid2, Result)` — true when `Sid1`'s integrity level is >= `Sid2`'s.
+pub fn sid_dominates(a: &Sid, b: &Sid) -> Option<bool> {
+    Some(mandatory_integrity_level(a)? >= mandatory_integrity_level(b)?)
+}
+
+/// `RtlSidEqualLevel(Sid1, Sid2, Result)` — true when both mandatory-label SIDs carry the same RID.
+pub fn sid_equal_level(a: &Sid, b: &Sid) -> Option<bool> {
+    Some(mandatory_integrity_level(a)? == mandatory_integrity_level(b)?)
+}
+
+/// `S-1-3-4` — the Owner Rights SID used by Vista+ owner ACEs.
+pub fn is_owner_rights_sid(sid: &Sid) -> bool {
+    sid.revision == 1
+        && sid.identifier_authority == SECURITY_CREATOR_SID_AUTHORITY
+        && sid.sub_authorities.as_slice() == [SECURITY_CREATOR_OWNER_RIGHTS_RID]
+}
+
+/// `RtlOwnerAcesPresent(Acl)` — true when any ACE names the Owner Rights SID.
+pub fn owner_aces_present(acl: &Acl) -> bool {
+    acl.aces.iter().any(|ace| is_owner_rights_sid(&ace.sid))
 }
 
 /// `RtlValidSid(Sid)` — revision 1 + a sub-authority count within `SID_MAX_SUB_AUTHORITIES` (15).
@@ -239,6 +279,25 @@ mod tests {
     }
 
     #[test]
+    fn integrity_level_sid_comparisons() {
+        let low = Sid::new(16, &[0x1000]);
+        let medium = Sid::new(16, &[0x2000]);
+        let high = Sid::new(16, &[0x3000]);
+        let world = Sid::everyone();
+
+        assert_eq!(mandatory_integrity_level(&medium), Some(0x2000));
+        assert_eq!(mandatory_integrity_level(&world), None);
+        assert_eq!(sid_dominates(&high, &medium), Some(true));
+        assert_eq!(sid_dominates(&low, &medium), Some(false));
+        assert_eq!(
+            sid_equal_level(&medium, &Sid::new(16, &[0x2000])),
+            Some(true)
+        );
+        assert_eq!(sid_equal_level(&medium, &high), Some(false));
+        assert_eq!(sid_dominates(&medium, &world), None);
+    }
+
+    #[test]
     fn sid_copy_and_sddl() {
         let s = Sid::local_system();
         assert!(copy_sid(4, &s).is_none()); // too small
@@ -260,6 +319,16 @@ mod tests {
         assert!(get_ace(&acl, 0).is_some());
         assert!(get_ace(&acl, 5).is_none());
         assert!(valid_acl(&acl));
+    }
+
+    #[test]
+    fn owner_aces_are_detected_by_owner_rights_sid() {
+        let mut acl = create_acl();
+        add_ace(&mut acl, Ace::allow(Sid::creator_owner(), 0x1));
+        assert!(!owner_aces_present(&acl));
+
+        add_ace(&mut acl, Ace::allow(Sid::new(3, &[4]), 0x2));
+        assert!(owner_aces_present(&acl));
     }
 
     #[test]

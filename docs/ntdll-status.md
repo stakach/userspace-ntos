@@ -1,15 +1,14 @@
 # Our Rust `ntdll.dll` — current state
 
-**ntdll measurements as of `6dee67e` (2026-07-26); boot gate now `225/99`, ZERO FAILs** (the
-credential-input and LSA-authentication-port batches noted below §5 added 3 specs each and changed no
-ntdll code — the LSA batch is executive/LPC work). This is the *current-state*
-document for the ntdll effort. The blow-by-blow history (BATCH 1..54, §A..§F) lives in
+**ntdll measurements updated through the 2026-08-01 security-export pickup; boot gate now
+`272/100`, ZERO FAILs.** This is the *current-state* document for the ntdll effort. The
+blow-by-blow history (BATCH 1..54, §A..§F) lives in
 `ntdll_plan.md`, which is now a historical log — read this file first, and go there only for the
 diagnosis story behind a specific decision.
 
 Every number below was **re-measured at `6dee67e`** against the built binary and the source tree (see
-§2 for how), then updated for the 2026-07-30 Dbgk `Zw*` alias pickup. Where a claim in
-`ntdll_plan.md` did not survive re-measurement it is corrected in §7.
+§2 for how), then incrementally updated by validated pickups. Where a claim in `ntdll_plan.md` did
+not survive re-measurement it is corrected in §7.
 
 ---
 
@@ -58,13 +57,13 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 
 ### 2.1 Exports in the built `.tmp/nt-ntdll.dll`
 
-**1351 exports, 0 forwarders.**
+**1355 exports, 0 forwarders.**
 
 | prefix | count | note |
 |---|---|---|
 | `Nt*` | 218 | 216 SSN trap stubs + `NtCurrentTeb` + `NtGetTickCount` |
 | `Zw*` | 216 | `zw_alias!` of the `Nt*` stubs; the five Dbgk aliases and registry hive variants are included |
-| `Rtl*` | 594 | incl. 13 `Rtlp*` |
+| `Rtl*` | 598 | incl. 13 `Rtlp*` |
 | `Ldr*` | 54 | incl. `LdrpInitialize` |
 | `Etw*` | 64 | 46 `etw_ok!` + 2 `etw_scenario_write!` no-ops + real ones |
 | `Dbg*` | 18 | of which 10 `DbgUi*` |
@@ -72,7 +71,7 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 | `Ki*` | 4 | the user dispatchers |
 | CRT / crypto / Alpc / data | 167 | `mem*`/`str*`/`wcs*`/`sprintf`/`qsort`/math, `A_SHA*`/`MD4*`/`MD5*`, `Pfx*`, `Alpc*`, `__C_specific_handler`, `__chkstk`, `VerSetConditionMask`, the 3 `Nls*` data exports |
 
-Roughly: 867 hand-written `#[export_name]` items + 216 macro trap stubs + 216 `zw_alias!` + 48 ETW
+Roughly: 871 hand-written `#[export_name]` items + 216 macro trap stubs + 216 `zw_alias!` + 48 ETW
 macros + a handful of data exports.
 
 ### 2.2 Required imports — is anything missing?
@@ -125,12 +124,12 @@ completion. (`RtlCompactHeap` is **no longer** in this group — it has a real c
 Measured against `references/reactos/dll/ntdll/def/ntdll.spec`, excluding `-arch=i386`-only rows:
 
 * **1882** x64-applicable spec names; **397** of them are `-stub` in ReactOS itself.
-* We export **1342** names; **24** of ours are not in the spec at all (`LdrpInitialize`, `DllMain`,
+* We export **1346** names; **24** of ours are not in the spec at all (`LdrpInitialize`, `DllMain`,
   `RtlGetTickCount`, the `Rtl*_Ustr` helpers, `RtlUTF8ToUnicodeN`, `fma`/`fmaf`, …).
-* **564** spec names we do not export — **289 of which ReactOS `-stub`s too**. By prefix:
-  185 `Nt*`, 179 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*` (threadpool), 6 `Ldr*`, 22 other
+* **560** spec names we do not export — **285 of which ReactOS `-stub`s too**. By prefix:
+  185 `Nt*`, 179 `Zw*`, 103 `Rtl*`, 23 `Rtlp*`, 42 `Tp*` (threadpool), 6 `Ldr*`, 22 other
   (`Exp*` SList, setjmp/longjmp, `sscanf`, ARM helpers).
-* **None of the 564 is imported by anything we host** (§2.2).
+* **None of the 560 is imported by anything we host** (§2.2).
 
 ### 2.5 Host tests
 
@@ -139,9 +138,9 @@ them**, don't read the last one.
 
 | crate | tests | status |
 |---|---|---|
-| `nt-ntdll` | **692** | green |
+| `nt-ntdll` | **699** | green |
 | `nt-process` (incl. the Dbgk state machine) | **79** | green |
-| `nt-syscall` | **42** | green |
+| `nt-syscall` | **45** | green |
 | `nt-syscall-abi` | **15** | green |
 | `nt-ntdll-layout` | **12** | green |
 
@@ -272,10 +271,14 @@ in the shared SSN table, exported by ntdll, and dispatched by the executive to t
 `NtLoadKey`/`NtUnloadKey` CM mount/detach implementation with flag validation, trust-key validation,
 and synchronous `NtUnloadKeyEx` event signalling.
 
-1. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 4 names
-   remain unexported: `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`,
-   `RtlSidEqualLevel` (all `-stub` +Vista in ReactOS). The wider measured spec tail in §2.4 needs
-   the next DLL remeasurement. **None is imported by anything we
+**Completed pickup (2026-08-01):** the four named Tier-2 security `Rtl*` exports that ReactOS leaves
+as Vista+ stubs are now real in our ntdll: `RtlOwnerAcesPresent` scans for Owner Rights ACEs,
+`RtlAddMandatoryAce` appends validated mandatory-label ACEs, and `RtlSidDominates` /
+`RtlSidEqualLevel` compare mandatory integrity label SIDs. They are exported, gate-verified, and
+covered by focused pure security tests where the model is host-testable.
+
+1. **Remaining Tier-2/3 `Rtl*` breadth — low value, do on demand.** The named Tier-2 security list is
+   closed. The wider measured spec tail in §2.4 is remaining breadth. **None is imported by anything we
    host.** The rule that governs all of it:
    > **NEVER add a trap stub whose SSN the executive cannot service.** An unserviced SSN reaches
    > `park_and_log!(pi, b"unhandled-syscall", …)` and parks the process — a correct "not implemented"

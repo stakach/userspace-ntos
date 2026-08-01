@@ -1,6 +1,6 @@
 //! # ntdll security exports — raw SID / ACL / SECURITY_DESCRIPTOR C-ABI wrappers
 //!
-//! This module implements the 51 `Rtl*` security exports that operate directly over the **raw
+//! This module implements the raw `Rtl*` security exports that operate directly over the **raw
 //! Windows x64 byte layouts** of SIDs, ACLs and SECURITY_DESCRIPTORs (absolute and self-relative).
 //! They are the companion set to the SID/ACL/SD exports already in [`crate::exports`]
 //! (`RtlLengthSid`, `RtlCreateSecurityDescriptor`, `RtlAllocateAndInitializeSid`,
@@ -98,6 +98,7 @@ const SYSTEM_AUDIT_ACE_TYPE: u8 = 0x02;
 const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
 const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x06;
 const SYSTEM_AUDIT_OBJECT_ACE_TYPE: u8 = 0x07;
+const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 
 // GENERIC access bits.
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -112,6 +113,10 @@ const ACL_HEADER: usize = 8;
 const ACE_HEADER: usize = 4; // Type(1) Flags(1) Size(2)
 const OBJECT_ACE_FLAG_TYPE_PRESENT: u32 = 0x1;
 const OBJECT_ACE_FLAG_INHERITED_TYPE_PRESENT: u32 = 0x2;
+const SYSTEM_MANDATORY_LABEL_VALID_MASK: u32 = 0x7;
+const SECURITY_MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+const SECURITY_CREATOR_SID_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 3];
+const SECURITY_CREATOR_OWNER_RIGHTS_RID: u32 = 4;
 
 // =================================================================================================
 // Small raw-pointer helpers over the byte layouts. All are `unsafe`: the caller vouches the
@@ -126,6 +131,95 @@ const OBJECT_ACE_FLAG_INHERITED_TYPE_PRESENT: u32 = 0x2;
 unsafe fn sid_len(sid: *const u8) -> usize {
     // SAFETY: SubAuthorityCount is the byte at offset 1 per the SID layout.
     8 + 4 * (unsafe { *sid.add(1) } as usize)
+}
+
+/// Read SID authority bytes.
+///
+/// # Safety
+/// `sid` a valid SID.
+#[inline]
+unsafe fn sid_authority(sid: *const u8) -> [u8; 6] {
+    let mut authority = [0u8; 6];
+    // SAFETY: IdentifierAuthority is the 6-byte field at SID offset 2.
+    unsafe { core::ptr::copy_nonoverlapping(sid.add(2), authority.as_mut_ptr(), 6) };
+    authority
+}
+
+/// Read one SID sub-authority.
+///
+/// # Safety
+/// `sid` a valid SID and `index < SubAuthorityCount`.
+#[inline]
+unsafe fn sid_sub_authority(sid: *const u8, index: usize) -> u32 {
+    // SAFETY: SubAuthority[index] starts at offset 8 + 4 * index; unaligned reads are valid here.
+    unsafe { core::ptr::read_unaligned(sid.add(8 + index * 4) as *const u32) }
+}
+
+/// Mandatory integrity level for `S-1-16-<rid>` label SIDs.
+///
+/// # Safety
+/// `sid` a valid SID.
+unsafe fn sid_mandatory_integrity_level(sid: *const u8) -> Option<u32> {
+    // SAFETY: caller supplied a valid SID; Count and Authority are in fixed fields.
+    unsafe {
+        if *sid != SID_REVISION
+            || *sid.add(1) != 1
+            || sid_authority(sid) != SECURITY_MANDATORY_LABEL_AUTHORITY
+        {
+            return None;
+        }
+        Some(sid_sub_authority(sid, 0))
+    }
+}
+
+/// Is this the Vista+ Owner Rights SID (`S-1-3-4`)?
+///
+/// # Safety
+/// `sid` a valid SID.
+unsafe fn sid_is_owner_rights(sid: *const u8) -> bool {
+    // SAFETY: caller supplied a valid SID; Count, Authority and first RID are fixed fields.
+    unsafe {
+        *sid == SID_REVISION
+            && *sid.add(1) == 1
+            && sid_authority(sid) == SECURITY_CREATOR_SID_AUTHORITY
+            && sid_sub_authority(sid, 0) == SECURITY_CREATOR_OWNER_RIGHTS_RID
+    }
+}
+
+/// Byte offset of the SID payload inside an ACE, for ACE layouts with an inline SID.
+///
+/// # Safety
+/// `ace` readable for `ace_size` bytes.
+unsafe fn ace_sid_offset(ace: *const u8, ace_size: usize) -> Option<usize> {
+    if ace_size < ACE_HEADER + 4 + 8 {
+        return None;
+    }
+    // SAFETY: the ACE header and fixed Mask field are readable because of the size guard above.
+    unsafe {
+        match *ace {
+            ACCESS_ALLOWED_ACE_TYPE
+            | ACCESS_DENIED_ACE_TYPE
+            | SYSTEM_AUDIT_ACE_TYPE
+            | SYSTEM_MANDATORY_LABEL_ACE_TYPE => Some(8),
+            ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | SYSTEM_AUDIT_OBJECT_ACE_TYPE => {
+                if ace_size < ACE_HEADER + 4 + 4 + 8 {
+                    return None;
+                }
+                let object_flags = core::ptr::read_unaligned(ace.add(8) as *const u32);
+                let mut off = 12usize;
+                if object_flags & OBJECT_ACE_FLAG_TYPE_PRESENT != 0 {
+                    off += 16;
+                }
+                if object_flags & OBJECT_ACE_FLAG_INHERITED_TYPE_PRESENT != 0 {
+                    off += 16;
+                }
+                (off + 8 <= ace_size).then_some(off)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Read the SD Control word (@offset 2).
@@ -624,6 +718,67 @@ pub unsafe extern "system" fn rtl_equal_prefix_sid(sid1: *const c_void, sid2: *c
     1
 }
 
+/// `RtlSidDominates(PSID Sid1, PSID Sid2, PBOOLEAN Result) -> NTSTATUS`.
+///
+/// Mandatory-label SIDs are ordered by their single integrity RID (`S-1-16-<rid>`). `Sid1`
+/// dominates `Sid2` when its RID is greater than or equal to `Sid2`'s RID.
+///
+/// # Safety
+/// `sid1`/`sid2` valid readable SIDs; `result` a writable BOOLEAN.
+#[export_name = "RtlSidDominates"]
+pub unsafe extern "system" fn rtl_sid_dominates(
+    sid1: *const c_void,
+    sid2: *const c_void,
+    result: *mut u8,
+) -> NtStatus {
+    if sid1.is_null() || sid2.is_null() || result.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: pointers are non-null and are expected to be valid SIDs/out BOOLEAN by contract.
+    unsafe {
+        if rtl_valid_sid(sid1) == 0 || rtl_valid_sid(sid2) == 0 {
+            return STATUS_INVALID_SID;
+        }
+        let Some(level1) = sid_mandatory_integrity_level(sid1 as *const u8) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(level2) = sid_mandatory_integrity_level(sid2 as *const u8) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        *result = u8::from(level1 >= level2);
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlSidEqualLevel(PSID Sid1, PSID Sid2, PBOOLEAN Result) -> NTSTATUS`.
+///
+/// # Safety
+/// `sid1`/`sid2` valid readable mandatory-label SIDs; `result` a writable BOOLEAN.
+#[export_name = "RtlSidEqualLevel"]
+pub unsafe extern "system" fn rtl_sid_equal_level(
+    sid1: *const c_void,
+    sid2: *const c_void,
+    result: *mut u8,
+) -> NtStatus {
+    if sid1.is_null() || sid2.is_null() || result.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: pointers are non-null and are expected to be valid SIDs/out BOOLEAN by contract.
+    unsafe {
+        if rtl_valid_sid(sid1) == 0 || rtl_valid_sid(sid2) == 0 {
+            return STATUS_INVALID_SID;
+        }
+        let Some(level1) = sid_mandatory_integrity_level(sid1 as *const u8) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(level2) = sid_mandatory_integrity_level(sid2 as *const u8) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        *result = u8::from(level1 == level2);
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlLengthRequiredSid(ULONG SubAuthorityCount) -> ULONG` = `8 + 4*count`. Ported from `sid.c:54`.
 #[export_name = "RtlLengthRequiredSid"]
 pub extern "system" fn rtl_length_required_sid(sub_authority_count: u32) -> u32 {
@@ -1032,6 +1187,51 @@ pub unsafe extern "system" fn rtl_first_free_ace(
     }
 }
 
+/// `RtlOwnerAcesPresent(PACL) -> BOOLEAN`.
+///
+/// Vista introduced the Owner Rights SID (`S-1-3-4`) as the explicit owner-rights ACE marker. This
+/// scans the ACL's parseable ACEs and reports whether any inline SID is that SID.
+///
+/// # Safety
+/// `acl` a readable ACL or NULL.
+#[export_name = "RtlOwnerAcesPresent"]
+pub unsafe extern "system" fn rtl_owner_aces_present(acl: *const c_void) -> u8 {
+    if acl.is_null() {
+        return 0;
+    }
+    // SAFETY: `acl` is a readable ACL by contract; every ACE walk is bounded by AclSize.
+    unsafe {
+        if rtl_valid_acl(acl as *mut c_void) == 0 {
+            return 0;
+        }
+        let p = acl as *const u8;
+        let acl_size = *(p.add(2) as *const u16) as usize;
+        let ace_count = *(p.add(4) as *const u16) as usize;
+        let mut off = ACL_HEADER;
+        for _ in 0..ace_count {
+            if off + ACE_HEADER > acl_size {
+                return 0;
+            }
+            let ace = p.add(off);
+            let ace_size = *(ace.add(2) as *const u16) as usize;
+            if ace_size < ACE_HEADER || off + ace_size > acl_size {
+                return 0;
+            }
+            if let Some(sid_off) = ace_sid_offset(ace, ace_size) {
+                let sid = ace.add(sid_off);
+                if sid_off + sid_len(sid) <= ace_size
+                    && rtl_valid_sid(sid as *const c_void) != 0
+                    && sid_is_owner_rights(sid)
+                {
+                    return 1;
+                }
+            }
+            off += ace_size;
+        }
+    }
+    0
+}
+
 /// `RtlQueryInformationAcl(PACL, PVOID Info, ULONG Len, ACL_INFORMATION_CLASS) -> NTSTATUS`.
 /// Class 1 = AclRevisionInformation (`{ULONG AclRevision}`), 2 = AclSizeInformation
 /// (`{ULONG AceCount; ULONG AclBytesInUse; ULONG AclBytesFree}`). Ported from `acl.c:708`.
@@ -1402,6 +1602,43 @@ pub unsafe extern "system" fn rtl_add_audit_access_ace_ex(
         flags as u8 | (if success != 0 { 0x40 } else { 0 }) | (if failure != 0 { 0x80 } else { 0 });
     // SAFETY: forwarded to add_known_ace under the same contract.
     unsafe { add_known_ace(acl, revision, f, mask, sid, SYSTEM_AUDIT_ACE_TYPE) }
+}
+
+/// `RtlAddMandatoryAce(PACL, ULONG Revision, ULONG Flags, ULONG MandatoryFlags, UCHAR AceType,
+/// PSID LabelSid) -> NTSTATUS`.
+///
+/// Appends a `SYSTEM_MANDATORY_LABEL_ACE { Header, Mask=MandatoryFlags, SidStart=LabelSid }`.
+/// The public Win32 `AddMandatoryAce` wrapper always supplies `SYSTEM_MANDATORY_LABEL_ACE_TYPE`;
+/// reject other policy bits/types rather than publishing a malformed label ACE.
+///
+/// # Safety
+/// `acl` a valid writable ACL with capacity; `label_sid` a valid SID.
+#[export_name = "RtlAddMandatoryAce"]
+pub unsafe extern "system" fn rtl_add_mandatory_ace(
+    acl: *mut c_void,
+    revision: u32,
+    flags: u32,
+    mandatory_flags: u32,
+    ace_type: u8,
+    label_sid: *const c_void,
+) -> NtStatus {
+    if mandatory_flags & !SYSTEM_MANDATORY_LABEL_VALID_MASK != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ace_type != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: mandatory-label ACE has the same raw `{Header, Mask, Sid}` shape as the known ACEs.
+    unsafe {
+        add_known_ace(
+            acl,
+            revision,
+            flags as u8,
+            mandatory_flags,
+            label_sid,
+            SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+        )
+    }
 }
 
 // ---- Object ACE append helper (ALLOWED / DENIED / AUDIT object) ----------------------------------
@@ -3264,6 +3501,8 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_valid_sid as usize,
         rtl_equal_sid as usize,
         rtl_equal_prefix_sid as usize,
+        rtl_sid_dominates as usize,
+        rtl_sid_equal_level as usize,
         rtl_length_required_sid as usize,
         rtl_initialize_sid as usize,
         rtl_identifier_authority_sid as usize,
@@ -3276,6 +3515,7 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_query_information_acl as usize,
         rtl_set_information_acl as usize,
         rtl_first_free_ace as usize,
+        rtl_owner_aces_present as usize,
         rtl_add_ace as usize,
         rtl_delete_ace as usize,
         rtl_add_access_allowed_ace_ex as usize,
@@ -3283,6 +3523,7 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_add_access_denied_ace_ex as usize,
         rtl_add_audit_access_ace as usize,
         rtl_add_audit_access_ace_ex as usize,
+        rtl_add_mandatory_ace as usize,
         rtl_add_access_allowed_object_ace as usize,
         rtl_add_access_denied_object_ace as usize,
         rtl_add_audit_access_object_ace as usize,
