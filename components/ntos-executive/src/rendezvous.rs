@@ -40,11 +40,23 @@ fn live_hosted_main_tid_for_leaf(
     nt_handler.pm_main_tid_for_pi(pi)
 }
 
+fn live_hosted_cid_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> (u64, u64) {
+    (
+        nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+        nt_handler.pm_main_tid_for_pi(pi).unwrap_or(0) as u64,
+    )
+}
+
 /// Spawn the AUTHENTIC SM-loop thread (path B): the general hosted thread running smss's real
 /// `SmpApiLoop` (`entry_rip`) with RCX = the `\SmApiPort` handle (`port_handle`). Its stack is
 /// MIRRORED into the executive so `sm_rendezvous` can write its syscall out-params. It faults to
 /// `SM_FAULT_EP` (no standing receiver) and is resumed at spawn → PARKS on its first fault.
-pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
+pub(crate) unsafe fn spawn_sm_loop_thread(
+    smss_pml4: u64,
+    entry_rip: u64,
+    port_handle: u64,
+    cid_proc: u64,
+) -> u64 {
     // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
     // thread must too. The hosted-syscalls flag is hybrid now: OUR ntdll's `Call(CT_FAULT,
     // label=0x4E54)` still arrives natively with MR0=SSN, while raw Windows syscall stubs fault as NT
@@ -65,7 +77,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         peb_va: SMSS_PEB_VA,
         stack_mirror_va: SM_STACK_MIRROR_VA,
         fault_ep: SM_FAULT_EP.load(Ordering::Relaxed),
-        cid_proc: PM_PIDS[0].load(Ordering::Relaxed),
+        cid_proc,
         cid_thread: SM_LOOP_TID.load(Ordering::Relaxed),
         resume: true,
         prio: 0,
@@ -539,6 +551,7 @@ pub(crate) unsafe fn sm_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
+    let (connector_pid, connector_tid) = live_hosted_cid_for_pi(nt_handler, connector_pi);
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
         if SM_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
             let recvmsg = SM_RECVMSG.load(Ordering::Relaxed);
@@ -552,8 +565,8 @@ pub(crate) unsafe fn sm_rendezvous(
                 return 0;
             }
             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-            sm_stack_write(recvmsg + 0x08, PM_PIDS[connector_pi].load(Ordering::Relaxed));
-            sm_stack_write(recvmsg + 0x10, PM_TIDS[connector_pi].load(Ordering::Relaxed));
+            sm_stack_write(recvmsg + 0x08, connector_pid);
+            sm_stack_write(recvmsg + 0x10, connector_tid);
             sm_stack_write32(recvmsg + 0x28, received.subsystem_type);
             for (i, chunk) in received.connection_info.chunks_exact(2).take(120).enumerate() {
                 sm_stack_write16(
@@ -564,9 +577,9 @@ pub(crate) unsafe fn sm_rendezvous(
             print_str(b"[sm-rdv] resumed parked receive for pi=");
             print_u64(connector_pi as u64);
             print_str(b" cid=");
-            print_u64(PM_PIDS[connector_pi].load(Ordering::Relaxed));
+            print_u64(connector_pid);
             print_str(b"/");
-            print_u64(PM_TIDS[connector_pi].load(Ordering::Relaxed));
+            print_u64(connector_tid);
             print_str(b"\n");
             set_reply_mr(15, 0);
             set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
@@ -725,14 +738,8 @@ pub(crate) unsafe fn sm_rendezvous(
                         Some(r) if r.connection_id != 0 => {
                             // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
                             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
-                            sm_stack_write(
-                                recvmsg + 0x08,
-                                PM_PIDS[connector_pi].load(Ordering::Relaxed),
-                            );
-                            sm_stack_write(
-                                recvmsg + 0x10,
-                                PM_TIDS[connector_pi].load(Ordering::Relaxed),
-                            );
+                            sm_stack_write(recvmsg + 0x08, connector_pid);
+                            sm_stack_write(recvmsg + 0x10, connector_tid);
                             sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
                             for (i, chunk) in r.connection_info.chunks_exact(2).take(120).enumerate() {
                                 sm_stack_write16(
@@ -741,9 +748,9 @@ pub(crate) unsafe fn sm_rendezvous(
                                 );
                             }
                             print_str(b"[sm-rdv] delivered connection cid=");
-                            print_u64(PM_PIDS[connector_pi].load(Ordering::Relaxed));
+                            print_u64(connector_pid);
                             print_str(b"/");
-                            print_u64(PM_TIDS[connector_pi].load(Ordering::Relaxed));
+                            print_u64(connector_tid);
                             print_str(b" subsystem=");
                             print_u64(r.subsystem_type as u64);
                             print_str(b" info_len=");
@@ -794,6 +801,7 @@ pub(crate) unsafe fn sm_rendezvous(
                                 ntdll_pe,
                                 reg,
                                 dll_pes,
+                                nt_handler,
                             );
                             if handle == 0 {
                                 result = 0xC000_0001;
@@ -2404,6 +2412,7 @@ unsafe fn csr_sb_accept_connection(
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    nt_handler: &ExecNtHandler,
 ) -> u64 {
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
@@ -2415,6 +2424,7 @@ unsafe fn csr_sb_accept_connection(
     }
     let recvmsg = CSR_SB_RECVMSG.load(Ordering::Relaxed);
     let port = CSR_SB_RECVPORT.load(Ordering::Relaxed);
+    let (smss_pid, smss_tid) = live_hosted_cid_for_pi(nt_handler, 0);
     let delivered = lpc_client()
         .and_then(|c| c.reply_wait_receive(port).ok())
         .is_some_and(|r| r.connection_id == conn_id);
@@ -2423,8 +2433,8 @@ unsafe fn csr_sb_accept_connection(
         return 0;
     }
     csr_sb_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-    csr_sb_stack_write(recvmsg + 0x08, PM_PIDS[0].load(Ordering::Relaxed));
-    csr_sb_stack_write(recvmsg + 0x10, PM_TIDS[0].load(Ordering::Relaxed));
+    csr_sb_stack_write(recvmsg + 0x08, smss_pid);
+    csr_sb_stack_write(recvmsg + 0x10, smss_tid);
     set_reply_mr(15, 0);
     set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
     set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));

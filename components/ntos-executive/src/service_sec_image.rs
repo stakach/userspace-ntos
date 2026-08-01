@@ -5451,7 +5451,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex((port_handle >> 32) as u32);
                     print_hex(port_handle as u32);
                     print_str(b"\n");
-                    let tcb = spawn_sm_loop_thread(pml4, entry_rip, port_handle);
+                    let cid_proc = nt_handler.pm_pid_for_pi(0).unwrap_or(0) as u64;
+                    let tcb = spawn_sm_loop_thread(pml4, entry_rip, port_handle, cid_proc);
                     SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.register_hosted_thread_tcb(
                         0,
