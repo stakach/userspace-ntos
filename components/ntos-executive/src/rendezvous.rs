@@ -4,10 +4,7 @@
 #![allow(clippy::all)]
 use crate::*;
 
-fn live_hosted_pid_for_leaf(
-    nt_handler: &ExecNtHandler,
-    leaf: &[u8],
-) -> Option<nt_process::ProcessId> {
+fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
     for pi in 0..MAX_PI {
         let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
             continue;
@@ -21,10 +18,26 @@ fn live_hosted_pid_for_leaf(
             continue;
         };
         if image.leaf.eq_ignore_ascii_case(leaf) {
-            return Some(pid);
+            return Some(pi);
         }
     }
     None
+}
+
+fn live_hosted_pid_for_leaf(
+    nt_handler: &ExecNtHandler,
+    leaf: &[u8],
+) -> Option<nt_process::ProcessId> {
+    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    nt_handler.pm_pid_for_pi(pi)
+}
+
+fn live_hosted_main_tid_for_leaf(
+    nt_handler: &ExecNtHandler,
+    leaf: &[u8],
+) -> Option<nt_process::ThreadId> {
+    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    nt_handler.pm_main_tid_for_pi(pi)
 }
 
 /// Spawn the AUTHENTIC SM-loop thread (path B): the general hosted thread running smss's real
@@ -696,7 +709,10 @@ pub(crate) unsafe fn sm_rendezvous(
                     let class = rdx;
                     let buf = get_recv_mr(7); // R8 = buffer
                     if class == 0 {
-                        sm_stack_write(buf + 0x20, PM_PIDS[0].load(Ordering::Relaxed));
+                        sm_stack_write(
+                            buf + 0x20,
+                            live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64,
+                        );
                     } else if class == 24 {
                         sm_stack_write32(buf, 0); // ProcessSessionInformation: session 0
                     }
@@ -897,9 +913,11 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
         SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return false;
     }
+    let smss_pid = live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
+    let smss_tid = live_hosted_main_tid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
     request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
-    request[8..16].copy_from_slice(&PM_PIDS[0].load(Ordering::Relaxed).to_le_bytes());
-    request[16..24].copy_from_slice(&PM_TIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    request[8..16].copy_from_slice(&smss_pid.to_le_bytes());
+    request[16..24].copy_from_slice(&smss_tid.to_le_bytes());
     if request_len >= 0x7c {
         print_str(b"[sm-api] SmExecPgm wire subsystem=");
         print_u64(u32::from_le_bytes(request[0x78..0x7c].try_into().unwrap()) as u64);
@@ -927,8 +945,8 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
         return false;
     }
     sm_stack_write16(recvmsg + 4, nt_lpc_abi::msg_type::LPC_REQUEST);
-    sm_stack_write(recvmsg + 8, PM_PIDS[0].load(Ordering::Relaxed));
-    sm_stack_write(recvmsg + 16, PM_TIDS[0].load(Ordering::Relaxed));
+    sm_stack_write(recvmsg + 8, smss_pid);
+    sm_stack_write(recvmsg + 16, smss_tid);
     let context_out = SM_RECV_RDX.load(Ordering::Relaxed);
     if context_out != 0 {
         sm_stack_write(context_out, received.port_context);
@@ -1037,7 +1055,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         let class = rdx;
                         let buffer = get_recv_mr(7);
                         if class == 0 {
-                            sm_stack_write(buffer + 0x20, PM_PIDS[0].load(Ordering::Relaxed));
+                            sm_stack_write(buffer + 0x20, smss_pid);
                         } else if class == 24 {
                             sm_stack_write32(buffer, 0);
                         }
@@ -2573,9 +2591,11 @@ unsafe fn csr_sb_api_request_rendezvous(
         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return false;
     }
+    let smss_pid = live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
+    let smss_tid = live_hosted_main_tid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
     request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
-    request[8..16].copy_from_slice(&PM_PIDS[0].load(Ordering::Relaxed).to_le_bytes());
-    request[16..24].copy_from_slice(&PM_TIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    request[8..16].copy_from_slice(&smss_pid.to_le_bytes());
+    request[16..24].copy_from_slice(&smss_tid.to_le_bytes());
     if lpc_client()
         .and_then(|client| client.request_wait_reply(client_port, &request[..request_len]).ok())
         .is_none()
@@ -2602,8 +2622,8 @@ unsafe fn csr_sb_api_request_rendezvous(
         return false;
     }
     csr_sb_stack_write16(recvmsg + 4, nt_lpc_abi::msg_type::LPC_REQUEST);
-    csr_sb_stack_write(recvmsg + 8, PM_PIDS[0].load(Ordering::Relaxed));
-    csr_sb_stack_write(recvmsg + 16, PM_TIDS[0].load(Ordering::Relaxed));
+    csr_sb_stack_write(recvmsg + 8, smss_pid);
+    csr_sb_stack_write(recvmsg + 16, smss_tid);
     let context_out = CSR_SB_RECV_RDX.load(Ordering::Relaxed);
     if context_out != 0 {
         csr_sb_stack_write(context_out, received.port_context);
@@ -2862,6 +2882,7 @@ pub(crate) unsafe fn csr_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
+    let csrss_pid = live_hosted_pid_for_leaf(nt_handler, b"csrss.exe").unwrap_or(0) as u64;
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
         if CSR_API_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
             let recvmsg = CSR_API_RECVMSG.load(Ordering::Relaxed);
@@ -2876,7 +2897,7 @@ pub(crate) unsafe fn csr_rendezvous(
             }
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-            csr_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
+            csr_stack_write(recvmsg + 0x08, csrss_pid);
             csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
             set_reply_mr(15, 0);
             set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
@@ -3039,7 +3060,7 @@ pub(crate) unsafe fn csr_rendezvous(
                             // real path (NtReplyWaitReceivePort returning a real connection) — count it.
                             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
                             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-                            csr_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
+                            csr_stack_write(recvmsg + 0x08, csrss_pid);
                             csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
                         }
                         _ => {
