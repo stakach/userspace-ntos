@@ -487,6 +487,125 @@ struct HostedExeSpawn<'a> {
     spawned: &'static AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+enum HostedMultiplexedThreadSpawner {
+    ServicesListener,
+    ScmWorker,
+    LsassListener,
+    LsassListener2,
+    LsassListener3,
+    LsaWorker,
+}
+
+#[derive(Clone, Copy)]
+enum HostedThreadResumeMode {
+    PoolState,
+    Always,
+}
+
+#[derive(Clone, Copy)]
+struct HostedThreadSpawnSpec {
+    owner_leaf: &'static [u8],
+    tcb: &'static AtomicU64,
+    tid: &'static AtomicU64,
+    teb: u64,
+    badge: u64,
+    role: HostedThreadRole,
+    spawner: HostedMultiplexedThreadSpawner,
+    resume: HostedThreadResumeMode,
+    spawn_prefix: &'static [u8],
+    spawned_prefix: &'static [u8],
+    spawned_suffix: &'static [u8],
+}
+
+fn hosted_multiplexed_thread_spawn_for(
+    request: HostedThreadSpawnRequest,
+) -> Option<HostedThreadSpawnSpec> {
+    match request {
+        HostedThreadSpawnRequest::ServicesListener => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"services.exe",
+            tcb: &SVC_LISTENER_TCB,
+            tid: &SVC_LISTENER_TID,
+            teb: SVC_LISTENER_TEB_VA,
+            badge: SVC_LISTENER_BADGE,
+            role: HostedThreadRole::ServicesListener,
+            spawner: HostedMultiplexedThreadSpawner::ServicesListener,
+            resume: HostedThreadResumeMode::PoolState,
+            spawn_prefix: b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x",
+            spawned_prefix: b"[svc-thread] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 7)\n",
+        }),
+        HostedThreadSpawnRequest::ScmWorker => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"services.exe",
+            tcb: &SCM_WORKER_TCB,
+            tid: &SCM_WORKER_TID,
+            teb: SCM_WORKER_TEB_VA,
+            badge: SCM_WORKER_BADGE,
+            role: HostedThreadRole::ScmWorker,
+            spawner: HostedMultiplexedThreadSpawner::ScmWorker,
+            resume: HostedThreadResumeMode::Always,
+            spawn_prefix:
+                b"[scm-worker] spawning + RESUMING REAL per-connection RPC worker: entry=0x",
+            spawned_prefix: b"[scm-worker] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 15)\n",
+        }),
+        HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"lsass.exe",
+            tcb: &LSASS_LISTENER_TCB,
+            tid: &LSASS_LISTENER_TID,
+            teb: LSASS_LISTENER_TEB_VA,
+            badge: LSASS_LISTENER_BADGE,
+            role: HostedThreadRole::LsassListener,
+            spawner: HostedMultiplexedThreadSpawner::LsassListener,
+            resume: HostedThreadResumeMode::PoolState,
+            spawn_prefix: b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x",
+            spawned_prefix: b"[lsass-thread] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 9)\n",
+        }),
+        HostedThreadSpawnRequest::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"lsass.exe",
+            tcb: &LSASS_LISTENER2_TCB,
+            tid: &LSASS_LISTENER2_TID,
+            teb: LSASS_LISTENER2_TEB_VA,
+            badge: LSASS_LISTENER2_BADGE,
+            role: HostedThreadRole::LsassListener2,
+            spawner: HostedMultiplexedThreadSpawner::LsassListener2,
+            resume: HostedThreadResumeMode::PoolState,
+            spawn_prefix: b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x",
+            spawned_prefix: b"[lsass-thread2] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 10)\n",
+        }),
+        HostedThreadSpawnRequest::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"lsass.exe",
+            tcb: &LSASS_LISTENER3_TCB,
+            tid: &LSASS_LISTENER3_TID,
+            teb: LSASS_LISTENER3_TEB_VA,
+            badge: LSASS_LISTENER3_BADGE,
+            role: HostedThreadRole::LsassListener3,
+            spawner: HostedMultiplexedThreadSpawner::LsassListener3,
+            resume: HostedThreadResumeMode::PoolState,
+            spawn_prefix: b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x",
+            spawned_prefix: b"[lsass-thread3] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 14)\n",
+        }),
+        HostedThreadSpawnRequest::LsaWorker => Some(HostedThreadSpawnSpec {
+            owner_leaf: b"lsass.exe",
+            tcb: &LSA_WORKER_TCB,
+            tid: &LSA_WORKER_TID,
+            teb: LSA_WORKER_TEB_VA,
+            badge: LSA_WORKER_BADGE,
+            role: HostedThreadRole::LsaWorker,
+            spawner: HostedMultiplexedThreadSpawner::LsaWorker,
+            resume: HostedThreadResumeMode::Always,
+            spawn_prefix:
+                b"[lsa-worker] spawning + RESUMING REAL per-connection LSA RPC worker: entry=0x",
+            spawned_prefix: b"[lsa-worker] spawned + resumed tcb=0x",
+            spawned_suffix: b" (runs into the main multiplex, badge 26)\n",
+        }),
+        _ => None,
+    }
+}
+
 fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
     csrss_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
@@ -5293,529 +5412,15 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                let thread_spawn_request = nt_handler.thread_spawn_request.take();
-                // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
-                // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
-                // has Context* at [sp+0x30] (arg6), and RtlInitializeContext(amd64) set CONTEXT.Rip@0xF8
-                // = StartAddress (SmpApiLoop) and CONTEXT.Rcx@0x80 = Parameter (the \SmApiPort handle).
-                // (pi == 0 here so ACTIVE_STACK_MIRROR = smss's mirror; pml4 = smss's PML4.)
-                if matches!(thread_spawn_request, Some(HostedThreadSpawnRequest::SmLoop))
-                    && SM_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let port_handle = smss_stack_read(ctx_va + 0x80);
-                    print_str(b"[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x");
-                    print_hex((ctx_va >> 32) as u32);
-                    print_hex(ctx_va as u32);
-                    print_str(b" entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
-                    print_str(b" port=0x");
-                    print_hex((port_handle >> 32) as u32);
-                    print_hex(port_handle as u32);
-                    print_str(b"\n");
-                    let cid_proc = nt_handler.pm_pid_for_pi(0).unwrap_or(0) as u64;
-                    let tcb = spawn_sm_loop_thread(pml4, entry_rip, port_handle, cid_proc);
-                    SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        0,
-                        SM_LOOP_TID.load(Ordering::Relaxed),
-                        tcb,
-                        hosted_top_badge_for_pi(0),
-                        HostedThreadRole::SmLoop,
-                    );
-                    print_str(b"[sm-loop] spawned tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (parks on its first fault to sm_fault_ep)\n");
-                }
-                // Authentic CSR accept: csrss's first NtCreateThread (its CsrApiRequestThread) — spawn
-                // the REAL CSR API thread in csrss's VSpace (pi == 1 here → pml4 = csrss's PML4,
-                // ACTIVE_STACK_MIRROR = csrss's mirror). Same CONTEXT ABI as SM: Context* at [sp+0x30],
-                // CONTEXT.Rip@0xF8 = CsrApiRequestThread, CONTEXT.Rcx@0x80 = Parameter (hRequestEvent).
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::Csr { slot: 0 })
-                ) && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
-                    print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
-                    print_str(b" param=0x");
-                    print_hex(param as u32);
-                    print_str(b"\n");
-                    let csrss_pi = live_hosted_pi_for_leaf(&nt_handler, b"csrss.exe")
-                        .expect("csrss.exe EPROCESS missing before CSR API thread spawn");
-                    let pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
-                        .unwrap_or(0) as u64;
-                    let tid = CSR_API_TID.load(Ordering::Relaxed);
-                    let tcb = spawn_csr_loop_thread(pml4, entry_rip, param, pid, tid);
-                    CSR_LOOP_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        csrss_pi,
-                        tid,
-                        tcb,
-                        hosted_top_badge_for_pi(csrss_pi),
-                        HostedThreadRole::CsrApi,
-                    );
-                    print_str(b"[csr-loop] spawned tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (parks on its first fault to csr_fault_ep)\n");
-                }
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::Csr { slot: 1 })
-                )
-                    && CSR_SB_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
-                    let csrss_pi = live_hosted_pi_for_leaf(&nt_handler, b"csrss.exe")
-                        .expect("csrss.exe EPROCESS missing before CSR/SB thread spawn");
-                    let pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
-                        .unwrap_or(0) as u64;
-                    let tid = CSR_SB_TID.load(Ordering::Relaxed);
-                    print_str(b"[csr-sb] spawning REAL CsrSbApiRequestThread: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let tcb = spawn_csr_sb_loop_thread(pml4, entry_rip, param, pid, tid);
-                    CSR_SB_LOOP_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        csrss_pi,
-                        tid,
-                        tcb,
-                        hosted_top_badge_for_pi(csrss_pi),
-                        HostedThreadRole::CsrSbApi,
-                    );
-                }
-                // ★ GENERAL NtCreateThread: winlogon's first NtCreateThread (its RPC listener) — spawn
-                // the REAL thread in winlogon's VSpace (pi == 2 here → pml4 = winlogon's PML4,
-                // ACTIVE_STACK_MIRROR = winlogon's mirror). Same CONTEXT ABI as SM/CSR: Context* at
-                // [sp+0x30], CONTEXT.Rip@0xF8 = StartRoutine, CONTEXT.Rcx@0x80 = Parameter. Its real
-                // ETHREAD (PM_LISTENER_TID) was already popped + bound in the handler; here we build the
-                // seL4 TCB + real TEB and record the TEB base on the ETHREAD (alloc-free). The TCB is
-                // spawned SUSPENDED (a parked listener) — its TEB is mapped + queryable by the main
-                // thread's NtQueryInformationThread(162), which is what unblocks StartRpcServer.
-                if let Some(HostedThreadSpawnRequest::Winlogon { slot }) = thread_spawn_request {
-                    let tcb_cell = match slot {
-                        0 => &WL_LISTENER_TCB,
-                        1 => &WL_WORKER2_TCB,
-                        2 => &WL_WORKER3_TCB,
-                        _ => unreachable!(),
-                    };
-                    tcb_cell.store(1, Ordering::Relaxed);
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let initial_teb_va = smss_stack_read(sp + 0x38);
-                    let initial_teb = nt_thread_start::InitialTeb64::read(
-                        |address| smss_stack_read(address),
-                        initial_teb_va,
-                    );
-                    let tid = match slot {
-                        0 => PM_LISTENER_TID.load(Ordering::Relaxed),
-                        1 => WL_WORKER2_TID.load(Ordering::Relaxed),
-                        2 => WL_WORKER3_TID.load(Ordering::Relaxed),
-                        _ => 0,
-                    };
-                    let teb = match slot {
-                        0 => WL_LISTENER_TEB_VA,
-                        1 => WL_WORKER2_TEB_VA,
-                        2 => WL_WORKER3_TEB_VA,
-                        _ => 0,
-                    };
-                    let wl_pi = live_hosted_pi_for_leaf(&nt_handler, b"winlogon.exe")
-                        .expect("winlogon.exe EPROCESS missing before worker spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(wl_pi).unwrap_or(0) as u64;
-                    print_str(b"[wl-thread] spawning REAL worker slot=");
-                    print_u64(slot as u64);
-                    print_str(b" (multiplexed): entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" arg0=0x");
-                    print_hex((start.rcx >> 32) as u32);
-                    print_hex(start.rcx as u32);
-                    print_str(b" arg1=0x");
-                    print_hex((start.rdx >> 32) as u32);
-                    print_hex(start.rdx as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let suspended =
-                        PM_POOL_SUSPENDED[wl_pi].load(Ordering::Relaxed) & (1 << slot) != 0;
-                    let tcb = spawn_wl_listener_thread(
-                        slot,
-                        procs[wl_pi].pml4,
-                        start,
-                        initial_teb,
-                        cid_proc,
-                        tid,
+                if let Some(request) = nt_handler.thread_spawn_request.take() {
+                    spawn_requested_local_thread(
+                        &mut nt_handler,
+                        request,
+                        &procs,
+                        pml4,
+                        sp,
                         fault_ep,
-                        false,
                     );
-                    let teb_alias = match slot {
-                        0 => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
-                        1 => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
-                        2 => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
-                        _ => 0,
-                    };
-                    if seed_winlogon_thread_client_info(teb_alias, procs[wl_pi].pml4).is_none() {
-                        print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
-                    }
-                    if slot == 0 {
-                        let mapped_low = initial_teb
-                            .stack_limit
-                            .checked_sub(nt_thread_start::USER_PAGE_SIZE)
-                            .filter(|&low| {
-                                initial_teb.allocated_stack_base & 0xfff == 0
-                                    && initial_teb.stack_base & 0xfff == 0
-                                    && initial_teb.allocated_stack_base <= low
-                                    && low < initial_teb.stack_base
-                                    && csrss_frame_get_exact(wl_pi as u64, low).0 != 0
-                            })
-                            .unwrap_or(0);
-                        if mapped_low != 0 {
-                            WL_LISTENER_STACK_ALLOCATION_BASE.store(
-                                initial_teb.allocated_stack_base,
-                                Ordering::Release,
-                            );
-                            WL_LISTENER_STACK_BASE_REAL
-                                .store(initial_teb.stack_base, Ordering::Release);
-                            WL_LISTENER_STACK_MAPPED_LOW.store(mapped_low, Ordering::Release);
-                        } else {
-                            WL_LISTENER_STACK_ALLOCATION_BASE.store(0, Ordering::Release);
-                            WL_LISTENER_STACK_BASE_REAL.store(0, Ordering::Release);
-                            WL_LISTENER_STACK_MAPPED_LOW.store(0, Ordering::Release);
-                            print_str(b"[wl-thread] real stack reservation could not be armed\n");
-                        }
-                    }
-                    tcb_cell.store(tcb, Ordering::Relaxed);
-                    let (role, badge) = match slot {
-                        0 => (HostedThreadRole::WinlogonListener, WINLOGON_WORKER_BADGE),
-                        1 => (
-                            HostedThreadRole::WinlogonWorker { slot },
-                            WINLOGON_WORKER2_BADGE,
-                        ),
-                        2 => (
-                            HostedThreadRole::WinlogonWorker { slot },
-                            WINLOGON_WORKER3_BADGE,
-                        ),
-                        _ => unreachable!(),
-                    };
-                    nt_handler.register_hosted_thread_tcb(wl_pi, tid, tcb, badge, role);
-                    if slot == 0 {
-                        // A LATCH of the seL4 TCB the general `NtCreateThread` service minted for
-                        // this thread. `WL_LISTENER_TCB` is the LIVE cell — the thread-termination
-                        // mechanism zeroes it — so it cannot witness what was created once the
-                        // thread legitimately goes away. See `exec_general_nt_create_thread`.
-                        WL_LISTENER_TCB_MINTED.store(tcb, Ordering::Relaxed);
-                    }
-                    // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
-                    if !suspended {
-                        let _ = tcb_resume(tcb);
-                    }
-                    print_str(b"[wl-thread] spawned tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" TEB=0x");
-                    print_hex((teb >> 32) as u32);
-                    print_hex(teb as u32);
-                    print_str(if suspended {
-                        b" (SUSPENDED; NtResumeThread owns first run; real ETHREAD + TEB)\n"
-                    } else {
-                        b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
-                    });
-                }
-                // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
-                // service loop (badge SVC_LISTENER_BADGE). Its faults/syscalls interleave with services'
-                // main thread; the loop sub-selects it by badge → the listener's own stack mirror/TEB.
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::ServicesListener)
-                ) && SVC_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = SVC_LISTENER_TID.load(Ordering::Relaxed);
-                    let svc_pi = live_hosted_pi_for_leaf(&nt_handler, b"services.exe")
-                        .expect("services.exe EPROCESS missing before listener spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(svc_pi).unwrap_or(0) as u64;
-                    print_str(b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let suspended = nt_handler
-                        .pm_pool_slot_for_tid(tid)
-                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
-                    let tcb = spawn_svc_listener_thread(
-                        procs[svc_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
-                        !suspended,
-                    );
-                    SVC_LISTENER_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        svc_pi,
-                        tid,
-                        tcb,
-                        SVC_LISTENER_BADGE,
-                        HostedThreadRole::ServicesListener,
-                    );
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
-                    print_str(b"[svc-thread] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 7)\n");
-                }
-                // ★ BATCH 35: services' SCM per-connection RPC WORKER thread — spawned RESUMED into the
-                // main service loop (badge SCM_WORKER_BADGE). Its faults sub-select to (pi 3, scm-worker)
-                // by badge → its OWN stack mirror/TEB. This is the thread that reads winlogon's bind PDU
-                // and writes bind_ack; its pipe reads park (pipe_wait_park) + re-drive on winlogon's write.
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::ScmWorker)
-                ) && SCM_WORKER_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = SCM_WORKER_TID.load(Ordering::Relaxed);
-                    let svc_pi = live_hosted_pi_for_leaf(&nt_handler, b"services.exe")
-                        .expect("services.exe EPROCESS missing before SCM worker spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(svc_pi).unwrap_or(0) as u64;
-                    // Spawn RESUMED into the multiplex, like the SVC/LSASS listeners. This block only
-                    // runs when the recognizer requests the SCM worker (gated by SCM_WORKER_ROUTE_ENABLED
-                    // in exec_handler.rs — currently OFF pending the trampoline-entry fault; see the
-                    // BATCH 35 frontier note). When enabled, the worker runs into the loop at badge 15
-                    // (own stack mirror/TEB), reads winlogon's bind PDU, and writes bind_ack.
-                    print_str(b"[scm-worker] spawning + RESUMING REAL per-connection RPC worker: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let tcb = spawn_scm_worker_thread(
-                        procs[svc_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
-                        true,
-                    );
-                    SCM_WORKER_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        svc_pi,
-                        tid,
-                        tcb,
-                        SCM_WORKER_BADGE,
-                        HostedThreadRole::ScmWorker,
-                    );
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
-                    print_str(b"[scm-worker] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 15)\n");
-                }
-                // ★ N-threads multiplex: lsass' (pi 4) LSA server thread — spawned RESUMED into the main
-                // service loop (badge LSASS_LISTENER_BADGE). Same shape as the svc listener; its faults
-                // sub-select to (pi 4, listener) by badge → the listener's own stack mirror/TEB.
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::LsassListener { slot: 0 })
-                ) && LSASS_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = LSASS_LISTENER_TID.load(Ordering::Relaxed);
-                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
-                        .expect("lsass.exe EPROCESS missing before listener spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
-                    print_str(b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let suspended = nt_handler
-                        .pm_pool_slot_for_tid(tid)
-                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
-                    let tcb = spawn_lsass_listener_thread(
-                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
-                        !suspended,
-                    );
-                    LSASS_LISTENER_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        lsass_pi,
-                        tid,
-                        tcb,
-                        LSASS_LISTENER_BADGE,
-                        HostedThreadRole::LsassListener,
-                    );
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
-                    print_str(b"[lsass-thread] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 9)\n");
-                }
-                // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, badge 10.
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::LsassListener { slot: 1 })
-                ) && LSASS_LISTENER2_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = LSASS_LISTENER2_TID.load(Ordering::Relaxed);
-                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
-                        .expect("lsass.exe EPROCESS missing before second listener spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
-                    print_str(b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let suspended = nt_handler
-                        .pm_pool_slot_for_tid(tid)
-                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
-                    let tcb = spawn_lsass_listener2_thread(
-                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
-                        !suspended,
-                    );
-                    LSASS_LISTENER2_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        lsass_pi,
-                        tid,
-                        tcb,
-                        LSASS_LISTENER2_BADGE,
-                        HostedThreadRole::LsassListener2,
-                    );
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
-                    print_str(b"[lsass-thread2] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 10)\n");
-                }
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::LsassListener { slot: 2 })
-                )
-                    && LSASS_LISTENER3_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = LSASS_LISTENER3_TID.load(Ordering::Relaxed);
-                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
-                        .expect("lsass.exe EPROCESS missing before third listener spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
-                    print_str(b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let tcb = spawn_lsass_listener3_thread(
-                        procs[lsass_pi].pml4,
-                        start.rip,
-                        start.rcx,
-                        start.rdx,
-                        cid_proc,
-                        tid,
-                        fault_ep,
-                        !nt_handler.pm_pool_slot_for_tid(tid).is_some_and(|(pi, slot)| {
-                            PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0
-                        }),
-                    );
-                    LSASS_LISTENER3_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        lsass_pi,
-                        tid,
-                        tcb,
-                        LSASS_LISTENER3_BADGE,
-                        HostedThreadRole::LsassListener3,
-                    );
-                    nt_handler
-                        .pm
-                        .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER3_TEB_VA);
-                    print_str(b"[lsass-thread3] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 14)\n");
-                }
-                // ★ lsass' `\pipe\lsarpc` PER-CONNECTION RPC WORKER — spawned RESUMED into the main
-                // service loop (badge LSA_WORKER_BADGE) when its `\lsarpc` rpcrt4 server thread runs
-                // `RPCRT4_new_client` on an accepted connection. Same shape as the SCM worker above,
-                // for pi 4: its faults sub-select to (pi 4, lsa-worker) via its OWN stack mirror/TEB,
-                // and its blocking pipe reads park (`pipe_wait_park`) + re-drive on the peer's write.
-                // It is the SERVER half of lsass' self-RPC — the client is lsass' own main thread.
-                if matches!(
-                    thread_spawn_request,
-                    Some(HostedThreadSpawnRequest::LsaWorker)
-                ) && LSA_WORKER_TCB.swap(1, Ordering::Relaxed) == 0
-                {
-                    let ctx_va = smss_stack_read(sp + 0x30);
-                    let start = nt_thread_start::Amd64ThreadContext::read(
-                        |address| smss_stack_read(address),
-                        ctx_va,
-                    );
-                    let tid = LSA_WORKER_TID.load(Ordering::Relaxed);
-                    let lsass_pi = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe")
-                        .expect("lsass.exe EPROCESS missing before LSA worker spawn");
-                    let cid_proc = nt_handler.pm_pid_for_pi(lsass_pi).unwrap_or(0) as u64;
-                    print_str(b"[lsa-worker] spawning + RESUMING REAL per-connection LSA RPC worker: entry=0x");
-                    print_hex((start.rip >> 32) as u32);
-                    print_hex(start.rip as u32);
-                    print_str(b" tid=");
-                    print_u64(tid);
-                    print_str(b"\n");
-                    let tcb = spawn_lsa_worker_thread(
-                        procs[lsass_pi].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
-                        true,
-                    );
-                    LSA_WORKER_TCB.store(tcb, Ordering::Relaxed);
-                    nt_handler.register_hosted_thread_tcb(
-                        lsass_pi,
-                        tid,
-                        tcb,
-                        LSA_WORKER_BADGE,
-                        HostedThreadRole::LsaWorker,
-                    );
-                    nt_handler
-                        .pm
-                        .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
-                    print_str(b"[lsa-worker] spawned + resumed tcb=0x");
-                    print_hex(tcb as u32);
-                    print_str(b" (runs into the main multiplex, badge 26)\n");
-                }
-                if let Some(HostedThreadSpawnRequest::TpWorker {
-                    pi: tp_pi,
-                    slot: tp_slot,
-                }) = thread_spawn_request
-                {
-                    if tp_pi < TP_WORKER_PI_COUNT && tp_slot < TP_WORKER_SLOT_COUNT {
-                        spawn_requested_tp_worker(
-                            &mut nt_handler,
-                            tp_pi,
-                            tp_slot,
-                            procs[tp_pi].pml4,
-                            sp,
-                            fault_ep,
-                        );
-                    }
                 }
                 // ★ CROSS-VSPACE NtCreateThread: the handler decided the policy; build the REAL
                 // thread inside the TARGET's address space here, where the main fault endpoint the
@@ -11825,6 +11430,333 @@ pub(crate) unsafe fn service_sec_image(
     // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
     // exec_reactos_smss_* checks are about smss specifically. csrss's counts are in the sec-stop line.
     (verdict, procs[0].faults, procs[0].first, stop, procs[0].ntfaults, stop_ssn)
+}
+
+#[inline(never)]
+unsafe fn spawn_requested_multiplexed_thread(
+    nt_handler: &mut ExecNtHandler,
+    spec: HostedThreadSpawnSpec,
+    procs: &[ProcExec; MAX_PI],
+    caller_sp: u64,
+    fault_ep: u64,
+) {
+    if !claim_thread_tcb_cell(spec.tcb) {
+        return;
+    }
+
+    let (_ctx_va, start) = requested_thread_start(caller_sp);
+    let tid = spec.tid.load(Ordering::Relaxed);
+    let (owner_pi, cid_proc, pml4) = live_process_context(nt_handler, procs, spec.owner_leaf)
+        .expect("hosted EPROCESS missing before multiplexed thread spawn");
+    let suspended = hosted_thread_suspended(nt_handler, tid);
+    let resume = match spec.resume {
+        HostedThreadResumeMode::PoolState => !suspended,
+        HostedThreadResumeMode::Always => true,
+    };
+
+    print_str(spec.spawn_prefix);
+    print_hex((start.rip >> 32) as u32);
+    print_hex(start.rip as u32);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b"\n");
+
+    let tcb = match spec.spawner {
+        HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+        HostedMultiplexedThreadSpawner::ScmWorker => spawn_scm_worker_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+        HostedMultiplexedThreadSpawner::LsaWorker => spawn_lsa_worker_thread(
+            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+        ),
+    };
+
+    spec.tcb.store(tcb, Ordering::Relaxed);
+    nt_handler.register_hosted_thread_tcb(owner_pi, tid, tcb, spec.badge, spec.role);
+    nt_handler
+        .pm
+        .set_thread_teb(tid as nt_process::ThreadId, spec.teb);
+
+    print_str(spec.spawned_prefix);
+    print_hex(tcb as u32);
+    print_str(spec.spawned_suffix);
+}
+
+#[inline(never)]
+unsafe fn requested_thread_start(
+    caller_sp: u64,
+) -> (u64, nt_thread_start::Amd64ThreadContext) {
+    let context_va = smss_stack_read(caller_sp + 0x30);
+    (
+        context_va,
+        nt_thread_start::Amd64ThreadContext::read(
+            |address| unsafe { smss_stack_read(address) },
+            context_va,
+        ),
+    )
+}
+
+#[inline]
+fn claim_thread_tcb_cell(cell: &'static AtomicU64) -> bool {
+    cell.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+#[inline]
+fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
+    nt_handler.pm_pool_slot_for_tid(tid).is_some_and(|(pi, slot)| {
+        PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0
+    })
+}
+
+#[inline]
+fn live_process_context(
+    nt_handler: &ExecNtHandler,
+    procs: &[ProcExec; MAX_PI],
+    leaf: &[u8],
+) -> Option<(usize, u64, u64)> {
+    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    Some((pi, nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64, procs[pi].pml4))
+}
+
+#[inline(never)]
+unsafe fn spawn_requested_local_thread(
+    nt_handler: &mut ExecNtHandler,
+    request: HostedThreadSpawnRequest,
+    procs: &[ProcExec; MAX_PI],
+    current_pml4: u64,
+    caller_sp: u64,
+    fault_ep: u64,
+) {
+    if let Some(spec) = hosted_multiplexed_thread_spawn_for(request) {
+        spawn_requested_multiplexed_thread(nt_handler, spec, procs, caller_sp, fault_ep);
+        return;
+    }
+
+    match request {
+        HostedThreadSpawnRequest::SmLoop => {
+            if !claim_thread_tcb_cell(&SM_LOOP_TCB) {
+                return;
+            }
+            let (ctx_va, start) = requested_thread_start(caller_sp);
+            print_str(b"[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x");
+            print_hex((ctx_va >> 32) as u32);
+            print_hex(ctx_va as u32);
+            print_str(b" entry=0x");
+            print_hex((start.rip >> 32) as u32);
+            print_hex(start.rip as u32);
+            print_str(b" port=0x");
+            print_hex((start.rcx >> 32) as u32);
+            print_hex(start.rcx as u32);
+            print_str(b"\n");
+            let cid_proc = nt_handler.pm_pid_for_pi(0).unwrap_or(0) as u64;
+            let pml4 = if procs[0].pml4 != 0 { procs[0].pml4 } else { current_pml4 };
+            let tcb = spawn_sm_loop_thread(pml4, start.rip, start.rcx, cid_proc);
+            SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
+            nt_handler.register_hosted_thread_tcb(
+                0,
+                SM_LOOP_TID.load(Ordering::Relaxed),
+                tcb,
+                hosted_top_badge_for_pi(0),
+                HostedThreadRole::SmLoop,
+            );
+            print_str(b"[sm-loop] spawned tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" (parks on its first fault to sm_fault_ep)\n");
+        }
+        HostedThreadSpawnRequest::Csr { slot } => {
+            let (cell, tid, role) = match slot {
+                0 => (
+                    &CSR_LOOP_TCB,
+                    CSR_API_TID.load(Ordering::Relaxed),
+                    HostedThreadRole::CsrApi,
+                ),
+                1 => (
+                    &CSR_SB_LOOP_TCB,
+                    CSR_SB_TID.load(Ordering::Relaxed),
+                    HostedThreadRole::CsrSbApi,
+                ),
+                _ => return,
+            };
+            if !claim_thread_tcb_cell(cell) {
+                return;
+            }
+            let (_ctx_va, start) = requested_thread_start(caller_sp);
+            let (csrss_pi, pid, pml4) = live_process_context(nt_handler, procs, b"csrss.exe")
+                .expect("csrss.exe EPROCESS missing before CSR thread spawn");
+            if slot == 0 {
+                print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
+            } else {
+                print_str(b"[csr-sb] spawning REAL CsrSbApiRequestThread: entry=0x");
+            }
+            print_hex((start.rip >> 32) as u32);
+            print_hex(start.rip as u32);
+            if slot == 0 {
+                print_str(b" param=0x");
+                print_hex(start.rcx as u32);
+            } else {
+                print_str(b" tid=");
+                print_u64(tid);
+            }
+            print_str(b"\n");
+            let tcb = if slot == 0 {
+                spawn_csr_loop_thread(pml4, start.rip, start.rcx, pid, tid)
+            } else {
+                spawn_csr_sb_loop_thread(pml4, start.rip, start.rcx, pid, tid)
+            };
+            cell.store(tcb, Ordering::Relaxed);
+            nt_handler.register_hosted_thread_tcb(
+                csrss_pi,
+                tid,
+                tcb,
+                hosted_top_badge_for_pi(csrss_pi),
+                role,
+            );
+            if slot == 0 {
+                print_str(b"[csr-loop] spawned tcb=0x");
+                print_hex(tcb as u32);
+                print_str(b" (parks on its first fault to csr_fault_ep)\n");
+            }
+        }
+        HostedThreadSpawnRequest::Winlogon { slot } => {
+            let tcb_cell = match slot {
+                0 => &WL_LISTENER_TCB,
+                1 => &WL_WORKER2_TCB,
+                2 => &WL_WORKER3_TCB,
+                _ => return,
+            };
+            if !claim_thread_tcb_cell(tcb_cell) {
+                return;
+            }
+            let (_ctx_va, start) = requested_thread_start(caller_sp);
+            let initial_teb_va = smss_stack_read(caller_sp + 0x38);
+            let initial_teb = nt_thread_start::InitialTeb64::read(
+                |address| unsafe { smss_stack_read(address) },
+                initial_teb_va,
+            );
+            let tid = match slot {
+                0 => PM_LISTENER_TID.load(Ordering::Relaxed),
+                1 => WL_WORKER2_TID.load(Ordering::Relaxed),
+                2 => WL_WORKER3_TID.load(Ordering::Relaxed),
+                _ => 0,
+            };
+            let teb = match slot {
+                0 => WL_LISTENER_TEB_VA,
+                1 => WL_WORKER2_TEB_VA,
+                2 => WL_WORKER3_TEB_VA,
+                _ => 0,
+            };
+            let (wl_pi, cid_proc, pml4) = live_process_context(nt_handler, procs, b"winlogon.exe")
+                .expect("winlogon.exe EPROCESS missing before worker spawn");
+            print_str(b"[wl-thread] spawning REAL worker slot=");
+            print_u64(slot as u64);
+            print_str(b" (multiplexed): entry=0x");
+            print_hex((start.rip >> 32) as u32);
+            print_hex(start.rip as u32);
+            print_str(b" arg0=0x");
+            print_hex((start.rcx >> 32) as u32);
+            print_hex(start.rcx as u32);
+            print_str(b" arg1=0x");
+            print_hex((start.rdx >> 32) as u32);
+            print_hex(start.rdx as u32);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b"\n");
+            let suspended =
+                PM_POOL_SUSPENDED[wl_pi].load(Ordering::Relaxed) & (1 << slot) != 0;
+            let tcb = spawn_wl_listener_thread(
+                slot,
+                pml4,
+                start,
+                initial_teb,
+                cid_proc,
+                tid,
+                fault_ep,
+                false,
+            );
+            let teb_alias = match slot {
+                0 => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+                1 => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
+                2 => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
+                _ => 0,
+            };
+            if seed_winlogon_thread_client_info(teb_alias, pml4).is_none() {
+                print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
+            }
+            if slot == 0 {
+                let mapped_low = initial_teb
+                    .stack_limit
+                    .checked_sub(nt_thread_start::USER_PAGE_SIZE)
+                    .filter(|&low| {
+                        initial_teb.allocated_stack_base & 0xfff == 0
+                            && initial_teb.stack_base & 0xfff == 0
+                            && initial_teb.allocated_stack_base <= low
+                            && low < initial_teb.stack_base
+                            && csrss_frame_get_exact(wl_pi as u64, low).0 != 0
+                    })
+                    .unwrap_or(0);
+                if mapped_low != 0 {
+                    WL_LISTENER_STACK_ALLOCATION_BASE
+                        .store(initial_teb.allocated_stack_base, Ordering::Release);
+                    WL_LISTENER_STACK_BASE_REAL.store(initial_teb.stack_base, Ordering::Release);
+                    WL_LISTENER_STACK_MAPPED_LOW.store(mapped_low, Ordering::Release);
+                } else {
+                    WL_LISTENER_STACK_ALLOCATION_BASE.store(0, Ordering::Release);
+                    WL_LISTENER_STACK_BASE_REAL.store(0, Ordering::Release);
+                    WL_LISTENER_STACK_MAPPED_LOW.store(0, Ordering::Release);
+                    print_str(b"[wl-thread] real stack reservation could not be armed\n");
+                }
+            }
+            tcb_cell.store(tcb, Ordering::Relaxed);
+            let (role, badge) = match slot {
+                0 => (HostedThreadRole::WinlogonListener, WINLOGON_WORKER_BADGE),
+                1 => (
+                    HostedThreadRole::WinlogonWorker { slot },
+                    WINLOGON_WORKER2_BADGE,
+                ),
+                2 => (
+                    HostedThreadRole::WinlogonWorker { slot },
+                    WINLOGON_WORKER3_BADGE,
+                ),
+                _ => return,
+            };
+            nt_handler.register_hosted_thread_tcb(wl_pi, tid, tcb, badge, role);
+            if slot == 0 {
+                WL_LISTENER_TCB_MINTED.store(tcb, Ordering::Relaxed);
+            }
+            nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
+            if !suspended {
+                let _ = tcb_resume(tcb);
+            }
+            print_str(b"[wl-thread] spawned tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" TEB=0x");
+            print_hex((teb >> 32) as u32);
+            print_hex(teb as u32);
+            print_str(if suspended {
+                b" (SUSPENDED; NtResumeThread owns first run; real ETHREAD + TEB)\n"
+            } else {
+                b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
+            });
+        }
+        HostedThreadSpawnRequest::TpWorker { pi, slot } => {
+            if pi < TP_WORKER_PI_COUNT && slot < TP_WORKER_SLOT_COUNT {
+                spawn_requested_tp_worker(nt_handler, pi, slot, procs[pi].pml4, caller_sp, fault_ep);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[inline(never)]

@@ -9380,13 +9380,9 @@ impl ExecNtHandler {
                 // failed connection (as they did when the bind read returned garbage) — so the 3
                 // `exec_live_terminate_thread_{routed,tcb_reclaimed,no_reply}` specs, which counted on
                 // those two self-exits (`>= 3`), drop to 2 (only csrss + lsass). AND winlogon, having
-                // OpenSCManager succeed, advances into GUI code and hits a NEW downstream null-deref
-                // frontier (rip in user32/gdi32) → gate 174→171. Per the batch constraint (gate ≥174, the
-                // 4 terminate specs MUST pass, no regression), the route is GATED OFF for the commit: the
-                // npfs reconcile fixes (correct + general + host-tested) land, bind_ack is PROVEN with the
-                // route flipped ON, and the OFF path is byte-identical to the BATCH-37 green boot (gate
-                // 174). NEXT WALL = winlogon's post-OpenSCManager GUI null-deref + the SCM server's
-                // persistent-thread lifecycle (the terminate specs need updating for a SUCCEEDING RPC).
+                // OpenSCManager succeed, advances into GUI code. That route is now enabled: the SCM
+                // RPC success path and persistent listener/worker lifecycle are part of the boot
+                // frontier, so this recognizer remains keyed by caller identity rather than order.
                 const SCM_WORKER_ROUTE_ENABLED: bool = true;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
@@ -9443,7 +9439,7 @@ impl ExecNtHandler {
                 // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (lsass.exe + the
                 // \lsarpc server thread role), never by creation order.
                 //
-                // ★★ ROUTE STILL GATED OFF — but for a NEWLY ISOLATED reason, no longer the
+                // ★★ ROUTE ENABLED. The formerly isolated wall is no longer the
                 // dispatch-correlation one. With `LSA_WORKER_ROUTE_ENABLED = true` the whole
                 // self-RPC RUNS FOR REAL: the worker reads the 72-byte bind (`05 00 0b 03`),
                 // `process_bind_packet` writes the 68-byte bind_ack (`05 00 0c 03`) which wakes
