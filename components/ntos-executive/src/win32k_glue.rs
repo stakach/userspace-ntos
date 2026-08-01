@@ -3138,6 +3138,15 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     );
     // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
     // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.
+    // Clear all slots first so component-side provider metadata can never observe stale tail args.
+    let mut clear = 0u64;
+    while clear < 12 {
+        core::ptr::write_volatile(
+            (sh + win32k_subsystem::SH_REQ_A4 + clear * 8) as *mut u64,
+            0,
+        );
+        clear += 1;
+    }
     let staged = if nargs > 4
         && caller_sp != 0
         && stack_args.len() >= nargs.min(16).saturating_sub(4) as usize

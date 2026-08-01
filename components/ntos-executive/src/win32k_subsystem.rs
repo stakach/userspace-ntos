@@ -30,7 +30,13 @@
 //! so the component calls them at the same VA.
 
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use nt_compat_exports::DriverExportRegistry;
+use nt_compat_exports::{
+    ssdt::{
+        x64_argument_count_from_sspt_byte,
+        WIN32K_SERVICE_TABLE_INDEX as NT_WIN32K_SERVICE_TABLE_INDEX,
+    },
+    DriverExportRegistry,
+};
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
 use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_wcslen};
@@ -177,6 +183,7 @@ pub const SH_DE_STATUS: u64 = 0x10; // out: DriverEntry NTSTATUS (i32)
 pub const SH_SSDT_BASE: u64 = 0x18; // out: recorded win32k SSDT base (u64)
 pub const SH_SSDT_COUNT: u64 = 0x20; // out: recorded win32k SSDT count (u32)
 pub const SH_SSDT_INDEX: u64 = 0x24; // out: recorded SSDT index (u32)
+pub const SH_SSDT_ARGUMENT_TABLE: u64 = 0x28; // out: recorded win32k SSPT/KiArgumentTable base (u64)
 pub const SH_POOL_USED: u64 = 0x30; // out: pool high-water (u64)
 pub const SH_NTUSER_HANDLER: u64 = 0x40; // out: resolved SSDT[0xFA] handler VA (u64)
 pub const SH_NTUSER_STATUS: u64 = 0x48; // out: NtUserInitialize NTSTATUS (i32)
@@ -249,13 +256,50 @@ pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_DEBUG_FLAGS < SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
-/// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
-/// + user32/gdi32 actually issue; verified: 0x1077=CreateWindowEx, 0x10bd=GetClassInfo,
-/// 0x1288=SwitchDesktop, 0x125a=Initialize, 0x10fa=ProcessConnect all match the live trace). Returns
-/// 0 for SSNs with <=4 args (register-only — the vast majority + the default), so the dispatch is
-/// byte-identical to the pre-BATCH-44 path unless the handler genuinely needs stack args. This is the
-/// GENERAL fix for the "garbage stack arg" wall (root cause: NtUserCreateWindowEx read hMenu from
-/// win32k's own leftover stack -> ERROR_INVALID_MENU_HANDLE -> NULL HWND -> winlogon SAS-init fail).
+/// The registered win32k service metadata published by `KeAddSystemServiceTable`.
+///
+/// The argument table is a provider VA. The executive may record and log it, but must not dereference
+/// it unless that VA is explicitly mapped into the executive. The component-side dispatcher can read
+/// it directly in win32k's own VSpace.
+pub fn registered_win32k_service_metadata() -> Option<(u64, u32, u64)> {
+    unsafe {
+        let base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+        let count = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *const u32);
+        let index = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_INDEX) as *const u32);
+        let argument_table =
+            read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_ARGUMENT_TABLE) as *const u64);
+        if base == 0 || count == 0 || argument_table == 0 || index != NT_WIN32K_SERVICE_TABLE_INDEX
+        {
+            None
+        } else {
+            Some((base, count, argument_table))
+        }
+    }
+}
+
+/// Component-side lookup of the provider's win32k x64 SSPT/KiArgumentTable arity.
+///
+/// # Safety
+///
+/// `argument_table` is the raw pointer win32k registered from its own address space. Call this only
+/// while running in the win32k component VSpace, where that pointer is valid.
+unsafe fn registered_win32k_provider_argc(ssn: u64) -> Option<u64> {
+    let (_base, count, argument_table) = registered_win32k_service_metadata()?;
+    let index = ssn.checked_sub(WIN32K_SERVICE_BASE)?;
+    if index >= count as u64 {
+        return None;
+    }
+    let argument_byte = read_volatile(argument_table.checked_add(index)? as *const u8);
+    Some(u64::from(x64_argument_count_from_sspt_byte(argument_byte)))
+}
+
+/// Static fallback for the win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the
+/// SSN space winlogon.exe + user32/gdi32 actually issue; verified: 0x1077=CreateWindowEx,
+/// 0x10bd=GetClassInfo, 0x1288=SwitchDesktop, 0x125a=Initialize, 0x10fa=ProcessConnect all match the
+/// live trace). Returns 0 for SSNs with <=4 args (register-only — the vast majority + the default),
+/// so the dispatch is byte-identical to the pre-BATCH-44 path unless the handler genuinely needs
+/// stack args. This remains the executive marshalling fallback until the provider SSPT is copied or
+/// mapped into the executive address space.
 pub fn win32k_ssn_argc(ssn: u64) -> u64 {
     match ssn {
         0x1001 => 5,  // UserPeekMessage
@@ -1733,7 +1777,7 @@ extern "win64" fn s_ke_add_system_service_table(
     base: u64,
     _count_ptr: u64,
     limit: u64,
-    _number_ptr: u64,
+    argument_table: u64,
     index: u64,
 ) -> u64 {
     unsafe {
@@ -1745,6 +1789,10 @@ extern "win64" fn s_ke_add_system_service_table(
         write_volatile(
             (WIN32K_SHARED_VADDR + SH_SSDT_INDEX) as *mut u32,
             index as u32,
+        );
+        write_volatile(
+            (WIN32K_SHARED_VADDR + SH_SSDT_ARGUMENT_TABLE) as *mut u64,
+            argument_table,
         );
         let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
         write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_SSDT);
@@ -4289,7 +4337,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     // (the common case) this is byte-identical to the old 4-register call. For a wide SSN (e.g.
     // NtUserCreateWindowEx = 15 args) we transmute to the exact-arity fn type so Rust/LLVM places
     // args 5..N on the stack per win64 — delivering hMenu et al. correctly instead of garbage.
-    let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
+    let marshaled_nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
+    let nargs = registered_win32k_provider_argc(ssn).unwrap_or(marshaled_nargs);
+    if nargs > 16 {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
     let sh = WIN32K_SHARED_VADDR;
     let debug_flags = read_volatile((sh + SH_REQ_DEBUG_FLAGS) as *const u64);
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)

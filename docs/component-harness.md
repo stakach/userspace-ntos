@@ -79,8 +79,8 @@ for added capability flags (§2.3).
 | Enter recv→dispatch→reply loop | `dispatch_loop(drv)` `:851`, body `:885-904` | `dispatch_loop()` `:2716`, body `:3344-3448` |
 | Ready/done signal (plain Send on `CT_FAULT`, distinct label) | `send_done` `:856-867`, `FSD_DISPATCH_LABEL=0x771` `:116` | `send_done` `:2958-2968`, `W32_DISPATCH_LABEL=0x770` `:487` |
 | Block for request (plain Recv on `CT_FAULT`) | `recv_req` `:870-880` | `recv_req` `:2974-2983` |
-| **Dispatch routing** | `DriverObject->MajorFunction[major]` at `mj_base+major*8` `:892` | SSDT: `dispatch_ssn` `:2722-2948`, `handler = [SH_SSDT_BASE + (ssn-0x1000)*8]` `:2733` |
-| **Arg marshal** | fixed IRP build `run_irp` `:915-1090` | wide-arg reconstruct via `win32k_ssn_argc` + exact-arity transmute `:2737-2786` |
+| **Dispatch routing** | `DriverObject->MajorFunction[major]` at `mj_base+major*8` `:892` | SSDT: `dispatch_ssn` `:2722-2948`, `handler = [SH_SSDT_BASE + (ssn-0x1000)*8]` `:2733`; provider SSPT pointer recorded at `SH_SSDT_ARGUMENT_TABLE` |
+| **Arg marshal** | fixed IRP build `run_irp` `:915-1090` | executive stages wide args from the fallback arity map; component-side dispatch prefers the registered provider SSPT arity, then exact-arity transmutes `:2737-2786` |
 | Write reply (status/info/seq) | `:899-902` | `:3444-3446` |
 
 **Shared-frame protocol** — both use one RW page shared into the executive, with a header of fixed
@@ -89,6 +89,7 @@ offsets. FSD `FSD_SHARED_VADDR=0x…0F38_0000` (`driver_launch.rs:78`), offsets 
 `SH_REQ_INLEN=0x58`, `SH_REQ_OUTLEN=0x60`, `SH_REQ_FILEID=0x68`, `SH_REQ_STATUS=0x70`, `SH_REQ_INFO=0x78`,
 `SH_REQ_SEQ=0x80`). win32k `WIN32K_SHARED_VADDR=0x…0718_0000` (`win32k_subsystem.rs:104`), offsets
 `:141-176` (`SH_ENTRY_RVA=0x00`, `SH_VERDICT=0x08`, `SH_DE_STATUS=0x10`, `SH_SSDT_BASE=0x18`,
+`SH_SSDT_COUNT=0x20`, `SH_SSDT_INDEX=0x24`, `SH_SSDT_ARGUMENT_TABLE=0x28`, `SH_POOL_USED=0x30`,
 `SH_REQ_SSN=0x50`, `SH_REQ_A0..A3=0x58/0x60/0x68/0x70`, `SH_REQ_STATUS=0x78`, `SH_REQ_SEQ=0x80`,
 `SH_FONT_SIZE=0x88`, wide-arg tail `SH_REQ_A4=0x90 .. SH_REQ_NARGS=0xF0`).
 
@@ -393,7 +394,7 @@ step is a separate commit = a rollback point.
 | **int-0x2c assert-skip (g) altitude** — verifying `CD 2C` via the executive RW image view must stay | `win32k_glue.rs:558-591` | Behind `assert_skip`; byte-for-byte relocation; keep the global `W32_ASSERT_LOG` gate + per-dispatch `skips<4000` bound. |
 | **Client-attach detach/remap ordering (c)** — `w32_client_attach` must run BEFORE the request fill each dispatch or a stale client's frames leak in | `win32k_glue.rs:157-179`; forward arm sets `W32_CLIENT_PI` `service_sec_image.rs:2849` | Pump step 1 does `client_attach` first, exactly as `win32k_dispatch_wide:405-406`. |
 | **Status-offset unification (0x70 vs 0x78)** — a wrong read = wrong NTSTATUS to the caller | §2.2 | Do NOT unify; read the offset by `caps.kind`. |
-| **`SH_REQ_KIND=0x38` collision** — must be free in BOTH frames | §2.2 | **UNCERTAIN — implementer MUST verify** 0x38 is unused in the FSD frame (between `SH_POOL_USED=0x28` and `SH_REQ_MAJOR=0x40`) and the win32k frame (between `SH_SSDT_INDEX=0x24` and `SH_REQ_SSN=0x50`). If not free, pick another gap or drop `SH_REQ_KIND` and key KIND off the descriptor (constant per component) — likely sufficient since no component serves both KINDs. |
+| **`SH_REQ_KIND=0x38` collision** — must be free in BOTH frames | §2.2 | **UNCERTAIN — implementer MUST verify** 0x38 is unused in the FSD frame (between `SH_POOL_USED=0x28` and `SH_REQ_MAJOR=0x40`) and the win32k frame (after `SH_POOL_USED=0x30`; `SH_SSDT_ARGUMENT_TABLE=0x28` now occupies the older hole, and `SH_NTUSER_HANDLER=0x40` is still the next field). If not free, pick another gap or drop `SH_REQ_KIND` and key KIND off the descriptor (constant per component) — likely sufficient since no component serves both KINDs. |
 | **DriverObject byte-layout parameterisation** — FSD (0x150, ext 0x68) vs win32k (0x200, ext 0x30) | `driver_launch.rs:795-810`, `win32k_subsystem.rs:2668-2673` | Pass a `DriverObjectSpec`; each DriverEntry reads the layout it expects. |
 | **Family B is NOT a dispatch server** — attempting to force it onto `component_pump` would be new behaviour | §1.3 | Keep Family B on `run_once` only; do NOT route IRPs to it. |
 | **win32k's component-side `dispatch_loop` extras** (BATCH-43 thread↔desktop re-assert `:3372-3404`, setup_dispatch_context) are INSIDE the loop, not the harness | `win32k_subsystem.rs:3344-3448` | The `dispatch` closure / `post_driver_entry` retains them; `component_main`'s loop only owns send_done/recv_req/status-writeback. Confirm no reordering. |

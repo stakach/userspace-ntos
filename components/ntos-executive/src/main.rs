@@ -16236,6 +16236,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SSDT_COUNT)
                     as *const u32,
             );
+            let ssdt_argument_table = core::ptr::read_volatile(
+                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SSDT_ARGUMENT_TABLE)
+                    as *const u64,
+            );
             let pool_used = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_POOL_USED)
                     as *const u64,
@@ -16271,6 +16275,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_hex(ssdt_base as u32);
                 print_str(b" count=");
                 print_u64(ssdt_count as u64);
+                print_str(b" sspt=0x");
+                print_hex((ssdt_argument_table >> 32) as u32);
+                print_hex(ssdt_argument_table as u32);
                 print_str(b"\n");
             }
             // Phase 2c: report the per-process attach (win32k's process-create callout) + the SSN
@@ -16378,6 +16385,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(
                 b"win32k_ssdt_registered",
                 (verdict & win32k_subsystem::V_SSDT) != 0,
+                &mut passed,
+            );
+            check(
+                b"win32k_sspt_metadata_registered",
+                win32k_subsystem::registered_win32k_service_metadata().is_some(),
                 &mut passed,
             );
             // Phase-2b milestone: GreDriverEntry ran through init and registered its NtUser/NtGdi

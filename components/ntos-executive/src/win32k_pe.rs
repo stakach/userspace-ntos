@@ -160,10 +160,12 @@ pub fn ssdt_seam_selftest() -> bool {
     // base + 0xFA*8.
     let first_ok = reg.resolve(WIN32K_SERVICE_BASE) == Some((table, base));
     let stop_ok = reg.resolve(WIN32K_SERVICE_BASE + 0xFA) == Some((table, base + 0xFA * 8));
+    let argument_metadata_ok =
+        table.argument_byte_ptr(WIN32K_SERVICE_BASE + 0xFA) == Some(argt + 0xFA);
     // A native (< 0x1000) SSN must not resolve to the win32k shadow table.
     let native_not_misrouted = reg
         .resolve(0x0055)
         .map(|(t, _)| t.index != WIN32K_SERVICE_TABLE_INDEX)
         .unwrap_or(true);
-    recorded && first_ok && stop_ok && native_not_misrouted
+    recorded && first_ok && stop_ok && argument_metadata_ok && native_not_misrouted
 }

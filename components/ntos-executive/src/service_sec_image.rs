@@ -7448,9 +7448,13 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" atom=0x");
                             print_hex(SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u32);
                             print_str(b" procA=");
-                            print_u64((SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64);
+                            print_u64(
+                                (SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64,
+                            );
                             print_str(b" procW=");
-                            print_u64((SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64);
+                            print_u64(
+                                (SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64,
+                            );
                             print_str(b" ansi=");
                             print_u64(capture.ansi as u64);
                             print_str(b" -> FALSE\n");

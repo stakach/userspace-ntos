@@ -21,6 +21,27 @@ pub const WIN32K_SERVICE_TABLE_INDEX: u32 = 1;
 /// numbers `< 0x1000` are native ntoskrnl; `>= 0x1000` are win32k.
 pub const WIN32K_SERVICE_BASE: u32 = 0x1000;
 
+/// ReactOS/NT5 x64 service parameter tables store the argument byte count,
+/// not the register-width argument count.
+pub const X64_SERVICE_ARGUMENT_GRANULARITY: u32 = core::mem::size_of::<u64>() as u32;
+
+/// Decode one x64 SSPT/KiArgumentTable byte into a pointer-width argument count.
+pub const fn x64_argument_count_from_sspt_byte(argument_bytes: u8) -> u32 {
+    (argument_bytes as u32) / X64_SERVICE_ARGUMENT_GRANULARITY
+}
+
+/// Encode a pointer-width argument count into the x64 SSPT byte form.
+pub const fn x64_sspt_byte_from_argument_count(argument_count: u32) -> Option<u8> {
+    let Some(argument_bytes) = argument_count.checked_mul(X64_SERVICE_ARGUMENT_GRANULARITY) else {
+        return None;
+    };
+    if argument_bytes > u8::MAX as u32 {
+        None
+    } else {
+        Some(argument_bytes as u8)
+    }
+}
+
 /// One recorded `KeAddSystemServiceTable` registration.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ServiceTable {
@@ -35,29 +56,46 @@ pub struct ServiceTable {
 }
 
 impl ServiceTable {
-    /// True if `ssn` falls within this table's service-number range.
-    /// win32k's table starts at [`WIN32K_SERVICE_BASE`]; native tables at 0.
-    pub fn contains(&self, ssn: u32) -> bool {
-        let start = if self.index == WIN32K_SERVICE_TABLE_INDEX {
+    /// The first service number owned by this descriptor.
+    pub fn service_base(&self) -> u32 {
+        if self.index == WIN32K_SERVICE_TABLE_INDEX {
             WIN32K_SERVICE_BASE
         } else {
             0
-        };
-        ssn >= start && ssn < start + self.count
+        }
+    }
+
+    /// The descriptor-relative service index for `ssn`, if in range.
+    pub fn service_index(&self, ssn: u32) -> Option<u32> {
+        let index = ssn.checked_sub(self.service_base())?;
+        if index < self.count {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    /// True if `ssn` falls within this table's service-number range.
+    /// win32k's table starts at [`WIN32K_SERVICE_BASE`]; native tables at 0.
+    pub fn contains(&self, ssn: u32) -> bool {
+        self.service_index(ssn).is_some()
     }
 
     /// The service-function pointer for `ssn` (`base + (ssn - start) * 8`),
     /// or `None` if out of range. Phase 2 uses this to locate the target.
     pub fn function_ptr(&self, ssn: u32) -> Option<u64> {
-        if !self.contains(ssn) {
+        let index = self.service_index(ssn)?;
+        self.base.checked_add(u64::from(index).checked_mul(8)?)
+    }
+
+    /// Pointer to the one-byte argument metadata for `ssn`, if the provider
+    /// registered an SSPT/KiArgumentTable and `ssn` is in range.
+    pub fn argument_byte_ptr(&self, ssn: u32) -> Option<u64> {
+        if self.argument_table == 0 {
             return None;
         }
-        let start = if self.index == WIN32K_SERVICE_TABLE_INDEX {
-            WIN32K_SERVICE_BASE
-        } else {
-            0
-        };
-        Some(self.base + u64::from(ssn - start) * 8)
+        let index = self.service_index(ssn)?;
+        self.argument_table.checked_add(u64::from(index))
     }
 }
 
@@ -158,12 +196,15 @@ mod tests {
         assert!(!t.contains(0x0FFF));
         // 0x1000 is the first NtUser/NtGdi service.
         assert!(t.contains(0x1000));
+        assert_eq!(t.service_index(0x1000), Some(0));
         assert_eq!(t.function_ptr(0x1000), Some(base));
         // 0x10FA (the SSN csrss/winsrv stops on) resolves to base + 0xFA*8.
         assert!(t.contains(0x10FA));
+        assert_eq!(t.service_index(0x10FA), Some(0xFA));
         assert_eq!(t.function_ptr(0x10FA), Some(base + 0xFA * 8));
         // Past the end of the table is out of range.
         assert!(!t.contains(0x1000 + 600));
+        assert_eq!(t.service_index(0x1000 + 600), None);
         assert_eq!(t.function_ptr(0x1000 + 600), None);
 
         let (rt, ptr) = reg.resolve(0x10FA).expect("resolved");
@@ -181,5 +222,41 @@ mod tests {
         assert!(t.contains(0x0055));
         assert_eq!(t.function_ptr(0x0055), Some(0xAAAA_0000 + 0x55 * 8));
         assert!(!t.contains(0x1000)); // win32k range is not in the native table
+    }
+
+    #[test]
+    fn service_table_exposes_argument_metadata_addresses() {
+        let table = ServiceTable {
+            index: WIN32K_SERVICE_TABLE_INDEX,
+            base: 0xFFFF_F800_0010_0000,
+            count: 600,
+            argument_table: 0xFFFF_F800_0011_0000,
+        };
+
+        assert_eq!(
+            table.argument_byte_ptr(WIN32K_SERVICE_BASE),
+            Some(table.argument_table)
+        );
+        assert_eq!(
+            table.argument_byte_ptr(WIN32K_SERVICE_BASE + 0xFA),
+            Some(table.argument_table + 0xFA)
+        );
+        assert_eq!(table.argument_byte_ptr(WIN32K_SERVICE_BASE + 600), None);
+
+        let no_metadata = ServiceTable {
+            argument_table: 0,
+            ..table
+        };
+        assert_eq!(no_metadata.argument_byte_ptr(WIN32K_SERVICE_BASE), None);
+    }
+
+    #[test]
+    fn x64_argument_count_decodes_sspt_bytes() {
+        assert_eq!(x64_argument_count_from_sspt_byte(0), 0);
+        assert_eq!(x64_argument_count_from_sspt_byte(32), 4);
+        assert_eq!(x64_argument_count_from_sspt_byte(40), 5);
+        assert_eq!(x64_argument_count_from_sspt_byte(120), 15);
+        assert_eq!(x64_sspt_byte_from_argument_count(15), Some(120));
+        assert_eq!(x64_sspt_byte_from_argument_count(32), None);
     }
 }
