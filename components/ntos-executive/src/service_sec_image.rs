@@ -489,6 +489,8 @@ struct HostedExeSpawn<'a> {
 
 fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
+    csrss_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+    winlogon_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     services_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     lsass_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
@@ -498,6 +500,18 @@ fn hosted_exe_spawn_for<'a>(
     let runtime = hosted_process_runtime_for_pi(image.pi)?;
     let spawned = runtime.spawned?;
     match image.pi {
+        1 => csrss_pe.as_ref().map(|pe| HostedExeSpawn {
+            image,
+            runtime,
+            pe,
+            spawned,
+        }),
+        2 => winlogon_pe.as_ref().map(|pe| HostedExeSpawn {
+            image,
+            runtime,
+            pe,
+            spawned,
+        }),
         3 => services_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
             runtime,
@@ -1878,20 +1892,8 @@ pub(crate) unsafe fn service_sec_image(
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
     // on `nt_handler.next_handle` (Workstream A group A) — a single monotonic source shared by the
     // migrated create-handle handlers and the remaining ladder cases (NtCreateSection/Process/File).
-    // Track the handles smss uses to launch csrss.exe: the file handle it opens (NtOpenFile), and
-    // the SEC_IMAGE section it creates from it (NtCreateSection). NtCreateProcess (next step) will
-    // spawn the real process from the section. Parse the staged csrss PE up front to prove it's
-    // available (FILEBUF tail; size at STORAGE_SHARED+0x3c).
-    let mut csrss_file_handle = 0u64;
-    let mut csrss_section_handle = 0u64;
     let mut csrss_process_handle = 0u64;
-    // winlogon.exe (the 3rd hosted process, smss's SmpExecuteInitialCommand initial command): the
-    // file/section handles smss opens+creates for it, and its process handle once spawned. Same roles
-    // as the csrss_* trio; the parsed PE is `winlogon_pe` below.
-    let mut winlogon_file_handle = 0u64;
-    let mut winlogon_section_handle = 0u64;
-    let mut winlogon_process_handle = 0u64;
-    // Generic owner-local file/section/spawn state for Win32 children.
+    // Generic owner-local file/section/spawn state for hosted executable images.
     let mut exe_images = nt_exe_image::ImageTable::<8>::new();
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
@@ -4717,10 +4719,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.process_dirty = false;
                 nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
-                nt_handler.spawn_request = false;
-                nt_handler.winlogon_spawn_request = false;
                 nt_handler.exe_spawn_request = None;
-                nt_handler.process_spawn_desired_access = 0;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = 0;
                 nt_handler.svc_listener_spawn = false;
@@ -4771,12 +4770,10 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
-                    csrss_file_handle: &mut csrss_file_handle as *mut u64,
-                    csrss_section_handle: &mut csrss_section_handle as *mut u64,
                     csrss_pe: &csrss_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    winlogon_file_handle: &mut winlogon_file_handle as *mut u64,
-                    winlogon_section_handle: &mut winlogon_section_handle as *mut u64,
+                    csrss_pool_va: csrss_va,
                     winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    winlogon_pool_va: winlogon_va,
                     exe_images: &mut exe_images as *mut nt_exe_image::ImageTable<8>,
                     services_pool_va: services_va,
                     services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
@@ -5268,197 +5265,23 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" parked reader(s)\n");
                     }
                 }
-                // Control-flow post-action (group C): NtCreateProcess validated the csrss section and
-                // asked the loop to spawn the subsystem process (needs fault_ep + the per-badge
-                // arrays that stay loop-resident). Mirrors the stop/out-write signal-back.
-                if nt_handler.spawn_request {
-                    // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
-                    // service EP tagged with that badge, so this loop multiplexes it against smss.
-                    let cruntime = hosted_process_runtime_for_pi(1).unwrap();
-                    let csrss_badge = hosted_top_badge_for_pi(1);
-                    let cf_c = mint_badged(fault_ep, csrss_badge);
-                    let cpe = csrss_pe.as_ref().unwrap();
-                    // Priority 101 (above smss's 100) so csrss actually gets scheduled: at equal
-                    // priority smss + the executive ping-pong and csrss never runs. csrss preempts
-                    // when runnable but blocks on every demand-fault (serviced by THIS loop, badge 2),
-                    // which hands smss its turns — so both make progress and smss's own checks still
-                    // pass. csrss uses a DISTINCT env-build scratch (0x78_0000, vs smss's 0x74_0000)
-                    // so its trampoline/PEB/params frames aren't clobbered by smss's still-mapped ones.
-                    // csrss's OWN process parameters (not smss's): its System32 image path drives
-                    // the loader's DLL search + ".local" SxS probe, and its Server command line
-                    // (ObjectDirectory/ServerDll=…) is what csrss.exe's entry parses once loaded.
-                    // TEMP (Phase 0b): drop the two `ServerDll=winsrv:...` entries. winsrv is the
-                    // Win32 GUI server; its UserServerDllInitialization issues win32k NtUser/NtGdi
-                    // syscalls (SSN >= 0x1000) that we have no graphics subsystem to service — a
-                    // benign-success stub makes it null-deref the fake HWND/HDESK return. Skipping
-                    // winsrv makes CsrParseServerCommandLine load only basesrv + csrsrv (neither
-                    // touches win32k) so csrss reaches csrsrv's CsrApiPortInitialize / \SmApiPort +
-                    // the SM<->CSR handshake, which csrsrv owns independently of winsrv. Real winsrv
-                    // init returns once win32k is hosted (Phase 2).
-                    // (`ServerDll=csrsrv` is NOT listed: csrsrv is ServerDll index 0, loaded
-                    // implicitly by CsrServerInitialization itself. Listing it fails CsrLoadServerDll
-                    // with STATUS_INVALID_PARAMETER — it has no ServerId. The real ReactOS command
-                    // line omits it too; it was only masked before by winsrv crashing first.)
-                    // Milestone C — winsrv DEFERRED pending the gSharedInfo grind (routing + marshaling
-                    // infra is IN PLACE; re-enabling is the one-line ServerDll add below). With winsrv
-                    // ON, csrsrv loads the full 14-DLL Win32 client stack and user32's DllMain `Init`
-                    // (dllmain.c:410) calls **NtUserProcessConnect(NtCurrentProcess(), USERCONNECT*, 0x240)**
-                    // = win32k SSN 0x10FA. The executive's SSN>=0x1000 forward arm ROUTES it (translating
-                    // NtCurrentProcess()==-1 → the hosted client handle + marshaling the 0x240 USERCONNECT
-                    // buffer through the shared ARG frame). BUT win32k's real NtUserProcessConnect handler
-                    // then CPU-SPINS (zero faults, never signals done) — with the real ulVersion=USER_VERSION
-                    // input it takes the FULL connect path that fills UserCon->siClient (gSharedInfo: psi +
-                    // aheList handle table) from win32k's shared section, which isn't set up as a
-                    // client-mappable section yet. Completing that (win32k produces a real USERCONNECT +
-                    // executive maps win32k's gSharedInfo shared section RO into csrss + user32 derefs
-                    // gHandleTable->handles) is the NEXT grind. Until then winsrv stays OUT so the gate is
-                    // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
-                    let cpml4 = spawn_hosted_sec_image_for_pi(
-                        1, cpe, cf_c, NTDLL_BASE, true,
-                        0, // 0 → effective_ldrp_rva resolves to OUR ntdll's derived LdrpInitialize RVA
-                    );
-                    nt_handler.register_main_thread_tcb(1, PM_MAIN_TCBS[1].load(Ordering::Relaxed));
-                    // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
-                    // ITS VSpace/image and a private scratch window.
-                    procs[1].pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
-                        .map(|pid| pid as u64)
-                        .unwrap_or(0);
-                    procs[1].pml4 = cpml4;
-                    PM_PML4S[1].store(cpml4, Ordering::Relaxed);
-                    CSRSS_SPAWNED.store(1, Ordering::Relaxed);
-                    procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
-                    procs[1].scratch_base = cruntime.scratch_base;
-                    map_demand_scratch_pts(cruntime.scratch_base); // own 64 MiB scratch window PTs
-                    // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
-                    nt_handler
-                        .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
-                    // Record csrss's process handle in smss's (the creator's) EPROCESS table as a
-                    // real typed Process object; the returned dense value IS the handle smss gets
-                    // (path 1b — process-local value). Fallback to a global value if pids are
-                    // unknown (shouldn't happen for the 3 hosted).
-                    csrss_process_handle = match (
-                        live_hosted_pid_for_leaf(&nt_handler, b"smss.exe"),
-                        live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe"),
-                    ) {
-                        (Some(smss_pid), Some(csrss_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                smss_pid,
-                                nt_process::HandleObject::Process(csrss_pid),
-                                nt_process::map_process_access(
-                                    nt_handler.process_spawn_desired_access,
-                                ),
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle;
-                                nt_handler.next_handle += 1;
-                                g
-                            })
-                        }
-                        _ => {
-                            let g = nt_handler.next_handle;
-                            nt_handler.next_handle += 1;
-                            g
-                        }
-                    };
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
-                        csrss_process_handle,
-                        SMSS_PEB_VA,
-                    ) {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge ");
-                    print_u64(csrss_badge);
-                    print_str(b") -> handle 0x");
-                    print_hex((csrss_process_handle >> 32) as u32);
-                    print_hex(csrss_process_handle as u32);
-                    print_str(b"; its faults now multiplexed into this loop\n");
-                }
-                // The 3rd hosted process: smss's SmpExecuteInitialCommand → RtlCreateUserProcess
-                // created winlogon's SEC_IMAGE section; NtCreateProcess validated it. Spawn winlogon
-                // (badge WINLOGON_BADGE) exactly like csrss — its own VSpace + image + ntdll + fault
-                // EP, per-process env-scratch/mirrors/alloc-bump (all distinct from smss/csrss). Its
-                // ntdll loader then runs, multiplexed into this loop by badge. Prio 102 (> csrss 101 >
-                // smss 100) so it is actually scheduled; it blocks on every demand-fault (serviced
-                // here), handing the others their turns.
-                if nt_handler.winlogon_spawn_request {
-                    let wruntime = hosted_process_runtime_for_pi(2).unwrap();
-                    let winlogon_badge = hosted_top_badge_for_pi(2);
-                    let wf_c = mint_badged(fault_ep, winlogon_badge);
-                    let wpe = winlogon_pe.as_ref().unwrap();
-                    let wpml4 = spawn_hosted_sec_image_for_pi(
-                        2, wpe, wf_c, NTDLL_BASE, true,
-                        0, // pi>=1: real ntdll LdrpInitialize
-                    );
-                    nt_handler.register_main_thread_tcb(2, PM_MAIN_TCBS[2].load(Ordering::Relaxed));
-                    procs[2].pid = live_hosted_pid_for_leaf(&nt_handler, b"winlogon.exe")
-                        .map(|pid| pid as u64)
-                        .unwrap_or(0);
-                    procs[2].pml4 = wpml4;
-                    PM_PML4S[2].store(wpml4, Ordering::Relaxed);
-                    procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
-                    procs[2].scratch_base = wruntime.scratch_base;
-                    map_demand_scratch_pts(wruntime.scratch_base); // own 64 MiB scratch window PTs
-                    // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
-                    nt_handler
-                        .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
-                    // Record winlogon's process handle in smss's EPROCESS table as a typed Process
-                    // object; the returned dense value IS smss's handle (path 1b).
-                    winlogon_process_handle = match (
-                        live_hosted_pid_for_leaf(&nt_handler, b"smss.exe"),
-                        live_hosted_pid_for_leaf(&nt_handler, b"winlogon.exe"),
-                    ) {
-                        (Some(smss_pid), Some(winlogon_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                smss_pid,
-                                nt_process::HandleObject::Process(winlogon_pid),
-                                nt_process::map_process_access(
-                                    nt_handler.process_spawn_desired_access,
-                                ),
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle;
-                                nt_handler.next_handle += 1;
-                                g
-                            })
-                        }
-                        _ => {
-                            let g = nt_handler.next_handle;
-                            nt_handler.next_handle += 1;
-                            g
-                        }
-                    };
-                    if !nt_handler.publish_created_process(
-                        get_recv_mr(9),
-                        winlogon_process_handle,
-                        SMSS_PEB_VA,
-                    ) {
-                        result = 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge ");
-                    print_u64(winlogon_badge);
-                    print_str(b") -> handle 0x");
-                    print_hex((winlogon_process_handle >> 32) as u32);
-                    print_hex(winlogon_process_handle as u32);
-                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                    WINLOGON_SPAWNED.store(1, Ordering::Relaxed);
-                }
-                // The generic Win32-child lane reserved a spawn after validating the owner-local
-                // file -> section -> process transition in `exe_images`. The remaining per-image policy
-                // is the address-space descriptor; handle publication and ProcessManager wiring are
-                // common for services/lsass/userinit/explorer.
+                // The hosted-exe lane reserved a spawn after validating the owner-local file ->
+                // section -> process transition in `exe_images`. The remaining per-image policy is
+                // the address-space descriptor; handle publication and ProcessManager wiring are
+                // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
+                    let is_csrss_spawn = request.leaf().eq_ignore_ascii_case(b"csrss.exe");
                     if let Some(spec) = hosted_exe_spawn_for(
                         request,
+                        &csrss_pe,
+                        &winlogon_pe,
                         &services_pe,
                         &lsass_pe,
                         &userinit_pe,
                         &explorer_pe,
                     ) {
                         if spec.spawned.load(Ordering::Relaxed) == 0 {
-                            if let Err(status) = spawn_requested_hosted_exe(
+                            match spawn_requested_hosted_exe(
                                 request,
                                 spec,
                                 fault_ep,
@@ -5466,7 +5289,13 @@ pub(crate) unsafe fn service_sec_image(
                                 &mut nt_handler,
                                 &mut exe_images,
                             ) {
-                                result = u64::from(status);
+                                Ok(process_handle) if is_csrss_spawn => {
+                                    csrss_process_handle = process_handle;
+                                }
+                                Ok(_) => {}
+                                Err(status) => {
+                                    result = u64::from(status);
+                                }
                             }
                         }
                     }

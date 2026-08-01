@@ -41,6 +41,8 @@ unsafe fn record_hosted_child_exe_open(
         return false;
     };
     let image = match hosted.pi {
+        1 => unsafe { (&*ctx.csrss_pe).as_ref() }.map(|pe| (pe, ctx.csrss_pool_va)),
+        2 => unsafe { (&*ctx.winlogon_pe).as_ref() }.map(|pe| (pe, ctx.winlogon_pool_va)),
         3 => unsafe { (&*ctx.services_pe).as_ref() }.map(|pe| (pe, ctx.services_pool_va)),
         4 => unsafe { (&*ctx.lsass_pe).as_ref() }.map(|pe| (pe, ctx.lsass_pool_va)),
         5 => unsafe { (&*ctx.userinit_pe).as_ref() }.map(|pe| (pe, ctx.userinit_pool_va)),
@@ -423,10 +425,7 @@ impl ExecNtHandler {
             out_writes: [(0, 0); 8],
             out_writes_n: 0,
             loop_ctx: None,
-            spawn_request: false,
-            winlogon_spawn_request: false,
             exe_spawn_request: None,
-            process_spawn_desired_access: 0,
             sm_spawn_request: false,
             wl_spawn_request: 0,
             svc_listener_spawn: false,
@@ -12037,18 +12036,6 @@ impl ExecNtHandler {
                             ctx.dll_pes()[index]
                                 .as_ref()
                                 .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.current_process_is_smss()
-                            && args[0] == *ctx.csrss_file_handle
-                        {
-                            (&*ctx.csrss_pe)
-                                .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false))
-                        } else if self.current_process_is_smss()
-                            && args[0] == *ctx.winlogon_file_handle
-                        {
-                            (&*ctx.winlogon_pe)
-                                .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false))
                         } else if let Some(index) =
                             (&*ctx.exe_images).index_for_file(self.pi, args[0])
                         {
@@ -14031,10 +14018,6 @@ impl ExecNtHandler {
                 {
                     WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
                 }
-                let is_csrss = hosted_exe_leaf
-                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(b"csrss.exe"));
-                let is_winlogon = hosted_exe_leaf
-                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(b"winlogon.exe"));
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -14079,8 +14062,6 @@ impl ExecNtHandler {
                 }
                 let mut opened_handle = 0;
                 let status: u32 = if volume_directory.is_some()
-                    || is_csrss
-                    || is_winlogon
                     || hosted_exe_leaf.is_some()
                     || dll_i.is_some()
                 {
@@ -14109,12 +14090,6 @@ impl ExecNtHandler {
                     };
                     opened_handle = h;
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
-                    if is_csrss {
-                        *ctx.csrss_file_handle = h; // remember it for NtCreateSection
-                    }
-                    if is_winlogon {
-                        *ctx.winlogon_file_handle = h; // for NtCreateSection
-                    }
                     if let Some(leaf) = hosted_exe_leaf {
                         let _ = record_hosted_child_exe_open(ctx, self.pi, leaf, h);
                     }
@@ -14164,52 +14139,8 @@ impl ExecNtHandler {
                 let buf = get_recv_mr(7); // R8
                 let sect = get_recv_mr(9); // R10 = SectionHandle
                 let sp = get_recv_mr(16);
-                let csrss_section_handle = *ctx.csrss_section_handle;
-                let csrss_pe = &*ctx.csrss_pe;
-                let winlogon_section_handle = *ctx.winlogon_section_handle;
-                let winlogon_pe = &*ctx.winlogon_pe;
                 let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(self.pi, sect) {
                     reg.image_info(i).map(|b| (b, reg.name(i)))
-                } else if self.current_process_is_smss()
-                    && csrss_section_handle != 0
-                    && sect == csrss_section_handle
-                {
-                    // The csrss.exe SEC_IMAGE section is created + queried ONLY by smss (pi 0) inside
-                    // RtlCreateUserProcess. Scope to pi 0 so a DIFFERENT process's dense handle with
-                    // the same value (path 1b) can never alias it (reg is matched first regardless).
-                    csrss_pe.as_ref().map(|p| {
-                        (
-                            nt_dll_registry::image_info(
-                                PE_LOAD_BASE,
-                                p.entry_point_rva(),
-                                p.size_of_image(),
-                                false,
-                            ),
-                            b"csrss.exe" as &[u8],
-                        )
-                    })
-                } else if self.current_process_is_smss()
-                    && winlogon_section_handle != 0
-                    && sect == winlogon_section_handle
-                {
-                    // smss's RtlCreateUserProcess(winlogon) queries SectionImageInformation on the
-                    // winlogon SEC_IMAGE section to size the initial thread's stack + find the entry.
-                    // Unrecognized before, this stopped the whole demo (the ONLY reason winlogon
-                    // couldn't run past its CSR connect); recognized now → smss proceeds + winlogon
-                    // (higher prio) keeps running.
-                    winlogon_pe.as_ref().map(|p| {
-                        let mut info = nt_dll_registry::image_info(
-                            PE_LOAD_BASE,
-                            p.entry_point_rva(),
-                            p.size_of_image(),
-                            false,
-                        );
-                        let (major, minor) = p.subsystem_version();
-                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
-                        info[0x24..0x26].copy_from_slice(&minor.to_le_bytes());
-                        info[0x26..0x28].copy_from_slice(&major.to_le_bytes());
-                        (info, b"winlogon.exe" as &[u8])
-                    })
                 } else if let Some(index) =
                     (&*ctx.exe_images).index_for_section(self.pi, sect)
                 {
@@ -14295,29 +14226,6 @@ impl ExecNtHandler {
                 );
                 let sec_file = smss_stack_read(sp + 0x38);
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
-                // The csrss.exe / winlogon.exe EXE sections are created ONLY by smss (pi 0). Scope
-                // to pi 0 so a csrss/winlogon DLL section create with a same-valued dense file handle
-                // (path 1b) can't spuriously match these (the per-pi reg lookup handles DLLs below).
-                if self.current_process_is_smss()
-                    && *ctx.csrss_file_handle != 0
-                    && sec_file == *ctx.csrss_file_handle
-                {
-                    *ctx.csrss_section_handle = h;
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
-                    print_hex((h >> 32) as u32);
-                    print_hex(h as u32);
-                    print_str(b"\n");
-                }
-                if self.current_process_is_smss()
-                    && *ctx.winlogon_file_handle != 0
-                    && sec_file == *ctx.winlogon_file_handle
-                {
-                    *ctx.winlogon_section_handle = h;
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
-                    print_hex((h >> 32) as u32);
-                    print_hex(h as u32);
-                    print_str(b"\n");
-                }
                 if let Ok(index) =
                     (&mut *ctx.exe_images).create_section(self.pi, sec_file, h)
                 {
@@ -14579,12 +14487,28 @@ impl ExecNtHandler {
             },
             // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
             // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Control-flow case: validate the
-            // SectionHandle names the tracked csrss.exe SEC_IMAGE, then hand the actual spawn to the
-            // loop (it needs fault_ep + the per-badge process arrays) via `spawn_request`.
+            // SectionHandle through the executable image table, reserve the process publication, then
+            // let the loop build the seL4 mechanism from the same SpawnRequest used by Win32 children.
             NativeService::NtCreateProcess => unsafe {
                 let ctx = self.loop_ctx.unwrap();
                 let sp = get_recv_mr(16);
                 let sect = smss_stack_read(sp + 0x30); // SectionHandle
+                let slot_info = {
+                    let table = &*ctx.exe_images;
+                    table.index_for_section(self.pi, sect).and_then(|index| {
+                        table.get(index).map(|slot| {
+                            let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
+                            let leaf_len = slot.leaf().len();
+                            leaf[..leaf_len].copy_from_slice(slot.leaf());
+                            (index, leaf, leaf_len)
+                        })
+                    })
+                };
+                let Some((slot_index, leaf, leaf_len)) = slot_info else {
+                    self.stop = true;
+                    return 0xC000_0002;
+                };
+                let leaf = &leaf[..leaf_len];
                 if self.current_process_is_winlogon() || self.current_process_is_userinit() {
                     print_str(if self.current_process_is_winlogon() {
                         b"[wl-createproc] pi=2 sect=0x" as &[u8]
@@ -14593,94 +14517,35 @@ impl ExecNtHandler {
                     });
                     print_hex(sect as u32);
                     print_str(b" exe-slot=");
-                    print_u64(
-                        (&*ctx.exe_images)
-                            .index_for_section(self.pi, sect)
-                            .map(|index| index as u64 + 1)
-                            .unwrap_or(0),
-                    );
+                    print_u64(slot_index as u64 + 1);
                     print_str(b"\n");
                 }
-                // NtCreateProcess(csrss/winlogon) is issued ONLY by smss (pi 0); scope so a dense
-                // section handle of the same value in another process can't trigger a spawn (1b).
-                if self.current_process_is_smss()
-                    && *ctx.csrss_section_handle != 0
-                    && sect == *ctx.csrss_section_handle
-                    && (*ctx.csrss_pe).is_some()
-                {
-                    match self.allocate_hosted_process_slot(self.pi, b"csrss.exe") {
-                        Ok(1) => {
-                            self.process_spawn_desired_access = args[1] as u32;
-                            self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
-                            0
-                        }
-                        Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
-                        Err(status) => status,
+                if nt_exe_image::hosted_image_for_leaf(leaf).is_none() {
+                    self.stop = true;
+                    return 0xC000_0002;
+                }
+                let child_pi = match self.allocate_hosted_process_slot(self.pi, leaf) {
+                    Ok(child_pi) => child_pi,
+                    Err(status) => return status,
+                };
+                if child_pi == 5 {
+                    USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                } else if child_pi == 6 {
+                    EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                }
+                // RtlCreateUserProcess/CreateProcessAsUserW names the parent process with a real
+                // process handle (commonly NtCurrentProcess). Keep image launch policy out of the
+                // catalog; the parent check belongs to the handle table.
+                if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let table = &mut *ctx.exe_images;
+                match table.reserve_spawn(self.pi, sect, args[1] as u32, get_recv_mr(9)) {
+                    Ok(request) => {
+                        self.exe_spawn_request = Some(request);
+                        0
                     }
-                } else if self.current_process_is_smss()
-                    && *ctx.winlogon_section_handle != 0
-                    && sect == *ctx.winlogon_section_handle
-                    && (*ctx.winlogon_pe).is_some()
-                {
-                    match self.allocate_hosted_process_slot(self.pi, b"winlogon.exe") {
-                        Ok(2) => {
-                            self.process_spawn_desired_access = args[1] as u32;
-                            self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
-                            0
-                        }
-                        Ok(_) => nt_process::STATUS_INVALID_PARAMETER,
-                        Err(status) => status,
-                    }
-                } else {
-                    let slot_info = {
-                        let table = &*ctx.exe_images;
-                        table.index_for_section(self.pi, sect).and_then(|index| {
-                            table.get(index).map(|slot| {
-                                let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
-                                let leaf_len = slot.leaf().len();
-                                leaf[..leaf_len].copy_from_slice(slot.leaf());
-                                (leaf, leaf_len)
-                            })
-                        })
-                    };
-                    if let Some((leaf, leaf_len)) = slot_info {
-                        let leaf = &leaf[..leaf_len];
-                        if nt_exe_image::hosted_image_for_leaf(leaf).is_none() {
-                            self.stop = true;
-                            return 0xC000_0002;
-                        }
-                        let child_pi = match self.allocate_hosted_process_slot(self.pi, leaf) {
-                            Ok(child_pi) => child_pi,
-                            Err(status) => return status,
-                        };
-                        if child_pi == 5 {
-                            USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                        } else if child_pi == 6 {
-                            EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // RtlCreateUserProcess/CreateProcessAsUserW names the parent process with a
-                        // real process handle (commonly NtCurrentProcess). Keep image launch policy
-                        // out of the catalog; the parent check belongs to the handle table.
-                        if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
-                            return nt_process::STATUS_INVALID_HANDLE;
-                        }
-                        let table = &mut *ctx.exe_images;
-                        match table.reserve_spawn(
-                            self.pi,
-                            sect,
-                            args[1] as u32,
-                            get_recv_mr(9),
-                        ) {
-                            Ok(request) => {
-                                self.exe_spawn_request = Some(request);
-                                0
-                            }
-                            Err(_) => 0xC000_000D,
-                        }
-                    } else {
-                        self.stop = true;
-                        0xC000_0002
-                    }
+                    Err(_) => 0xC000_000D,
                 }
             },
             // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route NT's two

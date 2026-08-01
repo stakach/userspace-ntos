@@ -10342,21 +10342,14 @@ struct ExecLoopCtx {
     /// The DLL registry (csrsrv/basesrv/winsrv + the Win32 client stack): name→index resolution,
     /// per-DLL file/section-handle tracking, and image-info synthesis for the file/section fakes.
     reg: *mut nt_dll_registry::Registry,
-    /// The file handle smss/csrss opened for csrss.exe (NtOpenFile records it; NtCreateSection reads
-    /// it to recognise the SEC_IMAGE for the subsystem process). Points at the loop-local.
-    csrss_file_handle: *mut u64,
-    /// The SEC_IMAGE section handle for csrss.exe (NtCreateSection records; NtQuerySection/
-    /// NtCreateProcess read). Points at the loop-local.
-    csrss_section_handle: *mut u64,
-    /// The parsed csrss.exe PE (`None` on the earlier demo path). NtQuerySection synthesises its
-    /// SECTION_IMAGE_INFORMATION; NtCreateProcess spawns from it. Lifetime-erased raw ptr.
+    /// The parsed csrss.exe PE (`None` on the earlier demo path) and backing pool address. The
+    /// hosted executable image table carries file/section/spawn state for it.
     csrss_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// winlogon.exe (the 3rd hosted process) — the file/section handles smss opens+creates for it
-    /// (NtOpenFile/NtCreateSection track them) so NtCreateProcess recognises its SEC_IMAGE and asks
-    /// the loop to spawn it; the parsed PE the loop spawns from. Same roles as the csrss_* trio.
-    winlogon_file_handle: *mut u64,
-    winlogon_section_handle: *mut u64,
+    csrss_pool_va: u64,
+    /// winlogon.exe (the 3rd hosted process) uses the same hosted executable table as csrss and the
+    /// later Win32 children.
     winlogon_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    winlogon_pool_va: u64,
     /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
     /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
     exe_images: *mut nt_exe_image::ImageTable<8>,
@@ -10515,20 +10508,10 @@ struct ExecNtHandler {
     /// Raw refs to the loop's per-iteration state for group-C handlers (see [`ExecLoopCtx`]). Set
     /// by the Tier-1 dispatch arm before each `dispatch`; `None` outside the loop.
     loop_ctx: Option<ExecLoopCtx>,
-    /// Control-flow signal-back (Workstream A group C): NtCreateProcess validates the csrss section
-    /// then sets this so the LOOP performs the actual spawn (mint_badged(CSRSS_BADGE) +
-    /// spawn_sec_image + per-badge state + *ProcessHandle out) after dispatch — the spawn needs
-    /// fault_ep + the per-process arrays which stay loop-resident. Mirrors `stop`/the write queue.
-    spawn_request: bool,
-    /// Like `spawn_request` but for the 3rd hosted process: NtCreateProcess recognised winlogon's
-    /// SEC_IMAGE section, so the loop spawns winlogon (badge WINLOGON_BADGE) after dispatch.
-    winlogon_spawn_request: bool,
-    /// Generic Win32-child spawn reservation produced by the executable image state table. The
-    /// loop consumes it after dispatch, then publishes or rolls the reservation back.
+    /// Hosted executable spawn reservation produced by the executable image state table. The loop
+    /// consumes it after dispatch, builds the seL4 mechanism, then publishes or rolls back the
+    /// reservation. This covers csrss/winlogon and later Win32 children.
     exe_spawn_request: Option<nt_exe_image::SpawnRequest>,
-    /// Access requested by the `NtCreateProcess` call that raised one of the spawn signals above.
-    /// The loop maps generic bits and publishes the typed child handle with this grant.
-    process_spawn_desired_access: u32,
     /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
     /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
     /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.
