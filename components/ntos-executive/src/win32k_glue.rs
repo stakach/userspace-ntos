@@ -676,23 +676,23 @@ unsafe fn client_copyin_process_u32(
 unsafe fn explorer_atl_create_data_for_tid(
     client: crate::spawn_hosts::UserCallbackClient,
 ) -> Option<(u64, u64)> {
+    let pi = callback_client_owner_pi(client)?;
     let list_head_va =
         crate::PE_LOAD_BASE + EXPLORER_ATL_WIN_MODULE_RVA + ATL_CREATE_WND_LIST_OFFSET;
-    let mut entry =
-        client_copyin_process_u64(client.pi as u64, client.scratch_base, list_head_va)?;
+    let mut entry = client_copyin_process_u64(pi as u64, client.scratch_base, list_head_va)?;
 
     for _ in 0..8 {
         if entry == 0 {
             break;
         }
         let entry_tid = client_copyin_process_u32(
-            client.pi as u64,
+            pi as u64,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_TID_OFFSET,
         )
         .unwrap_or(u32::MAX);
         let p_this = client_copyin_process_u64(
-            client.pi as u64,
+            pi as u64,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_THIS_OFFSET,
         )
@@ -701,7 +701,7 @@ unsafe fn explorer_atl_create_data_for_tid(
             return Some((entry, p_this));
         }
         entry = client_copyin_process_u64(
-            client.pi as u64,
+            pi as u64,
             client.scratch_base,
             entry + ATL_CREATE_WND_DATA_NEXT_OFFSET,
         )
@@ -717,7 +717,7 @@ unsafe fn remember_explorer_atl_pthis(
     message: u32,
     hwnd: u64,
 ) {
-    if client.pi != 6
+    if !callback_client_is_explorer(client)
         || request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC
         || !matches!(message, WM_GETMINMAXINFO | WM_NCCREATE)
         || hwnd == 0
@@ -987,7 +987,7 @@ pub(crate) unsafe fn service_user_callback(
             print_str(b" depth=");
             print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
             print_str(b"\n");
-            if client.pi == 6
+            if callback_client_is_explorer(client)
                 && request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
             {
                 USER_CALLBACK_EXPLORER_API0_REDIRECTS.fetch_add(1, Ordering::Relaxed);
@@ -1019,9 +1019,9 @@ pub(crate) unsafe fn service_user_callback(
         print_str(b" status=0x");
         print_hex(status as u32);
         print_str(b"\n");
-        if client.pi == 6 && !client_dead {
+        if callback_client_is_explorer(client) && !client_dead {
             USER_CALLBACK_EXPLORER_FAILURES.fetch_add(1, Ordering::Relaxed);
-        } else if client.pi == 6 {
+        } else if callback_client_is_explorer(client) {
             USER_CALLBACK_EXPLORER_DEAD_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
         write_callback_failure_reply(request, status);
