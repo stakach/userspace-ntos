@@ -8,7 +8,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::directory::{query_directory, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState};
+use crate::directory::{
+    query_directory, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
+};
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
 use crate::status::*;
 
@@ -324,8 +326,7 @@ impl MemFs {
             // Reserve EXACTLY what the write needs before growing: the executive backs this volume
             // with a no-free bump heap, so `resize`'s amortised doubling would strand a buffer up
             // to twice the useful size on every extend.
-            n.data
-                .reserve_exact(start + bytes.len() - n.data.len());
+            n.data.reserve_exact(start + bytes.len() - n.data.len());
             n.data.resize(start + bytes.len(), 0);
         }
         n.data[start..start + bytes.len()].copy_from_slice(bytes);
@@ -671,7 +672,11 @@ impl FileSystem {
     /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object. A file object
     /// with `DeletePending` set unlinks its node at cleanup, exactly like an FSD's `IRP_MJ_CLEANUP`.
     pub fn zw_close(&mut self, handle: u64) -> u32 {
-        match self.handles.get_mut(handle as usize).and_then(|h| h.as_mut()) {
+        match self
+            .handles
+            .get_mut(handle as usize)
+            .and_then(|h| h.as_mut())
+        {
             Some(obj) => {
                 obj.references = obj.references.saturating_sub(1);
                 if obj.references != 0 {

@@ -530,7 +530,10 @@ mod tests {
         assert!(equal_string(b"Service", b"SERVICE", true));
         assert!(prefix_string(b"\\Device", b"\\DEVICE\\Harddisk0", true));
         assert_eq!(upper_string(b"aBz9!"), b"ABZ9!");
-        assert_eq!(upper_string(&[b'a', b'Z', 0xE9, 0xFF, 0]), [b'A', b'Z', 0xE9, 0xFF, 0]);
+        assert_eq!(
+            upper_string(&[b'a', b'Z', 0xE9, 0xFF, 0]),
+            [b'A', b'Z', 0xE9, 0xFF, 0]
+        );
         for byte in 0x80..=0xff {
             assert_eq!(upcase_ansi_byte(byte), byte);
         }

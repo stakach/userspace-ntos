@@ -110,7 +110,7 @@ pub struct UnicodeString {
 /// or a hosted binary reaches.
 #[repr(C, align(16))]
 pub struct ObjectType {
-    _mutex: [u8; 0x68],   // ERESOURCE
+    _mutex: [u8; 0x68],     // ERESOURCE
     _type_list: [u8; 0x10], // LIST_ENTRY
     pub name: UnicodeString,
     pub default_object: u64,
@@ -168,9 +168,7 @@ impl ObjectType {
     /// This type's `Name` as UTF-16 code units.
     pub fn name_units(&self) -> &[u16] {
         // SAFETY: `buffer`/`length` were set from a `&'static [u16]` in `new`.
-        unsafe {
-            core::slice::from_raw_parts(self.name.buffer, (self.name.length / 2) as usize)
-        }
+        unsafe { core::slice::from_raw_parts(self.name.buffer, (self.name.length / 2) as usize) }
     }
 }
 
@@ -190,14 +188,54 @@ pub const INDEX_DESKTOP: u32 = 24;
 pub const INDEX_WINDOW_STATION: u32 = 25;
 
 // UTF-16 type names (const, no alloc).
-static NAME_PROCESS: [u16; 7] = [b'P' as u16, b'r' as u16, b'o' as u16, b'c' as u16, b'e' as u16, b's' as u16, b's' as u16];
-static NAME_THREAD: [u16; 6] = [b'T' as u16, b'h' as u16, b'r' as u16, b'e' as u16, b'a' as u16, b'd' as u16];
-static NAME_EVENT: [u16; 5] = [b'E' as u16, b'v' as u16, b'e' as u16, b'n' as u16, b't' as u16];
+static NAME_PROCESS: [u16; 7] = [
+    b'P' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b's' as u16,
+    b's' as u16,
+];
+static NAME_THREAD: [u16; 6] = [
+    b'T' as u16,
+    b'h' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'a' as u16,
+    b'd' as u16,
+];
+static NAME_EVENT: [u16; 5] = [
+    b'E' as u16,
+    b'v' as u16,
+    b'e' as u16,
+    b'n' as u16,
+    b't' as u16,
+];
 static NAME_PORT: [u16; 4] = [b'P' as u16, b'o' as u16, b'r' as u16, b't' as u16];
-static NAME_DESKTOP: [u16; 7] = [b'D' as u16, b'e' as u16, b's' as u16, b'k' as u16, b't' as u16, b'o' as u16, b'p' as u16];
+static NAME_DESKTOP: [u16; 7] = [
+    b'D' as u16,
+    b'e' as u16,
+    b's' as u16,
+    b'k' as u16,
+    b't' as u16,
+    b'o' as u16,
+    b'p' as u16,
+];
 static NAME_WINSTA: [u16; 13] = [
-    b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16, b'S' as u16,
-    b't' as u16, b'a' as u16, b't' as u16, b'i' as u16, b'o' as u16, b'n' as u16,
+    b'W' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'd' as u16,
+    b'o' as u16,
+    b'w' as u16,
+    b'S' as u16,
+    b't' as u16,
+    b'a' as u16,
+    b't' as u16,
+    b'i' as u16,
+    b'o' as u16,
+    b'n' as u16,
 ];
 
 // The real OBJECT_TYPE statics. `mut` because win32k writes `->TypeInfo.*` into the desktop /
@@ -299,7 +337,10 @@ mod tests {
         let base = desktop_object_type_addr();
         let size = core::mem::size_of::<ObjectType>() as u64;
         for off in [0xB0u64, 0xC0, 0xD0] {
-            assert!(off + 4 <= size, "win32k write at +0x{off:x} escapes the struct");
+            assert!(
+                off + 4 <= size,
+                "win32k write at +0x{off:x} escapes the struct"
+            );
         }
         // The GENERIC_MAPPING write is 16 bytes wide.
         assert!(0xB0 + 16 <= size);

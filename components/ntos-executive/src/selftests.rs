@@ -87,7 +87,8 @@ pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
     // makes for each hosted process), proven reclaimable.
     let pml4 = alloc_slot();
     let cnode = alloc_slot();
-    let pml4_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4) == 0;
+    let pml4_made =
+        untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4) == 0;
     let cnode_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, cnode) == 0;
     if pml4_made && cnode_made && cnode_delete_r(pml4) == 0 && cnode_delete_r(cnode) == 0 {
         ok |= 1 << 3;
@@ -106,7 +107,8 @@ pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
         core::ptr::write_volatile(RECLAIM_VA as *mut u32, 0xABCD_1234);
         let a_val = core::ptr::read_volatile(RECLAIM_VA as *const u32);
         let a_deleted = cnode_delete_r(fa) == 0; // kernel unmaps A's PTE
-        let b_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fb) == 0;
+        let b_made =
+            untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fb) == 0;
         let b_mapped = page_map_r(fb, RECLAIM_VA, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
         let b_val = if b_mapped {
             core::ptr::read_volatile(RECLAIM_VA as *const u32)
@@ -306,7 +308,7 @@ pub(crate) fn dbgk_breakin_thread_code() -> alloc::vec::Vec<u8> {
     t.extend_from_slice(&DBGK_BREAKIN_MARK_VA.to_le_bytes()); // movabs rcx, MARK
     t.extend_from_slice(&[0x48, 0xC7, 0x01, 0x11, 0x00, 0x00, 0x00]); // mov qword [rcx], 0x11
     t.extend_from_slice(&[0x4C, 0x89, 0x41, 0x18]); // mov [rcx+0x18], r8
-    // NtCurrentPeb(): gs:[0x60].
+                                                    // NtCurrentPeb(): gs:[0x60].
     t.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // mov rax, gs:[0x60]
     t.extend_from_slice(&[0x48, 0x89, 0x41, 0x08]); // mov [rcx+0x08], rax
     t.extend_from_slice(&[0x0F, 0xB6, 0x50, 0x02]); // movzx edx, byte [rax+2]  (PEB->BeingDebugged)
@@ -315,7 +317,7 @@ pub(crate) fn dbgk_breakin_thread_code() -> alloc::vec::Vec<u8> {
     t.extend_from_slice(&[0x74, 0x08]); // jz .exit  (over int3 + the 7-byte store)
     t.push(0xCC); // int3 = DbgBreakPoint()
     t.extend_from_slice(&[0x48, 0xC7, 0x01, 0x12, 0x00, 0x00, 0x00]); // mov qword [rcx], 0x12
-    // .exit: RtlExitUserThread(STATUS_SUCCESS) — a syscall, delivered as UnknownSyscall.
+                                                                      // .exit: RtlExitUserThread(STATUS_SUCCESS) — a syscall, delivered as UnknownSyscall.
     t.extend_from_slice(&[0x48, 0xB8]);
     t.extend_from_slice(&DBGK_BREAKIN_EXIT_SSN.to_le_bytes()); // movabs rax, EXIT
     t.extend_from_slice(&[0x0F, 0x05]); // syscall
@@ -389,10 +391,24 @@ pub(crate) unsafe fn dbgk_client_spawn(
     let raw = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = push(alloc_slot());
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        cnode,
+        raw,
+        CN_GUARD_BADGE,
+    );
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
     let fault_copy = push(copy_cap(ep));
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_copy, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        cnode,
+        LBL_CNODE_COPY << 12,
+        CT_FAULT,
+        fault_copy,
+        0,
+    );
     let tcb = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
@@ -400,7 +416,13 @@ pub(crate) unsafe fn dbgk_client_spawn(
     let _ = tcb_write_registers(tcb, CODE, STK + 0x1000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
     let sc = push(alloc_slot());
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
+    let _ = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_SCHED_CONTEXT,
+        SCHED_CONTEXT_BITS,
+        1,
+        sc,
+    );
     let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 1000, 1000);
     let _ = sched_context_bind(sc, tcb);
     // Hosted-syscalls flag: `syscall` faults as UnknownSyscall (delivering the register file to the
@@ -462,10 +484,24 @@ pub(crate) unsafe fn xview_spawn(
     let raw = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = push(alloc_slot());
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        cnode,
+        raw,
+        CN_GUARD_BADGE,
+    );
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
     let fault_copy = push(copy_cap(fault_ep));
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_copy, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        cnode,
+        LBL_CNODE_COPY << 12,
+        CT_FAULT,
+        fault_copy,
+        0,
+    );
     let tcb = push(alloc_slot());
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
@@ -473,7 +509,13 @@ pub(crate) unsafe fn xview_spawn(
     let _ = tcb_write_registers(tcb, CODE, STK + 0x1000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
     let sc = push(alloc_slot());
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
+    let _ = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_SCHED_CONTEXT,
+        SCHED_CONTEXT_BITS,
+        1,
+        sc,
+    );
     let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 1000, 1000);
     let _ = sched_context_bind(sc, tcb);
     // Hosted-syscalls flag: `syscall` faults as UnknownSyscall (delivering the register file to our
@@ -598,8 +640,15 @@ pub(crate) unsafe fn alpc_cross_vspace_selftest() -> u64 {
         && cnode_delete_r(cf1) == 0;
     for i in (0..n).rev() {
         let s = slots[i];
-        if s == 0 || s == f0 || s == f1 || s == cf0 || s == cf1 || s == tcb_a || s == tcb_b
-            || s == pml4_a || s == pml4_b
+        if s == 0
+            || s == f0
+            || s == f1
+            || s == cf0
+            || s == cf1
+            || s == tcb_a
+            || s == tcb_b
+            || s == pml4_a
+            || s == pml4_b
         {
             continue;
         }

@@ -86,7 +86,9 @@ impl RegistryOverlay {
     /// An empty overlay whose key vector is pre-reserved for `n` keys (so the executive can pin
     /// the backing buffer below its per-syscall heap mark and avoid a reallocation).
     pub fn with_capacity(n: usize) -> Self {
-        Self { keys: Vec::with_capacity(n) }
+        Self {
+            keys: Vec::with_capacity(n),
+        }
     }
 
     /// Number of key SLOTS, including slots detached by [`Self::detach_subtree`]. This is the
@@ -128,11 +130,7 @@ impl RegistryOverlay {
         if let Some(i) = self.find(canon) {
             return (i, false);
         }
-        if let Some(i) = self
-            .keys
-            .iter()
-            .position(|k| k.path == canon && k.detached)
-        {
+        if let Some(i) = self.keys.iter().position(|k| k.path == canon && k.detached) {
             self.keys[i].detached = false;
             self.keys[i].values.clear();
             return (i, true);
@@ -322,7 +320,10 @@ mod tests {
 
     #[test]
     fn canon_is_case_insensitive_and_trims() {
-        assert_eq!(canon_path(r"\Registry\Machine\SYSTEM"), r"\registry\machine\system");
+        assert_eq!(
+            canon_path(r"\Registry\Machine\SYSTEM"),
+            r"\registry\machine\system"
+        );
         assert_eq!(canon_path(r"Registry\\Machine\"), r"\registry\machine");
         assert_eq!(canon_path(""), "\\");
     }
@@ -428,9 +429,7 @@ mod tests {
         assert_eq!(ov.values_len(root), 0);
         assert!(!ov.set_value(root, "Loaded", 4, &2u32.to_le_bytes()));
         assert!(ov.subkeys(r"\registry\user\s-1-5-21-1").is_empty());
-        assert!(!ov
-            .subkeys(r"\registry\user")
-            .contains(&"s-1-5-21-1"));
+        assert!(!ov.subkeys(r"\registry\user").contains(&"s-1-5-21-1"));
         // …and nothing else moved: the slots are still there, only 2 are live.
         assert_eq!(ov.len(), 4);
         assert_eq!(ov.live_len(), 2);
@@ -439,7 +438,10 @@ mod tests {
 
         assert_eq!(ov.reattach_subtree(r"\registry\user\s-1-5-21-1"), 2);
         assert_eq!(ov.find(r"\registry\user\s-1-5-21-1"), Some(root));
-        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1\environment"), Some(child));
+        assert_eq!(
+            ov.find(r"\registry\user\s-1-5-21-1\environment"),
+            Some(child)
+        );
         assert_eq!(ov.value(root, "Loaded"), Some((4, &1u32.to_le_bytes()[..])));
         assert_eq!(ov.value(child, "TEMP"), Some((1, &b"t"[..])));
         assert_eq!(ov.live_len(), 4);
@@ -464,9 +466,16 @@ mod tests {
 
         let (again, created_again) = ov.create(r"\registry\user\s-1-5-21-1");
         assert_eq!(again, idx, "a re-mount must re-use the detached slot");
-        assert!(created_again, "a re-mounted key is newly created, not opened");
+        assert!(
+            created_again,
+            "a re-mounted key is newly created, not opened"
+        );
         assert!(!ov.is_detached(idx));
-        assert_eq!(ov.values_len(idx), 0, "the previous mount's writes must not survive");
+        assert_eq!(
+            ov.values_len(idx),
+            0,
+            "the previous mount's writes must not survive"
+        );
         assert_eq!(ov.len(), 1);
     }
 

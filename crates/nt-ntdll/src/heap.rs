@@ -437,9 +437,7 @@ impl<B: Backing> Heap<B> {
     }
 
     fn header_at_offset(&self, offset: usize) -> Option<BlockHeader> {
-        if !self.formatted
-            || offset % HEAP_ALIGN != 0
-            || offset.checked_add(HDR)? > self.region_len
+        if !self.formatted || offset % HEAP_ALIGN != 0 || offset.checked_add(HDR)? > self.region_len
         {
             return None;
         }
@@ -1576,7 +1574,9 @@ mod tests {
         let first = broken_link.allocate(32).unwrap();
         let second = broken_link.allocate(32).unwrap();
         // SAFETY: both pointers are live; block_of returns the exact second in-band header.
-        unsafe { (*broken_link.hdr(broken_link.block_of(second).unwrap())).prev_size += HEAP_ALIGN };
+        unsafe {
+            (*broken_link.hdr(broken_link.block_of(second).unwrap())).prev_size += HEAP_ALIGN
+        };
         assert!(!broken_link.validate(None));
         assert!(broken_link.validate(Some(first)));
         assert!(!broken_link.validate(Some(second)));

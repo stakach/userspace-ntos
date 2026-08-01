@@ -57,7 +57,10 @@ pub unsafe fn init_kevent(ev: *mut u8, kind: EventKind, signaled: bool) {
     use kevent_layout as o;
     core::ptr::write_unaligned(ev.add(o::TYPE), type_byte(kind));
     core::ptr::write_unaligned(ev.add(o::SIZE), KEVENT_SIZE_IN_DWORDS);
-    core::ptr::write_unaligned(ev.add(o::SIGNAL_STATE) as *mut i32, if signaled { 1 } else { 0 });
+    core::ptr::write_unaligned(
+        ev.add(o::SIGNAL_STATE) as *mut i32,
+        if signaled { 1 } else { 0 },
+    );
     // Empty waiter list: Flink = Blink = &WaitListHead.
     let head = ev.add(o::WAIT_LIST_HEAD) as u64;
     core::ptr::write_unaligned(ev.add(o::WAIT_LIST_HEAD) as *mut u64, head);
@@ -135,14 +138,23 @@ mod tests {
         let ev = buf.as_mut_ptr();
         unsafe {
             init_kevent(ev, EventKind::Synchronization, false);
-            assert_eq!(core::ptr::read_unaligned(ev.add(o::TYPE)), EVENT_SYNCHRONIZATION_OBJECT);
+            assert_eq!(
+                core::ptr::read_unaligned(ev.add(o::TYPE)),
+                EVENT_SYNCHRONIZATION_OBJECT
+            );
             assert_eq!(core::ptr::read_unaligned(ev.add(o::SIZE)), 6);
             assert!(!kevent_read_state(ev));
             assert_eq!(kevent_kind(ev), EventKind::Synchronization);
             // Empty waiter list is self-linked.
             let head = ev.add(o::WAIT_LIST_HEAD) as u64;
-            assert_eq!(core::ptr::read_unaligned(ev.add(o::WAIT_LIST_HEAD) as *const u64), head);
-            assert_eq!(core::ptr::read_unaligned(ev.add(o::WAIT_LIST_HEAD + 8) as *const u64), head);
+            assert_eq!(
+                core::ptr::read_unaligned(ev.add(o::WAIT_LIST_HEAD) as *const u64),
+                head
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(ev.add(o::WAIT_LIST_HEAD + 8) as *const u64),
+                head
+            );
         }
     }
 
@@ -152,7 +164,10 @@ mod tests {
         let ev = buf.as_mut_ptr();
         unsafe {
             init_kevent(ev, EventKind::Notification, true);
-            assert_eq!(core::ptr::read_unaligned(ev.add(o::TYPE)), EVENT_NOTIFICATION_OBJECT);
+            assert_eq!(
+                core::ptr::read_unaligned(ev.add(o::TYPE)),
+                EVENT_NOTIFICATION_OBJECT
+            );
             assert_eq!(kevent_kind(ev), EventKind::Notification);
             assert!(kevent_read_state(ev));
         }

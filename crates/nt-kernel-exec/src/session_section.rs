@@ -48,7 +48,10 @@ pub const fn round_up_page(n: u64) -> u64 {
 /// `desc` must point to at least [`section_object::SIZE_OF`] writable bytes.
 pub unsafe fn init_section(desc: *mut u8, size: u64) {
     use section_object as o;
-    core::ptr::write_unaligned(desc.add(o::SIZE) as *mut u64, round_up_page(size).max(0x1000));
+    core::ptr::write_unaligned(
+        desc.add(o::SIZE) as *mut u64,
+        round_up_page(size).max(0x1000),
+    );
     core::ptr::write_unaligned(desc.add(o::BASE) as *mut u64, 0);
     core::ptr::write_unaligned(desc.add(o::MAGIC) as *mut u64, SECTION_MAGIC);
 }

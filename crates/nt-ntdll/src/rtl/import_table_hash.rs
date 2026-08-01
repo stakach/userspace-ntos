@@ -135,11 +135,7 @@ fn ascii_case_insensitive_cmp(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 /// Reproduces NT5's linked-list insertion, including its unusual equal-key ordering.
-fn nt5_insertion_index<T>(
-    items: &[T],
-    value: &T,
-    compare: impl Fn(&T, &T) -> Ordering,
-) -> usize {
+fn nt5_insertion_index<T>(items: &[T], value: &T, compare: impl Fn(&T, &T) -> Ordering) -> usize {
     if items.is_empty() || compare(&items[0], value).is_gt() {
         return 0;
     }

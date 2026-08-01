@@ -242,7 +242,11 @@ impl Server {
     }
 
     /// `NtRequestWaitReplyPort` — send a message then receive the reply (if any).
-    fn op_request_wait_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
+    fn op_request_wait_reply(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
         let req: LpcMessageRequest = read_req(buf)?;
         let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
         self.core
@@ -251,7 +255,12 @@ impl Server {
             Some(m) => {
                 let n = m.bytes.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&m.bytes[..n]);
-                Ok(reply(NtStatus::SUCCESS, n as u32, 0, msg_type_of(&m.bytes) as u64))
+                Ok(reply(
+                    NtStatus::SUCCESS,
+                    n as u32,
+                    0,
+                    msg_type_of(&m.bytes) as u64,
+                ))
             }
             None => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
         }
@@ -469,7 +478,9 @@ mod tests {
             port_handle = c
                 .create_port(&utf16("\\SmApiPort"), 0x88, 0x148, 0)
                 .unwrap();
-            let r = c.connect_port(&utf16("\\SmApiPort"), 2, b"sb-connect-info").unwrap();
+            let r = c
+                .connect_port(&utf16("\\SmApiPort"), 2, b"sb-connect-info")
+                .unwrap();
             assert!(r.pending, "manual policy must leave the connect pending");
             conn_id = r.connection_id;
         }

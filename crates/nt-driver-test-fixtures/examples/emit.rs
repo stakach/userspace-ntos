@@ -5,7 +5,9 @@ use nt_driver_test_fixtures::{irp_fsd_pe, minimal_pe, pe_importing};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let out = args.next().expect("usage: emit <out.sys> [func...] | <out.sys> --irp-fsd");
+    let out = args
+        .next()
+        .expect("usage: emit <out.sys> [func...] | <out.sys> --irp-fsd");
     let rest: Vec<String> = args.collect();
     let bytes = if rest.first().map(|s| s.as_str()) == Some("--irp-fsd") {
         irp_fsd_pe()

@@ -54,6 +54,7 @@ pub const fn is_lpc_opcode(op: u16) -> bool {
 pub mod msg_type {
     pub const LPC_REQUEST: u16 = 1;
     pub const LPC_REPLY: u16 = 2;
+    pub const LPC_DATAGRAM: u16 = 3;
     pub const LPC_PORT_CLOSED: u16 = 5;
     pub const LPC_CONNECTION_REQUEST: u16 = 10;
     pub const LPC_CONNECTION_REFUSED: u16 = 11;

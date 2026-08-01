@@ -126,17 +126,20 @@ fn read_u64(buf: &[u8], off: usize) -> Option<u64> {
 }
 
 fn write_u16(buf: &mut [u8], off: usize, value: u16) -> Option<()> {
-    buf.get_mut(off..off + 2)?.copy_from_slice(&value.to_le_bytes());
+    buf.get_mut(off..off + 2)?
+        .copy_from_slice(&value.to_le_bytes());
     Some(())
 }
 
 fn write_u32(buf: &mut [u8], off: usize, value: u32) -> Option<()> {
-    buf.get_mut(off..off + 4)?.copy_from_slice(&value.to_le_bytes());
+    buf.get_mut(off..off + 4)?
+        .copy_from_slice(&value.to_le_bytes());
     Some(())
 }
 
 fn write_u64(buf: &mut [u8], off: usize, value: u64) -> Option<()> {
-    buf.get_mut(off..off + 8)?.copy_from_slice(&value.to_le_bytes());
+    buf.get_mut(off..off + 8)?
+        .copy_from_slice(&value.to_le_bytes());
     Some(())
 }
 
@@ -436,7 +439,10 @@ mod tests {
 
     #[test]
     fn required_size_detects_the_reactos_overflow_case() {
-        assert_eq!(required_size(RXACT_DATA_SIZE, 0x40), Ok(RXACT_DATA_SIZE + 0x40));
+        assert_eq!(
+            required_size(RXACT_DATA_SIZE, 0x40),
+            Ok(RXACT_DATA_SIZE + 0x40)
+        );
         assert_eq!(required_size(u32::MAX, 0x40), Err(RxactError::NoMemory));
     }
 
@@ -480,8 +486,7 @@ mod tests {
         // The key name lands immediately after the record header.
         assert_eq!(action.key_name_offset, RXACT_DATA_SIZE + RXACT_ACTION_SIZE);
         let stored_key = units_at(&buf, action.key_name_offset, action.key_name_length).unwrap();
-        let expected_key: alloc::vec::Vec<u8> =
-            key.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let expected_key: alloc::vec::Vec<u8> = key.iter().flat_map(|u| u.to_le_bytes()).collect();
         assert_eq!(stored_key, &expected_key[..]);
 
         let stored_value =
@@ -551,8 +556,7 @@ mod tests {
             let action = action_at(&buf, index as u32).unwrap();
             assert_eq!(action.key_handle, index as u64);
             assert_eq!(action.key_name_offset, walked + RXACT_ACTION_SIZE);
-            let stored =
-                units_at(&buf, action.key_name_offset, action.key_name_length).unwrap();
+            let stored = units_at(&buf, action.key_name_offset, action.key_name_length).unwrap();
             let expected: alloc::vec::Vec<u8> =
                 utf16(name).iter().flat_map(|u| u.to_le_bytes()).collect();
             assert_eq!(stored, &expected[..]);

@@ -158,6 +158,8 @@ mod tests {
         assert!(!c.open_key(r"\Registry\Machine\Nope"));
         assert!(c.query_dword(r"\Registry\Machine\Nope", "X").is_err());
         c.create_key(r"\Registry\Machine\Empty").unwrap();
-        assert!(c.query_dword(r"\Registry\Machine\Empty", "Missing").is_err());
+        assert!(c
+            .query_dword(r"\Registry\Machine\Empty", "Missing")
+            .is_err());
     }
 }

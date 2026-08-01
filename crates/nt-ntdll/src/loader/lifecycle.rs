@@ -259,9 +259,9 @@ impl<const N: usize> ThreadInitLedger<N> {
     }
 
     fn remove_if_state(&mut self, teb: u64, state: ThreadInitState) -> Option<ThreadInitEntry> {
-        let index = self.entries[..self.len]
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.teb == teb && entry.state == state))?;
+        let index = self.entries[..self.len].iter().position(|entry| {
+            entry.is_some_and(|entry| entry.teb == teb && entry.state == state)
+        })?;
         let removed = self.entries[index];
         self.entries.copy_within(index + 1..self.len, index);
         self.len -= 1;
@@ -383,12 +383,18 @@ mod tests {
     fn thread_init_ledger_balances_committed_threads_once() {
         let mut ledger = ThreadInitLedger::<2>::new();
         assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::Created));
-        assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::AlreadyReserved));
+        assert_eq!(
+            ledger.reserve(0x1000),
+            Ok(ThreadReserveOutcome::AlreadyReserved)
+        );
         assert!(!ledger.take_committed_for_shutdown(0x1000));
 
         assert_eq!(ledger.commit(0x1000), Ok(()));
         assert_eq!(ledger.commit(0x1000), Ok(()));
-        assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::AlreadyCommitted));
+        assert_eq!(
+            ledger.reserve(0x1000),
+            Ok(ThreadReserveOutcome::AlreadyCommitted)
+        );
         assert!(ledger.take_committed_for_shutdown(0x1000));
         assert!(!ledger.take_committed_for_shutdown(0x1000));
     }

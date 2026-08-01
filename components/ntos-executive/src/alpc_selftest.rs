@@ -11,13 +11,13 @@
 use crate::{check, print_str, RingChannel};
 
 use bytemuck::Pod;
+use nt_alpc::PeerDirect;
 use nt_alpc_abi::{
     msg_attr_flag, opcode as aop, port_flag, send_flag, AlpcAcceptConnectRequest,
     AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcMessageAttributes, AlpcSendReceiveRequest,
     AlpcViewIoRequest, PortMessage,
 };
-use nt_alpc::PeerDirect;
 use nt_lpc_abi::{opcode as lop, LpcConnectPortRequest, LpcMessageRequest, LpcReceiveRequest};
 use nt_port_core::MessageAttrs;
 
@@ -76,7 +76,11 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         b
     };
     let (status, _f, _i, listen, _d1) = chan.raw(aop::ALPC_OP_CREATE_PORT, &cp, &mut out);
-    check(b"exec_alpc_create_port", status == STATUS_SUCCESS && listen != 0, passed);
+    check(
+        b"exec_alpc_create_port",
+        status == STATUS_SUCCESS && listen != 0,
+        passed,
+    );
 
     // ALPC client connects (Manual -> Pending), ALPC host receives + accepts (folds complete).
     let (server_h, client_h, connect_ok) = alpc_rendezvous(chan, &name, listen, &mut out);
@@ -84,10 +88,17 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
 
     // Client -> host message carrying CONTEXT: ALPC->ALPC preserves the attribute.
     let msg = port_message(REQUEST, b"alpc-ping");
-    alpc_send(chan, client_h, &msg, msg_attr_flag::CONTEXT, &bytes(&AlpcContextAttr {
-        port_context: 0xC0DE,
-        ..Default::default()
-    }), &mut out);
+    alpc_send(
+        chan,
+        client_h,
+        &msg,
+        msg_attr_flag::CONTEXT,
+        &bytes(&AlpcContextAttr {
+            port_context: 0xC0DE,
+            ..Default::default()
+        }),
+        &mut out,
+    );
     let (rs, _f, ri, valid, mtype) = alpc_recv(chan, server_h, &mut out);
     let ctx_ok = rs == STATUS_SUCCESS
         && &out[..ri as usize] == &msg[..]
@@ -117,7 +128,11 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     // Step 4: peer-direct data plane — the broker (port-service ring) completes
     // the connect, then endpoint↔endpoint messages are delivered DIRECTLY against
     // the executive-local cache with the broker OFF the per-message path.
-    check(b"exec_alpc_peer_direct", peer_direct(chan, &mut out), passed);
+    check(
+        b"exec_alpc_peer_direct",
+        peer_direct(chan, &mut out),
+        passed,
+    );
 
     // ================= B. LPC client <-> ALPC host (the BRIDGE) =================
     let bname = utf16("\\BridgeLive");
@@ -168,7 +183,8 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     // ALPC host receives the (LPC-originated) connection request + accepts it.
     let (bserver_h, bclient_h) = {
         let (rs, _f, _i, rconn, rtype) = alpc_recv(chan, blisten, &mut out);
-        let recv_ok = rs == STATUS_SUCCESS && rconn == lpc_conn_id && rtype as u16 == CONNECTION_REQUEST;
+        let recv_ok =
+            rs == STATUS_SUCCESS && rconn == lpc_conn_id && rtype as u16 == CONNECTION_REQUEST;
         let ac = AlpcAcceptConnectRequest {
             abi_size: core::mem::size_of::<AlpcAcceptConnectRequest>() as u16,
             accept: 1,
@@ -178,7 +194,11 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         };
         let (as_, _f, _i, sh, ch) = chan.raw(aop::ALPC_OP_ACCEPT_CONNECT, &bytes(&ac), &mut out);
         let ok = recv_ok && as_ == STATUS_SUCCESS && sh != 0 && ch != 0;
-        check(b"exec_bridge_lpc_to_alpc_connect", ok && lpc_conn_id != 0 && blisten != 0, passed);
+        check(
+            b"exec_bridge_lpc_to_alpc_connect",
+            ok && lpc_conn_id != 0 && blisten != 0,
+            passed,
+        );
         (sh, ch)
     };
 
@@ -203,7 +223,14 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         port_context: 0xCAFE,
         ..Default::default()
     }));
-    alpc_send(chan, bserver_h, &rmsg, msg_attr_flag::VIEW | msg_attr_flag::CONTEXT, &attrs, &mut out);
+    alpc_send(
+        chan,
+        bserver_h,
+        &rmsg,
+        msg_attr_flag::VIEW | msg_attr_flag::CONTEXT,
+        &attrs,
+        &mut out,
+    );
     // LPC client receives via the classic-LPC receive (no attribute surface).
     let (ls, _f, li, ldetail0, _lmt) = lpc_recv(chan, bclient_h, &mut out);
     let reply_ok = ls == STATUS_SUCCESS && &out[..li as usize] == &rmsg[..] && ldetail0 == 0;
@@ -232,7 +259,8 @@ fn ssn_registration(chan: &mut RingChannel<'_>, passed: &mut u64) {
     let table_ok = alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_PORT) == Some(aop::ALPC_OP_CREATE_PORT)
         && alpc_ssn_to_opcode(SSN_NT_ALPC_CONNECT_PORT) == Some(aop::ALPC_OP_CONNECT_PORT)
         && alpc_ssn_to_opcode(SSN_NT_ALPC_ACCEPT_CONNECT_PORT) == Some(aop::ALPC_OP_ACCEPT_CONNECT)
-        && alpc_ssn_to_opcode(SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT) == Some(aop::ALPC_OP_SEND_RECEIVE)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT)
+            == Some(aop::ALPC_OP_SEND_RECEIVE)
         && alpc_ssn_to_opcode(SSN_NT_ALPC_DISCONNECT_PORT) == Some(aop::ALPC_OP_DISCONNECT_PORT)
         && alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_PORT_SECTION)
             == Some(aop::ALPC_OP_CREATE_PORT_SECTION)
@@ -339,7 +367,14 @@ fn section_view_shared(
         view_size: BIG as u64,
         ..Default::default()
     });
-    alpc_send(chan, client_h, &signal, msg_attr_flag::VIEW, &view_attr, out);
+    alpc_send(
+        chan,
+        client_h,
+        &signal,
+        msg_attr_flag::VIEW,
+        &view_attr,
+        out,
+    );
 
     // Endpoint B receives the signal (VIEW attribute present) ...
     let (rs, _f, ri, valid, _mt) = alpc_recv(chan, server_h, out);
@@ -358,7 +393,8 @@ fn section_view_shared(
         ..Default::default()
     };
     let mut readback = [0u8; BIG];
-    let (rrs, _f, rn, _d0, _d1) = chan.raw(aop::ALPC_OP_READ_SECTION_VIEW, &bytes(&rd), &mut readback);
+    let (rrs, _f, rn, _d0, _d1) =
+        chan.raw(aop::ALPC_OP_READ_SECTION_VIEW, &bytes(&rd), &mut readback);
     // Real cross-endpoint shared memory: view B sees view A's write, byte-for-byte,
     // while the message body stayed small (10 bytes, not 2048).
     rrs == STATUS_SUCCESS && rn as usize == BIG && readback[..] == big[..] && signal.len() < BIG
@@ -473,7 +509,10 @@ fn peer_direct(chan: &mut RingChannel<'_>, out: &mut [u8]) -> bool {
         _ => return false,
     };
     // And a reply server → client, also peer-direct.
-    if pd.send(server_h, b"direct-reply", MessageAttrs::default()).is_err() {
+    if pd
+        .send(server_h, b"direct-reply", MessageAttrs::default())
+        .is_err()
+    {
         return false;
     }
     let reply_ok = matches!(pd.recv(client_h), Ok(Some(m)) if m.bytes == b"direct-reply");

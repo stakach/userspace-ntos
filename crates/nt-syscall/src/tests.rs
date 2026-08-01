@@ -153,7 +153,10 @@ fn hive_load_variants_keep_native_argument_contracts() {
         assert_eq!(service.name(), name);
         assert_eq!(service.arg_count(), (argc, argc));
         assert_eq!(nt_syscall_abi::ssn_of(name), Some(ssn));
-        assert!(table.number_of(service).is_some(), "{name} missing from test table");
+        assert!(
+            table.number_of(service).is_some(),
+            "{name} missing from test table"
+        );
     }
 }
 

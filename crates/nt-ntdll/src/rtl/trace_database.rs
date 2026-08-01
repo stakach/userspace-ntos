@@ -8,8 +8,7 @@ pub const TRACE_DATABASE_MAGIC: u32 = 0xabcd_cccc;
 pub const TRACE_IN_USER_MODE: u32 = 0x0000_0001;
 pub const SEGMENT_SIZE: usize = 0x1_0000;
 
-pub type TraceHashFunction =
-    unsafe extern "system" fn(count: u32, trace: *mut *mut c_void) -> u32;
+pub type TraceHashFunction = unsafe extern "system" fn(count: u32, trace: *mut *mut c_void) -> u32;
 
 /// ReactOS's public x64 `RTL_TRACE_BLOCK`.
 ///
@@ -117,8 +116,7 @@ pub fn standard_hash(trace: &[usize]) -> u32 {
         let pointer = *pointer;
         value = value.wrapping_add((pointer as u16 ^ (pointer >> 16) as u16) as usize);
         if usize::BITS > 32 {
-            value =
-                value.wrapping_add(((pointer >> 32) as u16 ^ (pointer >> 48) as u16) as usize);
+            value = value.wrapping_add(((pointer >> 32) as u16 ^ (pointer >> 48) as u16) as usize);
         }
     }
     value as u32

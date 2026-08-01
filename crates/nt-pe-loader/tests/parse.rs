@@ -450,8 +450,12 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     let text_rva = |ord: u32| 0x1000 + ord * 0x10; // concrete export RVA for ordinal `ord`
     for i in 0..N {
         let ord = N - 1 - i; // non-identity permutation
-        // AddressOfNames[i] = the name-string RVA.
-        put_u32(&mut sec, (aon_local + i * 4) as usize, EDATA_VA + name_local[i as usize]);
+                             // AddressOfNames[i] = the name-string RVA.
+        put_u32(
+            &mut sec,
+            (aon_local + i * 4) as usize,
+            EDATA_VA + name_local[i as usize],
+        );
         // AddressOfNameOrdinals[i] = ord (u16).
         put_u16(&mut sec, (aono_local + i * 2) as usize, ord as u16);
     }
@@ -496,8 +500,16 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     // High-index name resolves to the concrete RVA of ITS ordinal (via the non-identity AoNO map).
     let gst = find("GetSystemTimeAsFileTime").expect("high-index export must be found");
     let gst_ord = N - 1 - HIGH; // AoNO[HIGH]
-    assert_eq!(gst.rva, 0x1000 + gst_ord * 0x10, "high-index func RVA via AoNO/AoF");
-    assert_eq!(gst.ordinal, 5u16.wrapping_add(gst_ord as u16), "ordinal = base + AoNO index");
+    assert_eq!(
+        gst.rva,
+        0x1000 + gst_ord * 0x10,
+        "high-index func RVA via AoNO/AoF"
+    );
+    assert_eq!(
+        gst.ordinal,
+        5u16.wrapping_add(gst_ord as u16),
+        "ordinal = base + AoNO index"
+    );
 
     // Boundary names (first + last in the name array) resolve correctly.
     let first = find("AFirst").expect("first export"); // name index 0 -> ordinal N-1
@@ -511,7 +523,9 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     assert!(
         fwd.rva >= EDATA_VA && fwd.rva < EDATA_VA + edata_size,
         "forwarder RVA {:#x} must fall inside the export dir range [{:#x},{:#x})",
-        fwd.rva, EDATA_VA, EDATA_VA + edata_size
+        fwd.rva,
+        EDATA_VA,
+        EDATA_VA + edata_size
     );
 
     // Every one of the N names resolved (no silent drop at a high index / boundary).

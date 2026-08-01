@@ -148,11 +148,7 @@ pub fn drive_thread_detach<H: LoaderHost, const N: usize>(
             let _ = host.run_tls_callbacks(action.base, DllReason::ThreadDetach);
             report.tls_calls += 1;
         }
-        let _ = host.call_dll_main(
-            action.base,
-            action.entry_point_rva,
-            DllReason::ThreadDetach,
-        );
+        let _ = host.call_dll_main(action.base, action.entry_point_rva, DllReason::ThreadDetach);
         report.dll_main_calls += 1;
     }
     if plan.executable_tls_base() != 0 {
@@ -172,11 +168,7 @@ pub fn drive_thread_attach<H: LoaderHost, const N: usize>(
             let _ = host.run_tls_callbacks(action.base, DllReason::ThreadAttach);
             report.tls_calls += 1;
         }
-        let _ = host.call_dll_main(
-            action.base,
-            action.entry_point_rva,
-            DllReason::ThreadAttach,
-        );
+        let _ = host.call_dll_main(action.base, action.entry_point_rva, DllReason::ThreadAttach);
         report.dll_main_calls += 1;
     }
     if plan.executable_tls_base() != 0 {
@@ -226,15 +218,36 @@ mod tests {
         ntdll.is_ntdll = true;
         let mut tls = module(3);
         tls.has_tls = true;
-        let modules = [module(1), module(2), tls, no_entry, disabled, not_attached, not_dll, ntdll];
+        let modules = [
+            module(1),
+            module(2),
+            tls,
+            no_entry,
+            disabled,
+            not_attached,
+            not_dll,
+            ntdll,
+        ];
 
         let plan = plan_thread_detach::<3>(true, false, &modules, 9).unwrap();
         assert_eq!(
             plan.actions(),
             &[
-                ThreadDetachAction { base: 3, entry_point_rva: 0x100, call_tls: true },
-                ThreadDetachAction { base: 2, entry_point_rva: 0x100, call_tls: false },
-                ThreadDetachAction { base: 1, entry_point_rva: 0x100, call_tls: false },
+                ThreadDetachAction {
+                    base: 3,
+                    entry_point_rva: 0x100,
+                    call_tls: true
+                },
+                ThreadDetachAction {
+                    base: 2,
+                    entry_point_rva: 0x100,
+                    call_tls: false
+                },
+                ThreadDetachAction {
+                    base: 1,
+                    entry_point_rva: 0x100,
+                    call_tls: false
+                },
             ]
         );
         assert_eq!(plan.executable_tls_base(), 9);
@@ -254,15 +267,36 @@ mod tests {
         ntdll.is_ntdll = true;
         let mut tls = module(3);
         tls.has_tls = true;
-        let modules = [module(1), module(2), tls, no_entry, disabled, not_attached, not_dll, ntdll];
+        let modules = [
+            module(1),
+            module(2),
+            tls,
+            no_entry,
+            disabled,
+            not_attached,
+            not_dll,
+            ntdll,
+        ];
 
         let plan = plan_thread_attach::<3>(false, &modules, 9).unwrap();
         assert_eq!(
             plan.actions(),
             &[
-                ThreadAttachAction { base: 1, entry_point_rva: 0x100, call_tls: false },
-                ThreadAttachAction { base: 2, entry_point_rva: 0x100, call_tls: false },
-                ThreadAttachAction { base: 3, entry_point_rva: 0x100, call_tls: true },
+                ThreadAttachAction {
+                    base: 1,
+                    entry_point_rva: 0x100,
+                    call_tls: false
+                },
+                ThreadAttachAction {
+                    base: 2,
+                    entry_point_rva: 0x100,
+                    call_tls: false
+                },
+                ThreadAttachAction {
+                    base: 3,
+                    entry_point_rva: 0x100,
+                    call_tls: true
+                },
             ]
         );
         assert_eq!(plan.executable_tls_base(), 9);
@@ -304,7 +338,9 @@ mod tests {
     }
 
     impl LoaderHost for OrderHost {
-        fn map_image(&mut self, _req: &MapRequest) -> NtStatus { STATUS_NOT_IMPLEMENTED }
+        fn map_image(&mut self, _req: &MapRequest) -> NtStatus {
+            STATUS_NOT_IMPLEMENTED
+        }
         fn write_iat_slot(&mut self, _base: u64, _rva: u32, _value: u64) -> NtStatus {
             STATUS_NOT_IMPLEMENTED
         }
@@ -316,8 +352,12 @@ mod tests {
             self.calls.push((1, base));
             STATUS_NOT_IMPLEMENTED
         }
-        fn commit_peb_teb(&mut self, _peb: u64, _teb: u64) -> NtStatus { STATUS_SUCCESS }
-        fn transfer_to_entry(&mut self, _entry: u64, _peb: u64) -> NtStatus { STATUS_SUCCESS }
+        fn commit_peb_teb(&mut self, _peb: u64, _teb: u64) -> NtStatus {
+            STATUS_SUCCESS
+        }
+        fn transfer_to_entry(&mut self, _entry: u64, _peb: u64) -> NtStatus {
+            STATUS_SUCCESS
+        }
     }
 
     #[test]
@@ -328,7 +368,10 @@ mod tests {
         let mut host = OrderHost::default();
         assert_eq!(
             drive_thread_detach(&plan, &mut host),
-            ThreadDetachReport { tls_calls: 2, dll_main_calls: 2 }
+            ThreadDetachReport {
+                tls_calls: 2,
+                dll_main_calls: 2
+            }
         );
         assert_eq!(host.calls, [(1, 1), (2, 1), (2, 2), (1, 9)]);
     }
@@ -341,7 +384,10 @@ mod tests {
         let mut host = OrderHost::default();
         assert_eq!(
             drive_thread_attach(&plan, &mut host),
-            ThreadDetachReport { tls_calls: 2, dll_main_calls: 2 }
+            ThreadDetachReport {
+                tls_calls: 2,
+                dll_main_calls: 2
+            }
         );
         assert_eq!(host.calls, [(1, 1), (2, 1), (2, 2), (1, 9)]);
     }

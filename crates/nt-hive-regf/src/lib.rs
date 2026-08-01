@@ -232,7 +232,10 @@ impl<'a> RegfHive<'a> {
     /// Open the immediate subkey named `name` (case-insensitive) under `nk`.
     pub fn open_subkey(&self, nk: KeyRef, name: &str) -> Option<KeyRef> {
         let want = fold(name);
-        self.subkeys(nk).into_iter().find(|(n, _)| *n == want).map(|(_, o)| o)
+        self.subkeys(nk)
+            .into_iter()
+            .find(|(n, _)| *n == want)
+            .map(|(_, o)| o)
     }
 
     /// Resolve a `\`-separated relative path from `from` (empty components ignored).
@@ -297,7 +300,11 @@ impl<'a> RegfHive<'a> {
     /// Handles small (≤4 B) inline data (data-length top bit set).
     pub fn value(&self, nk: KeyRef, name: &str) -> Option<(u32, Vec<u8>)> {
         let want = fold(name);
-        let vk = self.values(nk).into_iter().find(|(n, _)| *n == want).map(|(_, o)| o)?;
+        let vk = self
+            .values(nk)
+            .into_iter()
+            .find(|(n, _)| *n == want)
+            .map(|(_, o)| o)?;
         self.value_data(vk)
     }
 
@@ -446,7 +453,10 @@ mod tests {
         // A well-known value under Session Manager.
         if let Some(sub) = hive.open_key("ControlSet001\\Control\\Session Manager\\SubSystems") {
             let vals = hive.values(sub);
-            assert!(!vals.is_empty(), "SubSystems should have values (Required/Windows/…)");
+            assert!(
+                !vals.is_empty(),
+                "SubSystems should have values (Required/Windows/…)"
+            );
         }
     }
 
@@ -477,15 +487,25 @@ mod tests {
             return;
         };
         let hive = RegfHive::new(&bytes).expect("the staged `config\\default` must be a regf hive");
-        let roots: Vec<String> = hive.subkeys(hive.root()).into_iter().map(|(n, _)| n).collect();
+        let roots: Vec<String> = hive
+            .subkeys(hive.root())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         for expected in ["environment", "control panel", "software"] {
-            assert!(roots.iter().any(|n| n == expected), "missing {expected} in {roots:?}");
+            assert!(
+                roots.iter().any(|n| n == expected),
+                "missing {expected} in {roots:?}"
+            );
         }
         hive.open_key(r"software\microsoft\windows\currentversion\explorer\shell folders")
             .expect("UpdateUsersShellFolderSettings needs `Shell Folders`");
         let env = hive.open_key("environment").expect("Environment");
         let names: Vec<String> = hive.values(env).into_iter().map(|(n, _)| n).collect();
-        assert!(names.iter().any(|n| n == "temp"), "expected TEMP, got {names:?}");
+        assert!(
+            names.iter().any(|n| n == "temp"),
+            "expected TEMP, got {names:?}"
+        );
     }
 
     #[test]

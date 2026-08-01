@@ -194,8 +194,20 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     // Executive image frames.
     for i in 0..img_count {
         let cp = alloc_slot();
-        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
-        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, rights_at(d.image_rights, i), pml4);
+        let _ = syscall5(
+            SYS_SEND,
+            CAP_INIT_THREAD_CNODE,
+            LBL_CNODE_COPY << 12,
+            cp,
+            img_start + i,
+            0,
+        );
+        let _ = page_map(
+            cp,
+            IMAGE_BASE + i * 0x1000,
+            rights_at(d.image_rights, i),
+            pml4,
+        );
     }
     // Stack.
     if d.stack_dedicated_pt {
@@ -224,7 +236,14 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        cnode,
+        raw,
+        CN_GUARD_BADGE,
+    );
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
     if let Some(c) = d.granted.irq_ntfn {
         let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IRQ_NTFN, c, 0);
@@ -239,9 +258,20 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     // The fault-handler cap slot in the new CSpace is CT_FAULT when a fault EP was granted, else 0.
-    let fault_slot = if d.granted.fault_ep.is_some() { CT_FAULT } else { 0 };
+    let fault_slot = if d.granted.fault_ep.is_some() {
+        CT_FAULT
+    } else {
+        0
+    };
     let _ = tcb_set_space(tcb, fault_slot, cnode, pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        tcb,
+        LBL_TCB_SET_IPC_BUFFER << 12,
+        IPCBUF_VADDR,
+        ipcbuf,
+        0,
+    );
     let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, d.entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, d.prio);
@@ -250,7 +280,12 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     }
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
-    SpawnedComponent { pml4, tcb, cnode, stack_frame_base }
+    SpawnedComponent {
+        pml4,
+        tcb,
+        cnode,
+        stack_frame_base,
+    }
 }
 
 /// Resolve the rights for frame `i` of a region/image.
@@ -297,7 +332,12 @@ unsafe fn map_region(pml4: u64, r: &Region) {
 /// buffer) and a CNode holding ONLY a cap to the IRQ notification + the result
 /// notification — least privilege. Its thread (`isr_entry`) blocks on the IRQ
 /// notification and, when the real interrupt fires, signals the result notification.
-pub(crate) unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64, result_cap: u64, prio: u64) {
+pub(crate) unsafe fn spawn_isr(
+    entry: unsafe extern "C" fn() -> !,
+    irq_cap: u64,
+    result_cap: u64,
+    prio: u64,
+) {
     let d = ComponentDescriptor {
         entry,
         image_rights: Rights::Uniform(2), // RO
@@ -306,7 +346,11 @@ pub(crate) unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64,
         stack_frames: STACK_FRAMES,
         stack_dedicated_pt: false,
         regions: &[],
-        granted: GrantedCaps { irq_ntfn: Some(irq_cap), result_ntfn: Some(result_cap), fault_ep: None },
+        granted: GrantedCaps {
+            irq_ntfn: Some(irq_cap),
+            result_ntfn: Some(result_cap),
+            fault_ep: None,
+        },
         prio,
         gs_base: None,
         caps: HostCaps::default(),
@@ -342,29 +386,124 @@ pub(crate) unsafe fn spawn_storage_host(
     // Device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA frame, shared word.
     // Then the staging buffers, each with its own dedicated PT(s). NLS + SYSTEM-hive share one
     // input page table with each other, distinct from the relocated NTDLLBUF.
-    let mut regions: [Region; 32] = [Region { source: FrameSource::Alias(0), base_va: 0, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 }; 32];
+    let mut regions: [Region; 32] = [Region {
+        source: FrameSource::Alias(0),
+        base_va: 0,
+        count: 0,
+        rights: Rights::Uniform(RW_NX),
+        pts: 0,
+    }; 32];
     let mut n = 0usize;
-    regions[n] = Region { source: FrameSource::Alias(ahci_bar_frame), base_va: AHCI_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    regions[n] = Region { source: FrameSource::Alias(dma_frame), base_va: AHCI_DMA_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    regions[n] = Region { source: FrameSource::Alias(shared_frame), base_va: STORAGE_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(ahci_bar_frame),
+        base_va: AHCI_VADDR,
+        count: 1,
+        rights: Rights::Uniform(RW_NX),
+        pts: 0,
+    };
+    n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(dma_frame),
+        base_va: AHCI_DMA_VADDR,
+        count: 1,
+        rights: Rights::Uniform(RW_NX),
+        pts: 0,
+    };
+    n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(shared_frame),
+        base_va: STORAGE_SHARED_VADDR,
+        count: 1,
+        rights: Rights::Uniform(RW_NX),
+        pts: 0,
+    };
+    n += 1;
     // FILEBUF (own PT), NTDLLBUF (own PT), SRVBUF (own PT).
-    regions[n] = Region { source: FrameSource::Alias(filebuf_start), base_va: FILEBUF_VADDR, count: FILEBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
-    regions[n] = Region { source: FrameSource::Alias(ntdllbuf_start), base_va: NTDLLBUF_VADDR, count: NTDLLBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
-    regions[n] = Region { source: FrameSource::Alias(srvbuf_start), base_va: SRVBUF_VADDR, count: SRVBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(filebuf_start),
+        base_va: FILEBUF_VADDR,
+        count: FILEBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(ntdllbuf_start),
+        base_va: NTDLLBUF_VADDR,
+        count: NTDLLBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(srvbuf_start),
+        base_va: SRVBUF_VADDR,
+        count: SRVBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
     // WIN32BUF (4 PTs), WIN32KBUF (2 PTs).
-    regions[n] = Region { source: FrameSource::Alias(win32buf_start), base_va: WIN32BUF_VADDR, count: WIN32BUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 4 }; n += 1;
-    regions[n] = Region { source: FrameSource::Alias(win32kbuf_start), base_va: WIN32KBUF_VADDR, count: WIN32KBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 2 }; n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(win32buf_start),
+        base_va: WIN32BUF_VADDR,
+        count: WIN32BUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 4,
+    };
+    n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(win32kbuf_start),
+        base_va: WIN32KBUF_VADDR,
+        count: WIN32KBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 2,
+    };
+    n += 1;
     // WINLOGONBUF (own PT).
-    regions[n] = Region { source: FrameSource::Alias(winlogonbuf_start), base_va: WINLOGONBUF_VADDR, count: WINLOGONBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+    regions[n] = Region {
+        source: FrameSource::Alias(winlogonbuf_start),
+        base_va: WINLOGONBUF_VADDR,
+        count: WINLOGONBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
     // dxg/dxgthk/ftfd/framebuf/font staging buffers (one PT each).
     for (start, vaddr, frames) in [
-        (DXGBUF_START.load(Ordering::Relaxed), DXGBUF_VADDR, DXGBUF_FRAMES),
-        (DXGTHKBUF_START.load(Ordering::Relaxed), DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
-        (FTFDBUF_START.load(Ordering::Relaxed), FTFDBUF_VADDR, FTFDBUF_FRAMES),
-        (FRAMEBUFBUF_START.load(Ordering::Relaxed), FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
-        (FONTBUF_START.load(Ordering::Relaxed), win32k_subsystem::FONTBUF_VADDR, win32k_subsystem::FONTBUF_FRAMES),
+        (
+            DXGBUF_START.load(Ordering::Relaxed),
+            DXGBUF_VADDR,
+            DXGBUF_FRAMES,
+        ),
+        (
+            DXGTHKBUF_START.load(Ordering::Relaxed),
+            DXGTHKBUF_VADDR,
+            DXGTHKBUF_FRAMES,
+        ),
+        (
+            FTFDBUF_START.load(Ordering::Relaxed),
+            FTFDBUF_VADDR,
+            FTFDBUF_FRAMES,
+        ),
+        (
+            FRAMEBUFBUF_START.load(Ordering::Relaxed),
+            FRAMEBUFBUF_VADDR,
+            FRAMEBUFBUF_FRAMES,
+        ),
+        (
+            FONTBUF_START.load(Ordering::Relaxed),
+            win32k_subsystem::FONTBUF_VADDR,
+            win32k_subsystem::FONTBUF_FRAMES,
+        ),
     ] {
-        regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: 1 };
+        regions[n] = Region {
+            source: FrameSource::Alias(start),
+            base_va: vaddr,
+            count: frames,
+            rights: Rights::Uniform(RW_NX),
+            pts: 1,
+        };
         n += 1;
     }
     // NLS + SYSTEM-hive buffers share one page table; the first descriptor creates it.
@@ -374,16 +513,43 @@ pub(crate) unsafe fn spawn_storage_host(
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
         (nls20127_start, NLS_20127_VADDR, NLS_20127_FRAMES),
         (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
-        (SECHIVEBUF_START.load(Ordering::Relaxed), SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES),
-        (SAMHIVEBUF_START.load(Ordering::Relaxed), SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES),
-        (DEFHIVEBUF_START.load(Ordering::Relaxed), DEFHIVEBUF_VADDR, DEFHIVEBUF_FRAMES),
-    ].into_iter().enumerate() {
-        regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: u64::from(index == 0) };
+        (
+            SECHIVEBUF_START.load(Ordering::Relaxed),
+            SECHIVEBUF_VADDR,
+            SECHIVEBUF_FRAMES,
+        ),
+        (
+            SAMHIVEBUF_START.load(Ordering::Relaxed),
+            SAMHIVEBUF_VADDR,
+            SAMHIVEBUF_FRAMES,
+        ),
+        (
+            DEFHIVEBUF_START.load(Ordering::Relaxed),
+            DEFHIVEBUF_VADDR,
+            DEFHIVEBUF_FRAMES,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        regions[n] = Region {
+            source: FrameSource::Alias(start),
+            base_va: vaddr,
+            count: frames,
+            rights: Rights::Uniform(RW_NX),
+            pts: u64::from(index == 0),
+        };
         n += 1;
     }
     // The SOFTWARE hive buffer (471040 B) — its own 2 MiB window + dedicated PT, mirroring the
     // executive-side mapping (it does not fit in the shared 0xA0-0xC0 input page table).
-    regions[n] = Region { source: FrameSource::Alias(SWHIVEBUF_START.load(Ordering::Relaxed)), base_va: SWHIVEBUF_VADDR, count: SWHIVEBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 };
+    regions[n] = Region {
+        source: FrameSource::Alias(SWHIVEBUF_START.load(Ordering::Relaxed)),
+        base_va: SWHIVEBUF_VADDR,
+        count: SWHIVEBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
     n += 1;
     let d = ComponentDescriptor {
         entry,
@@ -393,7 +559,11 @@ pub(crate) unsafe fn spawn_storage_host(
         stack_frames: STACK_FRAMES,
         stack_dedicated_pt: false,
         regions: &regions[..n],
-        granted: GrantedCaps { irq_ntfn: None, result_ntfn: Some(result_cap), fault_ep: Some(fault_ep) },
+        granted: GrantedCaps {
+            irq_ntfn: None,
+            result_ntfn: Some(result_cap),
+            fault_ep: Some(fault_ep),
+        },
         prio,
         gs_base: None,
         caps: HostCaps::default(),
@@ -652,7 +822,9 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
         crate::print_u64(e);
         crate::print_str(b" cap=0x");
         crate::print_hex(ch.reply_cap as u32);
-        crate::print_str(b" -> the reply object was NOT bound (component was not blocked in a Call)\n");
+        crate::print_str(
+            b" -> the reply object was NOT bound (component was not blocked in a Call)\n",
+        );
     }
     e
 }
@@ -672,10 +844,9 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
 /// component dispatch is in flight. The main service loop has always screened this badge; the pump
 /// did not, because before the route nothing ticked during a dispatch.
 ///
-/// So: recognise the tick, LATCH it for the main service loop (`DELAY_TIMER_TICK_PENDING`) and go
-/// back to receiving. No spin is possible — the IOAPIC line stays masked until `delay_timer_interrupt`
-/// Acks it, so at most one tick can be outstanding, and the pump reaches the service loop within one
-/// dispatch.
+/// So: recognise the tick, count it for the main service loop (`DELAY_TIMER_TICKS_PENDING`) and go
+/// back to receiving. The watchdog re-arm path Acks nested deliveries; the service loop then services
+/// the coalesced timer state once while accounting for every pump-absorbed tick.
 #[inline]
 unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
     loop {
@@ -683,7 +854,7 @@ unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
         // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
         let (badge, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
         if badge == crate::DELAY_TIMER_BADGE {
-            crate::DELAY_TIMER_TICK_PENDING.store(true, Ordering::Relaxed);
+            crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
             // The main service loop owns the ordinary re-arm + IRQ Ack, and it cannot run while this
             // pump is blocked — so a deadlock INSIDE a dispatch would get exactly one tick and could
             // never trip the deadman. Re-arm it here (see `watchdog_nested_rearm`).
@@ -848,8 +1019,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             let ip = m0;
             let addr = m1;
             faults += 1;
-            let in_image =
-                ch.image_frames != 0 && addr >= ch.code_va && addr < ch.code_va + ch.image_frames * 0x1000;
+            let in_image = ch.image_frames != 0
+                && addr >= ch.code_va
+                && addr < ch.code_va + ch.image_frames * 0x1000;
             if ch.caps.client_attach {
                 // ── win32k demand-fault CLIENT-FRAME-SHARING (relocated VERBATIM from
                 // `win32k_dispatch_wide`; foreign-pointer detection + internal-low zero-fill discrimination).
@@ -908,9 +1080,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                     break;
                 }
                 if foreign {
-                    if !crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4) {
-                        let win32k_internal_low =
-                            page < 0x0000_0100_0000_0000 && page >= 0x10000;
+                    if !crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4)
+                    {
+                        let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
                         if win32k_internal_low {
                             if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
                                 crate::print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
@@ -997,8 +1169,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             if is_int2c && skips < W32_ASSERT_SKIP_BOUND {
                 // Verbose grind-era trace: the per-skip int-0x2c diagnostic (bounded to 40). Gated
                 // behind `debug-trace` — pure noise once the boot is stable, not load-bearing.
-                if crate::DEBUG_TRACE
-                    && crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40
+                if crate::DEBUG_TRACE && crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40
                 {
                     crate::print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
                     crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
@@ -1007,8 +1178,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 skips += 1;
                 // UserException(3) reply: len 1, MR0 = the resume FaultIP (past `CD 2C`). This is
                 // the ONLY non-zero-length reply the component pump ever emits (risk R4).
-                let (nmi, nm0, nm1, nm2, nm3) =
-                    pump_resume_recv(ch, 1, ip + 2);
+                let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 1, ip + 2);
                 mi = nmi;
                 m0 = nm0;
                 m1 = nm1;
@@ -1063,7 +1233,11 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
     if !completed && !callback_suspended {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
-        let e = if ch.tcb != 0 { crate::tcb_suspend_r(ch.tcb) } else { 0xFFFF };
+        let e = if ch.tcb != 0 {
+            crate::tcb_suspend_r(ch.tcb)
+        } else {
+            0xFFFF
+        };
         crate::print_str(b"[pump] WALL label=");
         crate::print_u64(wall_label);
         crate::print_str(b" ip=0x");
@@ -1073,7 +1247,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
         crate::print_hex(wall_addr as u32);
         crate::print_str(b" -> TCB_Suspend(component) e=");
         crate::print_u64(e);
-        crate::print_str(b" (its reply object stays bound to a thread that will never run again)\n");
+        crate::print_str(
+            b" (its reply object stays bound to a thread that will never run again)\n",
+        );
     }
     let (status, result) = if completed {
         // Proof-of-wiring: count each serviced dispatch by kind.
@@ -1083,11 +1259,13 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
         };
         match ch.caps.kind {
             ReqKind::Irp => {
-                let status = core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_IRP) as *const i32);
+                let status =
+                    core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_IRP) as *const i32);
                 (status, status as u32 as u64)
             }
             ReqKind::Syscall => {
-                let result = core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_SYSCALL) as *const u64);
+                let result =
+                    core::ptr::read_volatile((ch.shared_va + SH_REQ_STATUS_SYSCALL) as *const u64);
                 (result as u32 as i32, result)
             }
         }
@@ -1189,7 +1367,10 @@ pub(crate) unsafe fn component_main(
     core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
     core::ptr::write_unaligned((reg_path + 8) as *mut u64, reg_buf);
 
-    core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, crate::driver_launch::V_ENTERED);
+    core::ptr::write_volatile(
+        (shared_va + SH_VERDICT_H) as *mut u32,
+        crate::driver_launch::V_ENTERED,
+    );
 
     let entry = code_va + entry_rva as u64;
     let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());

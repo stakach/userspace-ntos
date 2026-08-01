@@ -689,12 +689,10 @@ mod tests {
             assert_eq!(parsed.root.dll_redirects[0].name, wide("comctl32.dll"));
             assert!(parsed.dependencies.is_empty());
             assert_eq!(parsed.window_classes.len(), 28);
-            assert!(
-                parsed
-                    .window_classes
-                    .iter()
-                    .all(|class| class.file_index == 0 && class.versioned == versioned)
-            );
+            assert!(parsed
+                .window_classes
+                .iter()
+                .all(|class| class.file_index == 0 && class.versioned == versioned));
 
             let mut catalog = MockCatalog::new(vec![]);
             let resolved = resolve_activation_dependencies(
@@ -709,12 +707,11 @@ mod tests {
             assert_eq!(resolved.manifest_bytes, manifest.len());
 
             let assembly = &resolved.assemblies[0].details;
-            let dll_section = build_dll_redirection_section_for_assemblies(&[
-                DllRedirectAssembly {
+            let dll_section =
+                build_dll_redirection_section_for_assemblies(&[DllRedirectAssembly {
                     redirects: &assembly.root.dll_redirects,
-                },
-            ])
-            .unwrap();
+                }])
+                .unwrap();
             assert_eq!(
                 validate_dll_redirection_section(&dll_section)
                     .unwrap()
@@ -722,13 +719,12 @@ mod tests {
                 1
             );
 
-            let window_section =
-                build_window_class_redirection_section(&[WindowClassAssembly {
-                    version: assembly.root.assembly_identity.version,
-                    files: &assembly.root.dll_redirects,
-                    classes: &assembly.window_classes,
-                }])
-                .unwrap();
+            let window_section = build_window_class_redirection_section(&[WindowClassAssembly {
+                version: assembly.root.assembly_identity.version,
+                files: &assembly.root.dll_redirects,
+                classes: &assembly.window_classes,
+            }])
+            .unwrap();
             assert_eq!(
                 validate_window_class_redirection_section(&window_section, 1)
                     .unwrap()

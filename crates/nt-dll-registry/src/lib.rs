@@ -117,14 +117,22 @@ impl Registry {
     pub fn new(arena_start: u64, arena_end: u64) -> Self {
         assert!(arena_start % ALLOCATION_GRANULARITY == 0);
         assert!(arena_start < arena_end);
-        Self { dlls: Vec::new(), arena_start, arena_end, next_base: arena_start }
+        Self {
+            dlls: Vec::new(),
+            arena_start,
+            arena_end,
+            next_base: arena_start,
+        }
     }
 
     /// Register `name` (lowercase ASCII stem) with its image extent + entry RVA. Assigns the next
     /// compact base and returns the DLL's index. The first registered keeps `arena_start` as its base.
     pub fn register(&mut self, name: &[u8], image_size: u64, entry_rva: u32) -> usize {
         let i = self.reserve();
-        assert!(self.activate(i, name, image_size, entry_rva), "DLL VA arena exhausted");
+        assert!(
+            self.activate(i, name, image_size, entry_rva),
+            "DLL VA arena exhausted"
+        );
         i
     }
 
@@ -242,7 +250,10 @@ impl Registry {
 
     /// The lowercase stem of DLL `i` (empty if out of range or a reserved slot) — for diagnostics.
     pub fn name(&self, i: usize) -> &[u8] {
-        self.dlls.get(i).map(|d| &d.name_buf[..d.name_len]).unwrap_or(b"")
+        self.dlls
+            .get(i)
+            .map(|d| &d.name_buf[..d.name_len])
+            .unwrap_or(b"")
     }
 
     /// True if `name` (any case) is an SxS/actctx probe the loader must be steered away from:
@@ -272,7 +283,11 @@ impl Registry {
     /// The NtOpenFile handle DLL `i` has in process `pi`'s handle namespace (0 = none / out of
     /// range). The per-pi read half of the growable store.
     pub fn file_handle(&self, pi: usize, i: usize) -> u64 {
-        self.dlls.get(i).and_then(|d| d.file_handle.get(pi)).copied().unwrap_or(0)
+        self.dlls
+            .get(i)
+            .and_then(|d| d.file_handle.get(pi))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record the NtOpenFile handle for DLL `i`, owned by process `pi` (handles are process-local).
@@ -291,12 +306,18 @@ impl Registry {
         if handle == 0 {
             return None;
         }
-        self.dlls.iter().position(|d| d.file_handle.get(pi).copied() == Some(handle))
+        self.dlls
+            .iter()
+            .position(|d| d.file_handle.get(pi).copied() == Some(handle))
     }
 
     /// The NtCreateSection handle DLL `i` has in process `pi`'s handle namespace (0 = none).
     pub fn section_handle(&self, pi: usize, i: usize) -> u64 {
-        self.dlls.get(i).and_then(|d| d.section_handle.get(pi)).copied().unwrap_or(0)
+        self.dlls
+            .get(i)
+            .and_then(|d| d.section_handle.get(pi))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record the NtCreateSection handle for DLL `i`, owned by process `pi`. Grows on demand.
@@ -311,7 +332,9 @@ impl Registry {
         if handle == 0 {
             return None;
         }
-        self.dlls.iter().position(|d| d.section_handle.get(pi).copied() == Some(handle))
+        self.dlls
+            .iter()
+            .position(|d| d.section_handle.get(pi).copied() == Some(handle))
     }
 
     /// Mark DLL `i`'s view mapped (its VA range is now reserved + demand-pageable).
@@ -348,7 +371,9 @@ impl Registry {
 }
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value.checked_add(alignment - 1).map(|v| v & !(alignment - 1))
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
 }
 
 /// True if `hay` contains the byte sub-slice `needle`.
@@ -423,8 +448,14 @@ mod tests {
     #[test]
     fn resolve_matches_full_path_any_case() {
         let r = seeded();
-        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\csrsrv.dll"), Some(0));
-        assert_eq!(r.resolve_name(b"c:\\windows\\system32\\basesrv.dll"), Some(1));
+        assert_eq!(
+            r.resolve_name(b"\\systemroot\\system32\\csrsrv.dll"),
+            Some(0)
+        );
+        assert_eq!(
+            r.resolve_name(b"c:\\windows\\system32\\basesrv.dll"),
+            Some(1)
+        );
         assert_eq!(r.resolve_name(b"winsrv"), Some(2));
         // The caller folds case before calling; resolve_name compares the already-folded identity.
         assert_eq!(r.resolve_name(b"csrsrv"), Some(0));
@@ -440,13 +471,21 @@ mod tests {
         r.register(b"kernel32_vista", 0x8000, 0x2000);
         r.register(b"advapi32_vista", 0x5A00, 0x3000);
         r.register(b"advapi32", 0x7_1E00, 0x4000);
-        let k = r.resolve_name(b"\\systemroot\\system32\\kernel32_vista.dll").unwrap();
+        let k = r
+            .resolve_name(b"\\systemroot\\system32\\kernel32_vista.dll")
+            .unwrap();
         assert_eq!(r.name(k), b"kernel32_vista");
         let a = r.resolve_name(b"advapi32_vista.dll").unwrap();
         assert_eq!(r.name(a), b"advapi32_vista");
         // The base names still resolve to themselves (they don't contain the longer stems).
-        assert_eq!(r.name(r.resolve_name(b"kernel32.dll").unwrap()), b"kernel32");
-        assert_eq!(r.name(r.resolve_name(b"advapi32.dll").unwrap()), b"advapi32");
+        assert_eq!(
+            r.name(r.resolve_name(b"kernel32.dll").unwrap()),
+            b"kernel32"
+        );
+        assert_eq!(
+            r.name(r.resolve_name(b"advapi32.dll").unwrap()),
+            b"advapi32"
+        );
     }
 
     #[test]
@@ -471,18 +510,30 @@ mod tests {
     #[test]
     fn resolve_accepts_nt_dos_and_forward_slash_paths() {
         let r = seeded();
-        assert_eq!(r.resolve_name(b"\\??\\c:\\reactos\\system32\\csrsrv.dll"), Some(0));
+        assert_eq!(
+            r.resolve_name(b"\\??\\c:\\reactos\\system32\\csrsrv.dll"),
+            Some(0)
+        );
         assert_eq!(r.resolve_name(b"c:/reactos/system32/basesrv.dll"), Some(1));
-        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\\\winsrv.dll"), Some(2));
+        assert_eq!(
+            r.resolve_name(b"\\systemroot\\system32\\\\winsrv.dll"),
+            Some(2)
+        );
     }
 
     #[test]
     fn malformed_or_nonfinal_substrings_do_not_resolve() {
         let r = seeded();
-        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\prefixwinsrv.dll"), None);
+        assert_eq!(
+            r.resolve_name(b"c:\\reactos\\system32\\prefixwinsrv.dll"),
+            None
+        );
         assert_eq!(r.resolve_name(b"c:\\reactos\\system32winsrv.dll"), None);
         assert_eq!(r.resolve_name(b"c:\\reactos\\winsrv.dll\\trailer"), None);
-        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\winsrv.dll.bak"), None);
+        assert_eq!(
+            r.resolve_name(b"c:\\reactos\\system32\\winsrv.dll.bak"),
+            None
+        );
         assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\winsrv"), Some(2));
         assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\"), None);
     }
@@ -498,7 +549,9 @@ mod tests {
     fn sxs_probes_are_rejected() {
         let r = seeded();
         assert!(Registry::is_sxs_probe(b"csrsrv.dll.local"));
-        assert!(Registry::is_sxs_probe(b"\\??\\c:\\windows\\csrss.exe.manifest"));
+        assert!(Registry::is_sxs_probe(
+            b"\\??\\c:\\windows\\csrss.exe.manifest"
+        ));
         assert!(Registry::is_sxs_probe(b"basesrv.dll.config"));
         assert_eq!(r.resolve_name(b"csrsrv.dll.local"), None);
         assert_eq!(r.resolve_name(b"basesrv.manifest"), None);
@@ -528,9 +581,9 @@ mod tests {
         r.set_file_handle(2, 2, 0x4); // winlogon: handle 0x4 -> winsrv (dll 2)
         assert_eq!(r.index_for_file(1, 0x4), Some(0)); // csrss's 0x4
         assert_eq!(r.index_for_file(2, 0x4), Some(2)); // winlogon's 0x4 — a different object
-        // A process that never opened handle 0x4 doesn't see the other process's binding.
+                                                       // A process that never opened handle 0x4 doesn't see the other process's binding.
         assert_eq!(r.index_for_file(0, 0x4), None); // smss
-        // Same for section handles.
+                                                    // Same for section handles.
         r.set_section_handle(1, 0, 0x8);
         r.set_section_handle(2, 2, 0x8);
         assert_eq!(r.index_for_section(1, 0x8), Some(0));
@@ -554,9 +607,17 @@ mod tests {
         }
         // Read them all back — none clobbered, none lost past the reserve.
         for pi in 0..n {
-            assert_eq!(r.file_handle(pi, 0), 0x1000 + pi as u64, "file handle pi={pi}");
+            assert_eq!(
+                r.file_handle(pi, 0),
+                0x1000 + pi as u64,
+                "file handle pi={pi}"
+            );
             assert_eq!(r.index_for_file(pi, 0x1000 + pi as u64), Some(0));
-            assert_eq!(r.section_handle(pi, 2), 0x2000 + pi as u64, "section handle pi={pi}");
+            assert_eq!(
+                r.section_handle(pi, 2),
+                0x2000 + pi as u64,
+                "section handle pi={pi}"
+            );
             assert_eq!(r.index_for_section(pi, 0x2000 + pi as u64), Some(2));
         }
         // A high pi's value never leaks into a different pi's namespace.
@@ -595,20 +656,38 @@ mod tests {
     fn image_info_dll_vs_exe() {
         let dll = image_info(0x8000_0000, 0x1200, 0x1_1000, true);
         // TransferAddress = base + entry.
-        assert_eq!(u64::from_le_bytes(dll[0x00..0x08].try_into().unwrap()), 0x8000_1200);
+        assert_eq!(
+            u64::from_le_bytes(dll[0x00..0x08].try_into().unwrap()),
+            0x8000_1200
+        );
         // ImageCharacteristics (u16 @ 0x2c) has the DLL bit (0x2000).
-        assert_eq!(u16::from_le_bytes(dll[0x2c..0x2e].try_into().unwrap()), 0x2022);
+        assert_eq!(
+            u16::from_le_bytes(dll[0x2c..0x2e].try_into().unwrap()),
+            0x2022
+        );
         // Machine = AMD64.
-        assert_eq!(u16::from_le_bytes(dll[0x30..0x32].try_into().unwrap()), 0x8664);
+        assert_eq!(
+            u16::from_le_bytes(dll[0x30..0x32].try_into().unwrap()),
+            0x8664
+        );
         // ImageFileSize.
-        assert_eq!(u32::from_le_bytes(dll[0x38..0x3c].try_into().unwrap()), 0x1_1000);
+        assert_eq!(
+            u32::from_le_bytes(dll[0x38..0x3c].try_into().unwrap()),
+            0x1_1000
+        );
 
         let exe = image_info(0x0001_0000, 0x40, 0x8000, false);
-        assert_eq!(u16::from_le_bytes(exe[0x2c..0x2e].try_into().unwrap()), 0x0022); // no DLL bit
+        assert_eq!(
+            u16::from_le_bytes(exe[0x2c..0x2e].try_into().unwrap()),
+            0x0022
+        ); // no DLL bit
 
         // The registry produces the same bytes for a registered DLL.
         let r = seeded();
-        assert_eq!(r.image_info(0), Some(image_info(0x8000_0000, 0x1200, 0x1_1000, true)));
+        assert_eq!(
+            r.image_info(0),
+            Some(image_info(0x8000_0000, 0x1200, 0x1_1000, true))
+        );
     }
 
     #[test]
@@ -629,9 +708,15 @@ mod tests {
         assert!(r.activate(free0, b"version", 0x9000, 0x2100));
         assert!(r.is_active(free0));
         assert_eq!(r.base(free0), 0x8002_0000);
-        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\version.dll"), Some(1));
+        assert_eq!(
+            r.resolve_name(b"\\systemroot\\system32\\version.dll"),
+            Some(1)
+        );
         assert_eq!(r.name(free0), b"version");
-        assert_eq!(r.image_info(free0), Some(image_info(0x8002_0000, 0x2100, 0x9000, true)));
+        assert_eq!(
+            r.image_info(free0),
+            Some(image_info(0x8002_0000, 0x2100, 0x9000, true))
+        );
         // first_free now points past the activated slot.
         assert_eq!(r.first_free(), Some(2));
     }
@@ -649,7 +734,10 @@ mod tests {
         assert_eq!(a.base(1), b.base(1));
         assert_eq!(a.name(1), b.name(1));
         assert_eq!(a.image_info(1), b.image_info(1));
-        assert_eq!(a.resolve_name(b"basesrv.dll"), b.resolve_name(b"basesrv.dll"));
+        assert_eq!(
+            a.resolve_name(b"basesrv.dll"),
+            b.resolve_name(b"basesrv.dll")
+        );
     }
 
     #[test]

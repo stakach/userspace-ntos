@@ -58,7 +58,10 @@ pub(crate) fn assign_nic(
 ) -> Option<GrantedDevice> {
     let nic = find_device_for_class(devices, DriverClass::Network)?;
     let assignment = assign_resources(nic, int_vector, int_latched, /*affinity=*/ 1, dma_len)?;
-    Some(GrantedDevice { device: nic.clone(), assignment })
+    Some(GrantedDevice {
+        device: nic.clone(),
+        assignment,
+    })
 }
 
 /// Write the driver-visible `CM_RESOURCE_LIST` for `assign` into the resource frame at

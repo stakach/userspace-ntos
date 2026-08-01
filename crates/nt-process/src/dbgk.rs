@@ -215,19 +215,19 @@ pub const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
 /// `STATUS_ACCESS_VIOLATION`, the code `KiDispatchException` uses for an unclassified user fault.
 pub fn exception_code_for_trap(vector: u32) -> u32 {
     match vector {
-        0 => STATUS_INTEGER_DIVIDE_BY_ZERO,   // #DE
-        1 => STATUS_SINGLE_STEP,              // #DB
-        3 => STATUS_BREAKPOINT,               // #BP
-        4 => STATUS_INTEGER_OVERFLOW,         // #OF
-        5 => STATUS_ARRAY_BOUNDS_EXCEEDED,    // #BR
-        6 => STATUS_ILLEGAL_INSTRUCTION,      // #UD
-        7 => STATUS_ILLEGAL_INSTRUCTION,      // #NM (no math coprocessor)
-        12 => STATUS_STACK_OVERFLOW,          // #SS
-        13 => STATUS_ACCESS_VIOLATION,        // #GP
-        14 => STATUS_ACCESS_VIOLATION,        // #PF
-        16 => STATUS_FLOAT_DIVIDE_BY_ZERO,    // #MF (the reported x87 status refines this)
-        17 => STATUS_DATATYPE_MISALIGNMENT,   // #AC
-        19 => STATUS_FLOAT_DIVIDE_BY_ZERO,    // #XM (the reported MXCSR status refines this)
+        0 => STATUS_INTEGER_DIVIDE_BY_ZERO, // #DE
+        1 => STATUS_SINGLE_STEP,            // #DB
+        3 => STATUS_BREAKPOINT,             // #BP
+        4 => STATUS_INTEGER_OVERFLOW,       // #OF
+        5 => STATUS_ARRAY_BOUNDS_EXCEEDED,  // #BR
+        6 => STATUS_ILLEGAL_INSTRUCTION,    // #UD
+        7 => STATUS_ILLEGAL_INSTRUCTION,    // #NM (no math coprocessor)
+        12 => STATUS_STACK_OVERFLOW,        // #SS
+        13 => STATUS_ACCESS_VIOLATION,      // #GP
+        14 => STATUS_ACCESS_VIOLATION,      // #PF
+        16 => STATUS_FLOAT_DIVIDE_BY_ZERO,  // #MF (the reported x87 status refines this)
+        17 => STATUS_DATATYPE_MISALIGNMENT, // #AC
+        19 => STATUS_FLOAT_DIVIDE_BY_ZERO,  // #XM (the reported MXCSR status refines this)
         _ => STATUS_ACCESS_VIOLATION,
     }
 }
@@ -1159,14 +1159,8 @@ mod tests {
 
     #[test]
     fn message_api_numbers_and_states_match_the_ndk_enums() {
-        assert_eq!(
-            create_thread_msg(0).api_number(),
-            DBGKM_CREATE_THREAD_API
-        );
-        assert_eq!(
-            create_thread_msg(0).state(),
-            DBG_CREATE_THREAD_STATE_CHANGE
-        );
+        assert_eq!(create_thread_msg(0).api_number(), DBGKM_CREATE_THREAD_API);
+        assert_eq!(create_thread_msg(0).state(), DBG_CREATE_THREAD_STATE_CHANGE);
         let exit = DbgKmMessage::ExitProcess { exit_status: 1 };
         assert_eq!(exit.api_number(), DBGKM_EXIT_PROCESS_API);
         assert_eq!(exit.state(), DBG_EXIT_PROCESS_STATE_CHANGE);
@@ -1238,7 +1232,10 @@ mod tests {
             u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             DBG_CREATE_THREAD_STATE_CHANGE
         );
-        assert_eq!(u64::from_le_bytes(buf[0x18..0x20].try_into().unwrap()), 0x44);
+        assert_eq!(
+            u64::from_le_bytes(buf[0x18..0x20].try_into().unwrap()),
+            0x44
+        );
         assert_eq!(
             u64::from_le_bytes(buf[0x28..0x30].try_into().unwrap()),
             0xDEAD_BEEF
@@ -1268,8 +1265,14 @@ mod tests {
             u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             DBG_LOAD_DLL_STATE_CHANGE
         );
-        assert_eq!(u64::from_le_bytes(buf[0x20..0x28].try_into().unwrap()), 0x8000_0000);
-        assert_eq!(u64::from_le_bytes(buf[0x30..0x38].try_into().unwrap()), 0x9000);
+        assert_eq!(
+            u64::from_le_bytes(buf[0x20..0x28].try_into().unwrap()),
+            0x8000_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[0x30..0x38].try_into().unwrap()),
+            0x9000
+        );
 
         let mut record = ExceptionRecord::default();
         record.exception_code = STATUS_BREAKPOINT;
@@ -1305,14 +1308,16 @@ mod tests {
 
     #[test]
     fn access_mapping_expands_generics() {
-        assert_eq!(map_debug_object_access(0x1000_0000), DEBUG_OBJECT_ALL_ACCESS);
-        assert_eq!(map_debug_object_access(0x0200_0000), DEBUG_OBJECT_ALL_ACCESS);
-        assert!(
-            map_debug_object_access(0x8000_0000) & DEBUG_OBJECT_WAIT_STATE_CHANGE != 0
+        assert_eq!(
+            map_debug_object_access(0x1000_0000),
+            DEBUG_OBJECT_ALL_ACCESS
         );
-        assert!(
-            map_debug_object_access(0x4000_0000) & DEBUG_OBJECT_ADD_REMOVE_PROCESS != 0
+        assert_eq!(
+            map_debug_object_access(0x0200_0000),
+            DEBUG_OBJECT_ALL_ACCESS
         );
+        assert!(map_debug_object_access(0x8000_0000) & DEBUG_OBJECT_WAIT_STATE_CHANGE != 0);
+        assert!(map_debug_object_access(0x4000_0000) & DEBUG_OBJECT_ADD_REMOVE_PROCESS != 0);
         // A specific mask passes through untouched.
         assert_eq!(
             map_debug_object_access(DEBUG_OBJECT_SET_INFORMATION),

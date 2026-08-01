@@ -65,7 +65,11 @@ pub(crate) unsafe fn fat_visit_directory(
 /// Scan directory `dir_cluster` (following its cluster chain) for the 8.3 name `name11`
 /// (11 bytes, space-padded). Returns (first_cluster, size_bytes, attr). LFN / deleted /
 /// volume-label / free entries are skipped. Extracts the entry before any further reads.
-pub(crate) unsafe fn dir_find(fs: &Fat32, dir_cluster: u32, name11: &[u8; 11]) -> Option<(u32, u32, u8)> {
+pub(crate) unsafe fn dir_find(
+    fs: &Fat32,
+    dir_cluster: u32,
+    name11: &[u8; 11],
+) -> Option<(u32, u32, u8)> {
     let mut cl = dir_cluster;
     while cl >= 2 && cl < 0x0FFF_FFF8 {
         for s in 0..fs.spc {
@@ -107,7 +111,12 @@ pub(crate) unsafe fn dir_find(fs: &Fat32, dir_cluster: u32, name11: &[u8; 11]) -
 /// the FAT cluster chain. Each cluster is read via the AHCI into the shared data buffer, then
 /// copied out to `dest_vaddr + offset` BEFORE the next read (which — incl. `fat_next` —
 /// overwrites the buffer). Returns the number of bytes written.
-pub(crate) unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, dest_vaddr: u64) -> u32 {
+pub(crate) unsafe fn fat_read_file(
+    fs: &Fat32,
+    first_cluster: u32,
+    size: u32,
+    dest_vaddr: u64,
+) -> u32 {
     let mut cl = first_cluster;
     let mut written = 0u32;
     while cl >= 2 && cl < 0x0FFF_FFF8 && written < size {
@@ -118,7 +127,10 @@ pub(crate) unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, de
             let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
             let n = core::cmp::min(fs.bps, size - written);
             for i in 0..n as u64 {
-                core::ptr::write_volatile((dest_vaddr + written as u64 + i) as *mut u8, *p.add(i as usize));
+                core::ptr::write_volatile(
+                    (dest_vaddr + written as u64 + i) as *mut u8,
+                    *p.add(i as usize),
+                );
             }
             written += n;
         }
@@ -160,7 +172,11 @@ pub(crate) unsafe fn fat_read_file_range(
             let start = within_cluster.saturating_sub(sector_start) as usize;
             let data = fat_read_sector(fs, fat_cluster_sector(fs, cluster) + sector);
             let count = (fs.bps as usize - start).min(wanted - written);
-            core::ptr::copy_nonoverlapping(data.add(start), output.as_mut_ptr().add(written), count);
+            core::ptr::copy_nonoverlapping(
+                data.add(start),
+                output.as_mut_ptr().add(written),
+                count,
+            );
             written += count;
             within_cluster = sector_start + fs.bps;
             if written == wanted {
@@ -182,7 +198,11 @@ pub(crate) unsafe fn fat_read_file_range(
 /// chars keyed by a 1-based sequence ordinal; this reassembles them (ASCII only — sufficient for
 /// the ReactOS tree) and compares to `comp`. When an entry has an LFN, only the long name is
 /// matched (the 8.3 is a mangled alias); otherwise the 8.3 short name is matched (old behavior).
-pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> Option<(u32, u32, u8)> {
+pub(crate) unsafe fn dir_find_lfn(
+    fs: &Fat32,
+    dir_cluster: u32,
+    comp: &[u8],
+) -> Option<(u32, u32, u8)> {
     let short = name_to_83(comp);
     // Lowercase the target (ASCII) once.
     let mut want = [0u8; 256];
@@ -224,7 +244,9 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                     return None; // end of directory
                 }
                 if first == 0xE5 {
-                    have_lfn = false; term = None; hi_ord = 0; // deleted — drop any pending LFN
+                    have_lfn = false;
+                    term = None;
+                    hi_ord = 0; // deleted — drop any pending LFN
                     continue;
                 }
                 let attr = *ent.add(0x0B);
@@ -233,7 +255,9 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                     let ord = (first & 0x1F) as usize;
                     if ord >= 1 && ord <= 20 {
                         have_lfn = true;
-                        if ord > hi_ord { hi_ord = ord; }
+                        if ord > hi_ord {
+                            hi_ord = ord;
+                        }
                         let base = (ord - 1) * 13;
                         let mut k = 0;
                         while k < 13 {
@@ -243,10 +267,16 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                             let idx = base + k;
                             if idx < 260 {
                                 if lo == 0 && hi == 0 {
-                                    if term.is_none() { term = Some(idx); }
+                                    if term.is_none() {
+                                        term = Some(idx);
+                                    }
                                 } else if !(lo == 0xFF && hi == 0xFF) {
                                     lfn[idx] = if hi == 0 {
-                                        if lo.is_ascii_uppercase() { lo + 32 } else { lo }
+                                        if lo.is_ascii_uppercase() {
+                                            lo + 32
+                                        } else {
+                                            lo
+                                        }
                                     } else {
                                         0xFF // non-ASCII — won't match an ASCII target
                                     };
@@ -258,7 +288,9 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                     continue;
                 }
                 if (attr & 0x08) != 0 {
-                    have_lfn = false; term = None; hi_ord = 0; // volume label
+                    have_lfn = false;
+                    term = None;
+                    hi_ord = 0; // volume label
                     continue;
                 }
                 // 8.3 entry: decide match against the long name (if any) or the short name.
@@ -268,7 +300,10 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                         let mut m = true;
                         let mut j = 0;
                         while j < len {
-                            if lfn[j] != want[j] { m = false; break; }
+                            if lfn[j] != want[j] {
+                                m = false;
+                                break;
+                            }
                             j += 1;
                         }
                         m
@@ -278,7 +313,10 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                         let mut m = true;
                         let mut j = 0;
                         while j < 11 {
-                            if *ent.add(j) != short[j] { m = false; break; }
+                            if *ent.add(j) != short[j] {
+                                m = false;
+                                break;
+                            }
                             j += 1;
                         }
                         m
@@ -290,7 +328,9 @@ pub(crate) unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> 
                     let size = core::ptr::read_unaligned(ent.add(0x1C) as *const u32);
                     return Some(((hi << 16) | lo, size, attr));
                 }
-                have_lfn = false; term = None; hi_ord = 0;
+                have_lfn = false;
+                term = None;
+                hi_ord = 0;
             }
         }
         cl = fat_next(fs, cl);
@@ -559,9 +599,9 @@ pub(crate) unsafe fn demand_load_dll(
     core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
     *store.add(slot) = Some(pe);
     crate::bump_progress(); // (B) a NEW DLL loaded = unambiguous forward progress (resets stall)
-    // samsrv.dll — lsass' SAM server. lsasrv/lsass resolve it at runtime; nothing in the executive
-    // names it, so a genuine by-path demand-load is the ONLY way it can appear. Recorded for the
-    // `exec_samsrv_hosted` gate spec (with its real on-disk byte size).
+                            // samsrv.dll — lsass' SAM server. lsasrv/lsass resolve it at runtime; nothing in the executive
+                            // names it, so a genuine by-path demand-load is the ONLY way it can appear. Recorded for the
+                            // `exec_samsrv_hosted` gate spec (with its real on-disk byte size).
     if stem == b"samsrv" {
         crate::SAMSRV_LOADED_SIZE.store(sz as u64, core::sync::atomic::Ordering::Relaxed);
     }

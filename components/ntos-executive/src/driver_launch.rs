@@ -127,11 +127,11 @@ impl ExecVaWindow {
             let base = FSD_EXEC_BASE + (instance as u64 - 1) * FSD_EXEC_STRIDE;
             // Same RELATIVE offsets as the fixed layout: aux PT (2 MiB) holds DATA/SHARED/ARG.
             ExecVaWindow {
-                code_va: base,                  // 256 KiB image window (fits in the first 2 MiB PT)
-                data_va: base + 0x0030_0000,    // DATA (4 frames)
-                shared_va: base + 0x0038_0000,  // SHARED (1 frame)
-                arg_va: base + 0x003A_0000,     // ARG (4 frames)
-                aux_pt_va: base + 0x0020_0000,  // aux PT covering the 2 MiB region holding DATA/SHARED/ARG
+                code_va: base,                 // 256 KiB image window (fits in the first 2 MiB PT)
+                data_va: base + 0x0030_0000,   // DATA (4 frames)
+                shared_va: base + 0x0038_0000, // SHARED (1 frame)
+                arg_va: base + 0x003A_0000,    // ARG (4 frames)
+                aux_pt_va: base + 0x0020_0000, // aux PT covering the 2 MiB region holding DATA/SHARED/ARG
             }
         }
     }
@@ -145,7 +145,7 @@ pub const SH_DE_STATUS: u64 = 0x10; // out: DriverEntry NTSTATUS (i32)
 pub const SH_MJ_TABLE: u64 = 0x18; // out: recorded DriverObject->MajorFunction[] base VA (u64)
 pub const SH_DEVOBJ: u64 = 0x20; // out: the control DEVICE_OBJECT VA (u64)
 pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
-// IRP dispatch request/reply (executive → FSD, via the shared page).
+                                    // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
 pub const SH_REQ_MINOR: u64 = 0x48; // in:  minor function (u64)
 pub const SH_REQ_FSCTL: u64 = 0x50; // in:  control code or FILE_INFORMATION_CLASS (u64)
@@ -271,7 +271,9 @@ pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::v
 
 pub(crate) unsafe fn take_completed_write(fid: u64) -> Option<(u32, u64)> {
     let table = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
-    let slot = table.iter_mut().find(|entry| entry.fid == fid && entry.fid != 0)?;
+    let slot = table
+        .iter_mut()
+        .find(|entry| entry.fid == fid && entry.fid != 0)?;
     let result = (slot.status, slot.info);
     slot.fid = 0;
     Some(result)
@@ -371,9 +373,7 @@ unsafe fn pool_free(p: u64) {
         print_hex(p as u32);
         print_str(b"\n");
     }
-    if p < FSD_POOL_VADDR + POOL_DATA_OFF
-        || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
-    {
+    if p < FSD_POOL_VADDR + POOL_DATA_OFF || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 {
         return;
     }
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
@@ -671,7 +671,14 @@ unsafe fn audit_data_queue(dq: u64) -> bool {
         return false;
     }
     FSD_QUEUE_REPAIRS.fetch_add(1, Ordering::Relaxed);
-    queue_dump(b"[fsd-queue] INCONSISTENT -> repaired", dq, state, entries, walked, types);
+    queue_dump(
+        b"[fsd-queue] INCONSISTENT -> repaired",
+        dq,
+        state,
+        entries,
+        walked,
+        types,
+    );
     // Re-initialise exactly as `NpInitializeDataQueue` (`datasup.c:32`) does, keeping Quota: an
     // empty circular list in state Empty. npfs can no longer spin on it.
     write_volatile(dq as *mut u64, dq); // Flink = &Queue
@@ -974,7 +981,7 @@ extern "win64" fn s_io_create_device(
             write_unaligned((dev + 0x40) as *mut u64, dev + 0x150); // DeviceExtension (past the body)
         }
         write_unaligned((dev + 0x48) as *mut u32, dev_type as u32); // DeviceType
-        // link onto DriverObject->DeviceObject@8 (NextDevice@0x10).
+                                                                    // link onto DriverObject->DeviceObject@8 (NextDevice@0x10).
         if drv != 0 {
             let head = read_unaligned((drv + 8) as *const u64);
             write_unaligned((dev + 0x10) as *mut u64, head);
@@ -1067,8 +1074,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 cslot.length = if source_valid { length } else { 0 };
                 if source_valid {
                     for index in 0..length {
-                        cslot.bytes[index] =
-                            read_volatile((source + index as u64) as *const u8);
+                        cslot.bytes[index] = read_volatile((source + index as u64) as *const u8);
                     }
                 }
             }
@@ -1130,7 +1136,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
 /// The name is a `UNICODE_STRING.Buffer` (UTF-16); we read it live from the FSD's own pool at Find time.
 #[derive(Clone, Copy)]
 struct PrefixSlot {
-    entry: u64,   // the PUNICODE_PREFIX_TABLE_ENTRY the FSD passed to Insert (returned by Find)
+    entry: u64, // the PUNICODE_PREFIX_TABLE_ENTRY the FSD passed to Insert (returned by Find)
     name_va: u64, // UNICODE_STRING.Buffer VA
     name_len: u16, // UNICODE_STRING.Length (bytes)
     used: bool,
@@ -1141,8 +1147,12 @@ const PREFIX_CAP: usize = 64;
 /// The single VCB prefix table (npfs is a singleton driver). Lives in the executive image `.bss`
 /// (shared into the component). Populated by `s_rtl_insert_unicode_prefix`, queried by
 /// `s_rtl_find_unicode_prefix`. Reset by `s_rtl_init_unicode_prefix`.
-static mut PREFIX_TABLE: [PrefixSlot; PREFIX_CAP] =
-    [PrefixSlot { entry: 0, name_va: 0, name_len: 0, used: false }; PREFIX_CAP];
+static mut PREFIX_TABLE: [PrefixSlot; PREFIX_CAP] = [PrefixSlot {
+    entry: 0,
+    name_va: 0,
+    name_len: 0,
+    used: false,
+}; PREFIX_CAP];
 
 /// Copy a UNICODE_STRING.Buffer (UTF-16) into a fixed scratch for comparison. Returns the length in
 /// u16 units (capped at the scratch size). Pipe names are short (`\ntsvcs` = 7).
@@ -1166,7 +1176,12 @@ extern "win64" fn s_rtl_init_unicode_prefix(tbl: u64) {
         }
         let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
         for s in table.iter_mut() {
-            *s = PrefixSlot { entry: 0, name_va: 0, name_len: 0, used: false };
+            *s = PrefixSlot {
+                entry: 0,
+                name_va: 0,
+                name_len: 0,
+                used: false,
+            };
         }
     }
 }
@@ -1192,13 +1207,21 @@ extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64
             }
             let mut ex: [u16; 128] = [0; 128];
             let en = read_ustr16(s.name_va, s.name_len, &mut ex);
-            if en == nn && nt_kernel_exec::np_prefix::is_component_prefix(&ex[..en], &new[..nn]) && nn == en {
+            if en == nn
+                && nt_kernel_exec::np_prefix::is_component_prefix(&ex[..en], &new[..nn])
+                && nn == en
+            {
                 return 0; // duplicate
             }
         }
         for s in table.iter_mut() {
             if !s.used {
-                *s = PrefixSlot { entry, name_va, name_len, used: true };
+                *s = PrefixSlot {
+                    entry,
+                    name_va,
+                    name_len,
+                    used: true,
+                };
                 return 1;
             }
         }
@@ -1221,14 +1244,16 @@ extern "win64" fn s_rtl_find_unicode_prefix(_tbl: u64, full: u64, _ci: u64) -> u
         let table = &*core::ptr::addr_of!(PREFIX_TABLE);
         let mut best_entry = 0u64;
         let mut best_len = 0usize; // matched name length in u16 units
-        // Compare against each used slot; keep the longest component-prefix.
+                                   // Compare against each used slot; keep the longest component-prefix.
         let mut cbuf: [u16; 128] = [0; 128];
         for s in table.iter() {
             if !s.used {
                 continue;
             }
             let cn = read_ustr16(s.name_va, s.name_len, &mut cbuf);
-            if nt_kernel_exec::np_prefix::is_component_prefix(&cbuf[..cn], &fbuf[..fn_]) && cn >= best_len {
+            if nt_kernel_exec::np_prefix::is_component_prefix(&cbuf[..cn], &fbuf[..fn_])
+                && cn >= best_len
+            {
                 best_len = cn;
                 best_entry = s.entry;
             }
@@ -1361,17 +1386,32 @@ fn register_fsd_trampolines() {
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(FSD_EXPORTS) };
     // pool (ExAllocatePool* → the FSD arena)
     reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_tag as usize as u64);
-    reg.bind("ExAllocatePoolWithQuotaTag", s_ex_alloc_pool_quota_tag as usize as u64);
+    reg.bind(
+        "ExAllocatePoolWithQuotaTag",
+        s_ex_alloc_pool_quota_tag as usize as u64,
+    );
     reg.bind("ExAllocatePool", s_ex_alloc_pool as usize as u64);
     reg.bind("ExFreePoolWithTag", s_ex_free_pool_tag as usize as u64);
     reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
     // Rtl string init
-    reg.bind("RtlInitUnicodeString", s_rtl_init_unicode_string as usize as u64);
-    reg.bind("RtlInitEmptyUnicodeString", s_rtl_init_empty_unicode_string as usize as u64);
+    reg.bind(
+        "RtlInitUnicodeString",
+        s_rtl_init_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlInitEmptyUnicodeString",
+        s_rtl_init_empty_unicode_string as usize as u64,
+    );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
     reg.bind("IoCreateDevice", s_io_create_device as usize as u64);
-    reg.bind("IoCreateSymbolicLink", s_io_create_symbolic_link as usize as u64);
-    reg.bind("IoRegisterFileSystem", s_io_register_file_system as usize as u64);
+    reg.bind(
+        "IoCreateSymbolicLink",
+        s_io_create_symbolic_link as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterFileSystem",
+        s_io_register_file_system as usize as u64,
+    );
     reg.bind("IoCompleteRequest", s_io_complete_request as usize as u64);
     // npfs.sys's PE actually imports the fastcall alias `IofCompleteRequest` (the `IoCompleteRequest`
     // macro compiles to it). On x64 there is ONE calling convention, so `Irp`/`PriorityBoost` still
@@ -1382,17 +1422,44 @@ fn register_fsd_trampolines() {
     // the drained queue and returned uninitialized pool (`d0 16 d0 16 …`). BATCH 38 root cause.
     reg.bind("IofCompleteRequest", s_io_complete_request as usize as u64);
     // Rtl Unicode prefix table (nt_kernel_exec::np_prefix) — the VCB name→FCB map
-    reg.bind("RtlInitializeUnicodePrefix", s_rtl_init_unicode_prefix as usize as u64);
-    reg.bind("RtlInsertUnicodePrefix", s_rtl_insert_unicode_prefix as usize as u64);
-    reg.bind("RtlFindUnicodePrefix", s_rtl_find_unicode_prefix as usize as u64);
-    reg.bind("RtlInitializeGenericTable", s_rtl_init_generic_table as usize as u64);
+    reg.bind(
+        "RtlInitializeUnicodePrefix",
+        s_rtl_init_unicode_prefix as usize as u64,
+    );
+    reg.bind(
+        "RtlInsertUnicodePrefix",
+        s_rtl_insert_unicode_prefix as usize as u64,
+    );
+    reg.bind(
+        "RtlFindUnicodePrefix",
+        s_rtl_find_unicode_prefix as usize as u64,
+    );
+    reg.bind(
+        "RtlInitializeGenericTable",
+        s_rtl_init_generic_table as usize as u64,
+    );
     // ERESOURCE acquire/release (uncontended single-threaded host)
-    reg.bind("ExAcquireResourceExclusiveLite", s_acquire_resource as usize as u64);
-    reg.bind("ExAcquireResourceSharedLite", s_acquire_resource as usize as u64);
-    reg.bind("ExAcquireSharedStarveExclusive", s_acquire_resource as usize as u64);
-    reg.bind("ExAcquireSharedWaitForExclusive", s_acquire_resource as usize as u64);
+    reg.bind(
+        "ExAcquireResourceExclusiveLite",
+        s_acquire_resource as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireResourceSharedLite",
+        s_acquire_resource as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireSharedStarveExclusive",
+        s_acquire_resource as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireSharedWaitForExclusive",
+        s_acquire_resource as usize as u64,
+    );
     reg.bind("ExReleaseResourceLite", s_release_resource as usize as u64);
-    reg.bind("ExReleaseResourceForThreadLite", s_release_resource as usize as u64);
+    reg.bind(
+        "ExReleaseResourceForThreadLite",
+        s_release_resource as usize as u64,
+    );
     // The driver's OWN consistency bugchecks (npfs' `NpBugCheck`) — caught + reported + unwound,
     // never skipped. Previously an UNBOUND import resolving to the fail-soft `s_true` no-op.
     if crate::KEBUGCHECK_BOUND {
@@ -1406,10 +1473,16 @@ fn register_fsd_trampolines() {
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
-    reg.bind("RtlCompareMemoryUlong", s_rtl_compare_memory as usize as u64);
+    reg.bind(
+        "RtlCompareMemoryUlong",
+        s_rtl_compare_memory as usize as u64,
+    );
     reg.bind("RtlUpcaseUnicodeChar", s_rtl_upcase_char as usize as u64);
     // small-struct init (spinlock/event/timer/dpc/mutex/semaphore/ERESOURCE init)
-    reg.bind("ExInitializeResourceLite", s_init_small_struct as usize as u64);
+    reg.bind(
+        "ExInitializeResourceLite",
+        s_init_small_struct as usize as u64,
+    );
     reg.bind("KeInitializeSpinLock", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeEvent", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeTimer", s_init_small_struct as usize as u64);
@@ -1418,14 +1491,20 @@ fn register_fsd_trampolines() {
     reg.bind("KeInitializeMutex", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeSemaphore", s_init_small_struct as usize as u64);
     // Se / Ob security helpers
-    reg.bind("IoGetFileObjectGenericMapping", s_generic_mapping as usize as u64);
+    reg.bind(
+        "IoGetFileObjectGenericMapping",
+        s_generic_mapping as usize as u64,
+    );
     reg.bind("SeAssignSecurity", s_se_assign_security as usize as u64);
     reg.bind("ObLogSecurityDescriptor", s_ob_log_sd as usize as u64);
     // Ps/Io current-object identity
     reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentThread", s_current_process as usize as u64);
     reg.bind("KeGetCurrentThread", s_current_process as usize as u64);
-    reg.bind("IoGetCurrentProcess", s_io_get_current_process as usize as u64);
+    reg.bind(
+        "IoGetCurrentProcess",
+        s_io_get_current_process as usize as u64,
+    );
     // Debug print forwarders
     reg.bind("vDbgPrintExWithPrefix", s_dbg_print as usize as u64);
     reg.bind("vDbgPrintEx", s_dbg_print as usize as u64);
@@ -1614,7 +1693,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
     // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
     // and writes through that pointer on disconnect), so it must NOT be rebuilt/freed per request.
-    let existing = if crate::FSD_FILE_OBJECT_PER_OPEN { fo_lookup(file_id) } else { 0 };
+    let existing = if crate::FSD_FILE_OBJECT_PER_OPEN {
+        fo_lookup(file_id)
+    } else {
+        0
+    };
     let owns_fo = existing == 0;
     let fo = if owns_fo { pool_alloc(0x100) } else { existing };
     if fo == 0 {
@@ -1626,7 +1709,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         write_unaligned((fo + 2) as *mut u16, 0x100);
         write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
         write_unaligned((fo + 0x18) as *mut u64, file_id); // FsContext
-        // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
+                                                           // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
         write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
         write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
         write_unaligned((fo + 0x60) as *mut u64, FSD_ARG_VADDR); // Buffer = the pipe name (UTF-16)
@@ -1662,7 +1745,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // reads reserve `outlen` and are copied back to the ARG transport only after completion.
     write_unaligned((irp + 0x18) as *mut u64, data);
     write_unaligned((irp + 0x70) as *mut u64, data); // UserBuffer
-    // CurrentLocation@0x42 = 1, StackCount@0x43 = 1 (IoGetCurrentIrpStackLocation asserts this).
+                                                     // CurrentLocation@0x42 = 1, StackCount@0x43 = 1 (IoGetCurrentIrpStackLocation asserts this).
     write_unaligned((irp + 0x42) as *mut u8, 1);
     write_unaligned((irp + 0x43) as *mut u8, 1);
 
@@ -1673,14 +1756,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     write_unaligned((iosl + 1) as *mut u8, 0); // MinorFunction
     write_unaligned((iosl + 0x20) as *mut u64, devobj); // DeviceObject
     write_unaligned((iosl + 0x30) as *mut u64, fo); // FileObject
-    // Parameters union @ iosl+0x08. Layouts (references/reactos ndk/iotypes.h; POINTER_ALIGNMENT =
-    // DECLSPEC_ALIGN(8) on x64 → Reserved/FileAttributes 8-align, ShareAccess follows, next ptr 8-aligns):
-    //  Create/CreatePipe: SecurityContext@iosl+0x08, Options@iosl+0x10, ShareAccess(USHORT)@iosl+0x1a,
-    //    Parameters@iosl+0x20.
-    //  Read/Write: Length(ULONG)@0x08, Key@0x10, ByteOffset(LARGE_INTEGER)@0x18.
-    //  SetFile: Length(ULONG)@0x08, FileInformationClass (8-aligned) @0x10.
-    //  FS/DeviceControl: OutputBufferLength@0x08, InputBufferLength@0x10, IoControlCode@0x18,
-    //    Type3InputBuffer@0x20.
+                                                    // Parameters union @ iosl+0x08. Layouts (references/reactos ndk/iotypes.h; POINTER_ALIGNMENT =
+                                                    // DECLSPEC_ALIGN(8) on x64 → Reserved/FileAttributes 8-align, ShareAccess follows, next ptr 8-aligns):
+                                                    //  Create/CreatePipe: SecurityContext@iosl+0x08, Options@iosl+0x10, ShareAccess(USHORT)@iosl+0x1a,
+                                                    //    Parameters@iosl+0x20.
+                                                    //  Read/Write: Length(ULONG)@0x08, Key@0x10, ByteOffset(LARGE_INTEGER)@0x18.
+                                                    //  SetFile: Length(ULONG)@0x08, FileInformationClass (8-aligned) @0x10.
+                                                    //  FS/DeviceControl: OutputBufferLength@0x08, InputBufferLength@0x10, IoControlCode@0x18,
+                                                    //    Type3InputBuffer@0x20.
     match major {
         0 | 1 => {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
@@ -1693,17 +1776,17 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             write_unaligned((sec_ctx + 0x08) as *mut u64, access_state); // AccessState
             write_unaligned((sec_ctx + 0x10) as *mut u32, 0x001F_01FF); // DesiredAccess = all
             write_unaligned((iosl + 0x08) as *mut u64, sec_ctx); // SecurityContext
-            // Options: Disposition in the high byte, CreateOptions in the low 24.
-            // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
-            // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
-            // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
-            // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
-            // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
-            // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
-            // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
-            // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
-            // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
-            // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
+                                                                 // Options: Disposition in the high byte, CreateOptions in the low 24.
+                                                                 // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
+                                                                 // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
+                                                                 // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
+                                                                 // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
+                                                                 // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
+                                                                 // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
+                                                                 // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
+                                                                 // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
+                                                                 // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
+                                                                 // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
             let disposition: u32 = if major == 1 { 3 } else { 1 }; // create-named-pipe=FILE_OPEN_IF, open=FILE_OPEN
             write_unaligned((iosl + 0x10) as *mut u32, disposition << 24);
             write_unaligned((iosl + 0x1a) as *mut u16, 3); // ShareAccess = FILE_SHARE_READ|WRITE (full duplex)
@@ -1764,7 +1847,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
 
     let irp_status = read_unaligned((irp + 0x30) as *const i32);
     let info = read_unaligned((irp + 0x38) as *const u64);
-    let st = if irp_status != 0 || info != 0 { irp_status } else { ret };
+    let st = if irp_status != 0 || info != 0 {
+        irp_status
+    } else {
+        ret
+    };
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
     let fsctx = read_unaligned((fo + 0x18) as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
@@ -1872,13 +1959,23 @@ pub(crate) enum DriverClass {
 pub(crate) fn caps_and_layout_for(class: DriverClass) -> (HostCaps, bool) {
     match class {
         // The default user-driver path: a persistent IRP dispatch server, no device caps.
-        DriverClass::Fsd | DriverClass::Filter => {
-            (HostCaps { dispatch_server: true, kind: ReqKind::Irp, ..HostCaps::default() }, false)
-        }
+        DriverClass::Fsd | DriverClass::Filter => (
+            HostCaps {
+                dispatch_server: true,
+                kind: ReqKind::Irp,
+                ..HostCaps::default()
+            },
+            false,
+        ),
         // Same IRP substrate; ONLY the granted-cap/region device section differs (nt-pnp populates it).
-        DriverClass::Device => {
-            (HostCaps { dispatch_server: true, kind: ReqKind::Irp, ..HostCaps::default() }, true)
-        }
+        DriverClass::Device => (
+            HostCaps {
+                dispatch_server: true,
+                kind: ReqKind::Irp,
+                ..HostCaps::default()
+            },
+            true,
+        ),
         // win32k's unique privileged class — NOT routed through load_driver's IRP builder.
         DriverClass::GuiSyscallServer => (HostCaps::default(), false),
     }
@@ -1924,7 +2021,10 @@ pub(crate) struct DriverComponent {
 unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
     let mut i = 0u64;
     while i + 8 <= n {
-        write_unaligned((dst + i) as *mut u64, read_unaligned((src + i) as *const u64));
+        write_unaligned(
+            (dst + i) as *mut u64,
+            read_unaligned((src + i) as *const u64),
+        );
         i += 8;
     }
     while i < n {
@@ -1977,7 +2077,11 @@ unsafe fn load_pe_into(
         let n = raw_size.min(cap - va);
         copy_bytes(dst_va + va, src_va + raw_ptr, n);
         // W^X: executable section → RX (2), else RW_NX.
-        let r = if chars & 0x2000_0000 != 0 { 2u64 } else { RW_NX };
+        let r = if chars & 0x2000_0000 != 0 {
+            2u64
+        } else {
+            RW_NX
+        };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
         while p < span {
@@ -2171,7 +2275,12 @@ pub(crate) unsafe fn load_driver(
         let _ = alloc_frame();
     }
     for i in 0..img_frames {
-        let _ = page_map(copy_cap(code_base + i), code_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            copy_cap(code_base + i),
+            code_va + i * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        );
     }
     // POOL frames (host-only; allocate the caps, mapped by spawn_component).
     let pool_base = alloc_frame();
@@ -2190,13 +2299,33 @@ pub(crate) unsafe fn load_driver(
     }
     let apt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
-    let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, win.aux_pt_va, CAP_INIT_THREAD_VSPACE);
+    let _ = paging_struct_map(
+        apt,
+        LBL_X86_PAGE_TABLE_MAP,
+        win.aux_pt_va,
+        CAP_INIT_THREAD_VSPACE,
+    );
     for i in 0..FSD_DATA_FRAMES {
-        let _ = page_map(copy_cap(data_base + i), win.data_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            copy_cap(data_base + i),
+            win.data_va + i * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        );
     }
-    let _ = page_map(copy_cap(shared), win.shared_va, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(
+        copy_cap(shared),
+        win.shared_va,
+        RW_NX,
+        CAP_INIT_THREAD_VSPACE,
+    );
     for i in 0..FSD_ARG_FRAMES {
-        let _ = page_map(copy_cap(arg_base + i), win.arg_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            copy_cap(arg_base + i),
+            win.arg_va + i * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        );
     }
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
@@ -2211,7 +2340,15 @@ pub(crate) unsafe fn load_driver(
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
-    let (pml4, tcb) = spawn_fsd_component(code_base, pool_base, data_base, shared, arg_base, fault_ep, &rights[..img_frames as usize]);
+    let (pml4, tcb) = spawn_fsd_component(
+        code_base,
+        pool_base,
+        data_base,
+        shared,
+        arg_base,
+        fault_ep,
+        &rights[..img_frames as usize],
+    );
     // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
     // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
     let reply_cap = crate::fsd_reply_slot(instance);
@@ -2313,17 +2450,53 @@ unsafe fn spawn_fsd_component(
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
         // The npfs PE image, W^X, its own 2 MiB PT.
-        Region { source: FrameSource::Alias(code_base), base_va: FSD_CODE_VA, count: FSD_IMAGE_FRAMES, rights: Rights::PerFrame(rights_static), pts: 1 },
+        Region {
+            source: FrameSource::Alias(code_base),
+            base_va: FSD_CODE_VA,
+            count: FSD_IMAGE_FRAMES,
+            rights: Rights::PerFrame(rights_static),
+            pts: 1,
+        },
         // Pool arena (own window + PTs, aliased executive frames).
-        Region { source: FrameSource::Alias(pool_base), base_va: FSD_POOL_VADDR, count: FSD_POOL_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 },
+        Region {
+            source: FrameSource::Alias(pool_base),
+            base_va: FSD_POOL_VADDR,
+            count: FSD_POOL_FRAMES,
+            rights: Rights::Uniform(RW_NX),
+            pts: 1,
+        },
         // Aux PT window for DATA/SHARED/ARG.
-        Region { source: FrameSource::Alias(0), base_va: FSD_AUX_PT_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 1 },
+        Region {
+            source: FrameSource::Alias(0),
+            base_va: FSD_AUX_PT_VADDR,
+            count: 0,
+            rights: Rights::Uniform(RW_NX),
+            pts: 1,
+        },
         // DATA export/placeholder region (aux window).
-        Region { source: FrameSource::Alias(data_base), base_va: FSD_DATA_VADDR, count: FSD_DATA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 },
+        Region {
+            source: FrameSource::Alias(data_base),
+            base_va: FSD_DATA_VADDR,
+            count: FSD_DATA_FRAMES,
+            rights: Rights::Uniform(RW_NX),
+            pts: 0,
+        },
         // Shared handoff page (aux window).
-        Region { source: FrameSource::Alias(shared), base_va: FSD_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
+        Region {
+            source: FrameSource::Alias(shared),
+            base_va: FSD_SHARED_VADDR,
+            count: 1,
+            rights: Rights::Uniform(RW_NX),
+            pts: 0,
+        },
         // Arg-marshal frames (aux window).
-        Region { source: FrameSource::Alias(arg_base), base_va: FSD_ARG_VADDR, count: FSD_ARG_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 },
+        Region {
+            source: FrameSource::Alias(arg_base),
+            base_va: FSD_ARG_VADDR,
+            count: FSD_ARG_FRAMES,
+            rights: Rights::Uniform(RW_NX),
+            pts: 0,
+        },
     ];
     let d = ComponentDescriptor {
         entry: fsd_component_entry,
@@ -2333,7 +2506,11 @@ unsafe fn spawn_fsd_component(
         stack_frames: FSD_STACK_FRAMES,
         stack_dedicated_pt: true,
         regions: &regions,
-        granted: GrantedCaps { irq_ntfn: None, result_ntfn: None, fault_ep: Some(fault_ep) },
+        granted: GrantedCaps {
+            irq_ntfn: None,
+            result_ntfn: None,
+            fault_ep: Some(fault_ep),
+        },
         prio: 100,
         gs_base: Some(FSD_KPCR_VA),
         caps: HostCaps::default(),
@@ -2450,7 +2627,9 @@ pub(crate) fn npfs_ready() -> bool {
 
 /// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP to instance 0.
 pub(crate) unsafe fn npfs_last_file_id() -> u64 {
-    let sh = instance(0).map(|d| d.exec_shared_va).unwrap_or(FSD_SHARED_VADDR);
+    let sh = instance(0)
+        .map(|d| d.exec_shared_va)
+        .unwrap_or(FSD_SHARED_VADDR);
     read_volatile((sh + SH_REQ_FILEID) as *const u64)
 }
 

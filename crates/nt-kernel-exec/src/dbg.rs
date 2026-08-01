@@ -81,7 +81,10 @@ pub fn format_dbg(
         i += 1;
         while i < fmt.len() {
             let m = fmt[i];
-            if matches!(m, b'-' | b'+' | b' ' | b'#' | b'0'..=b'9' | b'.' | b'l' | b'h' | b'w' | b'I') {
+            if matches!(
+                m,
+                b'-' | b'+' | b' ' | b'#' | b'0'..=b'9' | b'.' | b'l' | b'h' | b'w' | b'I'
+            ) {
                 i += 1;
             } else {
                 break;

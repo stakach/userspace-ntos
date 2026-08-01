@@ -867,10 +867,7 @@ mod tests {
             wide_ctype_bits(b'A' as u32),
             WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_HEX
         );
-        assert_eq!(
-            wide_ctype_bits(b'z' as u32),
-            WCTYPE_ALPHA | WCTYPE_LOWER
-        );
+        assert_eq!(wide_ctype_bits(b'z' as u32), WCTYPE_ALPHA | WCTYPE_LOWER);
         assert_eq!(wide_ctype_bits(0xa0), WCTYPE_SPACE | WCTYPE_BLANK);
         assert_eq!(wide_ctype_bits(0xb2), WCTYPE_PUNCT | WCTYPE_DIGIT);
         assert_eq!(wide_ctype_bits(0xc9), WCTYPE_ALPHA | WCTYPE_UPPER);
@@ -886,10 +883,7 @@ mod tests {
             wide_ctype(b'A' as u32, WCTYPE_ALPHA_MASK | WCTYPE_HEX),
             WCTYPE_ALPHA | WCTYPE_UPPER | WCTYPE_HEX
         );
-        assert_eq!(
-            wide_is_alpha(0xc9),
-            WCTYPE_ALPHA | WCTYPE_UPPER
-        );
+        assert_eq!(wide_is_alpha(0xc9), WCTYPE_ALPHA | WCTYPE_UPPER);
         assert_eq!(wide_is_digit(0xb2), WCTYPE_DIGIT);
         assert_eq!(wide_is_lower(0xdf), WCTYPE_LOWER);
         assert_eq!(wide_is_space(0xa0), WCTYPE_SPACE);

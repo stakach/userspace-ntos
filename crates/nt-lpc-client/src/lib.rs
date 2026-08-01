@@ -181,7 +181,11 @@ impl<B: Backend> LpcClient<B> {
             _reserved: 0,
             _reserved2: 0,
             port_handle,
-            reply_msg_offset: if reply_msg.is_empty() { 0 } else { header as u32 },
+            reply_msg_offset: if reply_msg.is_empty() {
+                0
+            } else {
+                header as u32
+            },
             reply_msg_len_bytes: reply_msg.len() as u32,
         };
         let mut buf = bytemuck::bytes_of(&req).to_vec();

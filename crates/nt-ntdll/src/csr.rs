@@ -48,6 +48,8 @@ pub const CSR_API_MESSAGE_API_NUMBER_OFFSET: usize = 0x30;
 pub const CSR_API_MESSAGE_STATUS_OFFSET: usize = 0x34;
 pub const CSR_API_MESSAGE_RESERVED_OFFSET: usize = 0x38;
 pub const CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET: usize = 0x40;
+pub const CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN: usize =
+    CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET - PORT_MESSAGE_HEADER_LEN;
 pub const CSR_API_MESSAGE_SIZE: usize = 0x178;
 
 const MAXLONG: usize = 0x7fff_ffff;
@@ -435,8 +437,9 @@ pub fn csr_client_call_lengths(data_length: u32) -> Option<(u16, u16)> {
     if data_length > MAXSHORT.checked_sub(CSR_API_MESSAGE_SIZE)? {
         return None;
     }
-    let total_length = data_length.checked_add(CSR_API_MESSAGE_HEADER_LEN)?;
-    Some((data_length as u16, total_length as u16))
+    let port_data_len = data_length.checked_add(CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN)?;
+    let total_length = data_length.checked_add(CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET)?;
+    Some((port_data_len as u16, total_length as u16))
 }
 
 /// Fill the fixed CSR/PORT headers before sending a `CSR_API_MESSAGE`.
@@ -1025,14 +1028,24 @@ mod tests {
     fn csr_client_call_header_lengths_match_x64_layout() {
         assert_eq!(
             csr_client_call_lengths(0),
-            Some((0, CSR_API_MESSAGE_HEADER_LEN as u16))
+            Some((
+                CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN as u16,
+                CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET as u16
+            ))
         );
-        assert_eq!(csr_client_call_lengths(0x10), Some((0x10, 0x38)));
+        assert_eq!(
+            csr_client_call_lengths(0x10),
+            Some((
+                (CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN + 0x10) as u16,
+                (CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET + 0x10) as u16
+            ))
+        );
         assert_eq!(
             csr_client_call_lengths((MAXSHORT - CSR_API_MESSAGE_SIZE) as u32),
             Some((
-                (MAXSHORT - CSR_API_MESSAGE_SIZE) as u16,
-                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_HEADER_LEN) as u16
+                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN) as u16,
+                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET)
+                    as u16
             ))
         );
         assert_eq!(

@@ -92,16 +92,34 @@ pub(crate) unsafe fn storage_probe(
         macro_rules! open_or_sys32 {
             ($leaf:expr, $short:expr) => {{
                 match open_sys32(&fs, $leaf) {
-                    Some((c, s)) => { fs_hits += 1; Some((c, s, 0u8)) }
-                    None => { let r = dir_find(&fs, fs.root_cl, $short); if r.is_some() { fs_miss += 1; } r }
+                    Some((c, s)) => {
+                        fs_hits += 1;
+                        Some((c, s, 0u8))
+                    }
+                    None => {
+                        let r = dir_find(&fs, fs.root_cl, $short);
+                        if r.is_some() {
+                            fs_miss += 1;
+                        }
+                        r
+                    }
                 }
             }};
         }
         macro_rules! open_or_path {
             ($path:expr, $short:expr) => {{
                 match fat_open_path(&fs, $path) {
-                    Some((c, s)) => { fs_hits += 1; Some((c, s, 0u8)) }
-                    None => { let r = dir_find(&fs, fs.root_cl, $short); if r.is_some() { fs_miss += 1; } r }
+                    Some((c, s)) => {
+                        fs_hits += 1;
+                        Some((c, s, 0u8))
+                    }
+                    None => {
+                        let r = dir_find(&fs, fs.root_cl, $short);
+                        if r.is_some() {
+                            fs_miss += 1;
+                        }
+                        r
+                    }
                 }
             }};
         }
@@ -247,20 +265,98 @@ pub(crate) unsafe fn storage_probe(
         // (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders + ws2help) — staged into the WIN32BUF
         // (its own 8 MiB region), sizes reported at STORAGE_SHARED +0x4c..+0x70.
         for (leaf, short, off, shoff, cap) in [
-            (b"kernel32.dll".as_slice(), b"KERNEL32DLL", KERNEL32_WIN32BUF_OFFSET, 0x4cu64, USER32_WIN32BUF_OFFSET),
-            (b"user32.dll".as_slice(), b"USER32  DLL", USER32_WIN32BUF_OFFSET, 0x50, GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET),
-            (b"gdi32.dll".as_slice(), b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, RPCRT4_WIN32BUF_OFFSET - GDI32_WIN32BUF_OFFSET),
-            (b"rpcrt4.dll".as_slice(), b"RPCRT4  DLL", RPCRT4_WIN32BUF_OFFSET, 0x58, MSVCRT_WIN32BUF_OFFSET - RPCRT4_WIN32BUF_OFFSET),
-            (b"msvcrt.dll".as_slice(), b"MSVCRT  DLL", MSVCRT_WIN32BUF_OFFSET, 0x5c, ADVAPI32_WIN32BUF_OFFSET - MSVCRT_WIN32BUF_OFFSET),
-            (b"advapi32.dll".as_slice(), b"ADVAPI32DLL", ADVAPI32_WIN32BUF_OFFSET, 0x60, WS2_32_WIN32BUF_OFFSET - ADVAPI32_WIN32BUF_OFFSET),
-            (b"ws2_32.dll".as_slice(), b"WS2_32  DLL", WS2_32_WIN32BUF_OFFSET, 0x64, KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET),
-            (b"kernel32_vista.dll".as_slice(), b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
-            (b"advapi32_vista.dll".as_slice(), b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
-            (b"ws2help.dll".as_slice(), b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET),
-            (b"ntdll_vista.dll".as_slice(), b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, USERENV_WIN32BUF_OFFSET - NTDLL_VISTA_WIN32BUF_OFFSET),
+            (
+                b"kernel32.dll".as_slice(),
+                b"KERNEL32DLL",
+                KERNEL32_WIN32BUF_OFFSET,
+                0x4cu64,
+                USER32_WIN32BUF_OFFSET,
+            ),
+            (
+                b"user32.dll".as_slice(),
+                b"USER32  DLL",
+                USER32_WIN32BUF_OFFSET,
+                0x50,
+                GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET,
+            ),
+            (
+                b"gdi32.dll".as_slice(),
+                b"GDI32   DLL",
+                GDI32_WIN32BUF_OFFSET,
+                0x54,
+                RPCRT4_WIN32BUF_OFFSET - GDI32_WIN32BUF_OFFSET,
+            ),
+            (
+                b"rpcrt4.dll".as_slice(),
+                b"RPCRT4  DLL",
+                RPCRT4_WIN32BUF_OFFSET,
+                0x58,
+                MSVCRT_WIN32BUF_OFFSET - RPCRT4_WIN32BUF_OFFSET,
+            ),
+            (
+                b"msvcrt.dll".as_slice(),
+                b"MSVCRT  DLL",
+                MSVCRT_WIN32BUF_OFFSET,
+                0x5c,
+                ADVAPI32_WIN32BUF_OFFSET - MSVCRT_WIN32BUF_OFFSET,
+            ),
+            (
+                b"advapi32.dll".as_slice(),
+                b"ADVAPI32DLL",
+                ADVAPI32_WIN32BUF_OFFSET,
+                0x60,
+                WS2_32_WIN32BUF_OFFSET - ADVAPI32_WIN32BUF_OFFSET,
+            ),
+            (
+                b"ws2_32.dll".as_slice(),
+                b"WS2_32  DLL",
+                WS2_32_WIN32BUF_OFFSET,
+                0x64,
+                KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET,
+            ),
+            (
+                b"kernel32_vista.dll".as_slice(),
+                b"K32VISTADLL",
+                KERNEL32_VISTA_WIN32BUF_OFFSET,
+                0x68,
+                ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET,
+            ),
+            (
+                b"advapi32_vista.dll".as_slice(),
+                b"A32VISTADLL",
+                ADVAPI32_VISTA_WIN32BUF_OFFSET,
+                0x6c,
+                WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET,
+            ),
+            (
+                b"ws2help.dll".as_slice(),
+                b"WS2HELP DLL",
+                WS2HELP_WIN32BUF_OFFSET,
+                0x70,
+                NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET,
+            ),
+            (
+                b"ntdll_vista.dll".as_slice(),
+                b"NTDLLVISDLL",
+                NTDLL_VISTA_WIN32BUF_OFFSET,
+                0x78,
+                USERENV_WIN32BUF_OFFSET - NTDLL_VISTA_WIN32BUF_OFFSET,
+            ),
             // winlogon.exe's two extra static imports (the rest of its stack is shared with csrss).
-            (b"userenv.dll".as_slice(), b"USERENV DLL", USERENV_WIN32BUF_OFFSET, 0x98, MPR_WIN32BUF_OFFSET - USERENV_WIN32BUF_OFFSET),
-            (b"mpr.dll".as_slice(), b"MPR     DLL", MPR_WIN32BUF_OFFSET, 0x9c, WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET),
+            (
+                b"userenv.dll".as_slice(),
+                b"USERENV DLL",
+                USERENV_WIN32BUF_OFFSET,
+                0x98,
+                MPR_WIN32BUF_OFFSET - USERENV_WIN32BUF_OFFSET,
+            ),
+            (
+                b"mpr.dll".as_slice(),
+                b"MPR     DLL",
+                MPR_WIN32BUF_OFFSET,
+                0x9c,
+                WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET,
+            ),
         ] {
             if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
                 if sz > 0 && (sz as u64) <= cap {
@@ -268,8 +364,12 @@ pub(crate) unsafe fn storage_probe(
                     if got == sz {
                         core::ptr::write_volatile((STORAGE_SHARED_VADDR + shoff) as *mut u32, sz);
                         print_str(b"[storage-host] ");
-                        for &ch in leaf { debug_put_char(ch); }
-                        print_str(b" size="); print_u64(sz as u64); print_str(b"\n");
+                        for &ch in leaf {
+                            debug_put_char(ch);
+                        }
+                        print_str(b" size=");
+                        print_u64(sz as u64);
+                        print_str(b"\n");
                     }
                 }
             }
@@ -287,8 +387,18 @@ pub(crate) unsafe fn storage_probe(
         // set ONLY on a genuine path resolution), falling back to the flat ::NTDLL.DLL. Bytes are
         // identical, so the loaded ntdll is unchanged.
         let ntdll_ent = match open_sys32(&fs, b"ntdll.dll") {
-            Some((c, s)) => { fs_hits += 1; verdict |= 0x100; Some((c, s, 0u8)) }
-            None => { let r = dir_find(&fs, fs.root_cl, b"NTDLL   DLL"); if r.is_some() { fs_miss += 1; } r }
+            Some((c, s)) => {
+                fs_hits += 1;
+                verdict |= 0x100;
+                Some((c, s, 0u8))
+            }
+            None => {
+                let r = dir_find(&fs, fs.root_cl, b"NTDLL   DLL");
+                if r.is_some() {
+                    fs_miss += 1;
+                }
+                r
+            }
         };
         if let Some((nc, nsz, _)) = ntdll_ent {
             let cap = (NTDLLBUF_FRAMES * 0x1000) as u32;
@@ -306,16 +416,36 @@ pub(crate) unsafe fn storage_probe(
         }
         // NLS code-page tables — c_1252 (ANSI), c_437 (OEM), l_intl (Unicode case).
         for (leaf, short, dest, frames, out) in [
-            (b"c_1252.nls".as_slice(), b"C_1252  NLS", nls_ansi_dest, NLS_ANSI_FRAMES, &mut nls_ansi_size),
-            (b"c_437.nls".as_slice(), b"C_437   NLS", nls_oem_dest, NLS_OEM_FRAMES, &mut nls_oem_size),
-            (b"l_intl.nls".as_slice(), b"L_INTL  NLS", nls_case_dest, NLS_CASE_FRAMES, &mut nls_case_size),
+            (
+                b"c_1252.nls".as_slice(),
+                b"C_1252  NLS",
+                nls_ansi_dest,
+                NLS_ANSI_FRAMES,
+                &mut nls_ansi_size,
+            ),
+            (
+                b"c_437.nls".as_slice(),
+                b"C_437   NLS",
+                nls_oem_dest,
+                NLS_OEM_FRAMES,
+                &mut nls_oem_size,
+            ),
+            (
+                b"l_intl.nls".as_slice(),
+                b"L_INTL  NLS",
+                nls_case_dest,
+                NLS_CASE_FRAMES,
+                &mut nls_case_size,
+            ),
         ] {
             if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
                 let cap = (frames * 0x1000) as u32;
                 let want = if sz < cap { sz } else { cap };
                 let got = fat_read_file(&fs, c, want, dest);
                 print_str(b"[storage-host] NLS ");
-                for &ch in leaf { debug_put_char(ch); }
+                for &ch in leaf {
+                    debug_put_char(ch);
+                }
                 print_str(b" size=");
                 print_u64(sz as u64);
                 print_str(b" read=");
@@ -361,11 +491,41 @@ pub(crate) unsafe fn storage_probe(
         // dxg.sys + dxgthk.sys (DirectX kernel driver + thunk table) into their own buffers; sizes
         // reported at STORAGE_SHARED+0x80 / +0x84 so the executive can host them into win32k.
         for (path, short, dest, cap_frames, off) in [
-            (b"reactos\\system32\\drivers\\dxg.sys".as_slice(), b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
-            (b"reactos\\system32\\drivers\\dxgthk.sys".as_slice(), b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
-            (b"reactos\\system32\\ftfd.dll".as_slice(), b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
-            (b"reactos\\system32\\framebuf.dll".as_slice(), b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
-            (b"reactos\\Fonts\\arial.ttf".as_slice(), b"ARIAL   TTF", win32k_subsystem::FONTBUF_VADDR, win32k_subsystem::FONTBUF_FRAMES, 0x90u64),
+            (
+                b"reactos\\system32\\drivers\\dxg.sys".as_slice(),
+                b"DXG     SYS",
+                DXGBUF_VADDR,
+                DXGBUF_FRAMES,
+                0x80u64,
+            ),
+            (
+                b"reactos\\system32\\drivers\\dxgthk.sys".as_slice(),
+                b"DXGTHK  SYS",
+                DXGTHKBUF_VADDR,
+                DXGTHKBUF_FRAMES,
+                0x84u64,
+            ),
+            (
+                b"reactos\\system32\\ftfd.dll".as_slice(),
+                b"FTFD    DLL",
+                FTFDBUF_VADDR,
+                FTFDBUF_FRAMES,
+                0x88u64,
+            ),
+            (
+                b"reactos\\system32\\framebuf.dll".as_slice(),
+                b"FRAMEBUFDLL",
+                FRAMEBUFBUF_VADDR,
+                FRAMEBUFBUF_FRAMES,
+                0x8Cu64,
+            ),
+            (
+                b"reactos\\Fonts\\arial.ttf".as_slice(),
+                b"ARIAL   TTF",
+                win32k_subsystem::FONTBUF_VADDR,
+                win32k_subsystem::FONTBUF_FRAMES,
+                0x90u64,
+            ),
         ] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;
@@ -401,7 +561,9 @@ pub(crate) unsafe fn storage_probe(
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
         // size at STORAGE_SHARED+0x38 so the executive can nt-hive-regf-parse it for smss.
-        if let Some((c, sz, _)) = open_or_path!(b"reactos\\system32\\config\\system", b"ROSSYS  HIV") {
+        if let Some((c, sz, _)) =
+            open_or_path!(b"reactos\\system32\\config\\system", b"ROSSYS  HIV")
+        {
             let cap = (HIVEBUF_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
             let got = fat_read_file(&fs, c, want, HIVEBUF_VADDR);
@@ -421,12 +583,36 @@ pub(crate) unsafe fn storage_probe(
         // formality); sizes reported at STORAGE_SHARED+0x98 / +0x9C / +0xA8 so the executive can
         // mount them with nt-hive-regf at \Registry\Machine\{SECURITY,SAM,SOFTWARE}.
         for (path, short, dest, cap_frames, off) in [
-            (b"reactos\\system32\\config\\security".as_slice(), b"SECURITY   ", SECHIVEBUF_VADDR, SECHIVEBUF_FRAMES, 0x98u64),
-            (b"reactos\\system32\\config\\sam".as_slice(), b"SAM        ", SAMHIVEBUF_VADDR, SAMHIVEBUF_FRAMES, 0x9Cu64),
-            (b"reactos\\system32\\config\\software".as_slice(), b"SOFTWARE   ", SWHIVEBUF_VADDR, SWHIVEBUF_FRAMES, 0xA8u64),
+            (
+                b"reactos\\system32\\config\\security".as_slice(),
+                b"SECURITY   ",
+                SECHIVEBUF_VADDR,
+                SECHIVEBUF_FRAMES,
+                0x98u64,
+            ),
+            (
+                b"reactos\\system32\\config\\sam".as_slice(),
+                b"SAM        ",
+                SAMHIVEBUF_VADDR,
+                SAMHIVEBUF_FRAMES,
+                0x9Cu64,
+            ),
+            (
+                b"reactos\\system32\\config\\software".as_slice(),
+                b"SOFTWARE   ",
+                SWHIVEBUF_VADDR,
+                SWHIVEBUF_FRAMES,
+                0xA8u64,
+            ),
             // The DEFAULT hive — HKEY_USERS\.DEFAULT's backing store AND the file setup copies to
             // become a new user's ntuser.dat. Size reported at STORAGE_SHARED+0xAC.
-            (b"reactos\\system32\\config\\default".as_slice(), b"DEFAULT    ", DEFHIVEBUF_VADDR, DEFHIVEBUF_FRAMES, 0xACu64),
+            (
+                b"reactos\\system32\\config\\default".as_slice(),
+                b"DEFAULT    ",
+                DEFHIVEBUF_VADDR,
+                DEFHIVEBUF_FRAMES,
+                0xACu64,
+            ),
         ] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;
@@ -460,8 +646,16 @@ pub(crate) unsafe fn storage_probe(
         }
     }
     (
-        verdict, cluster, size, hive_size, smss_size, imports_size, ntdll_size,
-        nls_ansi_size, nls_oem_size, nls_case_size,
+        verdict,
+        cluster,
+        size,
+        hive_size,
+        smss_size,
+        imports_size,
+        ntdll_size,
+        nls_ansi_size,
+        nls_oem_size,
+        nls_case_size,
     )
 }
 
@@ -489,7 +683,12 @@ pub(crate) unsafe fn iopt_map(iopt_cap: u64, io_space_cap: u64, io_address: u64)
 /// Map frame `frame_cap` into device IO space `io_space_cap` at `io_address` with `rights`
 /// (bit0 = write, bit1 = read). Returns the error label (0 = success). The frame cap must
 /// be UNMAPPED — pass a copy if the original is mapped in a VSpace.
-pub(crate) unsafe fn map_io(frame_cap: u64, io_space_cap: u64, rights: u64, io_address: u64) -> u64 {
+pub(crate) unsafe fn map_io(
+    frame_cap: u64,
+    io_space_cap: u64,
+    rights: u64,
+    io_address: u64,
+) -> u64 {
     let ipc = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, io_space_cap); // extraCaps[0] = IOSpace
     let msginfo = (LBL_X86_PAGE_MAP_IO << 12) | (1 << 9) | (1 << 7) | 2;

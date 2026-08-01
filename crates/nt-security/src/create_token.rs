@@ -30,14 +30,14 @@ use alloc::vec::Vec;
 use crate::native_acl::NativeAcl;
 use crate::sid::{Luid, Sid};
 use crate::token::{
-    AccessToken, SecurityImpersonationLevel, TokenGroup, TokenPrivilege, TokenType,
+    AccessToken, SecurityImpersonationLevel, TokenGroup, TokenPrivilege, TokenSource, TokenType,
     SE_ASSIGN_PRIMARY_TOKEN, SE_AUDIT, SE_BACKUP, SE_CHANGE_NOTIFY, SE_CREATE_GLOBAL,
     SE_CREATE_PAGEFILE, SE_CREATE_PERMANENT, SE_CREATE_TOKEN, SE_DEBUG, SE_ENABLE_DELEGATION,
     SE_IMPERSONATE, SE_INCREASE_BASE_PRIORITY, SE_INCREASE_QUOTA, SE_LOAD_DRIVER, SE_LOCK_MEMORY,
     SE_MACHINE_ACCOUNT, SE_MANAGE_VOLUME, SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_ENABLED_BY_DEFAULT,
     SE_PROFILE_SINGLE_PROCESS, SE_REMOTE_SHUTDOWN, SE_RESTORE, SE_SECURITY, SE_SHUTDOWN,
     SE_SYNC_AGENT, SE_SYSTEM_ENVIRONMENT, SE_SYSTEM_PROFILE, SE_SYSTEM_TIME, SE_TAKE_OWNERSHIP,
-    SE_TCB, SE_UNDOCK, TokenSource,
+    SE_TCB, SE_UNDOCK,
 };
 
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -451,7 +451,10 @@ pub fn capture_token(
         requested_privilege_count,
     )?;
     let mut privileges = Vec::new();
-    if privileges.try_reserve_exact(captured_privileges.len()).is_err() {
+    if privileges
+        .try_reserve_exact(captured_privileges.len())
+        .is_err()
+    {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     for (luid, attributes) in captured_privileges {

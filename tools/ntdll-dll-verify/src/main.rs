@@ -89,7 +89,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("==> verifying {path} ({} bytes) with nt-pe-loader::PeFile", bytes.len());
+    println!(
+        "==> verifying {path} ({} bytes) with nt-pe-loader::PeFile",
+        bytes.len()
+    );
 
     let pe = match PeFile::parse(&bytes) {
         Ok(p) => p,
@@ -106,19 +109,33 @@ fn main() -> ExitCode {
         ok &= cond;
     };
 
-    check(h.magic == PE32PLUS_MAGIC, &format!("PE32+ (magic {:#06x})", h.magic));
+    check(
+        h.magic == PE32PLUS_MAGIC,
+        &format!("PE32+ (magic {:#06x})", h.magic),
+    );
     check(
         h.characteristics & IMAGE_FILE_DLL != 0,
-        &format!("IMAGE_FILE_DLL set (characteristics {:#06x})", h.characteristics),
+        &format!(
+            "IMAGE_FILE_DLL set (characteristics {:#06x})",
+            h.characteristics
+        ),
     );
-    println!("       image_base={:#x} size_of_image={:#x} entry_rva={:#x} subsystem={}",
-        pe.image_base(), pe.size_of_image(), pe.entry_point_rva(), pe.subsystem());
+    println!(
+        "       image_base={:#x} size_of_image={:#x} entry_rva={:#x} subsystem={}",
+        pe.image_base(),
+        pe.size_of_image(),
+        pe.entry_point_rva(),
+        pe.subsystem()
+    );
 
     // Sections.
     let secs: Vec<&str> = pe.sections().iter().map(|s| s.name_str()).collect();
     println!("       sections: {}", secs.join(" "));
     check(secs.iter().any(|s| s.starts_with(".text")), ".text present");
-    check(secs.iter().any(|s| s.starts_with(".reloc")), ".reloc section present");
+    check(
+        secs.iter().any(|s| s.starts_with(".reloc")),
+        ".reloc section present",
+    );
 
     // Exports: parse the export directory with our own loader.
     let exports = match pe.exports() {
@@ -128,8 +145,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let names: std::collections::BTreeSet<&str> =
-        exports.iter().map(|e| e.name.as_str()).collect();
+    let names: std::collections::BTreeSet<&str> = exports.iter().map(|e| e.name.as_str()).collect();
     println!("       total exports: {}", exports.len());
 
     // LdrpInitialize present + report its RVA (Step 4.B points the trampoline here).
@@ -148,7 +164,11 @@ fn main() -> ExitCode {
     }
     check(
         missing.is_empty(),
-        &format!("all {} Nt* stubs exported ({} missing)", NT_SYSCALLS.len(), missing.len()),
+        &format!(
+            "all {} Nt* stubs exported ({} missing)",
+            NT_SYSCALLS.len(),
+            missing.len()
+        ),
     );
     if !missing.is_empty() {
         eprintln!("   missing Nt* exports: {missing:?}");
@@ -192,18 +212,24 @@ fn main() -> ExitCode {
     if let (Some(nt), Some(zw)) = (nt_callback_return, zw_callback_return) {
         let image = pe.map(pe.image_base()).expect("map emitted ntdll");
         let nt_stub = &image.bytes[nt.rva as usize..nt.rva as usize + 96];
-        let moves_rcx_to_r10 = nt_stub.starts_with(&[0x4c, 0x8b, 0xd1])
-            || nt_stub.starts_with(&[0x49, 0x89, 0xca]);
+        let moves_rcx_to_r10 =
+            nt_stub.starts_with(&[0x4c, 0x8b, 0xd1]) || nt_stub.starts_with(&[0x49, 0x89, 0xca]);
         let trap_ssn = moves_rcx_to_r10
-            && nt_stub.get(3..8).is_some_and(|bytes| bytes == [0xb8, 22, 0, 0, 0])
-            && nt_stub.get(8..10).is_some_and(|bytes| bytes == [0x0f, 0x05]);
-        let native_ssn = nt_stub.windows(6).any(|window| window == [0x41, 0xba, 22, 0, 0, 0]);
-        check(
-            trap_ssn || native_ssn,
-            "NtCallbackReturn encodes SSN 22",
-        );
+            && nt_stub
+                .get(3..8)
+                .is_some_and(|bytes| bytes == [0xb8, 22, 0, 0, 0])
+            && nt_stub
+                .get(8..10)
+                .is_some_and(|bytes| bytes == [0x0f, 0x05]);
+        let native_ssn = nt_stub
+            .windows(6)
+            .any(|window| window == [0x41, 0xba, 22, 0, 0, 0]);
+        check(trap_ssn || native_ssn, "NtCallbackReturn encodes SSN 22");
         let zw_stub = &image.bytes[zw.rva as usize..zw.rva as usize + 5];
-        check(zw_stub.first() == Some(&0xe9), "ZwCallbackReturn is a tail-jump alias");
+        check(
+            zw_stub.first() == Some(&0xe9),
+            "ZwCallbackReturn is a tail-jump alias",
+        );
     }
 
     // Native seL4 message registers overlap Windows x64 nonvolatile rdi/rsi/r15. Every naked Nt*
@@ -307,7 +333,10 @@ fn main() -> ExitCode {
 
     // Base relocations parse cleanly (the .reloc directory the loader will apply).
     match pe.relocations() {
-        Ok(relocs) => check(!relocs.is_empty(), &format!("base relocations parse ({} fixups)", relocs.len())),
+        Ok(relocs) => check(
+            !relocs.is_empty(),
+            &format!("base relocations parse ({} fixups)", relocs.len()),
+        ),
         Err(e) => check(false, &format!("base relocations parse ({e:?})")),
     }
 
@@ -319,7 +348,10 @@ fn main() -> ExitCode {
     if let Some(smss_missing) = smss_import_coverage(&names) {
         check(
             smss_missing.is_empty(),
-            &format!("smss.exe ntdll import set fully covered ({} missing)", smss_missing.len()),
+            &format!(
+                "smss.exe ntdll import set fully covered ({} missing)",
+                smss_missing.len()
+            ),
         );
         if !smss_missing.is_empty() {
             let mut m = smss_missing;
@@ -356,7 +388,9 @@ fn main() -> ExitCode {
                     eprintln!("   MISSING {dll} ntdll imports (not exported by our DLL): {m:?}");
                 }
             }
-            None => println!("   [SKIP] {dll}.dll not found — skipping its import-coverage cross-check"),
+            None => {
+                println!("   [SKIP] {dll}.dll not found — skipping its import-coverage cross-check")
+            }
         }
     }
 
@@ -380,7 +414,9 @@ fn stack_dll_import_coverage(
         format!("rust-micro/.tmp/reactos/reactos/system32/{dll}.dll"),
         format!(".tmp/reactos/reactos/system32/{dll}.dll"),
     ];
-    let path = candidates.iter().find(|p| std::path::Path::new(p).exists())?;
+    let path = candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())?;
     let bytes = std::fs::read(path).ok()?;
     let pe = PeFile::parse(&bytes).ok()?;
 
@@ -403,7 +439,9 @@ fn stack_dll_import_coverage(
     // resolving the DLL requires us to export X too. A forwarder export's RVA falls inside the export
     // directory range and its target string is `"TARGETDLL.func"`.
     if let Ok(exports) = pe.exports() {
-        let dir = pe.headers().data_directory(nt_pe_loader::DIRECTORY_ENTRY_EXPORT);
+        let dir = pe
+            .headers()
+            .data_directory(nt_pe_loader::DIRECTORY_ENTRY_EXPORT);
         let (lo, hi) = (dir.virtual_address, dir.virtual_address + dir.size);
         for e in &exports {
             if e.rva >= lo && e.rva < hi {
@@ -435,7 +473,9 @@ fn smss_import_coverage(our_exports: &std::collections::BTreeSet<&str>) -> Optio
         "rust-micro/.tmp/reactos/reactos/system32/smss.exe",
         ".tmp/reactos/reactos/system32/smss.exe",
     ];
-    let path = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists())?;
+    let path = CANDIDATES
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())?;
     let bytes = std::fs::read(path).ok()?;
     let pe = PeFile::parse(&bytes).ok()?;
     let imports = pe.imports().ok()?;

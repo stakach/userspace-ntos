@@ -23,7 +23,8 @@ pub unsafe extern "C" fn driver_host_entry() -> ! {
 
     // 1. Parse the CM_RESOURCE_LIST handed at START — exactly the bytes a WDK driver
     //    reads from Parameters.StartDevice.AllocatedResourcesTranslated.
-    let reslist = core::slice::from_raw_parts(RESLIST_VADDR as *const u8, MEMORY_INTERRUPT_LIST_SIZE);
+    let reslist =
+        core::slice::from_raw_parts(RESLIST_VADDR as *const u8, MEMORY_INTERRUPT_LIST_SIZE);
     if let Some((mem, int)) = decode_memory_interrupt_list(reslist) {
         print_str(b"[driver-host] START: parsed CM_RESOURCE_LIST (MMIO + interrupt)\n");
         // Must have a real MMIO window + the expected interrupt vector wired.
@@ -76,7 +77,9 @@ pub unsafe extern "C" fn driver_host_entry() -> ! {
         }
         if res_ok && mmio_ok && (dd & 0x1 != 0) {
             verdict = 1;
-            print_str(b"[driver-host] drove the NIC from isolation: MMIO read + confined DMA (DD)\n");
+            print_str(
+                b"[driver-host] drove the NIC from isolation: MMIO read + confined DMA (DD)\n",
+            );
         }
     }
 

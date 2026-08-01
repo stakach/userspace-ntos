@@ -234,7 +234,10 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
     // GroupCount, then one 16-byte SID_AND_ATTRIBUTES per group, then the SID bodies.
     let count = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
     assert_eq!(count, system.groups.len());
-    assert_eq!(count, 3, "the LocalSystem token has Administrators/AuthUsers/Everyone");
+    assert_eq!(
+        count, 3,
+        "the LocalSystem token has Administrators/AuthUsers/Everyone"
+    );
     let array = 8;
     let mut expected_len = array + count * SID_AND_ATTRIBUTES_LENGTH;
     for group in &system.groups {
@@ -260,7 +263,11 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
     // The Administrators group is the token's OWNER group; the other two are plain enabled groups.
     assert_eq!(system.groups[0].attributes() & 0x8, 0x8, "SE_GROUP_OWNER");
     assert_eq!(system.groups[1].attributes() & 0x8, 0, "not an owner group");
-    assert_eq!(system.groups[1].attributes() & 0x7, 0x7, "mandatory|default|enabled");
+    assert_eq!(
+        system.groups[1].attributes() & 0x7,
+        0x7,
+        "mandatory|default|enabled"
+    );
 
     // The SIZE QUERY: a zero-length buffer must still report the exact length and write nothing.
     let mut none = [0u8; 0];
@@ -276,8 +283,9 @@ fn token_groups_encoding_is_exact_relocatable_and_size_queryable() {
 /// is a wild pointer in the caller.
 #[test]
 fn logon_sid_group_keeps_its_se_group_logon_id_through_capture_and_encode() {
-    use crate::create_token::{group_from_attributes, SE_GROUP_ENABLED, SE_GROUP_LOGON_ID,
-        SE_GROUP_MANDATORY};
+    use crate::create_token::{
+        group_from_attributes, SE_GROUP_ENABLED, SE_GROUP_LOGON_ID, SE_GROUP_MANDATORY,
+    };
     // The logon SID lsasrv mints for an interactive logon: S-1-5-5-X-Y, mandatory+enabled+logon-id.
     let logon_sid = Sid::new(5, &[5, 0, 0x3e7f]);
     let attributes = SE_GROUP_MANDATORY | SE_GROUP_ENABLED | SE_GROUP_LOGON_ID;
@@ -290,7 +298,10 @@ fn logon_sid_group_keeps_its_se_group_logon_id_through_capture_and_encode() {
     let plain = group_from_attributes(Sid::administrators(), SE_GROUP_MANDATORY | SE_GROUP_ENABLED);
     assert!(!plain.logon_id);
     let half = group_from_attributes(Sid::everyone(), 0x4000_0000);
-    assert!(!half.logon_id, "half of SE_GROUP_LOGON_ID is not a logon SID");
+    assert!(
+        !half.logon_id,
+        "half of SE_GROUP_LOGON_ID is not a logon SID"
+    );
 
     // …and the encoder must place it where the scan looks: entry 1's Attributes word.
     let mut token = AccessToken::system();
@@ -304,7 +315,9 @@ fn logon_sid_group_keeps_its_se_group_logon_id_through_capture_and_encode() {
         let entry = 8 + index * SID_AND_ATTRIBUTES_LENGTH;
         let attrs = u32::from_le_bytes(output[entry + 8..entry + 12].try_into().unwrap());
         if attrs & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID {
-            found = Some(u64::from_le_bytes(output[entry..entry + 8].try_into().unwrap()));
+            found = Some(u64::from_le_bytes(
+                output[entry..entry + 8].try_into().unwrap(),
+            ));
         }
     }
     let sid_va = found.expect("the scan winlogon performs must find exactly this group");
@@ -1076,10 +1089,20 @@ fn create_token_captures_the_real_logon_token_layout() {
     assert_eq!(captured.token.owner, Sid::administrators());
     assert_eq!(captured.token.primary_group, Sid::users());
     assert_eq!(
-        captured.token.default_dacl.as_ref().map(|acl| acl.acl_size()),
+        captured
+            .token
+            .default_dacl
+            .as_ref()
+            .map(|acl| acl.acl_size()),
         Some(52)
     );
-    assert_eq!(captured.token.authentication_id, Luid { low: 0x3e9, high: 2 });
+    assert_eq!(
+        captured.token.authentication_id,
+        Luid {
+            low: 0x3e9,
+            high: 2
+        }
+    );
     assert_eq!(captured.expiration_time, -1);
     assert_eq!(&captured.source.name, b"User32  ");
     assert_eq!(captured.source.identifier, Luid::new(0x3ea));
@@ -1095,7 +1118,11 @@ fn create_token_group_and_privilege_counts_bound_the_walk() {
         Err(STATUS_INVALID_PARAMETER)
     );
     // LUID(8) + expiration(8) + source(16) + user entry(16) + user SID(8+16) + GroupCount(4).
-    assert!(client.bytes_read() < 128, "over-read: {}", client.bytes_read());
+    assert!(
+        client.bytes_read() < 128,
+        "over-read: {}",
+        client.bytes_read()
+    );
 
     let (client, args) = logon_token_client(3, MAX_CAPTURED_PRIVILEGES + 1);
     assert_eq!(
@@ -1232,7 +1259,10 @@ fn privilege_luid_names_cover_the_well_known_range_and_nothing_else() {
     }
     assert_eq!(privilege_name_for_luid(Luid::new(2)), Some(SE_CREATE_TOKEN));
     assert_eq!(privilege_name_for_luid(Luid::new(7)), Some(SE_TCB));
-    assert_eq!(privilege_name_for_luid(Luid::new(30)), Some(SE_CREATE_GLOBAL));
+    assert_eq!(
+        privilege_name_for_luid(Luid::new(30)),
+        Some(SE_CREATE_GLOBAL)
+    );
     assert_eq!(privilege_name_for_luid(Luid::new(0)), None);
     assert_eq!(privilege_name_for_luid(Luid::new(1)), None);
     assert_eq!(privilege_name_for_luid(Luid::new(31)), None);
@@ -1347,7 +1377,10 @@ fn token_store_records_expiration_and_source_and_duplicates_inherit_them() {
     let created = store.insert_created(AccessToken::user(MACHINE), 0x1234_5678, source);
     assert_eq!(store.source(created), Some(source));
     assert_eq!(store.expiration_time(created), Some(0x1234_5678));
-    assert_eq!(store.statistics(created).unwrap().expiration_time, 0x1234_5678);
+    assert_eq!(
+        store.statistics(created).unwrap().expiration_time,
+        0x1234_5678
+    );
 
     let duplicate = store
         .duplicate(

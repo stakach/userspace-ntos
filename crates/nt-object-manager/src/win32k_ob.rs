@@ -315,14 +315,18 @@ impl ObHandleTable {
 /// # Safety
 /// `desktop_body` must point to at least [`DESKTOP_BODY_SIZE`] writable bytes.
 pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
-    core::ptr::write_unaligned(desktop_body.add(desktop::P_DESK_INFO) as *mut u64, desktop_info);
+    core::ptr::write_unaligned(
+        desktop_body.add(desktop::P_DESK_INFO) as *mut u64,
+        desktop_info,
+    );
     // InitializeListHead the DESKTOP's list heads (Flink=Blink=&head), as real IntCreateDesktop does.
     // The window-manager/paint path walks these (PtiList, ShellHookWindows); a zeroed (NULL Flink) head
     // null-derefs on the first traversal.
     for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
         let head = desktop_body.add(off) as u64;
         core::ptr::write_unaligned(desktop_body.add(off) as *mut u64, head); // Flink = &head
-        core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head); // Blink = &head
+        core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head);
+        // Blink = &head
     }
 }
 
@@ -376,7 +380,10 @@ mod tests {
             desktop_object_type_addr, process_object_type_addr, window_station_object_type_addr,
         };
         // Matching type resolves.
-        assert!(object_type_matches(ObKind::Desktop, desktop_object_type_addr()));
+        assert!(object_type_matches(
+            ObKind::Desktop,
+            desktop_object_type_addr()
+        ));
         assert!(object_type_matches(
             ObKind::WindowStation,
             window_station_object_type_addr()
@@ -395,9 +402,15 @@ mod tests {
             desktop_object_type_addr()
         ));
         // A desktop referenced as a Process (wrong type) is rejected.
-        assert!(!object_type_matches(ObKind::Desktop, process_object_type_addr()));
+        assert!(!object_type_matches(
+            ObKind::Desktop,
+            process_object_type_addr()
+        ));
         // Unrecognized create-time type stays permissive (no identity to verify).
-        assert!(object_type_matches(ObKind::Other, desktop_object_type_addr()));
+        assert!(object_type_matches(
+            ObKind::Other,
+            desktop_object_type_addr()
+        ));
     }
 
     #[test]
@@ -410,8 +423,14 @@ mod tests {
         // NULL ExpectedType is polymorphic.
         assert!(object_type_matches(ObKind::Event, 0));
         // A different type is rejected (would be STATUS_OBJECT_TYPE_MISMATCH).
-        assert!(!object_type_matches(ObKind::Event, process_object_type_addr()));
-        assert!(!object_type_matches(ObKind::Event, desktop_object_type_addr()));
+        assert!(!object_type_matches(
+            ObKind::Event,
+            process_object_type_addr()
+        ));
+        assert!(!object_type_matches(
+            ObKind::Event,
+            desktop_object_type_addr()
+        ));
     }
 
     #[test]
@@ -553,7 +572,8 @@ mod tests {
         let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
         unsafe {
             init_desktop_body(body.as_mut_ptr(), 0xDEC0_0000);
-            let p = core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
+            let p =
+                core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
             assert_eq!(p, 0xDEC0_0000);
         }
     }
@@ -583,7 +603,10 @@ mod tests {
         let entry = unsafe { thread.as_mut_ptr().add(thread_info::PTI_LINK) } as u64;
         unsafe {
             init_desktop_body(body.as_mut_ptr(), 0x1000);
-            assert!(link_thread_to_desktop(body.as_mut_ptr(), thread.as_mut_ptr()));
+            assert!(link_thread_to_desktop(
+                body.as_mut_ptr(),
+                thread.as_mut_ptr()
+            ));
             assert_eq!(core::ptr::read_unaligned(head as *const u64), entry);
             assert_eq!(core::ptr::read_unaligned((head + 8) as *const u64), entry);
             assert_eq!(core::ptr::read_unaligned(entry as *const u64), head);

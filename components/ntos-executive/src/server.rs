@@ -39,7 +39,10 @@ pub unsafe extern "C" fn server_entry() -> ! {
         // SAFETY: single request in flight; the ring push/pop pairs order the
         // client's write to the request frame before this read.
         let in_buf = unsafe {
-            core::slice::from_raw_parts((REQ_DATA_VADDR + sqe.offset) as *const u8, sqe.len as usize)
+            core::slice::from_raw_parts(
+                (REQ_DATA_VADDR + sqe.offset) as *const u8,
+                sqe.len as usize,
+            )
         };
         let out_buf =
             unsafe { core::slice::from_raw_parts_mut(REP_DATA_VADDR as *mut u8, REP_DATA_LEN) };

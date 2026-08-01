@@ -899,9 +899,9 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
     /// chain. `None` means the thread holds no continuation at all, which is exactly the "this is a
     /// fresh root dispatch" case (see the type's doc comment).
     fn top_index_for(&self, client: &ClientThreadIdentity) -> Option<usize> {
-        (0..self.len).rev().find(|&index| {
-            self.frames[index].is_some_and(|frame| frame.client == *client)
-        })
+        (0..self.len)
+            .rev()
+            .find(|&index| self.frames[index].is_some_and(|frame| frame.client == *client))
     }
 
     /// The innermost continuation of one client thread's chain.
@@ -1247,7 +1247,10 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
     /// thread, and match the correlation exactly. Together those two conditions are strictly
     /// stronger than the old "must be the array's top", and they are what make an interleaved array
     /// safe: a stale or cross-thread correlation resolves to nothing.
-    fn correlated_index(&self, correlation: &CallbackCorrelation) -> Result<usize, ValidationError> {
+    fn correlated_index(
+        &self,
+        correlation: &CallbackCorrelation,
+    ) -> Result<usize, ValidationError> {
         let client = ClientThreadIdentity::new(
             correlation.client_pi,
             correlation.client_tid,
@@ -1961,10 +1964,7 @@ mod tests {
         assert!(sequence.is_complete());
         assert_eq!(sequence.paint_dispatches(), 1);
         assert_eq!(sequence.expected_ssn(), Some(NTUSER_PEEK_MESSAGE_SSN));
-        assert_eq!(
-            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None),
-            Ok(())
-        );
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
         assert!(sequence.is_drained());
         assert_eq!(sequence.expected_ssn(), None);
     }
@@ -2640,10 +2640,7 @@ mod tests {
         assert_eq!(stack.len_for(&a), 2);
         assert_eq!(stack.len_for(&b), 1);
         // A's callback is STILL RUNNING — B's dispatch must not have suspended it.
-        assert_eq!(
-            stack.top_for(&a).unwrap().state,
-            ContinuationState::Running
-        );
+        assert_eq!(stack.top_for(&a).unwrap().state, ContinuationState::Running);
         // A nested syscall from A, on top of A's own callback, still nests correctly.
         stack.push_dispatch(a, 11).unwrap();
         assert_eq!(
@@ -2651,10 +2648,7 @@ mod tests {
             ContinuationKind::Win32kDispatch
         );
         assert_eq!(stack.complete_dispatch(a, 11), Ok(()));
-        assert_eq!(
-            stack.top_for(&a).unwrap().state,
-            ContinuationState::Running
-        );
+        assert_eq!(stack.top_for(&a).unwrap().state, ContinuationState::Running);
         // B raises a callback of its own, returns it, and completes — OUT of global LIFO order.
         stack.push_callback(b_callback).unwrap();
         assert_eq!(stack.return_callback(b_callback), Ok(()));
@@ -2717,7 +2711,10 @@ mod tests {
         assert_eq!(stack.len(), 1);
         // B's frame survived the middle-removal with its own context intact.
         let identity_b = ClientThreadIdentity::new(2, 21, 13);
-        assert_eq!(stack.top_for(&identity_b).unwrap().dispatch_context().ssn, 0x1076);
+        assert_eq!(
+            stack.top_for(&identity_b).unwrap().dispatch_context().ssn,
+            0x1076
+        );
         let popped_b = stack.pop(cb).unwrap();
         assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
         assert!(stack.is_empty());
@@ -2767,9 +2764,13 @@ mod tests {
     #[test]
     fn active_callback_stack_restores_nested_user_contexts_lifo() {
         let mut outer = CallbackHeader::idle(7, 2, 44, 4);
-        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        outer
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let mut inner = CallbackHeader::idle(8, 2, 44, 4);
-        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        inner
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let outer_correlation = CallbackCorrelation::from_request(&outer);
         let inner_correlation = CallbackCorrelation::from_request(&inner);
         let mut stack = ActiveCallbackStack::<2>::new();
@@ -2818,9 +2819,13 @@ mod tests {
     #[test]
     fn active_callback_stack_frame_index_sees_every_level() {
         let mut outer = CallbackHeader::idle(7, 2, 44, 4); // client_pi 2
-        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        outer
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let mut inner = CallbackHeader::idle(8, 3, 55, 5); // a DIFFERENT client_pi
-        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        inner
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let mut stack = ActiveCallbackStack::<2>::new();
 
         assert!(stack.frame(0).is_none());
@@ -2863,12 +2868,13 @@ mod tests {
             stack.record_redirect(stale, [0; 20], 0x1000),
             Err(ValidationError::Correlation)
         );
-        stack
-            .record_redirect(correlation, [0; 20], 0x1000)
-            .unwrap();
+        stack.record_redirect(correlation, [0; 20], 0x1000).unwrap();
         assert_eq!(stack.pop(stale), Err(ValidationError::Correlation));
         assert_eq!(stack.len(), 1);
-        assert_eq!(stack.top().unwrap().callback_window(), Some(&callback_window));
+        assert_eq!(
+            stack.top().unwrap().callback_window(),
+            Some(&callback_window)
+        );
     }
 
     #[test]
@@ -2893,9 +2899,13 @@ mod tests {
     #[test]
     fn active_callback_abort_discards_window_state_lifo() {
         let mut outer = CallbackHeader::idle(7, 2, 44, 4);
-        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        outer
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let mut inner = CallbackHeader::idle(8, 2, 44, 4);
-        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        inner
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
         let outer_correlation = CallbackCorrelation::from_request(&outer);
         let inner_correlation = CallbackCorrelation::from_request(&inner);
         let outer_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);

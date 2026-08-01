@@ -1063,8 +1063,17 @@ mod tests {
         assert_eq!(span("\\\\.\\CON"), Some(0x0008_0006));
         assert_eq!(span("\\??\\CON"), Some(0x0008_0006));
         for path in [
-            "", "COM0", "COM10", "CONSOLE", "README", "c:\\nul\\", "c:\\nul\\foo",
-            "\\\\server\\share\\NUL", "\\\\.\\NUL", "\\\\?\\CON", "//./CON",
+            "",
+            "COM0",
+            "COM10",
+            "CONSOLE",
+            "README",
+            "c:\\nul\\",
+            "c:\\nul\\foo",
+            "\\\\server\\share\\NUL",
+            "\\\\.\\NUL",
+            "\\\\?\\CON",
+            "//./CON",
         ] {
             assert_eq!(span(path), None, "{path}");
         }
@@ -1078,11 +1087,7 @@ mod tests {
                 .map(DosDeviceNameSpan::packed),
             Some(0x0000_0008)
         );
-        assert!(!is_dos_device_name(&[
-            0x014e,
-            b'U' as u16,
-            b'L' as u16
-        ]));
+        assert!(!is_dos_device_name(&[0x014e, b'U' as u16, b'L' as u16]));
     }
 
     #[test]

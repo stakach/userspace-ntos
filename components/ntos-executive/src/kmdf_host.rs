@@ -100,7 +100,11 @@ fn alloc_bytes(size: usize) -> u64 {
 
 // The CFG indirect-call trampoline: the driver does `call [__guard_dispatch_icall_fptr]`
 // with the real target in rax; this just transfers to it.
-global_asm!(".globl cfg_dispatch_jmp_rax", "cfg_dispatch_jmp_rax:", "jmp rax");
+global_asm!(
+    ".globl cfg_dispatch_jmp_rax",
+    "cfg_dispatch_jmp_rax:",
+    "jmp rax"
+);
 extern "win64" {
     fn cfg_dispatch_jmp_rax();
 }
@@ -176,8 +180,10 @@ extern "win64" fn ntos_wdf_version_bind(
 ) -> i32 {
     // SAFETY: `bind_info` is the driver's WDF_BIND_INFO; `globals_out` its globals slot.
     unsafe {
-        let major = core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MAJOR) as *const u32);
-        let minor = core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MINOR) as *const u32);
+        let major =
+            core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MAJOR) as *const u32);
+        let minor =
+            core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MINOR) as *const u32);
         if major != wt::WDF_KMDF_VERSION_MAJOR || minor != wt::WDF_KMDF_VERSION_MINOR {
             return STATUS_UNSUCCESSFUL;
         }
@@ -216,8 +222,9 @@ extern "win64" fn wdf_driver_create(
 ) -> i32 {
     // SAFETY: `config` is the driver's WDF_DRIVER_CONFIG; `driver_out` its WDFDRIVER slot.
     unsafe {
-        let evt_device_add =
-            core::ptr::read_unaligned((config + wt::driver_config::EVT_DRIVER_DEVICE_ADD) as *const u64);
+        let evt_device_add = core::ptr::read_unaligned(
+            (config + wt::driver_config::EVT_DRIVER_DEVICE_ADD) as *const u64,
+        );
         match wdf().create_driver(driver_object, evt_device_add) {
             Ok(d) => {
                 if !driver_out.is_null() {
@@ -277,11 +284,13 @@ extern "win64" fn wdf_device_create(
         let init_id = init_id_of(device_init);
         // Allocate the device context from the attributes' WDF_OBJECT_CONTEXT_TYPE_INFO.
         let (ctx_ptr, ctx_type) = if attributes != 0 {
-            let type_info =
-                core::ptr::read_unaligned((attributes + wt::object_attributes::CONTEXT_TYPE_INFO) as *const u64);
+            let type_info = core::ptr::read_unaligned(
+                (attributes + wt::object_attributes::CONTEXT_TYPE_INFO) as *const u64,
+            );
             if type_info != 0 {
-                let size =
-                    core::ptr::read_unaligned((type_info + wt::context_type_info::CONTEXT_SIZE) as *const u64);
+                let size = core::ptr::read_unaligned(
+                    (type_info + wt::context_type_info::CONTEXT_SIZE) as *const u64,
+                );
                 (alloc_bytes(size as usize), type_info)
             } else {
                 (0, 0)
@@ -325,9 +334,11 @@ extern "win64" fn wdf_io_queue_create(
             core::ptr::read_unaligned((config + wt::queue_config::DISPATCH_TYPE) as *const u32);
         let power_raw =
             core::ptr::read_unaligned((config + wt::queue_config::POWER_MANAGED) as *const u32);
-        let default_queue = core::ptr::read_unaligned((config + wt::queue_config::DEFAULT_QUEUE) as *const u8);
-        let evt_io_device_control =
-            core::ptr::read_unaligned((config + wt::queue_config::EVT_IO_DEVICE_CONTROL) as *const u64);
+        let default_queue =
+            core::ptr::read_unaligned((config + wt::queue_config::DEFAULT_QUEUE) as *const u8);
+        let evt_io_device_control = core::ptr::read_unaligned(
+            (config + wt::queue_config::EVT_IO_DEVICE_CONTROL) as *const u64,
+        );
         let dispatch = match dispatch_raw {
             wt::WDF_IO_QUEUE_DISPATCH_PARALLEL => DispatchType::Parallel,
             wt::WDF_IO_QUEUE_DISPATCH_MANUAL => DispatchType::Manual,
@@ -455,23 +466,53 @@ unsafe fn install_function_table() {
     let f = core::ptr::addr_of_mut!(WDF_FUNCTIONS);
     let set = |idx: usize, fp: u64| core::ptr::write_unaligned((*f).as_mut_ptr().add(idx), fp);
     set(wt::IDX_WDF_DRIVER_CREATE, wdf_driver_create as usize as u64);
-    set(wt::IDX_WDF_DEVICE_INIT_SET_IO_TYPE, wdf_device_init_set_io_type as usize as u64);
-    set(wt::IDX_WDF_DEVICE_INIT_SET_DEVICE_TYPE, wdf_device_init_set_device_type as usize as u64);
+    set(
+        wt::IDX_WDF_DEVICE_INIT_SET_IO_TYPE,
+        wdf_device_init_set_io_type as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_DEVICE_INIT_SET_DEVICE_TYPE,
+        wdf_device_init_set_device_type as usize as u64,
+    );
     set(62, wdf_device_init_set_exclusive as usize as u64); // WdfDeviceInitSetExclusive
     set(
         wt::IDX_WDF_DEVICE_INIT_SET_PNP_POWER_EVENT_CALLBACKS,
         wdf_device_init_set_pnp_power_callbacks as usize as u64,
     );
     set(wt::IDX_WDF_DEVICE_CREATE, wdf_device_create as usize as u64);
-    set(wt::IDX_WDF_DEVICE_CREATE_SYMBOLIC_LINK, wdf_device_create_symbolic_link as usize as u64);
-    set(wt::IDX_WDF_IO_QUEUE_CREATE, wdf_io_queue_create as usize as u64);
+    set(
+        wt::IDX_WDF_DEVICE_CREATE_SYMBOLIC_LINK,
+        wdf_device_create_symbolic_link as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_IO_QUEUE_CREATE,
+        wdf_io_queue_create as usize as u64,
+    );
     set(157, wdf_io_queue_get_device as usize as u64); // WdfIoQueueGetDevice
-    set(wt::IDX_WDF_OBJECT_GET_TYPED_CONTEXT_WORKER, wdf_object_get_typed_context as usize as u64);
-    set(wt::IDX_WDF_REQUEST_COMPLETE_WITH_INFORMATION, wdf_request_complete_with_information as usize as u64);
-    set(wt::IDX_WDF_REQUEST_RETRIEVE_INPUT_BUFFER, wdf_request_retrieve_input_buffer as usize as u64);
-    set(wt::IDX_WDF_REQUEST_RETRIEVE_OUTPUT_BUFFER, wdf_request_retrieve_output_buffer as usize as u64);
-    set(wt::IDX_WDF_CM_RESOURCE_LIST_GET_COUNT, wdf_cm_resource_list_get_count as usize as u64);
-    set(wt::IDX_WDF_CM_RESOURCE_LIST_GET_DESCRIPTOR, wdf_cm_resource_list_get_descriptor as usize as u64);
+    set(
+        wt::IDX_WDF_OBJECT_GET_TYPED_CONTEXT_WORKER,
+        wdf_object_get_typed_context as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_REQUEST_COMPLETE_WITH_INFORMATION,
+        wdf_request_complete_with_information as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_REQUEST_RETRIEVE_INPUT_BUFFER,
+        wdf_request_retrieve_input_buffer as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_REQUEST_RETRIEVE_OUTPUT_BUFFER,
+        wdf_request_retrieve_output_buffer as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_CM_RESOURCE_LIST_GET_COUNT,
+        wdf_cm_resource_list_get_count as usize as u64,
+    );
+    set(
+        wt::IDX_WDF_CM_RESOURCE_LIST_GET_DESCRIPTOR,
+        wdf_cm_resource_list_get_descriptor as usize as u64,
+    );
 }
 
 // --- the SHARED ntoskrnl/WDFLDR export surface (registration-driven, the win32k/FSD model) -----
@@ -494,16 +535,28 @@ fn register_kmdf_trampolines() {
     // SAFETY: single-threaded executive; the registry is only touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(KMDF_EXPORTS) };
     // ntoskrnl.exe imports (KMDF-specific glue — NOT shared with the FSD/Subsystem classes)
-    reg.bind("RtlInitUnicodeString", ntos_rtl_init_unicode_string as usize as u64);
-    reg.bind("RtlCopyUnicodeString", ntos_rtl_copy_unicode_string as usize as u64);
+    reg.bind(
+        "RtlInitUnicodeString",
+        ntos_rtl_init_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCopyUnicodeString",
+        ntos_rtl_copy_unicode_string as usize as u64,
+    );
     reg.bind("DbgPrintEx", ntos_dbg_print_ex as usize as u64);
     reg.bind("MmMapIoSpace", ntos_mm_map_io_space as usize as u64);
     reg.bind("MmUnmapIoSpace", ntos_mm_unmap_io_space as usize as u64);
     // WDFLDR.SYS imports (the WDF version-bind protocol — publishes the function table)
     reg.bind("WdfVersionBind", ntos_wdf_version_bind as usize as u64);
     reg.bind("WdfVersionUnbind", ntos_wdf_version_unbind as usize as u64);
-    reg.bind("WdfVersionBindClass", ntos_wdf_version_bind_class as usize as u64);
-    reg.bind("WdfVersionUnbindClass", ntos_wdf_version_unbind_class as usize as u64);
+    reg.bind(
+        "WdfVersionBindClass",
+        ntos_wdf_version_bind_class as usize as u64,
+    );
+    reg.bind(
+        "WdfVersionUnbindClass",
+        ntos_wdf_version_unbind_class as usize as u64,
+    );
 }
 
 /// Resolve an ntoskrnl/WDFLDR import name to a trampoline VA through the SHARED
@@ -564,27 +617,28 @@ unsafe fn run_ioctl(device: u64, ioctl: u32, input: &[u8], out_cap: u64) -> (i32
         output_ptr: if out_cap == 0 { 0 } else { sysbuf },
         output_len: out_cap,
     };
-    let (request, dispatch) = match wdf().present_ioctl(
-        nt_wdf_object::WdfHandle(device),
-        irp,
-        ioctl,
-        buffers,
-    ) {
-        Ok(v) => v,
-        Err(_) => return (STATUS_UNSUCCESSFUL, 0, [0u8; 32]),
-    };
+    let (request, dispatch) =
+        match wdf().present_ioctl(nt_wdf_object::WdfHandle(device), irp, ioctl, buffers) {
+            Ok(v) => v,
+            Err(_) => return (STATUS_UNSUCCESSFUL, 0, [0u8; 32]),
+        };
     let Some(d) = dispatch else {
         return (STATUS_UNSUCCESSFUL, 0, [0u8; 32]);
     };
     // EvtIoDeviceControl(Queue, Request, OutputBufferLength, InputBufferLength, IoControlCode).
-    let f: extern "win64" fn(u64, u64, u64, u64, u32) = core::mem::transmute(d.evt_io_device_control as *const ());
+    let f: extern "win64" fn(u64, u64, u64, u64, u32) =
+        core::mem::transmute(d.evt_io_device_control as *const ());
     f(d.queue.0, request.0, out_cap, input.len() as u64, ioctl);
 
     let mut out = [0u8; 32];
     for (i, o) in out.iter_mut().enumerate().take(out_cap.min(32) as usize) {
         *o = core::ptr::read_volatile((sysbuf + i as u64) as *const u8);
     }
-    (LAST_STATUS.load(Ordering::Relaxed) as i32, LAST_INFO.load(Ordering::Relaxed), out)
+    (
+        LAST_STATUS.load(Ordering::Relaxed) as i32,
+        LAST_INFO.load(Ordering::Relaxed),
+        out,
+    )
 }
 
 // --- executive-side loader --------------------------------------------------
@@ -604,7 +658,10 @@ pub unsafe fn load_into(sys_bytes: &[u8]) -> Option<u32> {
     if let Ok(imports) = pe.imports() {
         for dll in &imports {
             for f in &dll.functions {
-                if let ImportRef::ByName { name, iat_slot_rva, .. } = f {
+                if let ImportRef::ByName {
+                    name, iat_slot_rva, ..
+                } = f
+                {
                     core::ptr::write_unaligned(
                         (KMDF_CODE_VA + *iat_slot_rva as u64) as *mut u64,
                         export_addr(name),

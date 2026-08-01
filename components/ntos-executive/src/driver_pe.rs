@@ -170,13 +170,20 @@ fn export_addr(name: &str) -> u64 {
         "IofCompleteRequest" => s_iof_complete_request as usize as u64,
         "IoConnectInterrupt" => s_io_connect_interrupt as usize as u64,
         // void-returning no-ops:
-        "MmUnmapIoSpace" | "IoDeleteDevice" | "IoDetachDevice" | "IoDisconnectInterrupt"
-        | "KeInitializeDpc" | "KeInitializeEvent" | "KeInitializeSpinLock"
+        "MmUnmapIoSpace"
+        | "IoDeleteDevice"
+        | "IoDetachDevice"
+        | "IoDisconnectInterrupt"
+        | "KeInitializeDpc"
+        | "KeInitializeEvent"
+        | "KeInitializeSpinLock"
         | "KeReleaseSpinLock" => s_void as usize as u64,
         // BOOLEAN / KIRQL (u8):
         "KeInsertQueueDpc" | "KeAcquireSpinLockRaiseToDpc" => s_u8 as usize as u64,
         // NTSTATUS / LONG (i32) → success:
-        "KeSetEvent" | "KeWaitForSingleObject" | "IoCreateSymbolicLink"
+        "KeSetEvent"
+        | "KeWaitForSingleObject"
+        | "IoCreateSymbolicLink"
         | "IoDeleteSymbolicLink" => s_ok as usize as u64,
         _ => s_ok as usize as u64,
     };
@@ -197,7 +204,10 @@ pub unsafe fn load_into(sys_bytes: &[u8]) -> Option<u32> {
     if let Ok(imports) = pe.imports() {
         for dll in &imports {
             for f in &dll.functions {
-                if let ImportRef::ByName { name, iat_slot_rva, .. } = f {
+                if let ImportRef::ByName {
+                    name, iat_slot_rva, ..
+                } = f
+                {
                     core::ptr::write_unaligned(
                         (CODE_VA + *iat_slot_rva as u64) as *mut u64,
                         export_addr(name),

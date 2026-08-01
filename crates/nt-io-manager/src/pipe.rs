@@ -226,8 +226,8 @@ impl PipeConnection {
     /// The queue a given end READS from.
     fn read_queue_idx(end: PipeEnd) -> usize {
         match end {
-            PipeEnd::Server => FILE_PIPE_INBOUND,   // server reads client→server
-            PipeEnd::Client => FILE_PIPE_OUTBOUND,  // client reads server→client
+            PipeEnd::Server => FILE_PIPE_INBOUND, // server reads client→server
+            PipeEnd::Client => FILE_PIPE_OUTBOUND, // client reads server→client
         }
     }
 
@@ -490,10 +490,7 @@ impl PipeRegistry {
     /// connection is removed; otherwise it transitions to `Closing` (the peer may
     /// still drain queued bytes) then `Disconnected`.
     pub fn disconnect(&mut self, h: PipeHandle) -> Result<(), NtStatus> {
-        let fcb = self
-            .pipes
-            .get_mut(h.fcb)
-            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let fcb = self.pipes.get_mut(h.fcb).ok_or(NtStatus::INVALID_HANDLE)?;
         let conn = fcb
             .connections
             .get_mut(h.conn)
@@ -765,9 +762,9 @@ impl<const N: usize> PipeWaiterTable<N> {
     /// supports: `pipe_write_redrive` completes a parked waiter from a per-DIRECTION stash
     /// (`take_completed_write` vs `take_completed_read`), so the two never collide.
     pub fn parked_on_dir(&self, file_id: u64, is_write: bool) -> bool {
-        self.slots.iter().any(|s| {
-            s.is_some_and(|w| w.file_id == file_id && w.is_write == is_write)
-        })
+        self.slots
+            .iter()
+            .any(|s| s.is_some_and(|w| w.file_id == file_id && w.is_write == is_write))
     }
 }
 
@@ -816,7 +813,11 @@ pub struct AsyncListen {
 pub fn pipe_name_hash(name16: &[u16]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &w in name16 {
-        let c = if (b'A' as u16..=b'Z' as u16).contains(&w) { w + 32 } else { w };
+        let c = if (b'A' as u16..=b'Z' as u16).contains(&w) {
+            w + 32
+        } else {
+            w
+        };
         h ^= c as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -927,7 +928,11 @@ impl<const N: usize> AsyncListenTable<N> {
 
     /// The `server_file_id` recorded in `slot`, if any (peek without removing).
     pub fn get_slot_id(&self, slot: usize) -> Option<u64> {
-        self.slots.get(slot).copied().flatten().map(|l| l.server_file_id)
+        self.slots
+            .get(slot)
+            .copied()
+            .flatten()
+            .map(|l| l.server_file_id)
     }
 
     /// Complete + free the FIRST pending listen matching `name_hash` (a client connected to that
@@ -1164,14 +1169,24 @@ mod tests {
         r.listen(s).unwrap();
         let c = r.connect_client("ntsvcs").unwrap();
         // A 72-byte "bind PDU": a recognizable header then filler.
-        let mut bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00,
-                                 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        let mut bind: Vec<u8> = [
+            0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00,
+        ]
+        .to_vec();
         bind.extend((16u8..72).map(|i| i));
         assert_eq!(r.pipe_write(c, &bind).unwrap(), 72);
         // Server reads only the 16-byte common header → the FIRST 16 real bytes + truncation flag.
         let (hdr, more) = r.pipe_read(s, 16).unwrap();
-        assert_eq!(&hdr, &bind[..16], "partial read must return the real header bytes, not garbage");
-        assert!(more, "a 16-of-72 message read must flag BUFFER_OVERFLOW (more)");
+        assert_eq!(
+            &hdr,
+            &bind[..16],
+            "partial read must return the real header bytes, not garbage"
+        );
+        assert!(
+            more,
+            "a 16-of-72 message read must flag BUFFER_OVERFLOW (more)"
+        );
         // The remaining 56 bytes of the SAME message are still queued and read next.
         let (rest, more2) = r.pipe_read(s, 256).unwrap();
         assert_eq!(&rest, &bind[16..]);
@@ -1189,21 +1204,36 @@ mod tests {
         // IRP's ORIGINAL buffer instead of the buffer npfs REASSIGNED into AssociatedIrp.SystemBuffer on
         // completion, so the reader got 16 zero bytes; this model asserts the byte-exact reconcile.)
         let mut r = dx();
-        let params = PipeParams { pipe_type: FILE_PIPE_MESSAGE_TYPE, ..PipeParams::default() };
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
         let s = r.create_server_pipe("ntsvcs", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("ntsvcs").unwrap();
         // Server reads FIRST (queue empty) — models the read that goes STATUS_PENDING and parks.
         let (empty, more0) = r.pipe_read(s, 16).unwrap();
-        assert!(empty.is_empty(), "a read of an empty queue must return NO bytes (not stale garbage)");
+        assert!(
+            empty.is_empty(),
+            "a read of an empty queue must return NO bytes (not stale garbage)"
+        );
         assert!(!more0);
         // Peer write arrives; the re-driven read must now return the REAL queued header bytes.
-        let bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00,
-                             0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        let bind: Vec<u8> = [
+            0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00,
+        ]
+        .to_vec();
         assert_eq!(r.pipe_write(c, &bind).unwrap(), 16);
         let (hdr, more) = r.pipe_read(s, 16).unwrap();
-        assert_eq!(&hdr, &bind, "re-driven read must drain the ACTUAL queue bytes, not a stale buffer");
-        assert!(!more, "an exact-size read of a 16-byte message does not overflow");
+        assert_eq!(
+            &hdr, &bind,
+            "re-driven read must drain the ACTUAL queue bytes, not a stale buffer"
+        );
+        assert!(
+            !more,
+            "an exact-size read of a 16-byte message does not overflow"
+        );
     }
 
     #[test]
@@ -1212,19 +1242,29 @@ mod tests {
         // write, a 16-byte read (returns the first 16 WITH overflow), then a 56-byte read (drains the
         // rest, no overflow). Asserts the message-mode partial-read semantics the reconcile relies on.
         let mut r = dx();
-        let params = PipeParams { pipe_type: FILE_PIPE_MESSAGE_TYPE, ..PipeParams::default() };
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
         let s = r.create_server_pipe("p", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("p").unwrap();
-        let mut bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00,
-                                 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        let mut bind: Vec<u8> = [
+            0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00,
+        ]
+        .to_vec();
         bind.extend(16u8..72);
         assert_eq!(r.pipe_write(c, &bind).unwrap(), 72);
         let (h, more1) = r.pipe_read(s, 16).unwrap();
         assert_eq!(&h, &bind[..16]);
         assert!(more1, "16-of-72 must flag BUFFER_OVERFLOW (more)");
         let (rest, more2) = r.pipe_read(s, 56).unwrap();
-        assert_eq!(&rest, &bind[16..], "the remaining 56 bytes of the SAME message");
+        assert_eq!(
+            &rest,
+            &bind[16..],
+            "the remaining 56 bytes of the SAME message"
+        );
         assert!(!more2, "the message is now fully drained");
         assert_eq!(r.readable_bytes(s).unwrap(), 0);
     }
@@ -1416,10 +1456,7 @@ mod tests {
         let mut r = dx();
         let s = r.create_server_pipe("p", PipeParams::default()).unwrap();
         // Not connected yet.
-        assert_eq!(
-            r.pipe_write(s, b"x").unwrap_err(),
-            STATUS_PIPE_DISCONNECTED
-        );
+        assert_eq!(r.pipe_write(s, b"x").unwrap_err(), STATUS_PIPE_DISCONNECTED);
     }
 
     #[test]
@@ -1504,7 +1541,11 @@ mod tests {
         t.arm(al(0xE802D50, 42)).unwrap();
         let done = t.complete(0xE802D50).expect("armed listen completes");
         assert_eq!(done.event_obj_idx, 42, "carries the event index to SIGNAL");
-        assert_eq!(done.iosb_va, 0x9000 + 0xE802D50, "carries the listen IOSB to fill");
+        assert_eq!(
+            done.iosb_va,
+            0x9000 + 0xE802D50,
+            "carries the listen IOSB to fill"
+        );
         // Consumed exactly once — no double-signal.
         assert!(t.complete(0xE802D50).is_none());
         assert!(t.is_empty());
@@ -1594,14 +1635,20 @@ mod tests {
         let mut t = AsyncListenTable::<8>::new();
         t.arm(al(0xA, 1)).unwrap(); // al() leaves name_hash == 0
         let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
-        assert_eq!(done.event_obj_idx, 1, "an unset stored name_hash matches any connect");
+        assert_eq!(
+            done.event_obj_idx, 1,
+            "an unset stored name_hash matches any connect"
+        );
         assert!(t.is_empty());
         // Query unset (hash 0) → matches the FIRST armed listen regardless of its stored name.
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
         let mut t2 = AsyncListenTable::<8>::new();
         t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
         let done2 = t2.complete_by_name(0).unwrap();
-        assert_eq!(done2.event_obj_idx, 2, "a hash-0 query matches the first armed listen");
+        assert_eq!(
+            done2.event_obj_idx, 2,
+            "a hash-0 query matches the first armed listen"
+        );
         assert!(t2.is_empty());
     }
 
@@ -1706,7 +1753,10 @@ mod tests {
         let c = r.connect_client("hdo").unwrap();
         // OUTBOUND: server→client allowed, client→server write rejected.
         assert_eq!(r.pipe_write(s, b"ok").unwrap(), 2);
-        assert_eq!(r.pipe_write(c, b"no").unwrap_err(), NtStatus::INVALID_PARAMETER);
+        assert_eq!(
+            r.pipe_write(c, b"no").unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
         // Server READ is the wrong direction on an OUTBOUND pipe → rejected.
         assert_eq!(r.pipe_read(s, 8).unwrap_err(), NtStatus::INVALID_PARAMETER);
         // Client read of the server's write is allowed.
@@ -1734,12 +1784,19 @@ mod tests {
         // enqueue on a queue with NO room returns 0 (the room==0 early-out) — a second write once the
         // quota is exhausted is accepted-what-fits = nothing, not a panic or overwrite.
         let mut r = dx();
-        let p = PipeParams { outbound_quota: 4, ..PipeParams::default() };
+        let p = PipeParams {
+            outbound_quota: 4,
+            ..PipeParams::default()
+        };
         let s = r.create_server_pipe("full", p).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("full").unwrap();
         assert_eq!(r.pipe_write(s, b"ABCD").unwrap(), 4); // fills the quota exactly
-        assert_eq!(r.pipe_write(s, b"EF").unwrap(), 0, "no room left → 0 accepted");
+        assert_eq!(
+            r.pipe_write(s, b"EF").unwrap(),
+            0,
+            "no room left → 0 accepted"
+        );
         // The queued bytes are intact and untouched by the rejected write.
         assert_eq!(r.pipe_read(c, 64).unwrap().0, b"ABCD");
     }
@@ -1749,11 +1806,17 @@ mod tests {
         // transceive is write-then-read; a direction-illegal write must surface as the error (and NOT
         // then attempt the read). On an INBOUND pipe a server transceive write is rejected.
         let mut r = dx();
-        let p = PipeParams { configuration: FILE_PIPE_INBOUND as u32, ..PipeParams::default() };
+        let p = PipeParams {
+            configuration: FILE_PIPE_INBOUND as u32,
+            ..PipeParams::default()
+        };
         let s = r.create_server_pipe("inb", p).unwrap();
         r.listen(s).unwrap();
         let _c = r.connect_client("inb").unwrap();
-        assert_eq!(r.transceive(s, b"x", 16).unwrap_err(), NtStatus::INVALID_PARAMETER);
+        assert_eq!(
+            r.transceive(s, b"x", 16).unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
     }
 
     #[test]
@@ -1761,7 +1824,10 @@ mod tests {
         // transceive before a client connects → the underlying write hits the not-Connected guard.
         let mut r = dx();
         let s = r.create_server_pipe("d", PipeParams::default()).unwrap();
-        assert_eq!(r.transceive(s, b"x", 16).unwrap_err(), STATUS_PIPE_DISCONNECTED);
+        assert_eq!(
+            r.transceive(s, b"x", 16).unwrap_err(),
+            STATUS_PIPE_DISCONNECTED
+        );
     }
 
     #[test]

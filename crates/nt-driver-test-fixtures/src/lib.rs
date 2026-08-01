@@ -200,7 +200,7 @@ pub fn irp_fsd_pe() -> Vec<u8> {
     // lea rax, [rip + disp32]   (48 8D 05 <disp32>) — patch disp32 after we know handler offset.
     de.extend_from_slice(&[0x48, 0x8D, 0x05, 0, 0, 0, 0]);
     let lea_end = de.len(); // disp is relative to here
-    // mov [rcx + mj(i)], rax   (48 89 81 <disp32>) for CREATE/READ/WRITE/DEVICE_CONTROL.
+                            // mov [rcx + mj(i)], rax   (48 89 81 <disp32>) for CREATE/READ/WRITE/DEVICE_CONTROL.
     for &i in &[0u32, 3, 4, 0xe] {
         de.extend_from_slice(&[0x48, 0x89, 0x81]);
         de.extend_from_slice(&mj(i).to_le_bytes());
@@ -296,7 +296,11 @@ mod tests {
     fn minimal_pe_has_well_formed_headers() {
         let b = minimal_pe();
         assert_eq!(rd_u16(&b, 0), 0x5A4D, "MZ magic");
-        assert_eq!(rd_u32(&b, 0x3C) as usize, NT_OFF, "e_lfanew points at PE header");
+        assert_eq!(
+            rd_u32(&b, 0x3C) as usize,
+            NT_OFF,
+            "e_lfanew points at PE header"
+        );
         assert_eq!(rd_u32(&b, NT_OFF), 0x0000_4550, "PE\\0\\0 signature");
         assert_eq!(rd_u16(&b, NT_OFF + 4), 0x8664, "machine = AMD64");
         assert_eq!(rd_u16(&b, OPT_OFF), 0x020b, "PE32+ optional-header magic");
@@ -335,7 +339,10 @@ mod tests {
         let byname_rva = rd_u64(&b, iat0) as u32;
         let byname_off = to_off(byname_rva).unwrap();
         let fn_end = b[byname_off + 2..].iter().position(|&c| c == 0).unwrap();
-        assert_eq!(&b[byname_off + 2..byname_off + 2 + fn_end], b"IoCreateDevice");
+        assert_eq!(
+            &b[byname_off + 2..byname_off + 2 + fn_end],
+            b"IoCreateDevice"
+        );
         // The thunk array is NULL-terminated (2 imports → slot 2 is zero).
         assert_eq!(rd_u64(&b, iat0 + 2 * 8), 0, "IAT null terminator");
     }
@@ -346,11 +353,19 @@ mod tests {
         // Valid PE32+ with entry at 0x1000.
         assert_eq!(rd_u16(&b, 0), 0x5A4D);
         assert_eq!(rd_u16(&b, OPT_OFF), 0x020b);
-        assert_eq!(rd_u32(&b, OPT_OFF + 16), 0x1000, "DriverEntry at RVA 0x1000");
+        assert_eq!(
+            rd_u32(&b, OPT_OFF + 16),
+            0x1000,
+            "DriverEntry at RVA 0x1000"
+        );
         let to_off = rva_to_off(&b);
         let entry = to_off(0x1000).unwrap();
         // DriverEntry prologue: `lea rax, [rip+disp32]` (48 8D 05 ..).
-        assert_eq!(&b[entry..entry + 3], &[0x48, 0x8D, 0x05], "lea rax,[rip+disp]");
+        assert_eq!(
+            &b[entry..entry + 3],
+            &[0x48, 0x8D, 0x05],
+            "lea rax,[rip+disp]"
+        );
         let disp = rd_u32(&b, entry + 3) as i32;
         let lea_end = entry + 7;
         let handler = (lea_end as i64 + disp as i64) as usize;
@@ -359,16 +374,37 @@ mod tests {
         let mut p = lea_end;
         for &i in &[0u32, 3, 4, 0xe] {
             assert_eq!(&b[p..p + 3], &[0x48, 0x89, 0x81], "mov [rcx+mj],rax");
-            assert_eq!(rd_u32(&b, p + 3), 0x70 + i * 8, "MajorFunction[{}] slot offset", i);
+            assert_eq!(
+                rd_u32(&b, p + 3),
+                0x70 + i * 8,
+                "MajorFunction[{}] slot offset",
+                i
+            );
             p += 7;
         }
         // Then `xor eax,eax; ret` (STATUS_SUCCESS return).
         assert_eq!(&b[p..p + 3], &[0x31, 0xC0, 0xC3]);
         // The handler: sets IoStatus.Status=0 @Irp+0x30 and Information=0x5A5A @Irp+0x38.
-        assert_eq!(&b[handler..handler + 3], &[0xC7, 0x42, 0x30], "mov dword[rdx+0x30],imm");
-        assert_eq!(rd_u32(&b, handler + 3), 0, "IoStatus.Status = STATUS_SUCCESS");
-        assert_eq!(&b[handler + 7..handler + 11], &[0x48, 0xC7, 0x42, 0x38], "mov qword[rdx+0x38],imm");
-        assert_eq!(rd_u32(&b, handler + 11), 0x5A5A, "IoStatus.Information sentinel");
+        assert_eq!(
+            &b[handler..handler + 3],
+            &[0xC7, 0x42, 0x30],
+            "mov dword[rdx+0x30],imm"
+        );
+        assert_eq!(
+            rd_u32(&b, handler + 3),
+            0,
+            "IoStatus.Status = STATUS_SUCCESS"
+        );
+        assert_eq!(
+            &b[handler + 7..handler + 11],
+            &[0x48, 0xC7, 0x42, 0x38],
+            "mov qword[rdx+0x38],imm"
+        );
+        assert_eq!(
+            rd_u32(&b, handler + 11),
+            0x5A5A,
+            "IoStatus.Information sentinel"
+        );
         // Handler tail: xor eax,eax; ret.
         assert_eq!(&b[handler + 15..handler + 18], &[0x31, 0xC0, 0xC3]);
     }
@@ -394,7 +430,11 @@ mod tests {
             &[(5, 0x2000, 0x40)], // base-reloc directory
         );
         assert_eq!(rd_u32(&b, OPT_OFF + 112 + 5 * 8), 0x2000, "reloc dir RVA");
-        assert_eq!(rd_u32(&b, OPT_OFF + 112 + 5 * 8 + 4), 0x40, "reloc dir size");
+        assert_eq!(
+            rd_u32(&b, OPT_OFF + 112 + 5 * 8 + 4),
+            0x40,
+            "reloc dir size"
+        );
         // SizeOfImage / SizeOfHeaders are populated and file-aligned.
         assert_eq!(rd_u32(&b, OPT_OFF + 56), 0x3000);
         let soh = rd_u32(&b, OPT_OFF + 60) as usize;

@@ -123,7 +123,11 @@ where
     let orig = read(off);
     let is_io = orig & BAR_IO_SPACE != 0;
     let is_64bit = !is_io && (orig & BAR_TYPE_MASK) == BAR_TYPE_64BIT;
-    let addr_mask = if is_io { BAR_IO_ADDR_MASK } else { BAR_MEM_ADDR_MASK };
+    let addr_mask = if is_io {
+        BAR_IO_ADDR_MASK
+    } else {
+        BAR_MEM_ADDR_MASK
+    };
     // Write all-ones and read back the decoded address mask, then restore.
     write(off, 0xFFFF_FFFF);
     let probed = read(off) & addr_mask;
@@ -141,7 +145,13 @@ where
     } else {
         (orig & BAR_MEM_ADDR_MASK) as u64
     };
-    Bar { index, is_io, is_64bit, base, size }
+    Bar {
+        index,
+        is_io,
+        is_64bit,
+        base,
+        size,
+    }
 }
 
 /// Enumerate one PCI function at `(bus, dev, func)` given a config reader + writer scoped to that
@@ -174,7 +184,17 @@ where
         }
         i += step;
     }
-    Some(PciDevice { bus, dev, func, vendor, device, class, irq_line, irq_pin, bars })
+    Some(PciDevice {
+        bus,
+        dev,
+        func,
+        vendor,
+        device,
+        class,
+        irq_line,
+        irq_pin,
+        bars,
+    })
 }
 
 /// Enumerate every present function on `bus` (0..32 devices × 0..8 functions). `read(dev,func,off)`
@@ -354,7 +374,8 @@ mod tests {
         fn write(&self, dev: u8, func: u8, off: u8, v: u32) {
             // Emulate the BAR size probe: an all-ones write to a probed BAR latches the size mask.
             if v == 0xFFFF_FFFF {
-                if let Some((_, mask)) = self.bar_masks.iter().find(|(k, _)| *k == (dev, func, off)) {
+                if let Some((_, mask)) = self.bar_masks.iter().find(|(k, _)| *k == (dev, func, off))
+                {
                     self.set(dev, func, off, *mask);
                     return;
                 }
@@ -411,7 +432,11 @@ mod tests {
     #[test]
     fn binds_network_class_to_nic_driver() {
         let m = nic_mock();
-        let devs = enumerate_bus(0, |d, f, o| m.read(d, f, o), |d, f, o, v| m.write(d, f, o, v));
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
         assert_eq!(bind_driver(&devs[0]), Some(DriverClass::Network));
         let nic = find_device_for_class(&devs, DriverClass::Network).unwrap();
         assert_eq!(nic.device, 0x100E);
@@ -421,15 +446,26 @@ mod tests {
     #[test]
     fn absent_device_terminates_scan() {
         // Empty config space => every read is 0xFFFF => no devices.
-        let m = MockConfig { regs: RefCell::new(vec![]), bar_masks: vec![] };
-        let devs = enumerate_bus(0, |d, f, o| m.read(d, f, o), |d, f, o, v| m.write(d, f, o, v));
+        let m = MockConfig {
+            regs: RefCell::new(vec![]),
+            bar_masks: vec![],
+        };
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
         assert!(devs.is_empty());
     }
 
     #[test]
     fn assigns_resources_and_builds_cm_list() {
         let m = nic_mock();
-        let devs = enumerate_bus(0, |d, f, o| m.read(d, f, o), |d, f, o, v| m.write(d, f, o, v));
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
         let nic = find_device_for_class(&devs, DriverClass::Network).unwrap();
         let assign = assign_resources(nic, 5, true, 1, 0x1000).unwrap();
         assert_eq!(assign.mmio_phys, 0xFEBC_0000);
@@ -464,7 +500,8 @@ mod tests {
             regs: RefCell::new(regs),
             bar_masks: vec![((5, 0, PCI_CFG_BAR0), 0xFFFF_FF01)], // 256-byte I/O BAR
         };
-        let dev = enumerate_function(0, 5, 0, |o| m.read(5, 0, o), |o, v| m.write(5, 0, o, v)).unwrap();
+        let dev =
+            enumerate_function(0, 5, 0, |o| m.read(5, 0, o), |o, v| m.write(5, 0, o, v)).unwrap();
         assert!(dev.first_memory_bar().is_none());
         assert!(assign_resources(&dev, 5, true, 1, 0).is_none());
     }

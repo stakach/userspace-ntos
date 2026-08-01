@@ -143,7 +143,8 @@ fn alpc_ping() {
     let mut core = PortCore::new();
     let mut alpc = AlpcServer::new();
     assert_eq!(
-        alpc.dispatch(&mut core, aop::ALPC_OP_PING, &[], &mut []).status,
+        alpc.dispatch(&mut core, aop::ALPC_OP_PING, &[], &mut [])
+            .status,
         SUCCESS
     );
 }
@@ -158,7 +159,11 @@ fn alpc_create_and_connect_auto_accept() {
     assert_eq!(r.status, SUCCESS);
     assert_ne!(r.detail0, 0);
     // A connect auto-completes.
-    let cn = enc_connect(&name, 0, &port_message(msg_type::CONNECTION_REQUEST, b"hello"));
+    let cn = enc_connect(
+        &name,
+        0,
+        &port_message(msg_type::CONNECTION_REQUEST, b"hello"),
+    );
     let r = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &cn, &mut []);
     assert_eq!(r.status, SUCCESS);
     assert_ne!(r.detail0, 0, "client comm-port handle");
@@ -216,15 +221,25 @@ fn alpc_port_section_and_view() {
     // Teardown ops (delete view, delete section) are idempotent no-error.
     let dv = enc_handle_req(r.detail0);
     assert_eq!(
-        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_DELETE_SECTION_VIEW, &dv, &mut [])
-            .status,
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_DELETE_SECTION_VIEW,
+            &dv,
+            &mut []
+        )
+        .status,
         SUCCESS
     );
     assert_eq!(alpc.view_count(), 0);
     let ds = enc_handle_req(section);
     assert_eq!(
-        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_DELETE_PORT_SECTION, &ds, &mut [])
-            .status,
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_DELETE_PORT_SECTION,
+            &ds,
+            &mut []
+        )
+        .status,
         SUCCESS
     );
     assert_eq!(alpc.section_count(), 0);
@@ -262,7 +277,12 @@ fn section_view_shared_memory_not_a_copy() {
         ..Default::default()
     });
     let section = alpc
-        .dispatch(&mut PortCore::new(), aop::ALPC_OP_CREATE_PORT_SECTION, &cs, &mut [])
+        .dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_CREATE_PORT_SECTION,
+            &cs,
+            &mut [],
+        )
         .detail0;
     assert_ne!(section, 0);
 
@@ -275,8 +295,13 @@ fn section_view_shared_memory_not_a_copy() {
             view_size: 0x4000,
             ..Default::default()
         });
-        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_CREATE_SECTION_VIEW, &cv, &mut [])
-            .detail0
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_CREATE_SECTION_VIEW,
+            &cv,
+            &mut [],
+        )
+        .detail0
     };
     let view_a = mk_view(&mut alpc);
     let view_b = mk_view(&mut alpc);
@@ -293,7 +318,12 @@ fn section_view_shared_memory_not_a_copy() {
         ..Default::default()
     });
     w.extend_from_slice(&big);
-    let r = alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &w, &mut []);
+    let r = alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_WRITE_SECTION_VIEW,
+        &w,
+        &mut [],
+    );
     assert_eq!(r.status, SUCCESS);
     assert_eq!(r.information, big.len() as u32);
 
@@ -306,10 +336,18 @@ fn section_view_shared_memory_not_a_copy() {
         ..Default::default()
     });
     let mut out = alloc::vec![0u8; big.len()];
-    let r = alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_READ_SECTION_VIEW, &rd, &mut out);
+    let r = alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_READ_SECTION_VIEW,
+        &rd,
+        &mut out,
+    );
     assert_eq!(r.status, SUCCESS);
     assert_eq!(r.information as usize, big.len());
-    assert_eq!(out, big, "view B observes view A's write — shared, not copied");
+    assert_eq!(
+        out, big,
+        "view B observes view A's write — shared, not copied"
+    );
 
     // A second write through B is observed through A at a different offset.
     let tail = [0xAAu8, 0xBB, 0xCC, 0xDD];
@@ -323,7 +361,13 @@ fn section_view_shared_memory_not_a_copy() {
     });
     w2.extend_from_slice(&tail);
     assert_eq!(
-        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &w2, &mut []).status,
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_WRITE_SECTION_VIEW,
+            &w2,
+            &mut []
+        )
+        .status,
         SUCCESS
     );
     let rd2 = bytes(&AlpcViewIoRequest {
@@ -334,7 +378,12 @@ fn section_view_shared_memory_not_a_copy() {
         ..Default::default()
     });
     let mut out2 = [0u8; 4];
-    alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_READ_SECTION_VIEW, &rd2, &mut out2);
+    alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_READ_SECTION_VIEW,
+        &rd2,
+        &mut out2,
+    );
     assert_eq!(out2, tail);
 
     // A write past the view bounds is rejected (no OOB).
@@ -347,7 +396,13 @@ fn section_view_shared_memory_not_a_copy() {
         ..Default::default()
     });
     assert_ne!(
-        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &oob, &mut []).status,
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_WRITE_SECTION_VIEW,
+            &oob,
+            &mut []
+        )
+        .status,
         SUCCESS
     );
 }
@@ -399,7 +454,10 @@ fn message_attributes_full_serialize_parse() {
     assert_eq!(valid2, msg_attr_flag::CONTEXT);
     let (_, parsed2, _) = parse_message_attributes(&blob2);
     assert_eq!(parsed2.context, Some(0xDEAD));
-    assert!(parsed2.view.is_none(), "un-allocated VIEW is not serialized");
+    assert!(
+        parsed2.view.is_none(),
+        "un-allocated VIEW is not serialized"
+    );
 }
 
 /// Step 3: the receive out-param path serializes ALPC_MESSAGE_ATTRIBUTES at the
@@ -415,15 +473,30 @@ fn receive_out_param_attributes_and_bridge_degradation() {
 
     // ALPC host port + an ALPC client rendezvous (both ALPC → attrs flow).
     let listen = alpc
-        .dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT, &enc_create_port(&name, port_flag::NONE), &mut [])
+        .dispatch(
+            lpc.core_mut(),
+            aop::ALPC_OP_CREATE_PORT,
+            &enc_create_port(&name, port_flag::NONE),
+            &mut [],
+        )
         .detail0;
     let cn = enc_connect(&name, 0, &port_message(msg_type::CONNECTION_REQUEST, b"c"));
     let conn_id = alpc
         .dispatch(lpc.core_mut(), aop::ALPC_OP_CONNECT_PORT, &cn, &mut [])
         .detail1;
     let mut out = [0u8; 256];
-    alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_RECEIVE, &enc_send_receive(listen, None, 0, &[]), &mut out);
-    let ac = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_ACCEPT_CONNECT, &enc_accept(conn_id, true, 0), &mut []);
+    alpc.dispatch(
+        lpc.core_mut(),
+        aop::ALPC_OP_RECEIVE,
+        &enc_send_receive(listen, None, 0, &[]),
+        &mut out,
+    );
+    let ac = alpc.dispatch(
+        lpc.core_mut(),
+        aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_accept(conn_id, true, 0),
+        &mut [],
+    );
     let (server_h, client_h) = (ac.detail0, ac.detail1);
 
     // ALPC client sends a message carrying CONTEXT + VIEW.
@@ -438,29 +511,58 @@ fn receive_out_param_attributes_and_bridge_degradation() {
     let mut rout = [0u8; 256];
     let r = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE, &rr, &mut rout);
     assert_eq!(r.status, SUCCESS);
-    assert_eq!(r.detail0 as u32, valid, "ValidAttributes = allocated & present");
+    assert_eq!(
+        r.detail0 as u32, valid,
+        "ValidAttributes = allocated & present"
+    );
     // Parse the front ALPC_MESSAGE_ATTRIBUTES; the body follows.
     let (pvalid, parsed, consumed) = parse_message_attributes(&rout[..r.information as usize]);
     assert_eq!(pvalid, valid);
     assert_eq!(parsed.context, Some(0x1234));
     assert_eq!(parsed.view.map(|v| v.view_base), Some(0x6000_0000));
-    assert_eq!(&rout[consumed..r.information as usize], &body[..], "body after the attrs");
+    assert_eq!(
+        &rout[consumed..r.information as usize],
+        &body[..],
+        "body after the attrs"
+    );
 
     // --- bridge: an LPC client to the same host degrades to ValidAttributes 0.
     let name2 = utf16("\\AttrBridge");
     let listen2 = alpc
-        .dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT, &enc_create_port(&name2, port_flag::LPC_MODE), &mut [])
+        .dispatch(
+            lpc.core_mut(),
+            aop::ALPC_OP_CREATE_PORT,
+            &enc_create_port(&name2, port_flag::LPC_MODE),
+            &mut [],
+        )
         .detail0;
     let lconn = {
-        let mut c = LpcClient::new(LpcDirect { server: &mut lpc, out: [0; 512] });
+        let mut c = LpcClient::new(LpcDirect {
+            server: &mut lpc,
+            out: [0; 512],
+        });
         c.connect_port(&name2, 2, b"SB").unwrap().connection_id
     };
-    alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_RECEIVE, &enc_send_receive(listen2, None, 0, &[]), &mut out);
-    let ac2 = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_ACCEPT_CONNECT, &enc_accept(lconn, true, 0), &mut []);
+    alpc.dispatch(
+        lpc.core_mut(),
+        aop::ALPC_OP_RECEIVE,
+        &enc_send_receive(listen2, None, 0, &[]),
+        &mut out,
+    );
+    let ac2 = alpc.dispatch(
+        lpc.core_mut(),
+        aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_accept(lconn, true, 0),
+        &mut [],
+    );
     let (bserver_h, bclient_h) = (ac2.detail0, ac2.detail1);
     // LPC client sends (no attributes).
     lpc.core_mut()
-        .send_message(bclient_h, &port_message(msg_type::REQUEST, b"lp"), MessageAttrs::default())
+        .send_message(
+            bclient_h,
+            &port_message(msg_type::REQUEST, b"lp"),
+            MessageAttrs::default(),
+        )
         .unwrap();
     // ALPC host receives WITH RECV_ATTRIBUTES + all allocated → still ValidAttributes 0.
     let rr2 = recv_with_attrs(bserver_h, 0xF800_0000);
@@ -469,7 +571,11 @@ fn receive_out_param_attributes_and_bridge_degradation() {
     assert_eq!(r2.detail0, 0, "LPC-originated message → no ALPC attributes");
     let (pv2, _, consumed2) = parse_message_attributes(&rout2[..r2.information as usize]);
     assert_eq!(pv2, 0);
-    assert_eq!(consumed2, size_of::<nt_alpc_abi::AlpcMessageAttributes>(), "header only, no structs");
+    assert_eq!(
+        consumed2,
+        size_of::<nt_alpc_abi::AlpcMessageAttributes>(),
+        "header only, no structs"
+    );
 }
 
 /// Build a send/receive request with the RECV_ATTRIBUTES flag set and `allocated`
@@ -527,7 +633,9 @@ struct LpcDirect<'a> {
 impl Backend for LpcDirect<'_> {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> nt_lpc_abi::LpcReply {
         let r = self.server.dispatch(opcode, in_buf, &mut self.out);
-        let n = (r.information as usize).min(out_buf.len()).min(self.out.len());
+        let n = (r.information as usize)
+            .min(out_buf.len())
+            .min(self.out.len());
         out_buf[..n].copy_from_slice(&self.out[..n]);
         r
     }
@@ -697,13 +805,22 @@ fn bridge_alpc_client_to_lpc_host() {
     // --- ALPC client → LPC host: carries CONTEXT (bridges); LPC host reads body.
     let req = port_message(msg_type::REQUEST, b"hi");
     {
-        let sr = enc_send_receive(client_h, Some(&req), msg_attr_flag::CONTEXT, &enc_attrs_context(0xABCD));
+        let sr = enc_send_receive(
+            client_h,
+            Some(&req),
+            msg_attr_flag::CONTEXT,
+            &enc_attrs_context(0xABCD),
+        );
         let mut out = [0u8; 256];
         let _ = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE, &sr, &mut out);
     }
     let got = lpc.core_mut().receive_message(server_h).unwrap().unwrap();
     assert_eq!(got.bytes, req);
-    assert_eq!(got.attrs.context, Some(0xABCD), "CONTEXT carried across the bridge");
+    assert_eq!(
+        got.attrs.context,
+        Some(0xABCD),
+        "CONTEXT carried across the bridge"
+    );
 
     // --- LPC host → ALPC client: no attributes; the ALPC client sees empty valid.
     let reply = port_message(msg_type::REPLY, b"yo");

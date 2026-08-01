@@ -314,10 +314,7 @@ mod tests {
             (interrupt / 10_000) as u32
         );
         for offset in [INTERRUPT_TIME, SYSTEM_TIME, TICK_COUNT] {
-            assert_eq!(
-                read_u32(&page.0, offset + 4),
-                read_u32(&page.0, offset + 8)
-            );
+            assert_eq!(read_u32(&page.0, offset + 4), read_u32(&page.0, offset + 8));
         }
     }
 
@@ -328,10 +325,7 @@ mod tests {
             1234
         );
         assert_eq!(
-            tick_count_to_milliseconds(
-                u64::from(u32::MAX) + 2,
-                TICK_COUNT_MULTIPLIER_ONE_MS
-            ),
+            tick_count_to_milliseconds(u64::from(u32::MAX) + 2, TICK_COUNT_MULTIPLIER_ONE_MS),
             1
         );
     }

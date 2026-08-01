@@ -433,7 +433,11 @@ mod tests {
                 Some(*ssn),
                 "{name} SSN drifted"
             );
-            assert_eq!(nt_syscall_abi::exact_argc_of(name), Some(*argc), "{name} argc");
+            assert_eq!(
+                nt_syscall_abi::exact_argc_of(name),
+                Some(*argc),
+                "{name} argc"
+            );
         }
     }
 
@@ -451,7 +455,11 @@ mod tests {
     fn debug_object_services_have_zw_aliases_on_the_same_ssn() {
         for (name, ssn, _) in DEBUG_OBJECT_SERVICES {
             let zw = std::format!("Zw{}", &name[2..]);
-            assert_eq!(nt_syscall_abi::ssn_of(&zw), Some(*ssn), "{zw} missing/drifted");
+            assert_eq!(
+                nt_syscall_abi::ssn_of(&zw),
+                Some(*ssn),
+                "{zw} missing/drifted"
+            );
         }
     }
 
@@ -459,8 +467,10 @@ mod tests {
     /// layout the kernel side (`nt_process::dbgk::encode_wait_state_change`) writes.
     fn create_process_state_change() -> [u8; DBGUI_WAIT_STATE_CHANGE_SIZE] {
         let mut sc = [0u8; DBGUI_WAIT_STATE_CHANGE_SIZE];
-        let put32 = |sc: &mut [u8], o: usize, v: u32| sc[o..o + 4].copy_from_slice(&v.to_le_bytes());
-        let put64 = |sc: &mut [u8], o: usize, v: u64| sc[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |sc: &mut [u8], o: usize, v: u32| sc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |sc: &mut [u8], o: usize, v: u64| sc[o..o + 8].copy_from_slice(&v.to_le_bytes());
         put32(&mut sc, 0x00, 3); // DbgCreateProcessStateChange
         put64(&mut sc, 0x08, 0x20); // AppClientId.UniqueProcess
         put64(&mut sc, 0x10, 0x24); // AppClientId.UniqueThread
@@ -497,7 +507,8 @@ mod tests {
         assert_eq!(u64_at(0x38), 0x7FFD_0000); // lpThreadLocalBase (from the TEB query)
         assert_eq!(u64_at(0x40), 0x0000_0001_4000_1000); // lpStartAddress
         assert_eq!(u64_at(0x48), 0); // lpImageName
-        assert_eq!(u16::from_le_bytes(event[0x50..0x52].try_into().unwrap()), 1); // fUnicode
+        assert_eq!(u16::from_le_bytes(event[0x50..0x52].try_into().unwrap()), 1);
+        // fUnicode
     }
 
     #[test]
@@ -522,7 +533,10 @@ mod tests {
         let mut event = [0u8; DEBUG_EVENT_SIZE];
         convert_state_change(&sc, &mut event, |_| None).unwrap();
         assert_eq!(u32::from_le_bytes(event[0..4].try_into().unwrap()), 5); // EXIT_PROCESS
-        assert_eq!(u32::from_le_bytes(event[0x10..0x14].try_into().unwrap()), 0x99);
+        assert_eq!(
+            u32::from_le_bytes(event[0x10..0x14].try_into().unwrap()),
+            0x99
+        );
         // An unknown DBG_STATE is refused rather than silently mis-converted.
         sc[0..4].copy_from_slice(&99u32.to_le_bytes());
         assert_eq!(
@@ -811,7 +825,10 @@ mod tests {
         assert_eq!(remote_breakin_action(0), RemoteBreakinAction::ExitOnly);
         assert_eq!(remote_breakin_action(1), RemoteBreakinAction::BreakThenExit);
         // NT stores a BOOLEAN; any non-zero truth value a debugger writes must break in.
-        assert_eq!(remote_breakin_action(0xff), RemoteBreakinAction::BreakThenExit);
+        assert_eq!(
+            remote_breakin_action(0xff),
+            RemoteBreakinAction::BreakThenExit
+        );
     }
 
     #[test]
@@ -823,8 +840,11 @@ mod tests {
         let base = peb.as_ptr() as usize;
         let flags = unsafe { core::ptr::addr_of!((*peb.as_ptr()).flags_bytes) } as usize;
         assert_eq!(flags - base, 0);
-        assert!(PEB_BEING_DEBUGGED_OFFSET < core::mem::size_of_val(&unsafe {
-            core::ptr::read(core::ptr::addr_of!((*peb.as_ptr()).flags_bytes))
-        }));
+        assert!(
+            PEB_BEING_DEBUGGED_OFFSET
+                < core::mem::size_of_val(&unsafe {
+                    core::ptr::read(core::ptr::addr_of!((*peb.as_ptr()).flags_bytes))
+                })
+        );
     }
 }

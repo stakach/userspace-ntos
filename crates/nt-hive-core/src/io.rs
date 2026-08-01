@@ -3,7 +3,9 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{decode_image, encode_image, encode_log_record, replay_log, HiveDecodeError, HiveLogOp};
+use crate::codec::{
+    decode_image, encode_image, encode_log_record, replay_log, HiveDecodeError, HiveLogOp,
+};
 use crate::hive::{Hive, HiveKind};
 
 /// Why a hive I/O operation failed (spec §10).

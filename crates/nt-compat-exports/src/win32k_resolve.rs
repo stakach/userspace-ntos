@@ -167,10 +167,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("first-batch import {name} is not declared"));
             // Real subsystem-backed: never a load-blocking or fail-loud import.
             assert!(
-                matches!(
-                    d.status,
-                    ExportStatus::Implemented | ExportStatus::Partial
-                ),
+                matches!(d.status, ExportStatus::Implemented | ExportStatus::Partial),
                 "first-batch import {name} is {:?}, expected Implemented/Partial",
                 d.status
             );

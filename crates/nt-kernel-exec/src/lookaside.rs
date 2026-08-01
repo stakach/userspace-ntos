@@ -77,7 +77,11 @@ pub unsafe fn init_general_lookaside(
     core::ptr::write_unaligned(base.add(o::DEPTH) as *mut u16, 0);
     core::ptr::write_unaligned(
         base.add(o::MAXIMUM_DEPTH) as *mut u16,
-        if depth == 0 { DEFAULT_MAXIMUM_DEPTH } else { depth },
+        if depth == 0 {
+            DEFAULT_MAXIMUM_DEPTH
+        } else {
+            depth
+        },
     );
     core::ptr::write_unaligned(base.add(o::TYPE) as *mut u32, pool_type);
     core::ptr::write_unaligned(base.add(o::TAG) as *mut u32, tag);
@@ -102,7 +106,16 @@ mod tests {
         let base = buf.as_mut_ptr();
         let va = base as u64;
         unsafe {
-            init_general_lookaside(base, va, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x40, 0x6b736157, 0, POOL_TYPE_PAGED);
+            init_general_lookaside(
+                base,
+                va,
+                0x1111_2222_3333_4444,
+                0x5555_6666_7777_8888,
+                0x40,
+                0x6b736157,
+                0,
+                POOL_TYPE_PAGED,
+            );
         }
         let r32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let r16 = |off: usize| u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
@@ -128,7 +141,16 @@ mod tests {
         let mut buf = [0u8; o::SIZE_OF];
         let base = buf.as_mut_ptr();
         unsafe {
-            init_general_lookaside(base, base as u64, 0xDEAD, 0xBEEF, 0x20, 0x1234, 32, POOL_TYPE_NONPAGED);
+            init_general_lookaside(
+                base,
+                base as u64,
+                0xDEAD,
+                0xBEEF,
+                0x20,
+                0x1234,
+                32,
+                POOL_TYPE_NONPAGED,
+            );
         }
         let r16 = |off: usize| u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
         let r32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());

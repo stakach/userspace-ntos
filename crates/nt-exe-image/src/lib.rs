@@ -219,10 +219,7 @@ pub fn hosted_spawn_allowed(_creator_pi: usize, leaf: &[u8]) -> bool {
     hosted_image_for_leaf(leaf).is_some()
 }
 
-pub fn hosted_probe_image(
-    folded_path: &[u8],
-    is_sxs: bool,
-) -> Option<&'static HostedProcessImage> {
+pub fn hosted_probe_image(folded_path: &[u8], is_sxs: bool) -> Option<&'static HostedProcessImage> {
     if is_sxs {
         return None;
     }
@@ -315,15 +312,22 @@ impl<const N: usize> Default for ImageTable<N> {
 
 impl<const N: usize> ImageTable<N> {
     pub const fn new() -> Self {
-        Self { slots: [EMPTY_SLOT; N] }
+        Self {
+            slots: [EMPTY_SLOT; N],
+        }
     }
 
     pub fn get(&self, slot: usize) -> Option<&ImageSlot> {
-        self.slots.get(slot).filter(|slot| slot.state != ImageState::Empty)
+        self.slots
+            .get(slot)
+            .filter(|slot| slot.state != ImageState::Empty)
     }
 
     pub fn active_len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.state != ImageState::Empty).count()
+        self.slots
+            .iter()
+            .filter(|slot| slot.state != ImageState::Empty)
+            .count()
     }
 
     pub fn open(
@@ -340,13 +344,11 @@ impl<const N: usize> ImageTable<N> {
             return Err(ImageError::InvalidMetadata);
         }
         let leaf = canonical_exe_leaf(path).ok_or(ImageError::InvalidPath)?;
-        if let Some((index, existing)) = self
-            .slots
-            .iter()
-            .enumerate()
-            .find(|(_, slot)| slot.state != ImageState::Empty && slot.owner_pi == owner_pi
-                && (slot.file_handle == file_handle || slot.section_handle == file_handle))
-        {
+        if let Some((index, existing)) = self.slots.iter().enumerate().find(|(_, slot)| {
+            slot.state != ImageState::Empty
+                && slot.owner_pi == owner_pi
+                && (slot.file_handle == file_handle || slot.section_handle == file_handle)
+        }) {
             return if existing.file_handle == file_handle
                 && eq_ascii_case(existing.leaf(), leaf)
                 && existing.metadata == metadata
@@ -402,7 +404,9 @@ impl<const N: usize> ImageTable<N> {
         if section_handle == 0 {
             return Err(ImageError::InvalidHandle);
         }
-        let index = self.index_for_file(owner_pi, file_handle).ok_or(ImageError::NotFound)?;
+        let index = self
+            .index_for_file(owner_pi, file_handle)
+            .ok_or(ImageError::NotFound)?;
         if self.slots[index].state == ImageState::Sectioned
             && self.slots[index].section_handle == section_handle
         {
@@ -452,7 +456,10 @@ impl<const N: usize> ImageTable<N> {
     }
 
     pub fn rollback_spawn(&mut self, request: SpawnRequest) -> Result<(), ImageError> {
-        let slot = self.slots.get_mut(request.slot).ok_or(ImageError::NotFound)?;
+        let slot = self
+            .slots
+            .get_mut(request.slot)
+            .ok_or(ImageError::NotFound)?;
         if slot.spawn_request(request.slot) != Some(request) {
             return Err(ImageError::InvalidState);
         }
@@ -462,11 +469,18 @@ impl<const N: usize> ImageTable<N> {
         Ok(())
     }
 
-    pub fn publish(&mut self, request: SpawnRequest, process_handle: u64) -> Result<(), ImageError> {
+    pub fn publish(
+        &mut self,
+        request: SpawnRequest,
+        process_handle: u64,
+    ) -> Result<(), ImageError> {
         if process_handle == 0 {
             return Err(ImageError::InvalidHandle);
         }
-        let slot = self.slots.get_mut(request.slot).ok_or(ImageError::NotFound)?;
+        let slot = self
+            .slots
+            .get_mut(request.slot)
+            .ok_or(ImageError::NotFound)?;
         if slot.spawn_request(request.slot) != Some(request) {
             return Err(ImageError::InvalidState);
         }
@@ -495,7 +509,10 @@ impl<const N: usize> ImageTable<N> {
         }
         if slot.file_handle == 0
             && slot.section_handle == 0
-            && !matches!(slot.state, ImageState::SpawnReserved | ImageState::Published)
+            && !matches!(
+                slot.state,
+                ImageState::SpawnReserved | ImageState::Published
+            )
         {
             *slot = EMPTY_SLOT;
             CloseOutcome::Released(index)
@@ -510,7 +527,8 @@ impl<const N: usize> ImageTable<N> {
 /// SxS probes and malformed/overlong leaves are rejected. Matching is component-exact: `userinit2`
 /// cannot alias `userinit`, and a directory containing `.exe` is irrelevant.
 pub fn canonical_exe_leaf(path: &[u8]) -> Option<&[u8]> {
-    if path.is_empty() || contains_ascii_case(path, b".local")
+    if path.is_empty()
+        || contains_ascii_case(path, b".local")
         || contains_ascii_case(path, b".manifest")
         || contains_ascii_case(path, b".config")
     {
@@ -524,9 +542,10 @@ pub fn canonical_exe_leaf(path: &[u8]) -> Option<&[u8]> {
     if leaf.len() <= 4 || leaf.len() > MAX_EXE_LEAF || !ends_with_ascii_case(leaf, b".exe") {
         return None;
     }
-    if !leaf.iter().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-    }) {
+    if !leaf
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
         return None;
     }
     Some(leaf)
@@ -534,7 +553,10 @@ pub fn canonical_exe_leaf(path: &[u8]) -> Option<&[u8]> {
 
 fn contains_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| {
-        window.iter().zip(needle).all(|(left, right)| left.eq_ignore_ascii_case(right))
+        window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
     })
 }
 
@@ -578,7 +600,10 @@ mod tests {
             canonical_exe_leaf(br"\SystemRoot/System32/services.exe"),
             Some(b"services.exe" as &[u8])
         );
-        assert_eq!(canonical_exe_leaf(b"userinit2.exe"), Some(b"userinit2.exe" as &[u8]));
+        assert_eq!(
+            canonical_exe_leaf(b"userinit2.exe"),
+            Some(b"userinit2.exe" as &[u8])
+        );
     }
 
     #[test]
@@ -616,7 +641,9 @@ mod tests {
         assert!(hosted_path_is_noninteractive_service(b"LSASS.EXE"));
         assert!(!hosted_path_is_noninteractive_service(b"winlogon.exe"));
         assert!(!hosted_path_is_noninteractive_service(b"explorer.exe"));
-        assert!(!hosted_path_is_noninteractive_service(b"service-helper.exe"));
+        assert!(!hosted_path_is_noninteractive_service(
+            b"service-helper.exe"
+        ));
     }
 
     #[test]
@@ -624,7 +651,10 @@ mod tests {
         let services = hosted_image_for_pi(3).unwrap();
         assert_eq!(services.top_badge, SERVICES_TOP_BADGE);
         assert_eq!(services.role, HostedProcessRole::NonInteractiveService);
-        assert_eq!(services.nt_image_path, b"\\SystemRoot\\System32\\services.exe");
+        assert_eq!(
+            services.nt_image_path,
+            b"\\SystemRoot\\System32\\services.exe"
+        );
         assert_eq!(services.command_line, b"services.exe");
         assert_eq!(services.image_root, HostedImageRoot::System32);
 
@@ -645,8 +675,14 @@ mod tests {
             hosted_probe_leaf(br"\SystemRoot\explorer.exe", false),
             Some(b"explorer.exe" as &[u8])
         );
-        assert_eq!(hosted_probe_leaf(br"\SystemRoot\System32\smss.exe", false), None);
-        assert_eq!(hosted_probe_leaf(br"\SystemRoot\System32\lsasrv.dll", false), None);
+        assert_eq!(
+            hosted_probe_leaf(br"\SystemRoot\System32\smss.exe", false),
+            None
+        );
+        assert_eq!(
+            hosted_probe_leaf(br"\SystemRoot\System32\lsasrv.dll", false),
+            None
+        );
         assert_eq!(
             hosted_probe_leaf(br"\SystemRoot\System32\userinit.exe.manifest", true),
             None
@@ -675,7 +711,10 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(table.index_for_file(2, 0x44), Some(a));
         assert_eq!(table.index_for_file(4, 0x44), Some(b));
-        assert_eq!(table.open(2, b"other.exe", 0x44, META), Err(ImageError::HandleCollision));
+        assert_eq!(
+            table.open(2, b"other.exe", 0x44, META),
+            Err(ImageError::HandleCollision)
+        );
     }
 
     #[test]
@@ -722,7 +761,10 @@ mod tests {
     fn fixed_capacity_refuses_without_mutating_existing_slots() {
         let mut table = ImageTable::<1>::new();
         table.open(2, b"services.exe", 0x40, META).unwrap();
-        assert_eq!(table.open(2, b"lsass.exe", 0x44, META), Err(ImageError::Full));
+        assert_eq!(
+            table.open(2, b"lsass.exe", 0x44, META),
+            Err(ImageError::Full)
+        );
         assert_eq!(table.active_len(), 1);
         assert_eq!(table.get(0).unwrap().leaf(), b"services.exe");
     }

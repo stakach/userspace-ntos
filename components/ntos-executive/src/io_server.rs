@@ -53,11 +53,11 @@ pub unsafe extern "C" fn io_server_entry() -> ! {
         Err(_) => park(),
     };
     let mut io = IoManager::new(port);
-    let driver = match io.create_driver(&npath("\\Driver\\Test"), Box::new(MockDriverBackend::new()))
-    {
-        Ok(d) => d,
-        Err(_) => park(),
-    };
+    let driver =
+        match io.create_driver(&npath("\\Driver\\Test"), Box::new(MockDriverBackend::new())) {
+            Ok(d) => d,
+            Err(_) => park(),
+        };
     if io
         .create_device(
             driver,
@@ -85,7 +85,10 @@ pub unsafe extern "C" fn io_server_entry() -> ! {
         // SAFETY: single request in flight; the ring push/pop orders the client's
         // write to the request frame before this read.
         let in_buf = unsafe {
-            core::slice::from_raw_parts((REQ_DATA_VADDR + sqe.offset) as *const u8, sqe.len as usize)
+            core::slice::from_raw_parts(
+                (REQ_DATA_VADDR + sqe.offset) as *const u8,
+                sqe.len as usize,
+            )
         };
         let out_buf =
             unsafe { core::slice::from_raw_parts_mut(REP_DATA_VADDR as *mut u8, REP_DATA_LEN) };

@@ -220,7 +220,10 @@ impl<'a> PeFile<'a> {
             const MAX_NAME_LEN: usize = 512;
             let start = rva as usize;
             let header_end = (self.headers.size_of_headers as usize).min(self.bytes.len());
-            let bytes = self.bytes.get(start..header_end).ok_or(PeError::Truncated)?;
+            let bytes = self
+                .bytes
+                .get(start..header_end)
+                .ok_or(PeError::Truncated)?;
             let end = bytes
                 .iter()
                 .take(MAX_NAME_LEN + 1)

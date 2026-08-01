@@ -6,7 +6,9 @@
 use nt_hive_core::{encode_image, Hive, HiveKind};
 
 fn main() {
-    let out = std::env::args().nth(1).unwrap_or_else(|| "hive.dat".to_string());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "hive.dat".to_string());
     let mut hive = Hive::new(HiveKind::System);
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");

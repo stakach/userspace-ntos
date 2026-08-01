@@ -339,7 +339,11 @@ pub(crate) unsafe fn create(
                 OVERLAY_OPENS.fetch_add(1, Ordering::Relaxed);
             }
         }
-        (result.status, Some(result.handle), result.information as u64)
+        (
+            result.status,
+            Some(result.handle),
+            result.information as u64,
+        )
     } else {
         (result.status, None, 0)
     }
@@ -444,7 +448,11 @@ pub(crate) unsafe fn query_directory(
         print_u64(output.len() as u64);
         print_str(b" pattern=\"");
         for &unit in pattern.unwrap_or(&[]).iter().take(32) {
-            debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+            debug_put_char(if (0x20..0x7f).contains(&unit) {
+                unit as u8
+            } else {
+                b'?'
+            });
         }
         print_str(b"\"\n");
     }
@@ -571,7 +579,11 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     const MAX_DEPTH: u32 = 12;
     let mut stack: alloc::vec::Vec<(u32, alloc::string::String, u32)> = alloc::vec::Vec::new();
     let _ = fs.provision_directory(PROFILES_VOLUME_ROOT);
-    stack.push((root_cluster, alloc::string::String::from(PROFILES_VOLUME_ROOT), 0));
+    stack.push((
+        root_cluster,
+        alloc::string::String::from(PROFILES_VOLUME_ROOT),
+        0,
+    ));
     let (mut dirs, mut files, mut bytes) = (0u64, 0u64, 0u64);
     while let Some((cluster, base, depth)) = stack.pop() {
         // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
@@ -650,7 +662,10 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
         PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
         PROFILE_SOURCE_BYTES.store(bytes, Ordering::Relaxed);
     }
-    PROFILE_SOURCE_ENTRIES.store(count_entries(fs, DEFAULT_USER_PROFILE_DIR), Ordering::Relaxed);
+    PROFILE_SOURCE_ENTRIES.store(
+        count_entries(fs, DEFAULT_USER_PROFILE_DIR),
+        Ordering::Relaxed,
+    );
     print_str(b"[profile-source] materialised ::Profiles onto the writable volume: dirs=");
     print_u64(dirs);
     print_str(b" files=");

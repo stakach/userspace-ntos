@@ -883,7 +883,11 @@ impl WdfRuntime {
     /// — what `CreateFile(symbolic_link)` would open. `None` if no enabled interface of that GUID
     /// exists (e.g. the device is stopped/removed and its interfaces are disabled).
     pub fn open_device_interface(&self, guid: &str) -> Option<(alloc::string::String, WdfHandle)> {
-        let iface = self.config.interfaces_by_guid(guid, true).into_iter().next()?;
+        let iface = self
+            .config
+            .interfaces_by_guid(guid, true)
+            .into_iter()
+            .next()?;
         let link = iface.symbolic_link.clone();
         // Resolve the interface's devnode back to the device object it belongs to (the I/O manager
         // resolves the symbolic link to the device stack's top FDO).

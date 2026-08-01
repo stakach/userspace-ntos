@@ -86,7 +86,10 @@ pub enum PortApi {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
     /// The connect completed synchronously (`AutoAccept`).
-    Completed { client_handle: u64, connection_id: u64 },
+    Completed {
+        client_handle: u64,
+        connection_id: u64,
+    },
     /// The connect is parked awaiting a receiver (`Manual`).
     Pending { connection_id: u64 },
 }
@@ -411,7 +414,10 @@ impl PortCore {
             conn.server_handle = next;
             self.next_handle += 1;
         }
-        Ok(self.conn(connection_id).map(|c| c.server_handle).unwrap_or(0))
+        Ok(self
+            .conn(connection_id)
+            .map(|c| c.server_handle)
+            .unwrap_or(0))
     }
 
     /// Complete an accepted connection (by connection id OR server comm-port
@@ -477,8 +483,15 @@ impl PortCore {
                 return Ok(());
             }
         }
-        if let Some(port) = self.ports.iter_mut().find(|port| port.handle == from_handle) {
-            let connection_id = port.reply_connection.take().ok_or(NtStatus::INVALID_HANDLE)?;
+        if let Some(port) = self
+            .ports
+            .iter_mut()
+            .find(|port| port.handle == from_handle)
+        {
+            let connection_id = port
+                .reply_connection
+                .take()
+                .ok_or(NtStatus::INVALID_HANDLE)?;
             let conn = self
                 .connections
                 .iter_mut()
@@ -605,7 +618,10 @@ mod tests {
                 connection_id,
             } => {
                 assert_ne!(client_handle, 0);
-                assert_eq!(core.connection_state(connection_id), Some(ConnState::Connected));
+                assert_eq!(
+                    core.connection_state(connection_id),
+                    Some(ConnState::Connected)
+                );
             }
             _ => panic!("auto-accept must complete"),
         }
@@ -664,9 +680,7 @@ mod tests {
         let mut core = PortCore::new();
         core.create_port(&utf16("\\P"), PortApi::Lpc);
         let blob = [1u8, 2, 3, 4, 5];
-        let out = core
-            .connect(&utf16("\\P"), PortApi::Lpc, 7, &blob)
-            .unwrap();
+        let out = core.connect(&utf16("\\P"), PortApi::Lpc, 7, &blob).unwrap();
         let cid = match out {
             ConnectOutcome::Completed { connection_id, .. } => connection_id,
             ConnectOutcome::Pending { connection_id } => connection_id,
@@ -690,11 +704,13 @@ mod tests {
         let sh = core.accept(cid, true, 0).unwrap();
         let (ch, _) = core.complete(cid).unwrap();
         // client -> server
-        core.send_message(ch, b"ping", MessageAttrs::default()).unwrap();
+        core.send_message(ch, b"ping", MessageAttrs::default())
+            .unwrap();
         let got = core.receive_message(sh).unwrap().unwrap();
         assert_eq!(got.bytes, b"ping");
         // server -> client
-        core.send_message(sh, b"pong", MessageAttrs::default()).unwrap();
+        core.send_message(sh, b"pong", MessageAttrs::default())
+            .unwrap();
         let got = core.receive_message(ch).unwrap().unwrap();
         assert_eq!(got.bytes, b"pong");
         // drained
@@ -723,7 +739,8 @@ mod tests {
         assert_eq!(request.bytes, b"second");
         assert_eq!(request.attrs.context, None);
         assert_eq!(request.port_context, 0x2222);
-        core.send_message(ph, b"reply", MessageAttrs::default()).unwrap();
+        core.send_message(ph, b"reply", MessageAttrs::default())
+            .unwrap();
 
         assert!(core.receive_message(clients[0]).unwrap().is_none());
         assert_eq!(

@@ -576,13 +576,13 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
         let _ = page_map(copy_cap(acs_frame), acs_va, RW_NX, pml4);
-                                                                // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
-                                                                // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
-                                                                // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
-                                                                // ..., alloc=FALSE) (e.g. ntdll+0xf05e). With MaximumLength=0 that returns
-                                                                // STATUS_BUFFER_OVERFLOW (0x80000005), which propagates out of LdrpWalkImportDescriptor and
-                                                                // fails process init. Set MaximumLength = 261*sizeof(WCHAR) = 522 and point Buffer at the
-                                                                // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
+        // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
+        // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
+        // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
+        // ..., alloc=FALSE) (e.g. ntdll+0xf05e). With MaximumLength=0 that returns
+        // STATUS_BUFFER_OVERFLOW (0x80000005), which propagates out of LdrpWalkImportDescriptor and
+        // fails process init. Set MaximumLength = 261*sizeof(WCHAR) = 522 and point Buffer at the
+        // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
         core::ptr::write_volatile((scr + 0x5000 + 0x25a) as *mut u16, 522); // MaximumLength
         core::ptr::write_volatile((scr + 0x5000 + 0x260) as *mut u64, SMSS_TEB_VA + 0x1268); // Buffer
                                                                                              // BATCH 39 — client-side win32k CLIENTINFO.pDeskInfo. An interactive GUI client (winlogon)
@@ -773,14 +773,20 @@ pub(crate) unsafe fn spawn_sec_image(
         const COMMAND_LINE_BUFFER: u64 = 0xA00;
         const _: () = assert!(CURDIR_BUFFER + CURDIR_CAPACITY as u64 <= DLL_PATH_BUFFER);
         const _: () = assert!(DLL_PATH_BUFFER + DLL_PATH_CAPACITY as u64 <= IMAGE_PATH_BUFFER);
-        const _: () = assert!(IMAGE_PATH_BUFFER + IMAGE_PATH_CAPACITY as u64 <= COMMAND_LINE_BUFFER);
+        const _: () =
+            assert!(IMAGE_PATH_BUFFER + IMAGE_PATH_CAPACITY as u64 <= COMMAND_LINE_BUFFER);
         const _: () = assert!(COMMAND_LINE_BUFFER + COMMAND_LINE_CAPACITY as u64 <= 0x1000);
         // (UNICODE_STRING field, buffer offset, byte capacity, text).
         // ImagePathName + CommandLine are per-process (smss vs csrss) — the loader derives the DLL
         // search + the ".local" SxS probe from ImagePathName, and the image's entry parses CommandLine.
         let ustrs: [(u64, u64, u16, &[u8]); 4] = [
             (0x38, CURDIR_BUFFER, CURDIR_CAPACITY, b"C:\\Windows"),
-            (0x50, DLL_PATH_BUFFER, DLL_PATH_CAPACITY, b"C:\\Windows\\System32"),
+            (
+                0x50,
+                DLL_PATH_BUFFER,
+                DLL_PATH_CAPACITY,
+                b"C:\\Windows\\System32",
+            ),
             (0x60, IMAGE_PATH_BUFFER, IMAGE_PATH_CAPACITY, image_path),
             (0x70, COMMAND_LINE_BUFFER, COMMAND_LINE_CAPACITY, cmd_line),
         ];
@@ -1089,19 +1095,13 @@ unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: 
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let ok = with_recorded_frame_alias(
-            pi,
-            chunk.page_base,
-            scratch_base,
-            false,
-            |alias| {
-                core::ptr::copy_nonoverlapping(
-                    (alias + chunk.page_offset as u64) as *const u8,
-                    dst.as_mut_ptr().add(copied),
-                    chunk.length,
-                );
-            },
-        );
+        let ok = with_recorded_frame_alias(pi, chunk.page_base, scratch_base, false, |alias| {
+            core::ptr::copy_nonoverlapping(
+                (alias + chunk.page_offset as u64) as *const u8,
+                dst.as_mut_ptr().add(copied),
+                chunk.length,
+            );
+        });
         if !ok {
             return false;
         }
@@ -1116,19 +1116,13 @@ unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64
     };
     let mut copied = 0usize;
     for chunk in chunks {
-        let ok = with_recorded_frame_alias(
-            pi,
-            chunk.page_base,
-            scratch_base,
-            true,
-            |alias| {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(copied),
-                    (alias + chunk.page_offset as u64) as *mut u8,
-                    chunk.length,
-                );
-            },
-        );
+        let ok = with_recorded_frame_alias(pi, chunk.page_base, scratch_base, true, |alias| {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(copied),
+                (alias + chunk.page_offset as u64) as *mut u8,
+                chunk.length,
+            );
+        });
         if !ok {
             return false;
         }
@@ -1192,13 +1186,12 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
         let mut temporary_cap = 0;
-        let mirrored = if !allow_active_mirrors
-            || pi == 2 && wl_listener_stack_contains(current, chunk)
-        {
-            None
-        } else {
-            smss_mirror(current, chunk as u64)
-        };
+        let mirrored =
+            if !allow_active_mirrors || pi == 2 && wl_listener_stack_contains(current, chunk) {
+                None
+            } else {
+                smss_mirror(current, chunk as u64)
+            };
         let source = if let Some(source) = mirrored {
             source
         } else {
@@ -1282,8 +1275,7 @@ pub(crate) unsafe fn client_write_mapped(
     if pi == 2 && wl_listener_stack_contains(va, src.len()) {
         return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
     }
-    smss_copyout(va, src)
-        || client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base)
+    smss_copyout(va, src) || client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base)
 }
 
 pub(crate) unsafe fn client_write_u64_mapped(

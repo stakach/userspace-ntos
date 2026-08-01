@@ -153,7 +153,8 @@ pub const GDI_HANDLE_COUNT: u64 = 0x1_0000;
 pub const GDI_TABLE_ENTRY_SIZE: u64 = 0x18;
 /// Frames spanning the GDI table (0x10000 * 0x18 = 0x18_0000 = 1.5 MiB = 384 frames).
 pub const GDI_SHARED_TABLE_FRAMES: u64 = (GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE + 0xfff) / 0x1000;
-const _: () = assert!(GDI_SHARED_TABLE_VA + GDI_SHARED_TABLE_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
+const _: () =
+    assert!(GDI_SHARED_TABLE_VA + GDI_SHARED_TABLE_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
 const _: () = assert!(GDI_SHARED_TABLE_VA >= CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000);
 
 // USERCONNECT / SHAREDINFO x64 field offsets (references/reactos win32ss/include/ntuser.h): a
@@ -179,10 +180,10 @@ pub const SH_SSDT_INDEX: u64 = 0x24; // out: recorded SSDT index (u32)
 pub const SH_POOL_USED: u64 = 0x30; // out: pool high-water (u64)
 pub const SH_NTUSER_HANDLER: u64 = 0x40; // out: resolved SSDT[0xFA] handler VA (u64)
 pub const SH_NTUSER_STATUS: u64 = 0x48; // out: NtUserInitialize NTSTATUS (i32)
-// Phase 2c dispatch-loop request/reply (executive → win32k, via the shared page). After
-// DriverEntry+attach the host enters a persistent loop: it trips the sentinel (ready/done), the
-// executive fills these fields + resume-replies, the host resolves the SSN through the registered
-// SSDT, invokes the handler in its own context (GS=KPCR/session heap), writes SH_REQ_STATUS, loops.
+                                        // Phase 2c dispatch-loop request/reply (executive → win32k, via the shared page). After
+                                        // DriverEntry+attach the host enters a persistent loop: it trips the sentinel (ready/done), the
+                                        // executive fills these fields + resume-replies, the host resolves the SSN through the registered
+                                        // SSDT, invokes the handler in its own context (GS=KPCR/session heap), writes SH_REQ_STATUS, loops.
 pub const SH_REQ_SSN: u64 = 0x50; // in:  the win32k SSN (>= 0x1000) to dispatch (u64)
 pub const SH_REQ_A0: u64 = 0x58; // in:  handler arg0 (rcx)
 pub const SH_REQ_A1: u64 = 0x60; // in:  handler arg1 (rdx)
@@ -190,19 +191,19 @@ pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
 pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
 pub const SH_REQ_STATUS: u64 = 0x78; // out: handler return value (u64; low i32 remains NTSTATUS-compatible)
 pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
-// ★ BATCH 44 — STACK-ARG TAIL for WIDE win32k SSNs. The x64 win64 ABI passes args 1-4 in rcx/rdx/r8/r9
-// and args 5+ on the caller's stack. `dispatch_ssn` originally forwarded ONLY the 4 register args, so a
-// handler like `NtUserCreateWindowEx` (15 args) read args 5-15 (incl. hMenu) from win32k's OWN leftover
-// stack = GARBAGE -> `ERROR_INVALID_MENU_HANDLE` -> NULL HWND -> winlogon's InitializeSAS fails ->
-// UnregisterClass + NtTerminateProcess (the root cause of the "post-SAS silent" wall). The executive
-// now reads the caller's stack args 5-N and marshals them here; `dispatch_ssn` reconstructs a real
-// N-arg win64 call. SH_REQ_A4..A14 hold args 5-15 (u64 each); SH_REQ_NARGS is the TOTAL arg count.
+                                    // ★ BATCH 44 — STACK-ARG TAIL for WIDE win32k SSNs. The x64 win64 ABI passes args 1-4 in rcx/rdx/r8/r9
+                                    // and args 5+ on the caller's stack. `dispatch_ssn` originally forwarded ONLY the 4 register args, so a
+                                    // handler like `NtUserCreateWindowEx` (15 args) read args 5-15 (incl. hMenu) from win32k's OWN leftover
+                                    // stack = GARBAGE -> `ERROR_INVALID_MENU_HANDLE` -> NULL HWND -> winlogon's InitializeSAS fails ->
+                                    // UnregisterClass + NtTerminateProcess (the root cause of the "post-SAS silent" wall). The executive
+                                    // now reads the caller's stack args 5-N and marshals them here; `dispatch_ssn` reconstructs a real
+                                    // N-arg win64 call. SH_REQ_A4..A14 hold args 5-15 (u64 each); SH_REQ_NARGS is the TOTAL arg count.
 pub const SH_REQ_A4: u64 = 0x90; // in:  handler arg4 (1st stack arg)
 pub const SH_REQ_NARGS: u64 = 0xF0; // in:  total handler arg count (0/<=4 => register-only, as before)
-// Compile-time invariants for the stack-arg-tail region (host-verified at build):
-//  - SH_REQ_A4 must sit ABOVE the last register field (SH_FONT_SIZE=0x88) so it never aliases.
-//  - The widest SSN is 16 args (SH_REQ_A4 holds args 5..16 = 12 u64 slots = 0x90..0xF0), which must
-//    END exactly at SH_REQ_NARGS with no overlap — i.e. NARGS = A4 + 12*8.
+                                    // Compile-time invariants for the stack-arg-tail region (host-verified at build):
+                                    //  - SH_REQ_A4 must sit ABOVE the last register field (SH_FONT_SIZE=0x88) so it never aliases.
+                                    //  - The widest SSN is 16 args (SH_REQ_A4 holds args 5..16 = 12 u64 slots = 0x90..0xF0), which must
+                                    //    END exactly at SH_REQ_NARGS with no overlap — i.e. NARGS = A4 + 12*8.
 const _: () = assert!(SH_REQ_A4 > SH_FONT_SIZE);
 const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + 12 * 8);
 
@@ -219,19 +220,19 @@ const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + 12 * 8);
 // Both are 0 until the desktop is bound (BOUND_DESK_* latched). Written above SH_REQ_NARGS.
 pub const SH_SAS_DESKINFO: u64 = 0x100; // out: bound DESKTOPINFO server VA (u64)
 pub const SH_SAS_PTI: u64 = 0x108; // out: dispatch THREADINFO server VA (== window head.pti) (u64)
-// The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
-// USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
-// can resolve a HWND → its PWND (handles[(hwnd&0xffff − 0x20)>>1].ptr) to persist WND.dwUserData.
+                                   // The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
+                                   // USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
+                                   // can resolve a HWND → its PWND (handles[(hwnd&0xffff − 0x20)>>1].ptr) to persist WND.dwUserData.
 pub const SH_SAS_AHELIST: u64 = 0x110; // in: gSharedInfo.aheList (USER_HANDLE_TABLE) server VA (u64)
-// The SAS window's Session pointer (CreateWindowEx lpCreateParams), published by win32k's WM_CREATE
-// callback bridge; the executive reads winlogon's `Session->LogonState` (Session+0x118) through it to
-// PROVE SASWindowProc → DispatchSAS ran client-side (STATE_INIT→STATE_LOGGED_OFF after the SAS).
+                                       // The SAS window's Session pointer (CreateWindowEx lpCreateParams), published by win32k's WM_CREATE
+                                       // callback bridge; the executive reads winlogon's `Session->LogonState` (Session+0x118) through it to
+                                       // PROVE SASWindowProc → DispatchSAS ran client-side (STATE_INIT→STATE_LOGGED_OFF after the SAS).
 pub const SH_SAS_SESSION: u64 = 0x118; // out: winlogon SAS-window Session VA (u64)
-// The SAS window's HWND (handle value), published by win32k's WM_CREATE callback bridge. The executive
-// uses it to INJECT the 2nd SAS: at STATE_LOGGED_OFF it posts WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL) to
-// this HWND via the REAL NtUserPostMessage(0x100e) path (co_IntPostMessage → MsqPostMessage), simulating
-// the Ctrl-Alt-Del a headless host can't receive from a keyboard, so winlogon's GetMessage retrieves it →
-// client-side SASWindowProc → DispatchSAS → WlxLoggedOutSAS (the msgina logon dialog).
+                                       // The SAS window's HWND (handle value), published by win32k's WM_CREATE callback bridge. The executive
+                                       // uses it to INJECT the 2nd SAS: at STATE_LOGGED_OFF it posts WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL) to
+                                       // this HWND via the REAL NtUserPostMessage(0x100e) path (co_IntPostMessage → MsqPostMessage), simulating
+                                       // the Ctrl-Alt-Del a headless host can't receive from a keyboard, so winlogon's GetMessage retrieves it →
+                                       // client-side SASWindowProc → DispatchSAS → WlxLoggedOutSAS (the msgina logon dialog).
 pub const SH_SAS_HWND: u64 = 0x120; // out: winlogon SAS-window HWND (u64)
 pub const SH_GDI_TABLE_BASE: u64 = 0x128; // out: coherent hosted GDI handle-table backing (u64)
 pub const SH_GDI_TABLE_SIZE: u64 = 0x130; // out: full hosted GDI handle-table byte size (u64)
@@ -257,146 +258,145 @@ const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRA
 /// win32k's own leftover stack -> ERROR_INVALID_MENU_HANDLE -> NULL HWND -> winlogon SAS-init fail).
 pub fn win32k_ssn_argc(ssn: u64) -> u64 {
     match ssn {
-        0x1001 => 5, // UserPeekMessage
-        0x1007 => 7, // UserMessageCall
+        0x1001 => 5,  // UserPeekMessage
+        0x1007 => 7,  // UserMessageCall
         0x1008 => 11, // GdiBitBlt
-        0x101b => 7, // UserBuildHwndList
-        0x101f => 5, // GdiIntersectClipRect
-        0x1023 => 7, // UserSetWindowPos
+        0x101b => 7,  // UserBuildHwndList
+        0x101f => 5,  // GdiIntersectClipRect
+        0x1023 => 7,  // UserSetWindowPos
         0x1028 => 16, // GdiSetDIBitsToDeviceInternal
         0x1030 => 12, // GdiStretchBlt
-        0x1037 => 9, // GdiExtTextOutW
-        0x1046 => 6, // GdiDoPalette
-        0x1047 => 5, // GdiPolyPolyDraw
-        0x1049 => 5, // UserEnumDisplayMonitors
-        0x104e => 6, // UserGetIconInfo
-        0x1052 => 8, // UserDeferWindowPos
-        0x1059 => 6, // GdiPatBlt
-        0x105c => 5, // GdiHfontCreate
-        0x105d => 6, // UserMoveWindow
+        0x1037 => 9,  // GdiExtTextOutW
+        0x1046 => 6,  // GdiDoPalette
+        0x1047 => 5,  // GdiPolyPolyDraw
+        0x1049 => 5,  // UserEnumDisplayMonitors
+        0x104e => 6,  // UserGetIconInfo
+        0x1052 => 8,  // UserDeferWindowPos
+        0x1059 => 6,  // GdiPatBlt
+        0x105c => 5,  // GdiHfontCreate
+        0x105d => 6,  // UserMoveWindow
         0x105f => 11, // UserDrawIconEx
-        0x1064 => 7, // GdiD3dDrawPrimitives2
+        0x1064 => 7,  // GdiD3dDrawPrimitives2
         0x1068 => 13, // GdiMaskBlt
-        0x1069 => 7, // GdiGetWidthTable
-        0x106a => 7, // UserScrollDC
-        0x106b => 5, // UserGetObjectInformation
-        0x106c => 5, // GdiCreateBitmap
-        0x106e => 5, // UserFindWindowEx
-        0x106f => 5, // GdiPolyPatBlt
-        0x1072 => 5, // GdiTransformPoints
-        0x1075 => 6, // GdiCreateDIBBrush
+        0x1069 => 7,  // GdiGetWidthTable
+        0x106a => 7,  // UserScrollDC
+        0x106b => 5,  // UserGetObjectInformation
+        0x106c => 5,  // GdiCreateBitmap
+        0x106e => 5,  // UserFindWindowEx
+        0x106f => 5,  // GdiPolyPatBlt
+        0x1072 => 5,  // GdiTransformPoints
+        0x1075 => 6,  // GdiCreateDIBBrush
         0x1077 => 15, // UserCreateWindowEx
-        0x107a => 7, // UserToUnicodeEx
+        0x107a => 7,  // UserToUnicodeEx
         0x107d => 12, // GdiAlphaBlend
         0x1082 => 16, // GdiStretchDIBitsInternal
-        0x1086 => 9, // GdiGetDIBitsInternal
-        0x108d => 6, // UserSetWindowsHookEx
-        0x1091 => 5, // GdiRectangle
-        0x1095 => 5, // GdiGetTextExtent
-        0x1098 => 5, // UserCalcMenuBar
-        0x1099 => 6, // UserThunkedMenuItemInfo
-        0x109a => 5, // GdiExcludeClipRect
-        0x109b => 9, // GdiCreateDIBSection
+        0x1086 => 9,  // GdiGetDIBitsInternal
+        0x108d => 6,  // UserSetWindowsHookEx
+        0x1091 => 5,  // GdiRectangle
+        0x1095 => 5,  // GdiGetTextExtent
+        0x1098 => 5,  // UserCalcMenuBar
+        0x1099 => 6,  // UserThunkedMenuItemInfo
+        0x109a => 5,  // GdiExcludeClipRect
+        0x109b => 9,  // GdiCreateDIBSection
         0x10a0 => 11, // GdiCreateDIBitmapInternal
-        0x10a4 => 7, // GdiEnumFontOpen
-        0x10a5 => 5, // GdiEnumFontChunk
-        0x10a7 => 8, // GdiDdCreateSurface
+        0x10a4 => 7,  // GdiEnumFontOpen
+        0x10a5 => 5,  // GdiEnumFontChunk
+        0x10a7 => 8,  // GdiDdCreateSurface
         0x10af => 11, // GdiExtCreatePen
-        0x10b4 => 7, // UserRegisterClassExWOW
-        0x10bd => 5, // UserGetClassInfo
-        0x10c2 => 8, // UserScrollWindowEx
-        0x10c7 => 6, // GdiDdCreateSurfaceObject
-        0x10cb => 6, // GdiGetCharWidthW
-        0x10cf => 8, // UserBitBltSysBmp
-        0x10db => 5, // GdiGetFontData
-        0x10de => 7, // GdiOpenDCW
-        0x10ea => 5, // GdiSetVirtualResolution
-        0x10ee => 6, // UserRealInternalGetMessage
-        0x10f2 => 6, // UserPaintMenuBar
-        0x10f7 => 6, // UserGetAltTabInfo
-        0x1109 => 8, // UserSetWinEventHook
-        0x1113 => 5, // UserDdeInitialize
-        0x1116 => 5, // GdiAddFontMemResourceEx
-        0x111c => 8, // GdiExtEscape
-        0x112a => 6, // GdiAddFontResourceW
-        0x112d => 6, // GdiAngleArc
+        0x10b4 => 7,  // UserRegisterClassExWOW
+        0x10bd => 5,  // UserGetClassInfo
+        0x10c2 => 8,  // UserScrollWindowEx
+        0x10c7 => 6,  // GdiDdCreateSurfaceObject
+        0x10cb => 6,  // GdiGetCharWidthW
+        0x10cf => 8,  // UserBitBltSysBmp
+        0x10db => 5,  // GdiGetFontData
+        0x10de => 7,  // GdiOpenDCW
+        0x10ea => 5,  // GdiSetVirtualResolution
+        0x10ee => 6,  // UserRealInternalGetMessage
+        0x10f2 => 6,  // UserPaintMenuBar
+        0x10f7 => 6,  // UserGetAltTabInfo
+        0x1109 => 8,  // UserSetWinEventHook
+        0x1113 => 5,  // UserDdeInitialize
+        0x1116 => 5,  // GdiAddFontMemResourceEx
+        0x111c => 8,  // GdiExtEscape
+        0x112a => 6,  // GdiAddFontResourceW
+        0x112d => 6,  // GdiAngleArc
         0x112f => 10, // GdiArcInternal
-        0x1136 => 5, // GdiCLIPOBJ_cEnumStart
-        0x113a => 8, // GdiCheckBitmapBits
-        0x113d => 6, // GdiColorCorrectPalette
-        0x113f => 8, // GdiCreateColorTransform
-        0x1143 => 6, // GdiCreateRoundRectRgn
-        0x1144 => 6, // GdiCreateServerMetaFile
-        0x114f => 8, // GdiDdCreateD3DBuffer
-        0x1156 => 5, // GdiDdFlip
+        0x1136 => 5,  // GdiCLIPOBJ_cEnumStart
+        0x113a => 8,  // GdiCheckBitmapBits
+        0x113d => 6,  // GdiColorCorrectPalette
+        0x113f => 8,  // GdiCreateColorTransform
+        0x1143 => 6,  // GdiCreateRoundRectRgn
+        0x1144 => 6,  // GdiCreateServerMetaFile
+        0x114f => 8,  // GdiDdCreateD3DBuffer
+        0x1156 => 5,  // GdiDdFlip
         0x1165 => 11, // GdiDdQueryDirectDrawObject
-        0x1187 => 6, // GdiDxgGenericThunk
-        0x1188 => 5, // GdiEllipse
-        0x118c => 7, // GdiEngAlphaBlend
+        0x1187 => 6,  // GdiDxgGenericThunk
+        0x1188 => 5,  // GdiEllipse
+        0x118c => 7,  // GdiEngAlphaBlend
         0x118e => 11, // GdiEngBitBlt
-        0x1191 => 6, // GdiEngCopyBits
-        0x1192 => 6, // GdiEngCreateBitmap
-        0x1196 => 6, // GdiEngCreatePalette
-        0x119c => 7, // GdiEngFillPath
+        0x1191 => 6,  // GdiEngCopyBits
+        0x1192 => 6,  // GdiEngCreateBitmap
+        0x1196 => 6,  // GdiEngCreatePalette
+        0x119c => 7,  // GdiEngFillPath
         0x119d => 10, // GdiEngGradientFill
-        0x119e => 9, // GdiEngLineTo
-        0x11a1 => 5, // GdiEngPaint
+        0x119e => 9,  // GdiEngLineTo
+        0x11a1 => 5,  // GdiEngPaint
         0x11a2 => 11, // GdiEngPlgBlt
         0x11a3 => 11, // GdiEngStretchBlt
         0x11a4 => 13, // GdiEngStretchBltROP
         0x11a5 => 10, // GdiEngStrokeAndFillPath
-        0x11a6 => 8, // GdiEngStrokePath
+        0x11a6 => 8,  // GdiEngStrokePath
         0x11a7 => 10, // GdiEngTextOut
-        0x11a8 => 8, // GdiEngTransparentBlt
-        0x11ab => 7, // GdiEudcLoadUnloadLink
-        0x11ac => 5, // GdiExtFloodFill
-        0x11ae => 5, // GdiFONTOBJ_cGetGlyphs
-        0x11b8 => 5, // GdiFrameRgn
-        0x11b9 => 5, // GdiFullscreenControl
-        0x11bb => 6, // GdiGetCharABCWidthsW
-        0x11bc => 6, // GdiGetCharacterPlacementW
-        0x11c5 => 7, // GdiGetEmbUFI
-        0x11c8 => 7, // GdiGetFontResourceInfoInternalW
-        0x11ca => 5, // GdiGetGlyphIndicesW
-        0x11cb => 6, // GdiGetGlyphIndicesWInternal
-        0x11cc => 8, // GdiGetGlyphOutline
-        0x11d5 => 7, // GdiGetServerMetaFileBits
-        0x11d7 => 5, // GdiGetStats
-        0x11d8 => 5, // GdiGetStringBitmapW
-        0x11d9 => 8, // GdiGetTextExtentExW
-        0x11da => 6, // GdiGetUFI
+        0x11a8 => 8,  // GdiEngTransparentBlt
+        0x11ab => 7,  // GdiEudcLoadUnloadLink
+        0x11ac => 5,  // GdiExtFloodFill
+        0x11ae => 5,  // GdiFONTOBJ_cGetGlyphs
+        0x11b8 => 5,  // GdiFrameRgn
+        0x11b9 => 5,  // GdiFullscreenControl
+        0x11bb => 6,  // GdiGetCharABCWidthsW
+        0x11bc => 6,  // GdiGetCharacterPlacementW
+        0x11c5 => 7,  // GdiGetEmbUFI
+        0x11c8 => 7,  // GdiGetFontResourceInfoInternalW
+        0x11ca => 5,  // GdiGetGlyphIndicesW
+        0x11cb => 6,  // GdiGetGlyphIndicesWInternal
+        0x11cc => 8,  // GdiGetGlyphOutline
+        0x11d5 => 7,  // GdiGetServerMetaFileBits
+        0x11d7 => 5,  // GdiGetStats
+        0x11d8 => 5,  // GdiGetStringBitmapW
+        0x11d9 => 8,  // GdiGetTextExtentExW
+        0x11da => 6,  // GdiGetUFI
         0x11db => 10, // GdiGetUFIPathname
-        0x11dc => 6, // GdiGradientFill
-        0x11de => 6, // GdiHT_Get8BPPMaskPalette
-        0x11df => 8, // GdiIcmBrushInfo
-        0x11e2 => 5, // GdiMakeFontDir
+        0x11dc => 6,  // GdiGradientFill
+        0x11de => 6,  // GdiHT_Get8BPPMaskPalette
+        0x11df => 8,  // GdiIcmBrushInfo
+        0x11e2 => 5,  // GdiMakeFontDir
         0x11f0 => 11, // GdiPlgBlt
-        0x11f6 => 6, // GdiRemoveFontResourceW
-        0x11f8 => 5, // GdiResetDC
-        0x11fa => 7, // GdiRoundRect
-        0x1200 => 6, // GdiScaleViewportExtEx
-        0x1201 => 6, // GdiScaleWindowExtEx
-        0x1210 => 5, // GdiSetRectRgn
+        0x11f6 => 6,  // GdiRemoveFontResourceW
+        0x11f8 => 5,  // GdiResetDC
+        0x11fa => 7,  // GdiRoundRect
+        0x1200 => 6,  // GdiScaleViewportExtEx
+        0x1201 => 6,  // GdiScaleWindowExtEx
+        0x1210 => 5,  // GdiSetRectRgn
         0x1219 => 11, // GdiTransparentBlt
-        0x1220 => 5, // GdiXFORMOBJ_bApplyXform
-        0x122d => 5, // UserCreateDesktop
-        0x122f => 7, // UserCreateWindowStation
-        0x1236 => 5, // UserDragObject
-        0x1239 => 7, // UserDrawCaptionTemp
-        0x123a => 5, // UserDrawMenuBarTemp
-        0x124e => 5, // UserGetMouseMovePointsEx
-        0x1251 => 5, // UserGetRawInputData
+        0x1220 => 5,  // GdiXFORMOBJ_bApplyXform
+        0x122d => 5,  // UserCreateDesktop
+        0x122f => 7,  // UserCreateWindowStation
+        0x1236 => 5,  // UserDragObject
+        0x1239 => 7,  // UserDrawCaptionTemp
+        0x123a => 5,  // UserDrawMenuBarTemp
+        0x124e => 5,  // UserGetMouseMovePointsEx
+        0x1251 => 5,  // UserGetRawInputData
         0x1259 => 12, // UserInitTask
-        0x125c => 7, // UserLoadKeyboardLayoutEx
-        0x1277 => 5, // UserSetImeHotKey
-        0x128a => 6, // UserTrackPopupMenuEx
+        0x125c => 7,  // UserLoadKeyboardLayoutEx
+        0x1277 => 5,  // UserSetImeHotKey
+        0x128a => 6,  // UserTrackPopupMenuEx
         0x1291 => 10, // UserUpdateLayeredWindow
-        0x1298 => 4, // UserSetWindowLongPtr
-        0x1299 => 6, // UserWin32PoolAllocationStats
+        0x1298 => 4,  // UserSetWindowLongPtr
+        0x1299 => 6,  // UserWin32PoolAllocationStats
         _ => 0,
     }
 }
-
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
@@ -839,7 +839,10 @@ extern "win64" fn s_se_query_authentication_id_token(_token: u64, luid_out: *mut
     if !luid_out.is_null() {
         // SAFETY: luid_out is win32k's stack-local &LUID (2 x u32); the component stack is mapped.
         unsafe {
-            write_unaligned(luid_out, nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW);
+            write_unaligned(
+                luid_out,
+                nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW,
+            );
             write_unaligned(
                 luid_out.add(1),
                 nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32,
@@ -1010,7 +1013,11 @@ extern "win64" fn s_set_win32process(process: u64, w32process: u64, _old: u64) -
 /// `PsGetCurrentThread()->Tcb.Win32Thread` and never goes through the export.
 extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u64 {
     unsafe {
-        let thread = if thread == 0 { current_ethread() } else { thread };
+        let thread = if thread == 0 {
+            current_ethread()
+        } else {
+            thread
+        };
         let pi = process_index_for_ethread(thread).unwrap_or_else(|| current_client_index());
         let field = (thread + KTHREAD_WIN32THREAD_OFF) as *mut u64;
         let previous = read_volatile(field);
@@ -1344,7 +1351,10 @@ extern "win64" fn s_ps_get_process_winsta(process: u64) -> u64 {
 extern "win64" fn s_ps_set_process_winsta(process: u64, handle: u64) {
     if process != 0 {
         unsafe {
-            write_volatile((process + EPROCESS_WIN32_WINDOW_STATION_OFF) as *mut u64, handle);
+            write_volatile(
+                (process + EPROCESS_WIN32_WINDOW_STATION_OFF) as *mut u64,
+                handle,
+            );
         }
     }
 }
@@ -1452,12 +1462,28 @@ extern "win64" fn s_lookaside_free(_buf: u64) {}
 /// (host-tested x64 layout), defaulting the Allocate/Free callbacks to this host's pool trampolines
 /// when the caller passed null. `ExInitialize{,N}PagedLookasideList` — a no-op stub left
 /// Allocate(+0x30) null, so win32k's slow-path `call [desc+0x30]` jumped to null (RVA 0xb3e88).
-unsafe fn init_lookaside(la: u64, allocate: u64, free: u64, size: u64, tag: u64, depth: u64, pool_type: u32) {
+unsafe fn init_lookaside(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+    pool_type: u32,
+) {
     if la == 0 {
         return;
     }
-    let alloc_fn = if allocate != 0 { allocate } else { s_lookaside_alloc as usize as u64 };
-    let free_fn = if free != 0 { free } else { s_lookaside_free as usize as u64 };
+    let alloc_fn = if allocate != 0 {
+        allocate
+    } else {
+        s_lookaside_alloc as usize as u64
+    };
+    let free_fn = if free != 0 {
+        free
+    } else {
+        s_lookaside_free as usize as u64
+    };
     nt_kernel_exec::init_general_lookaside(
         la as *mut u8,
         la, // same-AS: the ListEntry self-link VA is the descriptor pointer
@@ -1480,7 +1506,17 @@ extern "win64" fn s_ex_init_paged_lookaside(
     tag: u64,
     depth: u64,
 ) {
-    unsafe { init_lookaside(la, allocate, free, size, tag, depth, nt_kernel_exec::POOL_TYPE_PAGED) }
+    unsafe {
+        init_lookaside(
+            la,
+            allocate,
+            free,
+            size,
+            tag,
+            depth,
+            nt_kernel_exec::POOL_TYPE_PAGED,
+        )
+    }
 }
 /// `ExInitializeNPagedLookasideList(...)` — same layout, NonPagedPool type.
 extern "win64" fn s_ex_init_npaged_lookaside(
@@ -1492,7 +1528,11 @@ extern "win64" fn s_ex_init_npaged_lookaside(
     tag: u64,
     depth: u64,
 ) {
-    unsafe { init_lookaside(la, allocate, free, size, tag, depth, 0 /* NonPagedPool */) }
+    unsafe {
+        init_lookaside(
+            la, allocate, free, size, tag, depth, 0, /* NonPagedPool */
+        )
+    }
 }
 
 /// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)` — win32k
@@ -1545,7 +1585,11 @@ extern "win64" fn s_mm_create_section(
     max_size: *const i64,
 ) -> i32 {
     unsafe {
-        let size = if max_size.is_null() { 0x0010_0000 } else { read_unaligned(max_size) as u64 };
+        let size = if max_size.is_null() {
+            0x0010_0000
+        } else {
+            read_unaligned(max_size) as u64
+        };
         let desc = pool_alloc(section_object::SIZE_OF as u64);
         if desc == 0 {
             return STATUS_NO_MEMORY;
@@ -1564,7 +1608,11 @@ extern "win64" fn s_mm_create_section(
 /// + `*ViewSize` (a no-op stub left `*MappedBase` null → memset(null)).
 extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
     unsafe {
-        let hint = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+        let hint = if size_io.is_null() {
+            0
+        } else {
+            read_volatile(size_io)
+        };
         let (base, size) = section_view(section, hint);
         if base == 0 {
             return STATUS_NO_MEMORY;
@@ -1598,7 +1646,11 @@ extern "win64" fn s_mm_map_view_of_section(
     size_io: *mut u64,
 ) -> i32 {
     unsafe {
-        let hint = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+        let hint = if size_io.is_null() {
+            0
+        } else {
+            read_volatile(size_io)
+        };
         let (base, size) = section_view(section, hint);
         if base == 0 {
             return STATUS_NO_MEMORY;
@@ -1686,8 +1738,14 @@ extern "win64" fn s_ke_add_system_service_table(
 ) -> u64 {
     unsafe {
         write_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *mut u64, base);
-        write_volatile((WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *mut u32, limit as u32);
-        write_volatile((WIN32K_SHARED_VADDR + SH_SSDT_INDEX) as *mut u32, index as u32);
+        write_volatile(
+            (WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *mut u32,
+            limit as u32,
+        );
+        write_volatile(
+            (WIN32K_SHARED_VADDR + SH_SSDT_INDEX) as *mut u32,
+            index as u32,
+        );
         let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
         write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_SSDT);
     }
@@ -2034,19 +2092,31 @@ unsafe fn zero_region(base: u64, size: u64) {
 
 unsafe fn current_client_index() -> usize {
     let pi = WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed) as usize;
-    if pi < MAX_PI { pi } else { WIN32K_BOOTSTRAP_PI }
+    if pi < MAX_PI {
+        pi
+    } else {
+        WIN32K_BOOTSTRAP_PI
+    }
 }
 
 unsafe fn current_eprocess() -> u64 {
     let pi = current_client_index();
     let process = WIN32K_CLIENT_EPROCESS[pi].load(Ordering::Relaxed);
-    if process == 0 { PH_EPROCESS_VA } else { process }
+    if process == 0 {
+        PH_EPROCESS_VA
+    } else {
+        process
+    }
 }
 
 unsafe fn current_ethread() -> u64 {
     let pi = current_client_index();
     let thread = WIN32K_CLIENT_ETHREAD[pi].load(Ordering::Relaxed);
-    if thread == 0 { PH_ETHREAD } else { thread }
+    if thread == 0 {
+        PH_ETHREAD
+    } else {
+        thread
+    }
 }
 
 unsafe fn current_w32process() -> u64 {
@@ -2144,7 +2214,11 @@ unsafe fn seed_win32k_client_context(pi: u64, process_id: u64) -> bool {
         process_id
     } else {
         let saved = WIN32K_CLIENT_PROCESS_IDS[pi].load(Ordering::Relaxed);
-        if saved == 0 { FAKE_PROCESS_HANDLE } else { saved }
+        if saved == 0 {
+            FAKE_PROCESS_HANDLE
+        } else {
+            saved
+        }
     };
     WIN32K_CLIENT_PROCESS_IDS[pi].store(pid, Ordering::Relaxed);
 
@@ -2189,7 +2263,11 @@ unsafe fn seed_win32k_client_context(pi: u64, process_id: u64) -> bool {
             WIN32K_CLIENT_W32PROCESS[pi].store(existing_process, Ordering::Relaxed);
         }
         let existing_thread = read_volatile(SLOT_W32THREAD as *const u64);
-        let thread = if existing_thread == 0 { PH_W32THREAD_VA } else { existing_thread };
+        let thread = if existing_thread == 0 {
+            PH_W32THREAD_VA
+        } else {
+            existing_thread
+        };
         if WIN32K_CLIENT_W32THREAD[pi].load(Ordering::Relaxed) == 0 {
             WIN32K_CLIENT_W32THREAD[pi].store(thread, Ordering::Relaxed);
         }
@@ -2281,7 +2359,10 @@ unsafe fn seed_inherited_process_window_station(pi: usize) {
     }
     write_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *mut u64, winsta_body);
     write_volatile((ppi + PROCESSINFO_HWINSTA_OFF) as *mut u64, winsta_handle);
-    write_volatile((ppi + PROCESSINFO_AMWINSTA_OFF) as *mut u32, WINSTA_ALL_ACCESS);
+    write_volatile(
+        (ppi + PROCESSINFO_AMWINSTA_OFF) as *mut u32,
+        WINSTA_ALL_ACCESS,
+    );
     let flags = read_volatile((ppi + W32PROCESS_FLAGS_OFF) as *const u32);
     write_volatile(
         (ppi + W32PROCESS_FLAGS_OFF) as *mut u32,
@@ -2381,7 +2462,10 @@ extern "win64" fn s_rtl_copy_unicode_string(dest: *mut u8, src: *const u8) {
         if src_buf != 0 && dst_buf != 0 {
             let mut i = 0u64;
             while i < n as u64 {
-                write_volatile((dst_buf + i) as *mut u8, read_volatile((src_buf + i) as *const u8));
+                write_volatile(
+                    (dst_buf + i) as *mut u8,
+                    read_volatile((src_buf + i) as *const u8),
+                );
                 i += 1;
             }
         }
@@ -2406,7 +2490,11 @@ unsafe fn rtl_unicode_slice<'a>(string: *const u8) -> &'a [u16] {
 }
 
 /// `LONG RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
-extern "win64" fn s_rtl_compare_unicode_string(a: *const u8, b: *const u8, case_insensitive: u8) -> i32 {
+extern "win64" fn s_rtl_compare_unicode_string(
+    a: *const u8,
+    b: *const u8,
+    case_insensitive: u8,
+) -> i32 {
     let (a, b) = unsafe { (rtl_unicode_slice(a), rtl_unicode_slice(b)) };
     match nt_compat_exports::rtl::compare_unicode(a, b, case_insensitive != 0) {
         core::cmp::Ordering::Less => -1,
@@ -2416,7 +2504,11 @@ extern "win64" fn s_rtl_compare_unicode_string(a: *const u8, b: *const u8, case_
 }
 
 /// `BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
-extern "win64" fn s_rtl_equal_unicode_string(a: *const u8, b: *const u8, case_insensitive: u8) -> u8 {
+extern "win64" fn s_rtl_equal_unicode_string(
+    a: *const u8,
+    b: *const u8,
+    case_insensitive: u8,
+) -> u8 {
     let (a, b) = unsafe { (rtl_unicode_slice(a), rtl_unicode_slice(b)) };
     nt_compat_exports::rtl::equal_unicode(a, b, case_insensitive != 0) as u8
 }
@@ -2513,8 +2605,16 @@ extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
         while i < n {
             let ca = read_unaligned((a + i * 2) as *const u16);
             let cb = read_unaligned((b + i * 2) as *const u16);
-            let la = if (b'A' as u16..=b'Z' as u16).contains(&ca) { ca + 32 } else { ca };
-            let lb = if (b'A' as u16..=b'Z' as u16).contains(&cb) { cb + 32 } else { cb };
+            let la = if (b'A' as u16..=b'Z' as u16).contains(&ca) {
+                ca + 32
+            } else {
+                ca
+            };
+            let lb = if (b'A' as u16..=b'Z' as u16).contains(&cb) {
+                cb + 32
+            } else {
+                cb
+            };
             if la != lb {
                 return if la < lb { -1 } else { 1 };
             }
@@ -2542,7 +2642,11 @@ unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
     for (k, &wc) in tail.iter().enumerate() {
         let off = name_buf + (name_len as u64 - (tail.len() - k) as u64 * 2);
         let c = read_unaligned(off as *const u16);
-        let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+        let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        };
         if lc != wc as u16 {
             return false;
         }
@@ -2559,7 +2663,8 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
         let name_len = read_unaligned(buf as *const u16) as usize;
         let name_buf = read_unaligned((buf + 8) as *const u64);
-        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll / kbdus.dll) + pick its recorded info.
+        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll / kbdus.dll)
+        // and pick its recorded info.
         let (image, entry, expdir, len, tag): (u64, u64, u64, u32, &[u8]) =
             if wname_ends_with(name_buf, name_len, b"dxg.sys") {
                 (
@@ -2619,9 +2724,9 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 const HKEY_VIDEO_MAP: u64 = 0x5A5A_0F10; // \Registry\Machine\HARDWARE\DEVICEMAP\VIDEO
 const HKEY_FB_SETTINGS: u64 = 0x5A5A_0F11; // ..\Services\framebuf\Device0 (the display settings key)
 const HKEY_KBD_LAYOUT_0409: u64 = 0x5A5A_0F12; // ..\Keyboard Layouts\00000409
-// A fake DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
-// handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
-// stable). Zeroed sub-regions of DATA page 0.
+                                               // A fake DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
+                                               // handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
+                                               // stable). Zeroed sub-regions of DATA page 0.
 const FAKE_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
 const FAKE_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
 
@@ -2641,12 +2746,18 @@ unsafe fn wstr_contains_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
         return false;
     }
     let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
     };
     for start in 0..=(n - pat.len()) {
         let mut ok = true;
         for (k, &pb) in pat.iter().enumerate() {
-            let c = low(read_unaligned((buf + ((start + k) * 2) as u64) as *const u16));
+            let c = low(read_unaligned(
+                (buf + ((start + k) * 2) as u64) as *const u16,
+            ));
             if c != low(pb as u16) {
                 ok = false;
                 break;
@@ -2664,7 +2775,11 @@ unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
         return false;
     }
     let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
     };
     for k in 0..pat.len() {
         let c = low(read_unaligned((buf + (k * 2) as u64) as *const u16));
@@ -2707,7 +2822,14 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
 
 /// Emit an ASCII string `s` as a wide (UTF-16) REG_SZ/REG_MULTI_SZ into a KEY_VALUE_PARTIAL_INFORMATION
 /// {TitleIndex@0, Type@4, DataLength@8, Data@0xC}. `extra_nul` adds a second terminator (MULTI_SZ).
-unsafe fn emit_kvpi_wsz(kvi: u64, length: u64, result_len: *mut u32, rtype: u32, s: &[u8], extra_nul: bool) -> i32 {
+unsafe fn emit_kvpi_wsz(
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+    rtype: u32,
+    s: &[u8],
+    extra_nul: bool,
+) -> i32 {
     let nchars = s.len() + 1 + if extra_nul { 1 } else { 0 };
     let dbytes = (nchars * 2) as u64;
     let need = 0xC + dbytes;
@@ -2780,7 +2902,14 @@ extern "win64" fn s_zw_query_value_key(
                     return emit_kvpi_wsz(kvi, length, result_len, REG_MULTI_SZ, b"framebuf", true);
                 }
                 if wstr_eq_ascii(vbuf, vlen, b"Device Description") {
-                    return emit_kvpi_wsz(kvi, length, result_len, REG_SZ, b"BOOTBOOT Framebuffer", false);
+                    return emit_kvpi_wsz(
+                        kvi,
+                        length,
+                        result_len,
+                        REG_SZ,
+                        b"BOOTBOOT Framebuffer",
+                        false,
+                    );
                 }
                 if wstr_eq_ascii(vbuf, vlen, b"VgaCompatible") {
                     return emit_kvpi_dword(kvi, length, result_len, 0);
@@ -2982,8 +3111,8 @@ const USER32_CB_WINDOWPROC: u32 = 0;
 #[cfg(any())]
 const WPCA_MSG: u64 = 0x18; // UINT Msg
 const WPCA_RESULT: u64 = 0x38; // LRESULT Result
-// WINDOWPROC_CALLBACK_ARGUMENTS x64 layout invariant (callback.h:21): Proc@0 IsAnsiProc@8 Wnd@0x10
-// Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38. Result is the 8th 8-byte slot.
+                               // WINDOWPROC_CALLBACK_ARGUMENTS x64 layout invariant (callback.h:21): Proc@0 IsAnsiProc@8 Wnd@0x10
+                               // Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38. Result is the 8th 8-byte slot.
 const _: () = assert!(WPCA_RESULT == 7 * 8);
 extern "win64" fn s_ke_user_mode_callback_rendezvous(
     api: u32,
@@ -3013,9 +3142,13 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             return 0xC000_0023u32 as i32;
         }
 
-        let frame = (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
+        let frame =
+            (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
         let mut header = read_volatile(core::ptr::addr_of!((*frame).header));
-        if header.begin_request(api, input_len as usize, output_capacity).is_err() {
+        if header
+            .begin_request(api, input_len as usize, output_capacity)
+            .is_err()
+        {
             return 0xC000_000Du32 as i32;
         }
         for offset in 0..input_len as usize {
@@ -3104,7 +3237,11 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
     out_len: *mut u32,
 ) -> i32 {
     unsafe {
-        let want = if out_len.is_null() { 0 } else { read_volatile(out_len) };
+        let want = if out_len.is_null() {
+            0
+        } else {
+            read_volatile(out_len)
+        };
         let mut size = want as u64;
         if (input_len as u64) > size {
             size = input_len as u64;
@@ -3143,11 +3280,17 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
             let n = (input_len as u64).min(size);
             let mut j = 0u64;
             while j + 8 <= n {
-                write_volatile((buf + j) as *mut u64, read_volatile((_input + j) as *const u64));
+                write_volatile(
+                    (buf + j) as *mut u64,
+                    read_volatile((_input + j) as *const u64),
+                );
                 j += 8;
             }
             while j < n {
-                write_volatile((buf + j) as *mut u8, read_volatile((_input + j) as *const u8));
+                write_volatile(
+                    (buf + j) as *mut u8,
+                    read_volatile((_input + j) as *const u8),
+                );
                 j += 1;
             }
             // DefWindowProc LRESULT: TRUE(1) for the window-create messages (WM_NCCREATE=0x81 /
@@ -3203,7 +3346,10 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
                         write_volatile((pwnd + WND_DWUSERDATA_OFF) as *mut u64, create_params);
                         // Publish the Session VA so the executive can read LogonState (proof of the
                         // client-side SASWindowProc→DispatchSAS run).
-                        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_SESSION) as *mut u64, create_params);
+                        write_volatile(
+                            (WIN32K_SHARED_VADDR + SH_SAS_SESSION) as *mut u64,
+                            create_params,
+                        );
                         // Publish the SAS window HWND so the executive can INJECT the 2nd SAS to it via
                         // the real NtUserPostMessage path (the keyboard Ctrl-Alt-Del a headless host lacks).
                         write_volatile((WIN32K_SHARED_VADDR + SH_SAS_HWND) as *mut u64, hwnd);
@@ -3255,22 +3401,55 @@ fn register_trampolines() {
     // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
     // pool (Driver Host arena)
-    reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_with_tag as usize as u64);
+    reg.bind(
+        "ExAllocatePoolWithTag",
+        s_ex_alloc_pool_with_tag as usize as u64,
+    );
     reg.bind("ExAllocatePool", s_ex_alloc_pool as usize as u64);
-    reg.bind("ExAllocatePoolWithQuotaTag", s_ex_alloc_pool_quota as usize as u64);
+    reg.bind(
+        "ExAllocatePoolWithQuotaTag",
+        s_ex_alloc_pool_quota as usize as u64,
+    );
     reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
     reg.bind("ExFreePool", s_ex_free_pool_with_tag as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
-    reg.bind("RtlCreateAtomTable", s_rtl_create_atom_table as usize as u64);
-    reg.bind("RtlAddAtomToAtomTable", s_rtl_add_atom_to_atom_table as usize as u64);
-    reg.bind("RtlLookupAtomInAtomTable", s_rtl_lookup_atom_in_atom_table as usize as u64);
-    reg.bind("RtlDeleteAtomFromAtomTable", s_rtl_delete_atom_from_atom_table as usize as u64);
-    reg.bind("RtlPinAtomInAtomTable", s_rtl_pin_atom_in_atom_table as usize as u64);
-    reg.bind("RtlQueryAtomInAtomTable", s_rtl_query_atom_in_atom_table as usize as u64);
-    reg.bind("RtlDestroyAtomTable", s_rtl_destroy_atom_table as usize as u64);
+    reg.bind(
+        "RtlCreateAtomTable",
+        s_rtl_create_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlAddAtomToAtomTable",
+        s_rtl_add_atom_to_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlLookupAtomInAtomTable",
+        s_rtl_lookup_atom_in_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlDeleteAtomFromAtomTable",
+        s_rtl_delete_atom_from_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlPinAtomInAtomTable",
+        s_rtl_pin_atom_in_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlQueryAtomInAtomTable",
+        s_rtl_query_atom_in_atom_table as usize as u64,
+    );
+    reg.bind(
+        "RtlDestroyAtomTable",
+        s_rtl_destroy_atom_table as usize as u64,
+    );
     // Ob object layer (nt-object-manager)
-    reg.bind("ObReferenceObjectByHandle", s_ob_reference_object_by_handle as usize as u64);
-    reg.bind("ObOpenObjectByName", s_ob_open_object_by_name as usize as u64);
+    reg.bind(
+        "ObReferenceObjectByHandle",
+        s_ob_reference_object_by_handle as usize as u64,
+    );
+    reg.bind(
+        "ObOpenObjectByName",
+        s_ob_open_object_by_name as usize as u64,
+    );
     reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
@@ -3280,11 +3459,20 @@ fn register_trampolines() {
     reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as usize as u64);
     reg.bind("RtlFreeHeap", s_rtl_free_heap as usize as u64);
     // --- batch 2: RTL_BITMAP (GDI pool slot allocator) ---
-    reg.bind("RtlInitializeBitMap", s_rtl_initialize_bitmap as usize as u64);
+    reg.bind(
+        "RtlInitializeBitMap",
+        s_rtl_initialize_bitmap as usize as u64,
+    );
     reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as usize as u64);
     reg.bind("RtlSetAllBits", s_rtl_set_all_bits as usize as u64);
-    reg.bind("RtlFindClearBitsAndSet", s_rtl_find_clear_bits_and_set as usize as u64);
-    reg.bind("RtlNumberOfSetBits", s_rtl_number_of_set_bits as usize as u64);
+    reg.bind(
+        "RtlFindClearBitsAndSet",
+        s_rtl_find_clear_bits_and_set as usize as u64,
+    );
+    reg.bind(
+        "RtlNumberOfSetBits",
+        s_rtl_number_of_set_bits as usize as u64,
+    );
     reg.bind("RtlTestBit", s_rtl_test_bit as usize as u64);
     reg.bind("RtlSetBit", s_rtl_set_bit as usize as u64);
     reg.bind("RtlClearBit", s_rtl_clear_bit as usize as u64);
@@ -3292,35 +3480,89 @@ fn register_trampolines() {
     reg.bind("RtlClearBits", s_rtl_clear_bits as usize as u64);
     reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as usize as u64);
     // --- batch 2: RTL string init ---
-    reg.bind("RtlInitUnicodeString", s_rtl_init_unicode_string as usize as u64);
+    reg.bind(
+        "RtlInitUnicodeString",
+        s_rtl_init_unicode_string as usize as u64,
+    );
     reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
-    reg.bind("RtlInitEmptyUnicodeString", s_rtl_init_empty_unicode_string as usize as u64);
-    reg.bind("RtlCopyUnicodeString", s_rtl_copy_unicode_string as usize as u64);
-    reg.bind("RtlCompareUnicodeString", s_rtl_compare_unicode_string as usize as u64);
-    reg.bind("RtlEqualUnicodeString", s_rtl_equal_unicode_string as usize as u64);
-    reg.bind("RtlAppendUnicodeToString", s_rtl_append_unicode_to_string as usize as u64);
-    reg.bind("RtlCreateUnicodeString", s_rtl_create_unicode_string as usize as u64);
-    reg.bind("RtlMultiByteToUnicodeN", s_rtl_multibyte_to_unicode_n as usize as u64);
+    reg.bind(
+        "RtlInitEmptyUnicodeString",
+        s_rtl_init_empty_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCopyUnicodeString",
+        s_rtl_copy_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCompareUnicodeString",
+        s_rtl_compare_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlEqualUnicodeString",
+        s_rtl_equal_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlAppendUnicodeToString",
+        s_rtl_append_unicode_to_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCreateUnicodeString",
+        s_rtl_create_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlMultiByteToUnicodeN",
+        s_rtl_multibyte_to_unicode_n as usize as u64,
+    );
     reg.bind("wcslen", s_wcslen as usize as u64);
     reg.bind("_wcsnicmp", s_wcsnicmp as usize as u64);
     reg.bind("wcsnicmp", s_wcsnicmp as usize as u64);
     // --- batch 2: real va_list DbgPrintEx backend (nt_kernel_exec::dbg) ---
-    reg.bind("vDbgPrintExWithPrefix", s_vdbg_print_ex_with_prefix as usize as u64);
+    reg.bind(
+        "vDbgPrintExWithPrefix",
+        s_vdbg_print_ex_with_prefix as usize as u64,
+    );
     // --- batch 3: section objects (nt-kernel-exec session_section) ---
     reg.bind("MmCreateSection", s_mm_create_section as usize as u64);
     reg.bind("MmMapViewInSessionSpace", s_mm_map_view as usize as u64);
     reg.bind("MmMapViewInSystemSpace", s_mm_map_view as usize as u64);
-    reg.bind("MmMapViewOfSection", s_mm_map_view_of_section as usize as u64);
+    reg.bind(
+        "MmMapViewOfSection",
+        s_mm_map_view_of_section as usize as u64,
+    );
     // --- batch 3: lookaside-list init (nt_kernel_exec::init_general_lookaside) ---
-    reg.bind("ExInitializePagedLookasideList", s_ex_init_paged_lookaside as usize as u64);
-    reg.bind("ExInitializeNPagedLookasideList", s_ex_init_npaged_lookaside as usize as u64);
+    reg.bind(
+        "ExInitializePagedLookasideList",
+        s_ex_init_paged_lookaside as usize as u64,
+    );
+    reg.bind(
+        "ExInitializeNPagedLookasideList",
+        s_ex_init_npaged_lookaside as usize as u64,
+    );
     // --- batch 3: Zw virtual-memory / registry / file (canned; see backlog) ---
-    reg.bind("ZwAllocateVirtualMemory", s_zw_allocate_virtual_memory as usize as u64);
-    reg.bind("NtAllocateVirtualMemory", s_zw_allocate_virtual_memory as usize as u64);
-    reg.bind("ZwFreeVirtualMemory", s_zw_free_virtual_memory as usize as u64);
-    reg.bind("NtFreeVirtualMemory", s_zw_free_virtual_memory as usize as u64);
-    reg.bind("ZwSetSystemInformation", s_zw_set_system_information as usize as u64);
-    reg.bind("NtSetSystemInformation", s_zw_set_system_information as usize as u64);
+    reg.bind(
+        "ZwAllocateVirtualMemory",
+        s_zw_allocate_virtual_memory as usize as u64,
+    );
+    reg.bind(
+        "NtAllocateVirtualMemory",
+        s_zw_allocate_virtual_memory as usize as u64,
+    );
+    reg.bind(
+        "ZwFreeVirtualMemory",
+        s_zw_free_virtual_memory as usize as u64,
+    );
+    reg.bind(
+        "NtFreeVirtualMemory",
+        s_zw_free_virtual_memory as usize as u64,
+    );
+    reg.bind(
+        "ZwSetSystemInformation",
+        s_zw_set_system_information as usize as u64,
+    );
+    reg.bind(
+        "NtSetSystemInformation",
+        s_zw_set_system_information as usize as u64,
+    );
     reg.bind("ZwOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
@@ -3335,35 +3577,86 @@ fn register_trampolines() {
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
-    reg.bind("PsGetCurrentProcessId", s_current_process_id as usize as u64);
-    reg.bind("PsGetCurrentThreadProcessId", s_current_process_id as usize as u64);
+    reg.bind(
+        "PsGetCurrentProcessId",
+        s_current_process_id as usize as u64,
+    );
+    reg.bind(
+        "PsGetCurrentThreadProcessId",
+        s_current_process_id as usize as u64,
+    );
     reg.bind("IoGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentThread", s_current_thread as usize as u64);
-    reg.bind("PsLookupProcessByProcessId", s_ps_lookup_process_by_id as usize as u64);
+    reg.bind(
+        "PsLookupProcessByProcessId",
+        s_ps_lookup_process_by_id as usize as u64,
+    );
     reg.bind("KeGetCurrentThread", s_current_thread as usize as u64);
-    reg.bind("PsGetCurrentProcessWin32Process", s_get_current_win32process as usize as u64);
-    reg.bind("PsGetProcessWin32Process", s_get_process_win32process as usize as u64);
-    reg.bind("PsGetCurrentThreadWin32Thread", s_get_current_win32thread as usize as u64);
-    reg.bind("PsGetThreadWin32Thread", s_get_thread_win32thread as usize as u64);
-    reg.bind("PsSetProcessWin32Process", s_set_win32process as usize as u64);
+    reg.bind(
+        "PsGetCurrentProcessWin32Process",
+        s_get_current_win32process as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessWin32Process",
+        s_get_process_win32process as usize as u64,
+    );
+    reg.bind(
+        "PsGetCurrentThreadWin32Thread",
+        s_get_current_win32thread as usize as u64,
+    );
+    reg.bind(
+        "PsGetThreadWin32Thread",
+        s_get_thread_win32thread as usize as u64,
+    );
+    reg.bind(
+        "PsSetProcessWin32Process",
+        s_set_win32process as usize as u64,
+    );
     reg.bind("PsSetThreadWin32Thread", s_set_win32thread as usize as u64);
-    reg.bind("PsGetProcessWin32WindowStation", s_ps_get_process_winsta as usize as u64);
-    reg.bind("PsSetProcessWindowStation", s_ps_set_process_winsta as usize as u64);
-    reg.bind("PsEstablishWin32Callouts", s_establish_win32_callouts as usize as u64);
+    reg.bind(
+        "PsGetProcessWin32WindowStation",
+        s_ps_get_process_winsta as usize as u64,
+    );
+    reg.bind(
+        "PsSetProcessWindowStation",
+        s_ps_set_process_winsta as usize as u64,
+    );
+    reg.bind(
+        "PsEstablishWin32Callouts",
+        s_establish_win32_callouts as usize as u64,
+    );
     // --- batch 4: misc scalars ---
-    reg.bind("IoGetDeviceObjectPointer", s_io_get_device_object_pointer as usize as u64);
-    reg.bind("KeUserModeCallback", s_ke_user_mode_callback_rendezvous as usize as u64);
-    reg.bind("KeAddSystemServiceTable", s_ke_add_system_service_table as usize as u64);
+    reg.bind(
+        "IoGetDeviceObjectPointer",
+        s_io_get_device_object_pointer as usize as u64,
+    );
+    reg.bind(
+        "KeUserModeCallback",
+        s_ke_user_mode_callback_rendezvous as usize as u64,
+    );
+    reg.bind(
+        "KeAddSystemServiceTable",
+        s_ke_add_system_service_table as usize as u64,
+    );
     reg.bind("DbgPrint", s_dbg_print as usize as u64);
     // --- batch 4: resource / lock acquire → BOOLEAN TRUE (single-threaded host: always acquired) ---
     reg.bind("ExAcquireResourceExclusiveLite", s_true as usize as u64);
     reg.bind("ExAcquireResourceSharedLite", s_true as usize as u64);
     reg.bind("ExIsResourceAcquiredExclusiveLite", s_true as usize as u64);
     reg.bind("ExIsResourceAcquiredSharedLite", s_true as usize as u64);
-    reg.bind("ExEnterCriticalRegionAndAcquireResourceShared", s_true as usize as u64);
-    reg.bind("ExEnterCriticalRegionAndAcquireResourceExclusive", s_true as usize as u64);
-    reg.bind("ExEnterCriticalRegionAndAcquireFastMutexUnsafe", s_true as usize as u64);
+    reg.bind(
+        "ExEnterCriticalRegionAndAcquireResourceShared",
+        s_true as usize as u64,
+    );
+    reg.bind(
+        "ExEnterCriticalRegionAndAcquireResourceExclusive",
+        s_true as usize as u64,
+    );
+    reg.bind(
+        "ExEnterCriticalRegionAndAcquireFastMutexUnsafe",
+        s_true as usize as u64,
+    );
     reg.bind("ExfAcquirePushLockExclusive", s_true as usize as u64);
     reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
     reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
@@ -3404,7 +3697,10 @@ fn register_trampolines() {
     // nt_compat_exports::win32k_resolve::WIN32K_DATA_EXPORTS.
     let mut di = 0usize;
     while di < DATA_EXPORTS.len() {
-        reg.bind(DATA_EXPORTS[di].0, WIN32K_DATA_VADDR + 0x1000 + di as u64 * 8);
+        reg.bind(
+            DATA_EXPORTS[di].0,
+            WIN32K_DATA_VADDR + 0x1000 + di as u64 * 8,
+        );
         di += 1;
     }
 }
@@ -3488,7 +3784,10 @@ pub fn code_rights() -> &'static [u64] {
 unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
     let mut i = 0u64;
     while i + 8 <= n {
-        write_unaligned((dst + i) as *mut u64, read_unaligned((src + i) as *const u64));
+        write_unaligned(
+            (dst + i) as *mut u64,
+            read_unaligned((src + i) as *const u64),
+        );
         i += 8;
     }
     while i < n {
@@ -3532,7 +3831,11 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
         let n = raw_size.min(WIN32K_IMAGE_FRAMES * 0x1000 - va);
         copy_bytes(code_va + va, src_va + raw_ptr, n);
         // IMAGE_SCN_MEM_EXECUTE = 0x2000_0000 → RX (rights 2); else RW_NX.
-        let r = if chars & 0x2000_0000 != 0 { 2u64 } else { RW_NX };
+        let r = if chars & 0x2000_0000 != 0 {
+            2u64
+        } else {
+            RW_NX
+        };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
         while p < span {
@@ -3575,7 +3878,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
     // by the Se/Nls cells.
     for (idx, (name, value)) in DATA_EXPORTS.iter().enumerate() {
         let cell_value = object_type_cell_value(name).unwrap_or(*value);
-        write_volatile((WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64, cell_value);
+        write_volatile(
+            (WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64,
+            cell_value,
+        );
     }
 
     // SeExports (backlog item 3, Se→nt-security): build a REAL SE_EXPORTS in DATA page 0 so
@@ -3757,9 +4063,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
     let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
-    let top_level = read_volatile(
-        (WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64,
-    ) == 0;
+    let top_level =
+        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0;
     if !seed_win32k_client_context(client_pi, process_id)
         || !ensure_win32k_process_attached(client_pi)
         || !ensure_win32k_threadinfo(client_pi)
@@ -3868,10 +4173,16 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
             // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
             if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-                write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
+                write_volatile(
+                    (BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64,
+                    WIN32K_HEAP_HANDLE,
+                );
             }
         }
-        write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
+        write_volatile(
+            (t + THREADINFO_PDESKINFO_OFF) as *mut u64,
+            BOUND_DESK_PDESKINFO,
+        );
         let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
         if pci != 0 {
             write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
@@ -3895,7 +4206,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         // TEB.Win32ClientInfo (pDeskInfo = DESKTOPINFO−delta; Win32ThreadInfo = pti == head.pti),
         // so user32's client-side ValidateHwnd/IntCallMessageProc resolve the SAS window and run
         // its real SASWindowProc without a syscall. Written every dispatch (cheap, coherent frame).
-        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64, BOUND_DESK_PDESKINFO);
+        write_volatile(
+            (WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64,
+            BOUND_DESK_PDESKINFO,
+        );
         write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, t);
     }
     if ssn == SSN_NT_USER_INITIALIZE_REAL {
@@ -3979,11 +4293,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let sh = WIN32K_SHARED_VADDR;
     let debug_flags = read_volatile((sh + SH_REQ_DEBUG_FLAGS) as *const u64);
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
-    // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
-    // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
-    // returns TRUE with ZERO paint work — desktop.c:2996); (2) NrGuiAppsRunning (if != 0, co_AddGuiApp's
-    // lazy co_IntInitializeDesktopGraphics won't run on the 0→1 transition → SM_CXSCREEN stays 0 → blit
-    // no-ops). a0 (the HDESK) is the switch target.
+                                                                                  // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
+                                                                                  // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
+                                                                                  // returns TRUE with ZERO paint work — desktop.c:2996); (2) NrGuiAppsRunning (if != 0, co_AddGuiApp's
+                                                                                  // lazy co_IntInitializeDesktopGraphics won't run on the 0→1 transition → SM_CXSCREEN stays 0 → blit
+                                                                                  // no-ops). a0 (the HDESK) is the switch target.
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
         let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
         let target_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
@@ -3998,7 +4312,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         print_hex(gpdesk as u32);
         print_str(b" NrGuiAppsRunning=0x");
         print_hex(ngui);
-        print_str(if gpdesk != 0 && gpdesk == target_body { b" [ALREADY-CURRENT!]\n" } else { b"\n" });
+        print_str(if gpdesk != 0 && gpdesk == target_body {
+            b" [ALREADY-CURRENT!]\n"
+        } else {
+            b"\n"
+        });
     }
     let trace_setwndproc = (ssn == SSN_NT_USER_SET_WINDOW_LONG
         || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
@@ -4065,23 +4383,78 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
 
     let ret = if nargs <= 4 {
-        let f: extern "win64" fn(u64, u64, u64, u64) -> u64 = core::mem::transmute(handler as *const ());
+        let f: extern "win64" fn(u64, u64, u64, u64) -> u64 =
+            core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3)
     } else if nargs <= 8 {
         let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3, s(4), s(5), s(6), s(7))
     } else if nargs <= 12 {
-        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-            core::mem::transmute(handler as *const ());
-        f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11))
+        let f: extern "win64" fn(
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+        ) -> u64 = core::mem::transmute(handler as *const ());
+        f(
+            a0,
+            a1,
+            a2,
+            a3,
+            s(4),
+            s(5),
+            s(6),
+            s(7),
+            s(8),
+            s(9),
+            s(10),
+            s(11),
+        )
     } else {
         // Up to 16 args (covers NtUserCreateWindowEx = 15). Extra tail entries are 0 (unused).
         let f: extern "win64" fn(
-            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
         ) -> u64 = core::mem::transmute(handler as *const ());
         f(
-            a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11), s(12), s(13), s(14),
+            a0,
+            a1,
+            a2,
+            a3,
+            s(4),
+            s(5),
+            s(6),
+            s(7),
+            s(8),
+            s(9),
+            s(10),
+            s(11),
+            s(12),
+            s(13),
+            s(14),
             s(15),
         )
     };
@@ -4184,8 +4557,16 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // WM_ERASEBKGND → IntPaintDesktop over the full clip box. The pixels are still painted by win32k's
             // real GDI, not by us. The desktop HWND is `gpdesk->pDeskInfo->spwnd->head.h` (WND HEAD.h @ spwnd+0).
             let pdeskinfo = read_volatile((gpdesk + 0x08) as *const u64); // DESKTOP.pDeskInfo
-            let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
-            let hwnd_desktop = if spwnd != 0 { read_volatile(spwnd as *const u64) } else { 0 }; // WND HEAD.h
+            let spwnd = if pdeskinfo != 0 {
+                read_volatile((pdeskinfo + 0x10) as *const u64)
+            } else {
+                0
+            };
+            let hwnd_desktop = if spwnd != 0 {
+                read_volatile(spwnd as *const u64)
+            } else {
+                0
+            }; // WND HEAD.h
             if hwnd_desktop != 0 {
                 // Per-client THREADINFO isolation means the desktop window can still carry the bootstrap
                 // desktop-thread owner while this repaint runs in winlogon's isolated thread. In this
@@ -4223,7 +4604,9 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                     print_str(b"[win32k-paint] WARN: NtUserRedrawWindow SSN unresolved\n");
                 }
             } else {
-                print_str(b"[win32k-paint] WARN: no desktop HWND (spwnd null) - full repaint skipped\n");
+                print_str(
+                    b"[win32k-paint] WARN: no desktop HWND (spwnd null) - full repaint skipped\n",
+                );
             }
         }
     }
@@ -4248,7 +4631,10 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 write_volatile(rpwinsta, winsta_body);
                 // Keep the InputWindowStation global consistent (it is already set by the bring-up
                 // gfx-trigger to this same cached body; setting it is idempotent/harmless).
-                write_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64, winsta_body);
+                write_volatile(
+                    (WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64,
+                    winsta_body,
+                );
                 print_str(b"[win32k-host] routed NtUserCreateDesktop hDesk=0x");
                 print_hex(hdesk as u32);
                 print_str(b" rpwinstaParent set -> body=0x");
@@ -4336,7 +4722,11 @@ unsafe fn setup_dispatch_context() {
     // list head (Flink=Blink=&head) — the authentic InitializeListHead.
     let w32thread = {
         let t = current_w32thread();
-        if t == 0 { PH_W32THREAD_VA } else { t }
+        if t == 0 {
+            PH_W32THREAD_VA
+        } else {
+            t
+        }
     };
     init_threadinfo_placeholder(w32thread);
 
@@ -4545,7 +4935,10 @@ unsafe fn seed_process_startup_desktop(hdesk: u64) {
         return;
     }
     write_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *mut u64, hdesk);
-    write_volatile((ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *mut u64, desk_body);
+    write_volatile(
+        (ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *mut u64,
+        desk_body,
+    );
     let pti = current_w32thread();
     if pti != 0 && read_volatile((ppi + PROCESSINFO_PTIMAINTHREAD_OFF) as *const u64) == 0 {
         write_volatile((ppi + PROCESSINFO_PTIMAINTHREAD_OFF) as *mut u64, pti);
@@ -4782,11 +5175,19 @@ unsafe fn create_winsta_and_desktop() {
     let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
     if desk_body != 0 && winsta_body != 0 {
         // (1) pdesk->rpwinstaParent = our WINDOWSTATION body.
-        write_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64, winsta_body);
+        write_volatile(
+            (desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
+            winsta_body,
+        );
         // (2) the interactive InputWindowStation global = the same window station.
-        write_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64, winsta_body);
+        write_volatile(
+            (WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64,
+            winsta_body,
+        );
 
-        print_str(b"[win32k-host] NtUserSwitchDesktop(hDesk) [rpwinstaParent+InputWindowStation set]\n");
+        print_str(
+            b"[win32k-host] NtUserSwitchDesktop(hDesk) [rpwinstaParent+InputWindowStation set]\n",
+        );
         let switch: extern "win64" fn(u64) -> i32 =
             core::mem::transmute((WIN32K_CODE_VA + NT_USER_SWITCH_DESKTOP_RVA) as *const ());
         let sret = switch(hdesk);
@@ -4799,8 +5200,16 @@ unsafe fn create_winsta_and_desktop() {
         print_str(b" (spwnd=0x");
         // pDeskInfo @ body+0x08; DESKTOPINFO.spwnd @ +0x10 (pvDesktopBase@0, pvDesktopLimit@8, spwnd@0x10
         // — confirmed by co_IntShowDesktop disasm 0x6dc5c `mov rax,[rax+8]`; 0x6dc60 `mov rax,[rax+0x10]`).
-        let pdeskinfo = if gpdesk != 0 { read_volatile((gpdesk + 0x08) as *const u64) } else { 0 };
-        let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
+        let pdeskinfo = if gpdesk != 0 {
+            read_volatile((gpdesk + 0x08) as *const u64)
+        } else {
+            0
+        };
+        let spwnd = if pdeskinfo != 0 {
+            read_volatile((pdeskinfo + 0x10) as *const u64)
+        } else {
+            0
+        };
         print_hex((spwnd >> 32) as u32);
         print_hex(spwnd as u32);
         print_str(b")\n");
@@ -4828,7 +5237,7 @@ unsafe fn create_winsta_and_desktop() {
         }
         write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, desk_body); // pti->rpdesk = pdesk
         write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, desk_pdeskinfo); // = rpdesk->pDeskInfo
-        // Latch for per-dispatch re-assertion (see BOUND_DESK_* + dispatch_loop top).
+                                                                                      // Latch for per-dispatch re-assertion (see BOUND_DESK_* + dispatch_loop top).
         BOUND_DESK_BODY = desk_body;
         BOUND_DESK_PDESKINFO = desk_pdeskinfo;
         // Mirror the client side (pci->pDeskInfo), ulClientDelta == 0 in our single-AS host.
@@ -4882,7 +5291,10 @@ unsafe fn establish_client_and_dispatch() {
     }
     let idx = SSN_NT_USER_INITIALIZE - WIN32K_SERVICE_BASE;
     let handler = read_volatile((ssdt_base + idx * 8) as *const u64);
-    write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_HANDLER) as *mut u64, handler);
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_NTUSER_HANDLER) as *mut u64,
+        handler,
+    );
     print_str(b"[win32k-host] SSDT resolve(0x10FA) -> handler=0x");
     print_hex((handler >> 32) as u32);
     print_hex(handler as u32);
@@ -4904,7 +5316,8 @@ unsafe fn establish_client_and_dispatch() {
     print_hex(callout as u32);
     print_str(b"\n");
     if callout != 0 {
-        let mut v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_CALLOUT_ENTERED;
+        let mut v =
+            read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_CALLOUT_ENTERED;
         write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
         let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
         let cstatus = co(eprocess, 1);
@@ -4946,7 +5359,10 @@ unsafe fn establish_client_and_dispatch() {
         v |= V_NTUSER_SUCCESS;
     }
     write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
-    write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32, nstatus);
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32,
+        nstatus,
+    );
     print_str(b"[win32k-host] NtUserProcessConnect(0x10FA) returned status=0x");
     print_hex(nstatus as u32);
     print_str(b"\n");
@@ -4993,8 +5409,8 @@ static mut DXG_IMAGE: u64 = 0; // ImageAddress = DXG_VA
 static mut DXG_ENTRY: u64 = 0; // EntryPoint = DXG_VA + entry_rva
 static mut DXG_EXPORT_DIR: u64 = 0; // ExportSectionPointer = DXG_VA + export_dir_rva
 static mut DXG_IMAGE_LEN: u32 = 0; // size_of_image
-// Pre-loaded framebuf.dll image info (parallel to DXG_*), reported to win32k when it dynamically
-// loads "framebuf.dll" via ZwSetSystemInformation(SystemLoadGdiDriverInformation).
+                                   // Pre-loaded framebuf.dll image info (parallel to DXG_*), reported to win32k when it dynamically
+                                   // loads "framebuf.dll" via ZwSetSystemInformation(SystemLoadGdiDriverInformation).
 static mut FRAMEBUF_IMAGE: u64 = 0;
 static mut FRAMEBUF_ENTRY: u64 = 0;
 static mut FRAMEBUF_EXPORT_DIR: u64 = 0;
@@ -5012,8 +5428,15 @@ static mut KBDUS_IMAGE_LEN: u32 = 0;
 pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     unsafe {
         write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE), FRAMEBUF_VA);
-        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_ENTRY), FRAMEBUF_VA + entry_rva as u64);
-        let expd = if export_dir_rva != 0 { FRAMEBUF_VA + export_dir_rva as u64 } else { 0 };
+        write_volatile(
+            core::ptr::addr_of_mut!(FRAMEBUF_ENTRY),
+            FRAMEBUF_VA + entry_rva as u64,
+        );
+        let expd = if export_dir_rva != 0 {
+            FRAMEBUF_VA + export_dir_rva as u64
+        } else {
+            0
+        };
         write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_EXPORT_DIR), expd);
         write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE_LEN), image_len);
     }
@@ -5024,8 +5447,15 @@ pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
 pub fn record_kbdus(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     unsafe {
         write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE), KBDUS_VA);
-        write_volatile(core::ptr::addr_of_mut!(KBDUS_ENTRY), KBDUS_VA + entry_rva as u64);
-        let expd = if export_dir_rva != 0 { KBDUS_VA + export_dir_rva as u64 } else { 0 };
+        write_volatile(
+            core::ptr::addr_of_mut!(KBDUS_ENTRY),
+            KBDUS_VA + entry_rva as u64,
+        );
+        let expd = if export_dir_rva != 0 {
+            KBDUS_VA + export_dir_rva as u64
+        } else {
+            0
+        };
         write_volatile(core::ptr::addr_of_mut!(KBDUS_EXPORT_DIR), expd);
         write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE_LEN), image_len);
     }
@@ -5155,7 +5585,11 @@ pub unsafe fn load_driver_into(
         }
         let n = raw_size.min(cap - va);
         copy_bytes(dst_va + va, src_va + raw_ptr, n);
-        let r = if chars & 0x2000_0000 != 0 { 2u64 } else { RW_NX };
+        let r = if chars & 0x2000_0000 != 0 {
+            2u64
+        } else {
+            RW_NX
+        };
         let span = va + vsize.max(raw_size);
         let mut p = va & !0xFFF;
         while p < span {
@@ -5270,8 +5704,14 @@ pub unsafe fn load_driver_into(
 pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     unsafe {
         write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE), DXG_VA);
-        write_volatile(core::ptr::addr_of_mut!(DXG_ENTRY), DXG_VA + entry_rva as u64);
-        write_volatile(core::ptr::addr_of_mut!(DXG_EXPORT_DIR), DXG_VA + export_dir_rva as u64);
+        write_volatile(
+            core::ptr::addr_of_mut!(DXG_ENTRY),
+            DXG_VA + entry_rva as u64,
+        );
+        write_volatile(
+            core::ptr::addr_of_mut!(DXG_EXPORT_DIR),
+            DXG_VA + export_dir_rva as u64,
+        );
         write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE_LEN), image_len);
     }
 }

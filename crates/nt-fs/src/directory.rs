@@ -1,9 +1,9 @@
 //! Native directory-query state, wildcard matching, and information-record encoding.
 
 use crate::{
-    STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE, STATUS_NO_MORE_FILES,
-    STATUS_NO_SUCH_FILE, STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS,
+    STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
+    STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS,
 };
 
 pub const MAX_DIRECTORY_NAME: usize = 260;
@@ -119,7 +119,9 @@ impl DirectoryQueryState {
     }
 
     fn capture_pattern(&mut self, pattern: Option<&[u16]>) -> bool {
-        let pattern = pattern.filter(|value| !value.is_empty()).unwrap_or(&[b'*' as u16]);
+        let pattern = pattern
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&[b'*' as u16]);
         if pattern.len() > self.pattern.len() {
             return false;
         }
@@ -381,7 +383,15 @@ fn encode_fixed(output: &mut [u8], layout: RecordLayout, entry: &DirectoryEntry)
         put_u64(output, 32, entry.change_time);
         put_u64(output, 40, entry.end_of_file);
         put_u64(output, 48, entry.allocation_size);
-        put_u32(output, 56, if entry.attributes == 0 { 0x80 } else { entry.attributes });
+        put_u32(
+            output,
+            56,
+            if entry.attributes == 0 {
+                0x80
+            } else {
+                entry.attributes
+            },
+        );
         put_u32(output, 60, entry.name_len as u32 * 2);
     } else {
         put_u32(output, 8, entry.name_len as u32 * 2);
@@ -484,7 +494,11 @@ pub fn query_directory(
         if let Some(previous) = previous_record {
             put_u32(output, previous, (written - previous) as u32);
         }
-        encode_fixed(&mut output[written..written + layout.minimum_size], layout, entry);
+        encode_fixed(
+            &mut output[written..written + layout.minimum_size],
+            layout,
+            entry,
+        );
         copy_name(
             &mut output[written..written + record_bytes],
             layout.name_offset,
@@ -502,7 +516,11 @@ pub fn query_directory(
 
     if written == 0 {
         DirectoryQueryResult {
-            status: if first_scan { STATUS_NO_SUCH_FILE } else { STATUS_NO_MORE_FILES },
+            status: if first_scan {
+                STATUS_NO_SUCH_FILE
+            } else {
+                STATUS_NO_MORE_FILES
+            },
             information: 0,
         }
     } else {
@@ -519,7 +537,11 @@ mod tests {
     extern crate std;
 
     fn entry(name: &str, short: &str, index: u32) -> DirectoryEntry {
-        let mut entry = DirectoryEntry { file_index: index, file_id: index as u64 + 100, ..Default::default() };
+        let mut entry = DirectoryEntry {
+            file_index: index,
+            file_id: index as u64 + 100,
+            ..Default::default()
+        };
         assert!(entry.set_name(&name.encode_utf16().collect::<std::vec::Vec<_>>()));
         assert!(entry.set_short_name(&short.encode_utf16().collect::<std::vec::Vec<_>>()));
         entry
@@ -527,28 +549,74 @@ mod tests {
 
     #[test]
     fn wildcard_matches_long_or_short_names_case_insensitively() {
-        let item = entry("amd64_Microsoft.Windows.Common-Controls_6.0.1.manifest", "COMMON~1.MAN", 1);
-        assert!(wildcard_match(&"AMD64_*_6.0.*.manifest".encode_utf16().collect::<std::vec::Vec<_>>(), item.name()));
-        assert!(entry_matches(&"common~?.man".encode_utf16().collect::<std::vec::Vec<_>>(), &item));
-        assert!(!entry_matches(&"x86_*".encode_utf16().collect::<std::vec::Vec<_>>(), &item));
+        let item = entry(
+            "amd64_Microsoft.Windows.Common-Controls_6.0.1.manifest",
+            "COMMON~1.MAN",
+            1,
+        );
+        assert!(wildcard_match(
+            &"AMD64_*_6.0.*.manifest"
+                .encode_utf16()
+                .collect::<std::vec::Vec<_>>(),
+            item.name()
+        ));
+        assert!(entry_matches(
+            &"common~?.man".encode_utf16().collect::<std::vec::Vec<_>>(),
+            &item
+        ));
+        assert!(!entry_matches(
+            &"x86_*".encode_utf16().collect::<std::vec::Vec<_>>(),
+            &item
+        ));
     }
 
     #[test]
     fn class_three_batches_and_continues() {
-        let entries = [entry("one.manifest", "ONE.MAN", 1), entry("two.manifest", "TWO.MAN", 2)];
+        let entries = [
+            entry("one.manifest", "ONE.MAN", 1),
+            entry("two.manifest", "TWO.MAN", 2),
+        ];
         let pattern = "*.manifest".encode_utf16().collect::<std::vec::Vec<_>>();
         let mut state = DirectoryQueryState::new();
         let mut first = [0u8; 120];
-        let result = query_directory(&mut state, &entries, FILE_BOTH_DIRECTORY_INFORMATION, false, Some(&pattern), true, &mut first);
+        let result = query_directory(
+            &mut state,
+            &entries,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            false,
+            Some(&pattern),
+            true,
+            &mut first,
+        );
         assert_eq!(result.status, STATUS_SUCCESS);
         assert_eq!(state.cursor(), 1);
         assert_eq!(u32::from_le_bytes(first[0..4].try_into().unwrap()), 0);
         let mut second = [0u8; 120];
-        let result = query_directory(&mut state, &entries, FILE_BOTH_DIRECTORY_INFORMATION, false, None, false, &mut second);
+        let result = query_directory(
+            &mut state,
+            &entries,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            false,
+            None,
+            false,
+            &mut second,
+        );
         assert_eq!(result.status, STATUS_SUCCESS);
         assert_eq!(state.cursor(), 2);
         assert_eq!(u32::from_le_bytes(second[60..64].try_into().unwrap()), 24);
-        assert_eq!(query_directory(&mut state, &entries, FILE_BOTH_DIRECTORY_INFORMATION, false, None, false, &mut second).status, STATUS_NO_MORE_FILES);
+        assert_eq!(
+            query_directory(
+                &mut state,
+                &entries,
+                FILE_BOTH_DIRECTORY_INFORMATION,
+                false,
+                None,
+                false,
+                &mut second
+            )
+            .status,
+            STATUS_NO_MORE_FILES
+        );
     }
 
     #[test]
@@ -585,7 +653,15 @@ mod tests {
         let entries = [entry("a-very-long-name.manifest", "LONG.MAN", 1)];
         let mut state = DirectoryQueryState::new();
         let mut output = [0u8; 100];
-        let result = query_directory(&mut state, &entries, FILE_BOTH_DIRECTORY_INFORMATION, false, None, true, &mut output);
+        let result = query_directory(
+            &mut state,
+            &entries,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            false,
+            None,
+            true,
+            &mut output,
+        );
         assert_eq!(result.status, STATUS_BUFFER_OVERFLOW);
         assert_eq!(state.cursor(), 0);
         assert_eq!(u32::from_le_bytes(output[60..64].try_into().unwrap()), 50);
@@ -605,9 +681,18 @@ mod tests {
             let mut state = DirectoryQueryState::new();
             let mut output = [0u8; 128];
             let result = query_directory(&mut state, &[item], class, true, None, true, &mut output);
-            assert_eq!(result, DirectoryQueryResult { status: STATUS_SUCCESS, information: name_offset + 2 });
+            assert_eq!(
+                result,
+                DirectoryQueryResult {
+                    status: STATUS_SUCCESS,
+                    information: name_offset + 2
+                }
+            );
             assert!(minimum <= output.len());
-            assert_eq!(u16::from_le_bytes(output[name_offset..name_offset + 2].try_into().unwrap()), b'x' as u16);
+            assert_eq!(
+                u16::from_le_bytes(output[name_offset..name_offset + 2].try_into().unwrap()),
+                b'x' as u16
+            );
         }
     }
 

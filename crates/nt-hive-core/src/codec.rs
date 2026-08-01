@@ -156,7 +156,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     id,
                     parent_key,
                     name,
-                    value_type: RegistryValueType::from_u32(ty).unwrap_or(RegistryValueType::Binary),
+                    value_type: RegistryValueType::from_u32(ty)
+                        .unwrap_or(RegistryValueType::Binary),
                     data,
                     last_write_sequence: seq,
                 });
@@ -175,9 +176,19 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
 
 /// A hive mutation to log (spec §12.4), path-addressed so it survives cell-ID rewrites.
 pub enum HiveLogOp<'a> {
-    CreateKey { path: &'a str },
-    SetValue { path: &'a str, name: &'a str, value_type: RegistryValueType, data: &'a [u8] },
-    DeleteValue { path: &'a str, name: &'a str },
+    CreateKey {
+        path: &'a str,
+    },
+    SetValue {
+        path: &'a str,
+        name: &'a str,
+        value_type: RegistryValueType,
+        data: &'a [u8],
+    },
+    DeleteValue {
+        path: &'a str,
+        name: &'a str,
+    },
 }
 
 /// Encode one log record (spec §12.3): an `HLR1` header (op + sequence + CRCs) + payload.
@@ -188,7 +199,12 @@ pub fn encode_log_record(op: &HiveLogOp, sequence: u64) -> Vec<u8> {
             p.str16(path);
             OP_CREATE_KEY
         }
-        HiveLogOp::SetValue { path, name, value_type, data } => {
+        HiveLogOp::SetValue {
+            path,
+            name,
+            value_type,
+            data,
+        } => {
             p.str16(path);
             p.str16(name);
             p.u32(*value_type as u32);
@@ -224,7 +240,9 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
     let mut last = base;
     loop {
         let start = bytes.len() - r.remaining();
-        let Some(magic) = r.blob_fixed::<4>() else { break };
+        let Some(magic) = r.blob_fixed::<4>() else {
+            break;
+        };
         if magic != LOG_MAGIC {
             break;
         }
@@ -233,11 +251,15 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
         else {
             break;
         };
-        let Some(header) = bytes.get(start..start + LOG_HEADER_LEN) else { break };
+        let Some(header) = bytes.get(start..start + LOG_HEADER_LEN) else {
+            break;
+        };
         if crc32c(&header[..LOG_HEADER_LEN - 4]) != rcrc {
             break;
         }
-        let Some(payload) = r.take_slice(plen as usize) else { break };
+        let Some(payload) = r.take_slice(plen as usize) else {
+            break;
+        };
         if crc32c(payload) != pcrc {
             break;
         }
@@ -304,7 +326,11 @@ impl Hive {
         }
         self.next_id = self.next_id.max(v.id.0 + 1);
         self.cells[idx] = Some(Cell::Value(v));
-        if let Some(Cell::Key(k)) = self.cells.get_mut(parent.0 as usize).and_then(|c| c.as_mut()) {
+        if let Some(Cell::Key(k)) = self
+            .cells
+            .get_mut(parent.0 as usize)
+            .and_then(|c| c.as_mut())
+        {
             k.values.push(CellId(idx as u64));
         }
     }
@@ -319,7 +345,11 @@ impl Hive {
             })
             .collect();
         for (parent, folded, id) in links {
-            if let Some(Cell::Key(k)) = self.cells.get_mut(parent.0 as usize).and_then(|c| c.as_mut()) {
+            if let Some(Cell::Key(k)) = self
+                .cells
+                .get_mut(parent.0 as usize)
+                .and_then(|c| c.as_mut())
+            {
                 k.subkeys.push((folded, id));
             }
         }

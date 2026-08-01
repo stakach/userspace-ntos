@@ -27,8 +27,16 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
     // isolated host's VSpace. The hive lands in the shared frame at +0x100 (past the metadata)
     // for the executive's Config Manager to parse.
     let (
-        verdict, cluster, size, hive_size, smss_size, imports_size, ntdll_size,
-        nls_ansi_size, nls_oem_size, nls_case_size,
+        verdict,
+        cluster,
+        size,
+        hive_size,
+        smss_size,
+        imports_size,
+        ntdll_size,
+        nls_ansi_size,
+        nls_oem_size,
+        nls_case_size,
     ) = storage_probe(
         AHCI_VADDR,
         AHCI_DMA_VADDR,

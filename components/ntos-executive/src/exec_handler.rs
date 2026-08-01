@@ -7208,6 +7208,84 @@ impl ExecNtHandler {
         0
     }
 
+    pub(crate) unsafe fn model_lpc_request_reply(&mut self, reqmsg: u64) -> u32 {
+        // Generic LPC fallback for modeled non-CSR ports. Keep it out of CSR message-plane accounting:
+        // `CSR_API_MODELED_FALLBACKS` must mean a \Windows\ApiPort request avoided the real CSR worker.
+        let _ = self.xas_try_write_buf(reqmsg + 0x34, &0u32.to_le_bytes());
+        let _ = self.xas_try_write_buf(
+            reqmsg + 0x04,
+            &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
+        );
+        print_str(b"[lpc-msg] NtRequestWaitReplyPort -> modeled reply Status=SUCCESS (non-CSR port)\n");
+        0
+    }
+
+    pub(crate) unsafe fn service_srm_request_reply(&mut self, reqmsg: u64, replymsg: u64) -> u32 {
+        const PORT_MESSAGE_HEADER_LEN: u64 = 0x28;
+        const SRM_API_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN;
+        const SRM_RESULT_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN + 4;
+        const SRM_LUID_OFFSET: u64 = PORT_MESSAGE_HEADER_LEN + 4;
+        const RM_AUDIT_SET_COMMAND: u32 = 1;
+        const RM_CREATE_LOGON_SESSION: u32 = 2;
+        const RM_DELETE_LOGON_SESSION: u32 = 3;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+        let mut header = [0u8; 4];
+        if !self.xas_read(reqmsg, &mut header) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let total_len = u16::from_le_bytes([header[2], header[3]]) as u64;
+        let mut api_bytes = [0u8; 4];
+        if total_len < SRM_API_OFFSET + 4 || !self.xas_read(reqmsg + SRM_API_OFFSET, &mut api_bytes)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let api_number = u32::from_le_bytes(api_bytes);
+        let mut result_status = 0u32;
+        let mut luid = [0u8; 8];
+        match api_number {
+            RM_AUDIT_SET_COMMAND => {}
+            RM_CREATE_LOGON_SESSION | RM_DELETE_LOGON_SESSION => {
+                if total_len < SRM_LUID_OFFSET + 8
+                    || !self.xas_read(reqmsg + SRM_LUID_OFFSET, &mut luid)
+                {
+                    result_status = STATUS_INVALID_PARAMETER;
+                }
+            }
+            _ => {
+                result_status = STATUS_INVALID_PARAMETER;
+            }
+        }
+
+        if replymsg == 0
+            || !self.xas_try_write_buf(
+                replymsg + 0x04,
+                &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
+            )
+            || !self.xas_try_write_buf(replymsg + SRM_RESULT_OFFSET, &result_status.to_le_bytes())
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        print_str(b"[srm] serviced \\SeRmCommandPort ApiNumber=");
+        print_u64(api_number as u64);
+        if matches!(
+            api_number,
+            RM_CREATE_LOGON_SESSION | RM_DELETE_LOGON_SESSION
+        ) && result_status == 0
+        {
+            print_str(b" luid=0x");
+            print_hex(u32::from_le_bytes(luid[4..8].try_into().unwrap()));
+            print_hex(u32::from_le_bytes(luid[0..4].try_into().unwrap()));
+        }
+        print_str(b" status=0x");
+        print_hex(result_status);
+        print_str(b"\n");
+        0
+    }
+
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
     /// csrss owns \Windows\ApiPort and pending connects are completed by the real
@@ -10636,16 +10714,20 @@ impl ExecNtHandler {
                     print_str(b"[sm-api] routing SMSS request to real SmpApiLoop\n");
                     return 0;
                 }
-                if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport")
-                    && CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0
-                {
-                    self.csr_request_port = args[0];
-                    self.csr_request_message = args[1];
-                    self.csr_reply_message = args[2];
-                    print_str(b"[csr-api] routing CSR request to real CsrApiRequestThread\n");
-                    return 0;
+                if self.lpc_connection_is(args[0], self.pi, b"\\windows\\apiport") {
+                    if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0 {
+                        self.csr_request_port = args[0];
+                        self.csr_request_message = args[1];
+                        self.csr_reply_message = args[2];
+                        print_str(b"[csr-api] routing CSR request to real CsrApiRequestThread\n");
+                        return 0;
+                    }
+                    return self.model_csr_request_reply(args[1]);
                 }
-                self.model_csr_request_reply(args[1])
+                if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
+                    return self.service_srm_request_reply(args[1], args[2]);
+                }
+                self.model_lpc_request_reply(args[1])
             },
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
@@ -10691,6 +10773,7 @@ impl ExecNtHandler {
                     {
                         let h = self.mint_handle();
                         self.queue_write(args[0], h);
+                        self.cache_lpc_connection(0, h, &name16);
                         LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
                         print_str(b"[ntos-exec] lsass NtConnectPort(\\SeRmCommandPort) -> modeled SRM accept\n");
                         return 0;

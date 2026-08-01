@@ -133,9 +133,7 @@ fn resolve_in_module(
     match &export.target {
         ExportTarget::Address(addr) => Ok(*addr),
         ExportTarget::Forwarder { dll, func } => {
-            if dll.is_empty()
-                || matches!(func, ForwardSelector::Name(name) if name.is_empty())
-            {
+            if dll.is_empty() || matches!(func, ForwardSelector::Name(name) if name.is_empty()) {
                 return Err(ResolveError::MalformedForwarder(forwarder_key(dll, func)));
             }
             // Record the hop; detect a repeat (cycle) explicitly, and bound the depth.

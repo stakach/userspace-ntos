@@ -51,9 +51,9 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_alpc_abi::{
-    msg_attr_flag, opcode, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
+    msg_attr_flag, opcode, send_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
     AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
-    send_flag, AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest,
+    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest,
     AlpcMessageAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr,
     AlpcViewIoRequest,
 };
@@ -188,7 +188,11 @@ impl AlpcServer {
     /// ALPC accept folds complete: on accept the connection is driven all the way
     /// to Connected in one call. `detail0` = server comm-port handle, `detail1` =
     /// client comm-port handle (to unblock the connector).
-    fn op_accept_connect(&mut self, core: &mut PortCore, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+    fn op_accept_connect(
+        &mut self,
+        core: &mut PortCore,
+        buf: &[u8],
+    ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcAcceptConnectRequest = read_req(buf)?;
         let accept = req.accept != 0;
         let sh = core.accept(req.connection_id, accept, req.port_context)?;
@@ -262,7 +266,12 @@ impl AlpcServer {
                 } else {
                     let n = bytes.len().min(out_buf.len());
                     out_buf[..n].copy_from_slice(&bytes[..n]);
-                    Ok(reply(NtStatus::SUCCESS, n as u32, present as u64, msg_type as u64))
+                    Ok(reply(
+                        NtStatus::SUCCESS,
+                        n as u32,
+                        present as u64,
+                        msg_type as u64,
+                    ))
                 }
             }
             Ok(None) => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
@@ -383,7 +392,8 @@ impl AlpcServer {
     ) -> Result<AlpcReply, NtStatus> {
         let req: AlpcViewIoRequest = read_req(buf)?;
         let len = req.data_len_bytes as u64;
-        let (section_handle, section_offset) = self.resolve_view(req.view_base, req.view_offset, len)?;
+        let (section_handle, section_offset) =
+            self.resolve_view(req.view_base, req.view_offset, len)?;
         let section = self
             .sections
             .iter()
@@ -646,7 +656,9 @@ pub fn parse_message_attributes(blob: &[u8]) -> (u32, MessageAttrs, usize) {
         None => return (0, MessageAttrs::default(), 0),
     };
     let valid = header.valid_attributes;
-    let body = blob.get(size_of::<AlpcMessageAttributes>()..).unwrap_or(&[]);
+    let body = blob
+        .get(size_of::<AlpcMessageAttributes>()..)
+        .unwrap_or(&[]);
     let attrs = parse_attrs(valid, body);
     // Compute the consumed length (header + only the present structs).
     let mut structs = 0usize;

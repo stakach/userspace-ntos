@@ -63,7 +63,10 @@ pub fn is_component_prefix(cand: &[u16], full: &[u16]) -> bool {
 /// that is a component-prefix of `full` (ties broken by first-seen — the root `\` is shortest so a
 /// specific pipe name always wins). `None` if nothing matches (should never happen once the root `\`
 /// is inserted — npfs bug-checks on a NULL find).
-pub fn find_longest_prefix<'a>(cands: impl Iterator<Item = (usize, &'a [u16])>, full: &[u16]) -> Option<usize> {
+pub fn find_longest_prefix<'a>(
+    cands: impl Iterator<Item = (usize, &'a [u16])>,
+    full: &[u16],
+) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None; // (idx, matched-len)
     for (idx, cand) in cands {
         if is_component_prefix(cand, full) {

@@ -2527,13 +2527,15 @@ pub(crate) unsafe fn service_sec_image(
         if crate::WL_TEB_TAIL_WRITE_WATCH {
             crate::wl_teb2_protect();
         }
-        // ★ DRAIN a timer tick a COMPONENT PUMP absorbed. The HPET notification is bound to the root
+        // ★ DRAIN timer ticks a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
         // which cannot service it (the delay queue lives here). The pump latches it instead; this
         // runs the same `delay_timer_interrupt` the badge arm below would have, one dispatch later.
-        // Until this Ack the IOAPIC line stays masked, so no tick can be lost behind another.
-        if DELAY_TIMER_TICK_PENDING.swap(false, Ordering::Relaxed) {
-            PUMP_TIMER_TICKS_DRAINED.fetch_add(1, Ordering::Relaxed);
+        // Multiple pump receives can absorb ticks before this loop top; service the coalesced timer
+        // state once, but account for every delivery the pump deferred.
+        let pump_ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
+        if pump_ticks != 0 {
+            PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
             delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
         }
         if badge == DELAY_TIMER_BADGE {

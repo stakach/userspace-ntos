@@ -467,8 +467,16 @@ mod tests {
         // The heap-free assigned set and alloc-based token agree on presence. Several privileges
         // are deliberately disabled in the initial token, so `has_privilege` is false for them.
         let sys = crate::AccessToken::system();
-        for luid in [LUID_SHUTDOWN, LUID_LOAD_DRIVER, LUID_SECURITY, LUID_CHANGE_NOTIFY] {
-            assert!(sys.privileges.iter().any(|privilege| privilege.luid.low == luid));
+        for luid in [
+            LUID_SHUTDOWN,
+            LUID_LOAD_DRIVER,
+            LUID_SECURITY,
+            LUID_CHANGE_NOTIFY,
+        ] {
+            assert!(sys
+                .privileges
+                .iter()
+                .any(|privilege| privilege.luid.low == luid));
             assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&luid));
         }
         assert!(!sys.has_privilege(crate::SE_SHUTDOWN));

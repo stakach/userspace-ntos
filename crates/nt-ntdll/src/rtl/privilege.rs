@@ -50,9 +50,7 @@ pub fn acquire_allocation_size(count: u32) -> Option<usize> {
     const LUID_AND_ATTRIBUTES_SIZE: usize = 12;
     RTL_ACQUIRE_STATE_SIZE
         .checked_add(TOKEN_PRIVILEGES_ONE_SIZE)?
-        .checked_add(
-            (count.wrapping_sub(1) as usize).checked_mul(LUID_AND_ATTRIBUTES_SIZE)?,
-        )
+        .checked_add((count.wrapping_sub(1) as usize).checked_mul(LUID_AND_ATTRIBUTES_SIZE)?)
 }
 
 /// ReactOS turns a one-privilege partial assignment into the more useful failure status.

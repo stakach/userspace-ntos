@@ -64,7 +64,10 @@ macro_rules! wire {
             pub fn as_bytes(&self) -> &[u8] {
                 // SAFETY: `#[repr(C)]` POD; no padding beyond declared fields; read-only.
                 unsafe {
-                    core::slice::from_raw_parts(self as *const _ as *const u8, core::mem::size_of::<$t>())
+                    core::slice::from_raw_parts(
+                        self as *const _ as *const u8,
+                        core::mem::size_of::<$t>(),
+                    )
                 }
             }
             /// Parse the fixed header from the front of `buf` (unaligned).

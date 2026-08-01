@@ -42,7 +42,9 @@ fn umdf2_driver_loads_and_exposes_wdf_entry() {
     let imports = pe.imports().unwrap();
     let dll = |n: &str| imports.iter().find(|d| d.name.eq_ignore_ascii_case(n));
     let has = |d: &nt_pe_loader::ImportedDll, f: &str| {
-        d.functions.iter().any(|i| matches!(i, ImportRef::ByName { name, .. } if name == f))
+        d.functions
+            .iter()
+            .any(|i| matches!(i, ImportRef::ByName { name, .. } if name == f))
     };
     let ntdll = dll("ntdll.dll").expect("imports ntdll");
     assert!(has(ntdll, "RtlLookupFunctionEntry") && has(ntdll, "DbgPrintEx"));

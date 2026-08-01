@@ -96,11 +96,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Ok(port)
     }
 
-    pub fn associate(
-        &mut self,
-        file_id: u64,
-        binding: FileCompletionBinding,
-    ) -> Result<(), u32> {
+    pub fn associate(&mut self, file_id: u64, binding: FileCompletionBinding) -> Result<(), u32> {
         self.can_associate(file_id)?;
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         entry.binding = Some(binding);

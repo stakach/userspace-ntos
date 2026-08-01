@@ -231,7 +231,9 @@ impl Hive {
             .unwrap_or(None);
         match existing {
             Some(vid) => {
-                if let Some(Cell::Value(v)) = self.cells.get_mut(vid.0 as usize).and_then(|c| c.as_mut()) {
+                if let Some(Cell::Value(v)) =
+                    self.cells.get_mut(vid.0 as usize).and_then(|c| c.as_mut())
+                {
                     v.value_type = value_type;
                     v.data = data;
                     v.last_write_sequence = seq;
@@ -281,7 +283,12 @@ impl Hive {
         }
     }
     pub fn set_dword(&mut self, key: CellId, name: &str, v: u32) -> bool {
-        self.set_value(key, name, RegistryValueType::Dword, v.to_le_bytes().to_vec())
+        self.set_value(
+            key,
+            name,
+            RegistryValueType::Dword,
+            v.to_le_bytes().to_vec(),
+        )
     }
 
     pub fn enum_subkeys(&self, key: CellId) -> Vec<String> {
@@ -296,7 +303,12 @@ impl Hive {
     }
     pub fn enum_values(&self, key: CellId) -> Vec<String> {
         self.key(key)
-            .map(|k| k.values.iter().filter_map(|id| self.value(*id).map(|v| v.name.clone())).collect())
+            .map(|k| {
+                k.values
+                    .iter()
+                    .filter_map(|id| self.value(*id).map(|v| v.name.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -352,7 +364,8 @@ impl HiveMountTable {
         Self { mounts: Vec::new() }
     }
     pub fn mount(&mut self, root_path: &str, hive: HiveId) {
-        self.mounts.retain(|(p, _)| !p.eq_ignore_ascii_case(root_path));
+        self.mounts
+            .retain(|(p, _)| !p.eq_ignore_ascii_case(root_path));
         self.mounts.push((root_path.into(), hive));
     }
 
