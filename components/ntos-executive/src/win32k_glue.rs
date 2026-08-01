@@ -356,11 +356,12 @@ unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -
 fn winlogon_callback_teb_alias(
     client: crate::spawn_hosts::UserCallbackClient,
 ) -> Option<u64> {
-    if client.pi != 2 || client.tid == 0 {
+    let winlogon_pi = nt_exe_image::hosted_pi_for_leaf(b"winlogon.exe")?;
+    if !callback_client_is_winlogon(client) || client.tid == 0 {
         return None;
     }
     let alias = match client.badge {
-        WINLOGON_BADGE if client.tid == PM_TIDS[2].load(Ordering::Relaxed) => {
+        WINLOGON_BADGE if client.tid == PM_TIDS[winlogon_pi].load(Ordering::Relaxed) => {
             WINLOGON_MAIN_TEB_MIRROR_VA
         }
         WINLOGON_WORKER_BADGE if client.tid == PM_LISTENER_TID.load(Ordering::Relaxed) => {
@@ -376,22 +377,27 @@ fn winlogon_callback_teb_alias(
             let Some((pi, slot)) = tp_worker_identity_from_badge(badge) else {
                 return None;
             };
-            if pi != 2 || client.tid != TP_WORKER_TID[2][slot].load(Ordering::Relaxed) {
+            if pi != winlogon_pi
+                || client.tid != TP_WORKER_TID[winlogon_pi][slot].load(Ordering::Relaxed)
+            {
                 return None;
             }
-            tp_worker_stack_mirror_va(2, slot) + TP_WORKER_STACK_FRAMES * 0x1000
+            tp_worker_stack_mirror_va(winlogon_pi, slot) + TP_WORKER_STACK_FRAMES * 0x1000
         }
     };
     Some(alias)
 }
 
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let pi = client.pi as usize;
+    let pi = callback_client_owner_pi(client)?;
     if client.tid == 0 || pi >= PM_TIDS.len() || client.tid != PM_TIDS[pi].load(Ordering::Relaxed) {
         return None;
     }
-    match (client.pi, client.badge) {
-        (6, EXPLORER_BADGE) => {
+    match (pi, client.badge) {
+        (pi, EXPLORER_BADGE)
+            if nt_exe_image::hosted_image_for_pi(pi)
+                .is_some_and(|image| image.leaf.eq_ignore_ascii_case(b"explorer.exe")) =>
+        {
             let alias = crate::env_scratch_base_for_pi(pi);
             (alias != 0).then_some(alias)
         }
@@ -399,16 +405,47 @@ fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
     }
 }
 
+fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> Option<usize> {
+    if let Some((pi, _)) = tp_worker_identity_from_badge(client.badge) {
+        return Some(pi);
+    }
+    match client.badge {
+        WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
+            nt_exe_image::hosted_pi_for_leaf(b"winlogon.exe")
+        }
+        _ => nt_exe_image::hosted_pi_for_top_badge(client.badge),
+    }
+}
+
+fn callback_client_is_leaf(
+    client: crate::spawn_hosts::UserCallbackClient,
+    leaf: &[u8],
+) -> bool {
+    let Some(pi) = callback_client_owner_pi(client) else {
+        return false;
+    };
+    nt_exe_image::hosted_image_for_pi(pi)
+        .is_some_and(|image| image.leaf.eq_ignore_ascii_case(leaf))
+}
+
+fn callback_client_is_winlogon(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+    callback_client_is_leaf(client, b"winlogon.exe")
+}
+
+fn callback_client_is_explorer(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+    callback_client_is_leaf(client, b"explorer.exe")
+}
+
 fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    if client.pi == 2 {
+    if callback_client_is_winlogon(client) {
         winlogon_callback_teb_alias(client)
     } else {
         main_gui_callback_teb_alias(client)
     }
 }
 
-fn client_callbacks_supported(pi: u32) -> bool {
-    matches!(pi, 2 | 6)
+fn client_callbacks_supported(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+    callback_client_is_winlogon(client) || callback_client_is_explorer(client)
 }
 
 unsafe fn bind_client_callback_window(
@@ -773,7 +810,7 @@ pub(crate) unsafe fn service_user_callback(
         }
     });
 
-    let winlogon_api0_ordinal = if request.api_index == 0 && client.pi == 2 {
+    let winlogon_api0_ordinal = if request.api_index == 0 && callback_client_is_winlogon(client) {
         USER_CALLBACK_WINLOGON_API0.fetch_add(1, Ordering::Relaxed) + 1
     } else {
         0
@@ -823,7 +860,7 @@ pub(crate) unsafe fn service_user_callback(
     // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
     // error immediately instead of suspending the component again.
     let client_dead = user_callback_client_dead(client.pi);
-    if client_callbacks_supported(client.pi) && contract_valid && !client_dead && !owner_mismatch {
+    if client_callbacks_supported(client) && contract_valid && !client_dead && !owner_mismatch {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -970,7 +1007,7 @@ pub(crate) unsafe fn service_user_callback(
             STATUS_THREAD_IS_TERMINATING
         } else if owner_mismatch {
             STATUS_UNSUCCESSFUL
-        } else if contract.is_none() || client.pi != 2 {
+        } else if contract.is_none() || !callback_client_is_winlogon(client) {
             STATUS_NOT_SUPPORTED
         } else if !contract_valid {
             STATUS_INFO_LENGTH_MISMATCH
