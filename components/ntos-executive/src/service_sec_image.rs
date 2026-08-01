@@ -5281,7 +5281,9 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.register_main_thread_tcb(1, PM_MAIN_TCBS[1].load(Ordering::Relaxed));
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
-                    procs[1].pid = nt_handler.pm_pid_for_pi(1).map(|pid| pid as u64).unwrap_or(0);
+                    procs[1].pid = live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe")
+                        .map(|pid| pid as u64)
+                        .unwrap_or(0);
                     procs[1].pml4 = cpml4;
                     PM_PML4S[1].store(cpml4, Ordering::Relaxed);
                     CSRSS_SPAWNED.store(1, Ordering::Relaxed);
@@ -5295,7 +5297,10 @@ pub(crate) unsafe fn service_sec_image(
                     // real typed Process object; the returned dense value IS the handle smss gets
                     // (path 1b — process-local value). Fallback to a global value if pids are
                     // unknown (shouldn't happen for the 3 hosted).
-                    csrss_process_handle = match (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1)) {
+                    csrss_process_handle = match (
+                        live_hosted_pid_for_leaf(&nt_handler, b"smss.exe"),
+                        live_hosted_pid_for_leaf(&nt_handler, b"csrss.exe"),
+                    ) {
                         (Some(smss_pid), Some(csrss_pid)) => {
                             let h = nt_handler.pm.insert_handle(
                                 smss_pid,
@@ -5348,7 +5353,9 @@ pub(crate) unsafe fn service_sec_image(
                         0, // pi>=1: real ntdll LdrpInitialize
                     );
                     nt_handler.register_main_thread_tcb(2, PM_MAIN_TCBS[2].load(Ordering::Relaxed));
-                    procs[2].pid = nt_handler.pm_pid_for_pi(2).map(|pid| pid as u64).unwrap_or(0);
+                    procs[2].pid = live_hosted_pid_for_leaf(&nt_handler, b"winlogon.exe")
+                        .map(|pid| pid as u64)
+                        .unwrap_or(0);
                     procs[2].pml4 = wpml4;
                     PM_PML4S[2].store(wpml4, Ordering::Relaxed);
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
@@ -5359,7 +5366,10 @@ pub(crate) unsafe fn service_sec_image(
                         .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
                     // Record winlogon's process handle in smss's EPROCESS table as a typed Process
                     // object; the returned dense value IS smss's handle (path 1b).
-                    winlogon_process_handle = match (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(2)) {
+                    winlogon_process_handle = match (
+                        live_hosted_pid_for_leaf(&nt_handler, b"smss.exe"),
+                        live_hosted_pid_for_leaf(&nt_handler, b"winlogon.exe"),
+                    ) {
                         (Some(smss_pid), Some(winlogon_pid)) => {
                             let h = nt_handler.pm.insert_handle(
                                 smss_pid,
