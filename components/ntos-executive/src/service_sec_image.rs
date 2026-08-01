@@ -1235,6 +1235,7 @@ struct CapturedGetClassInfo {
     wnd_out: u64,
     menu_out: u64,
     scrollbar: bool,
+    ansi: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1251,32 +1252,19 @@ fn rc_arg_slot_base(slot: u64) -> u64 {
 }
 
 unsafe fn staged_unicode_string_is_scrollbar(desc: u64) -> bool {
-    const SCROLLBAR: [u16; 9] = [
-        b'S' as u16,
-        b'c' as u16,
-        b'r' as u16,
-        b'o' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        b'B' as u16,
-        b'a' as u16,
-        b'r' as u16,
-    ];
     let length = core::ptr::read_unaligned(desc as *const u16) as usize;
-    if length != SCROLLBAR.len() * 2 {
+    if length != nt_kernel_exec::user_class::SCROLLBAR_CLASS_NAME.len() * 2 {
         return false;
     }
     let buffer = core::ptr::read_unaligned((desc + 8) as *const u64);
     if buffer == 0 {
         return false;
     }
-    for (index, expected) in SCROLLBAR.iter().copied().enumerate() {
-        let actual = core::ptr::read_unaligned((buffer + index as u64 * 2) as *const u16);
-        if actual != expected {
-            return false;
-        }
+    let mut units = [0u16; nt_kernel_exec::user_class::SCROLLBAR_CLASS_NAME.len()];
+    for (index, unit) in units.iter_mut().enumerate() {
+        *unit = core::ptr::read_unaligned((buffer + index as u64 * 2) as *const u16);
     }
-    true
+    nt_kernel_exec::user_class::is_scrollbar_class_name(&units)
 }
 
 unsafe fn capture_get_class_info_graph(
@@ -1284,6 +1272,7 @@ unsafe fn capture_get_class_info_graph(
     class_name: u64,
     wnd_class: u64,
     menu_name_ptr: u64,
+    ansi: bool,
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
@@ -1335,6 +1324,7 @@ unsafe fn capture_get_class_info_graph(
         wnd_out,
         menu_out,
         scrollbar,
+        ansi,
     })
 }
 
@@ -1394,6 +1384,129 @@ unsafe fn copy_back_get_class_info(
         print_str(b"\n");
     }
     copyout_ok
+}
+
+unsafe fn capture_service_client_pfn_arrays(
+    pi: usize,
+    pfn_client_a: u64,
+    pfn_client_w: u64,
+    hmod_user: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    use nt_kernel_exec::user_class::{pfn_client_proc, FNID_SCROLLBAR, PFNCLIENT_SIZE};
+
+    if pi >= MAX_PI {
+        return false;
+    }
+
+    let mut captured = false;
+    let mut raw = [0u8; PFNCLIENT_SIZE];
+    if pfn_client_a != 0
+        && img_spawn::client_copyin_mapped(
+            pi as u64,
+            pfn_client_a,
+            &mut raw,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
+            SVC_CLIENT_PFNA_SCROLLBAR[pi].store(proc, Ordering::Relaxed);
+            captured = true;
+        }
+    }
+
+    raw.fill(0);
+    if pfn_client_w != 0
+        && img_spawn::client_copyin_mapped(
+            pi as u64,
+            pfn_client_w,
+            &mut raw,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
+            SVC_CLIENT_PFNW_SCROLLBAR[pi].store(proc, Ordering::Relaxed);
+            captured = true;
+        }
+    }
+
+    if hmod_user != 0 {
+        SVC_CLIENT_HMOD_USER32[pi].store(hmod_user, Ordering::Relaxed);
+    }
+    if captured {
+        SVC_CLIENT_PFN_ARRAYS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+    }
+    captured
+}
+
+unsafe fn copy_service_scrollbar_class_info(
+    pi: usize,
+    capture: CapturedGetClassInfo,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    use nt_kernel_exec::user_class::{scrollbar_class_info, WNDCLASSEXW_SIZE};
+
+    if pi >= MAX_PI || !capture.scrollbar {
+        return None;
+    }
+    let proc = if capture.ansi {
+        SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed)
+    } else {
+        SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed)
+    };
+    if proc == 0 {
+        return None;
+    }
+    let mut atom = SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u16;
+    if atom == 0 {
+        let fresh = (SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
+        if fresh == 0 {
+            return None;
+        }
+        atom = match SVC_SCROLLBAR_CLASS_ATOM[pi].compare_exchange(
+            0,
+            fresh as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => fresh,
+            Err(existing) => existing as u16,
+        };
+    }
+    let mut initial = [0u8; WNDCLASSEXW_SIZE];
+    core::ptr::copy_nonoverlapping(
+        capture.wnd_out as *const u8,
+        initial.as_mut_ptr(),
+        initial.len(),
+    );
+    let payload = scrollbar_class_info(&initial, atom, proc, 0x0001_0005)?;
+    core::ptr::copy_nonoverlapping(
+        payload.wnd_class().as_ptr(),
+        capture.wnd_out as *mut u8,
+        WNDCLASSEXW_SIZE,
+    );
+    core::ptr::write_unaligned(capture.menu_out as *mut u64, payload.menu_name());
+    if copy_back_get_class_info(
+        pi as u64,
+        capture,
+        payload.atom() as u64,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        Some(payload.atom() as u64)
+    } else {
+        SVC_SCROLLBAR_CLASSINFO_COPYOUT_ERRORS.fetch_add(1, Ordering::Relaxed);
+        None
+    }
 }
 
 unsafe fn capture_get_class_name_out(
@@ -6809,6 +6922,7 @@ pub(crate) unsafe fn service_sec_image(
                         .contains(&fn_id)
                         && flags == 0
                 });
+                let register_class_fn_id = builtin_class_args.map(|(fn_id, _)| fn_id).unwrap_or(0);
                 let builtin_class_key = builtin_class_args.and_then(|(fn_id, flags)| {
                     capture_builtin_class_key(
                         pi as u64,
@@ -6834,12 +6948,26 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
+                let get_class_info_ansi = if m0 == 0x10bd {
+                    let sp = get_recv_mr(16);
+                    client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x28,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
+                    .is_some_and(|value| value != 0)
+                } else {
+                    false
+                };
                 let get_class_info_capture = if m0 == 0x10bd {
                     let capture = capture_get_class_info_graph(
                         pi as u64,
                         a1,
                         a2,
                         a3,
+                        get_class_info_ansi,
                         filled_pages,
                         faults as usize,
                         scratch_base,
@@ -7151,6 +7279,11 @@ pub(crate) unsafe fn service_sec_image(
                     // NtUserRegisterClassExWOW -> a fresh class atom so RegisterSystemClasses advances.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
+                    if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
+                        && pi < MAX_PI
+                    {
+                        SVC_SCROLLBAR_CLASS_ATOM[pi].store(atom & 0xFFFF, Ordering::Relaxed);
+                    }
                     ((atom & 0xFFFF) as u64, true)
                 } else if m0 == 0x125b && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays.
@@ -7178,7 +7311,18 @@ pub(crate) unsafe fn service_sec_image(
                     // paint path is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it
                     // moved the hang to 0x11e0 by breaking winlogon's interactive init).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) FAKED (non-interactive service, no GDI blit) -> STATUS_SUCCESS\n");
+                    let captured = capture_service_client_pfn_arrays(
+                        pi,
+                        a0,
+                        a1,
+                        a3,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) SERVICE-SAFE captured-pfns=");
+                    print_u64(captured as u64);
+                    print_str(b" -> STATUS_SUCCESS\n");
                     (0, true)
                 } else if m0 == 0x11e0 && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h).
@@ -7276,25 +7420,48 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     (h as u64, true)
                 } else if m0 == 0x10bd && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtUserGetClassInfo (0x10bd — w32ksvc64.h).
-                    // ROOT of the whole GDI-blit family: win32k's class-lookup path
-                    // (IntGetAndReferenceClass, class.c:1461) does
-                    //   `if (!(pti->ppi->W32PF_flags & W32PF_CLASSESREGISTERED)) UserRegisterSystemClasses();`
-                    // and lsass' PROCESSINFO never has W32PF_CLASSESREGISTERED set (we faked the class
-                    // registration, never ran the REAL UserRegisterSystemClasses), so EVERY class call
-                    // (GetClassInfo, and any window-create) RE-triggers UserRegisterSystemClasses → the
-                    // interactive stock-object/cursor EngCopyBits (RVA 0x1cbdd8) runaway blit. Since our
-                    // single-threaded host shares ONE PROCESSINFO across clients (setup_dispatch_context),
-                    // we cannot set W32PF_CLASSESREGISTERED globally without breaking winlogon's REAL
-                    // interactive class registration (needed for the paint). So short-circuit lsass'
-                    // NtUserGetClassInfo → FALSE (0, class-not-found) WITHOUT dispatching: user32's
-                    // GetClassInfoExW treats it as an unregistered class (benign for a non-interactive
-                    // service that never creates windows) and does NOT reach the class-lookup that runs
-                    // UserRegisterSystemClasses. Scoped to non-interactive service images; winlogon's
-                    // real 0x10bd untouched.
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
-                    (0, true)
+                    // Non-interactive services have already supplied their real user32 client PFN
+                    // arrays and registered the system classes through the bounded service path above.
+                    // Return ScrollBar class info from that per-process state instead of reporting the
+                    // class absent, while still avoiding win32k's interactive UserRegisterSystemClasses
+                    // blit path for WSS_NOIO services.
+                    if let Some(capture) = get_class_info_capture {
+                        if let Some(atom) = copy_service_scrollbar_class_info(
+                            pi,
+                            capture,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            SVC_SCROLLBAR_CLASSINFO_HITS.fetch_add(1, Ordering::Relaxed);
+                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR ScrollBar atom=0x");
+                            print_hex(atom as u32);
+                            print_str(b" ansi=");
+                            print_u64(capture.ansi as u64);
+                            print_str(b" -> TRUE\n");
+                            (atom, true)
+                        } else {
+                            SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
+                            SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS scrollbar=");
+                            print_u64(capture.scrollbar as u64);
+                            print_str(b" atom=0x");
+                            print_hex(SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u32);
+                            print_str(b" procA=");
+                            print_u64((SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64);
+                            print_str(b" procW=");
+                            print_u64((SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64);
+                            print_str(b" ansi=");
+                            print_u64(capture.ansi as u64);
+                            print_str(b" -> FALSE\n");
+                            (0, true)
+                        }
+                    } else {
+                        SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
+                        SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS capture=0 -> FALSE\n");
+                        (0, true)
+                    }
                 } else {
                     // ★ BATCH 44 — marshal the win64 STACK-ARG TAIL for WIDE win32k SSNs. `sp` is the
                     // client's syscall-entry stack pointer (MR16). The kernel captures the faulting
