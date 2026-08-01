@@ -1466,6 +1466,9 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     const SSN_QUERY_OBJECT: u64 = 170;
     const SSN_SET_INFO_OBJECT: u64 = 236;
     const SSN_RESUME_THREAD: u64 = 214;
+    const SSN_DUPLICATE_OBJECT: u64 = 71;
+    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
 
     let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
@@ -1805,6 +1808,116 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         print_hex(status);
                         print_str(b"\n");
                         result = status as u64;
+                    }
+                    SSN_DUPLICATE_OBJECT => {
+                        let source_process = get_recv_mr(9);
+                        let source_handle = rdx;
+                        let target_process = get_recv_mr(7);
+                        let target_out = get_recv_mr(8);
+                        let desired_access = sp
+                            .checked_add(0x28)
+                            .and_then(|address| csr_stack_read(address));
+                        let options = sp
+                            .checked_add(0x38)
+                            .and_then(|address| csr_stack_read(address))
+                            .unwrap_or(0) as u32;
+                        let saved_pi = nt_handler.pi;
+                        let saved_tid = nt_handler.current_tid;
+                        nt_handler.pi = 1;
+                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        let source_pid = nt_handler.resolve_process_handle(source_process);
+                        let target_pid = nt_handler.resolve_process_handle(target_process);
+                        let mut close_source_pid = source_pid;
+                        let mut recovered_from_client = false;
+                        result = match target_pid {
+                            Some(target_pid) => {
+                                if options & DUPLICATE_SAME_ACCESS == 0 && desired_access.is_none()
+                                {
+                                    0xC000_0005
+                                } else {
+                                    let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
+                                        .then_some(desired_access.unwrap_or(0) as u32);
+                                    let mut duplicate_result: Option<
+                                        Result<nt_process::Handle, u32>,
+                                    > = None;
+                                    if let Some(source_pid) = source_pid {
+                                        duplicate_result =
+                                            Some(nt_handler.duplicate_process_handle_with_access(
+                                                source_pid,
+                                                source_handle as nt_process::Handle,
+                                                target_pid,
+                                                desired_access,
+                                            ));
+                                    }
+                                    if matches!(
+                                        duplicate_result,
+                                        None | Some(Err(nt_process::STATUS_INVALID_HANDLE))
+                                    ) {
+                                        let client_source_pid = client_pid as nt_process::ProcessId;
+                                        if client_source_pid != 0
+                                            && Some(client_source_pid) != source_pid
+                                            && nt_handler
+                                                .pm
+                                                .lookup_handle(
+                                                    client_source_pid,
+                                                    source_handle as nt_process::Handle,
+                                                )
+                                                .is_some()
+                                        {
+                                            duplicate_result = Some(
+                                                nt_handler.duplicate_process_handle_with_access(
+                                                    client_source_pid,
+                                                    source_handle as nt_process::Handle,
+                                                    target_pid,
+                                                    desired_access,
+                                                ),
+                                            );
+                                            close_source_pid = Some(client_source_pid);
+                                            recovered_from_client = true;
+                                        }
+                                    }
+                                    match duplicate_result
+                                        .unwrap_or(Err(nt_process::STATUS_INVALID_HANDLE))
+                                    {
+                                        Ok(handle) if csr_stack_has_range(target_out, 8) => {
+                                            let _ = csr_stack_copyout(
+                                                target_out,
+                                                &(handle as u64).to_le_bytes(),
+                                            );
+                                            let count =
+                                                nt_handler.pm.handle_count(target_pid) as u64;
+                                            if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+                                                PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+                                            }
+                                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                                            0
+                                        }
+                                        Ok(handle) => {
+                                            let _ = nt_handler.close_process_handle(
+                                                target_pid,
+                                                handle as u64,
+                                            );
+                                            0xC000_0005
+                                        }
+                                        Err(status) => status as u64,
+                                    }
+                                }
+                            }
+                            None => nt_process::STATUS_INVALID_HANDLE as u64,
+                        };
+                        if options & DUPLICATE_CLOSE_SOURCE != 0 {
+                            if let Some(source_pid) = close_source_pid {
+                                let _ = nt_handler.close_process_handle(source_pid, source_handle);
+                            }
+                        }
+                        nt_handler.pi = saved_pi;
+                        nt_handler.current_tid = saved_tid;
+                        print_str(b"[csr-api] serviced worker NtDuplicateObject status=0x");
+                        print_hex(result as u32);
+                        if recovered_from_client {
+                            print_str(b" source=client");
+                        }
+                        print_str(b"\n");
                     }
                     SSN_MAP_VIEW => {}
                     SSN_CLOSE => {
