@@ -24011,6 +24011,30 @@ pub unsafe extern "system" fn rtl_compact_heap(heap: *mut c_void, flags: u32) ->
     }
 }
 
+/// `RtlZeroHeap(PVOID HeapHandle, ULONG Flags) -> BOOLEAN` — clear payload bytes in every free
+/// block while preserving heap metadata.
+///
+/// # Safety
+/// `heap` must name a registered heap.
+#[export_name = "RtlZeroHeap"]
+pub unsafe extern "system" fn rtl_zero_heap(heap: *mut c_void, flags: u32) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ok = crate::heap_zero_free_blocks(heap.cast(), flags);
+        if !ok {
+            unsafe {
+                rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER)
+            };
+        }
+        return u8::from(ok);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (heap, flags);
+        0
+    }
+}
+
 /// `RtlWalkHeap(PVOID HeapHandle, PRTL_HEAP_WALK_ENTRY Entry) -> NTSTATUS` — return the segment
 /// descriptor and then each physical busy/free block. The entry itself is the continuation cursor.
 ///

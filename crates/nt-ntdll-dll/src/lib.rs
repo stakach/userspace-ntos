@@ -655,6 +655,20 @@ pub(crate) fn heap_compact(handle: *mut u8, flags: u32) -> Option<usize> {
     unsafe { process_heaps_locked().find(handle).and_then(Heap::compact) }
 }
 
+/// Zero free payload bytes in a registered heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_zero_free_blocks(handle: *mut u8, flags: u32) -> bool {
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0) else {
+        return false;
+    };
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .is_some_and(|heap| heap.zero_free_blocks())
+    }
+}
+
 /// Advance a native heap-walk cursor on the exact registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_walk(

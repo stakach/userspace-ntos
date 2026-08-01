@@ -597,6 +597,38 @@ impl<B: Backing> Heap<B> {
         Some(largest)
     }
 
+    /// Zero every free block's payload bytes while preserving the heap's physical metadata.
+    ///
+    /// Returns `false` without modifying memory if the heap headers are corrupt.
+    pub fn zero_free_blocks(&mut self) -> bool {
+        if !self.validate(None) {
+            return false;
+        }
+        let mut offset = 0usize;
+        let mut previous_size = 0usize;
+        while offset < self.region_len {
+            let Some(header) = self.header_at_offset(offset) else {
+                return false;
+            };
+            let Some(next) = self.validate_header(offset, previous_size, header) else {
+                return false;
+            };
+            if header.is_free() {
+                // SAFETY: validation proved the free block lies wholly inside the backing region.
+                unsafe {
+                    core::ptr::write_bytes(
+                        self.backing.base().add(offset + HDR),
+                        0,
+                        header.size - HDR,
+                    );
+                }
+            }
+            previous_size = header.size;
+            offset = next;
+        }
+        true
+    }
+
     fn segment_walk_entry(&self) -> RtlHeapWalkEntry {
         RtlHeapWalkEntry {
             data_address: self.backing.base(),
@@ -1725,6 +1757,58 @@ mod tests {
         // SAFETY: deliberately corrupt a plain integer field in the first header.
         unsafe { (*corrupt.hdr(corrupt.handle())).reserved = 1 };
         assert_eq!(corrupt.compact(), None);
+    }
+
+    #[test]
+    fn zero_free_blocks_clears_only_free_payloads() {
+        let mut h = heap(1024);
+        let first = h.allocate(64).unwrap();
+        let middle = h.allocate(80).unwrap();
+        let last = h.allocate(64).unwrap();
+
+        // SAFETY: all three pointers are exact live allocations for the requested extents.
+        unsafe {
+            core::ptr::write_bytes(first, 0x11, 64);
+            core::ptr::write_bytes(middle, 0xa5, 80);
+            core::ptr::write_bytes(last, 0x22, 64);
+            assert!(h.free(middle));
+            assert!(core::slice::from_raw_parts(middle, 80)
+                .iter()
+                .any(|byte| *byte == 0xa5));
+
+            assert!(h.zero_free_blocks());
+
+            assert!(core::slice::from_raw_parts(first, 64)
+                .iter()
+                .all(|byte| *byte == 0x11));
+            assert!(core::slice::from_raw_parts(middle, 80)
+                .iter()
+                .all(|byte| *byte == 0));
+            assert!(core::slice::from_raw_parts(last, 64)
+                .iter()
+                .all(|byte| *byte == 0x22));
+            assert!(h.validate(None));
+        }
+    }
+
+    #[test]
+    fn zero_free_blocks_rejects_corrupt_heap_without_writing() {
+        let h = heap(512);
+        let payload = unsafe { h.handle().add(HDR) };
+        // SAFETY: the fresh heap is one free block; corrupt a metadata field after seeding payload.
+        unsafe {
+            core::ptr::write_bytes(payload, 0xa5, 32);
+            (*h.hdr(h.handle())).reserved = 1;
+        }
+
+        let mut h = h;
+        assert!(!h.zero_free_blocks());
+        // SAFETY: the seeded payload bytes remain accessible in the test backing.
+        unsafe {
+            assert!(core::slice::from_raw_parts(payload, 32)
+                .iter()
+                .all(|byte| *byte == 0xa5));
+        }
     }
 
     #[test]

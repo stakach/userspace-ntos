@@ -262,10 +262,14 @@ fidelity**; nothing here is a missing import or an unconditional stub.
 `ZwWaitForDebugEvent`) are now exported, and `ntdll-dll-verify` checks the complete
 `ZW_ALIASES` table so alias drift is gated.
 
-1. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 5 names
-   remain unexported: `RtlZeroHeap` (the only one ReactOS actually implements) plus
-   `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`, `RtlSidEqualLevel` (all `-stub`
-   +Vista in ReactOS). The wider tail is 564 spec names (§2.4). **None is imported by anything we
+**Completed pickup (2026-08-01):** `RtlZeroHeap` is now exported and backed by the real
+`nt-ntdll` heap: it validates the heap, zeros payload bytes in every free block, preserves heap
+metadata/live allocations, and is covered by focused host tests.
+
+1. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 4 names
+   remain unexported: `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`,
+   `RtlSidEqualLevel` (all `-stub` +Vista in ReactOS). The wider measured spec tail in §2.4 needs
+   the next DLL remeasurement. **None is imported by anything we
    host.** The rule that governs all of it:
    > **NEVER add a trap stub whose SSN the executive cannot service.** An unserviced SSN reaches
    > `park_and_log!(pi, b"unhandled-syscall", …)` and parks the process — a correct "not implemented"
