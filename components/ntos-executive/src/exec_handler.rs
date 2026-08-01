@@ -514,10 +514,10 @@ impl ExecNtHandler {
                 let smss_pid = pm.create_process("smss.exe", None, None);
                 let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
-                PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
-                PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
-                PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
                 let bootstrap_pids = [smss_pid, csrss_pid, winlogon_pid];
+                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+                    PM_PIDS[pi].store(pid as u64, Ordering::Relaxed);
+                }
                 // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
                 // identity sequence. Later hosted processes get the same setup at successful
                 // `NtCreateProcess[Ex]`.

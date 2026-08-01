@@ -3184,7 +3184,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let spawned_pid = PM_PIDS[5].load(Ordering::Relaxed);
+    let process_linked = (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & (1u64 << 5)) != 0;
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
     let pml4 = PM_PML4S[5].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[5].load(Ordering::Relaxed);
@@ -3223,8 +3223,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(queried);
     print_str(b" create-process-requests=");
     print_u64(creates);
-    print_str(b" pi5-pid=");
-    print_u64(spawned_pid);
+    print_str(b" pi5-eprocess-linked=");
+    print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
     print_str(b" pml4=0x");
@@ -3292,7 +3292,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && sectioned >= 1
             && queried >= 1
             && creates >= 1
-            && spawned_pid != 0
+            && process_linked
             && spawned == 1
             && pml4 != 0
             && tcb > 1
@@ -3344,7 +3344,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let sectioned = EXPLORER_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = EXPLORER_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = EXPLORER_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let spawned_pid = PM_PIDS[6].load(Ordering::Relaxed);
+    let process_linked = (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & (1u64 << 6)) != 0;
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
     let pml4 = PM_PML4S[6].load(Ordering::Relaxed);
     let tcb = PM_MAIN_TCBS[6].load(Ordering::Relaxed);
@@ -3381,8 +3381,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(queried);
     print_str(b" create-process-requests=");
     print_u64(creates);
-    print_str(b" pi6-pid=");
-    print_u64(spawned_pid);
+    print_str(b" pi6-eprocess-linked=");
+    print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
     print_str(b" pml4=0x");
@@ -3438,7 +3438,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && sectioned >= 1
             && queried >= 1
             && creates >= 1
-            && spawned_pid != 0
+            && process_linked
             && spawned == 1
             && pml4 != 0
             && image_pts >= 2,
@@ -16712,12 +16712,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" terminate-ok=0x");
                     print_hex(PM_LIFECYCLE_OK.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
-                    print_str(b"[ntos-exec] nt-process: EPROCESS pids smss/csrss/winlogon = ");
-                    print_hex(PM_PIDS[0].load(Ordering::Relaxed) as u32);
-                    print_str(b"/");
-                    print_hex(PM_PIDS[1].load(Ordering::Relaxed) as u32);
-                    print_str(b"/");
-                    print_hex(PM_PIDS[2].load(Ordering::Relaxed) as u32);
+                    print_str(b"[ntos-exec] nt-process: identity-ok=0x");
+                    print_hex(PM_IDENTITY_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b" exec-link-ok=0x");
+                    print_hex(PM_EXEC_LINK_OK.load(Ordering::Relaxed) as u32);
                     print_str(b" dynamic-allocs=0x");
                     print_hex(PM_DYNAMIC_PROCESS_ALLOCATIONS.load(Ordering::Relaxed) as u32);
                     print_str(b" badge-lookups=0x");
