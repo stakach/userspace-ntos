@@ -1199,21 +1199,31 @@ impl ExecNtHandler {
         None
     }
 
-    /// `NtLoadKey(POBJECT_ATTRIBUTES TargetKey, POBJECT_ATTRIBUTES SourceFile)` — ReactOS
-    /// `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a `regf` hive FILE at a key in the
-    /// registry namespace. The order of checks is the source's: privilege first, then the captured
-    /// object attributes, then the load.
+    /// `NtLoadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a `regf`
+    /// hive FILE at a key in the registry namespace. Base `NtLoadKey` passes `flags = 0` and a null
+    /// trust-class key; `NtLoadKey2` / `NtLoadKeyEx` feed their additional arguments here.
     ///
     /// # Safety
     /// Reads two caller OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
-    unsafe fn nt_load_key(&mut self, args: &[u64]) -> u32 {
+    unsafe fn nt_load_key_ex(
+        &mut self,
+        target_oa: u64,
+        source_oa: u64,
+        flags: u32,
+        trust_class_key: u64,
+    ) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
         const STATUS_SHARING_VIOLATION: u32 = 0xC000_0043;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+        const REG_NO_LAZY_FLUSH: u32 = 0x0000_0004;
         NT_LOAD_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+
+        if flags & !REG_NO_LAZY_FLUSH != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
 
         // `SeSinglePrivilegeCheck(SeRestorePrivilege, PreviousMode)` (ntapi.c:1168). Enforced, not
         // assumed: `userenv!AcquireRemoveRestorePrivilege(TRUE)` must really have ENABLED it on the
@@ -1229,8 +1239,14 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
+        if trust_class_key != 0 {
+            match self.resolve_registry_key(trust_class_key, 0) {
+                Ok(_) => {}
+                Err(status) => return status,
+            }
+        }
+
         // The TARGET key: RootDirectory (usually the HKEY_USERS handle) + the leaf name (the SID).
-        let target_oa = args[0];
         let mut rd = [0u8; 8];
         if target_oa == 0 || !self.xas_read(target_oa + 8, &mut rd) {
             return 0xC000_0005; // STATUS_ACCESS_VIOLATION
@@ -1262,7 +1278,7 @@ impl ExecNtHandler {
         }
 
         // The SOURCE file: read the whole regf out of the filesystem into a durable static slot.
-        let file16 = self.read_objattr_name_pe(args[1]);
+        let file16 = self.read_objattr_name_pe(source_oa);
         let mut file_name = alloc::string::String::new();
         for &unit in &file16 {
             if let Some(c) = char::from_u32(unit as u32) {
@@ -1366,24 +1382,39 @@ impl ExecNtHandler {
         0
     }
 
-    /// `NtUnloadKey(POBJECT_ATTRIBUTES TargetKey)` — ReactOS `ntoskrnl/config/ntapi.c:1796`
-    /// (`NtUnloadKey2`). Detach a hive `NtLoadKey` mounted: the mount goes, its backing slot is
-    /// released, and the write overlay's keys under that path are detached too — otherwise the
-    /// writes made through the mount would keep answering at the same path and the "unload" would
-    /// be cosmetic.
+    /// `NtUnloadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1796` (`NtUnloadKey2`) plus the event
+    /// form. Detach a hive `NtLoadKey*` mounted: the mount goes, its backing slot is released, and
+    /// the write overlay's keys under that path are detached too — otherwise the writes made
+    /// through the mount would keep answering at the same path and the "unload" would be cosmetic.
     ///
     /// # Safety
     /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
-    unsafe fn nt_unload_key(&mut self, args: &[u64]) -> u32 {
+    unsafe fn nt_unload_key_ex(&mut self, target_oa: u64, flags: u32, event: u64) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const REG_FORCE_UNLOAD: u32 = 0x0000_0001;
         NT_UNLOAD_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+        if flags != 0 && flags != REG_FORCE_UNLOAD {
+            NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        }
         if !self.current_token_has_privilege(nt_security::SE_RESTORE) {
             NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return STATUS_PRIVILEGE_NOT_HELD;
         }
-        let oa = args[0];
+        let event_index = if event != 0 {
+            match self.event_index_for_handle(event, EVENT_MODIFY_STATE) {
+                Ok(index) => Some(index),
+                Err(status) => {
+                    NT_UNLOAD_KEY_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return status;
+                }
+            }
+        } else {
+            None
+        };
+        let oa = target_oa;
         let mut rd = [0u8; 8];
         if oa == 0 || !self.xas_read(oa + 8, &mut rd) {
             return 0xC000_0005; // STATUS_ACCESS_VIOLATION
@@ -1421,6 +1452,12 @@ impl ExecNtHandler {
         self.overlay_dirty = true;
         self.hive_mounts_dirty = true;
         NT_UNLOAD_KEY_DETACHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(index) = event_index {
+            let status = self.signal_event_index(index);
+            if status != 0 {
+                return status;
+            }
+        }
         print_str(b"[cm-load] NtUnloadKey DETACHED ");
         print_ascii_str(&mount.mount);
         print_str(b" overlay-keys=");
@@ -2441,6 +2478,18 @@ impl ExecNtHandler {
             .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
             .map(|_| index)
             .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn signal_event_index(&mut self, index: usize) -> u32 {
+        let Some(previous) = self.events.set_existing(index as u64) else {
+            return 0xC000_0008; // STATUS_INVALID_HANDLE
+        };
+        if !previous {
+            // SAFETY: native dispatch is serialized; the signal and waiter selection are one
+            // executive transition.
+            unsafe { wait_wake_dispatcher_set(self) };
+        }
+        0
     }
 
     pub(crate) fn mint_semaphore_handle(&mut self, index: usize, access: u32) -> Option<u64> {
@@ -7651,11 +7700,22 @@ impl ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS — HvSyncHive's volatile / no-dirty-block early return
             }
-            // ★ NtLoadKey(*TargetKey[0], *SourceFile[1]) / NtUnloadKey(*TargetKey[0]) — mount and
-            // detach a per-user `regf` hive at `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW`
-            // and `LoadUserProfileW` both go through here (`RegLoadKeyW`/`RegUnLoadKeyW`).
-            NativeService::NtLoadKey => unsafe { self.nt_load_key(args) },
-            NativeService::NtUnloadKey => unsafe { self.nt_unload_key(args) },
+            // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user `regf` hive at
+            // `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW` and `LoadUserProfileW` usually go
+            // through the base APIs (`RegLoadKeyW`/`RegUnLoadKeyW`), but the ntdll-visible variants
+            // are backed by the same real CM path instead of being left as gaps.
+            NativeService::NtLoadKey => unsafe { self.nt_load_key_ex(args[0], args[1], 0, 0) },
+            NativeService::NtLoadKey2 => unsafe {
+                self.nt_load_key_ex(args[0], args[1], args[2] as u32, 0)
+            },
+            NativeService::NtLoadKeyEx => unsafe {
+                self.nt_load_key_ex(args[0], args[1], args[2] as u32, args[3])
+            },
+            NativeService::NtUnloadKey => unsafe { self.nt_unload_key_ex(args[0], 0, 0) },
+            NativeService::NtUnloadKey2 => unsafe {
+                self.nt_unload_key_ex(args[0], args[1] as u32, 0)
+            },
+            NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key_ex(args[0], 0, args[1]) },
             NativeService::NtDeleteValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,

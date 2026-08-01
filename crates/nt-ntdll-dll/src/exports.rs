@@ -24908,6 +24908,8 @@ zw_alias!(
 zw_alias!(zw_listen_port, "ZwListenPort", nt_listen_port);
 zw_alias!(zw_load_driver, "ZwLoadDriver", nt_load_driver);
 zw_alias!(zw_load_key, "ZwLoadKey", nt_load_key);
+zw_alias!(zw_load_key2, "ZwLoadKey2", nt_load_key2);
+zw_alias!(zw_load_key_ex, "ZwLoadKeyEx", nt_load_key_ex);
 zw_alias!(zw_lock_file, "ZwLockFile", nt_lock_file);
 zw_alias!(
     zw_lock_virtual_memory,
@@ -25346,6 +25348,8 @@ zw_alias!(
 zw_alias!(zw_test_alert, "ZwTestAlert", nt_test_alert);
 zw_alias!(zw_unload_driver, "ZwUnloadDriver", nt_unload_driver);
 zw_alias!(zw_unload_key, "ZwUnloadKey", nt_unload_key);
+zw_alias!(zw_unload_key2, "ZwUnloadKey2", nt_unload_key2);
+zw_alias!(zw_unload_key_ex, "ZwUnloadKeyEx", nt_unload_key_ex);
 zw_alias!(zw_unlock_file, "ZwUnlockFile", nt_unlock_file);
 zw_alias!(
     zw_unlock_virtual_memory,
@@ -30128,6 +30132,8 @@ pub unsafe extern "C" fn export_anchor() {
         zw_listen_port as *const () as usize,
         zw_load_driver as *const () as usize,
         zw_load_key as *const () as usize,
+        zw_load_key2 as *const () as usize,
+        zw_load_key_ex as *const () as usize,
         zw_lock_file as *const () as usize,
         zw_lock_virtual_memory as *const () as usize,
         zw_make_permanent_object as *const () as usize,
@@ -30249,6 +30255,8 @@ pub unsafe extern "C" fn export_anchor() {
         zw_test_alert as *const () as usize,
         zw_unload_driver as *const () as usize,
         zw_unload_key as *const () as usize,
+        zw_unload_key2 as *const () as usize,
+        zw_unload_key_ex as *const () as usize,
         zw_unlock_file as *const () as usize,
         zw_unlock_virtual_memory as *const () as usize,
         zw_unmap_view_of_section as *const () as usize,

@@ -139,6 +139,25 @@ fn flush_key_is_a_single_handle_registry_service() {
 }
 
 #[test]
+fn hive_load_variants_keep_native_argument_contracts() {
+    let cases = [
+        (NativeService::NtLoadKey, "NtLoadKey", 102, 2),
+        (NativeService::NtLoadKey2, "NtLoadKey2", 103, 3),
+        (NativeService::NtLoadKeyEx, "NtLoadKeyEx", 104, 4),
+        (NativeService::NtUnloadKey, "NtUnloadKey", 272, 1),
+        (NativeService::NtUnloadKey2, "NtUnloadKey2", 273, 2),
+        (NativeService::NtUnloadKeyEx, "NtUnloadKeyEx", 274, 2),
+    ];
+    let table = NativeServiceTable::test_profile();
+    for (service, name, ssn, argc) in cases {
+        assert_eq!(service.name(), name);
+        assert_eq!(service.arg_count(), (argc, argc));
+        assert_eq!(nt_syscall_abi::ssn_of(name), Some(ssn));
+        assert!(table.number_of(service).is_some(), "{name} missing from test table");
+    }
+}
+
+#[test]
 fn query_directory_file_keeps_native_eleven_argument_contract() {
     assert_eq!(
         NativeService::NtQueryDirectoryFile.name(),

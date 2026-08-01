@@ -9708,17 +9708,25 @@ pub(crate) static mut USER_HIVE_BUF: [[u8; USER_HIVE_SLOT_BYTES]; USER_HIVE_SLOT
 /// Which slots are in use (bit per slot), so a load/unload pair really recycles storage.
 pub(crate) static USER_HIVE_SLOT_USED: AtomicU64 = AtomicU64::new(0);
 
-/// ★ BYPASS SWITCH for `NtLoadKey`/`NtUnloadKey` (SSN 102 / 272). `false` leaves both SSNs OUT of
-/// the service table — exactly the pre-batch state, in which `RegLoadKeyW` reaches an unserviced
-/// SSN. `exec_ntloadkey_serviced` FAILs. Verified.
+/// ★ BYPASS SWITCH for the `NtLoadKey*`/`NtUnloadKey*` family. `false` leaves the hive-load SSNs
+/// OUT of the service table — exactly the pre-batch state, in which `RegLoadKeyW` reaches an
+/// unserviced SSN. `exec_ntloadkey_serviced` FAILs. Verified.
 pub(crate) const NT_LOAD_KEY_SERVICED: bool = true;
 
 /// `NtLoadKey(POBJECT_ATTRIBUTES TargetKey, POBJECT_ATTRIBUTES SourceFile)` — ReactOS
 /// `ntoskrnl/config/ntapi.c:1129` (→ `NtLoadKeyEx`, which requires `SeRestorePrivilege`).
 pub const SSN_NT_LOAD_KEY: u64 = 102;
+/// `NtLoadKey2(..., ULONG Flags)` — same load path with hive flags.
+pub const SSN_NT_LOAD_KEY2: u64 = 103;
+/// `NtLoadKeyEx(..., ULONG Flags, HANDLE TrustClassKey)` — same load path plus the trust-class arg.
+pub const SSN_NT_LOAD_KEY_EX: u64 = 104;
 /// `NtUnloadKey(POBJECT_ATTRIBUTES TargetKey)` — `ntoskrnl/config/ntapi.c:1789` (→ `NtUnloadKey2`,
 /// which also requires `SeRestorePrivilege`).
 pub const SSN_NT_UNLOAD_KEY: u64 = 272;
+/// `NtUnloadKey2(POBJECT_ATTRIBUTES TargetKey, ULONG Flags)`.
+pub const SSN_NT_UNLOAD_KEY2: u64 = 273;
+/// `NtUnloadKeyEx(POBJECT_ATTRIBUTES TargetKey, HANDLE Event)`.
+pub const SSN_NT_UNLOAD_KEY_EX: u64 = 274;
 
 /// Print a `str`'s printable ASCII to the debug console (`?` for anything else) — registry mount
 /// paths and hive file names are runtime strings, so the trace has to be able to show them.
@@ -11159,8 +11167,24 @@ fn build_nt_table() -> NativeServiceTable {
                 if NT_LOAD_KEY_SERVICED { SSN_NT_LOAD_KEY as u32 } else { u32::MAX },
             ),
             (
+                NativeService::NtLoadKey2,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_LOAD_KEY2 as u32 } else { u32::MAX },
+            ),
+            (
+                NativeService::NtLoadKeyEx,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_LOAD_KEY_EX as u32 } else { u32::MAX },
+            ),
+            (
                 NativeService::NtUnloadKey,
                 if NT_LOAD_KEY_SERVICED { SSN_NT_UNLOAD_KEY as u32 } else { u32::MAX },
+            ),
+            (
+                NativeService::NtUnloadKey2,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_UNLOAD_KEY2 as u32 } else { u32::MAX },
+            ),
+            (
+                NativeService::NtUnloadKeyEx,
+                if NT_LOAD_KEY_SERVICED { SSN_NT_UNLOAD_KEY_EX as u32 } else { u32::MAX },
             ),
             (NativeService::NtSetSystemInformation, SSN_NT_SET_SYSTEM_INFORMATION as u32),
             (NativeService::NtUnmapViewOfSection, 277),

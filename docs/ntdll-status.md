@@ -20,7 +20,7 @@ Every number below was **re-measured at `6dee67e`** against the built binary and
 | the pure core | `crates/nt-ntdll` | `no_std` rlib, host-tested with plain `cargo test`. All the *logic*: `rtl/*.rs` (54 modules), `loader/*.rs`, `heap.rs`, `sync.rs`, `nls.rs`, `printf.rs`, `crt.rs`, `dbg.rs`, `csr.rs`, `ki.rs`, `trap_stubs.rs`. |
 | the DLL | `crates/nt-ntdll-dll` | a `cdylib` in **its own workspace** (it never builds for the host). ~47 kLOC of thin export wrappers: `exports.rs`, `security_exports.rs`, `on_target.rs` (the target-only tails), `seh.rs`, `lib.rs`. |
 | byte-exact layouts | `crates/nt-ntdll-layout` | static-asserted x64 `PEB`/`TEB`/`LDR_DATA_TABLE_ENTRY`/`KUSER_SHARED_DATA` offsets. The one place ntdll and the executive agree on a field offset (e.g. `PEB_BEING_DEBUGGED_OFFSET`). |
-| the shared SSN table | `crates/nt-syscall-abi` | **single source of truth** for the syscall ABI: `NT_SYSCALLS` (212 services), `ZW_ALIASES` (212), `NT_ARGC` (213 — `NtCreateThreadEx` has an arity row without a service row). SSNs are the **0-based line index in `references/reactos/ntoskrnl/sysfuncs.lst`**; both ntdll and the executive read this crate. |
+| the shared SSN table | `crates/nt-syscall-abi` | **single source of truth** for the syscall ABI: `NT_SYSCALLS` (216 services), `ZW_ALIASES` (216), `NT_ARGC` (217 — `NtCreateThreadEx` has an arity row without a service row). SSNs are the **0-based line index in `references/reactos/ntoskrnl/sysfuncs.lst`**; both ntdll and the executive read this crate. |
 | the build | `scripts/build_ntdll_dll.sh` | nightly + `-Zbuild-std`, a custom no-CRT `x86_64-pc-windows-gnullvm-nostd` target, `rust-lld`. Emits `.tmp/nt-ntdll.dll` (1 782 272 bytes at `6dee67e`). Hard gate: `tools/ntdll-dll-verify` parses the result with **the executive's own `nt-pe-loader`** and asserts PE32+/`IMAGE_FILE_DLL`, the complete `Nt*` ABI, `LdrpInitialize`, a `.reloc` directory, and per-stack-DLL import coverage. |
 | staging | `rust-micro/scripts/make_image.sh:166-180` | copies `.tmp/nt-ntdll.dll` onto the image **as `\reactos\system32\ntdll.dll`**, overwriting the real ReactOS one. **There is no fallback** — no real ReactOS ntdll bytes exist on the image; every hosted process that loads "ntdll" gets ours. |
 
@@ -58,13 +58,13 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 
 ### 2.1 Exports in the built `.tmp/nt-ntdll.dll`
 
-**1342 exports, 0 forwarders.**
+**1351 exports, 0 forwarders.**
 
 | prefix | count | note |
 |---|---|---|
-| `Nt*` | 214 | 212 SSN trap stubs + `NtCurrentTeb` + `NtGetTickCount` |
-| `Zw*` | 212 | `zw_alias!` of the `Nt*` stubs; the five Dbgk aliases are included |
-| `Rtl*` | 593 | incl. 13 `Rtlp*` |
+| `Nt*` | 218 | 216 SSN trap stubs + `NtCurrentTeb` + `NtGetTickCount` |
+| `Zw*` | 216 | `zw_alias!` of the `Nt*` stubs; the five Dbgk aliases and registry hive variants are included |
+| `Rtl*` | 594 | incl. 13 `Rtlp*` |
 | `Ldr*` | 54 | incl. `LdrpInitialize` |
 | `Etw*` | 64 | 46 `etw_ok!` + 2 `etw_scenario_write!` no-ops + real ones |
 | `Dbg*` | 18 | of which 10 `DbgUi*` |
@@ -72,7 +72,7 @@ module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`
 | `Ki*` | 4 | the user dispatchers |
 | CRT / crypto / Alpc / data | 167 | `mem*`/`str*`/`wcs*`/`sprintf`/`qsort`/math, `A_SHA*`/`MD4*`/`MD5*`, `Pfx*`, `Alpc*`, `__C_specific_handler`, `__chkstk`, `VerSetConditionMask`, the 3 `Nls*` data exports |
 
-Roughly: 866 hand-written `#[export_name]` items + 212 macro trap stubs + 212 `zw_alias!` + 48 ETW
+Roughly: 867 hand-written `#[export_name]` items + 216 macro trap stubs + 216 `zw_alias!` + 48 ETW
 macros + a handful of data exports.
 
 ### 2.2 Required imports — is anything missing?
@@ -154,7 +154,7 @@ covered by the pure core's tests plus the boot gate.
 
 Brief, by area — the code is the reference.
 
-* **`Nt*`/`Zw*` transport stubs** (`nt-ntdll/src/trap_stubs.rs` + `nt-syscall-abi`) — 212 services,
+* **`Nt*`/`Zw*` transport stubs** (`nt-ntdll/src/trap_stubs.rs` + `nt-syscall-abi`) — 216 services,
   arity-checked. Semantics live executive-side in `ExecNtHandler`.
 * **`Rtl*`** (`nt-ntdll/src/rtl/`, 54 modules) — strings/Unicode/case/NLS · path + DOS↔NT conversion ·
   environment blocks + process parameters · time/timezone · security (SIDs/ACLs/SDs/privileges/tokens/
@@ -265,6 +265,12 @@ fidelity**; nothing here is a missing import or an unconditional stub.
 **Completed pickup (2026-08-01):** `RtlZeroHeap` is now exported and backed by the real
 `nt-ntdll` heap: it validates the heap, zeros payload bytes in every free block, preserves heap
 metadata/live allocations, and is covered by focused host tests.
+
+**Completed pickup (2026-08-01):** registry hive API variants are now real surface, not ReactOS-gap
+mirrors: `NtLoadKey2`, `NtLoadKeyEx`, `NtUnloadKey2`, `NtUnloadKeyEx` and their `Zw*` aliases are
+in the shared SSN table, exported by ntdll, and dispatched by the executive to the existing
+`NtLoadKey`/`NtUnloadKey` CM mount/detach implementation with flag validation, trust-key validation,
+and synchronous `NtUnloadKeyEx` event signalling.
 
 1. **Tier-2/3 `Rtl*` breadth — low value, do on demand.** Of §C's named Tier-2 list only 4 names
    remain unexported: `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`,

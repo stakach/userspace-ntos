@@ -2,11 +2,11 @@
 
 use super::*;
 
-/// The exact count of `Nt*` exports the current hosted ReactOS set imports plus
-/// `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally, and
-/// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
-const REQUIRED_NT_COUNT: usize = 212;
-const REQUIRED_ZW_COUNT: usize = 212;
+/// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
+/// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
+/// load/unload variants that route to real executive CM functionality.
+const REQUIRED_NT_COUNT: usize = 216;
+const REQUIRED_ZW_COUNT: usize = 216;
 
 #[test]
 fn required_counts() {
@@ -114,6 +114,9 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtOpenFile", 122),               // (loader hot path)
         ("NtOpenIoCompletion", 123),       // SSN_NT_OPEN_IO_COMPLETION = 123
         ("NtOpenKey", 125),                // SSN_NT_OPEN_KEY = 125
+        ("NtLoadKey", 102),                // SSN_NT_LOAD_KEY = 102
+        ("NtLoadKey2", 103),               // SSN_NT_LOAD_KEY2 = 103
+        ("NtLoadKeyEx", 104),              // SSN_NT_LOAD_KEY_EX = 104
         ("NtPlugPlayControl", 138),        // SSN_NT_PLUG_PLAY_CONTROL = 138
         ("NtProtectVirtualMemory", 143),   // SSN_NT_PROTECT_VM = 143
         ("NtQueryDebugFilterState", 148),  // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
@@ -128,6 +131,9 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtSetValueKey", 256),            // SSN_NT_SET_VALUE_KEY = 256
         ("NtSuspendProcess", 262),         // SSN_NT_SUSPEND_PROCESS = 262
         ("NtTerminateProcess", 266),       // SSN_NT_TERMINATE_PROCESS = 266
+        ("NtUnloadKey", 272),              // SSN_NT_UNLOAD_KEY = 272
+        ("NtUnloadKey2", 273),             // SSN_NT_UNLOAD_KEY2 = 273
+        ("NtUnloadKeyEx", 274),            // SSN_NT_UNLOAD_KEY_EX = 274
         ("NtWaitForSingleObject", 281),    // (core sync)
     ];
     for &(name, expect) in anchors {
@@ -166,8 +172,16 @@ fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtWaitForSingleObject"), 3);
     assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest
     assert_eq!(exact_argc_of("NtCreateThreadEx"), Some(11));
+    assert_eq!(argc_of("NtLoadKey"), 2);
+    assert_eq!(argc_of("NtLoadKey2"), 3);
+    assert_eq!(argc_of("NtLoadKeyEx"), 4);
+    assert_eq!(argc_of("NtUnloadKey"), 1);
+    assert_eq!(argc_of("NtUnloadKey2"), 2);
+    assert_eq!(argc_of("NtUnloadKeyEx"), 2);
     // Zw* inherits its underlying Nt*'s arity.
     assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));
+    assert_eq!(argc_of("ZwLoadKeyEx"), argc_of("NtLoadKeyEx"));
+    assert_eq!(argc_of("ZwUnloadKey2"), argc_of("NtUnloadKey2"));
     // Unknown falls back conservatively to MAX_STUB_ARGS (never 0 → never silently drops args).
     assert_eq!(argc_of("NtNotARealService"), MAX_STUB_ARGS);
     assert_eq!(exact_argc_of("NtNotARealService"), None);
