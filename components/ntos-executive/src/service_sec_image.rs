@@ -173,7 +173,6 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
         nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL,
         0,
         0,
-        4,
         &[],
         win32k_glue::Win32kClientContext {
             pi: pi as u32,
@@ -6368,7 +6367,6 @@ pub(crate) unsafe fn service_sec_image(
                         get_recv_mr(7),
                         get_recv_mr(8),
                         sp,
-                        5,
                         &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
@@ -7152,9 +7150,6 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                // `NtUserLoadKeyboardLayoutEx` needs a captured stack-arg KLID descriptor; the
-                // real win32k handler probes that client `PUNICODE_STRING` before loading the HKL.
-                // The capture is done with the wide stack args immediately before dispatch below.
                 // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake.
                 // A service's user32 DllMain runs RegisterSystemClasses, but win32k's shared system
                 // cursors (gasyscur) are ONLY loaded by winlogon's INTERACTIVE SwitchDesktop ->
@@ -7467,57 +7462,10 @@ pub(crate) unsafe fn service_sec_image(
                         (0, true)
                     }
                 } else {
-                    // ★ BATCH 44 — marshal the win64 STACK-ARG TAIL for WIDE win32k SSNs. `sp` is the
-                    // client's syscall-entry stack pointer (MR16). The kernel captures the faulting
-                    // thread's RSP into MR16 (see the NtQueryInformationThread return_length read at
-                    // sp+0x28 above), so args 5..N live at [sp+0x28], [sp+0x30], … per win64. For a wide
-                    // SSN (nargs>4) win32k_dispatch_wide reads args 5..N from the client stack; for the
-                    // common nargs<=4 case it is byte-identical to the old register-only dispatch.
+                    // Forward the real syscall-entry stack pointer to win32k. The component derives
+                    // exact arity from win32k's SSPT and reads only the required tail args through
+                    // the attached client-memory path.
                     let sp = get_recv_mr(16);
-                    let nargs = win32k_subsystem::win32k_ssn_argc(m0);
-                    let stack_arg_count = nargs.min(16).saturating_sub(4) as usize;
-                    let mut stack_args = [0u64; 12];
-                    for (index, value) in stack_args[..stack_arg_count].iter_mut().enumerate() {
-                        *value = client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x28 + index as u64 * 8,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        )
-                        .unwrap_or(0);
-                    }
-                    if m0 == 0x125c && stack_arg_count >= 1 {
-                        let original = stack_args[0];
-                        let captured = capture_client_string_arg(
-                            pi as u64,
-                            original,
-                            false,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
-                        if captured != original {
-                            stack_args[0] = captured;
-                            print_str(
-                                b"[w32marshal] captured NtUserLoadKeyboardLayoutEx KLID arg=0x",
-                            );
-                            print_hex((original >> 32) as u32);
-                            print_hex(original as u32);
-                            print_str(b" -> 0x");
-                            print_hex((captured >> 32) as u32);
-                            print_hex(captured as u32);
-                            print_str(b"\n");
-                        } else {
-                            print_str(
-                                b"[w32marshal] NtUserLoadKeyboardLayoutEx KLID capture pass-through arg=0x",
-                            );
-                            print_hex((original >> 32) as u32);
-                            print_hex(original as u32);
-                            print_str(b"\n");
-                        }
-                    }
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
@@ -7551,8 +7499,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a2,
                         d_a3,
                         sp,
-                        nargs,
-                        &stack_args[..stack_arg_count],
+                        &[],
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
@@ -7573,11 +7520,24 @@ pub(crate) unsafe fn service_sec_image(
                     // es->text + col, count, …)` (args 5..9 ride the win64 stack tail). The string
                     // it hands GDI IS the control's live text buffer, so matching our injected user
                     // name there proves the real edit control holds what was typed into it.
-                    if pi == 2
-                        && m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
-                        && stack_arg_count >= 3
-                    {
-                        winlogon_credential_observe_text_out(stack_args[1], stack_args[2]);
+                    if pi == 2 && m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN && sp != 0 {
+                        let string = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let count = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x38,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if let (Some(string), Some(count)) = (string, count) {
+                            winlogon_credential_observe_text_out(string, count);
+                        }
                     }
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected

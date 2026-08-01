@@ -116,7 +116,7 @@ pub(crate) struct HostCaps {
     pub client_attach: bool,
     /// win32k: service the nested callback rendezvous label while an outer dispatch is active.
     pub usermode_callback: bool,
-    /// win32k: stage wide (>4) stack args from the caller frame into `SH_REQ_A4..` / `SH_REQ_NARGS`.
+    /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]
     pub wide_arg_marshal: bool,
@@ -921,7 +921,8 @@ pub(crate) unsafe fn component_pump_resume_user_callback(ch: &PumpChannel) -> Pu
 
 unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> PumpResult {
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
-    // wide-arg (SH_REQ_A4../NARGS) staging — is done by the win32k caller wrapper `win32k_dispatch_wide`
+    // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
+    // executive-originated calls — is done by the win32k caller wrapper `win32k_dispatch_wide`
     // BEFORE this pump runs (exactly as the FSD `dispatch_irp` fills the IRP fields before the pump).
     // `caps.client_attach` here gates only the DEMAND-FAULT foreign-frame sharing (pump step 4); the
     // initial attach is the caller's, matching the design's caller-owns-fill split.

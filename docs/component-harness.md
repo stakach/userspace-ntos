@@ -80,7 +80,7 @@ for added capability flags (§2.3).
 | Ready/done signal (plain Send on `CT_FAULT`, distinct label) | `send_done` `:856-867`, `FSD_DISPATCH_LABEL=0x771` `:116` | `send_done` `:2958-2968`, `W32_DISPATCH_LABEL=0x770` `:487` |
 | Block for request (plain Recv on `CT_FAULT`) | `recv_req` `:870-880` | `recv_req` `:2974-2983` |
 | **Dispatch routing** | `DriverObject->MajorFunction[major]` at `mj_base+major*8` `:892` | SSDT: `dispatch_ssn` `:2722-2948`, `handler = [SH_SSDT_BASE + (ssn-0x1000)*8]` `:2733`; provider SSPT pointer recorded at `SH_SSDT_ARGUMENT_TABLE` |
-| **Arg marshal** | fixed IRP build `run_irp` `:915-1090` | executive stages wide args from the fallback arity map; component-side dispatch prefers the registered provider SSPT arity, then exact-arity transmutes `:2737-2786` |
+| **Arg marshal** | fixed IRP build `run_irp` `:915-1090` | real client syscalls pass caller RSP; component-side dispatch requires the registered provider SSPT arity, reads the required tail from the attached client stack, then exact-arity transmutes `:2737-2786` |
 | Write reply (status/info/seq) | `:899-902` | `:3444-3446` |
 
 **Shared-frame protocol** — both use one RW page shared into the executive, with a header of fixed
@@ -91,7 +91,8 @@ offsets. FSD `FSD_SHARED_VADDR=0x…0F38_0000` (`driver_launch.rs:78`), offsets 
 `:141-176` (`SH_ENTRY_RVA=0x00`, `SH_VERDICT=0x08`, `SH_DE_STATUS=0x10`, `SH_SSDT_BASE=0x18`,
 `SH_SSDT_COUNT=0x20`, `SH_SSDT_INDEX=0x24`, `SH_SSDT_ARGUMENT_TABLE=0x28`, `SH_POOL_USED=0x30`,
 `SH_REQ_SSN=0x50`, `SH_REQ_A0..A3=0x58/0x60/0x68/0x70`, `SH_REQ_STATUS=0x78`, `SH_REQ_SEQ=0x80`,
-`SH_FONT_SIZE=0x88`, wide-arg tail `SH_REQ_A4=0x90 .. SH_REQ_NARGS=0xF0`).
+`SH_FONT_SIZE=0x88`, executive-staged wide-arg tail `SH_REQ_A4=0x90 .. SH_REQ_NARGS=0xF0`,
+real-syscall caller stack pointer `SH_REQ_CALLER_SP=0x160`).
 
 > Note: the two frames deliberately DIFFER in their per-request field offsets (`SH_REQ_MAJOR=0x40` for
 > IRP vs `SH_REQ_SSN=0x50` for SSN) and DONE labels (0x771 vs 0x770). The header prefix (0x00-0x30) is
@@ -138,7 +139,7 @@ them today. They already share `spawn_component` + the `DriverExportRegistry` IA
 |---|---|---|
 | (c) | Client-memory attach (KeStackAttachProcess model): `w32_client_attach` (detach prev client's pages), `map_csrss_page_into_win32k` (share client frame at identity VA, RW so out-params propagate) | `win32k_glue.rs:157-179`, `:184-199`; attach tables `:130-153`; `ensure_w32_client_paging` `:88-110` |
 | (d) | Usermode callback / WINDOWPROC bridge: `s_ke_user_mode_callback`, `api==0` WINDOWPROC → `Result=1` (WM_NCCALCSIZE→0) so `co_UserCreateWindowEx` continues | `win32k_subsystem.rs:2162-2240`, bound `:2349` |
-| (e) | Wide-arg stack marshal: executive stages client stack args into `SH_REQ_A4..`, `SH_REQ_NARGS`; component transmutes to exact arity | exec `win32k_glue.rs:415-423`; component `win32k_subsystem.rs:2737-2786`; `win32k_ssn_argc` `:185-324`; forward arm `service_sec_image.rs:3120-3122` |
+| (e) | Wide-arg stack marshal: real syscalls pass caller RSP and component reads required tail args from attached client memory; executive-originated calls stage explicit `SH_REQ_A4..` args. In both cases win32k's registered SSPT/KiArgumentTable supplies the exact arity | exec `win32k_glue.rs`; component `win32k_subsystem.rs`; forward arm `service_sec_image.rs` |
 | (f) | Demand-fault CLIENT-FRAME-SHARING (foreign-pointer detection + internal-low zero-fill discrimination) | `win32k_glue.rs:451-550` (foreign detect `:464-466`) |
 | (g) | Checked-build int-0x2c ASSERT-SKIP (verify `CD 2C` via executive RW image view, resume IP+2) | `win32k_glue.rs:558-591` |
 | (h) | REPLY_W32 nesting fix (Fix A: DONE via plain Send not Call; Fix B: nested faults answered through per-caller REPLY_W32 cap so REPLY_MAIN's binding to the outer csrss caller survives) | `win32k_glue.rs:434-448`, `:534-545`; component `win32k_subsystem.rs:2950-2983`; self-test `SSN_TEST_FAULT` `:358-364` |
@@ -211,7 +212,7 @@ pub(crate) struct HostCaps {
     /// win32k: honour KeUserModeCallback / WINDOWPROC bridge (component-side registration only —
     /// this flag documents the capability; the callback is bound in DriverEntry).
     pub usermode_callback: bool,
-    /// win32k: stage wide (>4) stack args from the caller frame into SH_REQ_A4.. / SH_REQ_NARGS.
+    /// win32k: carry wide (>4) stack args through caller RSP or explicit SH_REQ_A4.. staging.
     pub wide_arg_marshal: bool,
     /// win32k: skip checked-build int-0x2c NT_ASSERTs (resume IP+2) on a label-3 UserException.
     pub assert_skip: bool,
@@ -256,8 +257,8 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> (i32, bool);
 Body (single loop; the diffs from today are all `if ch.caps.*`):
 1. if `caps.client_attach`: `w32_client_attach(ch.client_pi)`.
 2. Request fields are ALREADY written by the caller (both `npfs_dispatch_irp` and the win32k forward arm
-   fill the frame before calling the pump); the pump only writes wide-args when `caps.wide_arg_marshal`
-   (stage `SH_REQ_A4../NARGS` from the caller SP). Clear `SH_REQ_STATUS`.
+   fill the frame before calling the pump); win32k tail staging is caller-owned and arity is provider-owned.
+   Clear `SH_REQ_STATUS`.
 3. `ep_send(ch.fault_ep, ch.dispatch_label)`; recv (via `recv_full_r12(fault_ep, reply_cap)` when
    `caps.nested_reply_cap && reply_cap!=0`, else `ep_recv_full`).
 4. `loop { match label:`
@@ -286,7 +287,7 @@ win32k forward arm), because it is genuinely KIND-specific; the pump is the shar
 pub(crate) unsafe fn component_main(
     shared_va: u64,
     code_va: u64,
-    // dispatch(ssn_or_major, a0..a3, nargs) -> status ; called per request inside the loop.
+    // dispatch(ssn_or_major, a0..a3) -> status ; called per request inside the loop.
     dispatch: unsafe fn(&DispatchReq) -> i32,
     post_driver_entry: unsafe fn(status: i32),  // win32k: establish_client_and_dispatch; FSD: no-op
     run_loop: bool,                              // true = Family A dispatch_loop; false = return
@@ -306,7 +307,7 @@ pub(crate) unsafe fn component_main(
 * The `dispatch` callback:
   * FSD plugs an IRP router: `major → MajorFunction[major] → run_irp`.
   * win32k plugs an SSN router: `ssn → dispatch_ssn` (which itself owns the exact-arity transmute (e) —
-    that stays win32k-internal, keyed off `win32k_ssn_argc`).
+    that stays win32k-internal and is keyed off the provider SSPT).
 
 DriverEntry preamble differences that MUST be parameterised (not hard-coded): DRIVER_OBJECT size (FSD
 0x150 / win32k 0x200) and DriverExtension offset (0x68 / 0x30) — pass as fields of a small
@@ -367,7 +368,7 @@ step is a separate commit = a rollback point.
   win32k flags true }`, `reply_cap = REPLY_W32_SLOT`, `client_pi = W32_CLIENT_PI`. The foreign-frame
   sharing (f), int-0x2c skip (g), REPLY_W32 nesting (h), wide-arg staging (e) all move behind their
   respective flags INSIDE the shared loop — no logic deleted, only relocated. Keep the win32k forward arm
-  (`service_sec_image.rs:3120-3122`) filling `SH_REQ_SSN/A*` and computing `nargs = win32k_ssn_argc`.
+  (`service_sec_image.rs`) filling `SH_REQ_SSN/A*` and passing caller RSP without computing arity.
 * 4b. Component entry: `win32k_subsystem_entry` → `component_main(...)` with an SSN `dispatch` closure
   (`ssn → dispatch_ssn`, which retains (e)), `post_driver_entry = establish_client_and_dispatch`,
   `DriverObjectSpec{size:0x200, ext:0x30}`.

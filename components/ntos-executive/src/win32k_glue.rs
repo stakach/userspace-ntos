@@ -1625,7 +1625,6 @@ pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 /// Returns the `NESTED_SLIP_*` proof mask.
 pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch_base: u64) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
-    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
     const WM_NULL: u64 = 0x0000;
     const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
@@ -1688,7 +1687,6 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
             0,
             0,
             victim_rsp,
-            NTUSER_MESSAGE_CALL_ARGC,
             &[0 /* ResultInfo */, FNID_SENDMESSAGE, 0 /* Ansi */],
             client,
         );
@@ -1755,7 +1753,6 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         0,
         0,
         victim_rsp,
-        0,
         &[],
         client,
     );
@@ -1834,7 +1831,6 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     kill_victim: &mut dyn FnMut(u64) -> bool,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
-    const NTUSER_MESSAGE_CALL_ARGC: u64 = 7;
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
     const WM_NULL: u64 = 0x0000;
     const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
@@ -1899,7 +1895,6 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
             0,
             0,
             victim_rsp,
-            NTUSER_MESSAGE_CALL_ARGC,
             &[0 /* ResultInfo */, FNID_SENDMESSAGE, 0 /* Ansi */],
             client,
         );
@@ -3017,7 +3012,6 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         a2,
         a3,
         0,
-        0,
         &[],
         Win32kClientContext {
             pi,
@@ -3031,14 +3025,10 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     )
 }
 
-/// Like [`win32k_dispatch`] but marshals the win64 STACK-ARG TAIL for WIDE SSNs (args 5+). The x64
-/// win64 ABI passes args 1-4 in rcx/rdx/r8/r9 and args 5..N on the CALLER's stack at
-/// `[rsp+0x28], [rsp+0x30], …` (rsp = the syscall-entry stack pointer). `caller_sp` is the client's
-/// stack pointer at the syscall (get_recv_mr(16)); `nargs` is the handler's TOTAL arg count. For
-/// `nargs<=4` this is byte-identical to the old register-only dispatch. For a wide SSN (e.g.
-/// NtUserCreateWindowEx = 15 args) we read stack args 5..N from the client's stack via
-/// `smss_stack_read` and stage them into SH_REQ_A4.. so win32k's `dispatch_ssn` can rebuild a real
-/// N-arg win64 call — the FIX for the garbage-hMenu wall (BATCH 44).
+/// Like [`win32k_dispatch`] but carries the win64 stack-argument source for win32k SSNs. Real client
+/// syscalls pass `caller_sp`, and the win32k component reads exactly the provider-required tail
+/// from the attached client stack. Executive-originated calls pass explicit `stack_args`, which are
+/// staged in `SH_REQ_A4..` and rejected by the component if they do not satisfy the provider arity.
 pub(crate) unsafe fn win32k_dispatch_wide(
     ssn: u64,
     a0: u64,
@@ -3046,7 +3036,6 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     a2: u64,
     a3: u64,
     caller_sp: u64,
-    nargs: u64,
     stack_args: &[u64],
     client: Win32kClientContext,
 ) -> (u64, bool) {
@@ -3136,31 +3125,38 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         (sh + win32k_subsystem::SH_REQ_DEBUG_FLAGS) as *mut u64,
         debug_flags,
     );
-    // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
-    // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.
-    // Clear all slots first so component-side provider metadata can never observe stale tail args.
+    let caller_stack_source = caller_sp != 0 && stack_args.is_empty();
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_CALLER_SP) as *mut u64,
+        if caller_stack_source { caller_sp } else { 0 },
+    );
+    // Stage explicit STACK-ARG TAIL values only for executive-originated calls. Clear all slots first
+    // so a provider-derived wide arity can never observe stale tail args from a previous dispatch.
     let mut clear = 0u64;
-    while clear < 12 {
+    while clear < win32k_subsystem::WIN32K_STACK_TAIL_ARGS as u64 {
         core::ptr::write_volatile(
             (sh + win32k_subsystem::SH_REQ_A4 + clear * 8) as *mut u64,
             0,
         );
         clear += 1;
     }
-    let staged = if nargs > 4
-        && caller_sp != 0
-        && stack_args.len() >= nargs.min(16).saturating_sub(4) as usize
-    {
-        nargs.min(16)
-    } else {
+    let staged_tail = stack_args
+        .len()
+        .min(win32k_subsystem::WIN32K_STACK_TAIL_ARGS);
+    let staged_total = if staged_tail == 0 {
         0
+    } else {
+        4 + staged_tail as u64
     };
-    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_NARGS) as *mut u64, staged);
-    let mut i = 4u64;
-    while i < staged {
-        let v = stack_args[(i - 4) as usize];
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_NARGS) as *mut u64,
+        staged_total,
+    );
+    let mut i = 0usize;
+    while i < staged_tail {
+        let v = stack_args[i];
         core::ptr::write_volatile(
-            (sh + win32k_subsystem::SH_REQ_A4 + (i - 4) * 8) as *mut u64,
+            (sh + win32k_subsystem::SH_REQ_A4 + i as u64 * 8) as *mut u64,
             v,
         );
         i += 1;
