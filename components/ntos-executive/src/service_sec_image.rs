@@ -19,14 +19,45 @@ const WIN32K_MSG_BYTES: usize = 48;
 const WM_QUIT: u32 = 0x0012;
 
 fn win32k_client_label(pi: usize) -> &'static [u8] {
-    match pi {
-        1 => b"csrss",
-        2 => b"winlogon",
-        3 => b"services",
-        4 => b"lsass",
-        5 => b"userinit",
-        6 => b"explorer",
-        _ => b"client",
+    nt_exe_image::hosted_image_for_pi(pi)
+        .map(|image| image.leaf)
+        .unwrap_or(b"client")
+}
+
+fn hosted_process_uses_client_gdi(pi: usize) -> bool {
+    match nt_exe_image::hosted_image_for_pi(pi).map(|image| image.role) {
+        Some(
+            nt_exe_image::HostedProcessRole::InteractiveLogon
+            | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+            | nt_exe_image::HostedProcessRole::InteractiveShell,
+        ) => true,
+        _ => false,
+    }
+}
+
+fn record_hosted_client_gdi_mapping(pi: usize, gdi_va: u64) {
+    let Some(image) = nt_exe_image::hosted_image_for_pi(pi) else {
+        return;
+    };
+    let first = match image.role {
+        nt_exe_image::HostedProcessRole::InteractiveLogon => {
+            WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
+        }
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
+            USERINIT_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
+        }
+        nt_exe_image::HostedProcessRole::InteractiveShell => {
+            EXPLORER_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
+        }
+        _ => false,
+    };
+    if first {
+        print_str(b"[client-gdi] ");
+        print_str(image.leaf);
+        print_str(b" handle table mapped @0x");
+        print_hex((gdi_va >> 32) as u32);
+        print_hex(gdi_va as u32);
+        print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
     }
 }
 
@@ -389,6 +420,14 @@ fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Op
 fn live_hosted_pi_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     live_hosted_pi_for_thread_badge(nt_handler, badge)
         .or_else(|| hosted_pi_for_fault_badge(badge))
+}
+
+fn hosted_leaf_for_fault_badge(
+    nt_handler: &ExecNtHandler,
+    badge: u64,
+) -> Option<&'static [u8]> {
+    let pi = live_hosted_pi_for_fault_badge(nt_handler, badge)?;
+    nt_exe_image::hosted_image_for_pi(pi).map(|image| image.leaf)
 }
 
 fn hosted_process_pi_is_live(pi: usize) -> bool {
@@ -8012,28 +8051,13 @@ pub(crate) unsafe fn service_sec_image(
                 // ★ CLIENT-GDI HANDLE-TABLE MAPPING. GUI clients whose PEB+0xf8 was seeded before
                 // gdi32's GdiProcessSetup must also have the live win32k GDI table projected into
                 // their VSpace before client-side GdiValidateHandle runs. Winlogon needs this for the
-                // msgina dialog DC/font setup; userinit reaches it after wallpaper/shell startup, and
-                // explorer is the real shell GUI client.
-                if pi == 2 || pi == 5 || pi == 6 {
+                // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
+                // role path instead of fixed pi checks.
+                if hosted_process_uses_client_gdi(pi) {
                     let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
                     let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
                     if gdi_va != 0 && gdi_attributes {
-                        if pi == 2 && WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
-                            print_str(b"[wl-main] winlogon client GDI handle table mapped @0x");
-                            print_hex((gdi_va >> 32) as u32);
-                            print_hex(gdi_va as u32);
-                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
-                        } else if pi == 5 && USERINIT_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
-                            print_str(b"[userinit-gdi] client GDI handle table mapped @0x");
-                            print_hex((gdi_va >> 32) as u32);
-                            print_hex(gdi_va as u32);
-                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
-                        } else if pi == 6 && EXPLORER_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
-                            print_str(b"[explorer-gdi] client GDI handle table mapped @0x");
-                            print_hex((gdi_va >> 32) as u32);
-                            print_hex(gdi_va as u32);
-                            print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
-                        }
+                        record_hosted_client_gdi_mapping(pi, gdi_va);
                     }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
@@ -11790,21 +11814,7 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b"\n[sec-stop] badge=");
     print_u64(badge);
     print_str(b" (");
-    print_str(if badge == CSRSS_BADGE {
-        b"csrss" as &[u8]
-    } else if badge == WINLOGON_BADGE {
-        b"winlogon"
-    } else if badge == SERVICES_BADGE {
-        b"services"
-    } else if badge == LSASS_BADGE {
-        b"lsass"
-    } else if badge == USERINIT_BADGE {
-        b"userinit"
-    } else if badge == EXPLORER_BADGE {
-        b"explorer"
-    } else {
-        b"smss"
-    });
+    print_str(hosted_leaf_for_fault_badge(&nt_handler, badge).unwrap_or(b"unknown"));
     print_str(b") label=");
     print_u64(mi >> 12);
     print_str(b" m0=0x");

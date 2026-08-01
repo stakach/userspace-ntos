@@ -1,7 +1,7 @@
 # Our Rust `ntdll.dll` — current state
 
-**ntdll measurements updated through the 2026-08-01 security-export pickup; boot gate now
-`272/100`, ZERO FAILs.** This is the *current-state* document for the ntdll effort. The
+**ntdll measurements updated through the 2026-08-01 runtime-cleanup gate; boot gate reports
+`273/273` with ZERO FAILs.** This is the *current-state* document for the ntdll effort. The
 blow-by-blow history (BATCH 1..54, §A..§F) lives in
 `ntdll_plan.md`, which is now a historical log — read this file first, and go there only for the
 diagnosis story behind a specific decision.
@@ -459,12 +459,14 @@ cd rust-micro && ./scripts/make_image.sh && ./scripts/run_specs.sh
 **The gate** is the serial line
 
 ```
-[ntos-exec summary: 225/99 executive->isolated-service checks passed]
+[ntos-exec summary: 273/273 executive->isolated-service checks passed]
 ```
 
 followed by `[microtest sentinel matched -- exiting QEMU]` and `RUNEXIT=3`. **Zero `FAIL` lines** is
-the bar. Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/768 px @
-`0x003a6ea5`), `exec_msgina_logon_dialog_painted`, `exec_msgina_credential_keystrokes_delivered`,
+the bar; the denominator is produced by the gate at runtime rather than a historical constant.
+Sanity anchors that must stay PASS: `exec_win32k_desktop_painted` (768/768 px @
+`0x003a6ea5`), `exec_desktop_shell_frontier`, `exec_msgina_logon_dialog_painted`,
+`exec_msgina_credential_keystrokes_delivered`,
 `exec_msgina_credentials_entered`, `exec_msgina_logon_validation_reached_lsa`, `exec_lsa_auth_port_connected`,
 `exec_lsa_logon_user_reached`, `exec_lsa_msv1_0_sam_validation_reached`,
 `exec_lsa_security_hive_backed`, `exec_samsrv_hosted`, `exec_msv1_0_account_domain_sid_resolved`, `exec_reg_flush_key_serviced`,

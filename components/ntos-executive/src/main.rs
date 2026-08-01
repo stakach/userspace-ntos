@@ -3178,16 +3178,19 @@ fn user_shell_activation_spec(passed: &mut u64) {
     userinit_image_pipeline_spec(passed);
 }
 
-/// ═══ userinit HAS REAL FILE + SEC_IMAGE + pi=5 PROCESS SEMANTICS ═══════════════════════════════
+/// ═══ userinit HAS REAL FILE + SEC_IMAGE + PROCESS SEMANTICS ═══════════════════════════════════
 fn userinit_image_pipeline_spec(passed: &mut u64) {
+    let userinit_pi = hosted_gate_pi(b"userinit.exe");
+    let userinit_bit = hosted_gate_bit(b"userinit.exe");
     let opened = USERINIT_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
     let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let process_linked = (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & (1u64 << 5)) != 0;
+    let process_linked =
+        userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = PM_PML4S[5].load(Ordering::Relaxed);
-    let tcb = PM_MAIN_TCBS[5].load(Ordering::Relaxed);
+    let pml4 = hosted_gate_slot(&PM_PML4S, userinit_pi);
+    let tcb = hosted_gate_slot(&PM_MAIN_TCBS, userinit_pi);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
@@ -3223,7 +3226,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(queried);
     print_str(b" create-process-requests=");
     print_u64(creates);
-    print_str(b" pi5-eprocess-linked=");
+    print_str(b" pi=");
+    print_u64(userinit_pi.unwrap_or(MAX_PI) as u64);
+    print_str(b" eprocess-linked=");
     print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
@@ -3245,9 +3250,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(cursor_identities);
     print_str(b" promotions=");
     print_u64(cursor_promotions);
-    print_str(b" pi5-cache-hits=");
+    print_str(b" cache-hits=");
     print_u64(cursor_hits);
-    print_str(b" pi5-cursor=0x");
+    print_str(b" cursor=0x");
     print_hex(cursor_handle as u32);
     print_str(b" classes-observed=");
     print_u64(classes_observed);
@@ -3307,9 +3312,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     check(b"exec_userinit_gdi_shared_table_mapped", gdi_mapped != 0, passed);
     check(
         b"exec_userinit_system_font_seeded",
-        (font_seeds & (1u64 << 5)) != 0
-            && (font_successes & (1u64 << 5)) != 0
-            && (font_failures & (1u64 << 5)) == 0,
+        userinit_bit != 0
+            && (font_seeds & userinit_bit) != 0
+            && (font_successes & userinit_bit) != 0
+            && (font_failures & userinit_bit) == 0,
         passed,
     );
     check(
@@ -3340,14 +3346,19 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
 
 /// ═══ userinit LAUNCHED THE REAL SHELL IMAGE THROUGH THE SAME EXE PIPELINE ═════════════════════
 fn explorer_image_pipeline_spec(passed: &mut u64) {
+    let userinit_bit = hosted_gate_bit(b"userinit.exe");
+    let explorer_pi = hosted_gate_pi(b"explorer.exe");
+    let explorer_bit = hosted_gate_bit(b"explorer.exe");
+    let shell_font_bits = userinit_bit | explorer_bit;
     let opened = EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed);
     let sectioned = EXPLORER_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = EXPLORER_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = EXPLORER_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let process_linked = (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & (1u64 << 6)) != 0;
+    let process_linked =
+        explorer_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = PM_PML4S[6].load(Ordering::Relaxed);
-    let tcb = PM_MAIN_TCBS[6].load(Ordering::Relaxed);
+    let pml4 = hosted_gate_slot(&PM_PML4S, explorer_pi);
+    let tcb = hosted_gate_slot(&PM_MAIN_TCBS, explorer_pi);
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     let create_window_string_captures =
         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
@@ -3372,7 +3383,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
     let process_self_term =
-        (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & (1u64 << 6)) != 0;
+        explorer_bit != 0
+            && (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & explorer_bit) != 0;
     print_str(b"[explorer-image] opens=");
     print_u64(opened);
     print_str(b" sections=");
@@ -3381,7 +3393,9 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(queried);
     print_str(b" create-process-requests=");
     print_u64(creates);
-    print_str(b" pi6-eprocess-linked=");
+    print_str(b" pi=");
+    print_u64(explorer_pi.unwrap_or(MAX_PI) as u64);
+    print_str(b" eprocess-linked=");
     print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
@@ -3461,9 +3475,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     );
     check(
         b"exec_userinit_explorer_system_fonts_seeded",
-        (font_seeds & ((1u64 << 5) | (1u64 << 6))) == ((1u64 << 5) | (1u64 << 6))
-            && (font_successes & ((1u64 << 5) | (1u64 << 6))) == ((1u64 << 5) | (1u64 << 6))
-            && (font_failures & ((1u64 << 5) | (1u64 << 6))) == 0,
+        userinit_bit != 0
+            && explorer_bit != 0
+            && (font_seeds & shell_font_bits) == shell_font_bits
+            && (font_successes & shell_font_bits) == shell_font_bits
+            && (font_failures & shell_font_bits) == 0,
         passed,
     );
     check(
@@ -12272,7 +12288,8 @@ impl ProcExec {
 }
 /// Bit i set iff `procs[i]` (the folded EPROCESS-linked per-process struct) has a live pml4 AND its
 /// `pid` matches the ProcessManager's pid for pi=i — proves the consolidated per-process mechanism
-/// struct is EPROCESS-linked at runtime (path 3). Expected 0b111_1111 for the seven live processes.
+/// struct is EPROCESS-linked at runtime (path 3). The gate derives the expected mask from
+/// `nt_exe_image::HOSTED_PROCESS_IMAGES`.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -12697,7 +12714,45 @@ fn print_hex(v: u32) {
     }
 }
 
+static GATE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn hosted_gate_pi(leaf: &[u8]) -> Option<usize> {
+    match nt_exe_image::hosted_pi_for_leaf(leaf) {
+        Some(pi) if pi < MAX_PI => Some(pi),
+        _ => None,
+    }
+}
+
+fn hosted_gate_bit(leaf: &[u8]) -> u64 {
+    match hosted_gate_pi(leaf) {
+        Some(pi) if pi < 64 => 1u64 << pi,
+        _ => 0,
+    }
+}
+
+fn hosted_gate_mask() -> u64 {
+    let mut mask = 0u64;
+    for image in nt_exe_image::HOSTED_PROCESS_IMAGES {
+        if image.pi < MAX_PI && image.pi < 64 {
+            mask |= 1u64 << image.pi;
+        }
+    }
+    mask
+}
+
+fn hosted_gate_count() -> u64 {
+    hosted_gate_mask().count_ones() as u64
+}
+
+fn hosted_gate_slot(slots: &[AtomicU64; MAX_PI], pi: Option<usize>) -> u64 {
+    match pi {
+        Some(pi) if pi < MAX_PI => slots[pi].load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
 fn check(name: &[u8], ok: bool, passed: &mut u64) {
+    GATE_TOTAL.fetch_add(1, Ordering::Relaxed);
     if ok {
         print_str(b"  PASS ");
         *passed += 1;
@@ -16157,24 +16212,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WL_LISTENER_TEB_QUERIED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
-                    // nt-process convergence (first increment): the real Process Manager backs the
-                    // hosted processes with EPROCESS objects. `exec_process_manager_up` = all EPROCESSes
-                    // exist; `exec_eprocess_backs_badges` = each pi's EPROCESS names its hosted binary
-                    // with a distinct pid (identity is real, not a scalar); `exec_eprocess_lookup_by_badge`
-                    // = the live service loop resolved a fault badge → its EPROCESS through the manager.
+                    // nt-process convergence: the real Process Manager backs every cataloged hosted
+                    // image with an EPROCESS. The expected identity mask comes from `nt_exe_image`,
+                    // not from a hand-maintained boot-history constant.
+                    let hosted_process_count = hosted_gate_count();
+                    let hosted_process_mask = hosted_gate_mask();
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == 7,
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == hosted_process_count,
                         &mut passed,
                     );
                     check(
                         b"exec_process_manager_dynamic_allocations",
-                        PM_DYNAMIC_PROCESS_ALLOCATIONS.load(Ordering::Relaxed) >= 4,
+                        PM_DYNAMIC_PROCESS_ALLOCATIONS.load(Ordering::Relaxed)
+                            >= hosted_process_count.saturating_sub(3),
                         &mut passed,
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b111_1111,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == hosted_process_mask,
                         &mut passed,
                     );
                     check(
@@ -16211,12 +16267,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // by the post-loop self-test on a throwaway EPROCESS; hosted processes are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b111_1111,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == hosted_process_mask,
                         &mut passed,
                     );
                     check(
                         b"exec_main_thread_bound_at_spawn",
-                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 7,
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= hosted_process_count,
                         &mut passed,
                     );
                     check(
@@ -16563,12 +16619,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     // Path 3 — the ex-parallel per-pi identity arrays (pml4s/scratch_bases/
                     // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
-                    // EPROCESS-linked via its `pid`. `exec_eprocess_linked_mechanism` = every hosted
-                    // process's folded mechanism struct has a live pml4 AND its pid matches the
-                    // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
+                    // EPROCESS-linked via its `pid`. The expected mask follows the hosted-image
+                    // catalog so this proof moves with the boot process set.
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b111_1111,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == hosted_process_mask,
                         &mut passed,
                     );
                     // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32
@@ -16852,54 +16907,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             b" px (natural flow did NOT fully re-paint)\n".as_slice()
         });
 
-        // BATCH 10 — RIP-instrument the winlogon user32-init spin. winlogon (pi 2) is PARKED at its
-        // busy-spin by the time the specs run (its ntdll loader quiesced with no faults/syscalls).
-        // Sample its saved RIP twice via seL4_TCB_ReadRegisters and classify against the known
-        // module bases so we can decide (a) OUR ntdll CS bug vs (b) a user32/kernel32 shared-value
-        // poll. If the two samples land in different functions it's a genuine loop; identical = a
-        // tight self-loop. Module bases (from the DEMAND-LOAD log): user32=0x80150000,
-        // kernel32=0x803a0000, gdi32=0x800f0000, advapi32=0x80280000, winsrv=0x80080000,
-        // ntdll=NTDLL_BASE(0x100_0080_0000), winlogon.exe=PE_LOAD_BASE(0x100_0056_0000).
-        let wl_tcb = PM_MAIN_TCBS[2].load(Ordering::Relaxed);
-        if wl_tcb > 1 {
-            for s in 0..3u64 {
-                let rip = unsafe { crate::win32k_glue::tcb_read_rip(wl_tcb) };
-                print_str(b"[batch10] winlogon parked RIP sample #");
-                print_u64(s);
-                print_str(b" = 0x");
-                print_hex((rip >> 32) as u32);
-                print_hex(rip as u32);
-                // Classify + emit the module-relative RVA.
-                let (name, base): (&[u8], u64) = if rip >= NTDLL_BASE && rip < NTDLL_BASE + 0x20_0000 {
-                    (b"ntdll", NTDLL_BASE)
-                } else if rip >= PE_LOAD_BASE && rip < PE_LOAD_BASE + 0x20_0000 {
-                    (b"winlogon.exe", PE_LOAD_BASE)
-                } else if rip >= 0x803a0000 && rip < 0x803a0000 + 0x2b0000 {
-                    (b"kernel32", 0x803a0000)
-                } else if rip >= 0x80150000 && rip < 0x80150000 + 0x130000 {
-                    (b"user32", 0x80150000)
-                } else if rip >= 0x80280000 && rip < 0x80280000 + 0x80000 {
-                    (b"advapi32", 0x80280000)
-                } else if rip >= 0x800f0000 && rip < 0x800f0000 + 0x60000 {
-                    (b"gdi32", 0x800f0000)
-                } else if rip >= 0x80080000 && rip < 0x80080000 + 0x70000 {
-                    (b"winsrv", 0x80080000)
-                } else if rip >= 0x80690000 && rip < 0x80690000 + 0x100000 {
-                    (b"msvcrt", 0x80690000)
-                } else {
-                    (b"?", 0)
-                };
-                print_str(b" (");
-                print_str(name);
-                if base != 0 {
-                    print_str(b"+0x");
-                    print_hex((rip - base) as u32);
-                }
-                print_str(b")\n");
-            }
-        } else {
-            print_str(b"[batch10] winlogon TCB not available for RIP sample\n");
-        }
+        let userinit_bit = hosted_gate_bit(b"userinit.exe");
+        let explorer_bit = hosted_gate_bit(b"explorer.exe");
+        let exec_links = PM_EXEC_LINK_OK.load(Ordering::Relaxed);
+        let shell_frontier = full_desktop
+            && (nat == FB_SAMPLE_COUNT || cursor_overlay)
+            && userinit_bit != 0
+            && explorer_bit != 0
+            && (exec_links & userinit_bit) != 0
+            && (exec_links & explorer_bit) != 0
+            && USERINIT_SPAWNED.load(Ordering::Relaxed) == 1
+            && EXPLORER_SPAWNED.load(Ordering::Relaxed) == 1
+            && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) >= 1
+            && USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed) >= 1;
+        check(b"exec_desktop_shell_frontier", shell_frontier, &mut passed);
     }
 
     // SELF-CONTAINED delay specs: exercise the `nt_delay_execution` PUBLIC interface directly
@@ -17456,7 +17477,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/100 executive->isolated-service checks passed]\n");
+    print_str(b"/");
+    print_u64(GATE_TOTAL.load(Ordering::Relaxed));
+    print_str(b" executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
