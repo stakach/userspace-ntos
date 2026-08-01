@@ -15025,6 +15025,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // win32k's desktop-graphics init (PDEVOBJ_Create → DrvEnablePDEV/DrvEnableSurface) can
                 // enable the primary surface on the real framebuffer → PIXELS.
                 load_framebuf_driver(host_pml4);
+                // Host kbdus.dll by path so win32k's real NtUserLoadKeyboardLayoutEx path can load
+                // the US layout and resolve KbdLayerDescriptor without a synthetic HKL result.
+                load_kbdus_driver(host_pml4);
             }
 
             let verdict = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT) as *const u32);

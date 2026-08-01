@@ -2944,6 +2944,42 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
     }
 }
 
+/// Host kbdus.dll (the US keyboard layout DLL) into win32k's VSpace. win32k loads keyboard layouts
+/// dynamically from UserLoadKbdDll via EngLoadImage -> ZwSetSystemInformation, then looks up the
+/// KbdLayerDescriptor export. Source it by path from the mounted ReactOS filesystem instead of
+/// extending the fixed storage-host staging table.
+pub(crate) unsafe fn load_kbdus_driver(host_pml4: u64) {
+    let Some(fs) = exec_fs() else {
+        print_str(b"[win32k-svc] kbdus.dll unavailable - executive FS not mounted\n");
+        return;
+    };
+    let Some((src_va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\kbdus.dll") else {
+        print_str(b"[win32k-svc] kbdus.dll not found by path - keyboard layout gate will fail\n");
+        return;
+    };
+    match load_one_driver(
+        src_va,
+        win32k_subsystem::KBDUS_VA,
+        win32k_subsystem::KBDUS_LOAD_FRAMES,
+        host_pml4,
+        0,
+    ) {
+        Some((entry, expdir, len)) => {
+            win32k_subsystem::record_kbdus(entry, expdir, len);
+            print_str(b"[win32k-svc] hosted kbdus.dll: file_size=");
+            print_u64(sz as u64);
+            print_str(b" entry_rva=0x");
+            print_hex(entry);
+            print_str(b" export_dir_rva=0x");
+            print_hex(expdir);
+            print_str(b" len=0x");
+            print_hex(len);
+            print_str(b"\n");
+        }
+        None => print_str(b"[win32k-svc] kbdus load failed\n"),
+    }
+}
+
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
 /// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
 /// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We

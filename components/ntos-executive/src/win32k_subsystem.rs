@@ -2559,7 +2559,7 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
         let name_len = read_unaligned(buf as *const u16) as usize;
         let name_buf = read_unaligned((buf + 8) as *const u64);
-        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll) + pick its recorded info.
+        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll / kbdus.dll) + pick its recorded info.
         let (image, entry, expdir, len, tag): (u64, u64, u64, u32, &[u8]) =
             if wname_ends_with(name_buf, name_len, b"dxg.sys") {
                 (
@@ -2576,6 +2576,14 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
                     read_volatile(core::ptr::addr_of!(FRAMEBUF_EXPORT_DIR)),
                     read_volatile(core::ptr::addr_of!(FRAMEBUF_IMAGE_LEN)),
                     b"framebuf.dll",
+                )
+            } else if wname_ends_with(name_buf, name_len, b"kbdus.dll") {
+                (
+                    read_volatile(core::ptr::addr_of!(KBDUS_IMAGE)),
+                    read_volatile(core::ptr::addr_of!(KBDUS_ENTRY)),
+                    read_volatile(core::ptr::addr_of!(KBDUS_EXPORT_DIR)),
+                    read_volatile(core::ptr::addr_of!(KBDUS_IMAGE_LEN)),
+                    b"kbdus.dll",
                 )
             } else {
                 print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
@@ -2610,6 +2618,7 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 // Synthetic HKEYs (opaque handles win32k passes back to ZwQueryValueKey / ZwClose).
 const HKEY_VIDEO_MAP: u64 = 0x5A5A_0F10; // \Registry\Machine\HARDWARE\DEVICEMAP\VIDEO
 const HKEY_FB_SETTINGS: u64 = 0x5A5A_0F11; // ..\Services\framebuf\Device0 (the display settings key)
+const HKEY_KBD_LAYOUT_0409: u64 = 0x5A5A_0F12; // ..\Keyboard Layouts\00000409
 // A fake DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
 // handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
 // stable). Zeroed sub-regions of DATA page 0.
@@ -2684,6 +2693,8 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
             HKEY_VIDEO_MAP
         } else if wstr_contains_ascii(buf, len, b"framebuf") {
             HKEY_FB_SETTINGS
+        } else if wstr_contains_ascii(buf, len, b"KEYBOARD LAYOUTS\\00000409") {
+            HKEY_KBD_LAYOUT_0409
         } else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
@@ -2773,6 +2784,11 @@ extern "win64" fn s_zw_query_value_key(
                 }
                 if wstr_eq_ascii(vbuf, vlen, b"VgaCompatible") {
                     return emit_kvpi_dword(kvi, length, result_len, 0);
+                }
+            }
+            HKEY_KBD_LAYOUT_0409 => {
+                if wstr_eq_ascii(vbuf, vlen, b"Layout File") {
+                    return emit_kvpi_wsz(kvi, length, result_len, REG_SZ, b"kbdus.dll", false);
                 }
             }
             _ => {}
@@ -4959,6 +4975,11 @@ pub const FTFD_LOAD_FRAMES: u64 = 248;
 /// ZwSetSystemInformation (like dxg); framebuf's PE entry (RVA 0x1260) IS its DrvEnableDriver.
 pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
 pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
+/// kbdus.dll (keyboard layout DLL) loaded-image base in win32k's VSpace. size_of_image 0x4000 ->
+/// 4 frames; reserve 8 frames in its own PT-aligned window. win32k loads it dynamically via
+/// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
+pub const KBDUS_VA: u64 = 0x0000_0100_08A0_0000;
+pub const KBDUS_LOAD_FRAMES: u64 = 8;
 /// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. framebuf's
 /// DrvEnableSurface issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns
 /// this VA as FrameBufferBase, so framebuf writes pixels straight to the real framebuffer.
@@ -4978,6 +4999,12 @@ static mut FRAMEBUF_IMAGE: u64 = 0;
 static mut FRAMEBUF_ENTRY: u64 = 0;
 static mut FRAMEBUF_EXPORT_DIR: u64 = 0;
 static mut FRAMEBUF_IMAGE_LEN: u32 = 0;
+// Pre-loaded kbdus.dll image info (parallel to FRAMEBUF_*), reported to win32k when it dynamically
+// loads the keyboard layout through UserLoadKbdDll.
+static mut KBDUS_IMAGE: u64 = 0;
+static mut KBDUS_ENTRY: u64 = 0;
+static mut KBDUS_EXPORT_DIR: u64 = 0;
+static mut KBDUS_IMAGE_LEN: u32 = 0;
 
 /// Record the loaded framebuf.dll info (called by the executive after `load_driver_into(framebuf)`).
 /// framebuf has NO export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` special-
@@ -4989,6 +5016,18 @@ pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
         let expd = if export_dir_rva != 0 { FRAMEBUF_VA + export_dir_rva as u64 } else { 0 };
         write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_EXPORT_DIR), expd);
         write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE_LEN), image_len);
+    }
+}
+
+/// Record the loaded kbdus.dll info (called by the executive after `load_driver_into(kbdus)`).
+/// win32k uses the export directory to find KbdLayerDescriptor; the PE entry may be zero.
+pub fn record_kbdus(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
+    unsafe {
+        write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE), KBDUS_VA);
+        write_volatile(core::ptr::addr_of_mut!(KBDUS_ENTRY), KBDUS_VA + entry_rva as u64);
+        let expd = if export_dir_rva != 0 { KBDUS_VA + export_dir_rva as u64 } else { 0 };
+        write_volatile(core::ptr::addr_of_mut!(KBDUS_EXPORT_DIR), expd);
+        write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE_LEN), image_len);
     }
 }
 
