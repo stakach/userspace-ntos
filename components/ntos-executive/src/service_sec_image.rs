@@ -7021,13 +7021,9 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                // P5 — FAKE NtUserLoadKeyboardLayoutEx (SSN 0x125c) for winlogon. Routing it to win32k
-                // faults dereferencing the client `pustrKLID` at a low VA AND drags in the interactive-
-                // winsta / desktop-thread keyboard-layout window-manager fork (which regressed the
-                // paint). winlogon's IntLoadKeyboardLayout only needs a NON-NULL HKL back (it checks
-                // `if (LoadKeyboardLayoutW(...))`), so return the US layout HKL MAKELONG(0x0409,0x0409)
-                // WITHOUT dispatching — win32k's post-paint window state stays clean (the counted paint
-                // already fired at SSN 0x1288 above).
+                // `NtUserLoadKeyboardLayoutEx` needs a captured stack-arg KLID descriptor; the
+                // real win32k handler probes that client `PUNICODE_STRING` before loading the HKL.
+                // The capture is done with the wide stack args immediately before dispatch below.
                 // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake.
                 // A service's user32 DllMain runs RegisterSystemClasses, but win32k's shared system
                 // cursors (gasyscur) are ONLY loaded by winlogon's INTERACTIVE SwitchDesktop ->
@@ -7084,10 +7080,6 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(fallback);
                     print_str(b"\n");
                     (fallback, true)
-                } else if m0 == 0x125c && badge == WINLOGON_BADGE {
-                    KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
-                    (0x0409_0409, true)
                 } else if m0 == 0x103d && (pi == 5 || pi == 6) {
                     // userinit/explorer are distinct interactive child processes, but the current
                     // win32k host still has one shared PROCESSINFO. Entering the real handler with
@@ -7273,6 +7265,37 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         )
                         .unwrap_or(0);
+                    }
+                    if m0 == 0x125c && stack_arg_count >= 1 {
+                        let original = stack_args[0];
+                        let captured = capture_client_string_arg(
+                            pi as u64,
+                            original,
+                            false,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
+                        if captured != original {
+                            stack_args[0] = captured;
+                            print_str(
+                                b"[w32marshal] captured NtUserLoadKeyboardLayoutEx KLID arg=0x",
+                            );
+                            print_hex((original >> 32) as u32);
+                            print_hex(original as u32);
+                            print_str(b" -> 0x");
+                            print_hex((captured >> 32) as u32);
+                            print_hex(captured as u32);
+                            print_str(b"\n");
+                        } else {
+                            print_str(
+                                b"[w32marshal] NtUserLoadKeyboardLayoutEx KLID capture pass-through arg=0x",
+                            );
+                            print_hex((original >> 32) as u32);
+                            print_hex(original as u32);
+                            print_str(b"\n");
+                        }
                     }
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler

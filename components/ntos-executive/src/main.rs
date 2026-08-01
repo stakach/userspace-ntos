@@ -10117,8 +10117,8 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 /// lsarpc RPC, and winlogon advances into its post-GinaInit logon flow (InitializeSAS → the SAS
 /// window → the desktop-switch paint). Scoped to winlogon's SYNTH_WINLOGON_KEY / DefaultPassword ONLY.
 pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
-/// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
-/// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
+/// Count of routed `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls whose client KLID descriptor was
+/// captured for isolated win32k before dispatch.
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 /// Count of faked non-interactive-service user32-init class/cursor calls
 /// (NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4). A NON-interactive
