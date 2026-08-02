@@ -126,6 +126,13 @@ fn register_loaded_hosted_bootstrap_pe(
         .expect("loaded hosted executable PE metadata must register once");
 }
 
+fn loaded_hosted_pe_by_pi<'a>(
+    loaded_images: &'a HostedLoadedImageTable,
+    pi: usize,
+) -> Option<&'a nt_pe_loader::PeFile<'static>> {
+    unsafe { loaded_images.pe_by_pi(pi) }
+}
+
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -1995,6 +2002,7 @@ pub(crate) unsafe fn service_sec_image(
     // The relocation runs on the pool `*_va`; the demand-fault router reads the relocated bytes via the
     // PeFile slice.
     let csrss_spec = csrss_bootstrap_load_spec();
+    let csrss_pi = csrss_spec.image.pi;
     let (csrss_pe, csrss_va) =
         load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), csrss_spec);
     // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
@@ -4998,15 +5006,16 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     if nt_handler.csr_start_request == 1 {
                         let tcb = nt_handler
-                            .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrApi)
+                            .hosted_thread_tcb_for_role(csrss_pi, HostedThreadRole::CsrApi)
                             .unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
                             let _ = csr_rendezvous(
                                 0,
-                                procs[1].pml4,
-                                csrss_pe.as_ref().unwrap(),
-                                procs[1].img_end,
+                                procs[csrss_pi].pml4,
+                                loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                                    .expect("CSRSS PE must be registered before CSR API start"),
+                                procs[csrss_pi].img_end,
                                 nt_base,
                                 nt_end,
                                 ntdll.map(|(_, p)| p),
@@ -5018,7 +5027,7 @@ pub(crate) unsafe fn service_sec_image(
                                 result = 0xC000_0001;
                             } else {
                                 if let Some(tid) = nt_handler
-                                    .hosted_thread_tid_for_role(1, HostedThreadRole::CsrApi)
+                                    .hosted_thread_tid_for_role(csrss_pi, HostedThreadRole::CsrApi)
                                 {
                                     let _ = nt_handler.pm.set_thread_state(
                                         tid as nt_process::ThreadId,
@@ -5033,14 +5042,15 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else if nt_handler.csr_start_request == 2 {
                         let tcb = nt_handler
-                            .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrSbApi)
+                            .hosted_thread_tcb_for_role(csrss_pi, HostedThreadRole::CsrSbApi)
                             .unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
                             if !csr_sb_startup(
-                                procs[1].pml4,
-                                csrss_pe.as_ref().unwrap(),
-                                procs[1].img_end,
+                                procs[csrss_pi].pml4,
+                                loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                                    .expect("CSRSS PE must be registered before CSR SB startup"),
+                                procs[csrss_pi].img_end,
                                 nt_base,
                                 nt_end,
                                 ntdll.map(|(_, p)| p),
@@ -5049,9 +5059,10 @@ pub(crate) unsafe fn service_sec_image(
                             ) {
                                 result = 0xC000_0001;
                             } else {
-                                if let Some(tid) = nt_handler
-                                    .hosted_thread_tid_for_role(1, HostedThreadRole::CsrSbApi)
-                                {
+                                if let Some(tid) = nt_handler.hosted_thread_tid_for_role(
+                                    csrss_pi,
+                                    HostedThreadRole::CsrSbApi,
+                                ) {
                                     let _ = nt_handler.pm.set_thread_state(
                                         tid as nt_process::ThreadId,
                                         nt_process::ThreadState::Running,
@@ -5618,9 +5629,10 @@ pub(crate) unsafe fn service_sec_image(
                         nt_base,
                         nt_end,
                         ntdll.map(|(_, p)| p),
-                        procs[1].pml4,
-                        csrss_pe.as_ref().unwrap(),
-                        procs[1].img_end,
+                        procs[csrss_pi].pml4,
+                        loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                            .expect("CSRSS PE must be registered before SM rendezvous"),
+                        procs[csrss_pi].img_end,
                         &reg,
                         &dll_pes,
                         &mut nt_handler,
@@ -5674,9 +5686,10 @@ pub(crate) unsafe fn service_sec_image(
                         nt_base,
                         nt_end,
                         ntdll.map(|(_, p)| p),
-                        procs[1].pml4,
-                        csrss_pe.as_ref().unwrap(),
-                        procs[1].img_end,
+                        procs[csrss_pi].pml4,
+                        loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                            .expect("CSRSS PE must be registered before SM API rendezvous"),
+                        procs[csrss_pi].img_end,
                         &reg,
                         &dll_pes,
                         &mut nt_handler,
@@ -5693,23 +5706,24 @@ pub(crate) unsafe fn service_sec_image(
                     let csr_request_port = nt_handler.csr_request_port;
                     let csr_request_message = nt_handler.csr_request_message;
                     let csr_reply_message = nt_handler.csr_reply_message;
-                    let completed = csrss_pe.as_ref().is_some_and(|pe| {
-                        csr_api_request_rendezvous(
-                            csr_request_port,
-                            csr_request_message,
-                            csr_reply_message,
-                            procs[1].pml4,
-                            fault_ep,
-                            pe,
-                            procs[1].img_end,
-                            nt_base,
-                            nt_end,
-                            ntdll.map(|(_, p)| p),
-                            &reg,
-                            &dll_pes,
-                            &mut nt_handler,
-                        )
-                    });
+                    let completed = loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                        .is_some_and(|pe| {
+                            csr_api_request_rendezvous(
+                                csr_request_port,
+                                csr_request_message,
+                                csr_reply_message,
+                                procs[csrss_pi].pml4,
+                                fault_ep,
+                                pe,
+                                procs[csrss_pi].img_end,
+                                nt_base,
+                                nt_end,
+                                ntdll.map(|(_, p)| p),
+                                &reg,
+                                &dll_pes,
+                                &mut nt_handler,
+                            )
+                        });
                     if completed {
                         result = 0;
                     } else if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0 {
@@ -5724,8 +5738,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // Authentic CSR accept: this client's NtSecureConnectPort left the broker connection
                 // Pending (Manual). Drive the REAL CsrApiRequestThread through the connection accept (it
-                // runs in csrss's VSpace = procs[1].pml4, demand-filling from csrss's image + the mapped
-                // DLLs + ntdll), then write the completed client comm-port handle to this process'
+                // runs in csrss's VSpace, demand-filling from csrss's image + the mapped DLLs +
+                // ntdll), then write the completed client comm-port handle to this process'
                 // *PortHandle. `pml4` is the client; csr_rendezvous takes csrss's PML4 explicitly.
                 if nt_handler.csr_rendezvous_conn != 0 {
                     let conn_id = nt_handler.csr_rendezvous_conn;
@@ -5735,9 +5749,9 @@ pub(crate) unsafe fn service_sec_image(
                     // forever with no faulter. Do not synthesize a handle here: pending
                     // \Windows\ApiPort connects are now required to complete through the real CSR worker.
                     let have_thread = nt_handler
-                        .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrApi)
+                        .hosted_thread_tcb_for_role(csrss_pi, HostedThreadRole::CsrApi)
                         .is_some()
-                        && csrss_pe.is_some();
+                        && loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi).is_some();
                     if !have_thread {
                         CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
                         print_str(b"[csr-rdv] no real CSR thread -> failing pending connect\n");
@@ -5751,9 +5765,10 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b") -> driving the real CsrApiRequestThread accept\n");
                         let client_handle = csr_rendezvous(
                             conn_id,
-                            procs[1].pml4,
-                            csrss_pe.as_ref().unwrap(),
-                            procs[1].img_end,
+                            procs[csrss_pi].pml4,
+                            loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                                .expect("CSRSS PE must be registered before CSR rendezvous"),
+                            procs[csrss_pi].img_end,
                             nt_base,
                             nt_end,
                             ntdll.map(|(_, p)| p),
@@ -11805,12 +11820,12 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
         print_hex(csrss_process_handle as u32);
         print_str(b"; demand-paged ");
-        print_u64(procs[1].faults);
+        print_u64(procs[csrss_pi].faults);
         print_str(b" page(s) (");
-        print_u64(procs[1].ntfaults);
+        print_u64(procs[csrss_pi].ntfaults);
         print_str(b" in ntdll), first fault=0x");
-        print_hex((procs[1].first >> 32) as u32);
-        print_hex(procs[1].first as u32);
+        print_hex((procs[csrss_pi].first >> 32) as u32);
+        print_hex(procs[csrss_pi].first as u32);
         print_str(b"\n");
     }
     print_str(b"[sec-stop] NEXT_SLOT=");

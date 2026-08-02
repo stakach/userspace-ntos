@@ -375,3 +375,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   spawn/current-PE selection no longer matches on `pi` to choose named PE locals. Review adjustment:
   the PE objects themselves still live as bootstrap loop locals because the loader has not yet handed
   off a durable image object store.
+- A2 cleanup. CSR and SM rendezvous launch sites now fetch CSRSS's PE through
+  `HostedLoadedImageTable` using the `pi` carried by `csrss_bootstrap_load_spec`, rather than
+  reaching into the `csrss_pe` loop local directly. Review adjustment: rendezvous itself still
+  correctly receives an explicit CSRSS PE parameter because it operates in CSRSS's address space; the
+  remaining static topology there is the fixed SMSS/CSRSS rendezvous relationship, not PE ownership.
