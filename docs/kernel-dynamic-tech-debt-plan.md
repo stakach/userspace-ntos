@@ -32,7 +32,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   contract driven by created sections and process parameters.
 - `[x]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
-- `[~]` A4: Replace badge-to-process switches with registered thread/process runtime records.
+- `[x]` A4: Replace badge-to-process switches with registered thread/process runtime records.
+- `[ ]` A5: Move remaining named hosted TCB cap cells into runtime-owned hosted-thread capability
+  records and narrow proof queries.
 
 ### B. Win32k Process And Thread Context
 
@@ -234,3 +236,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Top-level process badges and generic TP-worker badges remain mechanism-level decodes. Review
   adjustment: quiesce/crash owner accounting still has a non-handler badge owner map; the next A4
   cleanup should thread runtime context into those accounting sites or publish an owner snapshot.
+- A4 complete. Quiesce/crash owner accounting now threads `ExecNtHandler` into owner resolution, so
+  named listener/worker ownership comes from `HostedThreadRuntimeTable` badge metadata instead of
+  `hosted_pi_for_owner_badge`. Syscall current-TID and hosted current-role lookup also consume
+  runtime badge records; the static badge-to-role decoder is gone, and missing runtime identity logs
+  a visible diagnostic instead of silently falling back to main-thread `pi`. Review adjustment:
+  top-level process badges and generic TP-worker badges remain mechanism-level transport decodes.
+  The remaining named hosted TCB cells are low-level seL4 cap publication/teardown state, now tracked
+  separately as A5 rather than process-identity routing.

@@ -1941,6 +1941,19 @@ impl ExecNtHandler {
             .map(|runtime| runtime.pi)
     }
 
+    pub(crate) fn hosted_thread_tid_for_badge(&self, badge: u64) -> Option<u64> {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.tid)
+            .filter(|&tid| tid != 0)
+    }
+
+    fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
+        self.thread_runtime
+            .get_by_badge(self.current_badge)
+            .map(|runtime| runtime.role)
+    }
+
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
         self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
     }
@@ -2187,32 +2200,12 @@ impl ExecNtHandler {
         )
     }
 
-    pub(crate) fn hosted_thread_role_for_badge(badge: u64) -> Option<HostedThreadRole> {
-        match badge {
-            WINLOGON_WORKER_BADGE => Some(HostedThreadRole::WinlogonListener),
-            WINLOGON_WORKER2_BADGE => Some(HostedThreadRole::WinlogonWorker { slot: 1 }),
-            WINLOGON_WORKER3_BADGE => Some(HostedThreadRole::WinlogonWorker { slot: 2 }),
-            SVC_LISTENER_BADGE => Some(HostedThreadRole::ServicesListener),
-            SCM_WORKER_BADGE => Some(HostedThreadRole::ScmWorker),
-            LSASS_LISTENER_BADGE => Some(HostedThreadRole::LsassListener),
-            LSASS_LISTENER2_BADGE => Some(HostedThreadRole::LsassListener2),
-            LSASS_LISTENER3_BADGE => Some(HostedThreadRole::LsassListener3),
-            LSA_WORKER_BADGE => Some(HostedThreadRole::LsaWorker),
-            _ => None,
-        }
-    }
-
     fn current_hosted_thread_role(&self) -> Option<HostedThreadRole> {
-        Self::hosted_thread_role_for_badge(self.current_badge)
-            .or_else(|| {
-                self.thread_runtime
-                    .get_by_tid(self.current_tid)
-                    .map(|runtime| runtime.role)
-            })
-            .or_else(|| {
-                let image = self.current_hosted_process_image()?;
-                (self.current_badge == image.top_badge).then_some(HostedThreadRole::Main)
-            })
+        self.hosted_thread_role_for_current_badge().or_else(|| {
+            self.thread_runtime
+                .get_by_tid(self.current_tid)
+                .map(|runtime| runtime.role)
+        })
     }
 
     fn current_thread_has_role(&self, role: HostedThreadRole) -> bool {
