@@ -5,6 +5,7 @@
 use crate::*;
 
 fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
+    let target_leaf = nt_exe_image::canonical_exe_leaf(leaf)?;
     for pi in 0..MAX_PI {
         let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
             continue;
@@ -12,11 +13,12 @@ fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<us
         let Some(process) = nt_handler.pm.process(pid) else {
             continue;
         };
-        let Some(image) = nt_exe_image::hosted_image_for_path(process.image_file_name.as_bytes())
+        let Some(process_leaf) =
+            nt_exe_image::canonical_exe_leaf(process.image_file_name.as_bytes())
         else {
             continue;
         };
-        if image.leaf.eq_ignore_ascii_case(leaf) {
+        if process_leaf.eq_ignore_ascii_case(target_leaf) {
             return Some(pi);
         }
     }

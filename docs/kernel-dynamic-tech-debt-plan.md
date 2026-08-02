@@ -283,3 +283,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   uses the historical hosted descriptors to supply badge/role/root policy for the bounded preloaded
   images; the next A2 cleanup is moving that policy source behind a real session/image registration
   API and converting remaining static wrapper lookups that only format names or classify faults.
+- A2 continued. The duplicated live-hosted-process lookup helpers in service-loop and rendezvous
+  code now compare the ProcessManager's live `image_file_name` leaf directly with
+  `canonical_exe_leaf`, instead of round-tripping through the static hosted image table. Review
+  adjustment: remaining static wrapper uses are now concentrated in boot/gate expectations,
+  win32k callback classification, path-prefix formatting, and the open-time registration source for
+  bounded preloaded hosted images.
