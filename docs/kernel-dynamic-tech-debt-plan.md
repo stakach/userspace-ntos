@@ -206,3 +206,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - A3 complete. Source now has no `PM_PIDS`, `PM_TIDS`, `PM_POOL_TID`, `PM_POOL_USED`,
   `PM_POOL_SUSPENDED`, `PM_PML4S`, `TP_WORKER_TID`, or `TP_WORKER_TCB` arrays. Remaining dynamic
   launch-topology debt is tracked under A2 and A4.
+- A4 continued. Named `NtCreateThread` routes for SM, CSR, Winlogon, services, SCM, LSASS, and LSA
+  now gate and reserve through `HostedThreadRuntimeTable` roles instead of checking static
+  `*_TID`/`*_TCB` cells. Reservation failure tears down the claimed ETHREAD/handle transactionally,
+  and `NtResumeThread` resolves CSR/SCM behavior from hosted runtime role identity. Review
+  adjustment: the named TID/TCB cells that remain are low-level cap publication, spawn handoff, and
+  rendezvous diagnostics; the next A4 slice should make spawn handoff consume runtime role records
+  directly so those compatibility cells can shrink further.

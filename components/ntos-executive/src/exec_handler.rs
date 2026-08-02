@@ -1956,6 +1956,36 @@ impl ExecNtHandler {
         true
     }
 
+    fn abandon_created_hosted_thread(&mut self, pool_slot: usize, tid: u64, handle: u64) {
+        let _ = self.release_hosted_thread_runtime(tid);
+        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+            let _ = self.close_process_handle(pid, handle);
+        }
+        let thread = tid as nt_process::ThreadId;
+        let _ = self
+            .pm
+            .set_thread_state(thread, nt_process::ThreadState::Initialized);
+        self.release_pool_usage_slot(self.pi, pool_slot);
+        self.set_pool_thread_suspended(self.pi, pool_slot, false);
+    }
+
+    fn reserve_created_hosted_thread_role(
+        &mut self,
+        pool_slot: usize,
+        tid: u64,
+        handle: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> bool {
+        if self.hosted_thread_tid_for_role(self.pi, role).is_some()
+            || !self.reserve_hosted_thread_runtime(self.pi, tid, badge, role)
+        {
+            self.abandon_created_hosted_thread(pool_slot, tid, handle);
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn release_hosted_thread_runtime(
         &mut self,
         tid: u64,
@@ -5005,8 +5035,7 @@ impl ExecNtHandler {
             nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
         };
 
-        let scm_worker_tid = SCM_WORKER_TID.load(Ordering::Relaxed);
-        if scm_worker_tid != 0 && tid == scm_worker_tid {
+        if self.hosted_thread_role(tid) == Some(HostedThreadRole::ScmWorker) {
             let _ = self.take_pool_thread_suspended(pi, slot);
             if previous_count != 0
                 && !self.user_memory_write(memory, previous_count, &1u32.to_le_bytes())
@@ -5029,12 +5058,10 @@ impl ExecNtHandler {
             let _ = self
                 .pm
                 .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Ready);
-            let csr_role = if tid == CSR_API_TID.load(Ordering::Relaxed) {
-                1
-            } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
-                2
-            } else {
-                0
+            let csr_role = match self.hosted_thread_role(tid) {
+                Some(HostedThreadRole::CsrApi) => 1,
+                Some(HostedThreadRole::CsrSbApi) => 2,
+                _ => 0,
             };
             if csr_role != 0 {
                 self.csr_start_request = csr_role;
@@ -10524,7 +10551,9 @@ impl ExecNtHandler {
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_csrss()
                     && args[3] == u64::MAX
-                    && CSR_SB_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::CsrSbApi)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10537,11 +10566,27 @@ impl ExecNtHandler {
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
-                            let teb = match slot {
-                                0 => CSR_TEB_VA,
-                                1 => CSR_SB_TEB_VA,
-                                _ => return 0xC000_009A,
+                            let (role, badge, teb) = match slot {
+                                0 => (
+                                    HostedThreadRole::CsrApi,
+                                    hosted_top_badge_for_pi(self.pi),
+                                    CSR_TEB_VA,
+                                ),
+                                1 => (
+                                    HostedThreadRole::CsrSbApi,
+                                    hosted_top_badge_for_pi(self.pi),
+                                    CSR_SB_TEB_VA,
+                                ),
+                                _ => {
+                                    self.abandon_created_hosted_thread(slot, tid, handle);
+                                    return 0xC000_009A;
+                                }
                             };
+                            if !self.reserve_created_hosted_thread_role(
+                                slot, tid, handle, badge, role,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
@@ -10663,7 +10708,12 @@ impl ExecNtHandler {
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_winlogon()
                     && args[3] == u64::MAX
-                    && WL_WORKER3_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(
+                            self.pi,
+                            HostedThreadRole::WinlogonWorker { slot: 2 },
+                        )
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10682,12 +10732,32 @@ impl ExecNtHandler {
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
-                            let teb = match slot {
-                                0 => WL_LISTENER_TEB_VA,
-                                1 => WL_WORKER2_TEB_VA,
-                                2 => WL_WORKER3_TEB_VA,
-                                _ => return 0xC000_009A,
+                            let (role, badge, teb) = match slot {
+                                0 => (
+                                    HostedThreadRole::WinlogonListener,
+                                    WINLOGON_WORKER_BADGE,
+                                    WL_LISTENER_TEB_VA,
+                                ),
+                                1 => (
+                                    HostedThreadRole::WinlogonWorker { slot },
+                                    WINLOGON_WORKER2_BADGE,
+                                    WL_WORKER2_TEB_VA,
+                                ),
+                                2 => (
+                                    HostedThreadRole::WinlogonWorker { slot },
+                                    WINLOGON_WORKER3_BADGE,
+                                    WL_WORKER3_TEB_VA,
+                                ),
+                                _ => {
+                                    self.abandon_created_hosted_thread(slot, tid, handle);
+                                    return 0xC000_009A;
+                                }
                             };
+                            if !self.reserve_created_hosted_thread_role(
+                                slot, tid, handle, badge, role,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle = R10
@@ -10755,8 +10825,9 @@ impl ExecNtHandler {
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_services()
                     && self.current_thread_is_main_process_thread()
-                    && SVC_LISTENER_TCB.load(Ordering::Relaxed) == 0
-                    && SVC_LISTENER_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10766,9 +10837,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                SVC_LISTENER_BADGE,
+                                HostedThreadRole::ServicesListener,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
@@ -10792,8 +10872,9 @@ impl ExecNtHandler {
                 // LSASS_LISTENER_BADGE (its own stack mirror / TEB, distinct from lsass' main thread).
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_lsass()
-                    && LSASS_LISTENER_TCB.load(Ordering::Relaxed) == 0
-                    && LSASS_LISTENER_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10803,9 +10884,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                LSASS_LISTENER_BADGE,
+                                HostedThreadRole::LsassListener,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
@@ -10828,9 +10918,12 @@ impl ExecNtHandler {
                 // (mov [newTEB+0x1728]) writes to a stale stack pointer and faults.
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_lsass()
-                    && LSASS_LISTENER_TID.load(Ordering::Relaxed) != 0
-                    && LSASS_LISTENER2_TCB.load(Ordering::Relaxed) == 0
-                    && LSASS_LISTENER2_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener)
+                        .is_some()
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener2)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10840,9 +10933,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                LSASS_LISTENER2_BADGE,
+                                HostedThreadRole::LsassListener2,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
@@ -10860,9 +10962,12 @@ impl ExecNtHandler {
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_lsass()
-                    && LSASS_LISTENER2_TID.load(Ordering::Relaxed) != 0
-                    && LSASS_LISTENER3_TCB.load(Ordering::Relaxed) == 0
-                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener2)
+                        .is_some()
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10872,9 +10977,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                LSASS_LISTENER3_BADGE,
+                                HostedThreadRole::LsassListener3,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm.set_thread_teb(
                                 tid as nt_process::ThreadId,
                                 LSASS_LISTENER3_TEB_VA,
@@ -10969,9 +11083,12 @@ impl ExecNtHandler {
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_services()
                     && self.current_thread_has_role(HostedThreadRole::ServicesListener)
-                    && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0
-                    && SCM_WORKER_TCB.load(Ordering::Relaxed) == 0
-                    && SCM_WORKER_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
+                        .is_some()
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ScmWorker)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -10981,9 +11098,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                SCM_WORKER_BADGE,
+                                HostedThreadRole::ScmWorker,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
@@ -11053,9 +11179,12 @@ impl ExecNtHandler {
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_lsass()
                     && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
-                    && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
-                    && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
+                        .is_some()
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                        .is_none()
                 {
                     // Counted whether or not the route is enabled: reaching here PROVES lsass'
                     // `\lsarpc` server thread got through `rpcrt4_ncacn_np_handoff` (the
@@ -11066,9 +11195,12 @@ impl ExecNtHandler {
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_lsass()
                     && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) != 0
-                    && LSA_WORKER_TCB.load(Ordering::Relaxed) == 0
-                    && LSA_WORKER_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
+                        .is_some()
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -11078,9 +11210,18 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                LSA_WORKER_BADGE,
+                                HostedThreadRole::LsaWorker,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
@@ -11131,7 +11272,9 @@ impl ExecNtHandler {
                         } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
                             && self.current_process_is_lsass()
                             && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                            && LSA_WORKER_TID.load(Ordering::Relaxed) != 0
+                            && self
+                                .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                                .is_some()
                         {
                             // ★ THE SECOND `\pipe\lsarpc` CLIENT. rpcrt4 spawns ONE per-connection
                             // `RPCRT4_io_thread` per accepted connection (`RPCRT4_new_client`,
@@ -11222,7 +11365,9 @@ impl ExecNtHandler {
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_smss()
-                    && SM_LOOP_TID.load(Ordering::Relaxed) == 0
+                    && self
+                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::SmLoop)
+                        .is_none()
                 {
                     unsafe {
                         let sp = get_recv_mr(16);
@@ -11232,9 +11377,18 @@ impl ExecNtHandler {
                             context,
                         );
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((_slot, tid, handle)) =
+                        if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            if !self.reserve_created_hosted_thread_role(
+                                slot,
+                                tid,
+                                handle,
+                                hosted_top_badge_for_pi(self.pi),
+                                HostedThreadRole::SmLoop,
+                            ) {
+                                return 0xC000_009A;
+                            }
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SM_TEB_VA);
                             self.queue_write(args[0], handle);
