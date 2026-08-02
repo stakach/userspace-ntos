@@ -44,6 +44,8 @@ mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
 mod hosted_gate;
 pub(crate) use hosted_gate::*;
+mod hosted_process_runtime;
+pub(crate) use hosted_process_runtime::*;
 mod rendezvous;
 mod writable_fs;
 pub(crate) use rendezvous::*;

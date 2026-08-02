@@ -336,3 +336,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   spawn no longer performs a hidden static descriptor lookup by `pi`. Review adjustment: the only
   remaining executive-side reference to `HOSTED_PROCESS_IMAGES` is the startup catalog seed; replacing
   that cleanly requires a real boot/session image manifest rather than another fallback table.
+- A2 cleanup. Fixed hosted-process runtime placement, mirror selection, live-spawn latch lookup, and
+  hosted SEC_IMAGE spawn construction moved from `service_sec_image.rs` into
+  `hosted_process_runtime.rs`. This preserves the namespace and behavior but makes the remaining
+  hardcoded per-`pi` mechanism layout explicit for the future allocator work. Review adjustment:
+  this is a mechanical split; the runtime placement data is still fixed policy and should be replaced
+  by a process-slot layout allocator after the startup image manifest exists.
