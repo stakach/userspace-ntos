@@ -1758,7 +1758,7 @@ impl ExecNtHandler {
         let tid32 = tid as nt_process::ThreadId;
         self.thread_mechanisms.get_by_tid(tid32).or_else(|| {
             for pi in 0..MAX_PI {
-                if PM_TIDS[pi].load(Ordering::Relaxed) == tid {
+                if self.pm_main_tid_for_pi(pi) == Some(tid32) {
                     return Some(nt_user_host::ThreadMechanism {
                         pi,
                         tid: tid32,
@@ -1766,7 +1766,7 @@ impl ExecNtHandler {
                     });
                 }
                 for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                    if PM_POOL_TID[pi][slot].load(Ordering::Relaxed) == tid {
+                    if self.pm_pool_tid_for_slot(pi, slot) == Some(tid32) {
                         return Some(nt_user_host::ThreadMechanism {
                             pi,
                             tid: tid32,
@@ -1784,15 +1784,11 @@ impl ExecNtHandler {
     }
 
     fn claim_hosted_process_mechanism(&mut self, pi: usize) -> Result<(), u32> {
-        let pid = PM_PIDS
-            .get(pi)
-            .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ProcessId)
-            .filter(|&pid| pid != 0)
+        let pid = self
+            .pm_pid_for_pi(pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let tid = PM_TIDS
-            .get(pi)
-            .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ThreadId)
-            .filter(|&tid| tid != 0)
+        let tid = self
+            .pm_main_tid_for_pi(pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let badge =
             Self::hosted_mechanism_badge_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
@@ -1804,10 +1800,8 @@ impl ExecNtHandler {
     }
 
     fn claim_main_thread_mechanism(&mut self, pi: usize) -> Result<(), u32> {
-        let tid = PM_TIDS
-            .get(pi)
-            .map(|slot| slot.load(Ordering::Relaxed) as nt_process::ThreadId)
-            .filter(|&tid| tid != 0)
+        let tid = self
+            .pm_main_tid_for_pi(pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
 
         match self.thread_mechanisms.claim_main(pi, tid) {
@@ -1822,12 +1816,7 @@ impl ExecNtHandler {
     }
 
     fn claim_pool_thread_mechanism(&mut self, pi: usize, slot: usize) -> Result<(), u32> {
-        let Some(tid) = PM_POOL_TID
-            .get(pi)
-            .and_then(|pool| pool.get(slot))
-            .map(|cell| cell.load(Ordering::Relaxed) as nt_process::ThreadId)
-            .filter(|&tid| tid != 0)
-        else {
+        let Some(tid) = self.pm_pool_tid_for_slot(pi, slot) else {
             return Ok(());
         };
 

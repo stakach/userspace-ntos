@@ -30,7 +30,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` A1: Remove fixed `pi` dispatch from hosted child executable metadata lookup.
 - `[ ]` A2: Replace the static hosted image table with a dynamic image/session registration
   contract driven by created sections and process parameters.
-- `[ ]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
+- `[~]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
 - `[ ]` A4: Replace badge-to-process switches with registered thread/process runtime records.
 
@@ -92,3 +92,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   leaf and records userinit/explorer telemetry by hosted role instead of numeric `pi`. Review
   adjustment: the loop-owned loaded image slots are still statically enumerated because the boot
   loop still owns those PE locals; that remaining debt is now explicitly covered by A2/A3.
+- A3 started. Process/thread mechanism claim and reverse TID lookup now go through
+  `ExecNtHandler` PID/TID accessors instead of reading `PM_PIDS`, `PM_TIDS`, or pool TID mirrors
+  directly. Review adjustment: the accessors still preserve the existing mirror fallback while the
+  boot loop and self-test scaffolding write those mirrors; the next A3 slice should move mirror
+  writes into dedicated registration helpers and then remove fallback reads as the mechanism tables
+  become authoritative.
