@@ -454,7 +454,21 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
   exec_explorer_process_spawned`, and explorer completed 16 `0x106c` calls instead of parking at the
   previous `NtGdiCreateBitmap` wall. Review adjustment: the next concrete explorer wall is
-  `NtUserGetIconInfo` (`0x11d9`) after icon bitmap creation, while the still-failing gates remain
+  `NtGdiGetTextExtentExW` (`0x11d9`) after icon bitmap creation, while the still-failing gates remain
   explorer `RegisterWindowMessage` capture, api0/user-callback redirection, client-installed WndProc,
   and shell COM class provisioning. The older noninteractive service GDI handle fakes were not
   expanded by this slice and remain C3/F1 debt.
+- C3 repair. `NtGdiGetTextExtentExW` now treats the caller-owned string and output buffers as an
+  explicit isolated-client/win32k boundary. The executive probes the hosted caller stack tail for
+  `UnsafeFit`, `UnsafeDx`, `UnsafeSize`, and `fl`, stages the WCHAR input and optional output arrays
+  inside the win32k argument frame, dispatches with provider-owned stack arguments, and copies `SIZE`,
+  `Fit`, and `Dx[]` back to the client only after a TRUE service return. Failed input or output probes
+  return FALSE instead of fabricating measurements. Validation:
+  `.tmp/full-boot-text-extent-marshal-20260803-074802.log` reached `RUN_RC=0`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
+  exec_user_callback_dead_client_unwind`, `PASS exec_win32k_transport_call_nested`, `PASS
+  exec_lsa_worker_route`, `PASS exec_msgina_logon_dialog_painted`, and `PASS
+  exec_explorer_process_spawned`; explorer completed real `0x11d9` dispatches instead of parking at
+  the text measurement wall. Review adjustment: remaining red gates are now the profile-directory
+  value proof and explorer's `RegisterWindowMessage`, api0 callback redirection, client-installed
+  WndProc, and shell COM class provisioning checks.
