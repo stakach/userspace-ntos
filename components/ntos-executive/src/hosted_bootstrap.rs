@@ -5,6 +5,12 @@
 //! reach back into the historical descriptor table.
 #![allow(clippy::all)]
 
+use crate::{
+    csrss_process_runtime, explorer_process_runtime, lsass_process_runtime,
+    register_hosted_process_runtime, services_process_runtime, userinit_process_runtime,
+    winlogon_process_runtime, HostedProcessRuntime,
+};
+
 fn hosted_bootstrap_image(
     pi: usize,
     top_badge: u64,
@@ -34,17 +40,20 @@ pub(crate) struct HostedBootstrapLoadSpec {
     pub(crate) disk_path: &'static [u8],
     pub(crate) stem: &'static [u8],
     pub(crate) image: nt_exe_image::OwnedHostedProcessImage,
+    pub(crate) runtime: HostedProcessRuntime,
 }
 
 fn hosted_bootstrap_load_spec(
     disk_path: &'static [u8],
     stem: &'static [u8],
     image: nt_exe_image::OwnedHostedProcessImage,
+    runtime: HostedProcessRuntime,
 ) -> HostedBootstrapLoadSpec {
     HostedBootstrapLoadSpec {
         disk_path,
         stem,
         image,
+        runtime,
     }
 }
 
@@ -79,6 +88,7 @@ pub(crate) fn csrss_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         b"reactos\\system32\\csrss.exe",
         b"csrss.exe",
         csrss_bootstrap_image(),
+        csrss_process_runtime(),
     )
 }
 
@@ -100,6 +110,7 @@ pub(crate) fn winlogon_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         b"reactos\\system32\\winlogon.exe",
         b"winlogon.exe",
         winlogon_bootstrap_image(),
+        winlogon_process_runtime(),
     )
 }
 
@@ -121,6 +132,7 @@ pub(crate) fn services_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         b"reactos\\system32\\services.exe",
         b"services.exe",
         services_bootstrap_image(),
+        services_process_runtime(),
     )
 }
 
@@ -142,6 +154,7 @@ pub(crate) fn lsass_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         b"reactos\\system32\\lsass.exe",
         b"lsass.exe",
         lsass_bootstrap_image(),
+        lsass_process_runtime(),
     )
 }
 
@@ -163,6 +176,7 @@ pub(crate) fn userinit_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         br"reactos\system32\userinit.exe",
         b"userinit.exe",
         userinit_bootstrap_image(),
+        userinit_process_runtime(),
     )
 }
 
@@ -184,16 +198,20 @@ pub(crate) fn explorer_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
         br"reactos\explorer.exe",
         b"explorer.exe",
         explorer_bootstrap_image(),
+        explorer_process_runtime(),
     )
 }
 
 pub(crate) fn register_loaded_hosted_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
     image: nt_exe_image::OwnedHostedProcessImage,
+    runtime: HostedProcessRuntime,
     loaded: bool,
 ) -> Result<(), nt_exe_image::HostedImageRegistrationError> {
     if loaded {
         catalog.register(image)?;
+        register_hosted_process_runtime(runtime)
+            .expect("hosted process runtime layout must register once when image is loaded");
     }
     Ok(())
 }

@@ -362,3 +362,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   production model is registration into a catalog and lookup through that catalog. Review adjustment:
   bootstrap descriptors remain in the executive's `hosted_bootstrap.rs` until a real boot/session
   manifest handoff exists, but there is no global hosted-image identity table left to fall back to.
+- A2 continued. Hosted process runtime layout is now registered into a runtime table instead of
+  selected by a hardcoded `match pi`. SMSS registers before the pre-service SEC_IMAGE spawn paths,
+  and bootstrap child layouts register only when their image load succeeds. Mirror/scratch helpers
+  and hosted SEC_IMAGE spawn construction now require a registered runtime layout instead of silently
+  defaulting to SMSS mirrors. Review adjustment: layout values are still compiled-in bootstrap policy
+  in `hosted_process_runtime.rs`; the next semantic step is replacing those constructors with an
+  allocator or manifest-provided layout.
