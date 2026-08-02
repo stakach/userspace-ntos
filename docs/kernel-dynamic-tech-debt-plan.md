@@ -489,3 +489,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   now `RegisterWindowMessage` capture, api0 callback redirection, client-installed WndProc, and
   shell COM class service; the next cleanup target is the dynamic boundary that prevents explorer
   from reaching/registering those shell window messages.
+- C3 repair. `NtUserCreateWindowEx` now stages the ReactOS x64 stack-tail arguments (`dwStyle`,
+  coordinates, size, parent/menu/instance handles, `lpParam`, flags, and `acbiBuffer`) before
+  dispatching into isolated win32k, while retaining the original caller stack pointer in the dispatch
+  context for callback/completion observers. The transport still supplies only the staged tail to the
+  provider, so win32k does not dereference the hosted client stack; observers that need callsite
+  context, such as dialog/style correlation, keep their original data. Validation:
+  `.tmp/full-boot-create-window-tail-context-20260803-083601.log` reached `RUN_RC=0`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
+  exec_msgina_logon_dialog_painted`, `PASS exec_explorer_process_spawned`, `PASS
+  exec_explorer_register_window_messages_captured`, `PASS
+  exec_explorer_user_callbacks_redirected`, `PASS exec_explorer_wndproc_installed_by_client`, and
+  `PASS exec_explorer_shell_com_classes_served`. Review adjustment: explorer now reaches real api0
+  `WM_NCCREATE`/create callback traffic and the previous explorer message/callback/COM gates are
+  green. Remaining C3/F1 debt is the older noninteractive service GDI/user shims and global
+  cursor/class reuse machinery, which should be replaced by real provider/object ownership rather
+  than broadened.

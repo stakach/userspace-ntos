@@ -6716,6 +6716,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut d_a3 = a3;
                 let mut register_class_stack_args = [0u64; 3];
                 let mut register_class_stack_arg_count = 0usize;
+                let mut create_window_stack_args = [0u64; 11];
+                let mut create_window_stack_arg_count = 0usize;
+                let mut create_window_probe_failed = false;
                 let mut open_dcw_stack_args = [0u64; 3];
                 let mut open_dcw_stack_arg_count = 0usize;
                 let mut open_dcw_dhpdev_copyout = (0u64, 0u64);
@@ -7226,6 +7229,33 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == 0x1077 {
                     // `NtUserCreateWindowEx` takes LARGE_STRING ClassName/ClsVersion/WindowName.
+                    if sp == 0 {
+                        create_window_probe_failed = true;
+                    } else {
+                        let mut tail_ok = true;
+                        let mut i = 0usize;
+                        while i < create_window_stack_args.len() {
+                            match client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28 + i as u64 * 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                Some(value) => create_window_stack_args[i] = value,
+                                None => {
+                                    tail_ok = false;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        if tail_ok {
+                            create_window_stack_arg_count = create_window_stack_args.len();
+                        } else {
+                            create_window_probe_failed = true;
+                        }
+                    }
                     if pi == 6 {
                         // Explorer reaches this path with create-window strings outside the main image
                         // window. Capture them generically so isolated win32k never sees foreign VAs.
@@ -7813,6 +7843,16 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if create_window_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserCreateWindowEx stack probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if m0 == 0x103d && svc_noninteractive {
                     // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -8048,17 +8088,24 @@ pub(crate) unsafe fn service_sec_image(
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
                     let register_class_staged_stack = m0 == 0x10b4
                         && register_class_stack_arg_count == register_class_stack_args.len();
+                    let create_window_staged_stack = m0 == 0x1077
+                        && create_window_stack_arg_count == create_window_stack_args.len();
+                    // Keep the original SP in the dispatch context for callback/completion
+                    // observers. win32k_dispatch_wide still sends SH_REQ_CALLER_SP=0 when
+                    // stack_args is non-empty, so the component consumes only the staged tail.
                     let (dispatch_sp, dispatch_stack_args): (u64, &[u64]) = if open_dcw_staged_stack
                     {
-                        (0, &open_dcw_stack_args)
+                        (sp, &open_dcw_stack_args)
                     } else if build_hwnd_list_staged_stack {
-                        (0, &build_hwnd_list_stack_args)
+                        (sp, &build_hwnd_list_stack_args)
                     } else if create_bitmap_staged_stack {
-                        (0, &create_bitmap_stack_args)
+                        (sp, &create_bitmap_stack_args)
                     } else if text_extent_staged_stack {
-                        (0, &text_extent_stack_args)
+                        (sp, &text_extent_stack_args)
                     } else if register_class_staged_stack {
-                        (0, &register_class_stack_args)
+                        (sp, &register_class_stack_args)
+                    } else if create_window_staged_stack {
+                        (sp, &create_window_stack_args)
                     } else {
                         (sp, &[])
                     };
