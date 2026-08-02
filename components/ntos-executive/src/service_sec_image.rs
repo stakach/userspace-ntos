@@ -12341,7 +12341,7 @@ unsafe fn spawn_requested_local_thread(
             } else {
                 current_pml4
             };
-            let tcb = spawn_sm_loop_thread(pml4, start.rip, start.rcx, cid_proc);
+            let tcb = spawn_sm_loop_thread(pml4, start.rip, start.rcx, cid_proc, tid);
             SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
             nt_handler.register_hosted_thread_tcb(
                 0,

@@ -218,3 +218,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   resume-start bookkeeping. `HostedThreadSpawnSpec` no longer carries a static TID cell. Review
   adjustment: remaining named TID cell reads are now rendezvous/current-TID diagnostics and
   low-level post-loop gates; remaining named TCB cells are cap publication/teardown probes.
+- A4 continued. SM/CSR rendezvous helpers now derive their worker `current_tid`, CSR message
+  `ClientId.UniqueThread`, and SM-loop hosted thread spawn identity from runtime role records. The
+  SM-loop spawner receives the reserved TID from its caller instead of reading `SM_LOOP_TID`.
+  Review adjustment: named TID reads are now confined to post-loop gate probes in `main.rs`; named
+  TCB cells still publish low-level seL4 caps for gates and teardown.

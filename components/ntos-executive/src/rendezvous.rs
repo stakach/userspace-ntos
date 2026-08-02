@@ -46,6 +46,10 @@ fn live_hosted_cid_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> (u64, u64) {
     )
 }
 
+fn hosted_role_tid(nt_handler: &ExecNtHandler, pi: usize, role: HostedThreadRole) -> u64 {
+    nt_handler.hosted_thread_tid_for_role(pi, role).unwrap_or(0)
+}
+
 unsafe fn csr_api_worker_create_thread(
     nt_handler: &mut ExecNtHandler,
     main_fault_ep: u64,
@@ -115,7 +119,7 @@ unsafe fn csr_api_worker_create_thread(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 1;
-    nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
 
     let status = (|| {
         let caller_pid = nt_handler.pm_pid_for_pi(1).ok_or(STATUS_INVALID_HANDLE)?;
@@ -261,6 +265,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(
     entry_rip: u64,
     port_handle: u64,
     cid_proc: u64,
+    cid_thread: u64,
 ) -> u64 {
     // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
     // thread must too. The hosted-syscalls flag is hybrid now: OUR ntdll's `Call(CT_FAULT,
@@ -283,7 +288,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(
         stack_mirror_va: SM_STACK_MIRROR_VA,
         fault_ep: SM_FAULT_EP.load(Ordering::Relaxed),
         cid_proc,
-        cid_thread: SM_LOOP_TID.load(Ordering::Relaxed),
+        cid_thread,
         resume: true,
         prio: 0,
         native: true,
@@ -507,7 +512,7 @@ unsafe fn sm_set_thread_information_call(
         let saved_pi = nt_handler.pi;
         let saved_tid = nt_handler.current_tid;
         nt_handler.pi = 0;
-        nt_handler.current_tid = SM_LOOP_TID.load(Ordering::Relaxed);
+        nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
         let target = nt_handler.resolve_thread_for_set(handle);
         nt_handler.pi = saved_pi;
         nt_handler.current_tid = saved_tid;
@@ -543,7 +548,7 @@ unsafe fn sm_set_thread_information_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 0;
-    nt_handler.current_tid = SM_LOOP_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
     let status = nt_handler.set_thread_information_captured(
         handle,
         information_class,
@@ -580,7 +585,7 @@ unsafe fn sm_query_thread_information_call(
         let saved_pi = nt_handler.pi;
         let saved_tid = nt_handler.current_tid;
         nt_handler.pi = 0;
-        nt_handler.current_tid = SM_LOOP_TID.load(Ordering::Relaxed);
+        nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
         let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
         let query = nt_handler.query_thread_name_captured(handle, &mut name);
         nt_handler.pi = saved_pi;
@@ -640,7 +645,7 @@ unsafe fn sm_query_thread_information_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 0;
-    nt_handler.current_tid = SM_LOOP_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 0, HostedThreadRole::SmLoop);
     let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
         Ok((output, length)) => {
             if sm_stack_copyout(information, &output[..length]) {
@@ -1635,7 +1640,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                 let saved_pi = nt_handler.pi;
                                 let saved_tid = nt_handler.current_tid;
                                 nt_handler.pi = 1;
-                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                nt_handler.current_tid =
+                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                                 let status = nt_handler
                                     .nt_allocate_virtual_memory_with_user_memory(
                                         &alloc_args,
@@ -1669,7 +1675,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                 let saved_pi = nt_handler.pi;
                                 let saved_tid = nt_handler.current_tid;
                                 nt_handler.pi = 1;
-                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                nt_handler.current_tid =
+                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                                 let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                     &protect_args,
                                     SyscallUserMemory::CsrThreadStack { sb: false },
@@ -1726,7 +1733,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         result = csr_set_thread_information_call(
                             nt_handler,
                             false,
-                            CSR_API_TID.load(Ordering::Relaxed),
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
                             get_recv_mr(9),
                             rdx as u32,
                             get_recv_mr(7),
@@ -1765,7 +1772,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                 let saved_pi = nt_handler.pi;
                                 let saved_tid = nt_handler.current_tid;
                                 nt_handler.pi = 1;
-                                nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                                nt_handler.current_tid =
+                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                                 let status = nt_handler.nt_query_object_with_user_memory(
                                     &query_args,
                                     SyscallUserMemory::CsrThreadStack { sb: false },
@@ -1785,7 +1793,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         let saved_pi = nt_handler.pi;
                         let saved_tid = nt_handler.current_tid;
                         nt_handler.pi = 1;
-                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_set_information_object_with_user_memory(
                             &set_args,
                             SyscallUserMemory::CsrThreadStack { sb: false },
@@ -1802,7 +1811,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         let saved_pi = nt_handler.pi;
                         let saved_tid = nt_handler.current_tid;
                         nt_handler.pi = 1;
-                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let status = nt_handler.nt_resume_thread_with_user_memory(
                             &resume_args,
                             SyscallUserMemory::CsrThreadStack { sb: false },
@@ -1829,7 +1839,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         let saved_pi = nt_handler.pi;
                         let saved_tid = nt_handler.current_tid;
                         nt_handler.pi = 1;
-                        nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                         let source_pid = nt_handler.resolve_process_handle(source_process);
                         let target_pid = nt_handler.resolve_process_handle(target_process);
                         let mut close_source_pid = source_pid;
@@ -2970,7 +2981,7 @@ unsafe fn csr_sb_query_thread_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 1;
-    nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
     let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
         Ok((output, length)) => {
             if csr_sb_stack_copyout(information, &output[..length]) {
@@ -3017,7 +3028,7 @@ unsafe fn csr_sb_query_thread_name_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 1;
-    nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
     let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
     let query = nt_handler.query_thread_name_captured(handle, &mut name);
     nt_handler.pi = saved_pi;
@@ -3097,7 +3108,7 @@ unsafe fn csr_query_thread_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 1;
-    nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
     let mut status = match nt_handler.query_thread_information_captured(handle, information_class) {
         Ok((output, length)) => {
             if csr_stack_copyout(information, &output[..length]) {
@@ -3143,7 +3154,7 @@ unsafe fn csr_query_thread_name_call(
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     nt_handler.pi = 1;
-    nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+    nt_handler.current_tid = hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
     let mut name = [0u16; nt_process::THREAD_NAME_MAX_UNITS];
     let query = nt_handler.query_thread_name_captured(handle, &mut name);
     nt_handler.pi = saved_pi;
@@ -3565,7 +3576,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                                 let saved_pi = nt_handler.pi;
                                 let saved_tid = nt_handler.current_tid;
                                 nt_handler.pi = 1;
-                                nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                                nt_handler.current_tid =
+                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                                 let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                     &protect_args,
                                     SyscallUserMemory::CsrThreadStack { sb: true },
@@ -3586,7 +3598,7 @@ unsafe fn csr_sb_api_request_rendezvous(
                         result = csr_set_thread_information_call(
                             nt_handler,
                             true,
-                            CSR_SB_TID.load(Ordering::Relaxed),
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi),
                             get_recv_mr(9),
                             rdx as u32,
                             get_recv_mr(7),
@@ -3625,7 +3637,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                                 let saved_pi = nt_handler.pi;
                                 let saved_tid = nt_handler.current_tid;
                                 nt_handler.pi = 1;
-                                nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                                nt_handler.current_tid =
+                                    hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                                 let status = nt_handler.nt_query_object_with_user_memory(
                                     &query_args,
                                     SyscallUserMemory::CsrThreadStack { sb: true },
@@ -3645,7 +3658,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                         let saved_pi = nt_handler.pi;
                         let saved_tid = nt_handler.current_tid;
                         nt_handler.pi = 1;
-                        nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                         let status = nt_handler.nt_set_information_object_with_user_memory(
                             &set_args,
                             SyscallUserMemory::CsrThreadStack { sb: true },
@@ -3662,7 +3676,8 @@ unsafe fn csr_sb_api_request_rendezvous(
                         let saved_pi = nt_handler.pi;
                         let saved_tid = nt_handler.current_tid;
                         nt_handler.pi = 1;
-                        nt_handler.current_tid = CSR_SB_TID.load(Ordering::Relaxed);
+                        nt_handler.current_tid =
+                            hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrSbApi);
                         let status = nt_handler.nt_resume_thread_with_user_memory(
                             &resume_args,
                             SyscallUserMemory::CsrThreadStack { sb: true },
@@ -3810,7 +3825,10 @@ pub(crate) unsafe fn csr_rendezvous(
             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
             csr_stack_write(recvmsg + 0x08, csrss_pid);
-            csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
+            csr_stack_write(
+                recvmsg + 0x10,
+                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
+            );
             set_reply_mr(15, 0);
             set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
@@ -3968,7 +3986,8 @@ pub(crate) unsafe fn csr_rendezvous(
                             let saved_pi = nt_handler.pi;
                             let saved_tid = nt_handler.current_tid;
                             nt_handler.pi = 1;
-                            nt_handler.current_tid = CSR_API_TID.load(Ordering::Relaxed);
+                            nt_handler.current_tid =
+                                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi);
                             let status = nt_handler.nt_protect_virtual_memory_with_user_memory(
                                 &protect_args,
                                 SyscallUserMemory::CsrThreadStack { sb: false },
@@ -3989,7 +4008,7 @@ pub(crate) unsafe fn csr_rendezvous(
                     result = csr_set_thread_information_call(
                         nt_handler,
                         false,
-                        CSR_API_TID.load(Ordering::Relaxed),
+                        hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
                         get_recv_mr(9),
                         rdx as u32,
                         get_recv_mr(7),
@@ -4029,7 +4048,10 @@ pub(crate) unsafe fn csr_rendezvous(
                                 nt_lpc_client::LPC_CONNECTION_REQUEST,
                             );
                             csr_stack_write(recvmsg + 0x08, csrss_pid);
-                            csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
+                            csr_stack_write(
+                                recvmsg + 0x10,
+                                hosted_role_tid(nt_handler, 1, HostedThreadRole::CsrApi),
+                            );
                         }
                         _ => {
                             // No pending connection (the re-park receive): leave the thread PARKED.
