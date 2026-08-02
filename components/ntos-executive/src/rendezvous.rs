@@ -48,7 +48,6 @@ fn live_hosted_cid_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> (u64, u64) {
 
 unsafe fn csr_api_worker_create_thread(
     nt_handler: &mut ExecNtHandler,
-    csrss_pml4: u64,
     main_fault_ep: u64,
     thread_handle_out: u64,
     desired_access: u32,
@@ -128,12 +127,10 @@ unsafe fn csr_api_worker_create_thread(
         if target_pi >= TP_WORKER_PI_COUNT {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        let target_pml4 = if target_pi == 1 {
-            csrss_pml4
-        } else {
-            PM_PML4S[target_pi].load(Ordering::Relaxed)
+        let Some(target_pml4) = nt_handler.hosted_process_vspace(target_pi) else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
-        if target_pml4 == 0 || main_fault_ep == 0 {
+        if main_fault_ep == 0 {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let Some(worker_slot) = (0..TP_WORKER_SLOT_COUNT).find(|slot| {
@@ -158,10 +155,18 @@ unsafe fn csr_api_worker_create_thread(
                 let _ = nt_handler
                     .pm
                     .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
-                PM_POOL_USED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
+                nt_handler.release_pool_usage_slot(target_pi, pool_slot);
                 return Err(status);
             }
         };
+        if !nt_handler.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
+            let _ = nt_handler.close_process_handle(caller_pid, handle);
+            let _ = nt_handler
+                .pm
+                .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
+            nt_handler.release_pool_usage_slot(target_pi, pool_slot);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         let badged_fault_ep = mint_badged(main_fault_ep, tp_worker_badge(target_pi, worker_slot));
         let tcb = spawn_slot_thread(&RemoteThreadSpawn {
             target_pi,
@@ -180,15 +185,11 @@ unsafe fn csr_api_worker_create_thread(
             let _ = nt_handler
                 .pm
                 .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
-            PM_POOL_USED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
+            nt_handler.set_pool_thread_suspended(target_pi, pool_slot, false);
+            nt_handler.release_pool_usage_slot(target_pi, pool_slot);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
 
-        if create_suspended {
-            PM_POOL_SUSPENDED[target_pi].fetch_or(1 << pool_slot, Ordering::Relaxed);
-        } else {
-            PM_POOL_SUSPENDED[target_pi].fetch_and(!(1 << pool_slot), Ordering::Relaxed);
-        }
         TP_WORKER_TID[target_pi][worker_slot].store(tid, Ordering::Relaxed);
         TP_WORKER_TCB[target_pi][worker_slot].store(tcb, Ordering::Relaxed);
         nt_handler
@@ -1683,7 +1684,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                     SSN_NT_CREATE_THREAD => {
                         result = csr_api_worker_create_thread(
                             nt_handler,
-                            csrss_pml4,
                             main_fault_ep,
                             get_recv_mr(9),
                             rdx as u32,

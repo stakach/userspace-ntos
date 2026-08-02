@@ -1708,6 +1708,102 @@ impl ExecNtHandler {
             .pool_slot_for_tid(tid as nt_process::ThreadId)
     }
 
+    pub(crate) fn publish_hosted_process_vspace(
+        &mut self,
+        pi: usize,
+        pml4: u64,
+    ) -> Result<(), u32> {
+        if pi >= MAX_PI || pml4 == 0 || self.pm_pid_for_pi(pi).is_none() {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        PM_PML4S[pi].store(pml4, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn hosted_process_vspace(&self, pi: usize) -> Option<u64> {
+        self.pm_pid_for_pi(pi)?;
+        let pml4 = PM_PML4S.get(pi)?.load(Ordering::Relaxed);
+        (pml4 != 0).then_some(pml4)
+    }
+
+    fn pool_slot_bit(slot: usize) -> Option<u64> {
+        (slot < PM_RUNTIME_THREAD_SLOTS).then_some(1u64 << slot)
+    }
+
+    fn claim_pool_usage_slot(&self, pi: usize) -> Option<usize> {
+        let used = PM_POOL_USED.get(pi)?;
+        let mut claimed = used.load(Ordering::Relaxed);
+        loop {
+            let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| claimed & (1u64 << slot) == 0)?;
+            match used.compare_exchange_weak(
+                claimed,
+                claimed | (1u64 << slot),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(slot),
+                Err(now) => claimed = now,
+            }
+        }
+    }
+
+    pub(crate) fn pool_used_mask(&self, pi: usize) -> u64 {
+        PM_POOL_USED
+            .get(pi)
+            .map(|used| used.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn release_pool_usage_slot(&self, pi: usize, slot: usize) -> bool {
+        let Some(bit) = Self::pool_slot_bit(slot) else {
+            return false;
+        };
+        let Some(used) = PM_POOL_USED.get(pi) else {
+            return false;
+        };
+        used.fetch_and(!bit, Ordering::Relaxed);
+        true
+    }
+
+    pub(crate) fn set_pool_thread_suspended(
+        &self,
+        pi: usize,
+        slot: usize,
+        suspended: bool,
+    ) -> bool {
+        let Some(bit) = Self::pool_slot_bit(slot) else {
+            return false;
+        };
+        let Some(mask) = PM_POOL_SUSPENDED.get(pi) else {
+            return false;
+        };
+        if suspended {
+            mask.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            mask.fetch_and(!bit, Ordering::Relaxed);
+        }
+        true
+    }
+
+    pub(crate) fn take_pool_thread_suspended(&self, pi: usize, slot: usize) -> Option<u32> {
+        let bit = Self::pool_slot_bit(slot)?;
+        let mask = PM_POOL_SUSPENDED.get(pi)?;
+        Some(if mask.fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
+            1
+        } else {
+            0
+        })
+    }
+
+    pub(crate) fn is_pool_thread_suspended(&self, pi: usize, slot: usize) -> bool {
+        let Some(bit) = Self::pool_slot_bit(slot) else {
+            return false;
+        };
+        PM_POOL_SUSPENDED
+            .get(pi)
+            .is_some_and(|mask| mask.load(Ordering::Relaxed) & bit != 0)
+    }
+
     fn temporary_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
         let pid = *self.temporary_process_slots.get(pi)?;
         (pid != 0).then_some(pid)
@@ -1777,8 +1873,8 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         self.register_hosted_pool_thread_identity(pi, slot, tid)?;
-        PM_POOL_USED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
-        PM_POOL_SUSPENDED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        self.release_pool_usage_slot(pi, slot);
+        self.set_pool_thread_suspended(pi, slot, false);
         Ok(())
     }
 
@@ -1792,8 +1888,8 @@ impl ExecNtHandler {
         }
         let _ = self.thread_mechanisms.release_pool(pi, slot);
         PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
-        PM_POOL_USED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
-        PM_POOL_SUSPENDED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        self.release_pool_usage_slot(pi, slot);
+        self.set_pool_thread_suspended(pi, slot, false);
     }
 
     pub(crate) fn register_hosted_thread_tcb(
@@ -3423,7 +3519,7 @@ impl ExecNtHandler {
     ///    operation, so the `ProcessHandle` is re-resolved through `resolve_process_for_access`
     ///    demanding `PROCESS_CREATE_THREAD` (0x0002). A handle without it is `STATUS_ACCESS_DENIED`,
     ///    an unknown handle `STATUS_INVALID_HANDLE` — never an ambient side effect.
-    /// 2. The target must be ALIVE with a real address space (`PM_PML4S`), and not exiting.
+    /// 2. The target must be ALIVE with a published hosted VSpace, and not exiting.
     /// 3. The start context (`CONTEXT.Rip` = start routine, `.Rcx` = parameter) is read out of the
     ///    caller's `ThreadContext` argument — this is what makes the created thread the RIGHT
     ///    thread rather than "some thread somewhere".
@@ -3470,13 +3566,12 @@ impl ExecNtHandler {
                 nt_process::STATUS_PROCESS_IS_TERMINATING
             );
         }
-        let pml4 = PM_PML4S[target_pi].load(Ordering::Relaxed);
-        if pml4 == 0 {
+        let Some(pml4) = self.hosted_process_vspace(target_pi) else {
             reject!(
                 b"no-target-vspace",
                 nt_process::STATUS_PROCESS_IS_TERMINATING
             );
-        }
+        };
         // The caller's remaining NtCreateThread arguments live on its stack (x64: 5th..8th).
         let sp = unsafe { get_recv_mr(16) };
         let cid_ptr = unsafe { smss_stack_read(sp + 0x28) };
@@ -3499,8 +3594,7 @@ impl ExecNtHandler {
         else {
             reject!(b"no-free-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         };
-        let Some((_pool_slot, tid)) =
-            self.claim_pool_thread(target_pi, start.rip, create_suspended)
+        let Some((pool_slot, tid)) = self.claim_pool_thread(target_pi, start.rip, create_suspended)
         else {
             reject!(b"no-pool-ethread", STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -3511,8 +3605,22 @@ impl ExecNtHandler {
             args[1] as u32,
         ) {
             Ok(handle) => handle as u64,
-            Err(status) => reject!(b"handle-insert", status),
+            Err(status) => {
+                let _ = self
+                    .pm
+                    .set_thread_state(thread, nt_process::ThreadState::Initialized);
+                self.release_pool_usage_slot(target_pi, pool_slot);
+                reject!(b"handle-insert", status);
+            }
         };
+        if !self.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
+            let _ = self.close_process_handle(caller_pid, handle);
+            let _ = self
+                .pm
+                .set_thread_state(thread, nt_process::ThreadState::Initialized);
+            self.release_pool_usage_slot(target_pi, pool_slot);
+            reject!(b"suspend-state", STATUS_INSUFFICIENT_RESOURCES);
+        }
         self.pm.set_thread_teb(thread, tp_worker_teb_va(slot));
         let _ = self
             .pm
@@ -3565,24 +3673,11 @@ impl ExecNtHandler {
         entry: u64,
         create_suspended: bool,
     ) -> Option<(usize, u64)> {
-        let used = PM_POOL_USED.get(pi)?;
-        let mut claimed = used.load(Ordering::Relaxed);
-        let slot = loop {
-            let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| claimed & (1 << slot) == 0)?;
-            match used.compare_exchange_weak(
-                claimed,
-                claimed | (1 << slot),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break slot,
-                Err(now) => claimed = now,
-            }
-        };
+        let slot = self.claim_pool_usage_slot(pi)?;
         let tid = match self.pm_pool_tid_for_slot(pi, slot) {
             Some(tid) => tid as u64,
             None => {
-                used.fetch_and(!(1 << slot), Ordering::Relaxed);
+                self.release_pool_usage_slot(pi, slot);
                 return None;
             }
         };
@@ -3606,7 +3701,7 @@ impl ExecNtHandler {
                 }
         };
         if !prepared {
-            used.fetch_and(!(1 << slot), Ordering::Relaxed);
+            self.release_pool_usage_slot(pi, slot);
             return None;
         }
         Some((slot, tid))
@@ -3637,12 +3732,7 @@ impl ExecNtHandler {
                         print_str(b"[thread-pool] REFUSED NtCreateThread pi=");
                         print_u64(self.pi as u64);
                         print_str(b" used-mask=0x");
-                        print_hex(
-                            PM_POOL_USED
-                                .get(self.pi)
-                                .map(|used| used.load(Ordering::Relaxed))
-                                .unwrap_or(0) as u32,
-                        );
+                        print_hex(self.pool_used_mask(self.pi) as u32);
                         print_str(b" slots=");
                         print_u64(PM_RUNTIME_THREAD_SLOTS as u64);
                         print_str(b" pool-tids:");
@@ -3660,7 +3750,6 @@ impl ExecNtHandler {
                 return None;
             }
         };
-        let used = PM_POOL_USED.get(self.pi)?;
         let t = tid as nt_process::ThreadId;
         let h =
             match self
@@ -3675,17 +3764,20 @@ impl ExecNtHandler {
                     let _ = self
                         .pm
                         .set_thread_state(t, nt_process::ThreadState::Initialized);
-                    used.fetch_and(!(1 << slot), Ordering::Relaxed);
+                    self.release_pool_usage_slot(self.pi, slot);
                     return None;
                 }
             };
         let _ = self
             .pm
             .set_thread_create_time(t, nt_system_time_100ns() as i64);
-        if create_suspended {
-            PM_POOL_SUSPENDED[self.pi].fetch_or(1 << slot, Ordering::Relaxed);
-        } else {
-            PM_POOL_SUSPENDED[self.pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        if !self.set_pool_thread_suspended(self.pi, slot, create_suspended) {
+            let _ = self.close_process_handle(pid, h as u64);
+            let _ = self
+                .pm
+                .set_thread_state(t, nt_process::ThreadState::Initialized);
+            self.release_pool_usage_slot(self.pi, slot);
+            return None;
         }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
@@ -4902,8 +4994,7 @@ impl ExecNtHandler {
 
         let scm_worker_tid = SCM_WORKER_TID.load(Ordering::Relaxed);
         if scm_worker_tid != 0 && tid == scm_worker_tid {
-            let bit = 1u64 << slot;
-            PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed);
+            let _ = self.take_pool_thread_suspended(pi, slot);
             if previous_count != 0
                 && !self.user_memory_write(memory, previous_count, &1u32.to_le_bytes())
             {
@@ -4913,11 +5004,8 @@ impl ExecNtHandler {
             return 0;
         }
 
-        let bit = 1u64 << slot;
-        let previous = if PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
-            1
-        } else {
-            0
+        let Some(previous) = self.take_pool_thread_suspended(pi, slot) else {
+            return nt_process::STATUS_INVALID_PARAMETER;
         };
         if previous_count != 0
             && !self.user_memory_write(memory, previous_count, &(previous as u32).to_le_bytes())

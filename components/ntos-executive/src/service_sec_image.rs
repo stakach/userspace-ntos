@@ -680,7 +680,7 @@ unsafe fn spawn_requested_hosted_exe(
     nt_handler.register_main_thread_tcb(pi, PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_pml4;
-    PM_PML4S[pi].store(child_pml4, Ordering::Relaxed);
+    nt_handler.publish_hosted_process_vspace(pi, child_pml4)?;
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
@@ -2344,9 +2344,9 @@ pub(crate) unsafe fn service_sec_image(
             .unwrap_or(0);
     }
     procs[0].pml4 = pml4;
-    // Mirror into PM_PML4S so a service arm can reach this VSpace without the loop context
-    // (the cross-VSpace NtCreateThread path).
-    PM_PML4S[0].store(pml4, Ordering::Relaxed);
+    nt_handler
+        .publish_hosted_process_vspace(0, pml4)
+        .expect("smss VSpace publication requires a registered bootstrap process");
     procs[0].scratch_base = scratch_base;
     procs[0].img_end = img_end;
     // Per-process demand-fill bookkeeping is kept in static storage rather than on the bounded
@@ -12209,7 +12209,7 @@ fn claim_thread_tcb_cell(cell: &'static AtomicU64) -> bool {
 fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
     nt_handler
         .pm_pool_slot_for_tid(tid)
-        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0)
+        .is_some_and(|(pi, slot)| nt_handler.is_pool_thread_suspended(pi, slot))
 }
 
 #[inline]
@@ -12373,7 +12373,7 @@ unsafe fn spawn_requested_local_thread(
             print_str(b" tid=");
             print_u64(tid);
             print_str(b"\n");
-            let suspended = PM_POOL_SUSPENDED[wl_pi].load(Ordering::Relaxed) & (1 << slot) != 0;
+            let suspended = nt_handler.is_pool_thread_suspended(wl_pi, slot);
             let tcb = spawn_wl_listener_thread(
                 slot,
                 pml4,
@@ -12493,7 +12493,7 @@ unsafe fn spawn_requested_tp_worker(
     let suspended = nt_handler
         .pm_pool_slot_for_tid(tid)
         .is_some_and(|(pool_pi, slot)| {
-            pool_pi == pi && PM_POOL_SUSPENDED[pool_pi].load(Ordering::Relaxed) & (1 << slot) != 0
+            pool_pi == pi && nt_handler.is_pool_thread_suspended(pool_pi, slot)
         });
     let tcb = spawn_tp_worker_thread(
         pi,

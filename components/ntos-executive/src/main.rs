@@ -3252,7 +3252,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let process_linked =
         userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = hosted_gate_slot(&PM_PML4S, userinit_pi);
+    let pml4 = hosted_gate_pml4(userinit_pi);
     let tcb = hosted_gate_slot(&PM_MAIN_TCBS, userinit_pi);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
@@ -3437,7 +3437,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let process_linked =
         explorer_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = hosted_gate_slot(&PM_PML4S, explorer_pi);
+    let pml4 = hosted_gate_pml4(explorer_pi);
     let tcb = hosted_gate_slot(&PM_MAIN_TCBS, explorer_pi);
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     let create_window_string_captures =
@@ -10603,7 +10603,7 @@ pub(crate) struct RemoteThreadRequest {
     pub target_pi: usize,
     /// The bounded per-process thread window claimed for it.
     pub slot: usize,
-    /// The TARGET's VSpace (PML4) cap, resolved from `PM_PML4S`.
+    /// The TARGET's published hosted VSpace (PML4) cap.
     pub pml4: u64,
     /// The caller-supplied start context (`rip` = start routine, `rcx` = parameter).
     pub start: nt_thread_start::Amd64ThreadContext,
@@ -13256,6 +13256,10 @@ fn hosted_gate_slot(slots: &[AtomicU64; MAX_PI], pi: Option<usize>) -> u64 {
         Some(pi) if pi < MAX_PI => slots[pi].load(Ordering::Relaxed),
         _ => 0,
     }
+}
+
+fn hosted_gate_pml4(pi: Option<usize>) -> u64 {
+    hosted_gate_slot(&PM_PML4S, pi)
 }
 
 fn check(name: &[u8], ok: bool, passed: &mut u64) {

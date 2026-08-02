@@ -140,3 +140,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   A3 work is now the low-level mechanism state still keyed by `PM_PML4S` and
   `PM_POOL_SUSPENDED`, plus the compatibility mirror writes kept for code outside
   `ExecNtHandler`.
+- A3 continued. Hosted VSpace publication/lookup and pool usage/suspend bookkeeping now go through
+  `ExecNtHandler` APIs instead of open-coded `PM_PML4S`, `PM_POOL_USED`, or
+  `PM_POOL_SUSPENDED` access in the service loop and rendezvous paths. The CSR worker
+  `NtCreateThread` path consumes the published VSpace instead of its old `csrss_pml4` special case,
+  and failed remote-thread handle insertion releases the claimed pool slot. Review adjustment:
+  raw pool/PML4 atomics are now confined to reset/helper code and gate-only probes; the next A3/A4
+  boundary is replacing the static TCB/worker slot arrays with registered runtime records.
