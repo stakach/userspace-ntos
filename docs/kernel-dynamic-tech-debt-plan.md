@@ -1,6 +1,6 @@
 # Kernel Dynamic Tech Debt Plan
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 ## Objective
 
@@ -431,3 +431,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: the next frontier is no longer userinit shell spawn; it is explorer's missing
   `RegisterWindowMessage` capture, api0/user-callback redirection, client-installed WndProc, and
   shell COM class provisioning gates.
+
+### 2026-08-03
+
+- C3 repair. `NtUserBuildHwndList` now stages caller-owned output buffers before dispatching to
+  isolated win32k and copies the real returned `HWND` list and needed-count back into the client
+  after a successful service return. The boundary also normalizes the seven-argument ReactOS win32k
+  service shape and the eight-argument Vista/Wine user32 wrapper shape instead of letting isolated
+  win32k probe client stack/output pointers directly. Validation:
+  `.tmp/full-boot-build-hwnd-list-20260803-070653.log` reached `RUN_RC=0`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, and explorer `0x101b`
+  dispatches returned `status=0` where the previous run parked. Review adjustment: the next concrete
+  explorer frontier is the later `NtGdiCreateBitmap` (`0x106c`) wall, followed by the existing
+  explorer `RegisterWindowMessage`, api0 callback redirection, client WndProc, and shell COM gates.

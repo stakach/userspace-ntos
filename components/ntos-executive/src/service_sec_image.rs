@@ -14,8 +14,12 @@ static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
+static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_MSG_BYTES: usize = 48;
+const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
+const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
+const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WM_QUIT: u32 = 0x0012;
 
 fn win32k_client_label<'a>(nt_handler: &'a ExecNtHandler, pi: usize) -> &'a [u8] {
@@ -6650,6 +6654,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut open_dcw_stack_args = [0u64; 3];
                 let mut open_dcw_stack_arg_count = 0usize;
                 let mut open_dcw_dhpdev_copyout = (0u64, 0u64);
+                let mut build_hwnd_list_stack_args = [0u64; 3];
+                let mut build_hwnd_list_stack_arg_count = 0usize;
+                let mut build_hwnd_list_copyout = (0u64, 0u64, 0u64, 0u64);
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -6685,6 +6692,99 @@ pub(crate) unsafe fn service_sec_image(
                         if pi == 6 {
                             EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
                                 .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else if m0 == 0x101b && sp != 0 {
+                    // NtUserBuildHwndList writes both the needed count and the HWND array through
+                    // caller-owned user pointers. Isolated win32k cannot safely probe those VAs
+                    // directly, so stage the outputs in the shared ARG page and copy the real
+                    // win32k result back after dispatch. ReactOS' win32k table exposes seven
+                    // service arguments, while the Vista/Wine user32 path calls an eight-argument
+                    // wrapper with an extra TRUE before dwThreadId; normalize that shape here.
+                    let tail0 = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x28,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let tail1 = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x30,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let tail2 = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x38,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let tail3 = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x40,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let (Some(tail0), Some(tail1), Some(tail2)) = (tail0, tail1, tail2) {
+                        let eight_arg_shape = tail3.is_some_and(|needed| {
+                            a3 <= 1
+                                && tail1 != 0
+                                && tail1 <= 0x0001_0000
+                                && tail2 >= 0x0001_0000
+                                && needed >= 0x0001_0000
+                        });
+                        let (thread_id, c_hwnd, client_list, client_needed, shape) =
+                            if eight_arg_shape {
+                                (tail0, tail1, tail2, tail3.unwrap_or(0), 8u64)
+                            } else {
+                                (a3, tail0, tail1, tail2, 7u64)
+                            };
+                        if client_needed != 0 {
+                            let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                            let staged_list = arg;
+                            let staged_needed = arg + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET;
+                            let c_hwnd_forwarded = c_hwnd.min(WIN32K_BUILD_HWND_LIST_MAX_HANDLES);
+                            core::ptr::write_bytes(
+                                staged_list as *mut u8,
+                                0,
+                                WIN32K_BUILD_HWND_LIST_STAGE_BYTES,
+                            );
+                            d_a3 = thread_id;
+                            build_hwnd_list_stack_args = [
+                                c_hwnd_forwarded,
+                                if client_list != 0 && c_hwnd_forwarded != 0 {
+                                    staged_list
+                                } else {
+                                    0
+                                },
+                                staged_needed,
+                            ];
+                            build_hwnd_list_stack_arg_count = build_hwnd_list_stack_args.len();
+                            build_hwnd_list_copyout =
+                                (client_list, staged_list, client_needed, c_hwnd_forwarded);
+
+                            let n = BUILD_HWND_LIST_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 8 {
+                                print_str(b"[w32marshal] NtUserBuildHwndList pi=");
+                                print_u64(pi as u64);
+                                print_str(b" shape=");
+                                print_u64(shape);
+                                print_str(b" tid=");
+                                print_u64(thread_id);
+                                print_str(b" c=");
+                                print_u64(c_hwnd);
+                                print_str(b" forwarded=");
+                                print_u64(c_hwnd_forwarded);
+                                print_str(b" list=0x");
+                                print_hex_u64(client_list);
+                                print_str(b" needed=0x");
+                                print_hex_u64(client_needed);
+                                print_str(b"\n");
+                            }
                         }
                     }
                 } else if m0 == 0x10de && pi != 3 && pi != 4 {
@@ -7536,18 +7636,24 @@ pub(crate) unsafe fn service_sec_image(
                     crate::ke_gdi_flush_user_batch(pi, client_teb);
                     let open_dcw_staged_stack =
                         m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
+                    let build_hwnd_list_staged_stack = m0 == 0x101b
+                        && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
+                    let (dispatch_sp, dispatch_stack_args): (u64, &[u64]) = if open_dcw_staged_stack
+                    {
+                        (0, &open_dcw_stack_args)
+                    } else if build_hwnd_list_staged_stack {
+                        (0, &build_hwnd_list_stack_args)
+                    } else {
+                        (sp, &[])
+                    };
                     let mut r = win32k_glue::win32k_dispatch_wide(
                         m0,
                         d_a0,
                         d_a1,
                         d_a2,
                         d_a3,
-                        if open_dcw_staged_stack { 0 } else { sp },
-                        if open_dcw_staged_stack {
-                            &open_dcw_stack_args
-                        } else {
-                            &[]
-                        },
+                        dispatch_sp,
+                        dispatch_stack_args,
                         win32k_client_context_for_thread(
                             &nt_handler,
                             pi,
@@ -7613,6 +7719,50 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b"\n");
                             }
                             r = (0xC000_0001, false);
+                        }
+                    }
+                    if build_hwnd_list_staged_stack && r.1 {
+                        let (client_list, staged_list, client_needed, c_hwnd_forwarded) =
+                            build_hwnd_list_copyout;
+                        let needed = core::ptr::read_unaligned(
+                            (staged_list + WIN32K_BUILD_HWND_LIST_COUNT_OFFSET) as *const u32,
+                        );
+                        let needed_ok = img_spawn::client_write_mapped(
+                            pi as u64,
+                            client_needed,
+                            &needed.to_le_bytes(),
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let handles_to_copy = (needed as u64).min(c_hwnd_forwarded) as usize;
+                        let handles_ok = client_list == 0
+                            || handles_to_copy == 0
+                            || img_spawn::client_copyout_mapped(
+                                pi as u64,
+                                client_list,
+                                core::slice::from_raw_parts(
+                                    staged_list as *const u8,
+                                    handles_to_copy * 8,
+                                ),
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                        if !needed_ok || !handles_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] NtUserBuildHwndList copy-out failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" list=0x");
+                                print_hex_u64(client_list);
+                                print_str(b" needed=0x");
+                                print_hex_u64(client_needed);
+                                print_str(b" handles=");
+                                print_u64(handles_to_copy as u64);
+                                print_str(b"\n");
+                            }
+                            r = (0xC000_0005, false);
                         }
                     }
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
