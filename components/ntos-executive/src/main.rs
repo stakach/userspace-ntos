@@ -2088,8 +2088,8 @@ pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
     nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
     nt_kernel_exec::user_class::ClassAtomNameMirror::new();
 pub(crate) static GLOBAL_CLASS_ATOM_NAMES_OBSERVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_CLASS_ATOM_NAME_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -3259,9 +3259,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
     let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
-    let class_atom_fallbacks = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.load(Ordering::Relaxed);
-    let class_atom_fallback_failures =
-        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.load(Ordering::Relaxed);
+    let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
+    let class_atom_mirror_failures =
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
     let scrollbar_queries = USERINIT_SCROLLBAR_CLASSINFO_QUERIES.load(Ordering::Relaxed);
     let scrollbar_copyouts = USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.load(Ordering::Relaxed);
     let scrollbar_errors = USERINIT_SCROLLBAR_CLASSINFO_ERRORS.load(Ordering::Relaxed);
@@ -3324,10 +3324,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(dialog_atom as u32);
     print_str(b" class-atom-names=");
     print_u64(class_atom_names);
-    print_str(b" atom-name-fallbacks/failures=");
-    print_u64(class_atom_fallbacks);
+    print_str(b" atom-name-mirror-serves/failures=");
+    print_u64(class_atom_mirror_serves);
     print_str(b"/");
-    print_u64(class_atom_fallback_failures);
+    print_u64(class_atom_mirror_failures);
     print_str(b" scrollbar-classinfo=");
     print_u64(scrollbar_queries);
     print_str(b"/");
@@ -3436,9 +3436,9 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
-    let class_atom_fallbacks = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.load(Ordering::Relaxed);
-    let class_atom_fallback_failures =
-        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.load(Ordering::Relaxed);
+    let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
+    let class_atom_mirror_failures =
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
     let shell_com_provisioned = EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
     let shell_com_opened = EXPLORER_SHELL_COM_CLASS_OPEN_MASK.load(Ordering::Relaxed);
     let shell_com_inproc_default = EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
@@ -3479,10 +3479,10 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(win32k_pool_exhaustions);
     print_str(b" class-atom-names=");
     print_u64(class_atom_names);
-    print_str(b" atom-name-fallbacks/failures=");
-    print_u64(class_atom_fallbacks);
+    print_str(b" atom-name-mirror-serves/failures=");
+    print_u64(class_atom_mirror_serves);
     print_str(b"/");
-    print_u64(class_atom_fallback_failures);
+    print_u64(class_atom_mirror_failures);
     print_str(b" api0-redirects=");
     print_u64(api0_redirects);
     print_str(b" callback-failures=");

@@ -544,3 +544,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   debt is real provider-owned per-service GUI/GDI process ownership, so the remaining WSS_NOIO
   service branches can shrink to ordinary provider/object outcomes instead of executive-owned
   service identity shortcuts.
+- C3/F1 cleanup. Removed the class atom-name fallback accounting and the post-dispatch
+  `NtUserGetAtomName` result overwrite. Shell clients now resolve `NtUserGetAtomName(0x10ad)` only
+  from the observed class-atom mirror before dispatch; exact mirror misses return zero and stay
+  visible in the log. The same slice replaced the remaining static userinit/explorer PID checks in
+  DefSetText staging, global cursor mirror, built-in class mirror, and class
+  atom-name mirror paths with hosted-process role metadata. Validation:
+  `.tmp/full-boot-class-atom-mirror-no-fallback-20260803-094151.log` reached `RUN_RC=0`, `276/276`
+  checks passed, `PASS exec_win32k_desktop_painted`, `PASS
+  exec_msgina_logon_dialog_painted`, `PASS exec_services_scrollbar_classinfo_mirrored`, and the
+  explorer message/callback/WndProc/COM gates remained green. The userinit and explorer summaries
+  now report `atom-name-mirror-serves/failures=3/0`. Review adjustment: remaining C3/F1 debt is real
+  per-process win32k `PROCESSINFO`/`W32PROCESS` ownership so shell and service clients can use
+  ordinary provider-owned paths, followed by the remaining service WSS_NOIO branches and the F2/F3
+  real paint path.

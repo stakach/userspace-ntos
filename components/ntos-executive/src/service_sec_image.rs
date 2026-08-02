@@ -79,6 +79,16 @@ fn hosted_process_is_noninteractive_service_gui_client(
         == Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
 }
 
+fn hosted_process_is_interactive_shell_gui_client(nt_handler: &ExecNtHandler, pi: usize) -> bool {
+    matches!(
+        nt_handler.hosted_process_role(pi),
+        Some(
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                | nt_exe_image::HostedProcessRole::InteractiveShell
+        )
+    )
+}
+
 fn ntgdi_bitmap_format_rgb(bits: u32) -> u32 {
     if bits <= 1 {
         1
@@ -1815,7 +1825,7 @@ unsafe fn capture_registered_class_atom_name(
     Some(CapturedClassAtomName { len, units })
 }
 
-unsafe fn copy_class_atom_name_fallback(
+unsafe fn copy_class_atom_name_from_mirror(
     pi: u64,
     atom: u16,
     unicode_string: u64,
@@ -1824,9 +1834,13 @@ unsafe fn copy_class_atom_name_fallback(
     scratch_base: u64,
 ) -> Option<u64> {
     let mut name = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
-    let name_len = GLOBAL_CLASS_ATOM_NAME_MIRROR
+    let Some(name_len) = GLOBAL_CLASS_ATOM_NAME_MIRROR
         .copy_name(atom, &mut name)
-        .or_else(|| nt_kernel_exec::user_class::integer_atom_name(atom, &mut name))?;
+        .or_else(|| nt_kernel_exec::user_class::integer_atom_name(atom, &mut name))
+    else {
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     let mut raw = [0u8; 16];
     if unicode_string == 0
         || !img_spawn::client_copyin_mapped(
@@ -1838,7 +1852,7 @@ unsafe fn copy_class_atom_name_fallback(
             scratch_base,
         )
     {
-        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let maximum = u16::from_le_bytes([raw[2], raw[3]]) as usize;
@@ -1847,7 +1861,7 @@ unsafe fn copy_class_atom_name_fallback(
     }
     let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     if buffer == 0 {
-        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let chars = name_len.min((maximum - 2) / 2);
@@ -1873,19 +1887,10 @@ unsafe fn copy_class_atom_name_fallback(
         scratch_base,
     );
     if !text_ok || !terminator_ok {
-        GLOBAL_CLASS_ATOM_NAME_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let fallback = GLOBAL_CLASS_ATOM_NAME_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-    if fallback < 8 {
-        print_str(b"[win32k-class-atom] NtUserGetAtomName fallback pi=");
-        print_u64(pi);
-        print_str(b" atom=0x");
-        print_hex(atom as u32);
-        print_str(b" bytes=");
-        print_u64((chars * 2) as u64);
-        print_str(b"\n");
-    }
+    GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.fetch_add(1, Ordering::Relaxed);
     Some((chars * 2) as u64)
 }
 
@@ -7367,11 +7372,15 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         );
                     }
-                } else if m0 == 0x1080 && (pi == 5 || pi == 6) {
+                } else if m0 == 0x1080
+                    && hosted_process_is_interactive_shell_gui_client(&nt_handler, pi)
+                {
                     // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from
                     // DefWindowProc while win32k is parked in a user callback; capture the counted
                     // string before isolated win32k probes the client's raw pointer graph.
-                    if pi == 6 {
+                    if nt_handler.hosted_process_role(pi)
+                        == Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+                    {
                         prefill_client_large_string_pages(
                             pi as u64,
                             d_a1,
@@ -7737,25 +7746,36 @@ pub(crate) unsafe fn service_sec_image(
                 // EngCopyBits path while initializing service DLLs.
                 let svc_noninteractive =
                     hosted_process_is_noninteractive_service_gui_client(&nt_handler, pi);
-                let mut class_atom_name_pre_served = false;
-                // Explorer asks win32k for class atom names from inside nested user callbacks. The
-                // hosted win32k still has one shared PROCESSINFO, so those exact lookups can fault
-                // before the old post-dispatch fallback runs; complete only mirror-backed names here.
-                let class_atom_name_pre_result = if m0 == 0x10ad && (pi == 5 || pi == 6) {
+                let shell_gui_client =
+                    hosted_process_is_interactive_shell_gui_client(&nt_handler, pi);
+                let userinit_gui_client = nt_handler.hosted_process_role(pi)
+                    == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
+                // Shell GUI clients ask win32k for class atom names from inside nested user
+                // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
+                // mirror-backed names are served before dispatch; misses stay visible.
+                let class_atom_name_mirror_result = if m0 == 0x10ad && shell_gui_client {
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     crate::ke_gdi_flush_user_batch(pi, client_teb);
-                    copy_class_atom_name_fallback(
+                    let mirrored = copy_class_atom_name_from_mirror(
                         pi as u64,
                         a0 as u16,
                         a1,
                         filled_pages,
                         faults as usize,
                         scratch_base,
-                    )
+                    );
+                    if mirrored.is_none() {
+                        print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) MIRROR MISS pi=");
+                        print_u64(pi as u64);
+                        print_str(b" atom=0x");
+                        print_hex(a0 as u32);
+                        print_str(b" -> bytes=0\n");
+                    }
+                    Some(mirrored.unwrap_or(0))
                 } else {
                     None
                 };
@@ -7763,44 +7783,42 @@ pub(crate) unsafe fn service_sec_image(
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0, false)
-                } else if let Some(fallback) = class_atom_name_pre_result {
-                    class_atom_name_pre_served = true;
-                    print_str(b"[win32k-svc] post-winlogon NtUserGetAtomName(0x10ad) MIRROR pi=");
+                } else if let Some(mirror_bytes) = class_atom_name_mirror_result {
+                    print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) MIRROR pi=");
                     print_u64(pi as u64);
                     print_str(b" atom=0x");
                     print_hex(a0 as u32);
                     print_str(b" -> bytes=");
-                    print_u64(fallback);
+                    print_u64(mirror_bytes);
                     print_str(b"\n");
-                    (fallback, true)
-                } else if m0 == 0x103d && (pi == 5 || pi == 6) {
+                    (mirror_bytes, true)
+                } else if m0 == 0x103d && shell_gui_client {
                     // userinit/explorer are distinct interactive child processes, but the current
                     // win32k host still has one shared PROCESSINFO. Entering the real handler with
-                    // that mismatched state reaches an unbounded EngCopyBits path. Model the
-                    // handler's second (`gcurFirst`) search exactly: only return a handle learned
-                    // from a real winlogon lookup and a successful real NtUserSetSystemCursor
-                    // promotion; an exact miss remains NULL.
+                    // that mismatched state reaches an unbounded EngCopyBits path. Reuse only a
+                    // handle learned from a real winlogon lookup and a successful real
+                    // NtUserSetSystemCursor promotion; an exact miss remains NULL.
                     let hit = cursor_identity_key
                         .as_ref()
                         .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
                     if let Some(handle) = hit {
                         remember_global_scrollbar_cursor(handle);
-                        if pi == 5 {
+                        if userinit_gui_client {
                             USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
                             USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
                         }
-                        print_str(b"[win32k-svc] post-winlogon global cursor cache HIT pi=");
+                        print_str(b"[win32k-svc] shell global cursor mirror HIT pi=");
                         print_u64(pi as u64);
                         print_str(b" -> real HCURSOR 0x");
                         print_hex(handle);
                         print_str(b"\n");
                     } else {
-                        print_str(b"[win32k-svc] post-winlogon global cursor cache MISS pi=");
+                        print_str(b"[win32k-svc] shell global cursor mirror MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" -> NULL\n");
                     }
                     (hit.unwrap_or(0) as u64, true)
-                } else if m0 == 0x10b4 && (pi == 5 || pi == 6) && builtin_class_attempt {
+                } else if m0 == 0x10b4 && shell_gui_client && builtin_class_attempt {
                     // The hosted win32k currently has one shared PROCESSINFO, whose built-in class
                     // list was populated by winlogon. A second real registration from userinit or
                     // explorer would mutate that same list and report duplicate-class semantics.
@@ -7810,7 +7828,7 @@ pub(crate) unsafe fn service_sec_image(
                         .as_ref()
                         .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key));
                     if let (Some(key), Some(atom)) = (builtin_class_key.as_ref(), hit) {
-                        if pi == 5 {
+                        if userinit_gui_client {
                             let bit = 1u64 << (key.fn_id() - 0x02a1);
                             USERINIT_BUILTIN_CLASS_HITS.fetch_add(1, Ordering::Relaxed);
                             USERINIT_BUILTIN_CLASS_MASK.fetch_or(bit, Ordering::Relaxed);
@@ -7818,7 +7836,7 @@ pub(crate) unsafe fn service_sec_image(
                                 USERINIT_DIALOG_CLASS_ATOM.store(atom as u64, Ordering::Relaxed);
                             }
                         }
-                        print_str(b"[win32k-svc] post-winlogon builtin class HIT pi=");
+                        print_str(b"[win32k-svc] shell builtin class mirror HIT pi=");
                         print_u64(pi as u64);
                         print_str(b" fnid=0x");
                         print_hex(key.fn_id());
@@ -7826,10 +7844,10 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(atom as u32);
                         print_str(b"\n");
                     } else {
-                        if pi == 5 {
+                        if userinit_gui_client {
                             USERINIT_BUILTIN_CLASS_MISSES.fetch_add(1, Ordering::Relaxed);
                         }
-                        print_str(b"[win32k-svc] post-winlogon builtin class mirror MISS pi=");
+                        print_str(b"[win32k-svc] shell builtin class mirror MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" -> atom 0\n");
                     }
@@ -8494,18 +8512,6 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if ok && !redirected_user_callback {
-                    if m0 == 0x10ad && st == 0 && !class_atom_name_pre_served {
-                        if let Some(fallback) = copy_class_atom_name_fallback(
-                            pi as u64,
-                            a0 as u16,
-                            a1,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
-                            st = fallback;
-                        }
-                    }
                     if let Some(capture) = get_class_info_capture {
                         if st != 0 {
                             if !copy_back_get_class_info(
