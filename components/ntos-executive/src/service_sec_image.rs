@@ -329,9 +329,31 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
     client_thread_id: u64,
 ) -> img_spawn::SecImageSpawn {
     let image = nt_exe_image::hosted_image_for_pi(pi).unwrap();
-    let runtime = hosted_process_runtime_for_pi(pi).unwrap();
+    spawn_hosted_sec_image_for_image(
+        nt_exe_image::HostedProcessImageRef::from(image),
+        pe,
+        fault_ep_c,
+        ntdll_base,
+        setup_env,
+        ldrpinit_rva,
+        client_process_id,
+        client_thread_id,
+    )
+}
+
+unsafe fn spawn_hosted_sec_image_for_image(
+    image: nt_exe_image::HostedProcessImageRef<'_>,
+    pe: &nt_pe_loader::PeFile,
+    fault_ep_c: u64,
+    ntdll_base: u64,
+    setup_env: bool,
+    ldrpinit_rva: u64,
+    client_process_id: u64,
+    client_thread_id: u64,
+) -> img_spawn::SecImageSpawn {
+    let runtime = hosted_process_runtime_for_pi(image.pi).unwrap();
     spawn_sec_image(
-        pi as u64,
+        image.pi as u64,
         pe,
         fault_ep_c,
         ntdll_base,
@@ -470,7 +492,7 @@ unsafe fn defer_explorer_startup_quiesce(nt_handler: &ExecNtHandler) -> bool {
 }
 
 struct HostedExeSpawn<'a> {
-    image: &'static nt_exe_image::HostedProcessImage,
+    image: nt_exe_image::HostedProcessImageRef<'a>,
     runtime: HostedProcessRuntime,
     pe: &'a nt_pe_loader::PeFile<'static>,
     spawned: &'static AtomicU64,
@@ -583,6 +605,7 @@ fn hosted_multiplexed_thread_spawn_for(
 
 fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
+    catalog: &'a nt_exe_image::OwnedHostedImageCatalog<8>,
     csrss_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     winlogon_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     services_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
@@ -590,10 +613,14 @@ fn hosted_exe_spawn_for<'a>(
     userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
     explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
 ) -> Option<HostedExeSpawn<'a>> {
-    let image = nt_exe_image::hosted_image_for_leaf(request.leaf())?;
-    let runtime = hosted_process_runtime_for_pi(image.pi)?;
+    let target = request.target?;
+    let image = catalog.get_by_leaf(request.leaf())?;
+    if nt_exe_image::SpawnTarget::from_image(image) != target {
+        return None;
+    }
+    let runtime = hosted_process_runtime_for_pi(target.pi)?;
     let spawned = runtime.spawned?;
-    match image.pi {
+    match target.pi {
         1 => csrss_pe.as_ref().map(|pe| HostedExeSpawn {
             image,
             runtime,
@@ -652,8 +679,8 @@ unsafe fn spawn_requested_hosted_exe(
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let child_spawn = spawn_hosted_sec_image_for_pi(
-        pi,
+    let child_spawn = spawn_hosted_sec_image_for_image(
+        spec.image,
         spec.pe,
         mint_badged(fault_ep, spec.image.top_badge),
         NTDLL_BASE,
@@ -2100,6 +2127,7 @@ pub(crate) unsafe fn service_sec_image(
     let mut csrss_process_handle = 0u64;
     // Generic owner-local file/section/spawn state for hosted executable images.
     let mut exe_images = nt_exe_image::ImageTable::<8>::new();
+    let mut exe_image_catalog = nt_exe_image::OwnedHostedImageCatalog::<8>::new();
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
@@ -5093,6 +5121,8 @@ pub(crate) unsafe fn service_sec_image(
                     winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     winlogon_pool_va: winlogon_va,
                     exe_images: &mut exe_images as *mut nt_exe_image::ImageTable<8>,
+                    exe_image_catalog: &mut exe_image_catalog
+                        as *mut nt_exe_image::OwnedHostedImageCatalog<8>,
                     services_pool_va: services_va,
                     services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     lsass_pool_va: lsass_va,
@@ -5604,6 +5634,7 @@ pub(crate) unsafe fn service_sec_image(
                     let is_csrss_spawn = request.leaf().eq_ignore_ascii_case(b"csrss.exe");
                     if let Some(spec) = hosted_exe_spawn_for(
                         request,
+                        &exe_image_catalog,
                         &csrss_pe,
                         &winlogon_pe,
                         &services_pe,
@@ -5629,6 +5660,9 @@ pub(crate) unsafe fn service_sec_image(
                                 }
                             }
                         }
+                    } else {
+                        let _ = exe_images.rollback_spawn(request);
+                        result = u64::from(nt_process::STATUS_INVALID_PARAMETER);
                     }
                 }
                 if let Some(request) = nt_handler.thread_spawn_request.take() {

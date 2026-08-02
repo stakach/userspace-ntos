@@ -10482,6 +10482,10 @@ struct ExecLoopCtx {
     /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
     /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
     exe_images: *mut nt_exe_image::ImageTable<8>,
+    /// Runtime-owned identity catalog for hosted executable images admitted through file/section
+    /// creation. `NtCreateProcess` consumes this as the target authority instead of re-resolving
+    /// static leaf metadata at spawn time.
+    exe_image_catalog: *mut nt_exe_image::OwnedHostedImageCatalog<8>,
     services_pool_va: u64,
     services_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// lsass.exe's preloaded PE and backing pool address; migrated through `exe_images` too.

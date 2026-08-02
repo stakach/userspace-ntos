@@ -275,3 +275,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: the executive can now carry a real runtime-owned catalog instead of borrowing
   from the historical static image slice; the next step is wiring that catalog into open/section
   tracking and deleting static-wrapper lookups from the spawn path.
+- A2 continued. The service loop now owns an `OwnedHostedImageCatalog`, executable opens register
+  admitted hosted images into it, and `NtCreateProcess` reserves spawns with
+  `reserve_spawn_owned_registered`. The service-loop spawn consumer requires a target-bound request,
+  verifies it against the runtime catalog, rolls back malformed requests, and passes the catalog's
+  NT image path/command line into `spawn_sec_image`. Review adjustment: open-time admission still
+  uses the historical hosted descriptors to supply badge/role/root policy for the bounded preloaded
+  images; the next A2 cleanup is moving that policy source behind a real session/image registration
+  API and converting remaining static wrapper lookups that only format names or classify faults.

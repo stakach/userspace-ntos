@@ -75,7 +75,7 @@ fn loaded_hosted_image_slots(ctx: ExecLoopCtx) -> [LoadedHostedImageSlot; 6] {
 
 unsafe fn loaded_hosted_image_metadata(
     ctx: ExecLoopCtx,
-    hosted: &nt_exe_image::HostedProcessImage,
+    hosted: nt_exe_image::HostedProcessImageRef<'_>,
 ) -> Option<nt_exe_image::ImageMetadata> {
     for slot in loaded_hosted_image_slots(ctx) {
         if slot.leaf.eq_ignore_ascii_case(hosted.leaf) {
@@ -86,20 +86,51 @@ unsafe fn loaded_hosted_image_metadata(
     None
 }
 
+unsafe fn register_hosted_image_catalog_entry(
+    ctx: ExecLoopCtx,
+    image: &nt_exe_image::HostedProcessImage,
+) -> bool {
+    {
+        let catalog = unsafe { &*ctx.exe_image_catalog };
+        if catalog.get_by_leaf(image.leaf).is_some() {
+            return true;
+        }
+    }
+    let Ok(owned) = nt_exe_image::OwnedHostedProcessImage::new(
+        image.pi,
+        image.top_badge,
+        image.leaf,
+        image.process_name.as_bytes(),
+        image.role,
+        image.nt_image_path,
+        image.command_line,
+        image.image_root,
+        image.probe_fragment,
+    ) else {
+        return false;
+    };
+    unsafe { &mut *ctx.exe_image_catalog }
+        .register(owned)
+        .is_ok()
+}
+
 unsafe fn record_hosted_child_exe_open(
     ctx: ExecLoopCtx,
     owner_pi: usize,
-    leaf: &[u8],
+    image: &nt_exe_image::HostedProcessImage,
     file_handle: u64,
 ) -> bool {
-    let Some(hosted) = nt_exe_image::hosted_image_for_leaf(leaf) else {
+    if !unsafe { register_hosted_image_catalog_entry(ctx, image) } {
+        return false;
+    }
+    let Some(hosted) = (unsafe { &*ctx.exe_image_catalog }).get_by_leaf(image.leaf) else {
         return false;
     };
     let Some(metadata) = (unsafe { loaded_hosted_image_metadata(ctx, hosted) }) else {
         return false;
     };
     let opened = unsafe { &mut *ctx.exe_images }
-        .open(owner_pi, leaf, file_handle, metadata)
+        .open(owner_pi, hosted.leaf, file_handle, metadata)
         .is_ok();
     if opened {
         match hosted.role {
@@ -2112,10 +2143,6 @@ impl ExecNtHandler {
         nt_exe_image::hosted_process_name_for_pi(pi)
     }
 
-    fn hosted_pi_for_leaf(leaf: &[u8]) -> Option<usize> {
-        nt_exe_image::hosted_pi_for_leaf(leaf)
-    }
-
     fn current_pm_pid(&self) -> Option<nt_process::ProcessId> {
         self.pm_pid_for_pi(self.pi)
     }
@@ -2271,12 +2298,10 @@ impl ExecNtHandler {
     fn allocate_hosted_process_slot(
         &mut self,
         creator_pi: usize,
-        leaf: &[u8],
+        image: nt_exe_image::HostedProcessImageRef<'_>,
     ) -> Result<usize, u32> {
-        let child_pi =
-            Self::hosted_pi_for_leaf(leaf).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        let name = Self::hosted_process_name_for_pi(child_pi)
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let child_pi = image.pi;
+        let name = image.process_name;
         if let Some(existing_pid) = self.pm_pid_for_pi(child_pi) {
             let matches_existing = self
                 .pm
@@ -15375,10 +15400,11 @@ impl ExecNtHandler {
                 let exe_canon = (!want_dir)
                     .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
                     .flatten();
-                let hosted_exe_leaf = exe_canon.and_then(|leaf| {
+                let hosted_exe_image = exe_canon.and_then(|leaf| {
                     let image = nt_exe_image::hosted_image_for_leaf(leaf)?;
-                    Self::hosted_image_exists(image).then_some(image.leaf)
+                    Self::hosted_image_exists(image).then_some(image)
                 });
+                let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
                 let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
                     if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                         Some(b"explorer.exe" as &[u8])
@@ -15490,8 +15516,8 @@ impl ExecNtHandler {
                     };
                     opened_handle = h;
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
-                    if let Some(leaf) = hosted_exe_leaf {
-                        let _ = record_hosted_child_exe_open(ctx, self.pi, leaf, h);
+                    if let Some(image) = hosted_exe_image {
+                        let _ = record_hosted_child_exe_open(ctx, self.pi, image, h);
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
@@ -15920,18 +15946,22 @@ impl ExecNtHandler {
                     print_u64(slot_index as u64 + 1);
                     print_str(b"\n");
                 }
-                if nt_exe_image::hosted_image_for_leaf(leaf).is_none() {
+                let catalog = &*ctx.exe_image_catalog;
+                let Some(image) = catalog.get_by_leaf(leaf) else {
                     self.stop = true;
                     return 0xC000_0002;
-                }
-                let child_pi = match self.allocate_hosted_process_slot(self.pi, leaf) {
-                    Ok(child_pi) => child_pi,
-                    Err(status) => return status,
                 };
-                if child_pi == 5 {
-                    USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                } else if child_pi == 6 {
-                    EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                if let Err(status) = self.allocate_hosted_process_slot(self.pi, image) {
+                    return status;
+                }
+                match image.role {
+                    nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
+                        USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    nt_exe_image::HostedProcessRole::InteractiveShell => {
+                        EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
                 // RtlCreateUserProcess/CreateProcessAsUserW names the parent process with a real
                 // process handle (commonly NtCurrentProcess). Keep image launch policy out of the
@@ -15940,7 +15970,13 @@ impl ExecNtHandler {
                     return nt_process::STATUS_INVALID_HANDLE;
                 }
                 let table = &mut *ctx.exe_images;
-                match table.reserve_spawn(self.pi, sect, args[1] as u32, get_recv_mr(9)) {
+                match table.reserve_spawn_owned_registered(
+                    catalog,
+                    self.pi,
+                    sect,
+                    args[1] as u32,
+                    get_recv_mr(9),
+                ) {
                     Ok(request) => {
                         self.exe_spawn_request = Some(request);
                         0
