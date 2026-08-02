@@ -50,7 +50,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` C1: Route win32k services through `KeAddSystemServiceTable` and provider metadata.
 - `[x]` C2: Reject provider service calls whose runtime arity does not match the registered
   metadata.
-- `[ ]` C3: Audit remaining direct win32k/client service shims and convert them to provider-owned
+- `[~]` C3: Audit remaining direct win32k/client service shims and convert them to provider-owned
   dispatch or documented narrow kernel callbacks.
 
 ### D. Driver, Device, And Registry Discovery
@@ -420,3 +420,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `explorer.exe` can prove that their seL4 TCB-backed main ETHREAD is live without adding another
   kernel-side image-name branch. Review adjustment: listener-role gates are still role-specific
   because their startup paths are thread-service contracts, not hosted-image identities.
+- C3 repair. `NtGdiOpenDCW` now crosses the isolated-client/win32k boundary with explicit argument
+  marshalling instead of passing raw caller pointers into win32k. The executive stages the optional
+  device/log-address strings, optional `DEVMODEW`, and optional `pUMdhpdev` output slot in the shared
+  callback frame, forwards `bDisplay`/`hspool`/`pUMdhpdev` as provider-arity stack arguments, and
+  copies the returned DHPDEV value back to the caller only after a successful HDC result. This cleared
+  the previous `userinit.exe` OpenDCW wall: the full boot check reached `PASS
+  exec_desktop_shell_frontier`, `PASS exec_userinit_process_spawned`, `PASS
+  exec_userinit_shell_image_attempted`, and `PASS exec_explorer_process_spawned` with `RUN_RC=0`.
+  Review adjustment: the next frontier is no longer userinit shell spawn; it is explorer's missing
+  `RegisterWindowMessage` capture, api0/user-callback redirection, client-installed WndProc, and
+  shell COM class provisioning gates.

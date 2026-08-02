@@ -937,6 +937,9 @@ const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
 const RC_ARG_CAPTURE_SLOTS: u64 = 0x0010;
 const RC_CLASS_MENU_DESC_OFF: u64 = 0x0080;
 const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
+const DEVMODEW_DMSIZE_OFF: usize = 0x44;
+const DEVMODEW_DMDRIVEREXTRA_OFF: usize = 0x46;
+const DEVMODEW_MIN_BYTES: usize = 0x48;
 /// Maximum bytes captured per string. `RTL_MAXIMUM_ATOM_LENGTH` is 255 chars, so 0x200 bytes covers
 /// every legal class/window name; anything longer is passed through untouched.
 const RC_ARG_BUF_CAP: u64 = 0x0200;
@@ -1032,6 +1035,62 @@ unsafe fn capture_client_string_arg(
     }
     core::ptr::write_volatile((desc + 8) as *mut u64, captured_buffer);
     desc
+}
+
+unsafe fn capture_client_devmodew_arg(
+    pi: u64,
+    devmode: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> u64 {
+    if devmode == 0 {
+        return 0;
+    }
+    let mut header = [0u8; DEVMODEW_MIN_BYTES];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        devmode,
+        &mut header,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return devmode;
+    }
+    let dm_size = u16::from_le_bytes(
+        header[DEVMODEW_DMSIZE_OFF..DEVMODEW_DMSIZE_OFF + 2]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let dm_driver_extra = u16::from_le_bytes(
+        header[DEVMODEW_DMDRIVEREXTRA_OFF..DEVMODEW_DMDRIVEREXTRA_OFF + 2]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let Some(size) = dm_size.checked_add(dm_driver_extra) else {
+        return devmode;
+    };
+    if !(DEVMODEW_MIN_BYTES..=RC_ARG_CAPTURE_SLOT as usize).contains(&size) {
+        return devmode;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let staged = rc_arg_slot_base(slot);
+    core::ptr::write_bytes(staged as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    let mut bytes = [0u8; RC_ARG_CAPTURE_SLOT as usize];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        devmode,
+        &mut bytes[..size],
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return devmode;
+    }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), staged as *mut u8, size);
+    staged
 }
 
 /// Legacy `NtUserCreateWindowEx` capture: only rebase counted strings whose buffers live in the
@@ -6462,9 +6521,10 @@ pub(crate) unsafe fn service_sec_image(
                 let a1 = m3; // RDX = arg2
                 let a2 = get_recv_mr(7); // R8 = arg3
                 let a3 = get_recv_mr(8); // R9 = arg4
-                                         // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
-                                         // winsrv created these events via NtCreateEvent into its own image globals. Forward
-                                         // exactly what the caller supplied; no executive-side substitution is permitted.
+                let sp = get_recv_mr(16); // real syscall-entry RSP for win32k stack args
+                                          // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
+                                          // winsrv created these events via NtCreateEvent into its own image globals. Forward
+                                          // exactly what the caller supplied; no executive-side substitution is permitted.
                 if m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE_REAL {
                     print_str(b"[ntuser-init] raw power=0x");
                     print_hex((a1 >> 32) as u32);
@@ -6587,6 +6647,9 @@ pub(crate) unsafe fn service_sec_image(
                 // pointer, so this is fail-safe.
                 let mut d_a2 = a2;
                 let mut d_a3 = a3;
+                let mut open_dcw_stack_args = [0u64; 3];
+                let mut open_dcw_stack_arg_count = 0usize;
+                let mut open_dcw_dhpdev_copyout = (0u64, 0u64);
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -6645,6 +6708,53 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     );
+                    d_a1 = capture_client_devmodew_arg(
+                        pi as u64,
+                        d_a1,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if sp != 0 {
+                        let b_display = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let hspool = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let dhpdev_out = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x38,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if let (Some(b_display), Some(hspool), Some(dhpdev_out)) =
+                            (b_display, hspool, dhpdev_out)
+                        {
+                            if dhpdev_out != 0 {
+                                let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed)
+                                    % RC_ARG_CAPTURE_SLOTS;
+                                let staged_out = rc_arg_slot_base(slot);
+                                core::ptr::write_bytes(
+                                    staged_out as *mut u8,
+                                    0,
+                                    RC_ARG_CAPTURE_SLOT as usize,
+                                );
+                                open_dcw_stack_args = [b_display, hspool, staged_out];
+                                open_dcw_stack_arg_count = open_dcw_stack_args.len();
+                                open_dcw_dhpdev_copyout = (dhpdev_out, staged_out);
+                            }
+                        }
+                    }
                 } else if m0 == 0x1077 {
                     // `NtUserCreateWindowEx` takes LARGE_STRING ClassName/ClsVersion/WindowName.
                     if pi == 6 {
@@ -6877,7 +6987,6 @@ pub(crate) unsafe fn service_sec_image(
                     None
                 };
                 let get_class_info_ansi = if m0 == 0x10bd {
-                    let sp = get_recv_mr(16);
                     client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
@@ -7399,7 +7508,6 @@ pub(crate) unsafe fn service_sec_image(
                     // Forward the real syscall-entry stack pointer to win32k. The component derives
                     // exact arity from win32k's SSPT and reads only the required tail args through
                     // the attached client-memory path.
-                    let sp = get_recv_mr(16);
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
@@ -7426,14 +7534,20 @@ pub(crate) unsafe fn service_sec_image(
                     // cause of the whole TEB-clobber family (batches 53/59/60) and of winlogon's
                     // `#GP` in `RtlEnterCriticalSection` on rpcrt4's `TEB.ReservedForNtRpc`.
                     crate::ke_gdi_flush_user_batch(pi, client_teb);
-                    let r = win32k_glue::win32k_dispatch_wide(
+                    let open_dcw_staged_stack =
+                        m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
+                    let mut r = win32k_glue::win32k_dispatch_wide(
                         m0,
                         d_a0,
                         d_a1,
                         d_a2,
                         d_a3,
-                        sp,
-                        &[],
+                        if open_dcw_staged_stack { 0 } else { sp },
+                        if open_dcw_staged_stack {
+                            &open_dcw_stack_args
+                        } else {
+                            &[]
+                        },
                         win32k_client_context_for_thread(
                             &nt_handler,
                             pi,
@@ -7473,6 +7587,32 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         if let (Some(string), Some(count)) = (string, count) {
                             winlogon_credential_observe_text_out(string, count);
+                        }
+                    }
+                    if open_dcw_staged_stack && r.1 && r.0 != 0 {
+                        let (client_out, staged_out) = open_dcw_dhpdev_copyout;
+                        let dhpdev = core::ptr::read_unaligned(staged_out as *const u64);
+                        if client_out != 0
+                            && !img_spawn::client_write_u64_mapped(
+                                pi as u64,
+                                client_out,
+                                dhpdev,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            )
+                        {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtGdiOpenDCW pUMDHPDEV copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" buffer=0x");
+                                print_hex_u64(client_out);
+                                print_str(b"\n");
+                            }
+                            r = (0xC000_0001, false);
                         }
                     }
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
