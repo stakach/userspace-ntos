@@ -40,6 +40,8 @@ pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod fs_loader;
 pub(crate) use fs_loader::*;
+mod hosted_gate;
+pub(crate) use hosted_gate::*;
 mod rendezvous;
 mod writable_fs;
 pub(crate) use rendezvous::*;
@@ -12811,9 +12813,6 @@ impl ProcExec {
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set when the handler accepted a nonzero seL4 VSpace cap for hosted process pi.
 static PM_VSPACE_PUBLISHED_OK: AtomicU64 = AtomicU64::new(0);
-static HOSTED_GATE_EXPECTED_MASK: AtomicU64 = AtomicU64::new(0);
-static HOSTED_GATE_USERINIT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
-static HOSTED_GATE_EXPLORER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -13258,49 +13257,6 @@ fn print_hex(v: u32) {
 }
 
 static GATE_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn reset_hosted_gate_metadata() {
-    HOSTED_GATE_EXPECTED_MASK.store(0, Ordering::Relaxed);
-    HOSTED_GATE_USERINIT_PI.store(u64::MAX, Ordering::Relaxed);
-    HOSTED_GATE_EXPLORER_PI.store(u64::MAX, Ordering::Relaxed);
-}
-
-pub(crate) fn publish_hosted_gate_image(image: nt_exe_image::HostedProcessImageRef<'_>) {
-    if image.pi < 64 {
-        HOSTED_GATE_EXPECTED_MASK.fetch_or(1u64 << image.pi, Ordering::Relaxed);
-    }
-    if image.leaf.eq_ignore_ascii_case(b"userinit.exe") {
-        HOSTED_GATE_USERINIT_PI.store(image.pi as u64, Ordering::Relaxed);
-    } else if image.leaf.eq_ignore_ascii_case(b"explorer.exe") {
-        HOSTED_GATE_EXPLORER_PI.store(image.pi as u64, Ordering::Relaxed);
-    }
-}
-
-fn hosted_gate_pi(leaf: &[u8]) -> Option<usize> {
-    let pi = if leaf.eq_ignore_ascii_case(b"userinit.exe") {
-        HOSTED_GATE_USERINIT_PI.load(Ordering::Relaxed)
-    } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
-        HOSTED_GATE_EXPLORER_PI.load(Ordering::Relaxed)
-    } else {
-        u64::MAX
-    };
-    (pi != u64::MAX && (pi as usize) < MAX_PI).then_some(pi as usize)
-}
-
-fn hosted_gate_bit(leaf: &[u8]) -> u64 {
-    match hosted_gate_pi(leaf) {
-        Some(pi) if pi < 64 => 1u64 << pi,
-        _ => 0,
-    }
-}
-
-fn hosted_gate_mask() -> u64 {
-    HOSTED_GATE_EXPECTED_MASK.load(Ordering::Relaxed)
-}
-
-fn hosted_gate_count() -> u64 {
-    hosted_gate_mask().count_ones() as u64
-}
 
 fn check(name: &[u8], ok: bool, passed: &mut u64) {
     GATE_TOTAL.fetch_add(1, Ordering::Relaxed);

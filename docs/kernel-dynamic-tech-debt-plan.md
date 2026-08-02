@@ -319,3 +319,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `ExecNtHandler` registration, not from `HOSTED_PROCESS_IMAGES`. Review adjustment: remaining
   static uses are the startup seed policy, bootstrap process metadata registration, and bootstrap
   spawn descriptors.
+- A2 continued. Hosted process-manager gate publication/lookup moved out of the large root module
+  into `hosted_gate.rs`, while preserving the existing crate-level namespace through re-export. This
+  is a mechanical split with no policy change. Review adjustment: remaining static hosted-image
+  uses are still the startup seed policy, bootstrap process metadata registration, and bootstrap
+  spawn descriptors.
