@@ -40,6 +40,8 @@ pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod fs_loader;
 pub(crate) use fs_loader::*;
+mod hosted_bootstrap;
+pub(crate) use hosted_bootstrap::*;
 mod hosted_gate;
 pub(crate) use hosted_gate::*;
 mod rendezvous;
@@ -14141,7 +14143,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let spawn = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0, 0, 0);
+        let smss_image = smss_bootstrap_image();
+        let spawn = spawn_hosted_sec_image_for_image(
+            smss_image.as_ref(),
+            &pe,
+            si_fault_c,
+            0,
+            false,
+            0,
+            0,
+            0,
+        );
         let (v, f, _, _, _, _) = service_sec_image(
             si_fault,
             spawn.pml4,
@@ -17313,8 +17325,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let spawn = spawn_hosted_sec_image_for_pi(
-                        0,
+                    let smss_image = smss_bootstrap_image();
+                    let spawn = spawn_hosted_sec_image_for_image(
+                        smss_image.as_ref(),
                         &pe,
                         si_fault_c,
                         NTDLL_BASE,

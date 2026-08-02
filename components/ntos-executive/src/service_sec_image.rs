@@ -95,36 +95,6 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
     nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
 }
 
-fn seed_hosted_exe_image_catalog(
-    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
-    smss_pe: &nt_pe_loader::PeFile,
-    csrss_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    winlogon_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    services_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    lsass_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    userinit_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    explorer_pe: &Option<nt_pe_loader::PeFile<'static>>,
-) {
-    let loaded = [
-        (b"smss.exe" as &[u8], !smss_pe.bytes().is_empty()),
-        (b"csrss.exe" as &[u8], csrss_pe.is_some()),
-        (b"winlogon.exe" as &[u8], winlogon_pe.is_some()),
-        (b"services.exe" as &[u8], services_pe.is_some()),
-        (b"lsass.exe" as &[u8], lsass_pe.is_some()),
-        (b"userinit.exe" as &[u8], userinit_pe.is_some()),
-        (b"explorer.exe" as &[u8], explorer_pe.is_some()),
-    ];
-    for image in nt_exe_image::HOSTED_PROCESS_IMAGES {
-        if loaded
-            .iter()
-            .any(|(leaf, present)| *present && leaf.eq_ignore_ascii_case(image.leaf))
-            && catalog.get_by_leaf(image.leaf).is_none()
-        {
-            let _ = catalog.register_ref(nt_exe_image::HostedProcessImageRef::from(image));
-        }
-    }
-}
-
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -372,30 +342,7 @@ pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
         .unwrap_or(SMSS_HEAP_MIRROR_VA)
 }
 
-pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
-    pi: usize,
-    pe: &nt_pe_loader::PeFile,
-    fault_ep_c: u64,
-    ntdll_base: u64,
-    setup_env: bool,
-    ldrpinit_rva: u64,
-    client_process_id: u64,
-    client_thread_id: u64,
-) -> img_spawn::SecImageSpawn {
-    let image = nt_exe_image::hosted_image_for_pi(pi).unwrap();
-    spawn_hosted_sec_image_for_image(
-        nt_exe_image::HostedProcessImageRef::from(image),
-        pe,
-        fault_ep_c,
-        ntdll_base,
-        setup_env,
-        ldrpinit_rva,
-        client_process_id,
-        client_thread_id,
-    )
-}
-
-unsafe fn spawn_hosted_sec_image_for_image(
+pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     image: nt_exe_image::HostedProcessImageRef<'_>,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,

@@ -330,3 +330,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   executable catalog now includes the already-loaded smss image so bootstrap gate publication remains
   complete. Review adjustment: remaining executive-side static hosted-image uses are the startup
   seed policy and the bootstrap spawn descriptor helper.
+- A2 continued. Bootstrap hosted-image seed policy moved into `hosted_bootstrap.rs`, and the old
+  `spawn_hosted_sec_image_for_pi` helper was removed. SMSS launch now passes an explicit
+  `HostedProcessImageRef` from `smss_bootstrap_image()` into `spawn_hosted_sec_image_for_image`, so
+  spawn no longer performs a hidden static descriptor lookup by `pi`. Review adjustment: the only
+  remaining executive-side reference to `HOSTED_PROCESS_IMAGES` is the startup catalog seed; replacing
+  that cleanly requires a real boot/session image manifest rather than another fallback table.
