@@ -775,6 +775,7 @@ fn winlogon_thread_teb_alias_for(
 }
 
 fn hosted_gui_thread_teb_alias_for(
+    nt_handler: &ExecNtHandler,
     pi: usize,
     badge: u64,
     current_tid: u64,
@@ -784,9 +785,11 @@ fn hosted_gui_thread_teb_alias_for(
     if pi == 2 {
         return winlogon_thread_teb_alias_for(badge, tp_worker_identity, is_wl_worker);
     }
+    let Some(main_tid) = nt_handler.pm_main_tid_for_pi(pi) else {
+        return None;
+    };
     if current_tid == 0
-        || pi >= PM_TIDS.len()
-        || current_tid != PM_TIDS[pi].load(Ordering::Relaxed)
+        || current_tid != u64::from(main_tid)
         || badge != hosted_top_badge_for_pi(pi)
     {
         return None;
@@ -7924,6 +7927,7 @@ pub(crate) unsafe fn service_sec_image(
                 // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
                 // GUI main thread must be restated after win32k can clear the fields.
                 if let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
+                    &nt_handler,
                     pi,
                     badge,
                     current_tid,

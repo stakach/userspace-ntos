@@ -110,3 +110,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: production process identity no longer depends on mirror reads to claim mechanisms;
   the remaining fallback reads are now compatibility for loop diagnostics and self-test-only
   temporary process slots.
+- A3 continued. The GUI client-info TEB alias path now resolves hosted main TIDs through
+  `ExecNtHandler::pm_main_tid_for_pi`, and the runtime thread diagnostic dump resolves pool TIDs
+  through `pm_pool_tid_for_slot`. Review adjustment: remaining direct `PM_PIDS`/`PM_POOL_TID`
+  writes are self-test temporary slots or the centralized mirror helper layer; remaining raw
+  runtime read helpers should move behind handler-owned runtime lookup APIs before A3 can close.

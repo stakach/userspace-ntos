@@ -3577,7 +3577,11 @@ impl ExecNtHandler {
                         print_str(b" pool-tids:");
                         for index in 0..PM_RUNTIME_THREAD_SLOTS {
                             print_str(b" ");
-                            print_u64(PM_POOL_TID[self.pi][index].load(Ordering::Relaxed));
+                            print_u64(
+                                self.pm_pool_tid_for_slot(self.pi, index)
+                                    .map(u64::from)
+                                    .unwrap_or(0),
+                            );
                         }
                         print_str(b"\n");
                     }
