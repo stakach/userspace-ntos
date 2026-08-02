@@ -625,8 +625,6 @@ impl ExecNtHandler {
                     }
                 }
             }
-            let tcb = PM_MAIN_TCBS[pi].load(Ordering::Relaxed);
-            handler.register_main_thread_tcb(pi, tcb);
         }
         for pi in 0..MAX_PI {
             if let Some(pid) = handler.pm_pid_for_pi(pi) {

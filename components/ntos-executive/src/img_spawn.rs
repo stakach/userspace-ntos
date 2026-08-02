@@ -32,6 +32,12 @@ pub(crate) fn effective_ldrp_rva(explicit: u64) -> u64 {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SecImageSpawn {
+    pub(crate) pml4: u64,
+    pub(crate) main_tcb: u64,
+}
+
 /// Build a PE32+/x86_64 image. `sections` = (name8, va, chars, data); `dirs` = (index, rva,
 /// size). Mirrors nt-pe-loader's own test builder (crates/nt-pe-loader/tests/parse.rs).
 pub(crate) unsafe fn build_pe(
@@ -426,7 +432,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // table (nt-pe-loader) and passes it here. 0 = use the real-ntdll default (0x8e70), keeping the
     // pi>=1 / flag-OFF path byte-identical.
     ldrpinit_rva: u64,
-) -> u64 {
+) -> SecImageSpawn {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
@@ -979,7 +985,10 @@ pub(crate) unsafe fn spawn_sec_image(
     if pi == 0 {
         let _ = tcb_resume(tcb);
     }
-    pml4
+    SecImageSpawn {
+        pml4,
+        main_tcb: tcb,
+    }
 }
 
 /// Read a u64 from a SEC_IMAGE process VA. Fixed mirrors are the fast path; recorded frames cover

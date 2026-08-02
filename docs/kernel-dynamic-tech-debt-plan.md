@@ -174,3 +174,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   of reading `TP_WORKER_TID`. Review adjustment: the remaining `TP_WORKER_TID` writes are centralized
   compatibility publication/cleanup plus the isolated remote-breakin self-test reset; the next cleanup
   target is removing or replacing the TCB mirror arrays.
+- A3/A4 continued. `spawn_sec_image` now returns a structured spawn result carrying both the VSpace
+  cap and the main-thread TCB cap. SMSS and later hosted process main-thread runtime registration
+  consumes that returned TCB directly, and `ExecNtHandler::new` no longer reads `PM_MAIN_TCBS` while
+  constructing NT process/thread identity. Review adjustment: `PM_MAIN_TCBS` remains as a low-level
+  cap publication for gate probes and mechanism cleanup only; the next cleanup target is replacing
+  the remaining TP-worker TCB mirror cells with role-backed runtime registration.

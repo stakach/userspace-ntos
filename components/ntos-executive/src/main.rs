@@ -14210,9 +14210,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0);
-        let (v, f, _, _, _, _) =
-            service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
+        let spawn = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0);
+        let (v, f, _, _, _, _) = service_sec_image(
+            si_fault,
+            spawn.pml4,
+            spawn.main_tcb,
+            &pe,
+            STORAGE_SHARED_VADDR + 0x4000,
+            None,
+        );
         si_verdict = v;
         si_faults = f;
     }
@@ -17376,7 +17382,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_hosted_sec_image_for_pi(
+                    let spawn = spawn_hosted_sec_image_for_pi(
                         0,
                         &pe,
                         si_fault_c,
@@ -17396,7 +17402,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).
                     let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
-                        pml4,
+                        spawn.pml4,
+                        spawn.main_tcb,
                         &pe,
                         SCRATCH_BASE,
                         Some((NTDLL_BASE, smss_ntdll_pe)),

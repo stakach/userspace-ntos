@@ -325,7 +325,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
     ntdll_base: u64,
     setup_env: bool,
     ldrpinit_rva: u64,
-) -> u64 {
+) -> img_spawn::SecImageSpawn {
     let image = nt_exe_image::hosted_image_for_pi(pi).unwrap();
     let runtime = hosted_process_runtime_for_pi(pi).unwrap();
     spawn_sec_image(
@@ -671,7 +671,7 @@ unsafe fn spawn_requested_hosted_exe(
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let child_pml4 = spawn_hosted_sec_image_for_pi(
+    let child_spawn = spawn_hosted_sec_image_for_pi(
         pi,
         spec.pe,
         mint_badged(fault_ep, spec.image.top_badge),
@@ -679,10 +679,10 @@ unsafe fn spawn_requested_hosted_exe(
         true,
         0,
     );
-    nt_handler.register_main_thread_tcb(pi, PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
+    nt_handler.register_main_thread_tcb(pi, child_spawn.main_tcb);
     procs[pi].pid = child_pid as u64;
-    procs[pi].pml4 = child_pml4;
-    nt_handler.publish_hosted_process_vspace(pi, child_pml4)?;
+    procs[pi].pml4 = child_spawn.pml4;
+    nt_handler.publish_hosted_process_vspace(pi, child_spawn.pml4)?;
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
@@ -2069,6 +2069,7 @@ unsafe fn capture_builtin_class_key(
 pub(crate) unsafe fn service_sec_image(
     fault_ep: u64,
     pml4: u64,
+    main_tcb: u64,
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
@@ -2298,6 +2299,7 @@ pub(crate) unsafe fn service_sec_image(
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = ExecNtHandler::new();
+    nt_handler.register_main_thread_tcb(0, main_tcb);
     let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
     if ntdll.is_some() {
         publish_kuser_clocks();
