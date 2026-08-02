@@ -110,6 +110,8 @@ pub(crate) struct Win32kClientContext {
     pub tid: u64,
     pub tcb: u64,
     pub role: Option<HostedThreadRole>,
+    pub process_role: Option<nt_exe_image::HostedProcessRole>,
+    pub top_badge: u64,
     pub teb: u64,
     pub peb_mirror: u64,
     pub scratch_base: u64,
@@ -178,6 +180,62 @@ fn callback_runtime_role_from_code(code: u32) -> Option<HostedThreadRole> {
             Some(HostedThreadRole::WinlogonWorker {
                 slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
             })
+        }
+        _ => None,
+    }
+}
+
+const CALLBACK_PROCESS_ROLE_NONE: u32 = 0;
+const CALLBACK_PROCESS_ROLE_NATIVE_SESSION: u32 = 1;
+const CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM: u32 = 2;
+const CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON: u32 = 3;
+const CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE: u32 = 4;
+const CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP: u32 = 5;
+const CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL: u32 = 6;
+
+fn callback_process_role_code(role: Option<nt_exe_image::HostedProcessRole>) -> u32 {
+    match role {
+        Some(nt_exe_image::HostedProcessRole::NativeSession) => {
+            CALLBACK_PROCESS_ROLE_NATIVE_SESSION
+        }
+        Some(nt_exe_image::HostedProcessRole::Win32Subsystem) => {
+            CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM
+        }
+        Some(nt_exe_image::HostedProcessRole::InteractiveLogon) => {
+            CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON
+        }
+        Some(nt_exe_image::HostedProcessRole::NonInteractiveService) => {
+            CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+        }
+        Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap) => {
+            CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP
+        }
+        Some(nt_exe_image::HostedProcessRole::InteractiveShell) => {
+            CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL
+        }
+        None => CALLBACK_PROCESS_ROLE_NONE,
+    }
+}
+
+fn callback_process_role_from_code(code: u32) -> Option<nt_exe_image::HostedProcessRole> {
+    match code {
+        CALLBACK_PROCESS_ROLE_NATIVE_SESSION => {
+            Some(nt_exe_image::HostedProcessRole::NativeSession)
+        }
+        CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM => {
+            Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
+        }
+        CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON => {
+            Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+        }
+        CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE => {
+            Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
+        }
+        CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP => {
+            Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
+        }
+        CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL => {
+            Some(nt_exe_image::HostedProcessRole::InteractiveShell)
         }
         _ => None,
     }
@@ -348,6 +406,8 @@ unsafe fn begin_controlled_continuation(
     request: nt_user_callback::CallbackHeader,
     client_tcb: u64,
     client_runtime_role: u32,
+    client_process_role: u32,
+    client_top_badge: u64,
 ) -> bool {
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
     let client = nt_user_callback::ClientThreadIdentity::new(
@@ -370,7 +430,13 @@ unsafe fn begin_controlled_continuation(
     if (root && stack.push_dispatch(client, request.dispatch_id).is_err())
         || stack.push_callback(correlation).is_err()
         || active
-            .push_with_client_runtime_role(request, client_tcb, client_runtime_role)
+            .push_with_client_metadata(
+                request,
+                client_tcb,
+                client_runtime_role,
+                client_process_role,
+                client_top_badge,
+            )
             .is_err()
     {
         abort_controlled_user_callbacks();
@@ -436,9 +502,8 @@ unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -
 }
 
 fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
-    let winlogon_pi = nt_exe_image::hosted_pi_for_leaf(b"winlogon.exe")?;
-    if client.pi as usize != winlogon_pi || !callback_client_is_winlogon(client) || client.tid == 0
-    {
+    let winlogon_pi = callback_client_owner_pi(client)?;
+    if !callback_client_is_winlogon(client) || client.tid == 0 {
         return None;
     }
     let alias = match client.role {
@@ -462,44 +527,51 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
 
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let pi = callback_client_owner_pi(client)?;
-    let image = nt_exe_image::hosted_image_for_pi(pi)?;
-    if client.tid == 0 || client.badge != image.top_badge {
+    if client.tid == 0 || client.top_badge == 0 || client.badge != client.top_badge {
         return None;
     }
-    match (pi, client.badge) {
-        (pi, EXPLORER_BADGE) if image.leaf.eq_ignore_ascii_case(b"explorer.exe") => {
-            let alias = crate::env_scratch_base_for_pi(pi);
-            (alias != 0).then_some(alias)
+    if callback_client_is_explorer(client) {
+        let alias = crate::env_scratch_base_for_pi(pi);
+        (alias != 0).then_some(alias)
+    } else {
+        None
+    }
+}
+
+fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> Option<usize> {
+    let pi = client.pi as usize;
+    if pi >= MAX_PI {
+        return None;
+    }
+    if let Some((pi, _)) = tp_worker_identity_from_badge(client.badge) {
+        return (pi == client.pi as usize).then_some(pi);
+    }
+    if client.top_badge != 0 && client.badge == client.top_badge {
+        return Some(pi);
+    }
+    match client.role {
+        Some(HostedThreadRole::WinlogonListener | HostedThreadRole::WinlogonWorker { .. })
+            if callback_client_is_winlogon(client) =>
+        {
+            Some(pi)
         }
         _ => None,
     }
 }
 
-fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> Option<usize> {
-    if let Some((pi, _)) = tp_worker_identity_from_badge(client.badge) {
-        return Some(pi);
-    }
-    match client.badge {
-        WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
-            nt_exe_image::hosted_pi_for_leaf(b"winlogon.exe")
-        }
-        _ => nt_exe_image::hosted_pi_for_top_badge(client.badge),
-    }
-}
-
-fn callback_client_is_leaf(client: crate::spawn_hosts::UserCallbackClient, leaf: &[u8]) -> bool {
-    let Some(pi) = callback_client_owner_pi(client) else {
-        return false;
-    };
-    nt_exe_image::hosted_image_for_pi(pi).is_some_and(|image| image.leaf.eq_ignore_ascii_case(leaf))
+fn callback_client_has_process_role(
+    client: crate::spawn_hosts::UserCallbackClient,
+    role: nt_exe_image::HostedProcessRole,
+) -> bool {
+    client.process_role == Some(role)
 }
 
 fn callback_client_is_winlogon(client: crate::spawn_hosts::UserCallbackClient) -> bool {
-    callback_client_is_leaf(client, b"winlogon.exe")
+    callback_client_has_process_role(client, nt_exe_image::HostedProcessRole::InteractiveLogon)
 }
 
 fn callback_client_is_explorer(client: crate::spawn_hosts::UserCallbackClient) -> bool {
-    callback_client_is_leaf(client, b"explorer.exe")
+    callback_client_has_process_role(client, nt_exe_image::HostedProcessRole::InteractiveShell)
 }
 
 fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
@@ -511,7 +583,13 @@ fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> 
 }
 
 fn client_callbacks_supported(client: crate::spawn_hosts::UserCallbackClient) -> bool {
-    callback_client_is_winlogon(client) || callback_client_is_explorer(client)
+    matches!(
+        client.process_role,
+        Some(
+            nt_exe_image::HostedProcessRole::InteractiveLogon
+                | nt_exe_image::HostedProcessRole::InteractiveShell
+        )
+    )
 }
 
 unsafe fn bind_client_callback_window(
@@ -961,6 +1039,8 @@ pub(crate) unsafe fn service_user_callback(
                 request,
                 client.tcb,
                 callback_runtime_role_code(client.role),
+                callback_process_role_code(client.process_role),
+                client.top_badge,
             )
         {
             if !remember_active_dispatch(&request) {
@@ -1288,6 +1368,8 @@ unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
     client_tcb: u64,
     client_runtime_role: Option<HostedThreadRole>,
+    client_process_role: Option<nt_exe_image::HostedProcessRole>,
+    client_top_badge: u64,
 ) -> crate::spawn_hosts::PumpResult {
     let client = crate::spawn_hosts::UserCallbackClient {
         pi: request.client_pi,
@@ -1295,6 +1377,8 @@ unsafe fn resume_suspended_user_callback_component(
         tid: request.client_tid,
         tcb: client_tcb,
         role: client_runtime_role,
+        process_role: client_process_role,
+        top_badge: client_top_badge,
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
     };
@@ -1364,6 +1448,8 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         request,
         active_frame.client_tcb(),
         callback_runtime_role_from_code(active_frame.client_runtime_role()),
+        callback_process_role_from_code(active_frame.client_process_role()),
+        active_frame.client_top_badge(),
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -1535,6 +1621,8 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             request,
             client_tcb,
             callback_runtime_role_from_code(popped.client_runtime_role()),
+            callback_process_role_from_code(popped.client_process_role()),
+            popped.client_top_badge(),
         );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -1752,6 +1840,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
         tid,
         tcb,
         role: Some(role),
+        process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
+        top_badge: WINLOGON_BADGE,
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -1964,6 +2054,8 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         tid,
         tcb,
         role: Some(role),
+        process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
+        top_badge: WINLOGON_BADGE,
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -2309,6 +2401,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         request,
         completed_frame.client_tcb(),
         completed_role,
+        callback_process_role_from_code(completed_frame.client_process_role()),
+        completed_frame.client_top_badge(),
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -2322,6 +2416,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             tid: request.client_tid,
             tcb: completed_frame.client_tcb(),
             role: completed_role,
+            process_role: callback_process_role_from_code(completed_frame.client_process_role()),
+            top_badge: completed_frame.client_top_badge(),
             teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
             scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
@@ -3118,6 +3214,8 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             tid: 0,
             tcb: 0,
             role: None,
+            process_role: None,
+            top_badge: 0,
             teb: crate::SMSS_TEB_VA,
             peb_mirror: 0,
             scratch_base: crate::SM_FILL_SCRATCH_BASE,
@@ -3292,6 +3390,8 @@ pub(crate) unsafe fn win32k_dispatch_wide(
             tid: client.tid,
             tcb: client.tcb,
             role: client.role,
+            process_role: client.process_role,
+            top_badge: client.top_badge,
             peb_mirror: client.peb_mirror,
             scratch_base: client.scratch_base,
         }),

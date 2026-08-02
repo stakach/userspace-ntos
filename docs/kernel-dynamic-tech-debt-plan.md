@@ -302,3 +302,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   instead of the static hosted image badge map. Review adjustment: remaining static uses are now
   bootstrap/open-time registration policy, executable probe admission, win32k callback
   classification, bootstrap spawn descriptors, and post-loop gate expectations.
+- A2 continued. Win32k user-callback client identity now carries process role and top badge from
+  `ExecNtHandler` metadata through `Win32kClientContext`, `UserCallbackClient`, and active callback
+  frames. Callback support checks and TEB-alias selection classify winlogon/explorer from that
+  carried metadata instead of consulting `HOSTED_PROCESS_IMAGES`. Review adjustment: remaining
+  static uses are bootstrap/open-time registration policy, executable probe admission, bootstrap
+  spawn descriptors, and post-loop gate expectations.

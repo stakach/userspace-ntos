@@ -1124,6 +1124,8 @@ pub struct ActiveCallbackFrame {
     request: CallbackHeader,
     client_tcb: u64,
     client_runtime_role: u32,
+    client_process_role: u32,
+    client_top_badge: u64,
     saved_user_context: [u64; 20],
     outer_resume_ip: u64,
     redirected: bool,
@@ -1140,6 +1142,8 @@ impl ActiveCallbackFrame {
             request: CallbackHeader::idle(0, 0, 0, 0),
             client_tcb: 0,
             client_runtime_role: 0,
+            client_process_role: 0,
+            client_top_badge: 0,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -1159,6 +1163,14 @@ impl ActiveCallbackFrame {
 
     pub const fn client_runtime_role(&self) -> u32 {
         self.client_runtime_role
+    }
+
+    pub const fn client_process_role(&self) -> u32 {
+        self.client_process_role
+    }
+
+    pub const fn client_top_badge(&self) -> u64 {
+        self.client_top_badge
     }
 
     pub const fn dispatch_context(&self) -> &DispatchContext {
@@ -1289,6 +1301,17 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         client_tcb: u64,
         client_runtime_role: u32,
     ) -> Result<(), ValidationError> {
+        self.push_with_client_metadata(request, client_tcb, client_runtime_role, 0, 0)
+    }
+
+    pub fn push_with_client_metadata(
+        &mut self,
+        request: CallbackHeader,
+        client_tcb: u64,
+        client_runtime_role: u32,
+        client_process_role: u32,
+        client_top_badge: u64,
+    ) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if client_tcb <= 1 {
             return Err(ValidationError::State);
@@ -1300,6 +1323,8 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             request,
             client_tcb,
             client_runtime_role,
+            client_process_role,
+            client_top_badge,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,

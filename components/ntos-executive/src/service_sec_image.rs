@@ -95,12 +95,40 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
     nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
 }
 
+fn win32k_client_context_for_thread(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    badge: u64,
+    tid: u64,
+    tcb: u64,
+    role: Option<HostedThreadRole>,
+    teb: u64,
+    peb_mirror: u64,
+    scratch_base: u64,
+) -> win32k_glue::Win32kClientContext {
+    win32k_glue::Win32kClientContext {
+        pi: pi as u32,
+        pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+        badge,
+        tid,
+        tcb,
+        role,
+        process_role: nt_handler.hosted_process_role(pi),
+        top_badge: nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
+        teb,
+        peb_mirror,
+        scratch_base,
+    }
+}
+
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
     pi: usize,
     badge: u64,
     current_tid: u64,
     current_tcb: u64,
     current_role: Option<HostedThreadRole>,
+    process_role: Option<nt_exe_image::HostedProcessRole>,
+    top_badge: u64,
     main_tid: u64,
     pid: u64,
     client_teb: u64,
@@ -181,6 +209,8 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
             tid: current_tid,
             tcb: current_tcb,
             role: current_role,
+            process_role,
+            top_badge,
             teb: client_teb,
             peb_mirror,
             scratch_base,
@@ -6323,17 +6353,17 @@ pub(crate) unsafe fn service_sec_image(
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     let route =
-                        winlogon_credential_injection_route(win32k_glue::Win32kClientContext {
-                            pi: pi as u32,
-                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                        winlogon_credential_injection_route(win32k_client_context_for_thread(
+                            &nt_handler,
+                            pi,
                             badge,
-                            tid: nt_handler.current_tid,
-                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            teb: client_teb,
+                            nt_handler.current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            client_teb,
                             peb_mirror,
                             scratch_base,
-                        });
+                        ));
                     if !route {
                         print_str(b"[dialog-pump] real IDD_LOGON queue drained; parking its blocking GetMessage\n");
                         handled = false;
@@ -6403,17 +6433,17 @@ pub(crate) unsafe fn service_sec_image(
                         get_recv_mr(8),
                         sp,
                         &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
-                        win32k_glue::Win32kClientContext {
-                            pi: pi as u32,
-                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                        win32k_client_context_for_thread(
+                            &nt_handler,
+                            pi,
                             badge,
-                            tid: nt_handler.current_tid,
-                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            teb: client_teb,
+                            nt_handler.current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            client_teb,
                             peb_mirror,
                             scratch_base,
-                        },
+                        ),
                     );
                     GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
                     if peek.0 == 0 {
@@ -6427,6 +6457,8 @@ pub(crate) unsafe fn service_sec_image(
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),
                             nt_handler.hosted_thread_role(current_tid),
+                            nt_handler.hosted_process_role(pi),
+                            nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7539,17 +7571,17 @@ pub(crate) unsafe fn service_sec_image(
                         d_a3,
                         sp,
                         &[],
-                        win32k_glue::Win32kClientContext {
-                            pi: pi as u32,
-                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                        win32k_client_context_for_thread(
+                            &nt_handler,
+                            pi,
                             badge,
-                            tid: nt_handler.current_tid,
-                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            teb: client_teb,
+                            nt_handler.current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            client_teb,
                             peb_mirror,
                             scratch_base,
-                        },
+                        ),
                     );
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
@@ -7639,6 +7671,8 @@ pub(crate) unsafe fn service_sec_image(
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),
                             nt_handler.hosted_thread_role(current_tid),
+                            nt_handler.hosted_process_role(pi),
+                            nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7669,17 +7703,17 @@ pub(crate) unsafe fn service_sec_image(
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
-                        win32k_glue::Win32kClientContext {
-                            pi: pi as u32,
-                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                        win32k_client_context_for_thread(
+                            &nt_handler,
+                            pi,
                             badge,
-                            tid: nt_handler.current_tid,
-                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            teb: client_teb,
+                            nt_handler.current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            client_teb,
                             peb_mirror,
                             scratch_base,
-                        },
+                        ),
                         resume_ip,
                         sp,
                         flags,

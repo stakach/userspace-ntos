@@ -647,6 +647,8 @@ pub(crate) struct UserCallbackClient {
     pub tid: u64,
     pub tcb: u64,
     pub role: Option<HostedThreadRole>,
+    pub process_role: Option<nt_exe_image::HostedProcessRole>,
+    pub top_badge: u64,
     /// Executive alias of this process's PEB page, or zero when the dispatch has no user client.
     pub peb_mirror: u64,
     /// Executive scratch mapping used to access this process's demand-paged user buffers.
