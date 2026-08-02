@@ -28,7 +28,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[x]` A0: Inventory the current hardcoded dynamic-debt boundaries.
 - `[x]` A1: Remove fixed `pi` dispatch from hosted child executable metadata lookup.
-- `[ ]` A2: Replace the static hosted image table with a dynamic image/session registration
+- `[~]` A2: Replace the static hosted image table with a dynamic image/session registration
   contract driven by created sections and process parameters.
 - `[x]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
@@ -252,3 +252,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   winlogon listener post-loop proof is a boolean mint latch, so hosted TCB cap values live only in
   `HostedThreadRuntimeTable`. Review adjustment: remaining `_TCB` state belongs to non-hosted seL4
   mechanisms such as win32k/root-task plumbing, not hosted process/thread identity.
+- A2 started. `nt-exe-image` now has a no-heap `HostedImageCatalog` registration/lookup contract
+  separate from the historical `HOSTED_PROCESS_IMAGES` slice. Registration validates executable leaf
+  shape, NT image path consistency, and duplicate `pi`/top-badge/leaf identities; lookups cover
+  `pi`, leaf/path, top badge, role, noninteractive-service classification, probe fragments, count,
+  and expected-mask derivation. New crate tests cover registration, duplicate rejection, invalid
+  paths, bounded capacity, and SxS probe rejection. Review adjustment: the executive still calls the
+  static wrappers; the next A2 slice should instantiate a runtime catalog in the service loop and
+  route gate/lookup call sites through that catalog before deleting static-wrapper use.

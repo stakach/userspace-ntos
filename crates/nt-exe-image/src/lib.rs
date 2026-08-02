@@ -171,6 +171,184 @@ pub const HOSTED_PROCESS_IMAGES: &[HostedProcessImage] = &[
     },
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostedProcessImageRef<'a> {
+    pub pi: usize,
+    pub top_badge: u64,
+    pub leaf: &'a [u8],
+    pub process_name: &'a str,
+    pub role: HostedProcessRole,
+    pub nt_image_path: &'a [u8],
+    pub command_line: &'a [u8],
+    pub image_root: HostedImageRoot,
+    pub probe_fragment: &'a [u8],
+}
+
+impl<'a> From<&'a HostedProcessImage> for HostedProcessImageRef<'a> {
+    fn from(image: &'a HostedProcessImage) -> Self {
+        Self {
+            pi: image.pi,
+            top_badge: image.top_badge,
+            leaf: image.leaf,
+            process_name: image.process_name,
+            role: image.role,
+            nt_image_path: image.nt_image_path,
+            command_line: image.command_line,
+            image_root: image.image_root,
+            probe_fragment: image.probe_fragment,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedImageRegistrationError {
+    InvalidPath,
+    DuplicatePi,
+    DuplicateTopBadge,
+    DuplicateLeaf,
+    Full,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedImageCatalog<'a, const N: usize> {
+    entries: [Option<HostedProcessImageRef<'a>>; N],
+}
+
+impl<'a, const N: usize> Default for HostedImageCatalog<'a, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, const N: usize> HostedImageCatalog<'a, N> {
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    pub fn register(
+        &mut self,
+        image: HostedProcessImageRef<'a>,
+    ) -> Result<usize, HostedImageRegistrationError> {
+        let Some(leaf) = canonical_exe_leaf(image.leaf) else {
+            return Err(HostedImageRegistrationError::InvalidPath);
+        };
+        let Some(path_leaf) = canonical_exe_leaf(image.nt_image_path) else {
+            return Err(HostedImageRegistrationError::InvalidPath);
+        };
+        if image.top_badge >= 64
+            || image.leaf.is_empty()
+            || image.leaf.len() > MAX_EXE_LEAF
+            || image.nt_image_path.is_empty()
+            || image.command_line.is_empty()
+            || !eq_ascii_case(leaf, image.leaf)
+            || !eq_ascii_case(path_leaf, image.leaf)
+        {
+            return Err(HostedImageRegistrationError::InvalidPath);
+        }
+        if self.get_by_pi(image.pi).is_some() {
+            return Err(HostedImageRegistrationError::DuplicatePi);
+        }
+        if self.get_by_top_badge(image.top_badge).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateTopBadge);
+        }
+        if self.get_by_leaf(image.leaf).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateLeaf);
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .ok_or(HostedImageRegistrationError::Full)?;
+        self.entries[index] = Some(image);
+        Ok(index)
+    }
+
+    pub fn count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    pub fn mask(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.map(|image| image.pi))
+            .filter(|&pi| pi < 64)
+            .fold(0, |mask, pi| mask | (1u64 << pi))
+    }
+
+    pub fn get_by_pi(&self, pi: usize) -> Option<HostedProcessImageRef<'a>> {
+        self.entries
+            .iter()
+            .copied()
+            .flatten()
+            .find(|image| image.pi == pi)
+    }
+
+    pub fn get_by_leaf(&self, leaf: &[u8]) -> Option<HostedProcessImageRef<'a>> {
+        self.entries
+            .iter()
+            .copied()
+            .flatten()
+            .find(|image| eq_ascii_case(image.leaf, leaf))
+    }
+
+    pub fn get_by_path(&self, path: &[u8]) -> Option<HostedProcessImageRef<'a>> {
+        self.get_by_leaf(canonical_exe_leaf(path)?)
+    }
+
+    pub fn get_by_top_badge(&self, top_badge: u64) -> Option<HostedProcessImageRef<'a>> {
+        self.entries
+            .iter()
+            .copied()
+            .flatten()
+            .find(|image| image.top_badge == top_badge)
+    }
+
+    pub fn process_name_for_pi(&self, pi: usize) -> Option<&'a str> {
+        self.get_by_pi(pi).map(|image| image.process_name)
+    }
+
+    pub fn top_badge_for_pi(&self, pi: usize) -> Option<u64> {
+        self.get_by_pi(pi).map(|image| image.top_badge)
+    }
+
+    pub fn pi_for_leaf(&self, leaf: &[u8]) -> Option<usize> {
+        self.get_by_leaf(leaf).map(|image| image.pi)
+    }
+
+    pub fn pi_for_top_badge(&self, top_badge: u64) -> Option<usize> {
+        self.get_by_top_badge(top_badge).map(|image| image.pi)
+    }
+
+    pub fn role_for_path(&self, path: &[u8]) -> Option<HostedProcessRole> {
+        self.get_by_path(path).map(|image| image.role)
+    }
+
+    pub fn path_is_noninteractive_service(&self, path: &[u8]) -> bool {
+        self.role_for_path(path) == Some(HostedProcessRole::NonInteractiveService)
+    }
+
+    pub fn probe_image(
+        &self,
+        folded_path: &[u8],
+        is_sxs: bool,
+    ) -> Option<HostedProcessImageRef<'a>> {
+        if is_sxs {
+            return None;
+        }
+        self.entries
+            .iter()
+            .copied()
+            .flatten()
+            .filter(|image| !image.probe_fragment.is_empty())
+            .find(|image| contains_ascii_case(folded_path, image.probe_fragment))
+    }
+
+    pub fn probe_leaf(&self, folded_path: &[u8], is_sxs: bool) -> Option<&'a [u8]> {
+        self.probe_image(folded_path, is_sxs)
+            .map(|image| image.leaf)
+    }
+}
+
 pub fn hosted_image_for_pi(pi: usize) -> Option<&'static HostedProcessImage> {
     HOSTED_PROCESS_IMAGES.iter().find(|image| image.pi == pi)
 }
@@ -589,6 +767,204 @@ mod tests {
         subsystem_major: 5,
         subsystem_minor: 1,
     };
+
+    fn catalog_image(
+        pi: usize,
+        top_badge: u64,
+        leaf: &'static [u8],
+        nt_image_path: &'static [u8],
+        role: HostedProcessRole,
+        image_root: HostedImageRoot,
+        probe_fragment: &'static [u8],
+    ) -> HostedProcessImageRef<'static> {
+        HostedProcessImageRef {
+            pi,
+            top_badge,
+            leaf,
+            process_name: "registered.exe",
+            role,
+            nt_image_path,
+            command_line: leaf,
+            image_root,
+            probe_fragment,
+        }
+    }
+
+    #[test]
+    fn dynamic_catalog_registers_and_resolves_images() {
+        let mut catalog = HostedImageCatalog::<4>::new();
+        let userinit = catalog_image(
+            5,
+            USERINIT_TOP_BADGE,
+            b"userinit.exe",
+            b"\\SystemRoot\\System32\\userinit.exe",
+            HostedProcessRole::InteractiveShellBootstrap,
+            HostedImageRoot::System32,
+            b"userinit",
+        );
+        let explorer = catalog_image(
+            6,
+            EXPLORER_TOP_BADGE,
+            b"explorer.exe",
+            b"\\SystemRoot\\explorer.exe",
+            HostedProcessRole::InteractiveShell,
+            HostedImageRoot::SystemRoot,
+            b"explorer",
+        );
+
+        assert_eq!(catalog.register(userinit), Ok(0));
+        assert_eq!(catalog.register(explorer), Ok(1));
+        assert_eq!(catalog.count(), 2);
+        assert_eq!(catalog.mask(), (1u64 << 5) | (1u64 << 6));
+        assert_eq!(catalog.get_by_pi(5), Some(userinit));
+        assert_eq!(catalog.get_by_leaf(b"USERINIT.EXE"), Some(userinit));
+        assert_eq!(
+            catalog.get_by_path(b"\\??\\C:\\ReactOS\\explorer.exe"),
+            Some(explorer)
+        );
+        assert_eq!(catalog.top_badge_for_pi(6), Some(EXPLORER_TOP_BADGE));
+        assert_eq!(catalog.pi_for_top_badge(USERINIT_TOP_BADGE), Some(5));
+        assert_eq!(
+            catalog.role_for_path(b"\\SystemRoot\\explorer.exe"),
+            Some(HostedProcessRole::InteractiveShell)
+        );
+        assert_eq!(
+            catalog.probe_leaf(b"\\SystemRoot\\System32\\USERINIT.EXE", false),
+            Some(b"userinit.exe" as &[u8])
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_rejects_duplicate_identity() {
+        let mut catalog = HostedImageCatalog::<4>::new();
+        let userinit = catalog_image(
+            5,
+            USERINIT_TOP_BADGE,
+            b"userinit.exe",
+            b"\\SystemRoot\\System32\\userinit.exe",
+            HostedProcessRole::InteractiveShellBootstrap,
+            HostedImageRoot::System32,
+            b"userinit",
+        );
+        catalog.register(userinit).unwrap();
+
+        assert_eq!(
+            catalog.register(catalog_image(
+                5,
+                EXPLORER_TOP_BADGE,
+                b"explorer.exe",
+                b"\\SystemRoot\\explorer.exe",
+                HostedProcessRole::InteractiveShell,
+                HostedImageRoot::SystemRoot,
+                b"explorer",
+            )),
+            Err(HostedImageRegistrationError::DuplicatePi)
+        );
+        assert_eq!(
+            catalog.register(catalog_image(
+                6,
+                USERINIT_TOP_BADGE,
+                b"explorer.exe",
+                b"\\SystemRoot\\explorer.exe",
+                HostedProcessRole::InteractiveShell,
+                HostedImageRoot::SystemRoot,
+                b"explorer",
+            )),
+            Err(HostedImageRegistrationError::DuplicateTopBadge)
+        );
+        assert_eq!(
+            catalog.register(catalog_image(
+                6,
+                EXPLORER_TOP_BADGE,
+                b"USERINIT.EXE",
+                b"\\SystemRoot\\System32\\userinit.exe",
+                HostedProcessRole::InteractiveShellBootstrap,
+                HostedImageRoot::System32,
+                b"userinit",
+            )),
+            Err(HostedImageRegistrationError::DuplicateLeaf)
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_rejects_invalid_registration_paths() {
+        let mut catalog = HostedImageCatalog::<2>::new();
+        assert_eq!(
+            catalog.register(catalog_image(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe.local",
+                b"\\SystemRoot\\System32\\userinit.exe.local",
+                HostedProcessRole::InteractiveShellBootstrap,
+                HostedImageRoot::System32,
+                b"userinit",
+            )),
+            Err(HostedImageRegistrationError::InvalidPath)
+        );
+        assert_eq!(
+            catalog.register(catalog_image(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe",
+                b"\\SystemRoot\\System32\\explorer.exe",
+                HostedProcessRole::InteractiveShellBootstrap,
+                HostedImageRoot::System32,
+                b"userinit",
+            )),
+            Err(HostedImageRegistrationError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_capacity_is_explicit() {
+        let mut catalog = HostedImageCatalog::<1>::new();
+        catalog
+            .register(catalog_image(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe",
+                b"\\SystemRoot\\System32\\userinit.exe",
+                HostedProcessRole::InteractiveShellBootstrap,
+                HostedImageRoot::System32,
+                b"userinit",
+            ))
+            .unwrap();
+        assert_eq!(
+            catalog.register(catalog_image(
+                6,
+                EXPLORER_TOP_BADGE,
+                b"explorer.exe",
+                b"\\SystemRoot\\explorer.exe",
+                HostedProcessRole::InteractiveShell,
+                HostedImageRoot::SystemRoot,
+                b"explorer",
+            )),
+            Err(HostedImageRegistrationError::Full)
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_probe_keeps_sxs_out() {
+        let mut catalog = HostedImageCatalog::<1>::new();
+        let explorer = catalog_image(
+            6,
+            EXPLORER_TOP_BADGE,
+            b"explorer.exe",
+            b"\\SystemRoot\\explorer.exe",
+            HostedProcessRole::InteractiveShell,
+            HostedImageRoot::SystemRoot,
+            b"explorer",
+        );
+        catalog.register(explorer).unwrap();
+        assert_eq!(
+            catalog.probe_leaf(b"\\SystemRoot\\explorer.exe", false),
+            Some(b"explorer.exe" as &[u8])
+        );
+        assert_eq!(
+            catalog.probe_leaf(b"\\SystemRoot\\explorer.exe", true),
+            None
+        );
+    }
 
     #[test]
     fn exact_leaf_resolution_accepts_nt_dos_and_systemroot_paths() {
