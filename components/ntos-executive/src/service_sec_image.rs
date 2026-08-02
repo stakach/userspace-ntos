@@ -11567,6 +11567,7 @@ pub(crate) unsafe fn service_sec_image(
                 && debugger_pid != 0;
 
             let mut spawned_breakin_tid = 0u64;
+            let mut breakin_runtime_tid = 0u64;
             if setup_ok {
                 // ── 0x0001 — a real DEBUG_OBJECT + attach BY SSN, fake create messages drained ──
                 let created = sysc!(
@@ -11692,6 +11693,7 @@ pub(crate) unsafe fn service_sec_image(
                     let thread_handle = smss_stack_read(A_THREAD_HANDLE);
                     let cid_proc = smss_stack_read(A_CID_OUT);
                     let breakin_tid = smss_stack_read(A_CID_OUT + 8);
+                    breakin_runtime_tid = breakin_tid;
                     let request = nt_handler.remote_thread_request.take();
                     print_str(b"[dbgk-brk] denied=0x");
                     print_hex(denied);
@@ -11737,7 +11739,9 @@ pub(crate) unsafe fn service_sec_image(
                     // stack/TEB/IPC buffer are mapped in the TARGET's pml4, and the marker it writes
                     // lands in a page that exists ONLY there.
                     let mut tcb = 0u64;
+                    let mut breakin_runtime_slot = 0usize;
                     if let Some(request) = request {
+                        breakin_runtime_slot = request.slot;
                         tcb = rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
                             target_pi: request.target_pi,
                             slot: request.slot,
@@ -11754,7 +11758,6 @@ pub(crate) unsafe fn service_sec_image(
                             resume: request.resume,
                         });
                         if tcb != 0 {
-                            TP_WORKER_TCB[BRK_TEST_PI][0].store(tcb, Ordering::Relaxed);
                             nt_handler.register_hosted_thread_tcb(
                                 BRK_TEST_PI,
                                 request.cid_thread,
@@ -11862,7 +11865,14 @@ pub(crate) unsafe fn service_sec_image(
                     // `target_pml4` out of the recycle path for now because its skeleton mappings are
                     // not tracked in this local slot list; all other slots here are local aliases,
                     // replies, endpoints, or throwaway frames.
-                    let brk_tcb = TP_WORKER_TCB[BRK_TEST_PI][0].load(Ordering::Relaxed);
+                    let brk_tcb = nt_handler
+                        .hosted_thread_tcb_for_role(
+                            BRK_TEST_PI,
+                            HostedThreadRole::TpWorker {
+                                slot: breakin_runtime_slot,
+                            },
+                        )
+                        .unwrap_or(0);
                     if brk_tcb > 1 {
                         let _ = tcb_suspend_r(brk_tcb);
                     }
@@ -11890,12 +11900,13 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             if spawned_breakin_tid != 0 {
-                let _ = nt_handler.release_hosted_thread_runtime(spawned_breakin_tid);
+                breakin_runtime_tid = spawned_breakin_tid;
+            }
+            if breakin_runtime_tid != 0 {
+                let _ = nt_handler.release_hosted_thread_runtime(breakin_runtime_tid);
             }
             nt_handler.clear_temporary_pool_thread_slot(BRK_TEST_PI, 0);
             nt_handler.clear_temporary_process_slot(BRK_TEST_PI);
-            TP_WORKER_TID[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
-            TP_WORKER_TCB[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
             PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << BRK_TEST_PI), Ordering::Relaxed);
             nt_handler.remote_thread_request = None;
 
@@ -12524,10 +12535,8 @@ unsafe fn spawn_requested_tp_worker(
     caller_sp: u64,
     fault_ep: u64,
 ) {
-    if TP_WORKER_TCB[pi][worker_slot]
-        .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    let role = HostedThreadRole::TpWorker { slot: worker_slot };
+    if nt_handler.hosted_thread_tcb_for_role(pi, role).is_some() {
         return;
     }
 
@@ -12536,10 +12545,7 @@ unsafe fn spawn_requested_tp_worker(
         |address| unsafe { smss_stack_read(address) },
         context_va,
     );
-    let Some(tid) =
-        nt_handler.hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot: worker_slot })
-    else {
-        TP_WORKER_TCB[pi][worker_slot].store(0, Ordering::Relaxed);
+    let Some(tid) = nt_handler.hosted_thread_tid_for_role(pi, role) else {
         return;
     };
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
@@ -12558,14 +12564,7 @@ unsafe fn spawn_requested_tp_worker(
         fault_ep,
         !suspended,
     );
-    TP_WORKER_TCB[pi][worker_slot].store(tcb, Ordering::Relaxed);
-    nt_handler.register_hosted_thread_tcb(
-        pi,
-        tid,
-        tcb,
-        tp_worker_badge(pi, worker_slot),
-        HostedThreadRole::TpWorker { slot: worker_slot },
-    );
+    nt_handler.register_hosted_thread_tcb(pi, tid, tcb, tp_worker_badge(pi, worker_slot), role);
     nt_handler
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
@@ -12618,7 +12617,6 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
         native: true,
         resume: request.resume,
     });
-    TP_WORKER_TCB[request.target_pi][request.slot].store(tcb, Ordering::Relaxed);
     if tcb != 0 {
         nt_handler.register_hosted_thread_tcb(
             request.target_pi,

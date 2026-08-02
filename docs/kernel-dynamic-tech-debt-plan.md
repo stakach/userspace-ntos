@@ -180,3 +180,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   constructing NT process/thread identity. Review adjustment: `PM_MAIN_TCBS` remains as a low-level
   cap publication for gate probes and mechanism cleanup only; the next cleanup target is replacing
   the remaining TP-worker TCB mirror cells with role-backed runtime registration.
+- A3/A4 continued. Removed the `TP_WORKER_TID` and `TP_WORKER_TCB` mirror arrays. Normal TP-worker
+  spawn, cross-VSpace remote thread spawn, the CSR rendezvous worker create path, and the remote
+  break-in self-test now reserve, locate, register, suspend, and release worker mechanisms through
+  hosted thread runtime records keyed by `HostedThreadRole::TpWorker`. Review adjustment: remaining
+  TCB mirror cleanup is limited to named/bootstrap role cap cells that still back low-level gates and
+  teardown; worker identity no longer has a static array fallback or compatibility publication.

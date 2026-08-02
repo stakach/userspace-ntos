@@ -133,10 +133,7 @@ unsafe fn csr_api_worker_create_thread(
         if main_fault_ep == 0 {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        let Some(worker_slot) = (0..TP_WORKER_SLOT_COUNT).find(|slot| {
-            TP_WORKER_TID[target_pi][*slot].load(Ordering::Relaxed) == 0
-                && TP_WORKER_TCB[target_pi][*slot].load(Ordering::Relaxed) == 0
-        }) else {
+        let Some(worker_slot) = nt_handler.first_free_hosted_tp_worker_slot(target_pi) else {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
         let Some((pool_slot, tid)) =
@@ -167,6 +164,15 @@ unsafe fn csr_api_worker_create_thread(
             nt_handler.release_pool_usage_slot(target_pi, pool_slot);
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
+        if !nt_handler.reserve_hosted_tp_worker_slot(target_pi, worker_slot, tid) {
+            let _ = nt_handler.close_process_handle(caller_pid, handle);
+            let _ = nt_handler
+                .pm
+                .set_thread_state(tid_id, nt_process::ThreadState::Initialized);
+            nt_handler.set_pool_thread_suspended(target_pi, pool_slot, false);
+            nt_handler.release_pool_usage_slot(target_pi, pool_slot);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         let badged_fault_ep = mint_badged(main_fault_ep, tp_worker_badge(target_pi, worker_slot));
         let tcb = spawn_slot_thread(&RemoteThreadSpawn {
             target_pi,
@@ -181,6 +187,7 @@ unsafe fn csr_api_worker_create_thread(
             resume: !create_suspended,
         });
         if tcb == 0 {
+            let _ = nt_handler.release_hosted_thread_runtime(tid);
             let _ = nt_handler.close_process_handle(caller_pid, handle);
             let _ = nt_handler
                 .pm
@@ -190,8 +197,6 @@ unsafe fn csr_api_worker_create_thread(
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
 
-        TP_WORKER_TID[target_pi][worker_slot].store(tid, Ordering::Relaxed);
-        TP_WORKER_TCB[target_pi][worker_slot].store(tcb, Ordering::Relaxed);
         nt_handler
             .pm
             .set_thread_teb(tid_id, tp_worker_teb_va(worker_slot));

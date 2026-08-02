@@ -2019,16 +2019,6 @@ fn wl_listener_stack_contains(va: u64, len: usize) -> bool {
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER2_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
-/// Two bounded generic ntdll thread-pool workers per boot process (pi 0..4). These identities remain
-/// separate from the listener-specific state so badge routing cannot accidentally inherit a server
-/// listener's park/drop policy.
-/// Sized `MAX_PI` (not `TP_WORKER_PI_COUNT`): the SAME bounded windows are what a cross-VSpace
-/// `NtCreateThread` claims for an extra thread of ANY hosted process index, including the high
-/// temporary slots the post-loop self-tests use. Slots 5.. are zero on every live boot.
-static TP_WORKER_TID: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
-    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; MAX_PI];
-static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
-    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; MAX_PI];
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Threads created in a FOREIGN process's address space through the real cross-VSpace
 /// `NtCreateThread` path (`create_remote_thread`). 0 on every boot today — nothing hosted issues
@@ -9016,9 +9006,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
 fn hosted_thread_tcb_mirror(runtime: HostedThreadRuntime) -> Option<&'static AtomicU64> {
     match runtime.role {
         HostedThreadRole::Main => PM_MAIN_TCBS.get(runtime.pi),
-        HostedThreadRole::TpWorker { slot } => TP_WORKER_TCB
-            .get(runtime.pi)
-            .and_then(|slots| slots.get(slot)),
+        HostedThreadRole::TpWorker { .. } => None,
         HostedThreadRole::SmLoop => Some(&SM_LOOP_TCB),
         HostedThreadRole::CsrApi => Some(&CSR_LOOP_TCB),
         HostedThreadRole::CsrSbApi => Some(&CSR_SB_LOOP_TCB),

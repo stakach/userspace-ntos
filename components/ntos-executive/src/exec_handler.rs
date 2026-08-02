@@ -1995,7 +1995,6 @@ impl ExecNtHandler {
         {
             return false;
         }
-        TP_WORKER_TID[pi][slot].store(tid, Ordering::Relaxed);
         true
     }
 
@@ -2003,16 +2002,7 @@ impl ExecNtHandler {
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
-        let runtime = self.thread_runtime.release_tid(tid)?;
-        if let HostedThreadRole::TpWorker { slot } = runtime.role {
-            if runtime.pi < MAX_PI
-                && slot < TP_WORKER_SLOT_COUNT
-                && TP_WORKER_TID[runtime.pi][slot].load(Ordering::Relaxed) == runtime.tid
-            {
-                TP_WORKER_TID[runtime.pi][slot].store(0, Ordering::Relaxed);
-            }
-        }
-        Some(runtime)
+        self.thread_runtime.release_tid(tid)
     }
 
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
