@@ -186,3 +186,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   hosted thread runtime records keyed by `HostedThreadRole::TpWorker`. Review adjustment: remaining
   TCB mirror cleanup is limited to named/bootstrap role cap cells that still back low-level gates and
   teardown; worker identity no longer has a static array fallback or compatibility publication.
+- A3 continued. Removed the dead `PM_PIDS`, `PM_TIDS`, and `PM_POOL_TID` mirrors. Hosted PID/TID
+  identity now lives only in ProcessManager plus the process/thread mechanism tables, and child
+  `SEC_IMAGE` spawns receive their `TEB.ClientId` values directly from those objects instead of
+  reading global identity cells. Review adjustment: the pre-handler SMSS spawn still passes explicit
+  zero client IDs because the handler-owned bootstrap objects are constructed inside the service loop;
+  closing that ordering gap belongs with the remaining mechanism-state mirror cleanup.

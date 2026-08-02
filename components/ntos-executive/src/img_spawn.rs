@@ -424,6 +424,8 @@ pub(crate) unsafe fn spawn_sec_image(
     stack_mirror: u64,
     heap_mirror: u64,
     image_mirror: u64,
+    client_process_id: u64,
+    client_thread_id: u64,
     image_path: &[u8],
     cmd_line: &[u8],
     // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
@@ -532,18 +534,10 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA); // NtTib.Self
         core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA); // ProcessEnvironmentBlock
-        let process_id = PM_PIDS
-            .get(pi as usize)
-            .map(|pid| pid.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        let thread_id = PM_TIDS
-            .get(pi as usize)
-            .map(|tid| tid.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        core::ptr::write_volatile((scr + 0x40) as *mut u64, process_id); // ClientId.UniqueProcess
-        core::ptr::write_volatile((scr + 0x48) as *mut u64, thread_id); // ClientId.UniqueThread
-                                                                        // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
-                                                                        // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
+        core::ptr::write_volatile((scr + 0x40) as *mut u64, client_process_id); // ClientId.UniqueProcess
+        core::ptr::write_volatile((scr + 0x48) as *mut u64, client_thread_id); // ClientId.UniqueThread
+                                                                               // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
+                                                                               // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
         core::ptr::write_volatile((scr + 0x08) as *mut u64, STACK_BASE + STACK_FRAMES * 0x1000);
         core::ptr::write_volatile((scr + 0x10) as *mut u64, STACK_BASE);
         // TEB->ActivationContextStackPointer (x64 TEB+0x2C8): the loader's actctx code

@@ -12432,13 +12432,10 @@ static CSR_AUTHENTIC_ACCEPT_MASK: AtomicU64 = AtomicU64::new(0);
 /// cannot silently return.
 static CSR_RENDEZVOUS_FAILURES: AtomicU64 = AtomicU64::new(0);
 // === nt-process convergence (policy/mechanism split) ===================================
-// The live executive is converging its ad-hoc process IDENTITY tracking (the per-pi `pml4s`/
-// `scratch_bases`/… loop arrays + the `badge→pi` switch) onto the real host-tested nt-process
-// ProcessManager (EPROCESS/ETHREAD/handle-tables/lifecycle). Hosted processes register their
-// pid/tid/badge identity in `ProcessMechanismTable`; the legacy atomics below are synchronized
-// mirrors for low-level mechanism code that has not moved behind handler-owned lookup yet.
-/// Compatibility mirror of EPROCESS pids for hosted process indices (0 = not yet created).
-static PM_PIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+// The live executive is converging its remaining per-pi mechanism state onto handler-owned lookup
+// APIs. Hosted PID/TID identity is now authoritative in ProcessManager plus the process/thread
+// mechanism tables; the atomics below are status counters or low-level seL4 mechanism mirrors that
+// have not yet moved behind owned records.
 /// How many hosted EPROCESS objects the live ProcessManager holds once the boot frontier is reached.
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
@@ -12468,10 +12465,6 @@ static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
 /// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
-/// Main-thread tids for hosted process slots (0 = not yet created). smss/csrss/winlogon are
-/// pre-created at boot; later slots are created by live `NtCreateProcess[Ex]`, then their image entry
-/// is bound at the real seL4 spawn (alloc-free).
-static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
@@ -12499,8 +12492,6 @@ pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// dropped the connection. Batch 60's "claim a generic worker slot" reached that refusal too; the
 /// slot it claimed existed, the ETHREAD behind it did not.
 const PM_RUNTIME_THREAD_SLOTS: usize = 8;
-static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
-    [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
 static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Runtime `NtCreateThread`s refused because the pre-created ETHREAD pool had no free slot. Counted
 /// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
@@ -14198,7 +14189,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let spawn = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0);
+        let spawn = spawn_hosted_sec_image_for_pi(0, &pe, si_fault_c, 0, false, 0, 0, 0);
         let (v, f, _, _, _, _) = service_sec_image(
             si_fault,
             spawn.pml4,
@@ -17377,6 +17368,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         NTDLL_BASE,
                         true,
                         smss_ldrp_rva,
+                        0,
+                        0,
                     );
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),

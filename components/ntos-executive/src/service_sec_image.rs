@@ -325,6 +325,8 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
     ntdll_base: u64,
     setup_env: bool,
     ldrpinit_rva: u64,
+    client_process_id: u64,
+    client_thread_id: u64,
 ) -> img_spawn::SecImageSpawn {
     let image = nt_exe_image::hosted_image_for_pi(pi).unwrap();
     let runtime = hosted_process_runtime_for_pi(pi).unwrap();
@@ -339,6 +341,8 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_pi(
         runtime.stack_mirror_va,
         runtime.heap_mirror_va,
         runtime.spawn_image_mirror_va,
+        client_process_id,
+        client_thread_id,
         image.nt_image_path,
         image.command_line,
         ldrpinit_rva,
@@ -668,6 +672,9 @@ unsafe fn spawn_requested_hosted_exe(
     let child_pid = nt_handler
         .pm_pid_for_pi(pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let child_tid = nt_handler
+        .pm_main_tid_for_pi(pi)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
@@ -678,6 +685,8 @@ unsafe fn spawn_requested_hosted_exe(
         NTDLL_BASE,
         true,
         0,
+        child_pid as u64,
+        child_tid as u64,
     );
     nt_handler.register_main_thread_tcb(pi, child_spawn.main_tcb);
     procs[pi].pid = child_pid as u64;

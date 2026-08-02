@@ -86,9 +86,7 @@ unsafe fn loaded_hosted_image_metadata(
     None
 }
 
-fn reset_hosted_process_mirror_slot(pi: usize) {
-    PM_PIDS[pi].store(0, Ordering::Relaxed);
-    PM_TIDS[pi].store(0, Ordering::Relaxed);
+fn reset_hosted_mechanism_mirror_slot(pi: usize) {
     PM_PML4S[pi].store(0, Ordering::Relaxed);
     reset_hosted_pool_mirror_slot(pi);
 }
@@ -96,21 +94,6 @@ fn reset_hosted_process_mirror_slot(pi: usize) {
 fn reset_hosted_pool_mirror_slot(pi: usize) {
     PM_POOL_USED[pi].store(0, Ordering::Relaxed);
     PM_POOL_SUSPENDED[pi].store(0, Ordering::Relaxed);
-    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
-    }
-}
-
-fn store_hosted_pid_mirror(pi: usize, pid: nt_process::ProcessId) {
-    PM_PIDS[pi].store(pid as u64, Ordering::Relaxed);
-}
-
-fn store_hosted_main_tid_mirror(pi: usize, tid: nt_process::ThreadId) {
-    PM_TIDS[pi].store(tid as u64, Ordering::Relaxed);
-}
-
-fn store_hosted_pool_tid_mirror(pi: usize, slot: usize, tid: nt_process::ThreadId) {
-    PM_POOL_TID[pi][slot].store(tid as u64, Ordering::Relaxed);
 }
 
 unsafe fn record_hosted_child_exe_open(
@@ -453,7 +436,7 @@ impl ExecNtHandler {
         // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
         pm.reserve_modules(64);
         for pi in 0..MAX_PI {
-            reset_hosted_process_mirror_slot(pi);
+            reset_hosted_mechanism_mirror_slot(pi);
         }
         PM_PROC_COUNT.store(0, Ordering::Relaxed);
         PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
@@ -1837,7 +1820,6 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         self.temporary_process_slots[pi] = pid;
-        store_hosted_pid_mirror(pi, pid);
         PM_PML4S[pi].store(pml4, Ordering::Relaxed);
         Ok(())
     }
@@ -1847,7 +1829,6 @@ impl ExecNtHandler {
             return;
         }
         self.temporary_process_slots[pi] = 0;
-        PM_PIDS[pi].store(0, Ordering::Relaxed);
         PM_PML4S[pi].store(0, Ordering::Relaxed);
     }
 
@@ -1885,7 +1866,6 @@ impl ExecNtHandler {
             return;
         }
         let _ = self.thread_mechanisms.release_pool(pi, slot);
-        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
         self.release_pool_usage_slot(pi, slot);
         self.set_pool_thread_suspended(pi, slot, false);
     }
@@ -2067,11 +2047,7 @@ impl ExecNtHandler {
             .process_mechanisms
             .claim_or_get(pi, pid, main_tid, badge)
         {
-            Ok(_) => {
-                store_hosted_pid_mirror(pi, pid);
-                store_hosted_main_tid_mirror(pi, main_tid);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(_) => {
                 if main_claimed {
                     let _ = self.thread_mechanisms.release_main(pi);
@@ -2088,14 +2064,10 @@ impl ExecNtHandler {
         tid: nt_process::ThreadId,
     ) -> Result<(), u32> {
         match self.thread_mechanisms.claim_pool(pi, slot, tid) {
-            Ok(_) => {
-                store_hosted_pool_tid_mirror(pi, slot, tid);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(nt_user_host::MechanismError::SlotOccupied)
                 if self.thread_mechanisms.pool_tid_for_slot(pi, slot) == Some(tid) =>
             {
-                store_hosted_pool_tid_mirror(pi, slot, tid);
                 Ok(())
             }
             Err(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
@@ -2305,7 +2277,7 @@ impl ExecNtHandler {
             .pm_pid_for_pi(creator_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let pid = self.pm.create_process(name, Some(parent), None);
-        reset_hosted_process_mirror_slot(child_pi);
+        reset_hosted_mechanism_mirror_slot(child_pi);
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
         self.register_hosted_process_identity(child_pi, pid, main_tid)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
