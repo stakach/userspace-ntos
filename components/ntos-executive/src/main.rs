@@ -44,6 +44,8 @@ mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
 mod hosted_gate;
 pub(crate) use hosted_gate::*;
+mod hosted_loaded_images;
+pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
 mod rendezvous;
@@ -10477,14 +10479,10 @@ struct ExecLoopCtx {
     /// The DLL registry (csrsrv/basesrv/winsrv + the Win32 client stack): name→index resolution,
     /// per-DLL file/section-handle tracking, and image-info synthesis for the file/section fakes.
     reg: *mut nt_dll_registry::Registry,
-    /// The parsed csrss.exe PE (`None` on the earlier demo path) and backing pool address. The
-    /// hosted executable image table carries file/section/spawn state for it.
-    csrss_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    csrss_pool_va: u64,
-    /// winlogon.exe (the 3rd hosted process) uses the same hosted executable table as csrss and the
-    /// later Win32 children.
-    winlogon_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    winlogon_pool_va: u64,
+    /// Loop-owned parsed hosted EXE PEs and backing pool addresses, keyed by the runtime hosted
+    /// image catalog. The PE bytes remain loop-local; syscall handlers consume this registry for
+    /// metadata and demand-fill lookups instead of naming bootstrap image locals directly.
+    hosted_loaded_images: *const HostedLoadedImageTable,
     /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
     /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
     exe_images: *mut nt_exe_image::ImageTable<8>,
@@ -10492,19 +10490,6 @@ struct ExecLoopCtx {
     /// creation. `NtCreateProcess` consumes this as the target authority instead of re-resolving
     /// static leaf metadata at spawn time.
     exe_image_catalog: *mut nt_exe_image::OwnedHostedImageCatalog<8>,
-    services_pool_va: u64,
-    services_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// lsass.exe's preloaded PE and backing pool address; migrated through `exe_images` too.
-    lsass_pool_va: u64,
-    lsass_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// userinit.exe uses the same generic image lane through section query; pi=5 spawning remains
-    /// a separate checked mechanism step.
-    userinit_pool_va: u64,
-    userinit_pe: *const Option<nt_pe_loader::PeFile<'static>>,
-    /// explorer.exe is the first image launched by userinit itself; it uses the same generic EXE
-    /// lane, with pi=6 as the shell process.
-    explorer_pool_va: u64,
-    explorer_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 512],

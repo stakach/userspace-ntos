@@ -369,3 +369,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   defaulting to SMSS mirrors. Review adjustment: layout values are still compiled-in bootstrap policy
   in `hosted_process_runtime.rs`; the next semantic step is replacing those constructors with an
   allocator or manifest-provided layout.
+- A2 continued. Loop-owned hosted executable PEs now publish into `HostedLoadedImageTable`, keyed by
+  the runtime hosted-image catalog. `ExecLoopCtx` carries that table instead of six named PE/pool
+  pointers, `exec_handler` metadata lookup no longer has a fixed named-process slot list, and hosted
+  spawn/current-PE selection no longer matches on `pi` to choose named PE locals. Review adjustment:
+  the PE objects themselves still live as bootstrap loop locals because the loader has not yet handed
+  off a durable image object store.

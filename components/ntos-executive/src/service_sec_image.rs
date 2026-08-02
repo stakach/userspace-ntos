@@ -115,6 +115,17 @@ unsafe fn load_hosted_bootstrap_image(
     (pe, va)
 }
 
+fn register_loaded_hosted_bootstrap_pe(
+    loaded_images: &mut HostedLoadedImageTable,
+    spec: HostedBootstrapLoadSpec,
+    pe: &Option<nt_pe_loader::PeFile<'static>>,
+    pool_va: u64,
+) {
+    loaded_images
+        .register_if_loaded(spec.image.as_ref(), pe, pool_va)
+        .expect("loaded hosted executable PE metadata must register once");
+}
+
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -464,12 +475,7 @@ fn hosted_multiplexed_thread_spawn_for(
 fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
     catalog: &'a nt_exe_image::OwnedHostedImageCatalog<8>,
-    csrss_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
-    winlogon_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
-    services_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
-    lsass_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
-    userinit_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
-    explorer_pe: &'a Option<nt_pe_loader::PeFile<'static>>,
+    loaded_images: &'a HostedLoadedImageTable,
 ) -> Option<HostedExeSpawn<'a>> {
     let target = request.target?;
     let image = catalog.get_by_leaf(request.leaf())?;
@@ -478,45 +484,13 @@ fn hosted_exe_spawn_for<'a>(
     }
     let runtime = hosted_process_runtime_for_pi(target.pi)?;
     let spawned = runtime.spawned?;
-    match target.pi {
-        1 => csrss_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        2 => winlogon_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        3 => services_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        4 => lsass_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        5 => userinit_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        6 => explorer_pe.as_ref().map(|pe| HostedExeSpawn {
-            image,
-            runtime,
-            pe,
-            spawned,
-        }),
-        _ => None,
-    }
+    let pe = unsafe { loaded_images.pe_by_pi(target.pi)? };
+    Some(HostedExeSpawn {
+        image,
+        runtime,
+        pe,
+        spawned,
+    })
 }
 
 unsafe fn spawn_requested_hosted_exe(
@@ -2020,46 +1994,61 @@ pub(crate) unsafe fn service_sec_image(
     // (ldrinit.c:2409, the EXE-reloc path, is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT).
     // The relocation runs on the pool `*_va`; the demand-fault router reads the relocated bytes via the
     // PeFile slice.
-    let (csrss_pe, csrss_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        csrss_bootstrap_load_spec(),
-    );
+    let csrss_spec = csrss_bootstrap_load_spec();
+    let (csrss_pe, csrss_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), csrss_spec);
     // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
-    let (winlogon_pe, winlogon_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        winlogon_bootstrap_load_spec(),
-    );
+    let winlogon_spec = winlogon_bootstrap_load_spec();
+    let (winlogon_pe, winlogon_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), winlogon_spec);
     // services.exe — the 4th hosted process, spawned by winlogon's Win32 CreateProcessW
     // (StartServicesManager). Sourced BY PATH from the FS pool (P7-A — no fixed buffer needed); on
     // the demo run (ntdll=None) it stays None (services only spawns on the live run). Same EXE-reloc
     // + ImageBase patch as csrss/winlogon so ntdll doesn't hit the unimplemented EXE-reloc path.
-    let (services_pe, services_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        services_bootstrap_load_spec(),
-    );
+    let services_spec = services_bootstrap_load_spec();
+    let (services_pe, services_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), services_spec);
     // lsass.exe — the 5th hosted process, spawned by winlogon's StartLsass Win32 CreateProcessW.
     // Sourced BY PATH from the FS pool. Same EXE-reloc + ImageBase patch as services.
-    let (lsass_pe, lsass_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        lsass_bootstrap_load_spec(),
-    );
+    let lsass_spec = lsass_bootstrap_load_spec();
+    let (lsass_pe, lsass_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), lsass_spec);
     // userinit.exe — the first post-login image. It enters the generic Win32-child image table now;
     // the effectful pi=5 spawn remains deliberately separate so image semantics can be gated first.
-    let (userinit_pe, userinit_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        userinit_bootstrap_load_spec(),
-    );
+    let userinit_spec = userinit_bootstrap_load_spec();
+    let (userinit_pe, userinit_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), userinit_spec);
     // explorer.exe — userinit's StartShell target. It lives at the ReactOS root (`C:\ReactOS` /
     // hosted `C:\Windows`), not under System32, so source it by its real volume path.
-    let (explorer_pe, explorer_va) = load_hosted_bootstrap_image(
-        &mut exe_image_catalog,
-        ntdll.is_some(),
-        explorer_bootstrap_load_spec(),
+    let explorer_spec = explorer_bootstrap_load_spec();
+    let (explorer_pe, explorer_va) =
+        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), explorer_spec);
+    let mut hosted_loaded_images = HostedLoadedImageTable::new();
+    register_loaded_hosted_bootstrap_pe(&mut hosted_loaded_images, csrss_spec, &csrss_pe, csrss_va);
+    register_loaded_hosted_bootstrap_pe(
+        &mut hosted_loaded_images,
+        winlogon_spec,
+        &winlogon_pe,
+        winlogon_va,
+    );
+    register_loaded_hosted_bootstrap_pe(
+        &mut hosted_loaded_images,
+        services_spec,
+        &services_pe,
+        services_va,
+    );
+    register_loaded_hosted_bootstrap_pe(&mut hosted_loaded_images, lsass_spec, &lsass_pe, lsass_va);
+    register_loaded_hosted_bootstrap_pe(
+        &mut hosted_loaded_images,
+        userinit_spec,
+        &userinit_pe,
+        userinit_va,
+    );
+    register_loaded_hosted_bootstrap_pe(
+        &mut hosted_loaded_images,
+        explorer_spec,
+        &explorer_pe,
+        explorer_va,
     );
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
@@ -2792,14 +2781,11 @@ pub(crate) unsafe fn service_sec_image(
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         let img_end = procs[pi].img_end;
-        let pe: &nt_pe_loader::PeFile = match pi {
-            1 => csrss_pe.as_ref().unwrap(),
-            2 => winlogon_pe.as_ref().unwrap(),
-            3 => services_pe.as_ref().unwrap(),
-            4 => lsass_pe.as_ref().unwrap(),
-            5 => userinit_pe.as_ref().unwrap(),
-            6 => explorer_pe.as_ref().unwrap(),
-            _ => pe,
+        let pe: &nt_pe_loader::PeFile = if pi == 0 {
+            pe
+        } else {
+            unsafe { hosted_loaded_images.pe_by_pi(pi) }
+                .expect("faulting hosted process must have a registered loaded executable PE")
         };
         faults = procs[pi].faults;
         first = procs[pi].first;
@@ -4952,21 +4938,10 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
-                    csrss_pe: &csrss_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    csrss_pool_va: csrss_va,
-                    winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    winlogon_pool_va: winlogon_va,
+                    hosted_loaded_images: &hosted_loaded_images as *const HostedLoadedImageTable,
                     exe_images: &mut exe_images as *mut nt_exe_image::ImageTable<8>,
                     exe_image_catalog: &mut exe_image_catalog
                         as *mut nt_exe_image::OwnedHostedImageCatalog<8>,
-                    services_pool_va: services_va,
-                    services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    lsass_pool_va: lsass_va,
-                    lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    userinit_pool_va: userinit_va,
-                    userinit_pe: &userinit_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    explorer_pool_va: explorer_va,
-                    explorer_pe: &explorer_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
                     scratch_base,
@@ -5468,16 +5443,9 @@ pub(crate) unsafe fn service_sec_image(
                 // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
                     let is_csrss_spawn = request.leaf().eq_ignore_ascii_case(b"csrss.exe");
-                    if let Some(spec) = hosted_exe_spawn_for(
-                        request,
-                        &exe_image_catalog,
-                        &csrss_pe,
-                        &winlogon_pe,
-                        &services_pe,
-                        &lsass_pe,
-                        &userinit_pe,
-                        &explorer_pe,
-                    ) {
+                    if let Some(spec) =
+                        hosted_exe_spawn_for(request, &exe_image_catalog, &hosted_loaded_images)
+                    {
                         if spec.spawned.load(Ordering::Relaxed) == 0 {
                             match spawn_requested_hosted_exe(
                                 request,
