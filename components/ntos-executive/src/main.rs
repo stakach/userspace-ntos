@@ -11127,6 +11127,14 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
             .find(|entry| entry.pi == pi && entry.role == role)
     }
 
+    fn get_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
+        (badge != 0).then_some(())?;
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.is_live() && entry.badge == badge)
+    }
+
     fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
         self.get_by_role(pi, role)
             .map(|entry| entry.tcb)
@@ -11201,6 +11209,11 @@ impl HostedThreadRuntimes {
     fn get_by_role(&self, pi: usize, role: HostedThreadRole) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_role(pi, role) }
+    }
+
+    fn get_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get_by_badge(badge) }
     }
 
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {

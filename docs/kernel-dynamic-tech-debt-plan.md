@@ -229,3 +229,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   services/SCM/LSASS/LSA worker TIDs); source now has no named hosted TID mirrors. Review
   adjustment: remaining A4 work is the badge-to-process selection helpers and named TCB cap cells
   used for low-level seL4 publication/teardown.
+- A4 continued. Live fault routing for named listener/worker badges now resolves process ownership
+  from registered hosted thread runtime badge metadata instead of a badge-to-executable switch.
+  Top-level process badges and generic TP-worker badges remain mechanism-level decodes. Review
+  adjustment: quiesce/crash owner accounting still has a non-handler badge owner map; the next A4
+  cleanup should thread runtime context into those accounting sites or publish an owner snapshot.

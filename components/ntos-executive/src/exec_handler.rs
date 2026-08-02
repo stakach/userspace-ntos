@@ -1935,6 +1935,12 @@ impl ExecNtHandler {
             .filter(|&tid| tid != 0)
     }
 
+    pub(crate) fn hosted_thread_pi_for_badge(&self, badge: u64) -> Option<usize> {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.pi)
+    }
+
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
         self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
     }

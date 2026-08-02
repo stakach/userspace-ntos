@@ -370,17 +370,21 @@ fn hosted_pi_for_top_badge(badge: u64) -> Option<usize> {
         .filter(|&pi| hosted_process_runtime_for_pi(pi).is_some())
 }
 
-fn hosted_pi_for_fault_badge(badge: u64) -> Option<usize> {
+fn hosted_pi_for_mechanism_badge(badge: u64) -> Option<usize> {
     if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
         return Some(pi);
     }
+    hosted_pi_for_top_badge(badge)
+}
+
+fn hosted_pi_for_owner_badge(badge: u64) -> Option<usize> {
     match badge {
         WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => Some(2),
         SVC_LISTENER_BADGE | SCM_WORKER_BADGE => Some(3),
         LSASS_LISTENER_BADGE | LSASS_LISTENER2_BADGE | LSASS_LISTENER3_BADGE | LSA_WORKER_BADGE => {
             Some(4)
         }
-        _ => hosted_pi_for_top_badge(badge),
+        _ => hosted_pi_for_mechanism_badge(badge),
     }
 }
 
@@ -412,19 +416,14 @@ fn live_hosted_pid_for_leaf(
 }
 
 fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    let leaf: &[u8] = match badge {
-        WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => b"winlogon.exe",
-        SVC_LISTENER_BADGE | SCM_WORKER_BADGE => b"services.exe",
-        LSASS_LISTENER_BADGE | LSASS_LISTENER2_BADGE | LSASS_LISTENER3_BADGE | LSA_WORKER_BADGE => {
-            b"lsass.exe"
-        }
-        _ => return None,
-    };
-    live_hosted_pi_for_leaf(nt_handler, leaf)
+    nt_handler
+        .hosted_thread_pi_for_badge(badge)
+        .filter(|&pi| nt_handler.pm_pid_for_pi(pi).is_some())
 }
 
 fn live_hosted_pi_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    live_hosted_pi_for_thread_badge(nt_handler, badge).or_else(|| hosted_pi_for_fault_badge(badge))
+    live_hosted_pi_for_thread_badge(nt_handler, badge)
+        .or_else(|| hosted_pi_for_mechanism_badge(badge))
 }
 
 fn hosted_leaf_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<&'static [u8]> {
@@ -13652,7 +13651,7 @@ unsafe fn prefill_client_large_string_pages(
 /// winlogon=4, services=6, lsass=8, userinit=27, explorer=28.
 #[inline]
 fn owner_top_badge(badge: u64) -> u64 {
-    hosted_pi_for_fault_badge(badge)
+    hosted_pi_for_owner_badge(badge)
         .map(hosted_top_badge_for_pi)
         .unwrap_or(0)
 }
