@@ -183,8 +183,8 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     } else {
         0
     };
-    if pi != 2
-        || badge != WINLOGON_BADGE
+    if process_role != Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+        || badge != top_badge
         || current_tid == 0
         || main_tid != current_tid
         || sas1 == 0
@@ -7440,7 +7440,11 @@ pub(crate) unsafe fn service_sec_image(
                             );
                         }
                     }
-                    if pi == 2 && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN && r.0 == 0 {
+                    if nt_handler.hosted_process_role(pi)
+                        == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+                        && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+                        && r.0 == 0
+                    {
                         let main_tid = nt_handler
                             .pm_main_tid_for_pi(pi)
                             .map(u64::from)

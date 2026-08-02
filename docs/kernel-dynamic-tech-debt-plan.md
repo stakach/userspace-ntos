@@ -393,3 +393,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   from its registered `InteractiveShellBootstrap` role. Review adjustment: several older
   winlogon/LSASS-specific frontier checks still compare against their transport badges and should be
   handled in a focused pass.
+- A2 cleanup. The second-SAS injection helper no longer identifies winlogon through fixed `pi == 2`
+  and `WINLOGON_BADGE`; it uses the process role and top badge already carried by registered hosted
+  process metadata. Review adjustment: broader winlogon frontier diagnostics still contain fixed
+  `pi == 2` checks because they name measured winlogon-only boot milestones, not just image identity.
