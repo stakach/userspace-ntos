@@ -52,6 +52,7 @@ pub struct SpawnRequest {
     pub creator_pi: usize,
     pub desired_access: u32,
     pub process_handle_out: u64,
+    pub target: Option<SpawnTarget>,
     leaf: [u8; MAX_EXE_LEAF],
     leaf_len: u8,
 }
@@ -76,6 +77,13 @@ pub enum HostedProcessRole {
     NonInteractiveService,
     InteractiveShellBootstrap,
     InteractiveShell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnTarget {
+    pub pi: usize,
+    pub top_badge: u64,
+    pub role: HostedProcessRole,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,6 +469,14 @@ impl ImageSlot {
     }
 
     pub fn spawn_request(&self, slot: usize) -> Option<SpawnRequest> {
+        self.spawn_request_with_target(slot, None)
+    }
+
+    fn spawn_request_with_target(
+        &self,
+        slot: usize,
+        target: Option<SpawnTarget>,
+    ) -> Option<SpawnRequest> {
         if self.state != ImageState::SpawnReserved {
             return None;
         }
@@ -471,6 +487,7 @@ impl ImageSlot {
             creator_pi: self.owner_pi,
             desired_access: self.desired_access,
             process_handle_out: self.process_handle_out,
+            target,
             leaf,
             leaf_len: self.leaf_len,
         })
@@ -612,6 +629,50 @@ impl<const N: usize> ImageTable<N> {
         desired_access: u32,
         process_handle_out: u64,
     ) -> Result<SpawnRequest, ImageError> {
+        self.reserve_spawn_with_target(
+            owner_pi,
+            section_handle,
+            desired_access,
+            process_handle_out,
+            None,
+        )
+    }
+
+    pub fn reserve_spawn_registered<'a, const M: usize>(
+        &mut self,
+        catalog: &HostedImageCatalog<'a, M>,
+        owner_pi: usize,
+        section_handle: u64,
+        desired_access: u32,
+        process_handle_out: u64,
+    ) -> Result<SpawnRequest, ImageError> {
+        let index = self
+            .index_for_section(owner_pi, section_handle)
+            .ok_or(ImageError::NotFound)?;
+        let image = catalog
+            .get_by_leaf(self.slots[index].leaf())
+            .ok_or(ImageError::InvalidPath)?;
+        self.reserve_spawn_with_target(
+            owner_pi,
+            section_handle,
+            desired_access,
+            process_handle_out,
+            Some(SpawnTarget {
+                pi: image.pi,
+                top_badge: image.top_badge,
+                role: image.role,
+            }),
+        )
+    }
+
+    fn reserve_spawn_with_target(
+        &mut self,
+        owner_pi: usize,
+        section_handle: u64,
+        desired_access: u32,
+        process_handle_out: u64,
+        target: Option<SpawnTarget>,
+    ) -> Result<SpawnRequest, ImageError> {
         if process_handle_out == 0 {
             return Err(ImageError::InvalidHandle);
         }
@@ -630,7 +691,7 @@ impl<const N: usize> ImageTable<N> {
                     && slot.process_handle_out == process_handle_out => {}
             _ => return Err(ImageError::InvalidState),
         }
-        Ok(slot.spawn_request(index).unwrap())
+        Ok(slot.spawn_request_with_target(index, target).unwrap())
     }
 
     pub fn rollback_spawn(&mut self, request: SpawnRequest) -> Result<(), ImageError> {
@@ -638,7 +699,7 @@ impl<const N: usize> ImageTable<N> {
             .slots
             .get_mut(request.slot)
             .ok_or(ImageError::NotFound)?;
-        if slot.spawn_request(request.slot) != Some(request) {
+        if slot.spawn_request_with_target(request.slot, request.target) != Some(request) {
             return Err(ImageError::InvalidState);
         }
         slot.desired_access = 0;
@@ -659,7 +720,7 @@ impl<const N: usize> ImageTable<N> {
             .slots
             .get_mut(request.slot)
             .ok_or(ImageError::NotFound)?;
-        if slot.spawn_request(request.slot) != Some(request) {
+        if slot.spawn_request_with_target(request.slot, request.target) != Some(request) {
             return Err(ImageError::InvalidState);
         }
         slot.process_handle = process_handle;
@@ -964,6 +1025,59 @@ mod tests {
             catalog.probe_leaf(b"\\SystemRoot\\explorer.exe", true),
             None
         );
+    }
+
+    #[test]
+    fn spawn_reservation_can_bind_to_dynamic_catalog_target() {
+        let mut catalog = HostedImageCatalog::<1>::new();
+        catalog
+            .register(catalog_image(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe",
+                b"\\SystemRoot\\System32\\userinit.exe",
+                HostedProcessRole::InteractiveShellBootstrap,
+                HostedImageRoot::System32,
+                b"userinit",
+            ))
+            .unwrap();
+        let mut table = ImageTable::<1>::new();
+        let slot = table.open(2, b"userinit.exe", 0x40, META).unwrap();
+        table.create_section(2, 0x40, 0x44).unwrap();
+
+        let request = table
+            .reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000)
+            .unwrap();
+
+        assert_eq!(request.slot, slot);
+        assert_eq!(
+            request.target,
+            Some(SpawnTarget {
+                pi: 5,
+                top_badge: USERINIT_TOP_BADGE,
+                role: HostedProcessRole::InteractiveShellBootstrap,
+            })
+        );
+        assert_eq!(
+            table.reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000),
+            Ok(request)
+        );
+        table.publish(request, 0x48).unwrap();
+        assert_eq!(table.get(slot).unwrap().state, ImageState::Published);
+    }
+
+    #[test]
+    fn spawn_reservation_rejects_unregistered_images() {
+        let catalog = HostedImageCatalog::<1>::new();
+        let mut table = ImageTable::<1>::new();
+        table.open(2, b"calc.exe", 0x40, META).unwrap();
+        table.create_section(2, 0x40, 0x44).unwrap();
+
+        assert_eq!(
+            table.reserve_spawn_registered(&catalog, 2, 0x44, 0x1fffff, 0x1000),
+            Err(ImageError::InvalidPath)
+        );
+        assert_eq!(table.get(0).unwrap().state, ImageState::Sectioned);
     }
 
     #[test]

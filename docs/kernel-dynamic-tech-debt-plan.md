@@ -260,3 +260,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   paths, bounded capacity, and SxS probe rejection. Review adjustment: the executive still calls the
   static wrappers; the next A2 slice should instantiate a runtime catalog in the service loop and
   route gate/lookup call sites through that catalog before deleting static-wrapper use.
+- A2 continued. `ImageTable` spawn reservations can now bind to a dynamic catalog target through
+  `reserve_spawn_registered`, producing a `SpawnRequest` with the registered target `pi`, top badge,
+  and role while rejecting unregistered executable sections. The legacy `reserve_spawn` remains
+  target-less for current executive callers, but the crate now has the policy boundary needed for
+  `NtCreateProcessEx` to consume runtime catalog state instead of asking static leaf wrappers.
+  Review adjustment: the next wiring slice should pass the runtime catalog into the executable
+  create-process handler and make `spawn_requested_hosted_exe` consume `request.target` instead of
+  re-resolving target identity from `HOSTED_PROCESS_IMAGES`.
