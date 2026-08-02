@@ -10255,9 +10255,6 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 /// lsarpc RPC, and winlogon advances into its post-GinaInit logon flow (InitializeSAS → the SAS
 /// window → the desktop-switch paint). Scoped to winlogon's SYNTH_WINLOGON_KEY / DefaultPassword ONLY.
 pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
-/// Count of remaining non-interactive-service win32k shortcuts. Cursor/class paths should reuse
-/// real metadata observed from winlogon; remaining increments represent still-open GDI/init debt.
-pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).

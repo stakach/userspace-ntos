@@ -7930,31 +7930,10 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x125b && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays.
-                    // THE win32k 0x125b TERMINUS FIX (diagnose-first, fork (b): non-interactive path).
-                    // The REAL wall (root-caused by reading win32k's OWN faulting RIP at the hang): win32k
-                    // spins forever in the GDI scanline-copy loop `EngCopyBits` at RVA 0x1cbdd8 (the
-                    // `pvScan0 + y*lDelta + x*4` blit inner loop, confirmed by disasm) — NOT in
-                    // NtUserInitializeClientPfnArrays' trivial `RtlCopyMemory(&gpsi->apfnClient*, ...)`
-                    // body, but in the cursor/icon/stock-object bitmap-init blit the SERVICE user32
-                    // process-attach drags in (NtUserFindExistingCursorIcon 0x103d /
-                    // NtUserRegisterClassExWOW 0x10b4 / NtGdiCreateBitmap 0x106c -> an EngCopyBits over a
-                    // SURFOBJ whose dimensions are garbage for the current service GUI/GDI state -> an
-                    // UNBOUNDED copy). With all its source pages zero-filled it stops faulting and just
-                    // spins → the executive blocks in win32k_dispatch's recv forever (all vCPUs
-                    // kernel-idle = the addendum's observation). lsass is a NON-INTERACTIVE service on a
-                    // WSS_NOIO window station (winsta.c) — it never creates a real window/desktop, so it
-                    // must NOT drive win32k's INTERACTIVE cursor/icon/GDI path (faithful to the real
-                    // non-interactive-service user32 init). NtUserInitializeClientPfnArrays is trivial
-                    // server-side (copy 3 client PFN arrays into the already-initialized gpsi under the
-                    // USER lock — `if (ClientPfnInit) return STATUS_SUCCESS`, and ClientPfnInit is ALREADY
-                    // TRUE from winlogon's interactive 0x125b); the CLIENT only checks the returned
-                    // NTSTATUS. So SATISFY it here with STATUS_SUCCESS WITHOUT dispatching into win32k —
-                    // the same non-interactive-service boundary used by the cursor/class mirror above.
-                    // Scoped to non-interactive service images so winlogon's REAL interactive 0x125b +
-                    // paint path is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it
-                    // moved the hang to 0x11e0 by breaking winlogon's interactive init).
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    // ReactOS NtUserInitializeClientPfnArrays returns STATUS_SUCCESS once the
+                    // session-global client PFN arrays have already been initialized. Winlogon's
+                    // interactive setup does that first; WSS_NOIO service processes only need their
+                    // client PFNs captured for later service-owned classinfo mirrors.
                     let captured = capture_service_client_pfn_arrays(
                         pi,
                         a0,
@@ -7964,36 +7943,19 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     );
-                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) SERVICE-SAFE captured-pfns=");
+                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) SERVICE-PFN captured-pfns=");
                     print_u64(captured as u64);
                     print_str(b" -> STATUS_SUCCESS\n");
                     (0, true)
                 } else if m0 == 0x11e0 && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h).
-                    // The 0x125b fix advanced a service image to its NEXT interactive win32k SSN =
-                    // NtGdiInit, which hit the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit spin (win32k's GDI stock-object /
-                    // DDB bitmap-init blit — the source SURFOBJ dimensions are garbage for our faked
-                    // service cursor/class/GDI state). This is the EXACT "moved the hang to 0x11e0" BATCH 28
-                    // saw — now understood: a non-interactive service issues a SEQUENCE of interactive
-                    // user32/gdi32-init SSNs, each tripping the blit; each must take the non-interactive
-                    // light path. NtGdiInit is a per-process "init GDI" that returns BOOL; the REAL
-                    // interactive winlogon's NtGdiInit returned TRUE(1) in the SAME boot (proper stock
-                    // state → no runaway blit). A non-interactive service does NO GDI drawing, so returning
-                    // TRUE(1) WITHOUT dispatching is byte-behavior-identical for the client (gdi32
-                    // GdiProcessSetup checks the BOOL) and skips the interactive stock-object blit. Scoped
-                    // to non-interactive service images — winlogon's real NtGdiInit path is untouched.
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
+                    // ReactOS NtGdiInit is a BOOL leaf that returns TRUE. Keep WSS_NOIO services on
+                    // that leaf result until win32k has separate per-service GDI process ownership.
+                    print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) SERVICE-LEAF -> TRUE\n");
                     (1, true)
                 } else if m0 == 0x10de && svc_noninteractive {
-                    // NtGdiOpenDCW is the DC-open half of the same non-interactive service GDI init
-                    // family as 0x106c/0x10b5/0x10d4. When a service image asks gdi32 for a DISPLAY DC during
-                    // GUI-DLL process attach, a real win32k HDC lets client-side gdi32 continue into DC_ATTR
-                    // state that this service process never initialized. A NULL HDC is the benign
-                    // "no suitable display PDEV" outcome ReactOS already returns for unsupported
-                    // devices, and lets non-interactive services continue their server work.
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) FAKED (non-interactive service, no display DC) -> NULL\n");
+                    // WSS_NOIO services have no display DC. Return the real failure value for a DC
+                    // open instead of constructing an HDC backed by the interactive process state.
+                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) NO DISPLAY DC -> NULL\n");
                     (0, true)
                 } else if m0 == 0x10d4 && svc_noninteractive {
                     // NtGdiGetStockObject returns session-global stock handles. Reuse only handles

@@ -531,3 +531,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `NtUserInitializeClientPfnArrays` service-safe capture, `NtGdiInit` TRUE shortcut,
   `NtGdiOpenDCW` NULL shortcut, and real provider-owned service GDI object ownership if a service
   later needs non-stock GDI objects.
+- C3/F1 cleanup. Retired the old service win32k shortcut counter and log language.
+  The noninteractive `NtUserInitializeClientPfnArrays` path is now documented as ReactOS' already
+  initialized session-global PFN success case, with service PFN capture retained only so service
+  classinfo mirrors can use the service client's own callback table. Service `NtGdiInit` is recorded
+  as the ReactOS TRUE leaf result, and service `NtGdiOpenDCW` now logs the real WSS_NOIO no-display
+  NULL outcome instead of fake accounting. Validation:
+  `.tmp/full-boot-service-fake-counter-retired-20260803-092800.log` reached `RUN_RC=0`, `276/276`
+  checks passed, `PASS exec_services_scrollbar_classinfo_mirrored`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_logon_dialog_painted`, and the explorer
+  message/callback/WndProc/COM gates remained green. Review adjustment: remaining F1/C3 service
+  debt is real provider-owned per-service GUI/GDI process ownership, so the remaining WSS_NOIO
+  service branches can shrink to ordinary provider/object outcomes instead of executive-owned
+  service identity shortcuts.
