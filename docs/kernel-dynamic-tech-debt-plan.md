@@ -223,3 +223,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   SM-loop spawner receives the reserved TID from its caller instead of reading `SM_LOOP_TID`.
   Review adjustment: named TID reads are now confined to post-loop gate probes in `main.rs`; named
   TCB cells still publish low-level seL4 caps for gates and teardown.
+- A4 continued. Post-loop gates now consume `HOSTED_THREAD_RUNTIME_OK` proof bits published when
+  named runtime roles are promoted to live TCB-backed records. Deleted the remaining named hosted
+  TID cells and compatibility stores (`SM_LOOP_TID`, `CSR_*_TID`, Winlogon worker TIDs,
+  services/SCM/LSASS/LSA worker TIDs); source now has no named hosted TID mirrors. Review
+  adjustment: remaining A4 work is the badge-to-process selection helpers and named TCB cap cells
+  used for low-level seL4 publication/teardown.

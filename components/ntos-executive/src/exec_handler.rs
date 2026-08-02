@@ -430,6 +430,7 @@ impl ExecNtHandler {
         PM_IDENTITY_OK.store(0, Ordering::Relaxed);
         PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
         PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
+        HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
         PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
         let smss_pid = pm.create_process("smss.exe", None, None);
         let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
@@ -1856,7 +1857,13 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) {
-        let _ = self.thread_runtime.register(pi, tid, tcb, badge, role);
+        if self
+            .thread_runtime
+            .register(pi, tid, tcb, badge, role)
+            .is_some()
+        {
+            publish_hosted_thread_runtime_gate(pi, role);
+        }
     }
 
     pub(crate) fn reserve_hosted_thread_runtime(
@@ -10595,11 +10602,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            if slot == 0 {
-                                CSR_API_TID.store(tid, Ordering::Relaxed);
-                            } else {
-                                CSR_SB_TID.store(tid, Ordering::Relaxed);
-                            }
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::Csr { slot });
                             print_str(b"[csr-thread] create slot=");
@@ -10765,12 +10767,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
                                 self.queue_write(cid_ptr + 8, tid); // ClientId.UniqueThread
                             }
-                            match slot {
-                                0 => PM_LISTENER_TID.store(tid, Ordering::Relaxed),
-                                1 => WL_WORKER2_TID.store(tid, Ordering::Relaxed),
-                                2 => WL_WORKER3_TID.store(tid, Ordering::Relaxed),
-                                _ => {}
-                            }
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::Winlogon { slot });
                             let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
@@ -10858,7 +10854,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            SVC_LISTENER_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::ServicesListener);
                             return 0;
@@ -10905,7 +10900,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            LSASS_LISTENER_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::LsassListener { slot: 0 });
                             return 0;
@@ -10953,7 +10947,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            LSASS_LISTENER2_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::LsassListener { slot: 1 });
                             return 0;
@@ -11000,7 +10993,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            LSASS_LISTENER3_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::LsassListener { slot: 2 });
                             let initial_teb = smss_stack_read(sp + 0x38);
@@ -11119,7 +11111,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            SCM_WORKER_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::ScmWorker);
                             print_str(b"[scm-worker] recognized services' 2nd NtCreateThread = per-connection RPC worker: entry=0x");
@@ -11231,7 +11222,6 @@ impl ExecNtHandler {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
-                            LSA_WORKER_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::LsaWorker);
                             print_str(b"[lsa-worker] recognized lsass' \\lsarpc server-thread NtCreateThread = per-connection RPC worker: entry=0x");
@@ -11400,7 +11390,6 @@ impl ExecNtHandler {
                                 );
                                 self.queue_write(client_id + 8, tid);
                             }
-                            SM_LOOP_TID.store(tid, Ordering::Relaxed);
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::SmLoop);
                             return 0;
