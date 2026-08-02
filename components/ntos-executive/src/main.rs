@@ -534,8 +534,8 @@ pub const TP_WORKER_SLOT1_TRAMP_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x3_0000
 pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
 /// Executive-side windows for hosted-process indices BEYOND the five live ones. The two live
 /// `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and are only disjoint for
-/// `pi < TP_WORKER_PI_COUNT`; a throwaway/self-test process index (the free high `PM_PIDS` slots)
-/// would alias slot 1's window. Those indices get their own densely-packed `(pi, slot)` region
+/// `pi < TP_WORKER_PI_COUNT`; a throwaway/self-test temporary process index would alias slot 1's
+/// window. Those indices get their own densely-packed `(pi, slot)` region
 /// here — a genuinely free 32 MiB gap between the file-buffer POOL (`0x1500`+24×2 MiB = `0x1800`)
 /// and `FSD_EXEC_BASE` (`0x1A00`). `pi < TP_WORKER_PI_COUNT` is byte-identical to before.
 pub const TP_WORKER_AUX_EXEC_BASE: u64 = 0x0000_0100_1800_0000;
@@ -1117,13 +1117,13 @@ pub const LSASS_BADGE: u64 = 8;
 pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDOW;
 pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WINDOW;
 /// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
-/// per-process arrays are sized for. The 6 current processes
+/// per-process arrays are sized for. The current hosted processes
 /// (smss/csrss/winlogon/services/lsass/userinit/explorer = pi 0..6) are live; the extra headroom is
 /// for later post-login processes (the
 /// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
-/// (PM_PIDS/PM_TIDS/PM_POOL_TID, PFILLED, the service_sec_image `procs`/`dll_pd_created`/
-/// `dll_pt_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
-/// per-process slot. The pi-indexed WRITE sites guard `pi < MAX_PI` and panic LOUDLY (never a silent
+/// (mechanism mirrors, PFILLED, the service_sec_image `procs`/`dll_pd_created`/`dll_pt_bits` locals)
+/// is sized to this so a later hosted process never silently overflows a per-process slot. The
+/// pi-indexed WRITE sites guard `pi < MAX_PI` and panic LOUDLY (never a silent
 /// spin) if a spawn ever exceeds this — bump `MAX_PI` (a scalar cost) or move to a per-pid map. The
 /// per-pi VA-LAYOUT still uses distinct fixed windows per process (SCRATCH_BASE / *_MIRROR_VA above),
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
@@ -2023,8 +2023,8 @@ static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
 /// separate from the listener-specific state so badge routing cannot accidentally inherit a server
 /// listener's park/drop policy.
 /// Sized `MAX_PI` (not `TP_WORKER_PI_COUNT`): the SAME bounded windows are what a cross-VSpace
-/// `NtCreateThread` claims for an extra thread of ANY hosted process index, including the free high
-/// `PM_PIDS` slots the post-loop self-tests use. Slots 5.. are zero on every live boot.
+/// `NtCreateThread` claims for an extra thread of ANY hosted process index, including the high
+/// temporary slots the post-loop self-tests use. Slots 5.. are zero on every live boot.
 static TP_WORKER_TID: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
     [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; MAX_PI];
 static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; MAX_PI] =
@@ -10852,11 +10852,15 @@ struct ExecNtHandler {
     /// EPROCESSes (read-only during the loop, so no runtime realloc); the ad-hoc identity arrays +
     /// `next_handle` fakes stay live and are migrated onto this in the sequenced bulk. Policy lives
     /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
-    /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
+    /// executive (only the trusted root task holds those caps), linked to an EPROCESS through the
+    /// process mechanism table.
     pm: nt_process::ProcessManager,
     /// Allocation-free mirror of the hosted process mechanism slots keyed by NT PID/TID/badge.
     /// The old atomics remain synchronized for low-level code that has not moved yet.
     process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
+    /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
+    /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
+    temporary_process_slots: [nt_process::ProcessId; MAX_PI],
     /// Allocation-free mirror of hosted main/pool ETHREAD identities. The static TCB/cap cells stay
     /// in the executive for now; this table makes PID/TID keyed thread lookup authoritative inside
     /// the syscall handler before those low-level cells are moved.
@@ -12377,12 +12381,10 @@ static CSR_RENDEZVOUS_FAILURES: AtomicU64 = AtomicU64::new(0);
 // === nt-process convergence (policy/mechanism split) ===================================
 // The live executive is converging its ad-hoc process IDENTITY tracking (the per-pi `pml4s`/
 // `scratch_bases`/… loop arrays + the `badge→pi` switch) onto the real host-tested nt-process
-// ProcessManager (EPROCESS/ETHREAD/handle-tables/lifecycle). FIRST INCREMENT (behavior-preserving):
-// smss/csrss/winlogon are bootstrapped in `ExecNtHandler::new()`; later hosted processes get their
-// real nt-process EPROCESS/ETHREAD state when ReactOS reaches `NtCreateProcess[Ex]`. The mechanism
-// arrays are unchanged for now. `PM_PIDS[pi]` maps the fixed mechanism index (keyed by fault badge)
-// to the runtime EPROCESS pid — the badge↔pid link. Read by the counted specs.
-/// EPROCESS pids for hosted process indices (0 = not yet created).
+// ProcessManager (EPROCESS/ETHREAD/handle-tables/lifecycle). Hosted processes register their
+// pid/tid/badge identity in `ProcessMechanismTable`; the legacy atomics below are synchronized
+// mirrors for low-level mechanism code that has not moved behind handler-owned lookup yet.
+/// Compatibility mirror of EPROCESS pids for hosted process indices (0 = not yet created).
 static PM_PIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// How many hosted EPROCESS objects the live ProcessManager holds once the boot frontier is reached.
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -12392,8 +12394,8 @@ static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
 /// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
 static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
-/// Incremented each time the live service loop resolves the current fault BADGE → its EPROCESS via
-/// the ProcessManager (`pm.process(PM_PIDS[pi])`) — proves badge↔EPROCESS lookup works at runtime.
+/// Incremented each time the live service loop resolves the current fault badge to its EPROCESS via
+/// the ProcessManager-backed handler lookup.
 static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 /// Reserved handle-table capacity per hosted EPROCESS (path 1). Measured peak is < ~100 handles per
 /// process over a full boot; 256 is ~3× headroom so `insert_handle` never reallocates under the
@@ -12734,16 +12736,16 @@ static ALPC_XVIEW_OK: AtomicU64 = AtomicU64::new(0);
 /// Executive-side per-hosted-process MECHANISM state, EPROCESS-linked. Path 3 of the nt-process
 /// convergence folds the six parallel `[_;3]` identity arrays that `service_sec_image` indexed by
 /// `pi` (pml4s / scratch_bases / img_ends / pfaults / pfirst / pntfaults) into ONE array-of-structs,
-/// each slot carrying its own mechanism state PLUS the `pid` link to its real nt-process EPROCESS
-/// (== the pid in `PM_PIDS[pi]`). Behavior-preserving: the same values, keyed the same way (fault
-/// badge → pi), just consolidated + EPROCESS-linked instead of six parallel arrays. The seL4 VSpace
+/// each slot carrying its own mechanism state PLUS the `pid` link to its real nt-process EPROCESS.
+/// Behavior-preserving: the same values, keyed the same way (fault badge -> pi), just consolidated
+/// and EPROCESS-linked instead of six parallel arrays. The seL4 VSpace
 /// cap + the scratch/image VAs stay executive-side (only the trusted root task holds those caps — the
 /// policy/mechanism split); this struct just consolidates them under the EPROCESS link so the service
 /// loop reads a process's mechanism state via its EPROCESS instead of parallel arrays.
 #[derive(Clone, Copy)]
 struct ProcExec {
-    /// EPROCESS pid backing this hosted process (0 until linked); mirrors `PM_PIDS[pi]` — the
-    /// badge↔pid convergence link, so the loop reaches the per-process mechanism via the EPROCESS.
+    /// EPROCESS pid backing this hosted process (0 until linked); copied from the handler-owned
+    /// process mechanism lookup so the loop reaches the per-process mechanism via the EPROCESS.
     pid: u64,
     /// seL4 VSpace (PML4) cap for this process's address space (0 until the process is spawned).
     pml4: u64,

@@ -598,6 +598,7 @@ impl ExecNtHandler {
             // temporary compatibility shadow.
             pm,
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
+            temporary_process_slots: [0; MAX_PI],
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
             thread_runtime: HostedThreadRuntimes::reset(),
             token_store: nt_security::TokenStore::with_capacity(64),
@@ -1682,17 +1683,13 @@ impl ExecNtHandler {
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
     /// link). Returns `None` before the ProcessManager has created that hosted process.
     pub(crate) fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
-        self.process_mechanisms.pid_for_pi(pi).or_else(|| {
-            let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
-            (pid != 0).then_some(pid as nt_process::ProcessId)
-        })
+        self.process_mechanisms
+            .pid_for_pi(pi)
+            .or_else(|| self.temporary_pid_for_pi(pi))
     }
 
     pub(crate) fn pm_main_tid_for_pi(&self, pi: usize) -> Option<nt_process::ThreadId> {
-        self.thread_mechanisms.main_tid_for_pi(pi).or_else(|| {
-            let tid = PM_TIDS.get(pi)?.load(Ordering::Relaxed);
-            (tid != 0).then_some(tid as nt_process::ThreadId)
-        })
+        self.thread_mechanisms.main_tid_for_pi(pi)
     }
 
     pub(crate) fn pm_pool_tid_for_slot(
@@ -1700,12 +1697,7 @@ impl ExecNtHandler {
         pi: usize,
         slot: usize,
     ) -> Option<nt_process::ThreadId> {
-        self.thread_mechanisms
-            .pool_tid_for_slot(pi, slot)
-            .or_else(|| {
-                let tid = PM_POOL_TID.get(pi)?.get(slot)?.load(Ordering::Relaxed);
-                (tid != 0).then_some(tid as nt_process::ThreadId)
-            })
+        self.thread_mechanisms.pool_tid_for_slot(pi, slot)
     }
 
     pub(crate) fn pm_pool_slot_for_tid(&self, tid: u64) -> Option<(usize, usize)> {
@@ -1714,6 +1706,94 @@ impl ExecNtHandler {
         }
         self.thread_mechanisms
             .pool_slot_for_tid(tid as nt_process::ThreadId)
+    }
+
+    fn temporary_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
+        let pid = *self.temporary_process_slots.get(pi)?;
+        (pid != 0).then_some(pid)
+    }
+
+    fn temporary_pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
+        (pid != 0).then_some(())?;
+        self.temporary_process_slots
+            .iter()
+            .position(|stored| *stored == pid)
+    }
+
+    pub(crate) fn register_temporary_process_slot(
+        &mut self,
+        pi: usize,
+        pid: nt_process::ProcessId,
+        pml4: u64,
+    ) -> Result<(), u32> {
+        if pi >= MAX_PI
+            || pid == 0
+            || self.pm.process(pid).is_none()
+            || self.process_mechanisms.pid_for_pi(pi).is_some()
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        if self.temporary_process_slots[pi] != 0 && self.temporary_process_slots[pi] != pid {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        if self
+            .temporary_pi_for_pid(pid)
+            .is_some_and(|existing_pi| existing_pi != pi)
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        self.temporary_process_slots[pi] = pid;
+        store_hosted_pid_mirror(pi, pid);
+        PM_PML4S[pi].store(pml4, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn clear_temporary_process_slot(&mut self, pi: usize) {
+        if pi >= MAX_PI || self.process_mechanisms.pid_for_pi(pi).is_some() {
+            return;
+        }
+        self.temporary_process_slots[pi] = 0;
+        PM_PIDS[pi].store(0, Ordering::Relaxed);
+        PM_PML4S[pi].store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn register_temporary_pool_thread_slot(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: nt_process::ThreadId,
+    ) -> Result<(), u32> {
+        let Some(pid) = self.temporary_pid_for_pi(pi) else {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        };
+        if slot >= PM_RUNTIME_THREAD_SLOTS {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        match self.pm.thread(tid) {
+            Some(thread) if thread.process_id == pid => {}
+            _ => return Err(nt_process::STATUS_INVALID_PARAMETER),
+        }
+        if self.process_mechanisms.pid_for_pi(pi).is_some() {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        self.register_hosted_pool_thread_identity(pi, slot, tid)?;
+        PM_POOL_USED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        PM_POOL_SUSPENDED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn clear_temporary_pool_thread_slot(&mut self, pi: usize, slot: usize) {
+        if pi >= MAX_PI
+            || slot >= PM_RUNTIME_THREAD_SLOTS
+            || self.temporary_pid_for_pi(pi).is_none()
+            || self.process_mechanisms.pid_for_pi(pi).is_some()
+        {
+            return;
+        }
+        let _ = self.thread_mechanisms.release_pool(pi, slot);
+        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
+        PM_POOL_USED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        PM_POOL_SUSPENDED[pi].fetch_and(!(1 << slot), Ordering::Relaxed);
     }
 
     pub(crate) fn register_hosted_thread_tcb(
@@ -3615,19 +3695,12 @@ impl ExecNtHandler {
     /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
     /// at boot for the non-leaking heap solution; this alloc-free field write completes it).
     pub(crate) fn bind_main_thread_entry(&mut self, pi: usize, entry: u64) {
-        if let Some(tid) = PM_TIDS.get(pi).map(|t| t.load(Ordering::Relaxed)) {
-            if tid != 0
-                && self
-                    .pm
-                    .set_thread_start_address(tid as nt_process::ThreadId, entry)
-            {
+        if let Some(tid) = self.pm_main_tid_for_pi(pi) {
+            if self.pm.set_thread_start_address(tid, entry) {
+                let _ = self.pm.set_thread_teb(tid, SMSS_TEB_VA);
                 let _ = self
                     .pm
-                    .set_thread_teb(tid as nt_process::ThreadId, SMSS_TEB_VA);
-                let _ = self.pm.set_thread_create_time(
-                    tid as nt_process::ThreadId,
-                    nt_system_time_100ns() as i64,
-                );
+                    .set_thread_create_time(tid, nt_system_time_100ns() as i64);
                 PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -4705,11 +4778,9 @@ impl ExecNtHandler {
         }
     }
     fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
-        self.process_mechanisms.pi_for_pid(pid).or_else(|| {
-            PM_PIDS
-                .iter()
-                .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
-        })
+        self.process_mechanisms
+            .pi_for_pid(pid)
+            .or_else(|| self.temporary_pi_for_pid(pid))
     }
 
     pub(crate) fn resolve_process_for_access(

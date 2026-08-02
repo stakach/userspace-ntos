@@ -2333,9 +2333,9 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() {
         nt_handler.bind_main_thread_entry(0, PE_LOAD_BASE + smss_pe.entry_point_rva() as u64);
     }
-    // Slots are EPROCESS-linked via `pid` (== PM_PIDS[pi]). smss is live from the initial recv; later
-    // hosted processes claim their pid on the native create-process path and fill pml4/scratch/img_end
-    // when the service loop constructs their seL4 mechanism.
+    // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
+    // the initial recv; later hosted processes claim their pid on the native create-process path and
+    // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
     let mut procs = [ProcExec::empty(); MAX_PI];
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler
@@ -2865,11 +2865,10 @@ pub(crate) unsafe fn service_sec_image(
             pi < MAX_PI,
             "hosted process pi exceeds MAX_PI — bump MAX_PI"
         );
-        // Convergence (first increment): resolve this fault badge → its real EPROCESS via the Process
-        // Manager (badge → pi → PM_PIDS[pi] → pm.process(pid)). Read-only (no alloc under the reset),
-        // it proves the live badge-multiplex is backed by real nt-process objects. The ad-hoc per-pi
-        // arrays below still carry the load-bearing mechanism state; the bulk migrates that onto the
-        // EPROCESS next (see the convergence report).
+        // Resolve this fault badge to its real EPROCESS via the handler-owned ProcessManager lookup.
+        // Read-only (no alloc under the reset), it proves the live badge-multiplex is backed by real
+        // nt-process objects. The per-pi arrays below still carry the load-bearing mechanism state;
+        // the bulk migrates that onto the EPROCESS next (see the convergence report).
         if let Some(pid) = nt_handler.pm_pid_for_pi(pi) {
             if nt_handler.pm.process(pid).is_some() {
                 PM_BADGE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
@@ -9262,10 +9261,10 @@ pub(crate) unsafe fn service_sec_image(
             const A_HANDLE: u64 = STACK_BASE + 0x80; // *DebugHandle out (8)
             const A_CLIENT_ID: u64 = STACK_BASE + 0x88; // CLIENT_ID in (16)
             const A_TIMEOUT: u64 = STACK_BASE + 0x98; // LARGE_INTEGER *Timeout in (8)
-            const A_STATE: u64 = STACK_BASE + 0xA0; // DBGUI_WAIT_STATE_CHANGE out (0xB8)
-                                                    // Free `PM_PIDS` slots: the handler maps a resolved process id back to a hosted-process
-                                                    // index, so each throwaway debuggee is registered in an UNUSED slot for the duration of
-                                                    // the test and cleared afterwards. Slots 0..=4 are the live hosted set — untouched.
+                                                      // DBGUI_WAIT_STATE_CHANGE out (0xB8).
+            const A_STATE: u64 = STACK_BASE + 0xA0;
+            // Handler-owned temporary slots let the specs exercise pid -> pi routing without
+            // publishing throwaway processes as hosted launch topology.
             const DBGK_TEST_PI: usize = MAX_PI - 1;
             const DBGK_TEST_PI2: usize = MAX_PI - 2;
 
@@ -9383,7 +9382,9 @@ pub(crate) unsafe fn service_sec_image(
                     let target = nt_handler.pm.create_process("dbgk-syscall.exe", None, None);
                     nt_handler.pm.set_image_base(target, 0x0000_0001_5000_0000);
                     let main = nt_handler.pm.create_thread(target, 0x2100, 0, false).ok();
-                    PM_PIDS[DBGK_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let target_registered = nt_handler
+                        .register_temporary_process_slot(DBGK_TEST_PI, target, 0)
+                        .is_ok();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -9466,7 +9467,11 @@ pub(crate) unsafe fn service_sec_image(
                     // --- NtDebugActiveProcess (SSN 59): [ProcessHandle, DebugHandle] -------------
                     let attaches_before = DBGK_ATTACHES.load(Ordering::Relaxed);
                     let fake_before = DBGK_FAKE_MESSAGES.load(Ordering::Relaxed);
-                    let attach = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]);
+                    let attach = if target_registered {
+                        sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle])
+                    } else {
+                        ST_INVALID_PARAMETER
+                    };
                     // 0x0004 — the attach ran IN THE HANDLER (its counter moved), installed the port
                     // + PEB.BeingDebugged and posted the fake create message; a second one is
                     // STATUS_PORT_ALREADY_SET.
@@ -9593,7 +9598,9 @@ pub(crate) unsafe fn service_sec_image(
                         .create_process("dbgk-syscall-b.exe", None, None);
                     nt_handler.pm.set_image_base(target2, 0x0000_0001_6000_0000);
                     let _ = nt_handler.pm.create_thread(target2, 0x2200, 0, false);
-                    PM_PIDS[DBGK_TEST_PI2].store(target2 as u64, Ordering::Relaxed);
+                    let target2_registered = nt_handler
+                        .register_temporary_process_slot(DBGK_TEST_PI2, target2, 0)
+                        .is_ok();
                     let h_target2 = nt_handler
                         .pm
                         .insert_handle(
@@ -9603,7 +9610,8 @@ pub(crate) unsafe fn service_sec_image(
                         )
                         .map(u64::from)
                         .unwrap_or(0);
-                    let woke = sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target2, dbg_handle]) == 0
+                    let woke = target2_registered
+                        && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target2, dbg_handle]) == 0
                         && park_index >= 0
                         && nt_handler.dispatcher_ready(park_index as usize);
                     let redriven = sysc!(
@@ -9650,8 +9658,8 @@ pub(crate) unsafe fn service_sec_image(
                         sc_ok |= 0x0400;
                     }
 
-                    PM_PIDS[DBGK_TEST_PI].store(0, Ordering::Relaxed);
-                    PM_PIDS[DBGK_TEST_PI2].store(0, Ordering::Relaxed);
+                    nt_handler.clear_temporary_process_slot(DBGK_TEST_PI);
+                    nt_handler.clear_temporary_process_slot(DBGK_TEST_PI2);
                     for handle in [
                         h_target,
                         h_target2,
@@ -9692,9 +9700,9 @@ pub(crate) unsafe fn service_sec_image(
         // hosted process's syscalls do, and the DEBUGGEE side goes through
         // `ExecNtHandler::dbgk_forward_exception` — *the very entry the live fault path calls* at
         // its `#PF` / `#GP` / int3 classification sites (`dbgk_forward_exception!`). Nothing here
-        // reimplements the forward: the throwaway debuggee is registered in a FREE `PM_PIDS` slot,
-        // so the pi → pid → `EPROCESS.DebugPort` resolution the fault path performs is the same
-        // resolution performed here.
+        // reimplements the forward: the throwaway debuggee is registered in a handler-owned
+        // temporary slot, so the pi -> pid -> `EPROCESS.DebugPort` resolution the fault path
+        // performs is the same resolution performed here.
         {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
@@ -9705,8 +9713,8 @@ pub(crate) unsafe fn service_sec_image(
             const A_CLIENT_ID: u64 = STACK_BASE + 0x188;
             const A_TIMEOUT: u64 = STACK_BASE + 0x198;
             const A_STATE: u64 = STACK_BASE + 0x1A0;
-            // Free `PM_PIDS` slots for the throwaway debuggees (cleared again below). Slots 0..=4
-            // are the live hosted set — untouched.
+            // Temporary slots for the throwaway debuggees (cleared again below). Slots 0..=4 are
+            // the live hosted set and remain untouched.
             const EXC_TEST_PI: usize = MAX_PI - 1;
             const EXC_TEST_PI2: usize = MAX_PI - 2;
 
@@ -9779,12 +9787,16 @@ pub(crate) unsafe fn service_sec_image(
                     // A second thread so terminating one (the lifecycle poster below) does not
                     // signal the process and tear its handles down.
                     let worker = nt_handler.pm.create_thread(target, 0x3200, 0, false).ok();
-                    PM_PIDS[EXC_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let target_registered = nt_handler
+                        .register_temporary_process_slot(EXC_TEST_PI, target, 0)
+                        .is_ok();
                     // A NEVER-attached process in the OTHER free slot: the live-boot shape, the
                     // control for the no-debugger gate.
                     let plain = nt_handler.pm.create_process("dbgk-plain.exe", None, None);
                     let _ = nt_handler.pm.create_thread(plain, 0x3300, 0, false);
-                    PM_PIDS[EXC_TEST_PI2].store(plain as u64, Ordering::Relaxed);
+                    let plain_registered = nt_handler
+                        .register_temporary_process_slot(EXC_TEST_PI2, plain, 0)
+                        .is_ok();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -9812,7 +9824,8 @@ pub(crate) unsafe fn service_sec_image(
                     // other one) so the queue is empty and the exception below is unambiguously the
                     // outstanding event. Each drain step reads the reported CLIENT_ID straight back
                     // out of the state change in CLIENT memory and continues that exact thread.
-                    let attached = h_target != 0
+                    let attached = target_registered
+                        && h_target != 0
                         && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
                         && nt_handler.pm.process_debug_port(target) == Some(object);
                     let mut drained = 0u64;
@@ -9979,12 +9992,14 @@ pub(crate) unsafe fn service_sec_image(
                         .debug_object(object)
                         .map(|o| o.len())
                         .unwrap_or(0);
-                    if !nt_handler.dbgk_forward_exception(
-                        EXC_TEST_PI2,
-                        0,
-                        dbgk::ExceptionRecord::access_violation(0x1000, 0, 0x40),
-                        true,
-                    ) && !nt_handler.pm.is_process_being_debugged(plain)
+                    if plain_registered
+                        && !nt_handler.dbgk_forward_exception(
+                            EXC_TEST_PI2,
+                            0,
+                            dbgk::ExceptionRecord::access_violation(0x1000, 0, 0x40),
+                            true,
+                        )
+                        && !nt_handler.pm.is_process_being_debugged(plain)
                         && DBGK_EXCEPTIONS_FORWARDED.load(Ordering::Relaxed) == quiet_before
                         && nt_handler
                             .pm
@@ -10082,8 +10097,8 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.wait_park_event = -1;
                     nt_handler.wait_deadline_100ns = u64::MAX;
 
-                    PM_PIDS[EXC_TEST_PI].store(0, Ordering::Relaxed);
-                    PM_PIDS[EXC_TEST_PI2].store(0, Ordering::Relaxed);
+                    nt_handler.clear_temporary_process_slot(EXC_TEST_PI);
+                    nt_handler.clear_temporary_process_slot(EXC_TEST_PI2);
                     for handle in [h_target, h_worker] {
                         if handle != 0 {
                             let _ = nt_handler
@@ -10121,8 +10136,8 @@ pub(crate) unsafe fn service_sec_image(
         // DEBUGGEE side goes through `ExecNtHandler::dbgk_module_load` / `dbgk_module_unload` —
         // *the very entries the live `NtMapViewOfSection` SEC_IMAGE branch and the
         // `NtUnmapViewOfSection` arm call*. Nothing is reimplemented for the test: each throwaway
-        // process sits in a FREE `PM_PIDS` slot, so the pi → pid → `EPROCESS.DebugPort` resolution
-        // is the same one the mapping path performs.
+        // process sits in a handler-owned temporary slot, so the pi -> pid ->
+        // `EPROCESS.DebugPort` resolution is the same one the mapping path performs.
         {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
@@ -10132,7 +10147,7 @@ pub(crate) unsafe fn service_sec_image(
             const A_CLIENT_ID: u64 = STACK_BASE + 0x288;
             const A_TIMEOUT: u64 = STACK_BASE + 0x298;
             const A_STATE: u64 = STACK_BASE + 0x2A0;
-            // Free `PM_PIDS` slots (cleared again below); slots 0..=4 are the live hosted set.
+            // Temporary slots are cleared again below; slots 0..=4 are the live hosted set.
             const MOD_TEST_PI: usize = MAX_PI - 1;
             const MOD_TEST_PI2: usize = MAX_PI - 2;
             // The debuggee's own image base + the IMAGE views this test maps into it.
@@ -10214,7 +10229,9 @@ pub(crate) unsafe fn service_sec_image(
                     let target = nt_handler.pm.create_process("dbgk-module.exe", None, None);
                     nt_handler.pm.set_image_base(target, TARGET_IMAGE_BASE);
                     let main = nt_handler.pm.create_thread(target, 0x4100, 0, false).ok();
-                    PM_PIDS[MOD_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let target_registered = nt_handler
+                        .register_temporary_process_slot(MOD_TEST_PI, target, 0)
+                        .is_ok();
                     // The NEVER-attached control — the live-boot shape, and later the subject of the
                     // attach-time fake-module proof.
                     let plain = nt_handler
@@ -10222,7 +10239,9 @@ pub(crate) unsafe fn service_sec_image(
                         .create_process("dbgk-modplain.exe", None, None);
                     nt_handler.pm.set_image_base(plain, PLAIN_IMAGE_BASE);
                     let plain_main = nt_handler.pm.create_thread(plain, 0x4200, 0, false).ok();
-                    PM_PIDS[MOD_TEST_PI2].store(plain as u64, Ordering::Relaxed);
+                    let plain_registered = nt_handler
+                        .register_temporary_process_slot(MOD_TEST_PI2, plain, 0)
+                        .is_ok();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -10254,7 +10273,8 @@ pub(crate) unsafe fn service_sec_image(
                         .unwrap_or(0);
 
                     // --- 0x0001 setup: attach + drain the fake create message, all by SSN --------
-                    let attached = h_target != 0
+                    let attached = target_registered
+                        && h_target != 0
                         && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
                         && nt_handler.pm.process_debug_port(target) == Some(object);
                     let mut client_id = [0u8; 16];
@@ -10410,13 +10430,15 @@ pub(crate) unsafe fn service_sec_image(
                         .map(|o| o.len())
                         .unwrap_or(0);
                     nt_handler.current_tid = plain_main.unwrap_or(0) as u64;
-                    let gated = !nt_handler.dbgk_module_load(
-                        MOD_TEST_PI2,
-                        PLAIN_PROBE_BASE,
-                        0,
-                        DBG_INFO,
-                        NAME_POINTER,
-                    ) && !nt_handler.dbgk_module_unload(MOD_TEST_PI2, PLAIN_PROBE_BASE);
+                    let gated = plain_registered
+                        && !nt_handler.dbgk_module_load(
+                            MOD_TEST_PI2,
+                            PLAIN_PROBE_BASE,
+                            0,
+                            DBG_INFO,
+                            NAME_POINTER,
+                        )
+                        && !nt_handler.dbgk_module_unload(MOD_TEST_PI2, PLAIN_PROBE_BASE);
                     nt_handler.current_tid = debugger_tid as u64;
                     if gated
                         && !nt_handler.pm.is_process_being_debugged(plain)
@@ -10447,7 +10469,8 @@ pub(crate) unsafe fn service_sec_image(
                     let premapped = DBGK_MODULE_LOADS.load(Ordering::Relaxed) == premapped_loads
                         && nt_handler.pm.module_count(plain) == 3;
                     let fake_before = DBGK_FAKE_MESSAGES.load(Ordering::Relaxed);
-                    let attach_plain = h_plain != 0
+                    let attach_plain = plain_registered
+                        && h_plain != 0
                         && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_plain, dbg_handle]) == 0;
                     if premapped
                         && attach_plain
@@ -10517,8 +10540,8 @@ pub(crate) unsafe fn service_sec_image(
                         md_ok |= 0x0080;
                     }
 
-                    PM_PIDS[MOD_TEST_PI].store(0, Ordering::Relaxed);
-                    PM_PIDS[MOD_TEST_PI2].store(0, Ordering::Relaxed);
+                    nt_handler.clear_temporary_process_slot(MOD_TEST_PI);
+                    nt_handler.clear_temporary_process_slot(MOD_TEST_PI2);
                     for handle in [h_target, h_plain] {
                         if handle != 0 {
                             let _ = nt_handler
@@ -10565,9 +10588,9 @@ pub(crate) unsafe fn service_sec_image(
         //
         // The DEBUGGER side runs through the REAL dispatch route (`nt_dispatcher.dispatch(SSN, …)`
         // with the arguments marshalled in smss's CLIENT memory, the established idiom); the TARGET
-        // side runs through `dbgk_forward_exception` / `dbgk_module_load` / `dbgk_block_reporter` —
+        // side runs through `dbgk_forward_exception` / `dbgk_module_load` / `dbgk_block_reporter` -
         // the very entries the live fault loop and the live `NtMapViewOfSection` arm call.
-        // Throwaway-only: a free `PM_PIDS` slot, fresh caps, all reclaimed afterwards.
+        // Throwaway-only: a temporary handler slot, fresh caps, all reclaimed afterwards.
         {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
@@ -10675,14 +10698,16 @@ pub(crate) unsafe fn service_sec_image(
                     _ => None,
                 };
                 if let (0, Some(object)) = (created, object) {
-                    // The debuggee EPROCESS standing for the throwaway CLIENT THREAD, in a FREE
-                    // PM_PIDS slot so the pi → pid → DebugPort resolution is the real one. A second
+                    // The debuggee EPROCESS standing for the throwaway CLIENT THREAD, in a free
+                    // temporary slot so pi -> pid -> DebugPort resolution is the real one. A second
                     // thread keeps the process alive when the first is terminated by DBG_TERMINATE.
                     let target = nt_handler.pm.create_process("dbgk-block.exe", None, None);
                     nt_handler.pm.set_image_base(target, 0x0000_0001_9000_0000);
                     let main = nt_handler.pm.create_thread(target, 0x5100, 0, false).ok();
                     let _keepalive = nt_handler.pm.create_thread(target, 0x5200, 0, false).ok();
-                    PM_PIDS[BLK_TEST_PI].store(target as u64, Ordering::Relaxed);
+                    let target_registered = nt_handler
+                        .register_temporary_process_slot(BLK_TEST_PI, target, 0)
+                        .is_ok();
                     let main_tid = main.unwrap_or(0);
                     let h_target = nt_handler
                         .pm
@@ -10711,7 +10736,8 @@ pub(crate) unsafe fn service_sec_image(
                     // 0x0001 — setup: attach BY SSN + drain the fake create message BY SSN. The
                     // FIRST recv also proves the client thread really ran (marker 1) and really
                     // faulted (its `#PF` on the deliberately-unmapped page).
-                    let attach_ok = h_target != 0
+                    let attach_ok = target_registered
+                        && h_target != 0
                         && cid_written
                         && sysc!(SSN_NT_DEBUG_ACTIVE_PROCESS, &[h_target, dbg_handle]) == 0
                         && nt_handler.pm.process_debug_port(target) == Some(object);
@@ -11245,7 +11271,7 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = cnode_delete_recycle_r(dbg_tcb);
                     let _ = cnode_delete_recycle_r(client_pml4);
                     let _ = cnode_delete_recycle_r(dbg_pml4);
-                    PM_PIDS[BLK_TEST_PI].store(0, Ordering::Relaxed);
+                    nt_handler.clear_temporary_process_slot(BLK_TEST_PI);
                 }
             }
 
@@ -11478,10 +11504,12 @@ pub(crate) unsafe fn service_sec_image(
                 .pm
                 .create_thread(target, 0, 0, false)
                 .unwrap_or(0);
-            PM_PIDS[BRK_TEST_PI].store(target as u64, Ordering::Relaxed);
-            PM_PML4S[BRK_TEST_PI].store(target_pml4, Ordering::Relaxed);
-            PM_POOL_TID[BRK_TEST_PI][0].store(pool_tid as u64, Ordering::Relaxed);
-            PM_POOL_USED[BRK_TEST_PI].store(0, Ordering::Relaxed);
+            let target_registered = nt_handler
+                .register_temporary_process_slot(BRK_TEST_PI, target, target_pml4)
+                .is_ok();
+            let pool_registered = nt_handler
+                .register_temporary_pool_thread_slot(BRK_TEST_PI, 0, pool_tid)
+                .is_ok();
             // This process HAS its initial thread, so a foreign-handle create is a genuine
             // ADDITIONAL thread — the real cross-VSpace path (exactly the live rule).
             PM_INITIAL_THREAD_DONE.fetch_or(1u64 << BRK_TEST_PI, Ordering::Relaxed);
@@ -11514,11 +11542,14 @@ pub(crate) unsafe fn service_sec_image(
                 && code_mapped
                 && target_main != 0
                 && pool_tid != 0
+                && target_registered
+                && pool_registered
                 && h_target != 0
                 && h_target_no_create != 0
                 && args_ready
                 && debugger_pid != 0;
 
+            let mut spawned_breakin_tid = 0u64;
             if setup_ok {
                 // ── 0x0001 — a real DEBUG_OBJECT + attach BY SSN, fake create messages drained ──
                 let created = sysc!(
@@ -11706,6 +11737,15 @@ pub(crate) unsafe fn service_sec_image(
                             resume: request.resume,
                         });
                         if tcb != 0 {
+                            TP_WORKER_TCB[BRK_TEST_PI][0].store(tcb, Ordering::Relaxed);
+                            nt_handler.register_hosted_thread_tcb(
+                                BRK_TEST_PI,
+                                request.cid_thread,
+                                tcb,
+                                tp_worker_badge(BRK_TEST_PI, request.slot),
+                                HostedThreadRole::TpWorker { slot: request.slot },
+                            );
+                            spawned_breakin_tid = request.cid_thread;
                             PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -11832,9 +11872,11 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = cnode_delete_recycle_r(s);
                 }
             }
-            PM_PIDS[BRK_TEST_PI].store(0, Ordering::Relaxed);
-            PM_PML4S[BRK_TEST_PI].store(0, Ordering::Relaxed);
-            PM_POOL_TID[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
+            if spawned_breakin_tid != 0 {
+                let _ = nt_handler.release_hosted_thread_runtime(spawned_breakin_tid);
+            }
+            nt_handler.clear_temporary_pool_thread_slot(BRK_TEST_PI, 0);
+            nt_handler.clear_temporary_process_slot(BRK_TEST_PI);
             TP_WORKER_TID[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
             TP_WORKER_TCB[BRK_TEST_PI][0].store(0, Ordering::Relaxed);
             PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << BRK_TEST_PI), Ordering::Relaxed);

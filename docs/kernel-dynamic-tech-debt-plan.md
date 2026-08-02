@@ -131,3 +131,12 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `tp_worker_identity_for_tid` scanner, including the main-thread `PM_TIDS` fallback. Review
   adjustment: remaining A3 mirror debt is now limited to synchronized mirror writes and self-test
   temporary `PM_POOL_TID` slots; production TCB lookup no longer has a mirror fallback.
+- A3 continued. Post-quiesce debug self-tests now register throwaway debuggee processes through
+  handler-owned temporary process slots instead of writing raw `PM_PIDS` entries, and the remote
+  break-in proof registers its throwaway pool ETHREAD through the same thread mechanism table used by
+  hosted runtime thread creation. `pm_pid_for_pi`, `pi_for_pid`, `pm_main_tid_for_pi`, and
+  `pm_pool_tid_for_slot` no longer scan or read PID/TID mirrors; the table-backed lookup is
+  authoritative, with temporary self-test slots explicit and bounded. Review adjustment: remaining
+  A3 work is now the low-level mechanism state still keyed by `PM_PML4S` and
+  `PM_POOL_SUSPENDED`, plus the compatibility mirror writes kept for code outside
+  `ExecNtHandler`.
