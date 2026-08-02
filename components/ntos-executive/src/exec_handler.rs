@@ -437,6 +437,55 @@ impl ExecNtHandler {
         }
         let time_zone_information = seed_time_zone(hive.as_ref());
         unsafe { publish_time_zone(time_zone_information, nt_system_time_100ns()) };
+        let mut pm = nt_process::ProcessManager::new();
+        let mut bootstrap_pids: [nt_process::ProcessId; 3] = [0; 3];
+        let mut bootstrap_main_tids: [nt_process::ThreadId; 3] = [0; 3];
+        let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3] =
+            [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
+        // Path 1b: append-only handle values. The executive hands each hosted process its
+        // OWN dense per-process handle VALUES (real NT), then indexes external state (the
+        // per-pi DLL registry, EXE section scalars) by those values. NT-style slot reuse
+        // would recycle a value while stale bindings to the old value still exist ->
+        // mis-routing the next open; append-only keeps every value monotonic for the run.
+        pm.set_handle_no_reuse(true);
+        // Dbgk module tracking (`DbgkMapViewOfSection`'s `PEB->Ldr` equivalent): reserve the
+        // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
+        // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
+        pm.reserve_modules(64);
+        for pi in 0..MAX_PI {
+            reset_hosted_process_mirror_slot(pi);
+        }
+        PM_PROC_COUNT.store(0, Ordering::Relaxed);
+        PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
+        PM_IDENTITY_OK.store(0, Ordering::Relaxed);
+        PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
+        PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
+        let smss_pid = pm.create_process("smss.exe", None, None);
+        let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
+        let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
+        bootstrap_pids.copy_from_slice(&[smss_pid, csrss_pid, winlogon_pid]);
+        for &pid in &bootstrap_pids {
+            let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
+        }
+        // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
+        // identity sequence. Later hosted processes get the same setup at successful
+        // `NtCreateProcess[Ex]`.
+        for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+            if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                bootstrap_main_tids[pi] = tid;
+            }
+        }
+        for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+            for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                    let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
+                    bootstrap_pool_tids[pi][slot] = tid;
+                }
+            }
+        }
+        for &pid in &bootstrap_pids {
+            pm.reserve_handles(pid, PM_HANDLE_RESERVE);
+        }
         let mut handler = ExecNtHandler {
             hive,
             security_hive,
@@ -544,57 +593,10 @@ impl ExecNtHandler {
             csr_view_mask: 0,
             // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
             // subsystem handshake; post-winlogon children are created by the live
-            // `NtCreateProcess[Ex]` path that ReactOS drives. The fixed `pi` arrays remain the seL4
-            // mechanism slots for now; `PM_PIDS[pi]` is filled when a slot is claimed.
-            pm: {
-                let mut pm = nt_process::ProcessManager::new();
-                // Path 1b: append-only handle values. The executive hands each hosted process its
-                // OWN dense per-process handle VALUES (real NT), then indexes external state (the
-                // per-pi DLL registry, EXE section scalars) by those values. NT-style slot reuse
-                // would recycle a value while stale bindings to the old value still exist →
-                // mis-routing the next open; append-only keeps every value monotonic for the run.
-                pm.set_handle_no_reuse(true);
-                // Dbgk module tracking (`DbgkMapViewOfSection`'s `PEB->Ldr` equivalent): reserve the
-                // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
-                // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
-                pm.reserve_modules(64);
-                for pi in 0..MAX_PI {
-                    reset_hosted_process_mirror_slot(pi);
-                }
-                PM_PROC_COUNT.store(0, Ordering::Relaxed);
-                PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
-                PM_IDENTITY_OK.store(0, Ordering::Relaxed);
-                PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
-                PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
-                let smss_pid = pm.create_process("smss.exe", None, None);
-                let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
-                let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
-                let bootstrap_pids = [smss_pid, csrss_pid, winlogon_pid];
-                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-                    store_hosted_pid_mirror(pi, pid);
-                    let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
-                }
-                // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
-                // identity sequence. Later hosted processes get the same setup at successful
-                // `NtCreateProcess[Ex]`.
-                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-                    if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                        store_hosted_main_tid_mirror(pi, tid);
-                    }
-                }
-                for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                        if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                            let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
-                            store_hosted_pool_tid_mirror(pi, slot, tid);
-                        }
-                    }
-                }
-                for pid in bootstrap_pids {
-                    pm.reserve_handles(pid, PM_HANDLE_RESERVE);
-                }
-                pm
-            },
+            // `NtCreateProcess[Ex]` path that ReactOS drives. Mechanism tables below are the
+            // authoritative hosted identity map; the old `PM_*` mirrors are updated only as a
+            // temporary compatibility shadow.
+            pm,
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
             thread_runtime: HostedThreadRuntimes::reset(),
@@ -611,9 +613,17 @@ impl ExecNtHandler {
             dll_loaded_dirty: false,
             writable_fs_dirty: false,
         };
-        for pi in 0..3 {
-            let _ = handler.claim_hosted_process_mechanism(pi);
-            let _ = handler.claim_hosted_thread_mechanisms(pi);
+        for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+            let main_tid = bootstrap_main_tids[pi];
+            if pid != 0 && main_tid != 0 {
+                let _ = handler.register_hosted_process_identity(pi, pid, main_tid);
+                for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                    let tid = bootstrap_pool_tids[pi][slot];
+                    if tid != 0 {
+                        let _ = handler.register_hosted_pool_thread_identity(pi, slot, tid);
+                    }
+                }
+            }
             let tcb = PM_MAIN_TCBS[pi].load(Ordering::Relaxed);
             handler.register_main_thread_tcb(pi, tcb);
         }
@@ -1803,60 +1813,69 @@ impl ExecNtHandler {
         nt_exe_image::hosted_top_badge_for_pi(pi)
     }
 
-    fn claim_hosted_process_mechanism(&mut self, pi: usize) -> Result<(), u32> {
-        let pid = self
-            .pm_pid_for_pi(pi)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let tid = self
-            .pm_main_tid_for_pi(pi)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let badge =
-            Self::hosted_mechanism_badge_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-
-        match self.process_mechanisms.claim_or_get(pi, pid, tid, badge) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
-        }
-    }
-
-    fn claim_main_thread_mechanism(&mut self, pi: usize) -> Result<(), u32> {
-        let tid = self
-            .pm_main_tid_for_pi(pi)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-
+    fn register_hosted_main_thread_identity(
+        &mut self,
+        pi: usize,
+        tid: nt_process::ThreadId,
+    ) -> Result<bool, u32> {
         match self.thread_mechanisms.claim_main(pi, tid) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(nt_user_host::MechanismError::SlotOccupied)
                 if self.thread_mechanisms.main_tid_for_pi(pi) == Some(tid) =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
         }
     }
 
-    fn claim_pool_thread_mechanism(&mut self, pi: usize, slot: usize) -> Result<(), u32> {
-        let Some(tid) = self.pm_pool_tid_for_slot(pi, slot) else {
-            return Ok(());
-        };
+    fn register_hosted_process_identity(
+        &mut self,
+        pi: usize,
+        pid: nt_process::ProcessId,
+        main_tid: nt_process::ThreadId,
+    ) -> Result<(), u32> {
+        let badge =
+            Self::hosted_mechanism_badge_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let main_claimed = self.register_hosted_main_thread_identity(pi, main_tid)?;
 
+        match self
+            .process_mechanisms
+            .claim_or_get(pi, pid, main_tid, badge)
+        {
+            Ok(_) => {
+                store_hosted_pid_mirror(pi, pid);
+                store_hosted_main_tid_mirror(pi, main_tid);
+                Ok(())
+            }
+            Err(_) => {
+                if main_claimed {
+                    let _ = self.thread_mechanisms.release_main(pi);
+                }
+                Err(nt_process::STATUS_INVALID_PARAMETER)
+            }
+        }
+    }
+
+    fn register_hosted_pool_thread_identity(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: nt_process::ThreadId,
+    ) -> Result<(), u32> {
         match self.thread_mechanisms.claim_pool(pi, slot, tid) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                store_hosted_pool_tid_mirror(pi, slot, tid);
+                Ok(())
+            }
             Err(nt_user_host::MechanismError::SlotOccupied)
                 if self.thread_mechanisms.pool_tid_for_slot(pi, slot) == Some(tid) =>
             {
+                store_hosted_pool_tid_mirror(pi, slot, tid);
                 Ok(())
             }
             Err(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
         }
-    }
-
-    fn claim_hosted_thread_mechanisms(&mut self, pi: usize) -> Result<(), u32> {
-        self.claim_main_thread_mechanism(pi)?;
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            self.claim_pool_thread_mechanism(pi, slot)?;
-        }
-        Ok(())
     }
 
     fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
@@ -2062,16 +2081,15 @@ impl ExecNtHandler {
             .pm_pid_for_pi(creator_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let pid = self.pm.create_process(name, Some(parent), None);
-        store_hosted_pid_mirror(child_pi, pid);
-        reset_hosted_pool_mirror_slot(child_pi);
+        reset_hosted_process_mirror_slot(child_pi);
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
-        store_hosted_main_tid_mirror(child_pi, main_tid);
+        self.register_hosted_process_identity(child_pi, pid, main_tid)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
                 let _ = self
                     .pm
                     .set_thread_state(tid, nt_process::ThreadState::Initialized);
-                store_hosted_pool_tid_mirror(child_pi, slot, tid);
+                self.register_hosted_pool_thread_identity(child_pi, slot, tid)?;
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
@@ -2080,8 +2098,6 @@ impl ExecNtHandler {
         self.token_dirty = true;
         self.process_dirty = true;
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        self.claim_hosted_process_mechanism(child_pi)?;
-        self.claim_hosted_thread_mechanisms(child_pi)?;
         self.refresh_process_manager_gates();
         unsafe {
             print_str(b"[pm-dynamic] allocated hosted process pi=");

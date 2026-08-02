@@ -103,3 +103,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: the remaining direct mirror accesses are concentrated in loop selection diagnostics
   and self-test scaffolding; production launch should next register ProcessManager/process
   mechanisms atomically so the old mirror fallback can be deleted.
+- A3 continued. Bootstrap ProcessManager setup now preserves the real bootstrap PID/TID values and
+  registers process/thread mechanisms from those values directly after `ExecNtHandler` is built.
+  Dynamic child process creation registers the process and pool-thread mechanisms as part of the
+  spawn path, with `PM_*` mirrors updated only after mechanism registration succeeds. Review
+  adjustment: production process identity no longer depends on mirror reads to claim mechanisms;
+  the remaining fallback reads are now compatibility for loop diagnostics and self-test-only
+  temporary process slots.
