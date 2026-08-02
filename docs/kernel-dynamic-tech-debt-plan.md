@@ -444,3 +444,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   dispatches returned `status=0` where the previous run parked. Review adjustment: the next concrete
   explorer frontier is the later `NtGdiCreateBitmap` (`0x106c`) wall, followed by the existing
   explorer `RegisterWindowMessage`, api0 callback redirection, client WndProc, and shell COM gates.
+- C3 repair. `NtGdiCreateBitmap` now treats the optional fifth argument as an explicit
+  cross-address-space boundary for interactive hosted GUI clients. The executive probes the hosted
+  caller stack for `pUnsafeBits`, computes the ReactOS bitmap initializer byte count, preloads
+  source DLL/resource pages, copies bounded initializer bits into the win32k shared argument frame,
+  and dispatches with an explicit stack argument for both copied-bit and NULL-bit calls. Failed input
+  probes return NULL rather than inventing a successful bitmap handle. Validation:
+  `.tmp/full-boot-create-bitmap-tail-20260803-073354.log` reached `RUN_RC=0`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
+  exec_explorer_process_spawned`, and explorer completed 16 `0x106c` calls instead of parking at the
+  previous `NtGdiCreateBitmap` wall. Review adjustment: the next concrete explorer wall is
+  `NtUserGetIconInfo` (`0x11d9`) after icon bitmap creation, while the still-failing gates remain
+  explorer `RegisterWindowMessage` capture, api0/user-callback redirection, client-installed WndProc,
+  and shell COM class provisioning. The older noninteractive service GDI handle fakes were not
+  expanded by this slice and remain C3/F1 debt.

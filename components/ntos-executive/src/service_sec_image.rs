@@ -15,11 +15,13 @@ static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
+const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
 const WM_QUIT: u32 = 0x0012;
 
 fn win32k_client_label<'a>(nt_handler: &'a ExecNtHandler, pi: usize) -> &'a [u8] {
@@ -69,6 +71,61 @@ fn hosted_process_is_noninteractive_service_gui_client(
 ) -> bool {
     nt_handler.hosted_process_role(pi)
         == Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
+}
+
+fn ntgdi_bitmap_format_rgb(bits: u32) -> u32 {
+    if bits <= 1 {
+        1
+    } else if bits <= 4 {
+        2
+    } else if bits <= 8 {
+        3
+    } else if bits <= 16 {
+        4
+    } else if bits <= 24 {
+        5
+    } else if bits <= 32 {
+        6
+    } else {
+        0
+    }
+}
+
+fn ntgdi_bits_per_format(format: u32) -> Option<u64> {
+    match format {
+        1 => Some(1),
+        2 => Some(4),
+        3 => Some(8),
+        4 => Some(16),
+        5 => Some(24),
+        6 => Some(32),
+        _ => None,
+    }
+}
+
+fn ntgdi_create_bitmap_bits_size(
+    width: u64,
+    height: u64,
+    planes: u64,
+    bits_pixel: u64,
+) -> Option<usize> {
+    let width = (width as u32) as i32;
+    let height = (height as u32) as i32;
+    let planes = planes as u32;
+    let bits_pixel = bits_pixel as u32;
+    let c_bits = planes.checked_mul(bits_pixel)?;
+    let format = ntgdi_bitmap_format_rgb(c_bits);
+    let real_bpp = ntgdi_bits_per_format(format)?;
+    if width <= 0 || width >= 0x0800_0000 || height <= 0 || bits_pixel > 32 || planes > 32 {
+        return None;
+    }
+    let row_bits = (width as u64).checked_mul(real_bpp)?;
+    let row_bytes = row_bits.checked_add(15).map(|bits| (bits & !15) >> 3)?;
+    let size = row_bytes.checked_mul(height as u64)?;
+    if size >= 0x1_0000_0000 || size > usize::MAX as u64 {
+        return None;
+    }
+    Some(size as usize)
 }
 
 fn sec_image_forward_run() -> u64 {
@@ -6657,6 +6714,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut build_hwnd_list_stack_args = [0u64; 3];
                 let mut build_hwnd_list_stack_arg_count = 0usize;
                 let mut build_hwnd_list_copyout = (0u64, 0u64, 0u64, 0u64);
+                let mut create_bitmap_stack_args = [0u64; 1];
+                let mut create_bitmap_stack_arg_count = 0usize;
+                let mut create_bitmap_probe_failed = false;
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -6786,6 +6846,96 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b"\n");
                             }
                         }
+                    }
+                } else if m0 == 0x106c && sp != 0 && hosted_process_uses_client_gdi(&nt_handler, pi)
+                {
+                    // NtGdiCreateBitmap's fifth argument is an optional client pointer to
+                    // initialized bitmap bits. ReactOS probes and copies that range before
+                    // UnsafeSetBitmapBits; isolated win32k must receive a pointer in its own address
+                    // space, not a raw hosted-client VA that may later collapse inside EngCopyBits.
+                    let bits = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x28,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let Some(bits) = bits {
+                        create_bitmap_stack_args = [0];
+                        create_bitmap_stack_arg_count = create_bitmap_stack_args.len();
+                        let size = ntgdi_create_bitmap_bits_size(a0, a1, a2, a3);
+                        if bits != 0 {
+                            if let Some(bytes) = size {
+                                if bytes <= WIN32K_CREATE_BITMAP_STAGE_BYTES {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        bits,
+                                        bytes,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                                    core::ptr::write_bytes(
+                                        arg as *mut u8,
+                                        0,
+                                        WIN32K_CREATE_BITMAP_STAGE_BYTES,
+                                    );
+                                    let input =
+                                        core::slice::from_raw_parts_mut(arg as *mut u8, bytes);
+                                    if img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        bits,
+                                        input,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    ) {
+                                        create_bitmap_stack_args = [arg];
+                                        let n = CREATE_BITMAP_MARSHAL_TRACE
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if n < 24 {
+                                            print_str(b"[w32marshal] NtGdiCreateBitmap pi=");
+                                            print_u64(pi as u64);
+                                            print_str(b" ");
+                                            print_u64(a0 as u32 as u64);
+                                            print_str(b"x");
+                                            print_u64(a1 as u32 as u64);
+                                            print_str(b" planes=");
+                                            print_u64(a2 as u32 as u64);
+                                            print_str(b" bpp=");
+                                            print_u64(a3 as u32 as u64);
+                                            print_str(b" bits=0x");
+                                            print_hex_u64(bits);
+                                            print_str(b" bytes=");
+                                            print_u64(bytes as u64);
+                                            print_str(b"\n");
+                                        }
+                                    } else {
+                                        create_bitmap_probe_failed = true;
+                                    }
+                                } else {
+                                    create_bitmap_probe_failed = true;
+                                }
+                            }
+                        } else {
+                            let n = CREATE_BITMAP_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 24 {
+                                print_str(b"[w32marshal] NtGdiCreateBitmap explicit-null pi=");
+                                print_u64(pi as u64);
+                                print_str(b" ");
+                                print_u64(a0 as u32 as u64);
+                                print_str(b"x");
+                                print_u64(a1 as u32 as u64);
+                                print_str(b" planes=");
+                                print_u64(a2 as u32 as u64);
+                                print_str(b" bpp=");
+                                print_u64(a3 as u32 as u64);
+                                print_str(b"\n");
+                            }
+                        }
+                    } else {
+                        create_bitmap_probe_failed = true;
                     }
                 } else if m0 == 0x10de && pi != 3 && pi != 4 {
                     // NtGdiOpenDCW probes/copies the caller's optional device name before opening
@@ -7409,6 +7559,22 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> atom 0\n");
                     }
                     (hit.unwrap_or(0) as u64, true)
+                } else if create_bitmap_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiCreateBitmap input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" ");
+                        print_u64(a0 as u32 as u64);
+                        print_str(b"x");
+                        print_u64(a1 as u32 as u64);
+                        print_str(b" planes=");
+                        print_u64(a2 as u32 as u64);
+                        print_str(b" bpp=");
+                        print_u64(a3 as u32 as u64);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if m0 == 0x103d && svc_noninteractive {
                     // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -7638,11 +7804,15 @@ pub(crate) unsafe fn service_sec_image(
                         m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
                     let build_hwnd_list_staged_stack = m0 == 0x101b
                         && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
+                    let create_bitmap_staged_stack = m0 == 0x106c
+                        && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
                     let (dispatch_sp, dispatch_stack_args): (u64, &[u64]) = if open_dcw_staged_stack
                     {
                         (0, &open_dcw_stack_args)
                     } else if build_hwnd_list_staged_stack {
                         (0, &build_hwnd_list_stack_args)
+                    } else if create_bitmap_staged_stack {
+                        (0, &create_bitmap_stack_args)
                     } else {
                         (sp, &[])
                     };
@@ -13807,6 +13977,31 @@ unsafe fn ensure_client_copyin_dll_page(
     let _ = fill_image_page(tpe, rva, alias);
     client_copyin_frame_put(pi, page, frame, alias);
     true
+}
+
+unsafe fn prefill_client_copyin_dll_range_pages(
+    pi: u64,
+    va: u64,
+    len: usize,
+    scratch_base: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) {
+    if len == 0 {
+        return;
+    }
+    let Some(last) = va.checked_add(len as u64 - 1) else {
+        return;
+    };
+    let mut page = va & !0xfffu64;
+    let last_page = last & !0xfffu64;
+    loop {
+        let _ = ensure_client_copyin_dll_page(pi, page, scratch_base, reg, dll_pes);
+        if page == last_page {
+            break;
+        }
+        page += 0x1000;
+    }
 }
 
 unsafe fn prefill_client_large_string_pages(
