@@ -1951,6 +1951,17 @@ impl ExecNtHandler {
         (runtime.tid != 0 && runtime.tcb > 1).then_some((runtime.tid, runtime.tcb, runtime.badge))
     }
 
+    pub(crate) fn hosted_thread_tid_for_role(
+        &self,
+        pi: usize,
+        role: HostedThreadRole,
+    ) -> Option<u64> {
+        self.thread_runtime
+            .get_by_role(pi, role)
+            .map(|runtime| runtime.tid)
+            .filter(|&tid| tid != 0)
+    }
+
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
         self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
     }
@@ -2151,7 +2162,7 @@ impl ExecNtHandler {
         )
     }
 
-    fn hosted_thread_role_for_badge(badge: u64) -> Option<HostedThreadRole> {
+    pub(crate) fn hosted_thread_role_for_badge(badge: u64) -> Option<HostedThreadRole> {
         match badge {
             WINLOGON_WORKER_BADGE => Some(HostedThreadRole::WinlogonListener),
             WINLOGON_WORKER2_BADGE => Some(HostedThreadRole::WinlogonWorker { slot: 1 }),

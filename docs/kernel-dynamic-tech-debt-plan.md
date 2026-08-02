@@ -162,3 +162,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   runtime-table lookup instead of selecting from win32k's legacy TID/TCB mirrors. Review adjustment:
   remaining A3/A4 runtime debt is now concentrated in spawn-slot reservation/publication,
   compatibility mirror cleanup, service-loop current-TID diagnostics, and gate-only debug probes.
+- A3/A4 continued. The service loop's per-syscall `current_tid` derivation now resolves TP workers
+  and named hosted workers through registered runtime roles instead of reading `TP_WORKER_TID`,
+  `SVC_LISTENER_TID`, `WL_WORKER*_TID`, `LSASS_LISTENER*_TID`, or `LSA_WORKER_TID` cells. Review
+  adjustment: remaining A3/A4 runtime debt is concentrated in spawn-slot reservation/publication,
+  compatibility mirror cleanup, and gate-only/self-test probes.

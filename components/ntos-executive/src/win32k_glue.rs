@@ -2304,10 +2304,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let completed_role =
-        callback_runtime_role_from_code(completed_frame.client_runtime_role());
-    let component =
-        resume_suspended_user_callback_component(request, completed_frame.client_tcb(), completed_role);
+    let completed_role = callback_runtime_role_from_code(completed_frame.client_runtime_role());
+    let component = resume_suspended_user_callback_component(
+        request,
+        completed_frame.client_tcb(),
+        completed_role,
+    );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,

@@ -4669,25 +4669,11 @@ pub(crate) unsafe fn service_sec_image(
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let current_tid = if let Some((tp_pi, tp_slot)) = tp_worker_identity {
-                TP_WORKER_TID[tp_pi][tp_slot].load(Ordering::Relaxed)
-            } else if is_svc_listener {
-                SVC_LISTENER_TID.load(Ordering::Relaxed)
-            } else if is_scm_worker {
-                SCM_WORKER_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener {
-                LSASS_LISTENER_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener2 {
-                LSASS_LISTENER2_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener3 {
-                LSASS_LISTENER3_TID.load(Ordering::Relaxed)
-            } else if is_lsa_worker {
-                LSA_WORKER_TID.load(Ordering::Relaxed)
-            } else if is_wl_worker {
-                match badge {
-                    WINLOGON_WORKER2_BADGE => WL_WORKER2_TID.load(Ordering::Relaxed),
-                    WINLOGON_WORKER3_BADGE => WL_WORKER3_TID.load(Ordering::Relaxed),
-                    _ => PM_LISTENER_TID.load(Ordering::Relaxed),
-                }
+                nt_handler
+                    .hosted_thread_tid_for_role(tp_pi, HostedThreadRole::TpWorker { slot: tp_slot })
+                    .unwrap_or(0)
+            } else if let Some(role) = ExecNtHandler::hosted_thread_role_for_badge(badge) {
+                nt_handler.hosted_thread_tid_for_role(pi, role).unwrap_or(0)
             } else {
                 nt_handler
                     .pm_main_tid_for_pi(pi)
