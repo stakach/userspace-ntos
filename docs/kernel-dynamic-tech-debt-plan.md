@@ -213,3 +213,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: the named TID/TCB cells that remain are low-level cap publication, spawn handoff, and
   rendezvous diagnostics; the next A4 slice should make spawn handoff consume runtime role records
   directly so those compatibility cells can shrink further.
+- A4 continued. The service-loop thread-spawn handoff now consumes reserved runtime-role TIDs for
+  multiplexed services/SCM/LSASS/LSA threads, SM loop, CSR workers, Winlogon workers, and CSR
+  resume-start bookkeeping. `HostedThreadSpawnSpec` no longer carries a static TID cell. Review
+  adjustment: remaining named TID cell reads are now rendezvous/current-TID diagnostics and
+  low-level post-loop gates; remaining named TCB cells are cap publication/teardown probes.
