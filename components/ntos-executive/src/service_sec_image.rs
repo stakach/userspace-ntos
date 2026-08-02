@@ -293,6 +293,43 @@ fn hosted_non_native_top_level_badge(nt_handler: &ExecNtHandler, badge: u64) -> 
         .is_some_and(|role| role != nt_exe_image::HostedProcessRole::NativeSession)
 }
 
+fn hosted_pi_has_role(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    role: nt_exe_image::HostedProcessRole,
+) -> bool {
+    nt_handler.hosted_process_role(pi) == Some(role)
+}
+
+fn hosted_pi_has_leaf(nt_handler: &ExecNtHandler, pi: usize, leaf: &[u8]) -> bool {
+    nt_handler
+        .hosted_process_leaf(pi)
+        .is_some_and(|process_leaf| process_leaf.eq_ignore_ascii_case(leaf))
+}
+
+fn hosted_main_badge_has_role(
+    nt_handler: &ExecNtHandler,
+    badge: u64,
+    role: nt_exe_image::HostedProcessRole,
+) -> bool {
+    hosted_pi_for_top_badge(nt_handler, badge)
+        .is_some_and(|pi| hosted_pi_has_role(nt_handler, pi, role))
+}
+
+fn hosted_owner_has_role(
+    nt_handler: &ExecNtHandler,
+    badge: u64,
+    role: nt_exe_image::HostedProcessRole,
+) -> bool {
+    let owner = owner_top_badge_for(nt_handler, badge);
+    hosted_main_badge_has_role(nt_handler, owner, role)
+}
+
+fn hosted_main_badge_has_leaf(nt_handler: &ExecNtHandler, badge: u64, leaf: &[u8]) -> bool {
+    hosted_pi_for_top_badge(nt_handler, badge)
+        .is_some_and(|pi| hosted_pi_has_leaf(nt_handler, pi, leaf))
+}
+
 fn hosted_pi_for_mechanism_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
         return Some(pi);
@@ -2678,7 +2715,11 @@ pub(crate) unsafe fn service_sec_image(
         // This process is producing an event → it's running, not wait-parked. Clear its cooperative
         // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
         wait_parked &= !(1u64 << owner_top_badge_for(&nt_handler, badge));
-        if badge == WINLOGON_BADGE {
+        if hosted_main_badge_has_role(
+            &nt_handler,
+            badge,
+            nt_exe_image::HostedProcessRole::InteractiveLogon,
+        ) {
             WINLOGON_MAIN_EVENT_WAIT_PARKED.store(0, Ordering::Relaxed);
         }
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
@@ -2865,12 +2906,22 @@ pub(crate) unsafe fn service_sec_image(
             // bad TARGET. Recover the faulting thread's GPRs, the stack's return-address chain and —
             // when the fault IP is inside our `RtlEnterCriticalSection` — the 40-byte
             // `RTL_CRITICAL_SECTION` the caller handed us, so the wall is MEASURED, not attributed.
-            if pi == 2
-                && owner_top_badge_for(&nt_handler, badge) == WINLOGON_BADGE
-                && crate::WL_CPUEXC_DIAG_N.fetch_add(1, Ordering::Relaxed) < 4
+            if hosted_pi_has_role(
+                &nt_handler,
+                pi,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            ) && hosted_owner_has_role(
+                &nt_handler,
+                badge,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            ) && crate::WL_CPUEXC_DIAG_N.fetch_add(1, Ordering::Relaxed) < 4
             {
-                let tcb = if badge == WINLOGON_BADGE {
-                    nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0)
+                let tcb = if hosted_main_badge_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) {
+                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0)
                 } else {
                     0
                 };
@@ -3023,10 +3074,16 @@ pub(crate) unsafe fn service_sec_image(
             // hold no callback frames. Batch 59 measured exactly that: with `CopyDirectory` really
             // running, winlogon reaches kernel32's `ASSERT(StaticUnicodeString.MaximumLength == …)`
             // in `fileutils.c:26`, whose `int 3` lands HERE.
-            if pi == 2
-                && owner_top_badge_for(&nt_handler, badge) == WINLOGON_BADGE
-                && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
-                && !win32k_glue::client_has_active_callback_frames(2)
+            if hosted_pi_has_role(
+                &nt_handler,
+                pi,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            ) && hosted_owner_has_role(
+                &nt_handler,
+                badge,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                && !win32k_glue::client_has_active_callback_frames(pi as u32)
             {
                 print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path raises an unhandled CPU exception at ip=0x");
                 print_hex((fip >> 32) as u32);
@@ -3233,15 +3290,25 @@ pub(crate) unsafe fn service_sec_image(
             // `StaticUnicodeString`: win32k is exonerated (it is never handed this page, and the
             // good→bad transition never straddles a dispatch), so the writer runs in the client.
             if crate::WL_TEB_TAIL_WRITE_WATCH
-                && pi == 2
+                && hosted_pi_has_role(
+                    &nt_handler,
+                    pi,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                )
                 && page == SMSS_TEB_VA + 0x1000
                 && (m3 & 0x2) != 0
                 && crate::WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0
             {
-                let tcb = if owner_top_badge_for(&nt_handler, badge) == WINLOGON_BADGE
-                    && badge == WINLOGON_BADGE
-                {
-                    nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0)
+                let tcb = if hosted_owner_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && hosted_main_badge_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) {
+                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0)
                 } else {
                     0
                 };
@@ -3959,7 +4026,7 @@ pub(crate) unsafe fn service_sec_image(
                     // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
                     continue;
                 }
-                if badge == LSASS_BADGE
+                if hosted_main_badge_has_leaf(&nt_handler, badge, b"lsass.exe")
                     && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                 {
                     print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
@@ -4006,10 +4073,16 @@ pub(crate) unsafe fn service_sec_image(
                 // callback client, disarming both post-quiesce callback injections. The guard that
                 // makes this safe is the callback-frame assertion below, which is per-PROCESS, so it
                 // holds for any of its threads.
-                if pi == 2
-                    && owner_top_badge_for(&nt_handler, badge) == WINLOGON_BADGE
-                    && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
-                    && !win32k_glue::client_has_active_callback_frames(2)
+                if hosted_pi_has_role(
+                    &nt_handler,
+                    pi,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && hosted_owner_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                    && !win32k_glue::client_has_active_callback_frames(pi as u32)
                 {
                     print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON (LsaLogonUser SUCCESS + logon token received/queried); its POST-LOGON path faults at ip=0x");
                     print_hex((m0 >> 32) as u32);
@@ -4486,7 +4559,11 @@ pub(crate) unsafe fn service_sec_image(
             ssn_ring[ssn_ri % 32] = m0 as u16;
             ssn_ring_badge[ssn_ri % 32] = badge as u8;
             ssn_ri += 1;
-            if badge == WINLOGON_BADGE {
+            if hosted_main_badge_has_role(
+                &nt_handler,
+                badge,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            ) {
                 wl_ring[wl_ri % 48] = m0 as u16;
                 wl_ri += 1;
             }
@@ -6984,7 +7061,11 @@ pub(crate) unsafe fn service_sec_image(
                 // latched either here for a non-callback dispatch or later from NtCallbackReturn's completed
                 // outer-dispatch observer. Once latched, the already-current second switch must not clear the fb.
                 let winlogon_switch_requested = m0 == 0x1288
-                    && badge == WINLOGON_BADGE
+                    && hosted_main_badge_has_role(
+                        &nt_handler,
+                        badge,
+                        nt_exe_image::HostedProcessRole::InteractiveLogon,
+                    )
                     && WINLOGON_PAINT_DONE.load(Ordering::Relaxed) == 0;
                 let winlogon_switch_transitions = winlogon_switch_requested
                     && win32k_subsystem::switch_desktop_would_change_input_desktop(a0);
@@ -7942,10 +8023,16 @@ pub(crate) unsafe fn service_sec_image(
                 // latches the whole process as a dead callback client, which is wrong here because
                 // the expendable worker threads remain alive and hold no callback frames. The
                 // post-quiesce callback-injection gates depend on that distinction.
-                if pi == 2
-                    && owner_top_badge_for(&nt_handler, badge) == WINLOGON_BADGE
-                    && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
-                    && !win32k_glue::client_has_active_callback_frames(2)
+                if hosted_pi_has_role(
+                    &nt_handler,
+                    pi,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && hosted_owner_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+                    && !win32k_glue::client_has_active_callback_frames(pi as u32)
                 {
                     print_str(b"[wl-main] winlogon COMPLETED THE INTERACTIVE LOGON; its POST-LOGON path hit unimplemented win32k SSN=0x");
                     print_hex(m0 as u32);
@@ -8119,7 +8206,12 @@ pub(crate) unsafe fn service_sec_image(
                     m3 = nm3;
                     continue;
                 }
-                if badge == WINLOGON_BADGE && m0 == 190 {
+                if hosted_main_badge_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                ) && m0 == 190
+                {
                     // DIAG (BATCH 21): winlogon's hard-error site — dump raw args while its mirror
                     // is active (ErrorStatus=R10, param0=[stack], caller=[rsp]).
                     print_str(b"[wl-190] R10=0x");
@@ -8258,10 +8350,18 @@ pub(crate) unsafe fn service_sec_image(
             // and stopped immediately after RegisterClassExWOW, before the runnable worker's next
             // timeslice. Park the main thread normally and keep servicing the worker instead.
             let winlogon_worker_can_signal = park_wait_event >= 0
-                && pi == 2
-                && badge == WINLOGON_BADGE
+                && hosted_pi_has_role(
+                    &nt_handler,
+                    pi,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                )
+                && hosted_main_badge_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                )
                 && nt_handler
-                    .hosted_thread_tcb_for_role(2, HostedThreadRole::WinlogonWorker { slot: 1 })
+                    .hosted_thread_tcb_for_role(pi, HostedThreadRole::WinlogonWorker { slot: 1 })
                     .is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             if park_wait_event >= 0 && reply_main != 0 {

@@ -397,3 +397,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   and `WINLOGON_BADGE`; it uses the process role and top badge already carried by registered hosted
   process metadata. Review adjustment: broader winlogon frontier diagnostics still contain fixed
   `pi == 2` checks because they name measured winlogon-only boot milestones, not just image identity.
+- A2 cleanup. Several winlogon/LSASS main-thread frontier gates now resolve through registered
+  hosted-process metadata instead of raw transport badge constants: winlogon wait-park clearing,
+  post-logon CPU/VM/syscall milestone parks, TEB-tail write watch ownership, desktop-switch paint
+  observation, hard-error diagnostics, and the LSASS post-LSA-signal crash park. Review adjustment:
+  remaining `pi == 2` checks are mostly measured winlogon-only diagnostics or address probes and
+  need a separate semantic pass before conversion.
