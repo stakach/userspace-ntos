@@ -356,3 +356,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   disk path, stem, and NT process metadata together in the bootstrap boundary. Review adjustment: the
   specs are still compiled-in bootstrap policy; the next semantic step is a manifest handoff populated
   by the loader/session manager rather than functions in `hosted_bootstrap.rs`.
+- A2 complete for static hosted-image tables. Removed `nt_exe_image::HOSTED_PROCESS_IMAGES`, the
+  legacy `HostedProcessImage` static descriptor type, and the crate-level static lookup/spawn/probe
+  wrappers. `nt-exe-image` tests now build explicit borrowed/owned catalogs, so the only supported
+  production model is registration into a catalog and lookup through that catalog. Review adjustment:
+  bootstrap descriptors remain in the executive's `hosted_bootstrap.rs` until a real boot/session
+  manifest handoff exists, but there is no global hosted-image identity table left to fall back to.
