@@ -9013,46 +9013,25 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
-fn tp_worker_identity_for_tid(tid: u64) -> Option<(usize, usize)> {
-    for pi in 0..TP_WORKER_PI_COUNT {
-        for slot in 0..TP_WORKER_SLOT_COUNT {
-            if tid != 0 && tid == TP_WORKER_TID[pi][slot].load(Ordering::Relaxed) {
-                return Some((pi, slot));
-            }
-        }
-    }
-    None
-}
-
-fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
-    if let Some((pi, slot)) = tp_worker_identity_for_tid(tid) {
-        Some(&TP_WORKER_TCB[pi][slot])
-    } else if tid == SM_LOOP_TID.load(Ordering::Relaxed) {
-        Some(&SM_LOOP_TCB)
-    } else if tid == CSR_API_TID.load(Ordering::Relaxed) {
-        Some(&CSR_LOOP_TCB)
-    } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
-        Some(&CSR_SB_LOOP_TCB)
-    } else if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
-        Some(&WL_LISTENER_TCB)
-    } else if tid == WL_WORKER2_TID.load(Ordering::Relaxed) {
-        Some(&WL_WORKER2_TCB)
-    } else if tid == WL_WORKER3_TID.load(Ordering::Relaxed) {
-        Some(&WL_WORKER3_TCB)
-    } else if tid == SVC_LISTENER_TID.load(Ordering::Relaxed) {
-        Some(&SVC_LISTENER_TCB)
-    } else if tid == SCM_WORKER_TID.load(Ordering::Relaxed) {
-        Some(&SCM_WORKER_TCB)
-    } else if tid == LSASS_LISTENER_TID.load(Ordering::Relaxed) {
-        Some(&LSASS_LISTENER_TCB)
-    } else if tid == LSASS_LISTENER2_TID.load(Ordering::Relaxed) {
-        Some(&LSASS_LISTENER2_TCB)
-    } else if tid == LSASS_LISTENER3_TID.load(Ordering::Relaxed) {
-        Some(&LSASS_LISTENER3_TCB)
-    } else {
-        (0..MAX_PI)
-            .find(|&index| tid == PM_TIDS[index].load(Ordering::Relaxed))
-            .map(|index| &PM_MAIN_TCBS[index])
+fn hosted_thread_tcb_mirror(runtime: HostedThreadRuntime) -> Option<&'static AtomicU64> {
+    match runtime.role {
+        HostedThreadRole::Main => PM_MAIN_TCBS.get(runtime.pi),
+        HostedThreadRole::TpWorker { slot } => TP_WORKER_TCB
+            .get(runtime.pi)
+            .and_then(|slots| slots.get(slot)),
+        HostedThreadRole::SmLoop => Some(&SM_LOOP_TCB),
+        HostedThreadRole::CsrApi => Some(&CSR_LOOP_TCB),
+        HostedThreadRole::CsrSbApi => Some(&CSR_SB_LOOP_TCB),
+        HostedThreadRole::WinlogonListener => Some(&WL_LISTENER_TCB),
+        HostedThreadRole::WinlogonWorker { slot: 1 } => Some(&WL_WORKER2_TCB),
+        HostedThreadRole::WinlogonWorker { slot: 2 } => Some(&WL_WORKER3_TCB),
+        HostedThreadRole::WinlogonWorker { .. } => None,
+        HostedThreadRole::ServicesListener => Some(&SVC_LISTENER_TCB),
+        HostedThreadRole::ScmWorker => Some(&SCM_WORKER_TCB),
+        HostedThreadRole::LsassListener => Some(&LSASS_LISTENER_TCB),
+        HostedThreadRole::LsassListener2 => Some(&LSASS_LISTENER2_TCB),
+        HostedThreadRole::LsassListener3 => Some(&LSASS_LISTENER3_TCB),
+        HostedThreadRole::LsaWorker => Some(&LSA_WORKER_TCB),
     }
 }
 
@@ -9087,14 +9066,11 @@ unsafe fn terminate_hosted_thread_mechanism(
     wait_cancel_thread(tid);
     keyed_wait_cancel_thread(tid);
     pipe_io_cancel_thread(tid);
-    let cell = match hosted_thread_tcb_cell(tid) {
-        Some(cell) => cell,
+    let tcb = match handler.hosted_thread_tcb(tid) {
+        Some(tcb) if tcb > 1 => tcb,
         None => return false,
+        Some(_) => return false,
     };
-    let tcb = cell.load(Ordering::Relaxed);
-    if tcb <= 1 {
-        return false;
-    }
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_r(tcb)
@@ -9111,8 +9087,11 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_u64(delete);
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
-        cell.store(0, Ordering::Relaxed);
-        handler.release_hosted_thread_runtime(tid);
+        if let Some(runtime) = handler.release_hosted_thread_runtime(tid) {
+            if let Some(cell) = hosted_thread_tcb_mirror(runtime) {
+                cell.store(0, Ordering::Relaxed);
+            }
+        }
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -11014,7 +10993,7 @@ impl HostedThreadRole {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HostedThreadRuntime {
+pub(crate) struct HostedThreadRuntime {
     pi: usize,
     tid: u64,
     tcb: u64,

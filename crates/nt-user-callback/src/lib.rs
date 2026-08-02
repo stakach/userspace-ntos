@@ -1122,6 +1122,7 @@ impl DispatchContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
+    client_tcb: u64,
     saved_user_context: [u64; 20],
     outer_resume_ip: u64,
     redirected: bool,
@@ -1136,6 +1137,7 @@ impl ActiveCallbackFrame {
     const fn empty() -> Self {
         Self {
             request: CallbackHeader::idle(0, 0, 0, 0),
+            client_tcb: 0,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -1147,6 +1149,10 @@ impl ActiveCallbackFrame {
 
     pub const fn request(&self) -> &CallbackHeader {
         &self.request
+    }
+
+    pub const fn client_tcb(&self) -> u64 {
+        self.client_tcb
     }
 
     pub const fn dispatch_context(&self) -> &DispatchContext {
@@ -1263,13 +1269,17 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(index)
     }
 
-    pub fn push(&mut self, request: CallbackHeader) -> Result<(), ValidationError> {
+    pub fn push(&mut self, request: CallbackHeader, client_tcb: u64) -> Result<(), ValidationError> {
         validate_request(&request)?;
+        if client_tcb <= 1 {
+            return Err(ValidationError::State);
+        }
         if self.len == DEPTH {
             return Err(ValidationError::Length);
         }
         self.frames[self.len] = ActiveCallbackFrame {
             request,
+            client_tcb,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -2676,8 +2686,8 @@ mod tests {
         b.callback_id = 2;
         b.client_tid = 21;
         b.client_badge = 13;
-        stack.push(a).unwrap();
-        stack.push(b).unwrap();
+        stack.push(a, 0xaaa0).unwrap();
+        stack.push(b, 0xbbb0).unwrap();
         let ca = CallbackCorrelation::from_request(&a);
         let cb = CallbackCorrelation::from_request(&b);
         stack
@@ -2706,6 +2716,7 @@ mod tests {
         stack.record_redirect(cb, [9; 20], 0xbeef).unwrap();
         // A returns FIRST, from underneath B's frame.
         let popped_a = stack.pop(ca).unwrap();
+        assert_eq!(popped_a.client_tcb(), 0xaaa0);
         assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
         assert_eq!(popped_a.outer_resume_ip(), 0xdead);
         assert_eq!(stack.len(), 1);
@@ -2716,6 +2727,7 @@ mod tests {
             0x1076
         );
         let popped_b = stack.pop(cb).unwrap();
+        assert_eq!(popped_b.client_tcb(), 0xbbb0);
         assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
         assert!(stack.is_empty());
     }
@@ -2775,7 +2787,7 @@ mod tests {
         let inner_correlation = CallbackCorrelation::from_request(&inner);
         let mut stack = ActiveCallbackStack::<2>::new();
 
-        stack.push(outer).unwrap();
+        stack.push(outer, 0xaaa0).unwrap();
         stack
             .record_callback_window(
                 outer_correlation,
@@ -2785,7 +2797,7 @@ mod tests {
         stack
             .record_redirect(outer_correlation, [0x11; 20], 0x1111)
             .unwrap();
-        stack.push(inner).unwrap();
+        stack.push(inner, 0xbbb0).unwrap();
         stack
             .record_callback_window(
                 inner_correlation,
@@ -2829,8 +2841,8 @@ mod tests {
         let mut stack = ActiveCallbackStack::<2>::new();
 
         assert!(stack.frame(0).is_none());
-        stack.push(outer).unwrap();
-        stack.push(inner).unwrap();
+        stack.push(outer, 0xaaa0).unwrap();
+        stack.push(inner, 0xbbb0).unwrap();
 
         assert_eq!(stack.frame(0).unwrap().request().client_pi, 2);
         assert_eq!(stack.frame(1).unwrap().request().client_pi, 3);
@@ -2850,9 +2862,11 @@ mod tests {
             .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
             .unwrap();
         let correlation = CallbackCorrelation::from_request(&request);
+        let mut missing_tcb = ActiveCallbackStack::<1>::new();
+        assert_eq!(missing_tcb.push(request, 1), Err(ValidationError::State));
         let mut stack = ActiveCallbackStack::<1>::new();
-        stack.push(request).unwrap();
-        assert_eq!(stack.push(request), Err(ValidationError::Length));
+        stack.push(request, 0xaaa0).unwrap();
+        assert_eq!(stack.push(request, 0xbbb0), Err(ValidationError::Length));
         let mut stale = correlation;
         stale.callback_id += 1;
         let callback_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
@@ -2886,7 +2900,7 @@ mod tests {
         let correlation = CallbackCorrelation::from_request(&request);
         let callback_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
         let mut stack = ActiveCallbackStack::<1>::new();
-        stack.push(request).unwrap();
+        stack.push(request, 0xaaa0).unwrap();
         stack
             .record_callback_window(correlation, callback_window)
             .unwrap();
@@ -2911,11 +2925,11 @@ mod tests {
         let outer_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
         let inner_window = ClientCallbackWindowState::new(0xbbbb, [4, 5, 6]);
         let mut stack = ActiveCallbackStack::<2>::new();
-        stack.push(outer).unwrap();
+        stack.push(outer, 0xaaa0).unwrap();
         stack
             .record_callback_window(outer_correlation, outer_window)
             .unwrap();
-        stack.push(inner).unwrap();
+        stack.push(inner, 0xbbb0).unwrap();
         stack
             .record_callback_window(inner_correlation, inner_window)
             .unwrap();

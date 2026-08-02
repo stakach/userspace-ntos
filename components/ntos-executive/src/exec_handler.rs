@@ -1735,11 +1735,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn hosted_thread_tcb(&self, tid: u64) -> Option<u64> {
-        self.thread_runtime.tcb_by_tid(tid).or_else(|| {
-            hosted_thread_tcb_cell(tid)
-                .map(|cell| cell.load(Ordering::Relaxed))
-                .filter(|&tcb| tcb > 1)
-        })
+        self.thread_runtime.tcb_by_tid(tid)
     }
 
     fn hosted_thread_tcb_for_nt_resume_thread(&self, tid: u64) -> Option<u64> {
@@ -1749,18 +1745,11 @@ impl ExecNtHandler {
             }
             return (runtime.tcb > 1).then_some(runtime.tcb);
         }
-        hosted_thread_tcb_cell(tid)
-            .map(|cell| cell.load(Ordering::Relaxed))
-            .filter(|&tcb| tcb > 1)
+        None
     }
 
     pub(crate) fn hosted_main_thread_tcb_for_pi(&self, pi: usize) -> Option<u64> {
-        self.thread_runtime.tcb_for_main_pi(pi).or_else(|| {
-            PM_MAIN_TCBS
-                .get(pi)
-                .map(|cell| cell.load(Ordering::Relaxed))
-                .filter(|&tcb| tcb > 1)
-        })
+        self.thread_runtime.tcb_for_main_pi(pi)
     }
 
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
@@ -1776,8 +1765,11 @@ impl ExecNtHandler {
         self.hosted_thread_tcb(tid_cell.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn release_hosted_thread_runtime(&mut self, tid: u64) {
-        let _ = self.thread_runtime.release_tid(tid);
+    pub(crate) fn release_hosted_thread_runtime(
+        &mut self,
+        tid: u64,
+    ) -> Option<HostedThreadRuntime> {
+        self.thread_runtime.release_tid(tid)
     }
 
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {

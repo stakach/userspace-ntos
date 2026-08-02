@@ -122,3 +122,12 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `hosted_thread_tcb_cell` still has a main-thread `PM_TIDS` fallback for callback TCB lookup; that
   should be replaced by carrying/resolving callback TCB identity through the registered thread
   runtime before A3 closes.
+- A3 continued. User-callback dispatch now carries the client TCB explicitly in
+  `Win32kClientContext`, `UserCallbackClient`, and the active callback frame. Callback redirect,
+  chained callback, and `NtCallbackReturn` resume paths consume that frame-owned TCB instead of
+  rediscovering it through TID mirrors. `ExecNtHandler` hosted TCB accessors are now backed only by
+  the registered thread runtime, and hosted thread termination clears legacy TCB mirror cells by
+  runtime role after releasing the runtime record. Deleted the old `hosted_thread_tcb_cell` /
+  `tp_worker_identity_for_tid` scanner, including the main-thread `PM_TIDS` fallback. Review
+  adjustment: remaining A3 mirror debt is now limited to synchronized mirror writes and self-test
+  temporary `PM_POOL_TID` slots; production TCB lookup no longer has a mirror fallback.

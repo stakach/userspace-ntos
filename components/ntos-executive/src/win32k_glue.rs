@@ -108,6 +108,7 @@ pub(crate) struct Win32kClientContext {
     pub pid: u64,
     pub badge: u64,
     pub tid: u64,
+    pub tcb: u64,
     pub teb: u64,
     pub peb_mirror: u64,
     pub scratch_base: u64,
@@ -274,7 +275,10 @@ unsafe fn write_callback_failure_reply(request: nt_user_callback::CallbackHeader
     core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
 }
 
-unsafe fn begin_controlled_continuation(request: nt_user_callback::CallbackHeader) -> bool {
+unsafe fn begin_controlled_continuation(
+    request: nt_user_callback::CallbackHeader,
+    client_tcb: u64,
+) -> bool {
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
     let client = nt_user_callback::ClientThreadIdentity::new(
         request.client_pi,
@@ -286,13 +290,16 @@ unsafe fn begin_controlled_continuation(request: nt_user_callback::CallbackHeade
     if active.len() >= nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH {
         return false;
     }
+    if client_tcb <= 1 {
+        return false;
+    }
     // "Root" is per client thread: this thread holds no continuation yet, so the win32k dispatch
     // this callback was raised inside has to be recorded first. Another thread's chain being live
     // is irrelevant.
     let root = stack.is_empty_for(&client);
     if (root && stack.push_dispatch(client, request.dispatch_id).is_err())
         || stack.push_callback(correlation).is_err()
-        || active.push(request).is_err()
+        || active.push(request, client_tcb).is_err()
     {
         abort_controlled_user_callbacks();
         return false;
@@ -834,7 +841,12 @@ pub(crate) unsafe fn service_user_callback(
     // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
     // error immediately instead of suspending the component again.
     let client_dead = user_callback_client_dead(client.pi);
-    if client_callbacks_supported(client) && contract_valid && !client_dead && !owner_mismatch {
+    if client_callbacks_supported(client)
+        && client.tcb > 1
+        && contract_valid
+        && !client_dead
+        && !owner_mismatch
+    {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -879,7 +891,7 @@ pub(crate) unsafe fn service_user_callback(
         if (!requires_window_binding || callback_teb_alias.is_some())
             && valid
             && dispatcher != 0
-            && begin_controlled_continuation(request)
+            && begin_controlled_continuation(request, client.tcb)
         {
             if !remember_active_dispatch(&request) {
                 abort_controlled_user_callbacks();
@@ -1041,10 +1053,8 @@ pub(crate) unsafe fn rewind_fault_ip(tcb: u64, rip: u64) -> bool {
     tcb_write_regs20(tcb, &registers, false) == 0
 }
 
-fn callback_client_tcb(tid: u64) -> Option<u64> {
-    hosted_thread_tcb_cell(tid)
-        .map(|cell| cell.load(Ordering::Relaxed))
-        .filter(|tcb| *tcb != 0)
+fn callback_context_tcb(client: Win32kClientContext) -> Option<u64> {
+    (client.tcb > 1).then_some(client.tcb)
 }
 
 pub(crate) unsafe fn begin_controlled_user_callback_redirect(
@@ -1053,7 +1063,7 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     outer_rsp: u64,
     outer_flags: u64,
 ) -> bool {
-    let Some(tcb) = callback_client_tcb(client.tid) else {
+    let Some(tcb) = callback_context_tcb(client) else {
         return false;
     };
     let mut saved = [0u64; 20];
@@ -1079,7 +1089,7 @@ unsafe fn redirect_pending_user_callback(
     if active_frame.is_redirected() {
         return false;
     }
-    let Some(tcb) = callback_client_tcb(client.tid) else {
+    let Some(tcb) = callback_context_tcb(client) else {
         return false;
     };
     let dispatcher = USER_CALLBACK_DISPATCHER.load(Ordering::Relaxed);
@@ -1206,11 +1216,13 @@ unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
 
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
+    client_tcb: u64,
 ) -> crate::spawn_hosts::PumpResult {
     let client = crate::spawn_hosts::UserCallbackClient {
         pi: request.client_pi,
         badge: request.client_badge,
         tid: request.client_tid,
+        tcb: client_tcb,
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
     };
@@ -1276,7 +1288,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let result = resume_suspended_user_callback_component(request);
+    let result = resume_suspended_user_callback_component(request, active_frame.client_tcb());
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
@@ -1434,6 +1446,7 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             abort_controlled_user_callbacks();
             break;
         };
+        let client_tcb = popped.client_tcb();
         restore_client_callback_window(popped);
         // (3) Resume win32k with the failure and let it unwind its own dispatch.
         let previous_dispatch =
@@ -1442,7 +1455,7 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let component = resume_suspended_user_callback_component(request);
+        let component = resume_suspended_user_callback_component(request, client_tcb);
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -1503,6 +1516,12 @@ pub(crate) const DEAD_CLIENT_INJECT_DRAINED: u64 = 0x10;
 pub(crate) const DEAD_CLIENT_INJECT_WIN32K_IDLE: u64 = 0x20;
 pub(crate) const DEAD_CLIENT_INJECT_ALL: u64 = 0x3f;
 
+#[derive(Clone, Copy)]
+pub(crate) struct DeadClientVictimTermination {
+    pub terminated: bool,
+    pub tcb_reclaimed: bool,
+}
+
 /// ★ DELIBERATE FAULT INJECTION that makes [`unwind_dead_client_user_callbacks`] a GATE-PROTECTED
 /// path instead of a path evidenced only by historical crash boots.
 ///
@@ -1539,25 +1558,27 @@ pub(crate) const DEAD_CLIENT_INJECT_ALL: u64 = 0x3f;
 /// An EXPENDABLE winlogon (pi 2) worker thread usable as a callback-injection client: a real hosted
 /// thread with a live TCB, a registered client stack and a TEB alias the callback-window bridge can
 /// write (what a redirect needs). NEVER winlogon's main thread (the gate still samples that one).
-/// Returns `(badge, tid, teb_va, stack_top)`.
-unsafe fn expendable_winlogon_callback_thread() -> Option<(u64, u64, u64, u64)> {
+/// Returns `(badge, tid, tcb, teb_va, stack_top)`.
+unsafe fn expendable_winlogon_callback_thread() -> Option<(u64, u64, u64, u64, u64)> {
     let candidates = [
         (
             WINLOGON_WORKER2_BADGE,
             WL_WORKER2_TID.load(Ordering::Relaxed),
+            WL_WORKER2_TCB.load(Ordering::Relaxed),
             WL_WORKER2_TEB_VA,
             WL_WORKER2_STACK_BASE + WL_WORKER2_STACK_FRAMES * 0x1000,
         ),
         (
             WINLOGON_WORKER_BADGE,
             PM_LISTENER_TID.load(Ordering::Relaxed),
+            WL_LISTENER_TCB.load(Ordering::Relaxed),
             WL_LISTENER_TEB_VA,
             WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
         ),
     ];
     candidates
         .iter()
-        .find(|(_, tid, _, _)| *tid != 0 && callback_client_tcb(*tid).is_some())
+        .find(|(_, tid, tcb, _, _)| *tid != 0 && *tcb > 1)
         .copied()
 }
 
@@ -1627,11 +1648,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
 
     let mut proof = 0u64;
-    let Some((badge, tid, teb, stack_top)) = expendable_winlogon_callback_thread() else {
+    let Some((badge, tid, tcb, teb, stack_top)) = expendable_winlogon_callback_thread() else {
         print_str(b"[w32-slip] no expendable winlogon worker thread available -> skipped\n");
-        return proof;
-    };
-    let Some(tcb) = callback_client_tcb(tid) else {
         return proof;
     };
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
@@ -1661,6 +1679,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         pid: client_pid,
         badge,
         tid,
+        tcb,
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -1824,7 +1843,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
 pub(crate) unsafe fn inject_dead_client_callback_unwind(
     client_pid: u64,
     scratch_base: u64,
-    kill_victim: &mut dyn FnMut(u64) -> bool,
+    terminate_victim: &mut dyn FnMut(u64) -> DeadClientVictimTermination,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
@@ -1834,11 +1853,8 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     let mut proof = 0u64;
     // (0) VICTIM SELECTION — an expendable winlogon (pi 2) worker thread (see
     // [`expendable_winlogon_callback_thread`]).
-    let Some((badge, tid, teb, stack_top)) = expendable_winlogon_callback_thread() else {
+    let Some((badge, tid, tcb, teb, stack_top)) = expendable_winlogon_callback_thread() else {
         print_str(b"[cb-inject] no expendable winlogon worker thread available -> skipped\n");
-        return proof;
-    };
-    let Some(tcb) = callback_client_tcb(tid) else {
         return proof;
     };
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
@@ -1869,6 +1885,7 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         pid: client_pid,
         badge,
         tid,
+        tcb,
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -1933,15 +1950,14 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     print_str(b" (win32k parked awaiting the callback result)\n");
 
     // (3) KILL the client thread while it is AT that depth — it can never send NtCallbackReturn now.
-    let killed = kill_victim(tid);
-    let tcb_gone = callback_client_tcb(tid).is_none();
-    if killed && tcb_gone {
+    let termination = terminate_victim(tid);
+    if termination.terminated && termination.tcb_reclaimed {
         proof |= DEAD_CLIENT_INJECT_VICTIM_DEAD;
     }
     print_str(b"[cb-inject] victim terminated mid-callback: terminated=");
-    print_u64(killed as u64);
+    print_u64(termination.terminated as u64);
     print_str(b" tcb-reclaimed=");
-    print_u64(tcb_gone as u64);
+    print_u64(termination.tcb_reclaimed as u64);
     print_str(b"\n");
 
     // (4) RECOVERY — the path under test.
@@ -2210,7 +2226,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let component = resume_suspended_user_callback_component(request);
+    let component = resume_suspended_user_callback_component(request, completed_frame.client_tcb());
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
@@ -2221,6 +2237,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             pid: USER_CALLBACK_CLIENT_PID.load(Ordering::Relaxed),
             badge: request.client_badge,
             tid: request.client_tid,
+            tcb: completed_frame.client_tcb(),
             teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
             scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
@@ -2257,7 +2274,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
     // so restate the enclosing frame's bridged triple before the client runs again.
     reassert_top_client_callback_window(&identity);
-    let Some(tcb) = callback_client_tcb(client_tid) else {
+    let Some(tcb) = (completed_frame.client_tcb() > 1).then_some(completed_frame.client_tcb())
+    else {
         return None;
     };
     let completed = nt_user_callback::completed_outer_context(
@@ -3014,6 +3032,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             pid: 0,
             badge: 0,
             tid: 0,
+            tcb: 0,
             teb: crate::SMSS_TEB_VA,
             peb_mirror: 0,
             scratch_base: crate::SM_FILL_SCRATCH_BASE,
@@ -3186,6 +3205,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
             pi: client.pi,
             badge: client.badge,
             tid: client.tid,
+            tcb: client.tcb,
             peb_mirror: client.peb_mirror,
             scratch_base: client.scratch_base,
         }),

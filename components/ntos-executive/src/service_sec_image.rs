@@ -97,10 +97,15 @@ fn sec_image_forward_run() -> u64 {
     }
 }
 
+fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
+    nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
+}
+
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
     pi: usize,
     badge: u64,
     current_tid: u64,
+    current_tcb: u64,
     main_tid: u64,
     pid: u64,
     client_teb: u64,
@@ -179,6 +184,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
             pid,
             badge,
             tid: current_tid,
+            tcb: current_tcb,
             teb: client_teb,
             peb_mirror,
             scratch_base,
@@ -6298,6 +6304,7 @@ pub(crate) unsafe fn service_sec_image(
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -6376,6 +6383,7 @@ pub(crate) unsafe fn service_sec_image(
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -6391,6 +6399,7 @@ pub(crate) unsafe fn service_sec_image(
                             pi,
                             badge,
                             current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, current_tid),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7508,6 +7517,7 @@ pub(crate) unsafe fn service_sec_image(
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -7599,6 +7609,7 @@ pub(crate) unsafe fn service_sec_image(
                             pi,
                             badge,
                             current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, current_tid),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7634,6 +7645,7 @@ pub(crate) unsafe fn service_sec_image(
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -8731,13 +8743,18 @@ pub(crate) unsafe fn service_sec_image(
         let nested_proof =
             win32k_glue::inject_win32k_nested_dispatch_slip(client_pid, scratch_base);
         WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
-        let mut kill_victim = |victim_tid: u64| {
-            terminate_hosted_thread_mechanism(victim_tid, &mut delay_queue, &mut nt_handler)
+        let mut terminate_victim = |victim_tid: u64| {
+            let terminated =
+                terminate_hosted_thread_mechanism(victim_tid, &mut delay_queue, &mut nt_handler);
+            win32k_glue::DeadClientVictimTermination {
+                terminated,
+                tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
+            }
         };
         let proof = win32k_glue::inject_dead_client_callback_unwind(
             client_pid,
             scratch_base,
-            &mut kill_victim,
+            &mut terminate_victim,
         );
         DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
     }
