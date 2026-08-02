@@ -297,3 +297,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   historical descriptors still seed bootstrap/open-time registration; remaining consumers are gate
   expectations, win32k callback classification, mechanism top-badge helpers, and executable probe
   admission.
+- A2 continued. Service-loop top-badge ownership, quiesce masks, role-backed thread registration,
+  and fault-badge labels now derive from `ExecNtHandler`'s registered hosted-process metadata
+  instead of the static hosted image badge map. Review adjustment: remaining static uses are now
+  bootstrap/open-time registration policy, executable probe admission, win32k callback
+  classification, bootstrap spawn descriptors, and post-loop gate expectations.

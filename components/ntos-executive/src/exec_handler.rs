@@ -10644,17 +10644,10 @@ impl ExecNtHandler {
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
+                            let top_badge = self.hosted_process_top_badge(self.pi).unwrap_or(0);
                             let (role, badge, teb) = match slot {
-                                0 => (
-                                    HostedThreadRole::CsrApi,
-                                    hosted_top_badge_for_pi(self.pi),
-                                    CSR_TEB_VA,
-                                ),
-                                1 => (
-                                    HostedThreadRole::CsrSbApi,
-                                    hosted_top_badge_for_pi(self.pi),
-                                    CSR_SB_TEB_VA,
-                                ),
+                                0 => (HostedThreadRole::CsrApi, top_badge, CSR_TEB_VA),
+                                1 => (HostedThreadRole::CsrSbApi, top_badge, CSR_SB_TEB_VA),
                                 _ => {
                                     self.abandon_created_hosted_thread(slot, tid, handle);
                                     return 0xC000_009A;
@@ -11445,7 +11438,7 @@ impl ExecNtHandler {
                                 slot,
                                 tid,
                                 handle,
-                                hosted_top_badge_for_pi(self.pi),
+                                self.hosted_process_top_badge(self.pi).unwrap_or(0),
                                 HostedThreadRole::SmLoop,
                             ) {
                                 return 0xC000_009A;
