@@ -167,3 +167,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `SVC_LISTENER_TID`, `WL_WORKER*_TID`, `LSASS_LISTENER*_TID`, or `LSA_WORKER_TID` cells. Review
   adjustment: remaining A3/A4 runtime debt is concentrated in spawn-slot reservation/publication,
   compatibility mirror cleanup, and gate-only/self-test probes.
+- A3/A4 continued. Hosted thread runtime records now support a reserved state (`tid` present,
+  `tcb == 1`) so TP worker badge slots are claimed before their seL4 TCB is spawned. Remote and
+  in-process `NtCreateThread` paths choose free TP slots through runtime-role lookup and publish
+  reservations through `ExecNtHandler`; `spawn_requested_tp_worker` consumes that reservation instead
+  of reading `TP_WORKER_TID`. Review adjustment: the remaining `TP_WORKER_TID` writes are centralized
+  compatibility publication/cleanup plus the isolated remote-breakin self-test reset; the next cleanup
+  target is removing or replacing the TCB mirror arrays.

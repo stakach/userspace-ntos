@@ -1903,6 +1903,16 @@ impl ExecNtHandler {
         let _ = self.thread_runtime.register(pi, tid, tcb, badge, role);
     }
 
+    pub(crate) fn reserve_hosted_thread_runtime(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> bool {
+        self.thread_runtime.reserve(pi, tid, badge, role).is_some()
+    }
+
     pub(crate) fn register_main_thread_tcb(&mut self, pi: usize, tcb: u64) {
         if let Some(tid) = self.pm_main_tid_for_pi(pi) {
             let badge = Self::hosted_mechanism_badge_for_pi(pi).unwrap_or(0);
@@ -1966,11 +1976,45 @@ impl ExecNtHandler {
         self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
     }
 
+    pub(crate) fn first_free_hosted_tp_worker_slot(&self, pi: usize) -> Option<usize> {
+        (0..TP_WORKER_SLOT_COUNT).find(|&slot| {
+            self.hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot })
+                .is_none()
+        })
+    }
+
+    pub(crate) fn reserve_hosted_tp_worker_slot(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: u64,
+    ) -> bool {
+        if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
+            return false;
+        }
+        let badge = tp_worker_badge(pi, slot);
+        if !self.reserve_hosted_thread_runtime(pi, tid, badge, HostedThreadRole::TpWorker { slot })
+        {
+            return false;
+        }
+        TP_WORKER_TID[pi][slot].store(tid, Ordering::Relaxed);
+        true
+    }
+
     pub(crate) fn release_hosted_thread_runtime(
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
-        self.thread_runtime.release_tid(tid)
+        let runtime = self.thread_runtime.release_tid(tid)?;
+        if let HostedThreadRole::TpWorker { slot } = runtime.role {
+            if runtime.pi < MAX_PI
+                && slot < TP_WORKER_SLOT_COUNT
+                && TP_WORKER_TID[runtime.pi][slot].load(Ordering::Relaxed) == runtime.tid
+            {
+                TP_WORKER_TID[runtime.pi][slot].store(0, Ordering::Relaxed);
+            }
+        }
+        Some(runtime)
     }
 
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
@@ -3614,9 +3658,7 @@ impl ExecNtHandler {
         let create_suspended = unsafe { smss_stack_read(sp + 0x40) } != 0;
         // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
         // workers — one window per extra thread of that process.
-        let Some(slot) = (0..TP_WORKER_SLOT_COUNT)
-            .find(|slot| TP_WORKER_TID[target_pi][*slot].load(Ordering::Relaxed) == 0)
-        else {
+        let Some(slot) = self.first_free_hosted_tp_worker_slot(target_pi) else {
             reject!(b"no-free-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         };
         let Some((pool_slot, tid)) = self.claim_pool_thread(target_pi, start.rip, create_suspended)
@@ -3624,6 +3666,13 @@ impl ExecNtHandler {
             reject!(b"no-pool-ethread", STATUS_INSUFFICIENT_RESOURCES);
         };
         let thread = tid as nt_process::ThreadId;
+        if !self.reserve_hosted_tp_worker_slot(target_pi, slot, tid) {
+            let _ = self
+                .pm
+                .set_thread_state(thread, nt_process::ThreadState::Initialized);
+            self.release_pool_usage_slot(target_pi, pool_slot);
+            reject!(b"reserve-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
+        }
         let handle = match self.pm.insert_handle(
             caller_pid,
             nt_process::HandleObject::Thread(thread),
@@ -3631,6 +3680,7 @@ impl ExecNtHandler {
         ) {
             Ok(handle) => handle as u64,
             Err(status) => {
+                let _ = self.release_hosted_thread_runtime(tid);
                 let _ = self
                     .pm
                     .set_thread_state(thread, nt_process::ThreadState::Initialized);
@@ -3639,6 +3689,7 @@ impl ExecNtHandler {
             }
         };
         if !self.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
+            let _ = self.release_hosted_thread_runtime(tid);
             let _ = self.close_process_handle(caller_pid, handle);
             let _ = self
                 .pm
@@ -3650,7 +3701,6 @@ impl ExecNtHandler {
         let _ = self
             .pm
             .set_thread_create_time(thread, nt_system_time_100ns() as i64);
-        TP_WORKER_TID[target_pi][slot].store(tid, Ordering::Relaxed);
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         self.queue_write(args[0], handle);
@@ -11163,8 +11213,7 @@ impl ExecNtHandler {
                             // slot — the generic `(pi, slot)` hosted-thread layout is already fully
                             // general (badge, target VAs, executive mirror + env scratch, multiplex
                             // sub-select) and this process has a free slot, so this claims one.
-                            let free = (0..TP_WORKER_SLOT_COUNT)
-                                .find(|slot| TP_WORKER_TID[self.pi][*slot].load(Ordering::Relaxed) == 0);
+                            let free = self.first_free_hosted_tp_worker_slot(self.pi);
                             if free.is_some() {
                                 crate::LSA_RPC_EXTRA_WORKERS_CLAIMED
                                     .fetch_add(1, Ordering::Relaxed);
@@ -11177,16 +11226,27 @@ impl ExecNtHandler {
                             None
                         };
                         if let Some(tp_slot) = tp_slot {
-                            if TP_WORKER_TID[self.pi][tp_slot].load(Ordering::Relaxed) != 0 {
-                                return 0xC000_009A;
-                            }
                             let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                            if let Some((_slot, tid, handle)) = self.nt_create_thread_handle(
+                            if let Some((pool_slot, tid, handle)) = self.nt_create_thread_handle(
                                 start.rip,
                                 create_suspended,
                                 args[1] as u32,
                             ) {
-                                self.pm.set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
+                                if !self.reserve_hosted_tp_worker_slot(self.pi, tp_slot, tid) {
+                                    let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
+                                    let _ = self.close_process_handle(pid, handle);
+                                    let _ = self.pm.set_thread_state(
+                                        tid as nt_process::ThreadId,
+                                        nt_process::ThreadState::Initialized,
+                                    );
+                                    self.release_pool_usage_slot(self.pi, pool_slot);
+                                    self.set_pool_thread_suspended(self.pi, pool_slot, false);
+                                    return 0xC000_009A;
+                                }
+                                self.pm.set_thread_teb(
+                                    tid as nt_process::ThreadId,
+                                    tp_worker_teb_va(tp_slot),
+                                );
                                 let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
                                 self.queue_write(args[0], handle);
                                 let cid_ptr = smss_stack_read(sp + 0x28);
@@ -11194,7 +11254,6 @@ impl ExecNtHandler {
                                     self.queue_write(cid_ptr, pid as u64);
                                     self.queue_write(cid_ptr + 8, tid);
                                 }
-                                TP_WORKER_TID[self.pi][tp_slot].store(tid, Ordering::Relaxed);
                                 self.thread_spawn_request = Some(
                                     HostedThreadSpawnRequest::TpWorker {
                                         pi: self.pi,

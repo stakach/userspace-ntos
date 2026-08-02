@@ -11041,7 +11041,31 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
         badge: u64,
         role: HostedThreadRole,
     ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || tcb <= 1 {
+        if tcb <= 1 {
+            return None;
+        }
+        self.store(pi, tid, tcb, badge, role)
+    }
+
+    fn reserve(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        self.store(pi, tid, 1, badge, role)
+    }
+
+    fn store(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || tcb == 0 {
             return None;
         }
         let runtime = HostedThreadRuntime {
@@ -11054,6 +11078,13 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
             *existing = runtime;
             return Some(runtime);
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.is_live() && entry.pi == pi && entry.role == role)
+        {
+            return None;
         }
         if let Some(empty) = self.entries.iter_mut().find(|entry| !entry.is_live()) {
             *empty = runtime;
@@ -11145,6 +11176,17 @@ impl HostedThreadRuntimes {
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).register(pi, tid, tcb, badge, role) }
+    }
+
+    fn reserve(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).reserve(pi, tid, badge, role) }
     }
 
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {

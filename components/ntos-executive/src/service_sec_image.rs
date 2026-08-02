@@ -12534,7 +12534,12 @@ unsafe fn spawn_requested_tp_worker(
         |address| unsafe { smss_stack_read(address) },
         context_va,
     );
-    let tid = TP_WORKER_TID[pi][worker_slot].load(Ordering::Relaxed);
+    let Some(tid) =
+        nt_handler.hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot: worker_slot })
+    else {
+        TP_WORKER_TCB[pi][worker_slot].store(0, Ordering::Relaxed);
+        return;
+    };
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
     let suspended = nt_handler
         .pm_pool_slot_for_tid(tid)
