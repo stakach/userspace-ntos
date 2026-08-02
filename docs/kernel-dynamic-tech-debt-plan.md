@@ -33,7 +33,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
 - `[x]` A4: Replace badge-to-process switches with registered thread/process runtime records.
-- `[ ]` A5: Move remaining named hosted TCB cap cells into runtime-owned hosted-thread capability
+- `[x]` A5: Move remaining named hosted TCB cap cells into runtime-owned hosted-thread capability
   records and narrow proof queries.
 
 ### B. Win32k Process And Thread Context
@@ -244,3 +244,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   top-level process badges and generic TP-worker badges remain mechanism-level transport decodes.
   The remaining named hosted TCB cells are low-level seL4 cap publication/teardown state, now tracked
   separately as A5 rather than process-identity routing.
+- A5 complete. Local hosted-thread spawn paths no longer claim or store named TCB cap cells, and
+  `HostedThreadSpawnSpec` carries only role/badge/TEB/spawner metadata. Thread termination now
+  suspends/deletes the TCB from the runtime record and releases that record without clearing a mirror.
+  The `PM_MAIN_TCBS` array and `img_spawn` publication write are gone; userinit/explorer gates prove
+  main-thread publication through `HOSTED_THREAD_RUNTIME_OK` for `HostedThreadRole::Main`. The
+  winlogon listener post-loop proof is a boolean mint latch, so hosted TCB cap values live only in
+  `HostedThreadRuntimeTable`. Review adjustment: remaining `_TCB` state belongs to non-hosted seL4
+  mechanisms such as win32k/root-task plumbing, not hosted process/thread identity.

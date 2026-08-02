@@ -495,7 +495,6 @@ enum HostedThreadResumeMode {
 #[derive(Clone, Copy)]
 struct HostedThreadSpawnSpec {
     owner_leaf: &'static [u8],
-    tcb: &'static AtomicU64,
     teb: u64,
     badge: u64,
     role: HostedThreadRole,
@@ -512,7 +511,6 @@ fn hosted_multiplexed_thread_spawn_for(
     match request {
         HostedThreadSpawnRequest::ServicesListener => Some(HostedThreadSpawnSpec {
             owner_leaf: b"services.exe",
-            tcb: &SVC_LISTENER_TCB,
             teb: SVC_LISTENER_TEB_VA,
             badge: SVC_LISTENER_BADGE,
             role: HostedThreadRole::ServicesListener,
@@ -524,7 +522,6 @@ fn hosted_multiplexed_thread_spawn_for(
         }),
         HostedThreadSpawnRequest::ScmWorker => Some(HostedThreadSpawnSpec {
             owner_leaf: b"services.exe",
-            tcb: &SCM_WORKER_TCB,
             teb: SCM_WORKER_TEB_VA,
             badge: SCM_WORKER_BADGE,
             role: HostedThreadRole::ScmWorker,
@@ -537,7 +534,6 @@ fn hosted_multiplexed_thread_spawn_for(
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
-            tcb: &LSASS_LISTENER_TCB,
             teb: LSASS_LISTENER_TEB_VA,
             badge: LSASS_LISTENER_BADGE,
             role: HostedThreadRole::LsassListener,
@@ -549,7 +545,6 @@ fn hosted_multiplexed_thread_spawn_for(
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
-            tcb: &LSASS_LISTENER2_TCB,
             teb: LSASS_LISTENER2_TEB_VA,
             badge: LSASS_LISTENER2_BADGE,
             role: HostedThreadRole::LsassListener2,
@@ -561,7 +556,6 @@ fn hosted_multiplexed_thread_spawn_for(
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
-            tcb: &LSASS_LISTENER3_TCB,
             teb: LSASS_LISTENER3_TEB_VA,
             badge: LSASS_LISTENER3_BADGE,
             role: HostedThreadRole::LsassListener3,
@@ -573,7 +567,6 @@ fn hosted_multiplexed_thread_spawn_for(
         }),
         HostedThreadSpawnRequest::LsaWorker => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
-            tcb: &LSA_WORKER_TCB,
             teb: LSA_WORKER_TEB_VA,
             badge: LSA_WORKER_BADGE,
             role: HostedThreadRole::LsaWorker,
@@ -5900,7 +5893,7 @@ pub(crate) unsafe fn service_sec_image(
                     let conn_id = nt_handler.csr_rendezvous_conn;
                     let out_ptr = nt_handler.csr_rendezvous_out;
                     // Only drive the real accept if csrss actually spawned its CsrApiRequestThread
-                    // (CSR_LOOP_TCB is a real cap > 1). Otherwise recv_full_r12(CSR_FAULT_EP) would block
+                    // (the CSR runtime TCB record is a real cap > 1). Otherwise recv_full_r12(CSR_FAULT_EP) would block
                     // forever with no faulter. Do not synthesize a handle here: pending
                     // \Windows\ApiPort connects are now required to complete through the real CSR worker.
                     let have_thread = nt_handler
@@ -12170,9 +12163,6 @@ unsafe fn spawn_requested_multiplexed_thread(
         print_str(b"[thread-life] missing reserved runtime role before spawn\n");
         return;
     };
-    if !claim_thread_tcb_cell(spec.tcb) {
-        return;
-    }
 
     let (_ctx_va, start) = requested_thread_start(caller_sp);
     let suspended = hosted_thread_suspended(nt_handler, tid);
@@ -12209,7 +12199,6 @@ unsafe fn spawn_requested_multiplexed_thread(
         ),
     };
 
-    spec.tcb.store(tcb, Ordering::Relaxed);
     nt_handler.register_hosted_thread_tcb(owner_pi, tid, tcb, spec.badge, spec.role);
     nt_handler
         .pm
@@ -12230,12 +12219,6 @@ unsafe fn requested_thread_start(caller_sp: u64) -> (u64, nt_thread_start::Amd64
             context_va,
         ),
     )
-}
-
-#[inline]
-fn claim_thread_tcb_cell(cell: &'static AtomicU64) -> bool {
-    cell.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
 }
 
 #[inline]
@@ -12311,9 +12294,6 @@ unsafe fn spawn_requested_local_thread(
                 print_str(b"[sm-loop] missing reserved runtime role before spawn\n");
                 return;
             };
-            if !claim_thread_tcb_cell(&SM_LOOP_TCB) {
-                return;
-            }
             let (ctx_va, start) = requested_thread_start(caller_sp);
             print_str(b"[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x");
             print_hex((ctx_va >> 32) as u32);
@@ -12332,7 +12312,6 @@ unsafe fn spawn_requested_local_thread(
                 current_pml4
             };
             let tcb = spawn_sm_loop_thread(pml4, start.rip, start.rcx, cid_proc, tid);
-            SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
             nt_handler.register_hosted_thread_tcb(
                 0,
                 tid,
@@ -12345,9 +12324,9 @@ unsafe fn spawn_requested_local_thread(
             print_str(b" (parks on its first fault to sm_fault_ep)\n");
         }
         HostedThreadSpawnRequest::Csr { slot } => {
-            let (cell, role) = match slot {
-                0 => (&CSR_LOOP_TCB, HostedThreadRole::CsrApi),
-                1 => (&CSR_SB_LOOP_TCB, HostedThreadRole::CsrSbApi),
+            let role = match slot {
+                0 => HostedThreadRole::CsrApi,
+                1 => HostedThreadRole::CsrSbApi,
                 _ => return,
             };
             let (csrss_pi, pid, pml4) = live_process_context(nt_handler, procs, b"csrss.exe")
@@ -12356,9 +12335,6 @@ unsafe fn spawn_requested_local_thread(
                 print_str(b"[csr-thread] missing reserved runtime role before spawn\n");
                 return;
             };
-            if !claim_thread_tcb_cell(cell) {
-                return;
-            }
             let (_ctx_va, start) = requested_thread_start(caller_sp);
             if slot == 0 {
                 print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
@@ -12380,7 +12356,6 @@ unsafe fn spawn_requested_local_thread(
             } else {
                 spawn_csr_sb_loop_thread(pml4, start.rip, start.rcx, pid, tid)
             };
-            cell.store(tcb, Ordering::Relaxed);
             nt_handler.register_hosted_thread_tcb(
                 csrss_pi,
                 tid,
@@ -12395,21 +12370,18 @@ unsafe fn spawn_requested_local_thread(
             }
         }
         HostedThreadSpawnRequest::Winlogon { slot } => {
-            let (tcb_cell, role, badge, teb) = match slot {
+            let (role, badge, teb) = match slot {
                 0 => (
-                    &WL_LISTENER_TCB,
                     HostedThreadRole::WinlogonListener,
                     WINLOGON_WORKER_BADGE,
                     WL_LISTENER_TEB_VA,
                 ),
                 1 => (
-                    &WL_WORKER2_TCB,
                     HostedThreadRole::WinlogonWorker { slot },
                     WINLOGON_WORKER2_BADGE,
                     WL_WORKER2_TEB_VA,
                 ),
                 2 => (
-                    &WL_WORKER3_TCB,
                     HostedThreadRole::WinlogonWorker { slot },
                     WINLOGON_WORKER3_BADGE,
                     WL_WORKER3_TEB_VA,
@@ -12422,9 +12394,6 @@ unsafe fn spawn_requested_local_thread(
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
                 return;
             };
-            if !claim_thread_tcb_cell(tcb_cell) {
-                return;
-            }
             let (_ctx_va, start) = requested_thread_start(caller_sp);
             let initial_teb_va = smss_stack_read(caller_sp + 0x38);
             let initial_teb = nt_thread_start::InitialTeb64::read(
@@ -12489,10 +12458,9 @@ unsafe fn spawn_requested_local_thread(
                     print_str(b"[wl-thread] real stack reservation could not be armed\n");
                 }
             }
-            tcb_cell.store(tcb, Ordering::Relaxed);
             nt_handler.register_hosted_thread_tcb(wl_pi, tid, tcb, badge, role);
             if slot == 0 {
-                WL_LISTENER_TCB_MINTED.store(tcb, Ordering::Relaxed);
+                WL_LISTENER_THREAD_MINTED.store(1, Ordering::Relaxed);
             }
             nt_handler
                 .pm

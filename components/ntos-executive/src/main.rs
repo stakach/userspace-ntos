@@ -1933,8 +1933,6 @@ static LSA_RPC_SERVER_ACTIVE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 /// object (REPLY_SMLOOP), mirroring REPLY_W32. 0 = not yet retyped.
 static SM_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
-/// The SM-loop thread's TCB cap publication.
-static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
 /// The real SmpApiLoop's outstanding empty `NtReplyWaitReceivePort`. A completed rendezvous leaves
 /// the worker blocked here; the next connector is injected through this saved continuation instead
 /// of waiting for a new fault that cannot occur while the worker is parked.
@@ -1952,14 +1950,12 @@ static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 /// MCS reply object (REPLY_CSRLOOP). 0 = not yet retyped.
 static CSR_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static REPLY_CSRLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
-/// The CSR API thread's TCB (0 until csrss's first NtCreateThread spawns it). The same real thread
-/// re-parks on NtReplyWaitReceivePort and accepts later hosted Win32 client connects.
-static CSR_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
-/// CsrSbApiRequestThread has its own TCB and endpoint. It initially parks on its first code fault;
+/// CsrApiRequestThread re-parks on NtReplyWaitReceivePort and accepts later hosted Win32 client
+/// connects.
+/// CsrSbApiRequestThread has its own endpoint. It initially parks on its first code fault;
 /// the SB message-plane rendezvous can drive that endpoint independently of the API worker.
 static CSR_SB_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static REPLY_CSR_SB_SLOT: AtomicU64 = AtomicU64::new(0);
-static CSR_SB_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVMSG: AtomicU64 = AtomicU64::new(0);
 static CSR_API_RECVPORT: AtomicU64 = AtomicU64::new(0);
@@ -1987,15 +1983,11 @@ static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
 /// stays mapped + queryable by the main thread). 0 = not yet retyped. Distinct from SM/CSR EPs so a
 /// listener fault never lands in the SM/CSR rendezvous receivers.
 static WL_LISTENER_FAULT_EP: AtomicU64 = AtomicU64::new(0);
-/// The winlogon RPC-listener thread's TCB (0 until winlogon's first NtCreateThread spawns it).
-/// LIVE cell: zeroed again when the thread is torn down (`terminate_hosted_thread_mechanism`).
-static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
-/// …and the WRITE-ONCE latch of the same value: the seL4 TCB the general `NtCreateThread` service
-/// actually minted for that thread. Never cleared, so a later legitimate teardown cannot erase the
-/// proof that the service created a real thread. See `exec_general_nt_create_thread`.
-static WL_LISTENER_TCB_MINTED: AtomicU64 = AtomicU64::new(0);
-static WL_WORKER2_TCB: AtomicU64 = AtomicU64::new(0);
-static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
+/// Write-once proof latch that the general `NtCreateThread` service minted a seL4 TCB for
+/// winlogon's RPC-listener thread. Never cleared, so a later legitimate teardown cannot erase the
+/// proof that the service created a real thread. Runtime liveness and the cap value are tracked in
+/// `HostedThreadRuntimeTable`.
+static WL_LISTENER_THREAD_MINTED: AtomicU64 = AtomicU64::new(0);
 /// Slot-0's caller-created stack reservation. The fixed 0x1044 bootstrap stack is used only until
 /// LdrInitializeThunk restores this real context.
 static WL_LISTENER_STACK_ALLOCATION_BASE: AtomicU64 = AtomicU64::new(0);
@@ -3237,7 +3229,9 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
     let vspace_published =
         userinit_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let tcb = hosted_gate_slot(&PM_MAIN_TCBS, userinit_pi);
+    let main_thread_published = userinit_pi
+        .map(|pi| hosted_thread_runtime_gate_published(pi, HostedThreadRole::Main))
+        .unwrap_or(false);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
@@ -3283,8 +3277,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(spawned);
     print_str(b" vspace-published=");
     print_u64(vspace_published as u64);
-    print_str(b" tcb=0x");
-    print_hex(tcb as u32);
+    print_str(b" main-thread-runtime-ok=");
+    print_u64(main_thread_published as u64);
     print_str(b" primary-token-assignments=");
     print_u64(token_assigned);
     print_str(b" shell-image-attempts=");
@@ -3355,7 +3349,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && process_linked
             && spawned == 1
             && vspace_published
-            && tcb > 1
+            && main_thread_published
             && token_assigned >= 1,
         passed,
     );
@@ -3423,7 +3417,9 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
     let vspace_published =
         explorer_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
-    let tcb = hosted_gate_slot(&PM_MAIN_TCBS, explorer_pi);
+    let main_thread_published = explorer_pi
+        .map(|pi| hosted_thread_runtime_gate_published(pi, HostedThreadRole::Main))
+        .unwrap_or(false);
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     let create_window_string_captures =
         EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed);
@@ -3460,8 +3456,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(spawned);
     print_str(b" vspace-published=");
     print_u64(vspace_published as u64);
-    print_str(b" tcb=0x");
-    print_hex(tcb as u32);
+    print_str(b" main-thread-runtime-ok=");
+    print_u64(main_thread_published as u64);
     print_str(b" image-pts=");
     print_u64(image_pts);
     print_str(b" self-term-no-reply=");
@@ -3514,6 +3510,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && process_linked
             && spawned == 1
             && vspace_published
+            && main_thread_published
             && image_pts >= 2,
         passed,
     );
@@ -5022,9 +5019,7 @@ pub(crate) static PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn bump_progress() {
     PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
-/// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
-/// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
-static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+/// services' RPC listener thread fault count (multiplex proof).
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).
 pub(crate) static SVC_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -5035,13 +5030,10 @@ pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// server thread does after `rpcrt4_protseq_np_wait_for_new_connection` returns from an accept
 /// (`rpcrt4_spawn_connection` re-listen → `RPCRT4_new_client` → `CreateThread`).
 pub(crate) static LSA_LISTENER3_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
-/// lsass' LSA server thread — same shape as SVC_LISTENER, for pi 4 (the N-threads multiplex).
-static LSASS_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+/// lsass' LSA server thread fault count (N-threads multiplex proof).
 static LSASS_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// lsass' SECOND LSA server thread (LsapRmServerThread).
-static LSASS_LISTENER2_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
-static LSASS_LISTENER3_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 35: services' (pi 3) SCM per-connection RPC WORKER thread — spawned DYNAMICALLY by the SCM
 /// RPC listener via its SECOND NtCreateThread (rpcrt4 `RPCRT4_new_client` per accepted connection).
@@ -5049,7 +5041,6 @@ static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// mirror/TEB, distinct from services' main thread AND its listener). It is the thread that reads
 /// winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — so routing it (not drop-parking its
 /// NtCreateThread with 0xC000009A) is what closes the bind→bind_ack→RROpenSCManagerW round-trip.
-static SCM_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// lsass' (pi 4) `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread — spawned DYNAMICALLY by lsass'
 /// `\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3) via `RPCRT4_new_client` →
@@ -5057,7 +5048,6 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// multiplex keyed by [`LSA_WORKER_BADGE`]. This is the thread that reads the LSA RPC bind PDU and
 /// answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued by lsass' own
 /// main thread from samsrv) complete instead of blocking forever on an unserved pipe.
-static LSA_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
 /// ★★ THE LSA SELF-RPC WORKER ROUTE — **ON** (batch 51; was gated off for three batches).
 ///
 /// Routes lsass' `\pipe\lsarpc` per-connection RPC worker (`RPCRT4_new_client` ->
@@ -8992,26 +8982,6 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
-fn hosted_thread_tcb_mirror(runtime: HostedThreadRuntime) -> Option<&'static AtomicU64> {
-    match runtime.role {
-        HostedThreadRole::Main => PM_MAIN_TCBS.get(runtime.pi),
-        HostedThreadRole::TpWorker { .. } => None,
-        HostedThreadRole::SmLoop => Some(&SM_LOOP_TCB),
-        HostedThreadRole::CsrApi => Some(&CSR_LOOP_TCB),
-        HostedThreadRole::CsrSbApi => Some(&CSR_SB_LOOP_TCB),
-        HostedThreadRole::WinlogonListener => Some(&WL_LISTENER_TCB),
-        HostedThreadRole::WinlogonWorker { slot: 1 } => Some(&WL_WORKER2_TCB),
-        HostedThreadRole::WinlogonWorker { slot: 2 } => Some(&WL_WORKER3_TCB),
-        HostedThreadRole::WinlogonWorker { .. } => None,
-        HostedThreadRole::ServicesListener => Some(&SVC_LISTENER_TCB),
-        HostedThreadRole::ScmWorker => Some(&SCM_WORKER_TCB),
-        HostedThreadRole::LsassListener => Some(&LSASS_LISTENER_TCB),
-        HostedThreadRole::LsassListener2 => Some(&LSASS_LISTENER2_TCB),
-        HostedThreadRole::LsassListener3 => Some(&LSASS_LISTENER3_TCB),
-        HostedThreadRole::LsaWorker => Some(&LSA_WORKER_TCB),
-    }
-}
-
 unsafe fn pipe_io_cancel_thread(tid: u64) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let mut reply_caps = [0u64; PIPE_WAITER_N];
@@ -9064,11 +9034,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_u64(delete);
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
-        if let Some(runtime) = handler.release_hosted_thread_runtime(tid) {
-            if let Some(cell) = hosted_thread_tcb_mirror(runtime) {
-                cell.store(0, Ordering::Relaxed);
-            }
-        }
+        let _ = handler.release_hosted_thread_runtime(tid);
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -12489,9 +12455,6 @@ static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
 /// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
-/// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
-/// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
-pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
 /// with a foreign `ProcessHandle` (`RtlCreateUserProcess`'s "create the process, then its first
 /// thread" pair). The FIRST such create binds the process's pre-created main ETHREAD (and the seL4
@@ -13312,13 +13275,6 @@ fn hosted_gate_mask() -> u64 {
 
 fn hosted_gate_count() -> u64 {
     hosted_gate_mask().count_ones() as u64
-}
-
-fn hosted_gate_slot(slots: &[AtomicU64; MAX_PI], pi: Option<usize>) -> u64 {
-    match pi {
-        Some(pi) if pi < MAX_PI => slots[pi].load(Ordering::Relaxed),
-        _ => 0,
-    }
 }
 
 fn check(name: &[u8], ok: bool, passed: &mut u64) {
@@ -17607,7 +17563,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // kernel32's RPC listener setup no longer NULL-derefs an absent TEB
                     // (`exec_rpc_listener_thread_real`) → StartRpcServer runs past the wall.
                     // ★ RE-POINTED (batch 54), and strictly stronger. This used to sample the LIVE
-                    // `WL_LISTENER_TCB` cell, which the thread-termination mechanism zeroes. That was
+                    // live runtime TCB record, which the thread-termination mechanism releases. That was
                     // sound only while this thread outlived the whole boot. It no longer does: past
                     // the interactive logon winlogon's two transient workers (badges 12/13, tids
                     // 20/21) now really do run to completion and self-terminate through the real
@@ -17622,7 +17578,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_general_nt_create_thread",
                         PM_GENERAL_THREADS_CREATED.load(Ordering::Relaxed) >= 1
-                            && WL_LISTENER_TCB_MINTED.load(Ordering::Relaxed) > 1
+                            && WL_LISTENER_THREAD_MINTED.load(Ordering::Relaxed) != 0
                             && hosted_thread_runtime_gate_published(
                                 2,
                                 HostedThreadRole::WinlogonListener,
