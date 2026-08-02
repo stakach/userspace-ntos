@@ -12806,11 +12806,14 @@ impl ProcExec {
 }
 /// Bit i set iff `procs[i]` (the folded EPROCESS-linked per-process struct) has a live pml4 AND its
 /// `pid` matches the ProcessManager's pid for pi=i — proves the consolidated per-process mechanism
-/// struct is EPROCESS-linked at runtime (path 3). The gate derives the expected mask from
-/// `nt_exe_image::HOSTED_PROCESS_IMAGES`.
+/// struct is EPROCESS-linked at runtime (path 3). The gate derives the expected mask from runtime
+/// hosted-process metadata registration.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set when the handler accepted a nonzero seL4 VSpace cap for hosted process pi.
 static PM_VSPACE_PUBLISHED_OK: AtomicU64 = AtomicU64::new(0);
+static HOSTED_GATE_EXPECTED_MASK: AtomicU64 = AtomicU64::new(0);
+static HOSTED_GATE_USERINIT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+static HOSTED_GATE_EXPLORER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -13256,11 +13259,32 @@ fn print_hex(v: u32) {
 
 static GATE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-fn hosted_gate_pi(leaf: &[u8]) -> Option<usize> {
-    match nt_exe_image::hosted_pi_for_leaf(leaf) {
-        Some(pi) if pi < MAX_PI => Some(pi),
-        _ => None,
+pub(crate) fn reset_hosted_gate_metadata() {
+    HOSTED_GATE_EXPECTED_MASK.store(0, Ordering::Relaxed);
+    HOSTED_GATE_USERINIT_PI.store(u64::MAX, Ordering::Relaxed);
+    HOSTED_GATE_EXPLORER_PI.store(u64::MAX, Ordering::Relaxed);
+}
+
+pub(crate) fn publish_hosted_gate_image(image: nt_exe_image::HostedProcessImageRef<'_>) {
+    if image.pi < 64 {
+        HOSTED_GATE_EXPECTED_MASK.fetch_or(1u64 << image.pi, Ordering::Relaxed);
     }
+    if image.leaf.eq_ignore_ascii_case(b"userinit.exe") {
+        HOSTED_GATE_USERINIT_PI.store(image.pi as u64, Ordering::Relaxed);
+    } else if image.leaf.eq_ignore_ascii_case(b"explorer.exe") {
+        HOSTED_GATE_EXPLORER_PI.store(image.pi as u64, Ordering::Relaxed);
+    }
+}
+
+fn hosted_gate_pi(leaf: &[u8]) -> Option<usize> {
+    let pi = if leaf.eq_ignore_ascii_case(b"userinit.exe") {
+        HOSTED_GATE_USERINIT_PI.load(Ordering::Relaxed)
+    } else if leaf.eq_ignore_ascii_case(b"explorer.exe") {
+        HOSTED_GATE_EXPLORER_PI.load(Ordering::Relaxed)
+    } else {
+        u64::MAX
+    };
+    (pi != u64::MAX && (pi as usize) < MAX_PI).then_some(pi as usize)
 }
 
 fn hosted_gate_bit(leaf: &[u8]) -> u64 {
@@ -13271,13 +13295,7 @@ fn hosted_gate_bit(leaf: &[u8]) -> u64 {
 }
 
 fn hosted_gate_mask() -> u64 {
-    let mut mask = 0u64;
-    for image in nt_exe_image::HOSTED_PROCESS_IMAGES {
-        if image.pi < MAX_PI && image.pi < 64 {
-            mask |= 1u64 << image.pi;
-        }
-    }
-    mask
+    HOSTED_GATE_EXPECTED_MASK.load(Ordering::Relaxed)
 }
 
 fn hosted_gate_count() -> u64 {

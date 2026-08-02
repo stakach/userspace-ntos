@@ -314,3 +314,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   historical static table. Review adjustment: remaining static uses are the startup seed policy,
   bootstrap process metadata registration, bootstrap spawn descriptors, and post-loop gate
   expectations.
+- A2 continued. Post-loop process-manager gates now derive their expected hosted-process mask and
+  userinit/explorer `pi` values from hosted-process metadata published during
+  `ExecNtHandler` registration, not from `HOSTED_PROCESS_IMAGES`. Review adjustment: remaining
+  static uses are the startup seed policy, bootstrap process metadata registration, and bootstrap
+  spawn descriptors.

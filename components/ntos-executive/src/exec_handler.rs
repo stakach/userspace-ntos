@@ -426,6 +426,7 @@ impl ExecNtHandler {
         PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
         PM_IDENTITY_OK.store(0, Ordering::Relaxed);
         PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
+        reset_hosted_gate_metadata();
         PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
         HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
         PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
@@ -2080,15 +2081,21 @@ impl ExecNtHandler {
     ) -> Result<(), u32> {
         if let Some(existing) = self.hosted_images.get_by_pi(image.pi) {
             return if existing == image {
+                publish_hosted_gate_image(existing);
                 Ok(())
             } else {
                 Err(nt_process::STATUS_INVALID_PARAMETER)
             };
         }
-        self.hosted_images
+        let registered = self
+            .hosted_images
             .register_ref(image)
             .map(|_| ())
-            .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
+            .map_err(|_| nt_process::STATUS_INVALID_PARAMETER);
+        if registered.is_ok() {
+            publish_hosted_gate_image(image);
+        }
+        registered
     }
 
     fn register_hosted_main_thread_identity(
