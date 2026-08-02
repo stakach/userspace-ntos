@@ -3242,7 +3242,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let process_linked =
         userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = hosted_gate_pml4(userinit_pi);
+    let vspace_published =
+        userinit_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let tcb = hosted_gate_slot(&PM_MAIN_TCBS, userinit_pi);
     let token_assigned = USERINIT_PRIMARY_TOKEN_ASSIGNED.load(Ordering::Relaxed);
     let shell_attempts = USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
@@ -3287,8 +3288,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
-    print_str(b" pml4=0x");
-    print_hex(pml4 as u32);
+    print_str(b" vspace-published=");
+    print_u64(vspace_published as u64);
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
     print_str(b" primary-token-assignments=");
@@ -3360,7 +3361,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && creates >= 1
             && process_linked
             && spawned == 1
-            && pml4 != 0
+            && vspace_published
             && tcb > 1
             && token_assigned >= 1,
         passed,
@@ -3427,7 +3428,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let process_linked =
         explorer_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
     let spawned = EXPLORER_SPAWNED.load(Ordering::Relaxed);
-    let pml4 = hosted_gate_pml4(explorer_pi);
+    let vspace_published =
+        explorer_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & explorer_bit) != 0;
     let tcb = hosted_gate_slot(&PM_MAIN_TCBS, explorer_pi);
     let image_pts = EXPLORER_IMAGE_PAGE_TABLES.load(Ordering::Relaxed);
     let create_window_string_captures =
@@ -3463,8 +3465,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(process_linked as u64);
     print_str(b" spawned=");
     print_u64(spawned);
-    print_str(b" pml4=0x");
-    print_hex(pml4 as u32);
+    print_str(b" vspace-published=");
+    print_u64(vspace_published as u64);
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
     print_str(b" image-pts=");
@@ -3518,7 +3520,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && creates >= 1
             && process_linked
             && spawned == 1
-            && pml4 != 0
+            && vspace_published
             && image_pts >= 2,
         passed,
     );
@@ -10837,21 +10839,18 @@ struct ExecNtHandler {
     /// process/thread lifecycle. FIRST convergence increment — each hosted process (smss/csrss/
     /// winlogon) is backed by a real EPROCESS created in `new()` (below the per-syscall heap mark, so
     /// its BTreeMap allocations survive the bump reset). This increment only CREATES + LOOKS UP the
-    /// EPROCESSes (read-only during the loop, so no runtime realloc); the ad-hoc identity arrays +
-    /// `next_handle` fakes stay live and are migrated onto this in the sequenced bulk. Policy lives
-    /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
-    /// executive (only the trusted root task holds those caps), linked to an EPROCESS through the
-    /// process mechanism table.
+    /// EPROCESSes (read-only during the loop, so no runtime realloc). Policy lives here; the seL4
+    /// VSpace/CSpace/TCB caps + mirror/scratch VAs stay executive-side because only the trusted root
+    /// task holds those caps, linked to an EPROCESS through the process mechanism table.
     pm: nt_process::ProcessManager,
-    /// Allocation-free mirror of the hosted process mechanism slots keyed by NT PID/TID/badge.
-    /// The old atomics remain synchronized for low-level code that has not moved yet.
+    /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge.
     process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
+    /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
+    process_vspaces: [u64; MAX_PI],
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
     temporary_process_slots: [nt_process::ProcessId; MAX_PI],
-    /// Allocation-free mirror of hosted main/pool ETHREAD identities. The static TCB/cap cells stay
-    /// in the executive for now; this table makes PID/TID keyed thread lookup authoritative inside
-    /// the syscall handler before those low-level cells are moved.
+    /// Allocation-free hosted main/pool ETHREAD identities.
     thread_mechanisms: nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>,
     /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
     pool_used: [u64; MAX_PI],
@@ -12472,12 +12471,6 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// Each hosted process's seL4 VSpace (PML4) cap, mirrored out of the service loop's `procs[pi].pml4`
-/// so a service arm can reach a FOREIGN process's address space without the loop context (which the
-/// post-loop self-tests deliberately take away). Written wherever `procs[pi].pml4` is assigned.
-/// This is what makes a cross-VSpace `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != self)`)
-/// resolvable: pid → pi → the target VSpace the new thread's stack/TEB are built in.
-pub(crate) static PM_PML4S: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
 /// with a foreign `ProcessHandle` (`RtlCreateUserProcess`'s "create the process, then its first
 /// thread" pair). The FIRST such create binds the process's pre-created main ETHREAD (and the seL4
@@ -12823,6 +12816,8 @@ impl ProcExec {
 /// struct is EPROCESS-linked at runtime (path 3). The gate derives the expected mask from
 /// `nt_exe_image::HOSTED_PROCESS_IMAGES`.
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
+/// Bit i set when the handler accepted a nonzero seL4 VSpace cap for hosted process pi.
+static PM_VSPACE_PUBLISHED_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -13301,10 +13296,6 @@ fn hosted_gate_slot(slots: &[AtomicU64; MAX_PI], pi: Option<usize>) -> u64 {
         Some(pi) if pi < MAX_PI => slots[pi].load(Ordering::Relaxed),
         _ => 0,
     }
-}
-
-fn hosted_gate_pml4(pi: Option<usize>) -> u64 {
-    hosted_gate_slot(&PM_PML4S, pi)
 }
 
 fn check(name: &[u8], ok: bool, passed: &mut u64) {

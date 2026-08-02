@@ -86,10 +86,6 @@ unsafe fn loaded_hosted_image_metadata(
     None
 }
 
-fn reset_hosted_mechanism_mirror_slot(pi: usize) {
-    PM_PML4S[pi].store(0, Ordering::Relaxed);
-}
-
 unsafe fn record_hosted_child_exe_open(
     ctx: ExecLoopCtx,
     owner_pi: usize,
@@ -429,12 +425,10 @@ impl ExecNtHandler {
         // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
         // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
         pm.reserve_modules(64);
-        for pi in 0..MAX_PI {
-            reset_hosted_mechanism_mirror_slot(pi);
-        }
         PM_PROC_COUNT.store(0, Ordering::Relaxed);
         PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
         PM_IDENTITY_OK.store(0, Ordering::Relaxed);
+        PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
         PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
         PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
         let smss_pid = pm.create_process("smss.exe", None, None);
@@ -571,10 +565,10 @@ impl ExecNtHandler {
             // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
             // subsystem handshake; post-winlogon children are created by the live
             // `NtCreateProcess[Ex]` path that ReactOS drives. Mechanism tables below are the
-            // authoritative hosted identity map; the old `PM_*` mirrors are updated only as a
-            // temporary compatibility shadow.
+            // authoritative hosted identity map.
             pm,
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
+            process_vspaces: [0; MAX_PI],
             temporary_process_slots: [0; MAX_PI],
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
             pool_used: [0; MAX_PI],
@@ -1693,13 +1687,16 @@ impl ExecNtHandler {
         if pi >= MAX_PI || pml4 == 0 || self.pm_pid_for_pi(pi).is_none() {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        PM_PML4S[pi].store(pml4, Ordering::Relaxed);
+        self.process_vspaces[pi] = pml4;
+        if pi < 64 {
+            PM_VSPACE_PUBLISHED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
+        }
         Ok(())
     }
 
     pub(crate) fn hosted_process_vspace(&self, pi: usize) -> Option<u64> {
         self.pm_pid_for_pi(pi)?;
-        let pml4 = PM_PML4S.get(pi)?.load(Ordering::Relaxed);
+        let pml4 = *self.process_vspaces.get(pi)?;
         (pml4 != 0).then_some(pml4)
     }
 
@@ -1801,7 +1798,7 @@ impl ExecNtHandler {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         self.temporary_process_slots[pi] = pid;
-        PM_PML4S[pi].store(pml4, Ordering::Relaxed);
+        self.process_vspaces[pi] = pml4;
         Ok(())
     }
 
@@ -1810,7 +1807,7 @@ impl ExecNtHandler {
             return;
         }
         self.temporary_process_slots[pi] = 0;
-        PM_PML4S[pi].store(0, Ordering::Relaxed);
+        self.process_vspaces[pi] = 0;
     }
 
     pub(crate) fn register_temporary_pool_thread_slot(
@@ -2258,7 +2255,7 @@ impl ExecNtHandler {
             .pm_pid_for_pi(creator_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let pid = self.pm.create_process(name, Some(parent), None);
-        reset_hosted_mechanism_mirror_slot(child_pi);
+        self.process_vspaces[child_pi] = 0;
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
         self.register_hosted_process_identity(child_pi, pid, main_tid)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {

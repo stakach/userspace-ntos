@@ -197,3 +197,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   create-suspended handoff, diagnostics, CSR worker creation, and remote thread cleanup now mutate
   handler-owned state directly. Review adjustment: `PM_PML4S` remains as the last process-mechanism
   static in this cluster because post-loop gate probes still read it without an `ExecNtHandler`.
+- A3 continued. Moved hosted process VSpace caps out of `PM_PML4S` and into `ExecNtHandler`
+  process-mechanism state. Runtime cross-VSpace thread creation now resolves target PML4 caps from
+  the handler-owned table, while post-loop userinit/explorer gates consume a narrow
+  `PM_VSPACE_PUBLISHED_OK` proof bit instead of reading cap values. Review adjustment: the A3
+  process/thread identity and mechanism-state mirrors are now gone; remaining A4 work is the named
+  bootstrap/listener TCB/TID cap cells still used by low-level spawn and teardown glue.
