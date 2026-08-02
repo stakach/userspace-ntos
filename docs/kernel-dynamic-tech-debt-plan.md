@@ -324,3 +324,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   is a mechanical split with no policy change. Review adjustment: remaining static hosted-image
   uses are still the startup seed policy, bootstrap process metadata registration, and bootstrap
   spawn descriptors.
+- A2 continued. `ExecNtHandler::new` now receives bootstrap hosted-process metadata from the
+  runtime hosted-image catalog seeded by the service loop, and registers smss/csrss/winlogon
+  identities from that catalog instead of looking up static descriptors by `pi` internally. The
+  executable catalog now includes the already-loaded smss image so bootstrap gate publication remains
+  complete. Review adjustment: remaining executive-side static hosted-image uses are the startup
+  seed policy and the bootstrap spawn descriptor helper.

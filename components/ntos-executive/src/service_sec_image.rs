@@ -97,6 +97,7 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
 
 fn seed_hosted_exe_image_catalog(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    smss_pe: &nt_pe_loader::PeFile,
     csrss_pe: &Option<nt_pe_loader::PeFile<'static>>,
     winlogon_pe: &Option<nt_pe_loader::PeFile<'static>>,
     services_pe: &Option<nt_pe_loader::PeFile<'static>>,
@@ -105,6 +106,7 @@ fn seed_hosted_exe_image_catalog(
     explorer_pe: &Option<nt_pe_loader::PeFile<'static>>,
 ) {
     let loaded = [
+        (b"smss.exe" as &[u8], !smss_pe.bytes().is_empty()),
         (b"csrss.exe" as &[u8], csrss_pe.is_some()),
         (b"winlogon.exe" as &[u8], winlogon_pe.is_some()),
         (b"services.exe" as &[u8], services_pe.is_some()),
@@ -2283,6 +2285,7 @@ pub(crate) unsafe fn service_sec_image(
     }
     seed_hosted_exe_image_catalog(
         &mut exe_image_catalog,
+        pe,
         &csrss_pe,
         &winlogon_pe,
         &services_pe,
@@ -2374,7 +2377,7 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let mut nt_handler = ExecNtHandler::new();
+    let mut nt_handler = ExecNtHandler::new(&exe_image_catalog);
     nt_handler.register_main_thread_tcb(0, main_tcb);
     let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
     if ntdll.is_some() {

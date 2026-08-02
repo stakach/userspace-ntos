@@ -297,7 +297,7 @@ unsafe fn publish_time_zone(
 }
 
 impl ExecNtHandler {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(bootstrap_images: &nt_exe_image::OwnedHostedImageCatalog<8>) -> Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
         // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
         let hive = unsafe {
@@ -590,10 +590,8 @@ impl ExecNtHandler {
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
-                if let Some(image) = nt_exe_image::hosted_image_for_pi(pi) {
-                    let _ = handler.register_hosted_process_metadata(
-                        nt_exe_image::HostedProcessImageRef::from(image),
-                    );
+                if let Some(image) = bootstrap_images.get_by_pi(pi) {
+                    let _ = handler.register_hosted_process_metadata(image);
                     let _ = handler.register_hosted_process_identity(
                         pi,
                         pid,
