@@ -518,3 +518,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   service GDI/init shortcuts (`NtGdiInit`, `NtGdiOpenDCW`, bitmap/pattern-brush creation) still use
   noninteractive service shortcuts; the next cleanup should move those toward provider/object-owned
   state instead of expanding the shortcut surface.
+- C3/F1 cleanup. Removed the fake service GDI handle allocator and the noninteractive
+  bitmap/pattern-brush successful shortcut path. Service `NtGdiCreateBitmap` still reuses the real
+  observed session `DEFAULT_BITMAP` for the zero-sized stock-object case, but ordinary service
+  bitmap and pattern-brush allocation misses now return NULL and log a visible mirror miss instead
+  of minting process-owned GDI handles in the executive. Validation:
+  `.tmp/full-boot-service-gdi-null-20260803-091616.log` reached `RUN_RC=0`, `276/276` checks
+  passed, `PASS exec_services_scrollbar_classinfo_mirrored`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_logon_dialog_painted`, and the explorer
+  message/callback/WndProc/COM gates remained green while services and LSASS tolerated the NULL
+  bitmap/brush results. Review adjustment: remaining F1/C3 service debt is now the
+  `NtUserInitializeClientPfnArrays` service-safe capture, `NtGdiInit` TRUE shortcut,
+  `NtGdiOpenDCW` NULL shortcut, and real provider-owned service GDI object ownership if a service
+  later needs non-stock GDI objects.

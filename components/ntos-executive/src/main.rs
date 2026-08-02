@@ -10258,11 +10258,6 @@ pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Count of remaining non-interactive-service win32k shortcuts. Cursor/class paths should reuse
 /// real metadata observed from winlogon; remaining increments represent still-open GDI/init debt.
 pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Monotonic fake GDI-handle allocator for non-interactive-service GDI object creation
-/// (`NtGdiCreateBitmap` 0x106c / `NtGdiCreatePatternBrushInternal` 0x10b5). Service
-/// `NtGdiGetStockObject` (0x10d4) reuses real stock handles observed from win32k instead of this
-/// synthetic source.
-pub(crate) static SVC_FAKE_GDI_HANDLE: AtomicU64 = AtomicU64::new(0x0050_0100);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).

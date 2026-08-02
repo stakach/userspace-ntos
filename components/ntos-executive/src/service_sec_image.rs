@@ -8018,20 +8018,11 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x106c && svc_noninteractive {
-                    // ★ NON-INTERACTIVE SERVICE NtGdiCreateBitmap (0x106c — w32ksvc64.h).
-                    // After 0x125b/0x11e0, service-image
-                    // GUI-DLL DllMains (comctl32/uxtheme) create cached GDI objects; routing these into
-                    // win32k trips the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit (a fault-FREE spin the
-                    // executive cannot interrupt — it's blocked in win32k_dispatch's recv). A non-interactive
-                    // service creates these objects but NEVER draws with them. For ReactOS' zero-sized
-                    // bitmap case, return the real DEFAULT_BITMAP stock handle if it has already been
-                    // observed; otherwise return a synthetic non-NULL GDI handle (mimicking the
-                    // interactive path's 0x00050048 GDI-handle shape) so
-                    // the client's DllMain stores a plausible handle and proceeds — the same
-                    // non-interactive-service short-circuit as 0x103d/0x10b4/0x125b/0x11e0. Scoped to
-                    // non-interactive service images; the interactive clients' real routed 0x106c (BATCH 16, bounded via
-                    // zero-fill) are untouched. If a service later performs a REAL blit with the handle that
-                    // is the next diagnosed wall (a service normally does not).
+                    // Non-interactive services may ask gdi32 for cached process-attach bitmaps even
+                    // though they never own an interactive display target. Reuse the real session
+                    // DEFAULT_BITMAP only for the zero-sized stock-object case; all other service
+                    // bitmap allocation requests fail visibly until service GDI object ownership is
+                    // wired through the provider.
                     let zero_size_default_bitmap = if a0 == 0 || a1 == 0 {
                         GLOBAL_GDI_STOCK_OBJECT_MIRROR
                             .lookup(nt_kernel_exec::user_gdi::DEFAULT_BITMAP)
@@ -8045,24 +8036,25 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                         (handle as u64, true)
                     } else {
-                        SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                        let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
-                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) FAKED (non-interactive service, no GDI blit) -> handle 0x");
-                        print_hex(h as u32);
-                        print_str(b"\n");
-                        (h as u64, true)
+                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) MIRROR MISS ");
+                        print_u64(a0 as u32 as u64);
+                        print_str(b"x");
+                        print_u64(a1 as u32 as u64);
+                        print_str(b" planes=");
+                        print_u64(a2 as u32 as u64);
+                        print_str(b" bpp=");
+                        print_u64(a3 as u32 as u64);
+                        print_str(b" -> NULL\n");
+                        (0, true)
                     }
                 } else if m0 == 0x10b5 && svc_noninteractive {
-                    // NtGdiCreatePatternBrushInternal is another non-interactive service
-                    // process-attach object creation. It is not a stock-object lookup, so keep it on
-                    // the bounded service-only synthetic-handle path until service PROCESSINFO/GDI
-                    // state is independent enough to run the real blit path.
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) FAKED (non-interactive service, no GDI blit) -> handle 0x");
-                    print_hex(h as u32);
-                    print_str(b"\n");
-                    (h as u64, true)
+                    // Pattern brushes are process-owned GDI objects, not stock handles. A
+                    // non-interactive service cannot receive an invented brush handle; fail visibly
+                    // until real provider-owned service GDI object allocation is available.
+                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) MIRROR MISS hbm=0x");
+                    print_hex(a0 as u32);
+                    print_str(b" -> NULL\n");
+                    (0, true)
                 } else if m0 == 0x10bd && svc_noninteractive {
                     // Non-interactive services have already supplied their real user32 client PFN
                     // arrays and registered the system classes through the bounded service path above.
