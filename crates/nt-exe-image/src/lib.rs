@@ -7,6 +7,8 @@
 #![no_std]
 
 pub const MAX_EXE_LEAF: usize = 64;
+pub const MAX_NT_IMAGE_PATH: usize = 192;
+pub const MAX_COMMAND_LINE: usize = 384;
 pub const SMSS_TOP_BADGE: u64 = 0;
 pub const CSRSS_TOP_BADGE: u64 = 2;
 pub const WINLOGON_TOP_BADGE: u64 = 4;
@@ -84,6 +86,16 @@ pub struct SpawnTarget {
     pub pi: usize,
     pub top_badge: u64,
     pub role: HostedProcessRole,
+}
+
+impl SpawnTarget {
+    pub fn from_image(image: HostedProcessImageRef<'_>) -> Self {
+        Self {
+            pi: image.pi,
+            top_badge: image.top_badge,
+            role: image.role,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,10 +223,34 @@ impl<'a> From<&'a HostedProcessImage> for HostedProcessImageRef<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostedImageRegistrationError {
     InvalidPath,
+    InvalidProcessName,
+    FieldTooLong,
     DuplicatePi,
     DuplicateTopBadge,
     DuplicateLeaf,
     Full,
+}
+
+fn validate_hosted_image_ref(
+    image: HostedProcessImageRef<'_>,
+) -> Result<(), HostedImageRegistrationError> {
+    let Some(leaf) = canonical_exe_leaf(image.leaf) else {
+        return Err(HostedImageRegistrationError::InvalidPath);
+    };
+    let Some(path_leaf) = canonical_exe_leaf(image.nt_image_path) else {
+        return Err(HostedImageRegistrationError::InvalidPath);
+    };
+    if image.top_badge >= 64
+        || image.leaf.is_empty()
+        || image.leaf.len() > MAX_EXE_LEAF
+        || image.nt_image_path.is_empty()
+        || image.command_line.is_empty()
+        || !eq_ascii_case(leaf, image.leaf)
+        || !eq_ascii_case(path_leaf, image.leaf)
+    {
+        return Err(HostedImageRegistrationError::InvalidPath);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,22 +273,7 @@ impl<'a, const N: usize> HostedImageCatalog<'a, N> {
         &mut self,
         image: HostedProcessImageRef<'a>,
     ) -> Result<usize, HostedImageRegistrationError> {
-        let Some(leaf) = canonical_exe_leaf(image.leaf) else {
-            return Err(HostedImageRegistrationError::InvalidPath);
-        };
-        let Some(path_leaf) = canonical_exe_leaf(image.nt_image_path) else {
-            return Err(HostedImageRegistrationError::InvalidPath);
-        };
-        if image.top_badge >= 64
-            || image.leaf.is_empty()
-            || image.leaf.len() > MAX_EXE_LEAF
-            || image.nt_image_path.is_empty()
-            || image.command_line.is_empty()
-            || !eq_ascii_case(leaf, image.leaf)
-            || !eq_ascii_case(path_leaf, image.leaf)
-        {
-            return Err(HostedImageRegistrationError::InvalidPath);
-        }
+        validate_hosted_image_ref(image)?;
         if self.get_by_pi(image.pi).is_some() {
             return Err(HostedImageRegistrationError::DuplicatePi);
         }
@@ -352,6 +373,243 @@ impl<'a, const N: usize> HostedImageCatalog<'a, N> {
     }
 
     pub fn probe_leaf(&self, folded_path: &[u8], is_sxs: bool) -> Option<&'a [u8]> {
+        self.probe_image(folded_path, is_sxs)
+            .map(|image| image.leaf)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedBytes<const N: usize> {
+    bytes: [u8; N],
+    len: u16,
+}
+
+impl<const N: usize> FixedBytes<N> {
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, HostedImageRegistrationError> {
+        if bytes.len() > N || bytes.len() > u16::MAX as usize {
+            return Err(HostedImageRegistrationError::FieldTooLong);
+        }
+        let mut fixed = Self::empty();
+        fixed.bytes[..bytes.len()].copy_from_slice(bytes);
+        fixed.len = bytes.len() as u16;
+        Ok(fixed)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedHostedProcessImage {
+    pub pi: usize,
+    pub top_badge: u64,
+    leaf: FixedBytes<MAX_EXE_LEAF>,
+    process_name: FixedBytes<MAX_EXE_LEAF>,
+    pub role: HostedProcessRole,
+    nt_image_path: FixedBytes<MAX_NT_IMAGE_PATH>,
+    command_line: FixedBytes<MAX_COMMAND_LINE>,
+    pub image_root: HostedImageRoot,
+    probe_fragment: FixedBytes<MAX_EXE_LEAF>,
+}
+
+impl OwnedHostedProcessImage {
+    pub fn new(
+        pi: usize,
+        top_badge: u64,
+        leaf: &[u8],
+        process_name: &[u8],
+        role: HostedProcessRole,
+        nt_image_path: &[u8],
+        command_line: &[u8],
+        image_root: HostedImageRoot,
+        probe_fragment: &[u8],
+    ) -> Result<Self, HostedImageRegistrationError> {
+        let image = Self {
+            pi,
+            top_badge,
+            leaf: FixedBytes::from_slice(leaf)?,
+            process_name: FixedBytes::from_slice(process_name)?,
+            role,
+            nt_image_path: FixedBytes::from_slice(nt_image_path)?,
+            command_line: FixedBytes::from_slice(command_line)?,
+            image_root,
+            probe_fragment: FixedBytes::from_slice(probe_fragment)?,
+        };
+        if core::str::from_utf8(image.process_name.as_slice()).is_err() {
+            return Err(HostedImageRegistrationError::InvalidProcessName);
+        }
+        validate_hosted_image_ref(image.as_ref())?;
+        Ok(image)
+    }
+
+    pub fn as_ref(&self) -> HostedProcessImageRef<'_> {
+        HostedProcessImageRef {
+            pi: self.pi,
+            top_badge: self.top_badge,
+            leaf: self.leaf.as_slice(),
+            process_name: core::str::from_utf8(self.process_name.as_slice())
+                .expect("owned hosted process image process name is validated UTF-8"),
+            role: self.role,
+            nt_image_path: self.nt_image_path.as_slice(),
+            command_line: self.command_line.as_slice(),
+            image_root: self.image_root,
+            probe_fragment: self.probe_fragment.as_slice(),
+        }
+    }
+
+    pub fn leaf(&self) -> &[u8] {
+        self.leaf.as_slice()
+    }
+
+    pub fn nt_image_path(&self) -> &[u8] {
+        self.nt_image_path.as_slice()
+    }
+
+    pub fn command_line(&self) -> &[u8] {
+        self.command_line.as_slice()
+    }
+
+    pub fn probe_fragment(&self) -> &[u8] {
+        self.probe_fragment.as_slice()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedHostedImageCatalog<const N: usize> {
+    entries: [Option<OwnedHostedProcessImage>; N],
+}
+
+impl<const N: usize> Default for OwnedHostedImageCatalog<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> OwnedHostedImageCatalog<N> {
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    pub fn register(
+        &mut self,
+        image: OwnedHostedProcessImage,
+    ) -> Result<usize, HostedImageRegistrationError> {
+        validate_hosted_image_ref(image.as_ref())?;
+        if self.get_by_pi(image.pi).is_some() {
+            return Err(HostedImageRegistrationError::DuplicatePi);
+        }
+        if self.get_by_top_badge(image.top_badge).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateTopBadge);
+        }
+        if self.get_by_leaf(image.leaf()).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateLeaf);
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .ok_or(HostedImageRegistrationError::Full)?;
+        self.entries[index] = Some(image);
+        Ok(index)
+    }
+
+    pub fn count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    pub fn mask(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.map(|image| image.pi))
+            .filter(|&pi| pi < 64)
+            .fold(0, |mask, pi| mask | (1u64 << pi))
+    }
+
+    pub fn get_by_pi(&self, pi: usize) -> Option<HostedProcessImageRef<'_>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|image| image.pi == pi)
+            .map(OwnedHostedProcessImage::as_ref)
+    }
+
+    pub fn get_owned_by_pi(&self, pi: usize) -> Option<&OwnedHostedProcessImage> {
+        self.entries.iter().flatten().find(|image| image.pi == pi)
+    }
+
+    pub fn get_by_leaf(&self, leaf: &[u8]) -> Option<HostedProcessImageRef<'_>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|image| eq_ascii_case(image.leaf(), leaf))
+            .map(OwnedHostedProcessImage::as_ref)
+    }
+
+    pub fn get_by_path(&self, path: &[u8]) -> Option<HostedProcessImageRef<'_>> {
+        self.get_by_leaf(canonical_exe_leaf(path)?)
+    }
+
+    pub fn get_by_top_badge(&self, top_badge: u64) -> Option<HostedProcessImageRef<'_>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|image| image.top_badge == top_badge)
+            .map(OwnedHostedProcessImage::as_ref)
+    }
+
+    pub fn process_name_for_pi(&self, pi: usize) -> Option<&str> {
+        self.get_by_pi(pi).map(|image| image.process_name)
+    }
+
+    pub fn top_badge_for_pi(&self, pi: usize) -> Option<u64> {
+        self.get_by_pi(pi).map(|image| image.top_badge)
+    }
+
+    pub fn pi_for_leaf(&self, leaf: &[u8]) -> Option<usize> {
+        self.get_by_leaf(leaf).map(|image| image.pi)
+    }
+
+    pub fn pi_for_top_badge(&self, top_badge: u64) -> Option<usize> {
+        self.get_by_top_badge(top_badge).map(|image| image.pi)
+    }
+
+    pub fn role_for_path(&self, path: &[u8]) -> Option<HostedProcessRole> {
+        self.get_by_path(path).map(|image| image.role)
+    }
+
+    pub fn path_is_noninteractive_service(&self, path: &[u8]) -> bool {
+        self.role_for_path(path) == Some(HostedProcessRole::NonInteractiveService)
+    }
+
+    pub fn probe_image(
+        &self,
+        folded_path: &[u8],
+        is_sxs: bool,
+    ) -> Option<HostedProcessImageRef<'_>> {
+        if is_sxs {
+            return None;
+        }
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|image| !image.probe_fragment().is_empty())
+            .find(|image| contains_ascii_case(folded_path, image.probe_fragment()))
+            .map(OwnedHostedProcessImage::as_ref)
+    }
+
+    pub fn probe_leaf(&self, folded_path: &[u8], is_sxs: bool) -> Option<&[u8]> {
         self.probe_image(folded_path, is_sxs)
             .map(|image| image.leaf)
     }
@@ -657,11 +915,30 @@ impl<const N: usize> ImageTable<N> {
             section_handle,
             desired_access,
             process_handle_out,
-            Some(SpawnTarget {
-                pi: image.pi,
-                top_badge: image.top_badge,
-                role: image.role,
-            }),
+            Some(SpawnTarget::from_image(image)),
+        )
+    }
+
+    pub fn reserve_spawn_owned_registered<const M: usize>(
+        &mut self,
+        catalog: &OwnedHostedImageCatalog<M>,
+        owner_pi: usize,
+        section_handle: u64,
+        desired_access: u32,
+        process_handle_out: u64,
+    ) -> Result<SpawnRequest, ImageError> {
+        let index = self
+            .index_for_section(owner_pi, section_handle)
+            .ok_or(ImageError::NotFound)?;
+        let image = catalog
+            .get_by_leaf(self.slots[index].leaf())
+            .ok_or(ImageError::InvalidPath)?;
+        self.reserve_spawn_with_target(
+            owner_pi,
+            section_handle,
+            desired_access,
+            process_handle_out,
+            Some(SpawnTarget::from_image(image)),
         )
     }
 
@@ -851,6 +1128,29 @@ mod tests {
         }
     }
 
+    fn owned_catalog_image(
+        pi: usize,
+        top_badge: u64,
+        leaf: &[u8],
+        nt_image_path: &[u8],
+        role: HostedProcessRole,
+        image_root: HostedImageRoot,
+        probe_fragment: &[u8],
+    ) -> OwnedHostedProcessImage {
+        OwnedHostedProcessImage::new(
+            pi,
+            top_badge,
+            leaf,
+            b"registered.exe",
+            role,
+            nt_image_path,
+            leaf,
+            image_root,
+            probe_fragment,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn dynamic_catalog_registers_and_resolves_images() {
         let mut catalog = HostedImageCatalog::<4>::new();
@@ -1028,6 +1328,89 @@ mod tests {
     }
 
     #[test]
+    fn owned_dynamic_catalog_registers_runtime_backed_images() {
+        let mut catalog = OwnedHostedImageCatalog::<2>::new();
+        let userinit = owned_catalog_image(
+            5,
+            USERINIT_TOP_BADGE,
+            b"userinit.exe",
+            b"\\SystemRoot\\System32\\userinit.exe",
+            HostedProcessRole::InteractiveShellBootstrap,
+            HostedImageRoot::System32,
+            b"userinit",
+        );
+        let explorer = owned_catalog_image(
+            6,
+            EXPLORER_TOP_BADGE,
+            b"explorer.exe",
+            b"\\SystemRoot\\explorer.exe",
+            HostedProcessRole::InteractiveShell,
+            HostedImageRoot::SystemRoot,
+            b"explorer",
+        );
+
+        assert_eq!(catalog.register(userinit), Ok(0));
+        assert_eq!(catalog.register(explorer), Ok(1));
+        assert_eq!(catalog.count(), 2);
+        assert_eq!(catalog.mask(), (1u64 << 5) | (1u64 << 6));
+        assert_eq!(catalog.get_by_pi(5), Some(userinit.as_ref()));
+        assert_eq!(
+            catalog.get_by_leaf(b"EXPLORER.EXE"),
+            Some(explorer.as_ref())
+        );
+        assert_eq!(
+            catalog.get_by_path(b"\\??\\C:\\ReactOS\\System32\\USERINIT.EXE"),
+            Some(userinit.as_ref())
+        );
+        assert_eq!(catalog.get_owned_by_pi(6), Some(&explorer));
+        assert_eq!(catalog.process_name_for_pi(5), Some("registered.exe"));
+        assert_eq!(
+            catalog.probe_leaf(b"\\SystemRoot\\explorer.exe", false),
+            Some(b"explorer.exe" as &[u8])
+        );
+        assert_eq!(
+            catalog.probe_leaf(b"\\SystemRoot\\explorer.exe", true),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_dynamic_catalog_rejects_invalid_runtime_registration() {
+        assert_eq!(
+            OwnedHostedProcessImage::new(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe",
+                &[0xff],
+                HostedProcessRole::InteractiveShellBootstrap,
+                b"\\SystemRoot\\System32\\userinit.exe",
+                b"userinit.exe",
+                HostedImageRoot::System32,
+                b"userinit",
+            ),
+            Err(HostedImageRegistrationError::InvalidProcessName)
+        );
+        assert_eq!(
+            OwnedHostedProcessImage::new(
+                5,
+                USERINIT_TOP_BADGE,
+                b"userinit.exe",
+                b"userinit.exe",
+                HostedProcessRole::InteractiveShellBootstrap,
+                b"\\SystemRoot\\System32\\explorer.exe",
+                b"userinit.exe",
+                HostedImageRoot::System32,
+                b"userinit",
+            ),
+            Err(HostedImageRegistrationError::InvalidPath)
+        );
+        assert_eq!(
+            FixedBytes::<4>::from_slice(b"12345"),
+            Err(HostedImageRegistrationError::FieldTooLong)
+        );
+    }
+
+    #[test]
     fn spawn_reservation_can_bind_to_dynamic_catalog_target() {
         let mut catalog = HostedImageCatalog::<1>::new();
         catalog
@@ -1078,6 +1461,38 @@ mod tests {
             Err(ImageError::InvalidPath)
         );
         assert_eq!(table.get(0).unwrap().state, ImageState::Sectioned);
+    }
+
+    #[test]
+    fn spawn_reservation_can_bind_to_owned_catalog_target() {
+        let mut catalog = OwnedHostedImageCatalog::<1>::new();
+        catalog
+            .register(owned_catalog_image(
+                6,
+                EXPLORER_TOP_BADGE,
+                b"explorer.exe",
+                b"\\SystemRoot\\explorer.exe",
+                HostedProcessRole::InteractiveShell,
+                HostedImageRoot::SystemRoot,
+                b"explorer",
+            ))
+            .unwrap();
+        let mut table = ImageTable::<1>::new();
+        table.open(5, b"explorer.exe", 0x40, META).unwrap();
+        table.create_section(5, 0x40, 0x44).unwrap();
+
+        let request = table
+            .reserve_spawn_owned_registered(&catalog, 5, 0x44, 0x1fffff, 0x1000)
+            .unwrap();
+
+        assert_eq!(
+            request.target,
+            Some(SpawnTarget {
+                pi: 6,
+                top_badge: EXPLORER_TOP_BADGE,
+                role: HostedProcessRole::InteractiveShell,
+            })
+        );
     }
 
     #[test]

@@ -268,3 +268,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: the next wiring slice should pass the runtime catalog into the executable
   create-process handler and make `spawn_requested_hosted_exe` consume `request.target` instead of
   re-resolving target identity from `HOSTED_PROCESS_IMAGES`.
+- A2 continued. `nt-exe-image` now has an owned, fixed-capacity hosted image catalog for runtime
+  registration. Runtime-discovered leaf, process name, NT image path, command line, image root,
+  role, top badge, and probe fragment data can be stored without heap allocation, validated through
+  the same contract as borrowed registrations, and used to produce target-bound spawn requests.
+  Review adjustment: the executive can now carry a real runtime-owned catalog instead of borrowing
+  from the historical static image slice; the next step is wiring that catalog into open/section
+  tracking and deleting static-wrapper lookups from the spawn path.
