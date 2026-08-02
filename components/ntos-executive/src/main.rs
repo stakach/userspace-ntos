@@ -10802,6 +10802,9 @@ struct ExecNtHandler {
     pm: nt_process::ProcessManager,
     /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge.
     process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
+    /// Runtime-owned metadata for hosted process identities that have been registered with the
+    /// handler. Consumers use this table instead of the historical static hosted-image slice.
+    hosted_images: nt_exe_image::OwnedHostedImageCatalog<MAX_PI>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: [u64; MAX_PI],
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do

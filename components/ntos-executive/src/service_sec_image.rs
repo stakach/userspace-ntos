@@ -18,14 +18,12 @@ static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 const WIN32K_MSG_BYTES: usize = 48;
 const WM_QUIT: u32 = 0x0012;
 
-fn win32k_client_label(pi: usize) -> &'static [u8] {
-    nt_exe_image::hosted_image_for_pi(pi)
-        .map(|image| image.leaf)
-        .unwrap_or(b"client")
+fn win32k_client_label<'a>(nt_handler: &'a ExecNtHandler, pi: usize) -> &'a [u8] {
+    nt_handler.hosted_process_leaf(pi).unwrap_or(b"client")
 }
 
-fn hosted_process_uses_client_gdi(pi: usize) -> bool {
-    match nt_exe_image::hosted_image_for_pi(pi).map(|image| image.role) {
+fn hosted_process_uses_client_gdi(nt_handler: &ExecNtHandler, pi: usize) -> bool {
+    match nt_handler.hosted_process_role(pi) {
         Some(
             nt_exe_image::HostedProcessRole::InteractiveLogon
             | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
@@ -35,8 +33,8 @@ fn hosted_process_uses_client_gdi(pi: usize) -> bool {
     }
 }
 
-fn record_hosted_client_gdi_mapping(pi: usize, gdi_va: u64) {
-    let Some(image) = nt_exe_image::hosted_image_for_pi(pi) else {
+fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_va: u64) {
+    let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
     };
     let first = match image.role {
@@ -65,12 +63,8 @@ fn hosted_process_is_noninteractive_service_gui_client(
     nt_handler: &ExecNtHandler,
     pi: usize,
 ) -> bool {
-    let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
-        return false;
-    };
-    nt_handler.pm.process(pid).is_some_and(|process| {
-        nt_exe_image::hosted_path_is_noninteractive_service(process.image_file_name.as_bytes())
-    })
+    nt_handler.hosted_process_role(pi)
+        == Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
 }
 
 fn sec_image_forward_run() -> u64 {
@@ -6683,7 +6677,7 @@ pub(crate) unsafe fn service_sec_image(
                 let w32_log = !w32_hot || W32_HOT_LOG.fetch_add(1, Ordering::Relaxed) < 12;
                 if w32_log {
                     print_str(b"[win32k-svc] ");
-                    print_str(win32k_client_label(pi));
+                    print_str(win32k_client_label(&nt_handler, pi));
                     print_str(b" -> SSN 0x");
                     print_hex(m0 as u32);
                     print_str(b" (dispatch)\n");
@@ -7949,7 +7943,7 @@ pub(crate) unsafe fn service_sec_image(
                 // print — a wall is never suppressed).
                 if !redirected_user_callback && (!ok || w32_log) {
                     print_str(b"[win32k-svc] ");
-                    print_str(win32k_client_label(pi));
+                    print_str(win32k_client_label(&nt_handler, pi));
                     print_str(b" SSN 0x");
                     print_hex(m0 as u32);
                     print_str(if ok {
@@ -8022,11 +8016,11 @@ pub(crate) unsafe fn service_sec_image(
                 // their VSpace before client-side GdiValidateHandle runs. Winlogon needs this for the
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
-                if hosted_process_uses_client_gdi(pi) {
+                if hosted_process_uses_client_gdi(&nt_handler, pi) {
                     let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
                     let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
                     if gdi_va != 0 && gdi_attributes {
-                        record_hosted_client_gdi_mapping(pi, gdi_va);
+                        record_hosted_client_gdi_mapping(&nt_handler, pi, gdi_va);
                     }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a

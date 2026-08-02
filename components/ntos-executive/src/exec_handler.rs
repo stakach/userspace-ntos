@@ -600,6 +600,7 @@ impl ExecNtHandler {
             // authoritative hosted identity map.
             pm,
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
+            hosted_images: nt_exe_image::OwnedHostedImageCatalog::new(),
             process_vspaces: [0; MAX_PI],
             temporary_process_slots: [0; MAX_PI],
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
@@ -622,7 +623,17 @@ impl ExecNtHandler {
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
-                let _ = handler.register_hosted_process_identity(pi, pid, main_tid);
+                if let Some(image) = nt_exe_image::hosted_image_for_pi(pi) {
+                    let _ = handler.register_hosted_process_metadata(
+                        nt_exe_image::HostedProcessImageRef::from(image),
+                    );
+                    let _ = handler.register_hosted_process_identity(
+                        pi,
+                        pid,
+                        main_tid,
+                        image.top_badge,
+                    );
+                }
                 for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                     let tid = bootstrap_pool_tids[pi][slot];
                     if tid != 0 {
@@ -1909,7 +1920,7 @@ impl ExecNtHandler {
 
     pub(crate) fn register_main_thread_tcb(&mut self, pi: usize, tcb: u64) {
         if let Some(tid) = self.pm_main_tid_for_pi(pi) {
-            let badge = Self::hosted_mechanism_badge_for_pi(pi).unwrap_or(0);
+            let badge = self.hosted_process_top_badge(pi).unwrap_or(0);
             self.register_hosted_thread_tcb(pi, u64::from(tid), tcb, badge, HostedThreadRole::Main);
         }
     }
@@ -2078,8 +2089,52 @@ impl ExecNtHandler {
         })
     }
 
-    fn hosted_mechanism_badge_for_pi(pi: usize) -> Option<u64> {
-        nt_exe_image::hosted_top_badge_for_pi(pi)
+    pub(crate) fn hosted_process_image(
+        &self,
+        pi: usize,
+    ) -> Option<nt_exe_image::HostedProcessImageRef<'_>> {
+        self.hosted_images.get_by_pi(pi)
+    }
+
+    pub(crate) fn hosted_process_leaf(&self, pi: usize) -> Option<&[u8]> {
+        self.hosted_process_image(pi).map(|image| image.leaf)
+    }
+
+    pub(crate) fn hosted_process_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
+        self.hosted_process_image(pi).map(|image| image.role)
+    }
+
+    pub(crate) fn hosted_process_top_badge(&self, pi: usize) -> Option<u64> {
+        self.hosted_process_image(pi).map(|image| image.top_badge)
+    }
+
+    fn register_hosted_process_metadata(
+        &mut self,
+        image: nt_exe_image::HostedProcessImageRef<'_>,
+    ) -> Result<(), u32> {
+        if let Some(existing) = self.hosted_images.get_by_pi(image.pi) {
+            return if existing == image {
+                Ok(())
+            } else {
+                Err(nt_process::STATUS_INVALID_PARAMETER)
+            };
+        }
+        let owned = nt_exe_image::OwnedHostedProcessImage::new(
+            image.pi,
+            image.top_badge,
+            image.leaf,
+            image.process_name.as_bytes(),
+            image.role,
+            image.nt_image_path,
+            image.command_line,
+            image.image_root,
+            image.probe_fragment,
+        )
+        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?;
+        self.hosted_images
+            .register(owned)
+            .map(|_| ())
+            .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
     }
 
     fn register_hosted_main_thread_identity(
@@ -2103,14 +2158,13 @@ impl ExecNtHandler {
         pi: usize,
         pid: nt_process::ProcessId,
         main_tid: nt_process::ThreadId,
+        top_badge: u64,
     ) -> Result<(), u32> {
-        let badge =
-            Self::hosted_mechanism_badge_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let main_claimed = self.register_hosted_main_thread_identity(pi, main_tid)?;
 
         match self
             .process_mechanisms
-            .claim_or_get(pi, pid, main_tid, badge)
+            .claim_or_get(pi, pid, main_tid, top_badge)
         {
             Ok(_) => Ok(()),
             Err(_) => {
@@ -2139,23 +2193,12 @@ impl ExecNtHandler {
         }
     }
 
-    fn hosted_process_name_for_pi(pi: usize) -> Option<&'static str> {
-        nt_exe_image::hosted_process_name_for_pi(pi)
-    }
-
     fn current_pm_pid(&self) -> Option<nt_process::ProcessId> {
         self.pm_pid_for_pi(self.pi)
     }
 
-    fn current_process_image_name(&self) -> Option<&str> {
-        let pid = self.current_pm_pid()?;
-        self.pm
-            .process(pid)
-            .map(|process| process.image_file_name.as_str())
-    }
-
-    fn current_hosted_process_image(&self) -> Option<&'static nt_exe_image::HostedProcessImage> {
-        nt_exe_image::hosted_image_for_path(self.current_process_image_name()?.as_bytes())
+    fn current_hosted_process_image(&self) -> Option<nt_exe_image::HostedProcessImageRef<'_>> {
+        self.hosted_process_image(self.pi)
     }
 
     fn current_hosted_process_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
@@ -2256,12 +2299,13 @@ impl ExecNtHandler {
             min_handle_cap = min_handle_cap.min(self.pm.handle_capacity(pid));
             let distinct = (0..MAX_PI)
                 .all(|other_pi| other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid));
-            if let Some(name) = Self::hosted_process_name_for_pi(pi) {
+            if let Some(image) = self.hosted_process_image(pi) {
                 if distinct
-                    && self
-                        .pm
-                        .process(pid)
-                        .is_some_and(|process| process.image_file_name.eq_ignore_ascii_case(name))
+                    && self.pm.process(pid).is_some_and(|process| {
+                        process
+                            .image_file_name
+                            .eq_ignore_ascii_case(image.process_name)
+                    })
                 {
                     identity_ok |= 1 << pi;
                 }
@@ -2318,7 +2362,8 @@ impl ExecNtHandler {
         let pid = self.pm.create_process(name, Some(parent), None);
         self.process_vspaces[child_pi] = 0;
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
-        self.register_hosted_process_identity(child_pi, pid, main_tid)?;
+        self.register_hosted_process_metadata(image)?;
+        self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
                 let _ = self
@@ -4505,7 +4550,9 @@ impl ExecNtHandler {
         let Some(process) = self.pm.process(pid) else {
             return 0;
         };
-        let hosted = nt_exe_image::hosted_image_for_leaf(process.image_file_name.as_bytes());
+        let hosted = self
+            .pi_for_pid(pid)
+            .and_then(|pi| self.hosted_process_image(pi));
         let system32 = hosted
             .map(|image| image.image_root == nt_exe_image::HostedImageRoot::System32)
             .unwrap_or(true);

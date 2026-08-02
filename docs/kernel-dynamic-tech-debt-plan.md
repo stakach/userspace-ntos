@@ -289,3 +289,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: remaining static wrapper uses are now concentrated in boot/gate expectations,
   win32k callback classification, path-prefix formatting, and the open-time registration source for
   bounded preloaded hosted images.
+- A2 continued. `ExecNtHandler` now owns a runtime hosted-image metadata catalog registered
+  alongside process mechanism identity. Bootstrap and dynamic child processes publish metadata into
+  that catalog, and ProcessManager identity gates, current-process role/leaf checks, service-loop
+  GDI mapping, win32k service labels, and process image path-prefix formatting consume the handler's
+  registered metadata instead of querying the static hosted image table. Review adjustment: the
+  historical descriptors still seed bootstrap/open-time registration; remaining consumers are gate
+  expectations, win32k callback classification, mechanism top-badge helpers, and executable probe
+  admission.
