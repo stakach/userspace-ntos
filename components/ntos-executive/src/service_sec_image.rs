@@ -95,6 +95,34 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
     nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
 }
 
+fn seed_hosted_exe_image_catalog(
+    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    csrss_pe: &Option<nt_pe_loader::PeFile<'static>>,
+    winlogon_pe: &Option<nt_pe_loader::PeFile<'static>>,
+    services_pe: &Option<nt_pe_loader::PeFile<'static>>,
+    lsass_pe: &Option<nt_pe_loader::PeFile<'static>>,
+    userinit_pe: &Option<nt_pe_loader::PeFile<'static>>,
+    explorer_pe: &Option<nt_pe_loader::PeFile<'static>>,
+) {
+    let loaded = [
+        (b"csrss.exe" as &[u8], csrss_pe.is_some()),
+        (b"winlogon.exe" as &[u8], winlogon_pe.is_some()),
+        (b"services.exe" as &[u8], services_pe.is_some()),
+        (b"lsass.exe" as &[u8], lsass_pe.is_some()),
+        (b"userinit.exe" as &[u8], userinit_pe.is_some()),
+        (b"explorer.exe" as &[u8], explorer_pe.is_some()),
+    ];
+    for image in nt_exe_image::HOSTED_PROCESS_IMAGES {
+        if loaded
+            .iter()
+            .any(|(leaf, present)| *present && leaf.eq_ignore_ascii_case(image.leaf))
+            && catalog.get_by_leaf(image.leaf).is_none()
+        {
+            let _ = catalog.register_ref(nt_exe_image::HostedProcessImageRef::from(image));
+        }
+    }
+}
+
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -2253,6 +2281,15 @@ pub(crate) unsafe fn service_sec_image(
         let e_lfanew = core::ptr::read_volatile((explorer_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((explorer_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
+    seed_hosted_exe_image_catalog(
+        &mut exe_image_catalog,
+        &csrss_pe,
+        &winlogon_pe,
+        &services_pe,
+        &lsass_pe,
+        &userinit_pe,
+        &explorer_pe,
+    );
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
     // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's

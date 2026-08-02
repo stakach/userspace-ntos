@@ -308,3 +308,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   carried metadata instead of consulting `HOSTED_PROCESS_IMAGES`. Review adjustment: remaining
   static uses are bootstrap/open-time registration policy, executable probe admission, bootstrap
   spawn descriptors, and post-loop gate expectations.
+- A2 continued. The service loop now seeds the hosted executable-open catalog once from the loaded
+  PE set, and `NtQueryAttributesFile`/`NtOpenFile` probe that runtime catalog directly. Open-time
+  child image tracking no longer re-registers descriptors or resolves probe leaves through the
+  historical static table. Review adjustment: remaining static uses are the startup seed policy,
+  bootstrap process metadata registration, bootstrap spawn descriptors, and post-loop gate
+  expectations.

@@ -525,6 +525,23 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         Ok(index)
     }
 
+    pub fn register_ref(
+        &mut self,
+        image: HostedProcessImageRef<'_>,
+    ) -> Result<usize, HostedImageRegistrationError> {
+        self.register(OwnedHostedProcessImage::new(
+            image.pi,
+            image.top_badge,
+            image.leaf,
+            image.process_name.as_bytes(),
+            image.role,
+            image.nt_image_path,
+            image.command_line,
+            image.image_root,
+            image.probe_fragment,
+        )?)
+    }
+
     pub fn count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }

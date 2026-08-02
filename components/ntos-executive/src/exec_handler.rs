@@ -86,46 +86,12 @@ unsafe fn loaded_hosted_image_metadata(
     None
 }
 
-unsafe fn register_hosted_image_catalog_entry(
-    ctx: ExecLoopCtx,
-    image: &nt_exe_image::HostedProcessImage,
-) -> bool {
-    {
-        let catalog = unsafe { &*ctx.exe_image_catalog };
-        if catalog.get_by_leaf(image.leaf).is_some() {
-            return true;
-        }
-    }
-    let Ok(owned) = nt_exe_image::OwnedHostedProcessImage::new(
-        image.pi,
-        image.top_badge,
-        image.leaf,
-        image.process_name.as_bytes(),
-        image.role,
-        image.nt_image_path,
-        image.command_line,
-        image.image_root,
-        image.probe_fragment,
-    ) else {
-        return false;
-    };
-    unsafe { &mut *ctx.exe_image_catalog }
-        .register(owned)
-        .is_ok()
-}
-
 unsafe fn record_hosted_child_exe_open(
     ctx: ExecLoopCtx,
     owner_pi: usize,
-    image: &nt_exe_image::HostedProcessImage,
+    hosted: nt_exe_image::HostedProcessImageRef<'_>,
     file_handle: u64,
 ) -> bool {
-    if !unsafe { register_hosted_image_catalog_entry(ctx, image) } {
-        return false;
-    }
-    let Some(hosted) = (unsafe { &*ctx.exe_image_catalog }).get_by_leaf(image.leaf) else {
-        return false;
-    };
     let Some(metadata) = (unsafe { loaded_hosted_image_metadata(ctx, hosted) }) else {
         return false;
     };
@@ -2119,20 +2085,8 @@ impl ExecNtHandler {
                 Err(nt_process::STATUS_INVALID_PARAMETER)
             };
         }
-        let owned = nt_exe_image::OwnedHostedProcessImage::new(
-            image.pi,
-            image.top_badge,
-            image.leaf,
-            image.process_name.as_bytes(),
-            image.role,
-            image.nt_image_path,
-            image.command_line,
-            image.image_root,
-            image.probe_fragment,
-        )
-        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?;
         self.hosted_images
-            .register(owned)
+            .register_ref(image)
             .map(|_| ())
             .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
     }
@@ -8625,22 +8579,25 @@ impl ExecNtHandler {
         }
     }
 
-    fn hosted_image_exists(image: &nt_exe_image::HostedProcessImage) -> bool {
+    fn hosted_image_exists(image: nt_exe_image::HostedProcessImageRef<'_>) -> bool {
         match image.image_root {
             nt_exe_image::HostedImageRoot::System32 => unsafe { sys32_exists(image.leaf) },
             nt_exe_image::HostedImageRoot::SystemRoot => Self::fs_reactos_root_has_file(image.leaf),
         }
     }
 
-    /// Classify a folded probe path as one of the hosted-process EXEs by substring and return its
-    /// canonical leaf (so existence resolves against the real file, not a possibly-malformed extracted
-    /// leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator). The shared
-    /// hosted-image catalog records whether that image lives under System32 or `%SystemRoot%`.
+    /// Classify a folded probe path through the runtime hosted-executable catalog and return the
+    /// registered image entry, so existence resolves against the real file and its registered root
+    /// rather than a possibly-malformed extracted leaf.
     /// `None` if it isn't a recognized EXE probe or if it's an SxS/actctx probe (which must fail so
-    /// the loader doesn't take the .Local\/manifest path). Purely a name→canonical-leaf classifier;
-    /// the caller still confirms the leaf on the real FS.
-    fn exe_probe_canon(folded: &[u8], is_sxs: bool) -> Option<&'static [u8]> {
-        nt_exe_image::hosted_probe_leaf(folded, is_sxs)
+    /// the loader doesn't take the .Local\/manifest path). The caller still confirms the leaf on the
+    /// real FS.
+    fn exe_probe_image<'a>(
+        catalog: &'a nt_exe_image::OwnedHostedImageCatalog<8>,
+        folded: &[u8],
+        is_sxs: bool,
+    ) -> Option<nt_exe_image::HostedProcessImageRef<'a>> {
+        catalog.probe_image(folded, is_sxs)
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
@@ -13848,9 +13805,8 @@ impl ExecNtHandler {
                 // `\??\C:\Windowsservices.exe` with no separator, so the extracted leaf is garbage;
                 // the substring reliably says WHICH EXE it wants). SxS probes are rejected (loader
                 // must not take the .Local\/manifest path). Content delivery stays on nt-dll-registry.
-                let exe_canon = Self::exe_probe_canon(&nb[..nlen], is_sxs);
-                let exe_exists = exe_canon
-                    .and_then(nt_exe_image::hosted_image_for_leaf)
+                let catalog = &*ctx.exe_image_catalog;
+                let exe_exists = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
                     .is_some_and(Self::hosted_image_exists);
                 // General DLL existence (pi>=1) also comes from the real FS by-path.
                 let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
@@ -15434,16 +15390,15 @@ impl ExecNtHandler {
                 // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
                 // RtlCreateUserProcess / winlogon's CreateProcessInternalW): the substring classifies
                 // WHICH EXE, existence resolves against its CANONICAL leaf + root on the real
-                // \reactos FS (`exe_probe_canon` + hosted-image catalog) — path-form/malformed-path
+                // \reactos FS (runtime hosted-image catalog) — path-form/malformed-path
                 // independent, no hand-maintained list. Loader manifest opens are unaffected (SxS
                 // rejected).
-                let exe_canon = (!want_dir)
-                    .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
-                    .flatten();
-                let hosted_exe_image = exe_canon.and_then(|leaf| {
-                    let image = nt_exe_image::hosted_image_for_leaf(leaf)?;
-                    Self::hosted_image_exists(image).then_some(image)
-                });
+                let catalog = &*ctx.exe_image_catalog;
+                let hosted_exe_image =
+                    (!want_dir)
+                        .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
+                        .flatten()
+                        .filter(|image| Self::hosted_image_exists(*image));
                 let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
                 let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
                     if nb[..nlen].windows(8).any(|w| w == b"explorer") {
