@@ -3661,13 +3661,19 @@ pub(crate) unsafe fn service_sec_image(
                             nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot).unwrap_or(0)
                         }
                         WINLOGON_WORKER_BADGE => nt_handler
-                            .hosted_named_thread_tcb(&PM_LISTENER_TID)
+                            .hosted_thread_tcb_for_role(2, HostedThreadRole::WinlogonListener)
                             .unwrap_or(0),
                         WINLOGON_WORKER2_BADGE => nt_handler
-                            .hosted_named_thread_tcb(&WL_WORKER2_TID)
+                            .hosted_thread_tcb_for_role(
+                                2,
+                                HostedThreadRole::WinlogonWorker { slot: 1 },
+                            )
                             .unwrap_or(0),
                         WINLOGON_WORKER3_BADGE => nt_handler
-                            .hosted_named_thread_tcb(&WL_WORKER3_TID)
+                            .hosted_thread_tcb_for_role(
+                                2,
+                                HostedThreadRole::WinlogonWorker { slot: 2 },
+                            )
                             .unwrap_or(0),
                         _ => nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0),
                     };
@@ -5178,7 +5184,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     if nt_handler.csr_start_request == 1 {
                         let tcb = nt_handler
-                            .hosted_named_thread_tcb(&CSR_API_TID)
+                            .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrApi)
                             .unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
@@ -5207,7 +5213,9 @@ pub(crate) unsafe fn service_sec_image(
                             result = 0xC000_0001;
                         }
                     } else if nt_handler.csr_start_request == 2 {
-                        let tcb = nt_handler.hosted_named_thread_tcb(&CSR_SB_TID).unwrap_or(0);
+                        let tcb = nt_handler
+                            .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrSbApi)
+                            .unwrap_or(0);
                         if tcb > 1 {
                             let _ = tcb_resume(tcb);
                             if !csr_sb_startup(
@@ -5905,7 +5913,9 @@ pub(crate) unsafe fn service_sec_image(
                     // (CSR_LOOP_TCB is a real cap > 1). Otherwise recv_full_r12(CSR_FAULT_EP) would block
                     // forever with no faulter. Do not synthesize a handle here: pending
                     // \Windows\ApiPort connects are now required to complete through the real CSR worker.
-                    let have_thread = nt_handler.hosted_named_thread_tcb(&CSR_API_TID).is_some()
+                    let have_thread = nt_handler
+                        .hosted_thread_tcb_for_role(1, HostedThreadRole::CsrApi)
+                        .is_some()
                         && csrss_pe.is_some();
                     if !have_thread {
                         CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -8412,7 +8422,7 @@ pub(crate) unsafe fn service_sec_image(
                 && pi == 2
                 && badge == WINLOGON_BADGE
                 && nt_handler
-                    .hosted_named_thread_tcb(&WL_WORKER2_TID)
+                    .hosted_thread_tcb_for_role(2, HostedThreadRole::WinlogonWorker { slot: 1 })
                     .is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             if park_wait_event >= 0 && reply_main != 0 {

@@ -1928,17 +1928,16 @@ impl ExecNtHandler {
         self.thread_runtime.tcb_for_main_pi(pi)
     }
 
-    pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
-        let tid = TP_WORKER_TID
-            .get(pi)
-            .and_then(|slots| slots.get(slot))
-            .map(|cell| cell.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        self.hosted_thread_tcb(tid)
+    pub(crate) fn hosted_thread_tcb_for_role(
+        &self,
+        pi: usize,
+        role: HostedThreadRole,
+    ) -> Option<u64> {
+        self.thread_runtime.tcb_for_role(pi, role)
     }
 
-    pub(crate) fn hosted_named_thread_tcb(&self, tid_cell: &AtomicU64) -> Option<u64> {
-        self.hosted_thread_tcb(tid_cell.load(Ordering::Relaxed))
+    pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
+        self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
     }
 
     pub(crate) fn release_hosted_thread_runtime(

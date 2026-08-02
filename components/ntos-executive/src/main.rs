@@ -11090,6 +11090,19 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
             .filter(|&tcb| tcb > 1)
     }
 
+    fn get_by_role(&self, pi: usize, role: HostedThreadRole) -> Option<HostedThreadRuntime> {
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.pi == pi && entry.role == role)
+    }
+
+    fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
+        self.get_by_role(pi, role)
+            .map(|entry| entry.tcb)
+            .filter(|&tcb| tcb > 1)
+    }
+
     fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {
         let entry = self.entries.iter_mut().find(|entry| entry.tid == tid)?;
         let previous = *entry;
@@ -11147,6 +11160,11 @@ impl HostedThreadRuntimes {
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).tcb_for_main_pi(pi) }
+    }
+
+    fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).tcb_for_role(pi, role) }
     }
 
     fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {

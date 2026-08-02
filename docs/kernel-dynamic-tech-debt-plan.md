@@ -32,7 +32,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   contract driven by created sections and process parameters.
 - `[~]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
-- `[ ]` A4: Replace badge-to-process switches with registered thread/process runtime records.
+- `[~]` A4: Replace badge-to-process switches with registered thread/process runtime records.
 
 ### B. Win32k Process And Thread Context
 
@@ -147,3 +147,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   and failed remote-thread handle insertion releases the claimed pool slot. Review adjustment:
   raw pool/PML4 atomics are now confined to reset/helper code and gate-only probes; the next A3/A4
   boundary is replacing the static TCB/worker slot arrays with registered runtime records.
+- A3/A4 continued. `HostedThreadRuntimeTable` can now resolve a hosted TCB by registered process
+  index and `HostedThreadRole`, and `ExecNtHandler` exposes that lookup as the production TCB
+  boundary. Service-loop diagnostics, Winlogon desktop-info repair, CSR worker resume, CSR
+  rendezvous gating, and Winlogon worker signal checks now recover TCBs from registered runtime
+  roles instead of named TID cells or TP-worker TID mirrors. Review adjustment: remaining raw
+  runtime identity reads are spawn-slot reservation/publication, gate-only debug probes,
+  compatibility mirror cleanup, and the win32k callback TEB-alias/candidate paths until callback
+  client context carries role-backed runtime identity.
