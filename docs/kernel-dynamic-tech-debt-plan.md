@@ -192,3 +192,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   reading global identity cells. Review adjustment: the pre-handler SMSS spawn still passes explicit
   zero client IDs because the handler-owned bootstrap objects are constructed inside the service loop;
   closing that ordering gap belongs with the remaining mechanism-state mirror cleanup.
+- A3 continued. Moved runtime ETHREAD-pool occupancy and initial-suspend masks out of the
+  `PM_POOL_USED`/`PM_POOL_SUSPENDED` atomics and into `ExecNtHandler` fields. Pool claim/release,
+  create-suspended handoff, diagnostics, CSR worker creation, and remote thread cleanup now mutate
+  handler-owned state directly. Review adjustment: `PM_PML4S` remains as the last process-mechanism
+  static in this cluster because post-loop gate probes still read it without an `ExecNtHandler`.

@@ -88,12 +88,6 @@ unsafe fn loaded_hosted_image_metadata(
 
 fn reset_hosted_mechanism_mirror_slot(pi: usize) {
     PM_PML4S[pi].store(0, Ordering::Relaxed);
-    reset_hosted_pool_mirror_slot(pi);
-}
-
-fn reset_hosted_pool_mirror_slot(pi: usize) {
-    PM_POOL_USED[pi].store(0, Ordering::Relaxed);
-    PM_POOL_SUSPENDED[pi].store(0, Ordering::Relaxed);
 }
 
 unsafe fn record_hosted_child_exe_open(
@@ -583,6 +577,8 @@ impl ExecNtHandler {
             process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
             temporary_process_slots: [0; MAX_PI],
             thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
+            pool_used: [0; MAX_PI],
+            pool_suspended: [0; MAX_PI],
             thread_runtime: HostedThreadRuntimes::reset(),
             token_store: nt_security::TokenStore::with_capacity(64),
             token_dirty: false,
@@ -1711,43 +1707,30 @@ impl ExecNtHandler {
         (slot < PM_RUNTIME_THREAD_SLOTS).then_some(1u64 << slot)
     }
 
-    fn claim_pool_usage_slot(&self, pi: usize) -> Option<usize> {
-        let used = PM_POOL_USED.get(pi)?;
-        let mut claimed = used.load(Ordering::Relaxed);
-        loop {
-            let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| claimed & (1u64 << slot) == 0)?;
-            match used.compare_exchange_weak(
-                claimed,
-                claimed | (1u64 << slot),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(slot),
-                Err(now) => claimed = now,
-            }
-        }
+    fn claim_pool_usage_slot(&mut self, pi: usize) -> Option<usize> {
+        let used = self.pool_used.get_mut(pi)?;
+        let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| *used & (1u64 << slot) == 0)?;
+        *used |= 1u64 << slot;
+        Some(slot)
     }
 
     pub(crate) fn pool_used_mask(&self, pi: usize) -> u64 {
-        PM_POOL_USED
-            .get(pi)
-            .map(|used| used.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        self.pool_used.get(pi).copied().unwrap_or(0)
     }
 
-    pub(crate) fn release_pool_usage_slot(&self, pi: usize, slot: usize) -> bool {
+    pub(crate) fn release_pool_usage_slot(&mut self, pi: usize, slot: usize) -> bool {
         let Some(bit) = Self::pool_slot_bit(slot) else {
             return false;
         };
-        let Some(used) = PM_POOL_USED.get(pi) else {
+        let Some(used) = self.pool_used.get_mut(pi) else {
             return false;
         };
-        used.fetch_and(!bit, Ordering::Relaxed);
+        *used &= !bit;
         true
     }
 
     pub(crate) fn set_pool_thread_suspended(
-        &self,
+        &mut self,
         pi: usize,
         slot: usize,
         suspended: bool,
@@ -1755,34 +1738,32 @@ impl ExecNtHandler {
         let Some(bit) = Self::pool_slot_bit(slot) else {
             return false;
         };
-        let Some(mask) = PM_POOL_SUSPENDED.get(pi) else {
+        let Some(mask) = self.pool_suspended.get_mut(pi) else {
             return false;
         };
         if suspended {
-            mask.fetch_or(bit, Ordering::Relaxed);
+            *mask |= bit;
         } else {
-            mask.fetch_and(!bit, Ordering::Relaxed);
+            *mask &= !bit;
         }
         true
     }
 
-    pub(crate) fn take_pool_thread_suspended(&self, pi: usize, slot: usize) -> Option<u32> {
+    pub(crate) fn take_pool_thread_suspended(&mut self, pi: usize, slot: usize) -> Option<u32> {
         let bit = Self::pool_slot_bit(slot)?;
-        let mask = PM_POOL_SUSPENDED.get(pi)?;
-        Some(if mask.fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
-            1
-        } else {
-            0
-        })
+        let mask = self.pool_suspended.get_mut(pi)?;
+        let was_suspended = *mask & bit != 0;
+        *mask &= !bit;
+        Some(was_suspended as u32)
     }
 
     pub(crate) fn is_pool_thread_suspended(&self, pi: usize, slot: usize) -> bool {
         let Some(bit) = Self::pool_slot_bit(slot) else {
             return false;
         };
-        PM_POOL_SUSPENDED
+        self.pool_suspended
             .get(pi)
-            .is_some_and(|mask| mask.load(Ordering::Relaxed) & bit != 0)
+            .is_some_and(|mask| *mask & bit != 0)
     }
 
     fn temporary_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {

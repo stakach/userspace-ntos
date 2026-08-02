@@ -10853,6 +10853,10 @@ struct ExecNtHandler {
     /// in the executive for now; this table makes PID/TID keyed thread lookup authoritative inside
     /// the syscall handler before those low-level cells are moved.
     thread_mechanisms: nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>,
+    /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
+    pool_used: [u64; MAX_PI],
+    /// Runtime suspended-on-create mask for claimed pool ETHREADs.
+    pool_suspended: [u64; MAX_PI],
     /// Executive-side seL4 mechanism runtime keyed by real NT TID. This is where live handler paths
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
@@ -12492,13 +12496,10 @@ pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// dropped the connection. Batch 60's "claim a generic worker slot" reached that refusal too; the
 /// slot it claimed existed, the ETHREAD behind it did not.
 const PM_RUNTIME_THREAD_SLOTS: usize = 8;
-static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Runtime `NtCreateThread`s refused because the pre-created ETHREAD pool had no free slot. Counted
 /// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
 /// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.
 pub(crate) static PM_POOL_REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// Bit `slot` is set while a runtime thread still has its initial suspend count.
-static PM_POOL_SUSPENDED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
