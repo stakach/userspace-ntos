@@ -31,6 +31,61 @@ fn image_metadata_from_pe(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LoadedHostedImageSlot {
+    leaf: &'static [u8],
+    pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    pool_va: u64,
+}
+
+fn loaded_hosted_image_slots(ctx: ExecLoopCtx) -> [LoadedHostedImageSlot; 6] {
+    [
+        LoadedHostedImageSlot {
+            leaf: b"csrss.exe",
+            pe: ctx.csrss_pe,
+            pool_va: ctx.csrss_pool_va,
+        },
+        LoadedHostedImageSlot {
+            leaf: b"winlogon.exe",
+            pe: ctx.winlogon_pe,
+            pool_va: ctx.winlogon_pool_va,
+        },
+        LoadedHostedImageSlot {
+            leaf: b"services.exe",
+            pe: ctx.services_pe,
+            pool_va: ctx.services_pool_va,
+        },
+        LoadedHostedImageSlot {
+            leaf: b"lsass.exe",
+            pe: ctx.lsass_pe,
+            pool_va: ctx.lsass_pool_va,
+        },
+        LoadedHostedImageSlot {
+            leaf: b"userinit.exe",
+            pe: ctx.userinit_pe,
+            pool_va: ctx.userinit_pool_va,
+        },
+        LoadedHostedImageSlot {
+            leaf: b"explorer.exe",
+            pe: ctx.explorer_pe,
+            pool_va: ctx.explorer_pool_va,
+        },
+    ]
+}
+
+unsafe fn loaded_hosted_image_metadata(
+    ctx: ExecLoopCtx,
+    hosted: &nt_exe_image::HostedProcessImage,
+) -> Option<nt_exe_image::ImageMetadata> {
+    for slot in loaded_hosted_image_slots(ctx) {
+        if slot.leaf.eq_ignore_ascii_case(hosted.leaf) {
+            let pe = unsafe { (&*slot.pe).as_ref()? };
+            return Some(image_metadata_from_pe(pe, slot.pool_va));
+        }
+    }
+    None
+}
+
 unsafe fn record_hosted_child_exe_open(
     ctx: ExecLoopCtx,
     owner_pi: usize,
@@ -40,33 +95,18 @@ unsafe fn record_hosted_child_exe_open(
     let Some(hosted) = nt_exe_image::hosted_image_for_leaf(leaf) else {
         return false;
     };
-    let image = match hosted.pi {
-        1 => unsafe { (&*ctx.csrss_pe).as_ref() }.map(|pe| (pe, ctx.csrss_pool_va)),
-        2 => unsafe { (&*ctx.winlogon_pe).as_ref() }.map(|pe| (pe, ctx.winlogon_pool_va)),
-        3 => unsafe { (&*ctx.services_pe).as_ref() }.map(|pe| (pe, ctx.services_pool_va)),
-        4 => unsafe { (&*ctx.lsass_pe).as_ref() }.map(|pe| (pe, ctx.lsass_pool_va)),
-        5 => unsafe { (&*ctx.userinit_pe).as_ref() }.map(|pe| (pe, ctx.userinit_pool_va)),
-        6 => unsafe { (&*ctx.explorer_pe).as_ref() }.map(|pe| (pe, ctx.explorer_pool_va)),
-        _ => None,
-    };
-
-    let Some((pe, pool_va)) = image else {
+    let Some(metadata) = (unsafe { loaded_hosted_image_metadata(ctx, hosted) }) else {
         return false;
     };
     let opened = unsafe { &mut *ctx.exe_images }
-        .open(
-            owner_pi,
-            leaf,
-            file_handle,
-            image_metadata_from_pe(pe, pool_va),
-        )
+        .open(owner_pi, leaf, file_handle, metadata)
         .is_ok();
     if opened {
-        match hosted.pi {
-            5 => {
+        match hosted.role {
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
                 USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             }
-            6 => {
+            nt_exe_image::HostedProcessRole::InteractiveShell => {
                 EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
