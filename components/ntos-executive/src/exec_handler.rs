@@ -86,6 +86,33 @@ unsafe fn loaded_hosted_image_metadata(
     None
 }
 
+fn reset_hosted_process_mirror_slot(pi: usize) {
+    PM_PIDS[pi].store(0, Ordering::Relaxed);
+    PM_TIDS[pi].store(0, Ordering::Relaxed);
+    PM_PML4S[pi].store(0, Ordering::Relaxed);
+    reset_hosted_pool_mirror_slot(pi);
+}
+
+fn reset_hosted_pool_mirror_slot(pi: usize) {
+    PM_POOL_USED[pi].store(0, Ordering::Relaxed);
+    PM_POOL_SUSPENDED[pi].store(0, Ordering::Relaxed);
+    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
+    }
+}
+
+fn store_hosted_pid_mirror(pi: usize, pid: nt_process::ProcessId) {
+    PM_PIDS[pi].store(pid as u64, Ordering::Relaxed);
+}
+
+fn store_hosted_main_tid_mirror(pi: usize, tid: nt_process::ThreadId) {
+    PM_TIDS[pi].store(tid as u64, Ordering::Relaxed);
+}
+
+fn store_hosted_pool_tid_mirror(pi: usize, slot: usize, tid: nt_process::ThreadId) {
+    PM_POOL_TID[pi][slot].store(tid as u64, Ordering::Relaxed);
+}
+
 unsafe fn record_hosted_child_exe_open(
     ctx: ExecLoopCtx,
     owner_pi: usize,
@@ -532,14 +559,7 @@ impl ExecNtHandler {
                 // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
                 pm.reserve_modules(64);
                 for pi in 0..MAX_PI {
-                    PM_PIDS[pi].store(0, Ordering::Relaxed);
-                    PM_TIDS[pi].store(0, Ordering::Relaxed);
-                    PM_PML4S[pi].store(0, Ordering::Relaxed);
-                    PM_POOL_USED[pi].store(0, Ordering::Relaxed);
-                    PM_POOL_SUSPENDED[pi].store(0, Ordering::Relaxed);
-                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                        PM_POOL_TID[pi][slot].store(0, Ordering::Relaxed);
-                    }
+                    reset_hosted_process_mirror_slot(pi);
                 }
                 PM_PROC_COUNT.store(0, Ordering::Relaxed);
                 PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
@@ -551,7 +571,7 @@ impl ExecNtHandler {
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
                 let bootstrap_pids = [smss_pid, csrss_pid, winlogon_pid];
                 for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-                    PM_PIDS[pi].store(pid as u64, Ordering::Relaxed);
+                    store_hosted_pid_mirror(pi, pid);
                     let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
                 }
                 // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
@@ -559,14 +579,14 @@ impl ExecNtHandler {
                 // `NtCreateProcess[Ex]`.
                 for (pi, &pid) in bootstrap_pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                        PM_TIDS[pi].store(tid as u64, Ordering::Relaxed);
+                        store_hosted_main_tid_mirror(pi, tid);
                     }
                 }
                 for (pi, &pid) in bootstrap_pids.iter().enumerate() {
                     for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                         if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
                             let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
-                            PM_POOL_TID[pi][slot].store(tid as u64, Ordering::Relaxed);
+                            store_hosted_pool_tid_mirror(pi, slot, tid);
                         }
                     }
                 }
@@ -2042,20 +2062,16 @@ impl ExecNtHandler {
             .pm_pid_for_pi(creator_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let pid = self.pm.create_process(name, Some(parent), None);
-        PM_PIDS[child_pi].store(pid as u64, Ordering::Relaxed);
-        PM_POOL_USED[child_pi].store(0, Ordering::Relaxed);
-        PM_POOL_SUSPENDED[child_pi].store(0, Ordering::Relaxed);
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            PM_POOL_TID[child_pi][slot].store(0, Ordering::Relaxed);
-        }
+        store_hosted_pid_mirror(child_pi, pid);
+        reset_hosted_pool_mirror_slot(child_pi);
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
-        PM_TIDS[child_pi].store(main_tid as u64, Ordering::Relaxed);
+        store_hosted_main_tid_mirror(child_pi, main_tid);
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
                 let _ = self
                     .pm
                     .set_thread_state(tid, nt_process::ThreadState::Initialized);
-                PM_POOL_TID[child_pi][slot].store(tid as u64, Ordering::Relaxed);
+                store_hosted_pool_tid_mirror(child_pi, slot, tid);
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);

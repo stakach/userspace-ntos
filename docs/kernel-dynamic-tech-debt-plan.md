@@ -98,3 +98,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   boot loop and self-test scaffolding write those mirrors; the next A3 slice should move mirror
   writes into dedicated registration helpers and then remove fallback reads as the mechanism tables
   become authoritative.
+- A3 continued. Bootstrap and child-spawn writes now go through dedicated hosted mirror
+  reset/store helpers instead of open-coded `PM_PIDS`, `PM_TIDS`, and pool TID stores. Review
+  adjustment: the remaining direct mirror accesses are concentrated in loop selection diagnostics
+  and self-test scaffolding; production launch should next register ProcessManager/process
+  mechanisms atomically so the old mirror fallback can be deleted.
