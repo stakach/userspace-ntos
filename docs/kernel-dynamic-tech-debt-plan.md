@@ -30,7 +30,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` A1: Remove fixed `pi` dispatch from hosted child executable metadata lookup.
 - `[ ]` A2: Replace the static hosted image table with a dynamic image/session registration
   contract driven by created sections and process parameters.
-- `[~]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
+- `[x]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
 - `[~]` A4: Replace badge-to-process switches with registered thread/process runtime records.
 
@@ -203,3 +203,6 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `PM_VSPACE_PUBLISHED_OK` proof bit instead of reading cap values. Review adjustment: the A3
   process/thread identity and mechanism-state mirrors are now gone; remaining A4 work is the named
   bootstrap/listener TCB/TID cap cells still used by low-level spawn and teardown glue.
+- A3 complete. Source now has no `PM_PIDS`, `PM_TIDS`, `PM_POOL_TID`, `PM_POOL_USED`,
+  `PM_POOL_SUSPENDED`, `PM_PML4S`, `TP_WORKER_TID`, or `TP_WORKER_TCB` arrays. Remaining dynamic
+  launch-topology debt is tracked under A2 and A4.
