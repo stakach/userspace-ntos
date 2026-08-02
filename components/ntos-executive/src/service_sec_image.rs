@@ -106,6 +106,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     badge: u64,
     current_tid: u64,
     current_tcb: u64,
+    current_role: Option<HostedThreadRole>,
     main_tid: u64,
     pid: u64,
     client_teb: u64,
@@ -185,6 +186,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
             badge,
             tid: current_tid,
             tcb: current_tcb,
+            role: current_role,
             teb: client_teb,
             peb_mirror,
             scratch_base,
@@ -6314,6 +6316,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             tid: nt_handler.current_tid,
                             tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -6393,6 +6396,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             tid: nt_handler.current_tid,
                             tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -6409,6 +6413,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                            nt_handler.hosted_thread_role(current_tid),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7527,6 +7532,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             tid: nt_handler.current_tid,
                             tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -7619,6 +7625,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                            nt_handler.hosted_thread_role(current_tid),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             client_teb,
@@ -7655,6 +7662,7 @@ pub(crate) unsafe fn service_sec_image(
                             badge,
                             tid: nt_handler.current_tid,
                             tcb: hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                            role: nt_handler.hosted_thread_role(nt_handler.current_tid),
                             teb: client_teb,
                             peb_mirror,
                             scratch_base,
@@ -8744,28 +8752,39 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
         let client_pid = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
         let scratch_base = procs[2].scratch_base;
-        // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
-        // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
-        // dead-client injection below still finds a live, redirectable thread. Order matters: the
-        // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
-        // park and this injection could not arm.
-        let nested_proof =
-            win32k_glue::inject_win32k_nested_dispatch_slip(client_pid, scratch_base);
-        WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
-        let mut terminate_victim = |victim_tid: u64| {
-            let terminated =
-                terminate_hosted_thread_mechanism(victim_tid, &mut delay_queue, &mut nt_handler);
-            win32k_glue::DeadClientVictimTermination {
-                terminated,
-                tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
-            }
-        };
-        let proof = win32k_glue::inject_dead_client_callback_unwind(
-            client_pid,
-            scratch_base,
-            &mut terminate_victim,
-        );
-        DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
+        if let Some(callback_thread) = winlogon_callback_thread_candidate(&nt_handler) {
+            // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
+            // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
+            // dead-client injection below still finds a live, redirectable thread. Order matters: the
+            // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
+            // park and this injection could not arm.
+            let nested_proof = win32k_glue::inject_win32k_nested_dispatch_slip(
+                client_pid,
+                scratch_base,
+                callback_thread,
+            );
+            WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
+            let mut terminate_victim = |victim_tid: u64| {
+                let terminated = terminate_hosted_thread_mechanism(
+                    victim_tid,
+                    &mut delay_queue,
+                    &mut nt_handler,
+                );
+                win32k_glue::DeadClientVictimTermination {
+                    terminated,
+                    tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
+                }
+            };
+            let proof = win32k_glue::inject_dead_client_callback_unwind(
+                client_pid,
+                scratch_base,
+                callback_thread,
+                &mut terminate_victim,
+            );
+            DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
+        } else {
+            print_str(b"[cb-inject] no runtime-registered winlogon callback worker -> skipped\n");
+        }
     }
     // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
     // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
@@ -12220,6 +12239,37 @@ fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
     nt_handler
         .pm_pool_slot_for_tid(tid)
         .is_some_and(|(pi, slot)| nt_handler.is_pool_thread_suspended(pi, slot))
+}
+
+#[inline]
+fn winlogon_callback_thread_candidate(
+    nt_handler: &ExecNtHandler,
+) -> Option<win32k_glue::WinlogonCallbackThread> {
+    let candidates = [
+        (
+            HostedThreadRole::WinlogonWorker { slot: 1 },
+            WL_WORKER2_TEB_VA,
+            WL_WORKER2_STACK_BASE + WL_WORKER2_STACK_FRAMES * 0x1000,
+        ),
+        (
+            HostedThreadRole::WinlogonListener,
+            WL_LISTENER_TEB_VA,
+            WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
+        ),
+    ];
+    for (role, teb, stack_top) in candidates {
+        if let Some((tid, tcb, badge)) = nt_handler.hosted_thread_identity_for_role(2, role) {
+            return Some(win32k_glue::WinlogonCallbackThread {
+                badge,
+                tid,
+                tcb,
+                role,
+                teb,
+                stack_top,
+            });
+        }
+    }
+    None
 }
 
 #[inline]

@@ -155,3 +155,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   runtime identity reads are spawn-slot reservation/publication, gate-only debug probes,
   compatibility mirror cleanup, and the win32k callback TEB-alias/candidate paths until callback
   client context carries role-backed runtime identity.
+- A4 continued. Win32k callback client context now carries the registered `HostedThreadRole`
+  through `Win32kClientContext`, `UserCallbackClient`, and the active callback frame. Winlogon
+  callback TEB aliasing resolves from that role instead of checking static winlogon/TP TID cells,
+  and the post-quiesce nested/dead-client callback proof receives its victim from a service-side
+  runtime-table lookup instead of selecting from win32k's legacy TID/TCB mirrors. Review adjustment:
+  remaining A3/A4 runtime debt is now concentrated in spawn-slot reservation/publication,
+  compatibility mirror cleanup, service-loop current-TID diagnostics, and gate-only debug probes.

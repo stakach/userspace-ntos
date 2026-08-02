@@ -1123,6 +1123,7 @@ impl DispatchContext {
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
     client_tcb: u64,
+    client_runtime_role: u32,
     saved_user_context: [u64; 20],
     outer_resume_ip: u64,
     redirected: bool,
@@ -1138,6 +1139,7 @@ impl ActiveCallbackFrame {
         Self {
             request: CallbackHeader::idle(0, 0, 0, 0),
             client_tcb: 0,
+            client_runtime_role: 0,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -1153,6 +1155,10 @@ impl ActiveCallbackFrame {
 
     pub const fn client_tcb(&self) -> u64 {
         self.client_tcb
+    }
+
+    pub const fn client_runtime_role(&self) -> u32 {
+        self.client_runtime_role
     }
 
     pub const fn dispatch_context(&self) -> &DispatchContext {
@@ -1269,7 +1275,20 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(index)
     }
 
-    pub fn push(&mut self, request: CallbackHeader, client_tcb: u64) -> Result<(), ValidationError> {
+    pub fn push(
+        &mut self,
+        request: CallbackHeader,
+        client_tcb: u64,
+    ) -> Result<(), ValidationError> {
+        self.push_with_client_runtime_role(request, client_tcb, 0)
+    }
+
+    pub fn push_with_client_runtime_role(
+        &mut self,
+        request: CallbackHeader,
+        client_tcb: u64,
+        client_runtime_role: u32,
+    ) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if client_tcb <= 1 {
             return Err(ValidationError::State);
@@ -1280,6 +1299,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         self.frames[self.len] = ActiveCallbackFrame {
             request,
             client_tcb,
+            client_runtime_role,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -2686,8 +2706,12 @@ mod tests {
         b.callback_id = 2;
         b.client_tid = 21;
         b.client_badge = 13;
-        stack.push(a, 0xaaa0).unwrap();
-        stack.push(b, 0xbbb0).unwrap();
+        stack
+            .push_with_client_runtime_role(a, 0xaaa0, 0x11)
+            .unwrap();
+        stack
+            .push_with_client_runtime_role(b, 0xbbb0, 0x22)
+            .unwrap();
         let ca = CallbackCorrelation::from_request(&a);
         let cb = CallbackCorrelation::from_request(&b);
         stack
@@ -2717,6 +2741,7 @@ mod tests {
         // A returns FIRST, from underneath B's frame.
         let popped_a = stack.pop(ca).unwrap();
         assert_eq!(popped_a.client_tcb(), 0xaaa0);
+        assert_eq!(popped_a.client_runtime_role(), 0x11);
         assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
         assert_eq!(popped_a.outer_resume_ip(), 0xdead);
         assert_eq!(stack.len(), 1);
@@ -2728,6 +2753,7 @@ mod tests {
         );
         let popped_b = stack.pop(cb).unwrap();
         assert_eq!(popped_b.client_tcb(), 0xbbb0);
+        assert_eq!(popped_b.client_runtime_role(), 0x22);
         assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
         assert!(stack.is_empty());
     }

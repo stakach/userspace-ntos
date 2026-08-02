@@ -1914,6 +1914,12 @@ impl ExecNtHandler {
         self.thread_runtime.tcb_by_tid(tid)
     }
 
+    pub(crate) fn hosted_thread_role(&self, tid: u64) -> Option<HostedThreadRole> {
+        self.thread_runtime
+            .get_by_tid(tid)
+            .map(|runtime| runtime.role)
+    }
+
     fn hosted_thread_tcb_for_nt_resume_thread(&self, tid: u64) -> Option<u64> {
         if let Some(runtime) = self.thread_runtime.get_by_tid(tid) {
             if !runtime.role.can_raw_resume_from_nt_resume_thread() {
@@ -1934,6 +1940,15 @@ impl ExecNtHandler {
         role: HostedThreadRole,
     ) -> Option<u64> {
         self.thread_runtime.tcb_for_role(pi, role)
+    }
+
+    pub(crate) fn hosted_thread_identity_for_role(
+        &self,
+        pi: usize,
+        role: HostedThreadRole,
+    ) -> Option<(u64, u64, u64)> {
+        let runtime = self.thread_runtime.get_by_role(pi, role)?;
+        (runtime.tid != 0 && runtime.tcb > 1).then_some((runtime.tid, runtime.tcb, runtime.badge))
     }
 
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {

@@ -109,9 +109,78 @@ pub(crate) struct Win32kClientContext {
     pub badge: u64,
     pub tid: u64,
     pub tcb: u64,
+    pub role: Option<HostedThreadRole>,
     pub teb: u64,
     pub peb_mirror: u64,
     pub scratch_base: u64,
+}
+
+const CALLBACK_ROLE_NONE: u32 = 0;
+const CALLBACK_ROLE_MAIN: u32 = 1;
+const CALLBACK_ROLE_SM_LOOP: u32 = 2;
+const CALLBACK_ROLE_CSR_API: u32 = 3;
+const CALLBACK_ROLE_CSR_SB_API: u32 = 4;
+const CALLBACK_ROLE_WINLOGON_LISTENER: u32 = 5;
+const CALLBACK_ROLE_SERVICES_LISTENER: u32 = 6;
+const CALLBACK_ROLE_SCM_WORKER: u32 = 7;
+const CALLBACK_ROLE_LSASS_LISTENER: u32 = 8;
+const CALLBACK_ROLE_LSASS_LISTENER2: u32 = 9;
+const CALLBACK_ROLE_LSASS_LISTENER3: u32 = 10;
+const CALLBACK_ROLE_LSA_WORKER: u32 = 11;
+const CALLBACK_ROLE_TP_WORKER_BASE: u32 = 0x1000;
+const CALLBACK_ROLE_WINLOGON_WORKER_BASE: u32 = 0x2000;
+const CALLBACK_ROLE_SLOT_MASK: u32 = 0x0fff;
+
+fn callback_runtime_role_code(role: Option<HostedThreadRole>) -> u32 {
+    match role {
+        Some(HostedThreadRole::Main) => CALLBACK_ROLE_MAIN,
+        Some(HostedThreadRole::TpWorker { slot }) if slot <= CALLBACK_ROLE_SLOT_MASK as usize => {
+            CALLBACK_ROLE_TP_WORKER_BASE | slot as u32
+        }
+        Some(HostedThreadRole::SmLoop) => CALLBACK_ROLE_SM_LOOP,
+        Some(HostedThreadRole::CsrApi) => CALLBACK_ROLE_CSR_API,
+        Some(HostedThreadRole::CsrSbApi) => CALLBACK_ROLE_CSR_SB_API,
+        Some(HostedThreadRole::WinlogonListener) => CALLBACK_ROLE_WINLOGON_LISTENER,
+        Some(HostedThreadRole::WinlogonWorker { slot })
+            if slot <= CALLBACK_ROLE_SLOT_MASK as usize =>
+        {
+            CALLBACK_ROLE_WINLOGON_WORKER_BASE | slot as u32
+        }
+        Some(HostedThreadRole::ServicesListener) => CALLBACK_ROLE_SERVICES_LISTENER,
+        Some(HostedThreadRole::ScmWorker) => CALLBACK_ROLE_SCM_WORKER,
+        Some(HostedThreadRole::LsassListener) => CALLBACK_ROLE_LSASS_LISTENER,
+        Some(HostedThreadRole::LsassListener2) => CALLBACK_ROLE_LSASS_LISTENER2,
+        Some(HostedThreadRole::LsassListener3) => CALLBACK_ROLE_LSASS_LISTENER3,
+        Some(HostedThreadRole::LsaWorker) => CALLBACK_ROLE_LSA_WORKER,
+        _ => CALLBACK_ROLE_NONE,
+    }
+}
+
+fn callback_runtime_role_from_code(code: u32) -> Option<HostedThreadRole> {
+    match code {
+        CALLBACK_ROLE_MAIN => Some(HostedThreadRole::Main),
+        CALLBACK_ROLE_SM_LOOP => Some(HostedThreadRole::SmLoop),
+        CALLBACK_ROLE_CSR_API => Some(HostedThreadRole::CsrApi),
+        CALLBACK_ROLE_CSR_SB_API => Some(HostedThreadRole::CsrSbApi),
+        CALLBACK_ROLE_WINLOGON_LISTENER => Some(HostedThreadRole::WinlogonListener),
+        CALLBACK_ROLE_SERVICES_LISTENER => Some(HostedThreadRole::ServicesListener),
+        CALLBACK_ROLE_SCM_WORKER => Some(HostedThreadRole::ScmWorker),
+        CALLBACK_ROLE_LSASS_LISTENER => Some(HostedThreadRole::LsassListener),
+        CALLBACK_ROLE_LSASS_LISTENER2 => Some(HostedThreadRole::LsassListener2),
+        CALLBACK_ROLE_LSASS_LISTENER3 => Some(HostedThreadRole::LsassListener3),
+        CALLBACK_ROLE_LSA_WORKER => Some(HostedThreadRole::LsaWorker),
+        code if code & !CALLBACK_ROLE_SLOT_MASK == CALLBACK_ROLE_TP_WORKER_BASE => {
+            Some(HostedThreadRole::TpWorker {
+                slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
+            })
+        }
+        code if code & !CALLBACK_ROLE_SLOT_MASK == CALLBACK_ROLE_WINLOGON_WORKER_BASE => {
+            Some(HostedThreadRole::WinlogonWorker {
+                slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
@@ -278,6 +347,7 @@ unsafe fn write_callback_failure_reply(request: nt_user_callback::CallbackHeader
 unsafe fn begin_controlled_continuation(
     request: nt_user_callback::CallbackHeader,
     client_tcb: u64,
+    client_runtime_role: u32,
 ) -> bool {
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
     let client = nt_user_callback::ClientThreadIdentity::new(
@@ -299,7 +369,9 @@ unsafe fn begin_controlled_continuation(
     let root = stack.is_empty_for(&client);
     if (root && stack.push_dispatch(client, request.dispatch_id).is_err())
         || stack.push_callback(correlation).is_err()
-        || active.push(request, client_tcb).is_err()
+        || active
+            .push_with_client_runtime_role(request, client_tcb, client_runtime_role)
+            .is_err()
     {
         abort_controlled_user_callbacks();
         return false;
@@ -365,31 +437,25 @@ unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -
 
 fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let winlogon_pi = nt_exe_image::hosted_pi_for_leaf(b"winlogon.exe")?;
-    if !callback_client_is_winlogon(client) || client.tid == 0 {
+    if client.pi as usize != winlogon_pi || !callback_client_is_winlogon(client) || client.tid == 0
+    {
         return None;
     }
-    let alias = match client.badge {
-        WINLOGON_BADGE => WINLOGON_MAIN_TEB_MIRROR_VA,
-        WINLOGON_WORKER_BADGE if client.tid == PM_LISTENER_TID.load(Ordering::Relaxed) => {
+    let alias = match client.role {
+        Some(HostedThreadRole::Main) => WINLOGON_MAIN_TEB_MIRROR_VA,
+        Some(HostedThreadRole::WinlogonListener) => {
             WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000
         }
-        WINLOGON_WORKER2_BADGE if client.tid == WL_WORKER2_TID.load(Ordering::Relaxed) => {
+        Some(HostedThreadRole::WinlogonWorker { slot: 1 }) => {
             WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
         }
-        WINLOGON_WORKER3_BADGE if client.tid == WL_WORKER3_TID.load(Ordering::Relaxed) => {
+        Some(HostedThreadRole::WinlogonWorker { slot: 2 }) => {
             WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
         }
-        badge => {
-            let Some((pi, slot)) = tp_worker_identity_from_badge(badge) else {
-                return None;
-            };
-            if pi != winlogon_pi
-                || client.tid != TP_WORKER_TID[winlogon_pi][slot].load(Ordering::Relaxed)
-            {
-                return None;
-            }
+        Some(HostedThreadRole::TpWorker { slot }) => {
             tp_worker_stack_mirror_va(winlogon_pi, slot) + TP_WORKER_STACK_FRAMES * 0x1000
         }
+        _ => return None,
     };
     Some(alias)
 }
@@ -891,7 +957,11 @@ pub(crate) unsafe fn service_user_callback(
         if (!requires_window_binding || callback_teb_alias.is_some())
             && valid
             && dispatcher != 0
-            && begin_controlled_continuation(request, client.tcb)
+            && begin_controlled_continuation(
+                request,
+                client.tcb,
+                callback_runtime_role_code(client.role),
+            )
         {
             if !remember_active_dispatch(&request) {
                 abort_controlled_user_callbacks();
@@ -1217,12 +1287,14 @@ unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
     client_tcb: u64,
+    client_runtime_role: Option<HostedThreadRole>,
 ) -> crate::spawn_hosts::PumpResult {
     let client = crate::spawn_hosts::UserCallbackClient {
         pi: request.client_pi,
         badge: request.client_badge,
         tid: request.client_tid,
         tcb: client_tcb,
+        role: client_runtime_role,
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
     };
@@ -1288,7 +1360,11 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let result = resume_suspended_user_callback_component(request, active_frame.client_tcb());
+    let result = resume_suspended_user_callback_component(
+        request,
+        active_frame.client_tcb(),
+        callback_runtime_role_from_code(active_frame.client_runtime_role()),
+    );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
@@ -1455,7 +1531,11 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let component = resume_suspended_user_callback_component(request, client_tcb);
+        let component = resume_suspended_user_callback_component(
+            request,
+            client_tcb,
+            callback_runtime_role_from_code(popped.client_runtime_role()),
+        );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -1522,6 +1602,16 @@ pub(crate) struct DeadClientVictimTermination {
     pub tcb_reclaimed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WinlogonCallbackThread {
+    pub badge: u64,
+    pub tid: u64,
+    pub tcb: u64,
+    pub role: HostedThreadRole,
+    pub teb: u64,
+    pub stack_top: u64,
+}
+
 /// ★ DELIBERATE FAULT INJECTION that makes [`unwind_dead_client_user_callbacks`] a GATE-PROTECTED
 /// path instead of a path evidenced only by historical crash boots.
 ///
@@ -1555,33 +1645,6 @@ pub(crate) struct DeadClientVictimTermination {
 /// requested for winlogon after quiesce.
 ///
 /// Returns the `DEAD_CLIENT_INJECT_*` proof mask.
-/// An EXPENDABLE winlogon (pi 2) worker thread usable as a callback-injection client: a real hosted
-/// thread with a live TCB, a registered client stack and a TEB alias the callback-window bridge can
-/// write (what a redirect needs). NEVER winlogon's main thread (the gate still samples that one).
-/// Returns `(badge, tid, tcb, teb_va, stack_top)`.
-unsafe fn expendable_winlogon_callback_thread() -> Option<(u64, u64, u64, u64, u64)> {
-    let candidates = [
-        (
-            WINLOGON_WORKER2_BADGE,
-            WL_WORKER2_TID.load(Ordering::Relaxed),
-            WL_WORKER2_TCB.load(Ordering::Relaxed),
-            WL_WORKER2_TEB_VA,
-            WL_WORKER2_STACK_BASE + WL_WORKER2_STACK_FRAMES * 0x1000,
-        ),
-        (
-            WINLOGON_WORKER_BADGE,
-            PM_LISTENER_TID.load(Ordering::Relaxed),
-            WL_LISTENER_TCB.load(Ordering::Relaxed),
-            WL_LISTENER_TEB_VA,
-            WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
-        ),
-    ];
-    candidates
-        .iter()
-        .find(|(_, tid, tcb, _, _)| *tid != 0 && *tcb > 1)
-        .copied()
-}
-
 // ── SCENARIO INJECTION: `exec_win32k_transport_call_nested` ─────────────────────────────────────
 // Proof bits returned by [`inject_win32k_nested_dispatch_slip`]; ALL set = the spec passes.
 /// win32k really SUSPENDED an outer dispatch inside `KeUserModeCallback` (the nesting precondition).
@@ -1640,7 +1703,11 @@ pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 /// is safe to run BEFORE `inject_dead_client_callback_unwind` on the same worker.
 ///
 /// Returns the `NESTED_SLIP_*` proof mask.
-pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch_base: u64) -> u64 {
+pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
+    client_pid: u64,
+    scratch_base: u64,
+    victim: WinlogonCallbackThread,
+) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
     const WM_NULL: u64 = 0x0000;
@@ -1648,10 +1715,14 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
     const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
 
     let mut proof = 0u64;
-    let Some((badge, tid, tcb, teb, stack_top)) = expendable_winlogon_callback_thread() else {
-        print_str(b"[w32-slip] no expendable winlogon worker thread available -> skipped\n");
-        return proof;
-    };
+    let WinlogonCallbackThread {
+        badge,
+        tid,
+        tcb,
+        role,
+        teb,
+        stack_top,
+    } = victim;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
     // the redirect's callout-frame write has guaranteed room, exactly as the dead-client injection
     // does. `complete_controlled_user_callback` restores the thread's context at the end.
@@ -1680,6 +1751,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
         badge,
         tid,
         tcb,
+        role: Some(role),
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -1843,6 +1915,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(client_pid: u64, scratch
 pub(crate) unsafe fn inject_dead_client_callback_unwind(
     client_pid: u64,
     scratch_base: u64,
+    victim: WinlogonCallbackThread,
     terminate_victim: &mut dyn FnMut(u64) -> DeadClientVictimTermination,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
@@ -1851,12 +1924,16 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
 
     let mut proof = 0u64;
-    // (0) VICTIM SELECTION — an expendable winlogon (pi 2) worker thread (see
-    // [`expendable_winlogon_callback_thread`]).
-    let Some((badge, tid, tcb, teb, stack_top)) = expendable_winlogon_callback_thread() else {
-        print_str(b"[cb-inject] no expendable winlogon worker thread available -> skipped\n");
-        return proof;
-    };
+    // (0) VICTIM SELECTION — caller supplies an expendable winlogon (pi 2) worker thread resolved
+    // from the registered hosted-thread runtime table.
+    let WinlogonCallbackThread {
+        badge,
+        tid,
+        tcb,
+        role,
+        teb,
+        stack_top,
+    } = victim;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
     // the redirect's callout-frame write has guaranteed room. The thread is about to be destroyed, so
     // its live context is irrelevant; this only removes a spurious failure mode from the self-test.
@@ -1886,6 +1963,7 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         badge,
         tid,
         tcb,
+        role: Some(role),
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
@@ -2226,7 +2304,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let component = resume_suspended_user_callback_component(request, completed_frame.client_tcb());
+    let completed_role =
+        callback_runtime_role_from_code(completed_frame.client_runtime_role());
+    let component =
+        resume_suspended_user_callback_component(request, completed_frame.client_tcb(), completed_role);
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
@@ -2238,6 +2319,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             badge: request.client_badge,
             tid: request.client_tid,
             tcb: completed_frame.client_tcb(),
+            role: completed_role,
             teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
             scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
@@ -3033,6 +3115,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             badge: 0,
             tid: 0,
             tcb: 0,
+            role: None,
             teb: crate::SMSS_TEB_VA,
             peb_mirror: 0,
             scratch_base: crate::SM_FILL_SCRATCH_BASE,
@@ -3206,6 +3289,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
             badge: client.badge,
             tid: client.tid,
             tcb: client.tcb,
+            role: client.role,
             peb_mirror: client.peb_mirror,
             scratch_base: client.scratch_base,
         }),

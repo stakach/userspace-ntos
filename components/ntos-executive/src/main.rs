@@ -11157,6 +11157,11 @@ impl HostedThreadRuntimes {
         unsafe { (&*self.table).tcb_by_tid(tid) }
     }
 
+    fn get_by_role(&self, pi: usize, role: HostedThreadRole) -> Option<HostedThreadRuntime> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get_by_role(pi, role) }
+    }
+
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).tcb_for_main_pi(pi) }
