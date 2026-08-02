@@ -29,6 +29,25 @@ fn hosted_bootstrap_image(
     .expect("hosted bootstrap image descriptor is static and validated")
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostedBootstrapLoadSpec {
+    pub(crate) disk_path: &'static [u8],
+    pub(crate) stem: &'static [u8],
+    pub(crate) image: nt_exe_image::OwnedHostedProcessImage,
+}
+
+fn hosted_bootstrap_load_spec(
+    disk_path: &'static [u8],
+    stem: &'static [u8],
+    image: nt_exe_image::OwnedHostedProcessImage,
+) -> HostedBootstrapLoadSpec {
+    HostedBootstrapLoadSpec {
+        disk_path,
+        stem,
+        image,
+    }
+}
+
 pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         0,
@@ -42,7 +61,7 @@ pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn csrss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+fn csrss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         1,
         nt_exe_image::CSRSS_TOP_BADGE,
@@ -55,7 +74,15 @@ pub(crate) fn csrss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn winlogon_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn csrss_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        b"reactos\\system32\\csrss.exe",
+        b"csrss.exe",
+        csrss_bootstrap_image(),
+    )
+}
+
+fn winlogon_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         2,
         nt_exe_image::WINLOGON_TOP_BADGE,
@@ -68,7 +95,15 @@ pub(crate) fn winlogon_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImag
     )
 }
 
-pub(crate) fn services_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn winlogon_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        b"reactos\\system32\\winlogon.exe",
+        b"winlogon.exe",
+        winlogon_bootstrap_image(),
+    )
+}
+
+fn services_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         3,
         nt_exe_image::SERVICES_TOP_BADGE,
@@ -81,7 +116,15 @@ pub(crate) fn services_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImag
     )
 }
 
-pub(crate) fn lsass_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn services_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        b"reactos\\system32\\services.exe",
+        b"services.exe",
+        services_bootstrap_image(),
+    )
+}
+
+fn lsass_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         4,
         nt_exe_image::LSASS_TOP_BADGE,
@@ -94,7 +137,15 @@ pub(crate) fn lsass_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn userinit_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn lsass_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        b"reactos\\system32\\lsass.exe",
+        b"lsass.exe",
+        lsass_bootstrap_image(),
+    )
+}
+
+fn userinit_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         5,
         nt_exe_image::USERINIT_TOP_BADGE,
@@ -107,7 +158,15 @@ pub(crate) fn userinit_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImag
     )
 }
 
-pub(crate) fn explorer_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn userinit_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        br"reactos\system32\userinit.exe",
+        b"userinit.exe",
+        userinit_bootstrap_image(),
+    )
+}
+
+fn explorer_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     hosted_bootstrap_image(
         6,
         nt_exe_image::EXPLORER_TOP_BADGE,
@@ -117,6 +176,14 @@ pub(crate) fn explorer_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImag
         b"explorer.exe",
         nt_exe_image::HostedImageRoot::SystemRoot,
         b"explorer",
+    )
+}
+
+pub(crate) fn explorer_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+    hosted_bootstrap_load_spec(
+        br"reactos\explorer.exe",
+        b"explorer.exe",
+        explorer_bootstrap_image(),
     )
 }
 

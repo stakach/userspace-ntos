@@ -350,3 +350,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: the compatibility slice and static lookup wrappers remain inside `nt-exe-image` for
   crate tests/legacy callers; the executive path is now runtime-catalog based. Remaining A2 debt is
   replacing the bootstrap descriptor functions with a real boot/session image manifest source.
+- A2 cleanup. Hosted bootstrap image loading now consumes `HostedBootstrapLoadSpec` records and uses
+  one `load_hosted_bootstrap_image` helper for load, EXE relocation, ImageBase patching, and catalog
+  registration. This removes six duplicated load/register blocks from `service_sec_image.rs` and keeps
+  disk path, stem, and NT process metadata together in the bootstrap boundary. Review adjustment: the
+  specs are still compiled-in bootstrap policy; the next semantic step is a manifest handoff populated
+  by the loader/session manager rather than functions in `hosted_bootstrap.rs`.

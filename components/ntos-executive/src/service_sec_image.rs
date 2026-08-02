@@ -95,6 +95,26 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
     nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
 }
 
+unsafe fn load_hosted_bootstrap_image(
+    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    enabled: bool,
+    spec: HostedBootstrapLoadSpec,
+) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
+    let (pe, va) = if enabled {
+        load_dll_from_fs(spec.disk_path, spec.stem)
+    } else {
+        (None, 0)
+    };
+    if let Some(ref image_pe) = pe {
+        apply_relocations_to_buf(image_pe, va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
+    register_loaded_hosted_image(catalog, spec.image, pe.is_some())
+        .expect("hosted bootstrap image metadata must register once when loaded");
+    (pe, va)
+}
+
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -1998,113 +2018,47 @@ pub(crate) unsafe fn service_sec_image(
     // (ldrinit.c:2409, the EXE-reloc path, is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT).
     // The relocation runs on the pool `*_va`; the demand-fault router reads the relocated bytes via the
     // PeFile slice.
-    let (csrss_pe, csrss_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\csrss.exe", b"csrss.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref cpe) = csrss_pe {
-        apply_relocations_to_buf(cpe, csrss_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((csrss_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((csrss_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (csrss_pe, csrss_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        csrss_bootstrap_image(),
-        csrss_pe.is_some(),
-    )
-    .expect("CSRSS hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        csrss_bootstrap_load_spec(),
+    );
     // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
-    let (winlogon_pe, winlogon_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\winlogon.exe", b"winlogon.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref wpe) = winlogon_pe {
-        apply_relocations_to_buf(wpe, winlogon_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((winlogon_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((winlogon_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (winlogon_pe, winlogon_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        winlogon_bootstrap_image(),
-        winlogon_pe.is_some(),
-    )
-    .expect("winlogon hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        winlogon_bootstrap_load_spec(),
+    );
     // services.exe — the 4th hosted process, spawned by winlogon's Win32 CreateProcessW
     // (StartServicesManager). Sourced BY PATH from the FS pool (P7-A — no fixed buffer needed); on
     // the demo run (ntdll=None) it stays None (services only spawns on the live run). Same EXE-reloc
     // + ImageBase patch as csrss/winlogon so ntdll doesn't hit the unimplemented EXE-reloc path.
-    let (services_pe, services_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\services.exe", b"services.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref spe) = services_pe {
-        apply_relocations_to_buf(spe, services_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((services_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((services_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (services_pe, services_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        services_bootstrap_image(),
-        services_pe.is_some(),
-    )
-    .expect("services hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        services_bootstrap_load_spec(),
+    );
     // lsass.exe — the 5th hosted process, spawned by winlogon's StartLsass Win32 CreateProcessW.
     // Sourced BY PATH from the FS pool. Same EXE-reloc + ImageBase patch as services.
-    let (lsass_pe, lsass_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\lsass.exe", b"lsass.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref lpe) = lsass_pe {
-        apply_relocations_to_buf(lpe, lsass_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((lsass_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((lsass_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (lsass_pe, lsass_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        lsass_bootstrap_image(),
-        lsass_pe.is_some(),
-    )
-    .expect("lsass hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        lsass_bootstrap_load_spec(),
+    );
     // userinit.exe — the first post-login image. It enters the generic Win32-child image table now;
     // the effectful pi=5 spawn remains deliberately separate so image semantics can be gated first.
-    let (userinit_pe, userinit_va) = if ntdll.is_some() {
-        load_dll_from_fs(br"reactos\system32\userinit.exe", b"userinit.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref upe) = userinit_pe {
-        apply_relocations_to_buf(upe, userinit_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((userinit_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((userinit_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (userinit_pe, userinit_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        userinit_bootstrap_image(),
-        userinit_pe.is_some(),
-    )
-    .expect("userinit hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        userinit_bootstrap_load_spec(),
+    );
     // explorer.exe — userinit's StartShell target. It lives at the ReactOS root (`C:\ReactOS` /
     // hosted `C:\Windows`), not under System32, so source it by its real volume path.
-    let (explorer_pe, explorer_va) = if ntdll.is_some() {
-        load_dll_from_fs(br"reactos\explorer.exe", b"explorer.exe")
-    } else {
-        (None, 0)
-    };
-    if let Some(ref epe) = explorer_pe {
-        apply_relocations_to_buf(epe, explorer_va, PE_LOAD_BASE);
-        let e_lfanew = core::ptr::read_volatile((explorer_va + 0x3c) as *const u32) as u64;
-        core::ptr::write_volatile((explorer_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-    }
-    register_loaded_hosted_image(
+    let (explorer_pe, explorer_va) = load_hosted_bootstrap_image(
         &mut exe_image_catalog,
-        explorer_bootstrap_image(),
-        explorer_pe.is_some(),
-    )
-    .expect("explorer hosted image metadata must register once when loaded");
+        ntdll.is_some(),
+        explorer_bootstrap_load_spec(),
+    );
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
     // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
