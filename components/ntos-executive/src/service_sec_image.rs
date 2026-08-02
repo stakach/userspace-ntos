@@ -6703,17 +6703,19 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" (dispatch)\n");
                 }
                 // ── NT ARGUMENT CAPTURE for `NtUserRegisterClassExWOW` (SSN 0x10b4).
-                // arg2 = ClassName and arg3 = ClsVersion are client `PUNICODE_STRING`s whose descriptor
+                // a1 = ClassName and a2 = ClsVersion are client `PUNICODE_STRING`s whose descriptor
                 // and `Buffer` both belong to the caller's address space. Real NT probes and captures
                 // them before win32k consumes them. Do the same at the executive's cross-VSpace boundary:
                 // stage a bounded descriptor for atoms/resources too, and stage readable nonzero buffers
                 // regardless of whether they live in the main image, a DLL, stack, or heap.
                 //
                 // The shared ARG frame is mapped in both VSpaces (already the proven mechanism for
-                // `NtUserProcessConnect`). Any unreadable/oversized string falls back to the original
-                // pointer, so this is fail-safe.
+                // `NtUserProcessConnect`). If a string graph is unreadable or oversized, the original
+                // pointer is forwarded and win32k's normal probe/error path decides the result.
                 let mut d_a2 = a2;
                 let mut d_a3 = a3;
+                let mut register_class_stack_args = [0u64; 3];
+                let mut register_class_stack_arg_count = 0usize;
                 let mut open_dcw_stack_args = [0u64; 3];
                 let mut open_dcw_stack_arg_count = 0usize;
                 let mut open_dcw_dhpdev_copyout = (0u64, 0u64);
@@ -6744,6 +6746,35 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     );
+                    if sp != 0 {
+                        let fn_id = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let class_flags = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let p_wow = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x38,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if let (Some(fn_id), Some(class_flags), Some(p_wow)) =
+                            (fn_id, class_flags, p_wow)
+                        {
+                            register_class_stack_args = [fn_id, class_flags, p_wow];
+                            register_class_stack_arg_count = register_class_stack_args.len();
+                        }
+                    }
                 } else if m0 == 0x1036 {
                     // NtUserRegisterWindowMessage takes one client PUNICODE_STRING. ReactOS probes and
                     // captures it before adding the atom; isolated win32k needs the same cross-VSpace
@@ -7369,25 +7400,32 @@ pub(crate) unsafe fn service_sec_image(
                     None
                 };
                 let builtin_class_args = if m0 == 0x10b4 {
-                    let sp = get_recv_mr(16);
-                    match (
-                        client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x28,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ),
-                        client_read_u64_mapped(
-                            pi as u64,
-                            sp + 0x30,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ),
-                    ) {
-                        (Some(fn_id), Some(flags)) => Some((fn_id as u32, flags as u32)),
-                        _ => None,
+                    if register_class_stack_arg_count == register_class_stack_args.len() {
+                        Some((
+                            register_class_stack_args[0] as u32,
+                            register_class_stack_args[1] as u32,
+                        ))
+                    } else {
+                        let sp = get_recv_mr(16);
+                        match (
+                            client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ),
+                            client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x30,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ),
+                        ) {
+                            (Some(fn_id), Some(flags)) => Some((fn_id as u32, flags as u32)),
+                            _ => None,
+                        }
                     }
                 } else {
                     None
@@ -8008,6 +8046,8 @@ pub(crate) unsafe fn service_sec_image(
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
+                    let register_class_staged_stack = m0 == 0x10b4
+                        && register_class_stack_arg_count == register_class_stack_args.len();
                     let (dispatch_sp, dispatch_stack_args): (u64, &[u64]) = if open_dcw_staged_stack
                     {
                         (0, &open_dcw_stack_args)
@@ -8017,6 +8057,8 @@ pub(crate) unsafe fn service_sec_image(
                         (0, &create_bitmap_stack_args)
                     } else if text_extent_staged_stack {
                         (0, &text_extent_stack_args)
+                    } else if register_class_staged_stack {
+                        (0, &register_class_stack_args)
                     } else {
                         (sp, &[])
                     };

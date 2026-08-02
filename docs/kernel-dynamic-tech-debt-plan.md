@@ -477,3 +477,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `ProfileList\ProfilesDirectory` hive read, real read-only FAT opens, zero unsupported file opens,
   and the later profile-copy/userinit/explorer gates. A boot with no readonly FAT misses is now
   treated as the stronger success case instead of a red proof artifact.
+- C3 repair. `NtUserRegisterClassExWOW` now stages the ReactOS x64 stack-tail arguments
+  (`fnID`, `Flags`, and `pWow`) into provider-owned dispatch arguments along with the existing
+  captured class/version strings. Isolated win32k no longer reads those scalar tail arguments from a
+  stale client stack mapping, so class registration observes the real caller flags instead of
+  falling into the `Bad Flags` rejection path. Validation:
+  `.tmp/full-boot-register-class-tail-20260803-081413.log` reached `RUN_RC=0`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
+  exec_msgina_logon_dialog_painted`, `PASS exec_explorer_process_spawned`, and explorer completed
+  65 `NtUserRegisterClassExWOW` dispatches. Review adjustment: the remaining red explorer gates are
+  now `RegisterWindowMessage` capture, api0 callback redirection, client-installed WndProc, and
+  shell COM class service; the next cleanup target is the dynamic boundary that prevents explorer
+  from reaching/registering those shell window messages.
