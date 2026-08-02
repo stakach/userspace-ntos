@@ -10790,9 +10790,9 @@ struct ExecNtHandler {
     pm: nt_process::ProcessManager,
     /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge.
     process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
-    /// Runtime-owned metadata for hosted process identities that have been registered with the
-    /// handler. Consumers use this table instead of the historical static hosted-image slice.
-    hosted_images: nt_exe_image::OwnedHostedImageCatalog<MAX_PI>,
+    /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
+    /// second catalog so process identity, image open, and spawn all consult the same runtime table.
+    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: [u64; MAX_PI],
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
@@ -10841,6 +10841,19 @@ struct ExecNtHandler {
     /// directories a hosted process created SURVIVE the next per-syscall bump reset. Without it the
     /// volume would be handed back to the allocator the instant the syscall returned.
     writable_fs_dirty: bool,
+}
+
+static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
+    core::mem::MaybeUninit::uninit();
+
+unsafe fn reset_exec_nt_handler(
+    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
+) -> &'static mut ExecNtHandler {
+    let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
+    // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
+    // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
+    // contents, matching the rest of the rootserver bootstrap allocator model.
+    ExecNtHandler::initialize_in(slot, hosted_images)
 }
 
 /// Exclusive pointer to the serialized executive's fixed directory-open table.
@@ -10936,7 +10949,11 @@ impl HostedThreadRole {
 }
 
 const fn hosted_thread_runtime_gate_bit(pi: usize, role: HostedThreadRole) -> u64 {
+    const MAIN_THREAD_BASE: usize = 16;
     match (pi, role) {
+        (pi, HostedThreadRole::Main) if pi < MAX_PI && pi + MAIN_THREAD_BASE < 64 => {
+            1u64 << (MAIN_THREAD_BASE + pi)
+        }
         (2, HostedThreadRole::WinlogonListener) => 1 << 0,
         (3, HostedThreadRole::ServicesListener) => 1 << 1,
         (4, HostedThreadRole::LsassListener) => 1 << 2,
@@ -11059,7 +11076,10 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
 
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         (tid != 0).then_some(())?;
-        self.entries.iter().copied().find(|entry| entry.tid == tid)
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.is_live() && entry.tid == tid)
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -11069,10 +11089,9 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
     }
 
     fn main_for_pi(&self, pi: usize) -> Option<HostedThreadRuntime> {
-        self.entries
-            .iter()
-            .copied()
-            .find(|entry| entry.pi == pi && matches!(entry.role, HostedThreadRole::Main))
+        self.entries.iter().copied().find(|entry| {
+            entry.is_live() && entry.pi == pi && matches!(entry.role, HostedThreadRole::Main)
+        })
     }
 
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
@@ -11085,11 +11104,10 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
         self.entries
             .iter()
             .copied()
-            .find(|entry| entry.pi == pi && entry.role == role)
+            .find(|entry| entry.is_live() && entry.pi == pi && entry.role == role)
     }
 
     fn get_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
-        (badge != 0).then_some(())?;
         self.entries
             .iter()
             .copied()
@@ -11103,7 +11121,11 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
     }
 
     fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {
-        let entry = self.entries.iter_mut().find(|entry| entry.tid == tid)?;
+        (tid != 0).then_some(())?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
         let previous = *entry;
         *entry = HostedThreadRuntime::empty();
         Some(previous)

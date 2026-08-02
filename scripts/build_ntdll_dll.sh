@@ -32,22 +32,21 @@ TARGET_JSON="x86_64-pc-windows-gnullvm-nostd.json"
 TARGET_DIRNAME="x86_64-pc-windows-gnullvm-nostd"
 OUT_DIR="$ROOT/.tmp"
 OUT_DLL="$OUT_DIR/nt-ntdll.dll"
-FEATURE_ARGS=()
+BUILD_ARGS=(--release --target "$TARGET_JSON")
 if [ -n "${NTDLL_FEATURES:-}" ]; then
-  FEATURE_ARGS=(--features "$NTDLL_FEATURES")
+  BUILD_ARGS+=(--features "$NTDLL_FEATURES")
 fi
+BUILD_ARGS+=(
+  -Z build-std=core,alloc,panic_abort
+  -Z build-std-features=compiler-builtins-mem
+  -Z json-target-spec
+)
 
 echo "==> building nt-ntdll-dll (PE32+ ntdll.dll) for $TARGET_DIRNAME"
 
 ( cd "$DLL_CRATE" && \
   RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Clink-arg=--no-gc-sections" \
-    cargo +nightly build \
-      --release \
-      --target "$TARGET_JSON" \
-      "${FEATURE_ARGS[@]}" \
-      -Z build-std=core,alloc,panic_abort \
-      -Z build-std-features=compiler-builtins-mem \
-      -Z json-target-spec )
+    cargo +nightly build "${BUILD_ARGS[@]}" )
 
 BUILT="$DLL_CRATE/target/$TARGET_DIRNAME/release/nt_ntdll_dll.dll"
 if [ ! -f "$BUILT" ]; then

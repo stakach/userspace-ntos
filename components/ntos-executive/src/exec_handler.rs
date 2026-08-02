@@ -250,7 +250,10 @@ unsafe fn publish_time_zone(
 }
 
 impl ExecNtHandler {
-    pub(crate) fn new(bootstrap_images: &nt_exe_image::OwnedHostedImageCatalog<8>) -> Self {
+    pub(crate) unsafe fn initialize_in(
+        slot: *mut ExecNtHandler,
+        hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
+    ) -> &'static mut Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
         // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
         let hive = unsafe {
@@ -409,148 +412,148 @@ impl ExecNtHandler {
         for &pid in &bootstrap_pids {
             pm.reserve_handles(pid, PM_HANDLE_RESERVE);
         }
-        let mut handler = ExecNtHandler {
-            hive,
-            security_hive,
-            sam_hive,
-            software_hive,
-            hive_mounts,
-            hive_mounts_dirty: false,
-            time_zone_information,
-            obj_ns: {
-                let mut v = alloc::vec::Vec::with_capacity(192);
-                v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
-                                                  // The standard top-level directories the object manager pre-creates. SmpInit opens
-                                                  // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
-                                                  // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
-                                                  // Names are stored folded (lowercase), matching obj lookups.
-                for d in [
-                    b"??".as_slice(),
-                    b"device",
-                    b"global??",
-                    b"knowndlls",
-                    b"basenamedobjects",
-                    b"sessions",
-                    b"dosdevices",
-                    b"windows",
-                    b"objecttypes",
-                    b"driver",
-                    b"filesystem",
-                    b"security",
-                ] {
-                    v.push(ObjEntry::dir(d, 0));
-                }
-                let windows = v
-                    .iter()
-                    .position(|entry| entry.parent == 0 && entry.name() == b"windows")
-                    .expect("pre-created Windows object directory");
-                v.push(ObjEntry::dir(b"windowstations", windows as u8));
-                v
+        core::ptr::write(
+            slot,
+            ExecNtHandler {
+                hive,
+                security_hive,
+                sam_hive,
+                software_hive,
+                hive_mounts,
+                hive_mounts_dirty: false,
+                time_zone_information,
+                obj_ns: {
+                    let mut v = alloc::vec::Vec::with_capacity(192);
+                    v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
+                                                      // The standard top-level directories the object manager pre-creates. SmpInit opens
+                                                      // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
+                                                      // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
+                                                      // Names are stored folded (lowercase), matching obj lookups.
+                    for d in [
+                        b"??".as_slice(),
+                        b"device",
+                        b"global??",
+                        b"knowndlls",
+                        b"basenamedobjects",
+                        b"sessions",
+                        b"dosdevices",
+                        b"windows",
+                        b"objecttypes",
+                        b"driver",
+                        b"filesystem",
+                        b"security",
+                    ] {
+                        v.push(ObjEntry::dir(d, 0));
+                    }
+                    let windows = v
+                        .iter()
+                        .position(|entry| entry.parent == 0 && entry.name() == b"windows")
+                        .expect("pre-created Windows object directory");
+                    v.push(ObjEntry::dir(b"windowstations", windows as u8));
+                    v
+                },
+                events: nt_kernel_exec::EventStore::with_capacity(192),
+                semaphores: nt_kernel_exec::SemaphoreStore::with_capacity(192),
+                mutants: nt_kernel_exec::MutantStore::with_capacity(192),
+                global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
+                    GLOBAL_ATOM_CAPACITY,
+                )
+                .unwrap(),
+                io_completion_ports: nt_io_completion::CompletionPortTable::new(),
+                file_completion: nt_io_completion::FileCompletionTable::new(),
+                directory_opens: ExecDirectoryOpens::reset(),
+                pi: 0,
+                current_tid: 0,
+                current_badge: 0,
+                post_action: ExecPostAction::None,
+                stop: false,
+                next_handle: FAKE_HANDLE,
+                out_writes: [(0, 0); 8],
+                out_writes_n: 0,
+                loop_ctx: None,
+                exe_spawn_request: None,
+                thread_spawn_request: None,
+                remote_thread_request: None,
+                wait_park_event: -1,
+                wait_deadline_100ns: u64::MAX,
+                keyed_wait_key: u64::MAX,
+                keyed_wait_deadline_100ns: u64::MAX,
+                delay_requested: false,
+                delay_interval_100ns: 0,
+                delay_alertable: false,
+                io_completion_park_port: -1,
+                io_completion_key_out: 0,
+                io_completion_apc_out: 0,
+                io_completion_iosb_out: 0,
+                io_completion_deadline_100ns: u64::MAX,
+                io_completion_wake: None,
+                io_signal_event: -1,
+                pipe_park_fid: 0,
+                pipe_park_buffer_va: 0,
+                pipe_park_buffer_len: 0,
+                pipe_park_iosb_va: 0,
+                pipe_park_apc_context: 0,
+                pipe_park_event_obj_idx: u64::MAX,
+                pipe_park_transceive: false,
+                pipe_park_is_write: false,
+                dbgk_block_request: false,
+                pipe_write_redrive: false,
+                pipe_listen_fid: 0,
+                pipe_listen_event_handle: 0,
+                pipe_listen_iosb_va: 0,
+                pipe_connect_redrive: 0,
+                anon_event_seq: 0,
+                lpc_rendezvous_conn: 0,
+                lpc_rendezvous_out: 0,
+                sm_request_port: 0,
+                sm_request_message: 0,
+                sm_reply_message: 0,
+                csr_request_port: 0,
+                csr_request_message: 0,
+                csr_reply_message: 0,
+                csr_start_request: 0,
+                csr_rendezvous_conn: 0,
+                csr_rendezvous_out: 0,
+                // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
+                // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
+                lpc_connections: alloc::vec::Vec::with_capacity(16),
+                winlogon_csr_view: 0,
+                csr_view_mask: 0,
+                // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
+                // subsystem handshake; post-winlogon children are created by the live
+                // `NtCreateProcess[Ex]` path that ReactOS drives. Mechanism tables below are the
+                // authoritative hosted identity map.
+                pm,
+                process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
+                hosted_images,
+                process_vspaces: [0; MAX_PI],
+                temporary_process_slots: [0; MAX_PI],
+                thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
+                pool_used: [0; MAX_PI],
+                pool_suspended: [0; MAX_PI],
+                thread_runtime: HostedThreadRuntimes::reset(),
+                token_store: nt_security::TokenStore::with_capacity(64),
+                token_dirty: false,
+                process_dirty: false,
+                // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
+                // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
+                // runtime and is retained past the per-syscall bump reset because the loop pins the heap
+                // high-water mark past each mutation (see `overlay_dirty`). 64 keys is ample for the
+                // SCM's volatile-key creation (the boot creates only a handful).
+                overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
+                overlay_dirty: false,
+                dll_loaded_dirty: false,
+                writable_fs_dirty: false,
             },
-            events: nt_kernel_exec::EventStore::with_capacity(192),
-            semaphores: nt_kernel_exec::SemaphoreStore::with_capacity(192),
-            mutants: nt_kernel_exec::MutantStore::with_capacity(192),
-            global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
-                GLOBAL_ATOM_CAPACITY,
-            )
-            .unwrap(),
-            io_completion_ports: nt_io_completion::CompletionPortTable::new(),
-            file_completion: nt_io_completion::FileCompletionTable::new(),
-            directory_opens: ExecDirectoryOpens::reset(),
-            pi: 0,
-            current_tid: 0,
-            current_badge: 0,
-            post_action: ExecPostAction::None,
-            stop: false,
-            next_handle: FAKE_HANDLE,
-            out_writes: [(0, 0); 8],
-            out_writes_n: 0,
-            loop_ctx: None,
-            exe_spawn_request: None,
-            thread_spawn_request: None,
-            remote_thread_request: None,
-            wait_park_event: -1,
-            wait_deadline_100ns: u64::MAX,
-            keyed_wait_key: u64::MAX,
-            keyed_wait_deadline_100ns: u64::MAX,
-            delay_requested: false,
-            delay_interval_100ns: 0,
-            delay_alertable: false,
-            io_completion_park_port: -1,
-            io_completion_key_out: 0,
-            io_completion_apc_out: 0,
-            io_completion_iosb_out: 0,
-            io_completion_deadline_100ns: u64::MAX,
-            io_completion_wake: None,
-            io_signal_event: -1,
-            pipe_park_fid: 0,
-            pipe_park_buffer_va: 0,
-            pipe_park_buffer_len: 0,
-            pipe_park_iosb_va: 0,
-            pipe_park_apc_context: 0,
-            pipe_park_event_obj_idx: u64::MAX,
-            pipe_park_transceive: false,
-            pipe_park_is_write: false,
-            dbgk_block_request: false,
-            pipe_write_redrive: false,
-            pipe_listen_fid: 0,
-            pipe_listen_event_handle: 0,
-            pipe_listen_iosb_va: 0,
-            pipe_connect_redrive: 0,
-            anon_event_seq: 0,
-            lpc_rendezvous_conn: 0,
-            lpc_rendezvous_out: 0,
-            sm_request_port: 0,
-            sm_request_message: 0,
-            sm_reply_message: 0,
-            csr_request_port: 0,
-            csr_request_message: 0,
-            csr_reply_message: 0,
-            csr_start_request: 0,
-            csr_rendezvous_conn: 0,
-            csr_rendezvous_out: 0,
-            // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
-            // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
-            lpc_connections: alloc::vec::Vec::with_capacity(16),
-            winlogon_csr_view: 0,
-            csr_view_mask: 0,
-            // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
-            // subsystem handshake; post-winlogon children are created by the live
-            // `NtCreateProcess[Ex]` path that ReactOS drives. Mechanism tables below are the
-            // authoritative hosted identity map.
-            pm,
-            process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
-            hosted_images: nt_exe_image::OwnedHostedImageCatalog::new(),
-            process_vspaces: [0; MAX_PI],
-            temporary_process_slots: [0; MAX_PI],
-            thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
-            pool_used: [0; MAX_PI],
-            pool_suspended: [0; MAX_PI],
-            thread_runtime: HostedThreadRuntimes::reset(),
-            token_store: nt_security::TokenStore::with_capacity(64),
-            token_dirty: false,
-            process_dirty: false,
-            // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
-            // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
-            // runtime and is retained past the per-syscall bump reset because the loop pins the heap
-            // high-water mark past each mutation (see `overlay_dirty`). 64 keys is ample for the
-            // SCM's volatile-key creation (the boot creates only a handful).
-            overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
-            overlay_dirty: false,
-            dll_loaded_dirty: false,
-            writable_fs_dirty: false,
-        };
+        );
+        let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
-                if let Some(image) = bootstrap_images.get_by_pi(pi) {
-                    let _ = handler.register_hosted_process_metadata(image);
-                    let _ = handler.register_hosted_process_identity(
-                        pi,
-                        pid,
-                        main_tid,
-                        image.top_badge,
-                    );
+                if let Some(image) = handler.hosted_process_image(pi) {
+                    let top_badge = image.top_badge;
+                    let _ = handler.publish_registered_hosted_process_metadata(image);
+                    let _ = handler.register_hosted_process_identity(pi, pid, main_tid, top_badge);
                 }
                 for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                     let tid = bootstrap_pool_tids[pi][slot];
@@ -2011,7 +2014,10 @@ impl ExecNtHandler {
         &self,
         pi: usize,
     ) -> Option<nt_exe_image::HostedProcessImageRef<'_>> {
-        self.hosted_images.get_by_pi(pi)
+        // SAFETY: `service_sec_image` constructs the handler after the loop-owned catalog and drops
+        // it before the catalog. Catalog mutations are confined to the service loop/bootstrap path;
+        // handler lookups only publish or consume already-registered metadata.
+        unsafe { (&*self.hosted_images).get_by_pi(pi) }
     }
 
     pub(crate) fn hosted_process_leaf(&self, pi: usize) -> Option<&[u8]> {
@@ -2026,27 +2032,15 @@ impl ExecNtHandler {
         self.hosted_process_image(pi).map(|image| image.top_badge)
     }
 
-    fn register_hosted_process_metadata(
-        &mut self,
+    fn publish_registered_hosted_process_metadata(
+        &self,
         image: nt_exe_image::HostedProcessImageRef<'_>,
     ) -> Result<(), u32> {
-        if let Some(existing) = self.hosted_images.get_by_pi(image.pi) {
-            return if existing == image {
-                publish_hosted_gate_image(existing);
-                Ok(())
-            } else {
-                Err(nt_process::STATUS_INVALID_PARAMETER)
-            };
+        if self.hosted_process_image(image.pi) != Some(image) {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        let registered = self
-            .hosted_images
-            .register_ref(image)
-            .map(|_| ())
-            .map_err(|_| nt_process::STATUS_INVALID_PARAMETER);
-        if registered.is_ok() {
-            publish_hosted_gate_image(image);
-        }
-        registered
+        publish_hosted_gate_image(image);
+        Ok(())
     }
 
     fn register_hosted_main_thread_identity(
@@ -2271,10 +2265,10 @@ impl ExecNtHandler {
         let parent = self
             .pm_pid_for_pi(creator_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.publish_registered_hosted_process_metadata(image)?;
         let pid = self.pm.create_process(name, Some(parent), None);
         self.process_vspaces[child_pi] = 0;
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
-        self.register_hosted_process_metadata(image)?;
         self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             if let Ok(tid) = self.pm.create_thread(pid, 0, 0, false) {
@@ -8577,6 +8571,18 @@ impl NativeSyscallHandler for ExecNtHandler {
         status
     }
 }
+
+impl NativeSyscallHandler for &mut ExecNtHandler {
+    fn handle(
+        &mut self,
+        ctx: &NativeCallContext,
+        args: &[u64],
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> u32 {
+        <ExecNtHandler as NativeSyscallHandler>::handle(&mut **self, ctx, args, out)
+    }
+}
+
 impl ExecNtHandler {
     fn handle_service(
         &mut self,

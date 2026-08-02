@@ -149,7 +149,11 @@ if [ "$GRAPHICS" = 1 ]; then
   say "      Serial log streams here; close the QEMU window to quit."
   # In graphics mode run_specs drops isa-debug-exit, so QEMU stays alive with the
   # painted desktop until the user closes the window (exit status is the window's).
-  ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" )
+  if [ "${#PASSTHRU[@]}" -gt 0 ]; then
+    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" )
+  else
+    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh )
+  fi
   exit 0
 fi
 
@@ -159,7 +163,11 @@ say "      Tip: ./run.sh --desktop to SEE the painted ReactOS desktop in a windo
 # run_specs execs QEMU; the kernel signals the result through isa-debug-exit:
 #   host exit 3 = kernel qemu_exit(0) = PASS ((0<<1|1)<<1|1),  255 = panic.
 set +e
-( cd "$RM" && ./scripts/run_specs.sh "${PASSTHRU[@]}" )
+if [ "${#PASSTHRU[@]}" -gt 0 ]; then
+  ( cd "$RM" && ./scripts/run_specs.sh "${PASSTHRU[@]}" )
+else
+  ( cd "$RM" && ./scripts/run_specs.sh )
+fi
 rc=$?
 set -e
 echo

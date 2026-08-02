@@ -403,3 +403,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   observation, hard-error diagnostics, and the LSASS post-LSA-signal crash park. Review adjustment:
   remaining `pi == 2` checks are mostly measured winlogon-only diagnostics or address probes and
   need a separate semantic pass before conversion.
+- A2 repair. `ExecNtHandler` no longer owns a duplicate hosted-image catalog. It now reads the
+  loop-owned runtime catalog and only publishes metadata that is already registered there, keeping
+  process identity, image open, and hosted spawn on one dynamic authority. Review adjustment: this
+  keeps the catalog lifetime in raw loop state for now; a later object-store/session-manifest pass
+  should make that lifetime typed.
+- A2 repair. `ExecNtHandler` construction now writes into a serialized BSS work slot instead of
+  returning the large handler by value through the bounded rootserver stack. This preserves the
+  dynamic metadata cleanup while removing the early SEC_IMAGE-demo stack fault. Review adjustment:
+  this is still a rootserver-local singleton; a future typed executive object store should own it.
+- A2 repair. Hosted thread-runtime lookup now treats badge 0 as a valid SMSS top-level badge rather
+  than as "no badge"; live entries are already distinguished by TID. This keeps the dynamic
+  badge-to-thread route valid for every hosted native process, including SMSS.
+- A2 repair. Main-thread runtime publication now uses a dynamic per-process-index bit range instead
+  of the old listener-only proof table. Later hosted images such as `userinit.exe` and
+  `explorer.exe` can prove that their seL4 TCB-backed main ETHREAD is live without adding another
+  kernel-side image-name branch. Review adjustment: listener-role gates are still role-specific
+  because their startup paths are thread-service contracts, not hosted-image identities.

@@ -2159,7 +2159,9 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let mut nt_handler = ExecNtHandler::new(&exe_image_catalog);
+    let mut nt_handler = reset_exec_nt_handler(
+        &exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<8>,
+    );
     nt_handler.register_main_thread_tcb(0, main_tcb);
     let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
     if ntdll.is_some() {
