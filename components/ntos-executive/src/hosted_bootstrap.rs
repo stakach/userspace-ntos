@@ -43,6 +43,8 @@ pub(crate) struct HostedBootstrapLoadSpec {
     pub(crate) runtime: HostedProcessRuntime,
 }
 
+pub(crate) const HOSTED_BOOTSTRAP_LOAD_COUNT: usize = 6;
+
 fn hosted_bootstrap_load_spec(
     disk_path: &'static [u8],
     stem: &'static [u8],
@@ -83,7 +85,7 @@ fn csrss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn csrss_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn csrss_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         b"reactos\\system32\\csrss.exe",
         b"csrss.exe",
@@ -105,7 +107,7 @@ fn winlogon_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn winlogon_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn winlogon_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         b"reactos\\system32\\winlogon.exe",
         b"winlogon.exe",
@@ -127,7 +129,7 @@ fn services_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn services_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn services_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         b"reactos\\system32\\services.exe",
         b"services.exe",
@@ -149,7 +151,7 @@ fn lsass_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn lsass_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn lsass_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         b"reactos\\system32\\lsass.exe",
         b"lsass.exe",
@@ -171,7 +173,7 @@ fn userinit_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn userinit_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn userinit_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         br"reactos\system32\userinit.exe",
         b"userinit.exe",
@@ -193,13 +195,25 @@ fn explorer_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     )
 }
 
-pub(crate) fn explorer_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
+fn explorer_bootstrap_load_spec() -> HostedBootstrapLoadSpec {
     hosted_bootstrap_load_spec(
         br"reactos\explorer.exe",
         b"explorer.exe",
         explorer_bootstrap_image(),
         explorer_process_runtime(),
     )
+}
+
+pub(crate) fn hosted_bootstrap_load_specs() -> [HostedBootstrapLoadSpec; HOSTED_BOOTSTRAP_LOAD_COUNT]
+{
+    [
+        csrss_bootstrap_load_spec(),
+        winlogon_bootstrap_load_spec(),
+        services_bootstrap_load_spec(),
+        lsass_bootstrap_load_spec(),
+        userinit_bootstrap_load_spec(),
+        explorer_bootstrap_load_spec(),
+    ]
 }
 
 pub(crate) fn register_loaded_hosted_image(

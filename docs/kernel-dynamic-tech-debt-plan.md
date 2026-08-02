@@ -380,3 +380,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   reaching into the `csrss_pe` loop local directly. Review adjustment: rendezvous itself still
   correctly receives an explicit CSRSS PE parameter because it operates in CSRSS's address space; the
   remaining static topology there is the fixed SMSS/CSRSS rendezvous relationship, not PE ownership.
+- A2 cleanup. The SEC_IMAGE service loop now consumes child hosted EXEs from
+  `hosted_bootstrap_load_specs()` as a manifest array, with loaded PEs and pool VAs stored in indexed
+  loop-owned arrays before publication into `HostedLoadedImageTable`. The six child load-spec
+  constructors are private implementation details of `hosted_bootstrap.rs`, so service-loop loading
+  no longer names each bootstrap child as a separate local. Review adjustment: the manifest itself is
+  still compiled into the executive until the loader/session manager can hand off bootstrap image
+  policy.

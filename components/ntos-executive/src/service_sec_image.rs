@@ -1993,71 +1993,34 @@ pub(crate) unsafe fn service_sec_image(
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
     let mut nls_section_handle = 0u64;
-    // Only the LIVE smss run (ntdll present) launches csrss/winlogon; the earlier demo SEC_IMAGE call
-    // has no FS/pool, so skip the read there. The two hosted-process EXEs csrss.exe + winlogon.exe
-    // (like services.exe/lsass.exe below) are sourced BY PATH from the real \reactos FS into the
-    // demand-load pool — NO fixed buffer. Each is relocated to its load base (PE_LOAD_BASE) + its
-    // OptionalHeader.ImageBase patched to match — so ntdll doesn't try to RELOCATE THE EXE
-    // (ldrinit.c:2409, the EXE-reloc path, is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT).
-    // The relocation runs on the pool `*_va`; the demand-fault router reads the relocated bytes via the
-    // PeFile slice.
-    let csrss_spec = csrss_bootstrap_load_spec();
-    let csrss_pi = csrss_spec.image.pi;
-    let (csrss_pe, csrss_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), csrss_spec);
-    // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
-    let winlogon_spec = winlogon_bootstrap_load_spec();
-    let (winlogon_pe, winlogon_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), winlogon_spec);
-    // services.exe — the 4th hosted process, spawned by winlogon's Win32 CreateProcessW
-    // (StartServicesManager). Sourced BY PATH from the FS pool (P7-A — no fixed buffer needed); on
-    // the demo run (ntdll=None) it stays None (services only spawns on the live run). Same EXE-reloc
-    // + ImageBase patch as csrss/winlogon so ntdll doesn't hit the unimplemented EXE-reloc path.
-    let services_spec = services_bootstrap_load_spec();
-    let (services_pe, services_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), services_spec);
-    // lsass.exe — the 5th hosted process, spawned by winlogon's StartLsass Win32 CreateProcessW.
-    // Sourced BY PATH from the FS pool. Same EXE-reloc + ImageBase patch as services.
-    let lsass_spec = lsass_bootstrap_load_spec();
-    let (lsass_pe, lsass_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), lsass_spec);
-    // userinit.exe — the first post-login image. It enters the generic Win32-child image table now;
-    // the effectful pi=5 spawn remains deliberately separate so image semantics can be gated first.
-    let userinit_spec = userinit_bootstrap_load_spec();
-    let (userinit_pe, userinit_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), userinit_spec);
-    // explorer.exe — userinit's StartShell target. It lives at the ReactOS root (`C:\ReactOS` /
-    // hosted `C:\Windows`), not under System32, so source it by its real volume path.
-    let explorer_spec = explorer_bootstrap_load_spec();
-    let (explorer_pe, explorer_va) =
-        load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), explorer_spec);
+    // Only the LIVE smss run (ntdll present) launches hosted child EXEs; the earlier demo SEC_IMAGE
+    // call has no FS/pool, so skip the reads there. The bootstrap manifest supplies disk paths,
+    // image identity, and runtime layout; each loaded PE is relocated to PE_LOAD_BASE and published
+    // into the loaded-image registry below.
+    let bootstrap_load_specs = hosted_bootstrap_load_specs();
+    let csrss_pi = bootstrap_load_specs
+        .iter()
+        .find(|spec| spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem)
+        .map(|spec| spec.image.pi)
+        .expect("bootstrap manifest must include CSRSS");
+    let mut hosted_bootstrap_pes: [Option<nt_pe_loader::PeFile<'static>>;
+        HOSTED_BOOTSTRAP_LOAD_COUNT] = core::array::from_fn(|_| None);
+    let mut hosted_bootstrap_pool_vas = [0u64; HOSTED_BOOTSTRAP_LOAD_COUNT];
+    for (index, spec) in bootstrap_load_specs.iter().copied().enumerate() {
+        let (loaded_pe, pool_va) =
+            load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), spec);
+        hosted_bootstrap_pes[index] = loaded_pe;
+        hosted_bootstrap_pool_vas[index] = pool_va;
+    }
     let mut hosted_loaded_images = HostedLoadedImageTable::new();
-    register_loaded_hosted_bootstrap_pe(&mut hosted_loaded_images, csrss_spec, &csrss_pe, csrss_va);
-    register_loaded_hosted_bootstrap_pe(
-        &mut hosted_loaded_images,
-        winlogon_spec,
-        &winlogon_pe,
-        winlogon_va,
-    );
-    register_loaded_hosted_bootstrap_pe(
-        &mut hosted_loaded_images,
-        services_spec,
-        &services_pe,
-        services_va,
-    );
-    register_loaded_hosted_bootstrap_pe(&mut hosted_loaded_images, lsass_spec, &lsass_pe, lsass_va);
-    register_loaded_hosted_bootstrap_pe(
-        &mut hosted_loaded_images,
-        userinit_spec,
-        &userinit_pe,
-        userinit_va,
-    );
-    register_loaded_hosted_bootstrap_pe(
-        &mut hosted_loaded_images,
-        explorer_spec,
-        &explorer_pe,
-        explorer_va,
-    );
+    for (index, spec) in bootstrap_load_specs.iter().copied().enumerate() {
+        register_loaded_hosted_bootstrap_pe(
+            &mut hosted_loaded_images,
+            spec,
+            &hosted_bootstrap_pes[index],
+            hosted_bootstrap_pool_vas[index],
+        );
+    }
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
     // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
