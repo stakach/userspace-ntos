@@ -2097,6 +2097,10 @@ pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ATOM: AtomicU64 = AtomicU64::new(
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_STYLE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_EXTRA: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_PROC: AtomicU64 = AtomicU64::new(0);
+/// Real ScrollBar class metadata observed from win32k. Non-interactive services can pair this
+/// session-global class identity with their own client-side ScrollBar proc without minting atoms.
+pub(crate) static GLOBAL_SCROLLBAR_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GLOBAL_SCROLLBAR_CLASS_CURSOR: AtomicU64 = AtomicU64::new(0);
 /// Non-interactive services initialize user32 enough to expose their real client-side built-in
 /// window procs. Capture those PFNs and reuse them for service `NtUserGetClassInfo`, rather than
 /// reporting the system class as absent.
@@ -10251,22 +10255,9 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 /// lsarpc RPC, and winlogon advances into its post-GinaInit logon flow (InitializeSAS → the SAS
 /// window → the desktop-switch paint). Scoped to winlogon's SYNTH_WINLOGON_KEY / DefaultPassword ONLY.
 pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
-/// Count of faked non-interactive-service user32-init class/cursor calls
-/// (NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4). A NON-interactive
-/// service's user32 DllMain still runs RegisterSystemClasses, but win32k's shared system cursors
-/// (gasyscur) are NEVER loaded for it (only winlogon's INTERACTIVE SwitchDesktop → co_IntLoadDefaultCursors
-/// loads them) → NtUserFindExistingCursorIcon returns NULL forever → user32's per-class LoadCursor
-/// fallback + RegisterClassExWOW never satisfy their "have a system cursor" precondition → the loop
-/// never advances → the service never finishes process-attach → lsass never reaches LsaInitializeRpcServer
-/// → never SetEvent(lsa_rpc_server_active) → winlogon's WaitForLsass parks forever (the deadlock).
-/// FIX: for hosted non-interactive service images — NOT winlogon, whose real GUI path is untouched —
-/// SATISFY the loop's precondition without dragging in the interactive-winsta cursor fork: return a
-/// non-NULL HCURSOR from 0x103d and a fresh class atom from 0x10b4, so user32's RegisterSystemClasses
-/// completes and the service advances to its real (LSA/SCM) init. Mirrors the winlogon 0x125c
-/// keyboard-layout fake.
+/// Count of remaining non-interactive-service win32k shortcuts. Cursor/class paths should reuse
+/// real metadata observed from winlogon; remaining increments represent still-open GDI/init debt.
 pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the service-image 0x10b4 fake.
-pub(crate) static SVC_FAKE_CLASS_ATOM: AtomicU64 = AtomicU64::new(0xC100);
 /// Monotonic fake GDI-handle allocator for non-interactive-service GDI object creation
 /// (`NtGdiCreateBitmap` 0x106c / `NtGdiCreatePatternBrushInternal` 0x10b5). Service
 /// `NtGdiGetStockObject` (0x10d4) reuses real stock handles observed from win32k instead of this

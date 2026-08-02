@@ -72,7 +72,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### F. User32, GDI, And Paint Path Completion
 
-- `[ ]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
+- `[~]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
   object ownership.
 - `[ ]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
@@ -505,3 +505,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   green. Remaining C3/F1 debt is the older noninteractive service GDI/user shims and global
   cursor/class reuse machinery, which should be replaced by real provider/object ownership rather
   than broadened.
+- C3/F1 cleanup. Removed the service `NtUserFindExistingCursorIcon` fake HCURSOR path and the
+  old monotonic service class-atom allocator. Non-interactive services now reuse only exact cursor
+  identities and built-in class atoms that were observed from the real interactive win32k path, and
+  service ScrollBar classinfo is assembled from the real session ScrollBar atom/cursor plus the
+  service's own captured client PFN arrays. Cursor/class mirror misses return NULL/FALSE and are
+  logged instead of counting as successful fallbacks. Validation:
+  `.tmp/full-boot-service-class-mirror-fix-20260803-090312.log` reached `RUN_RC=0`, `276/276`
+  checks passed, `PASS exec_services_scrollbar_classinfo_mirrored`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_logon_dialog_painted`, and the explorer
+  message/callback/WndProc/COM gates remained green. Review adjustment: F1 remains open because
+  service GDI/init shortcuts (`NtGdiInit`, `NtGdiOpenDCW`, bitmap/pattern-brush creation) still use
+  noninteractive service shortcuts; the next cleanup should move those toward provider/object-owned
+  state instead of expanding the shortcut surface.

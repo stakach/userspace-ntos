@@ -534,10 +534,7 @@ mod tests {
         raw[0..8].copy_from_slice(&0x8012_3456u64.to_le_bytes());
         raw[6 * 8..7 * 8].copy_from_slice(&0x8077_1122u64.to_le_bytes());
 
-        assert_eq!(
-            pfn_client_proc(&raw, FNID_SCROLLBAR),
-            Some(0x8012_3456)
-        );
+        assert_eq!(pfn_client_proc(&raw, FNID_SCROLLBAR), Some(0x8012_3456));
         assert_eq!(pfn_client_proc(&raw, FNID_FIRST + 6), Some(0x8077_1122));
         assert_eq!(pfn_client_proc(&raw[..7], FNID_SCROLLBAR), None);
         assert_eq!(pfn_client_proc(&raw, FNID_FIRST - 1), None);
@@ -570,8 +567,7 @@ mod tests {
         initial[0..4].copy_from_slice(&(WNDCLASSEXW_SIZE as u32).to_le_bytes());
         initial[0x40..0x48].copy_from_slice(&0x1234_5678u64.to_le_bytes());
 
-        let payload =
-            scrollbar_class_info(&initial, 0xc004, 0x8020_1000, 0x0001_0005).unwrap();
+        let payload = scrollbar_class_info(&initial, 0xc004, 0x8020_1000, 0x0002_0044).unwrap();
         let wnd = payload.wnd_class();
 
         assert_eq!(payload.atom(), 0xc004);
@@ -590,12 +586,9 @@ mod tests {
         );
         assert_eq!(
             u64::from_le_bytes(wnd[0x28..0x30].try_into().unwrap()),
-            0x0001_0005
+            0x0002_0044
         );
-        assert_eq!(
-            u64::from_le_bytes(wnd[0x38..0x40].try_into().unwrap()),
-            0
-        );
+        assert_eq!(u64::from_le_bytes(wnd[0x38..0x40].try_into().unwrap()), 0);
         assert_eq!(
             u64::from_le_bytes(wnd[0x40..0x48].try_into().unwrap()),
             0x1234_5678

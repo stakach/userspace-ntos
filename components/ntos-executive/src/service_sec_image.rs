@@ -1397,10 +1397,18 @@ unsafe fn copy_back_get_class_info(
             scratch_base,
         );
     let copyout_ok = wnd_ok && menu_ok;
+    if capture.scrollbar && atom != 0 {
+        let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
+        GLOBAL_SCROLLBAR_CLASS_ATOM.store(atom, Ordering::Relaxed);
+        if hcursor != 0 {
+            GLOBAL_SCROLLBAR_CLASS_CURSOR.store(hcursor, Ordering::Relaxed);
+        }
+    }
     if pi == 5 && capture.scrollbar {
         let style = core::ptr::read_unaligned((capture.wnd_out + 0x04) as *const u32);
         let proc = core::ptr::read_unaligned((capture.wnd_out + 0x08) as *const u64);
         let cb_wnd_extra = core::ptr::read_unaligned((capture.wnd_out + 0x14) as *const u32);
+        let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
         USERINIT_SCROLLBAR_CLASSINFO_ATOM.store(atom, Ordering::Relaxed);
         USERINIT_SCROLLBAR_CLASSINFO_STYLE.store(style as u64, Ordering::Relaxed);
         USERINIT_SCROLLBAR_CLASSINFO_EXTRA.store(cb_wnd_extra as u64, Ordering::Relaxed);
@@ -1420,9 +1428,22 @@ unsafe fn copy_back_get_class_info(
         print_hex(cb_wnd_extra);
         print_str(b" proc=");
         print_u64((proc != 0) as u64);
+        print_str(b" hcursor=0x");
+        print_hex_u64(hcursor);
         print_str(b"\n");
     }
     copyout_ok
+}
+
+fn remember_global_scrollbar_cursor(handle: u32) {
+    if handle != 0 {
+        let _ = GLOBAL_SCROLLBAR_CLASS_CURSOR.compare_exchange(
+            0,
+            handle as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 unsafe fn capture_service_client_pfn_arrays(
@@ -1506,19 +1527,23 @@ unsafe fn copy_service_scrollbar_class_info(
     }
     let mut atom = SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u16;
     if atom == 0 {
-        let fresh = (SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
-        if fresh == 0 {
+        let observed = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
+        if observed == 0 {
             return None;
         }
         atom = match SVC_SCROLLBAR_CLASS_ATOM[pi].compare_exchange(
             0,
-            fresh as u64,
+            observed as u64,
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => fresh,
+            Ok(_) => observed,
             Err(existing) => existing as u16,
         };
+    }
+    let hcursor = GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed);
+    if hcursor == 0 {
+        return None;
     }
     let mut initial = [0u8; WNDCLASSEXW_SIZE];
     core::ptr::copy_nonoverlapping(
@@ -1526,7 +1551,7 @@ unsafe fn copy_service_scrollbar_class_info(
         initial.as_mut_ptr(),
         initial.len(),
     );
-    let payload = scrollbar_class_info(&initial, atom, proc, 0x0001_0005)?;
+    let payload = scrollbar_class_info(&initial, atom, proc, hcursor)?;
     core::ptr::copy_nonoverlapping(
         payload.wnd_class().as_ptr(),
         capture.wnd_out as *mut u8,
@@ -7699,24 +7724,17 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake.
-                // A service's user32 DllMain runs RegisterSystemClasses, but win32k's shared system
-                // cursors (gasyscur) are ONLY loaded by winlogon's INTERACTIVE SwitchDesktop ->
-                // co_IntLoadDefaultCursors -> NtUserSetSystemCursor. A service on a non-interactive
-                // (WSS_NOIO) winstation never triggers that, so NtUserFindExistingCursorIcon (0x103d)
-                // returns NULL forever and NtUserRegisterClassExWOW (0x10b4) can't satisfy its cursor
-                // precondition -> the per-class registration loop never advances -> the service never
-                // finishes process-attach -> lsass never reaches LsaInitializeRpcServer ->
-                // never SetEvent(lsa_rpc_server_active) -> winlogon's WaitForLsass deadlocks. Since a
-                // service is non-interactive and never creates a real window, SATISFY the loop's
-                // preconditions here (do NOT route to win32k, which drags in the interactive-winsta
-                // cursor fork winlogon owns): 0x103d -> a non-NULL synthetic HCURSOR so user32's
-                // LoadCursor short-circuits; 0x10b4 -> a fresh RTL_ATOM (0xC1xx) so the class registers.
-                // The gate is driven by the live EPROCESS image role, not the launch slot: services.exe
-                // and lsass.exe are both non-interactive service hosts on a WSS_NOIO window station, and
-                // neither creates a real window nor does GDI drawing. They must take the light
-                // non-interactive user32-init path instead of tripping win32k's interactive
-                // cursor/class/stock-object EngCopyBits runaway blit (RVA 0x1cbdd8).
+                // Non-interactive services run user32 RegisterSystemClasses during GUI-DLL
+                // process attach, but they do not own the interactive window station path that loads
+                // and registers system cursors. Route only the real interactive win32k state that is
+                // safe to share across the session: exact promoted cursor identities, exact built-in
+                // class registrations, and captured per-process client PFNs. A miss remains a visible
+                // NULL/FALSE result instead of minting an atom or handle.
+                //
+                // The gate is driven by the live EPROCESS image role, not the launch slot:
+                // services.exe and lsass.exe are non-interactive service hosts on a WSS_NOIO window
+                // station, and neither should enter win32k's interactive cursor/class/stock-object
+                // EngCopyBits path while initializing service DLLs.
                 let svc_noninteractive =
                     hosted_process_is_noninteractive_service_gui_client(&nt_handler, pi);
                 let mut class_atom_name_pre_served = false;
@@ -7766,6 +7784,7 @@ pub(crate) unsafe fn service_sec_image(
                         .as_ref()
                         .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
                     if let Some(handle) = hit {
+                        remember_global_scrollbar_cursor(handle);
                         if pi == 5 {
                             USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
                             USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
@@ -7854,19 +7873,62 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     (0, true)
                 } else if m0 == 0x103d && svc_noninteractive {
-                    // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    (0x0001_0005, true)
-                } else if m0 == 0x10b4 && svc_noninteractive {
-                    // NtUserRegisterClassExWOW -> a fresh class atom so RegisterSystemClasses advances.
-                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
-                    if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
-                        && pi < MAX_PI
-                    {
-                        SVC_SCROLLBAR_CLASS_ATOM[pi].store(atom & 0xFFFF, Ordering::Relaxed);
+                    // Reuse only an exact cursor handle learned from the real interactive win32k path.
+                    let hit = cursor_identity_key
+                        .as_ref()
+                        .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
+                    if let Some(handle) = hit {
+                        remember_global_scrollbar_cursor(handle);
+                        print_str(
+                            b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) MIRROR pi=",
+                        );
+                        print_u64(pi as u64);
+                        print_str(b" -> real HCURSOR 0x");
+                        print_hex(handle);
+                        print_str(b"\n");
+                    } else {
+                        print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) MIRROR MISS pi=");
+                        print_u64(pi as u64);
+                        print_str(b" -> NULL\n");
                     }
-                    ((atom & 0xFFFF) as u64, true)
+                    (hit.unwrap_or(0) as u64, true)
+                } else if m0 == 0x10b4 && svc_noninteractive {
+                    // Non-interactive services reuse only class atoms already observed from real
+                    // win32k registration/query paths. A miss stays visible instead of minting an atom.
+                    let hit = if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
+                    {
+                        let atom = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
+                        if atom != 0 && pi < MAX_PI {
+                            SVC_SCROLLBAR_CLASS_ATOM[pi].store(atom as u64, Ordering::Relaxed);
+                            Some(atom)
+                        } else {
+                            None
+                        }
+                    } else if builtin_class_attempt {
+                        builtin_class_key
+                            .as_ref()
+                            .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key))
+                    } else {
+                        None
+                    };
+                    if let Some(atom) = hit {
+                        print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) MIRROR pi=");
+                        print_u64(pi as u64);
+                        print_str(b" fnid=0x");
+                        print_hex(register_class_fn_id);
+                        print_str(b" -> real atom 0x");
+                        print_hex(atom as u32);
+                        print_str(b"\n");
+                    } else {
+                        print_str(
+                            b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) MIRROR MISS pi=",
+                        );
+                        print_u64(pi as u64);
+                        print_str(b" fnid=0x");
+                        print_hex(register_class_fn_id);
+                        print_str(b" -> atom 0\n");
+                    }
+                    (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x125b && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays.
                     // THE win32k 0x125b TERMINUS FIX (diagnose-first, fork (b): non-interactive path).
@@ -7876,8 +7938,8 @@ pub(crate) unsafe fn service_sec_image(
                     // NtUserInitializeClientPfnArrays' trivial `RtlCopyMemory(&gpsi->apfnClient*, ...)`
                     // body, but in the cursor/icon/stock-object bitmap-init blit the SERVICE user32
                     // process-attach drags in (NtUserFindExistingCursorIcon 0x103d /
-                    // NtUserRegisterClassExWOW 0x10b4 / NtGdiCreateBitmap 0x106c → an EngCopyBits over a
-                    // SURFOBJ whose dimensions are garbage for our faked service cursor/class state → an
+                    // NtUserRegisterClassExWOW 0x10b4 / NtGdiCreateBitmap 0x106c -> an EngCopyBits over a
+                    // SURFOBJ whose dimensions are garbage for the current service GUI/GDI state -> an
                     // UNBOUNDED copy). With all its source pages zero-filled it stops faulting and just
                     // spins → the executive blocks in win32k_dispatch's recv forever (all vCPUs
                     // kernel-idle = the addendum's observation). lsass is a NON-INTERACTIVE service on a
@@ -7888,7 +7950,7 @@ pub(crate) unsafe fn service_sec_image(
                     // USER lock — `if (ClientPfnInit) return STATUS_SUCCESS`, and ClientPfnInit is ALREADY
                     // TRUE from winlogon's interactive 0x125b); the CLIENT only checks the returned
                     // NTSTATUS. So SATISFY it here with STATUS_SUCCESS WITHOUT dispatching into win32k —
-                    // exactly the same reasoning already applied+documented for 0x103d/0x10b4 above.
+                    // the same non-interactive-service boundary used by the cursor/class mirror above.
                     // Scoped to non-interactive service images so winlogon's REAL interactive 0x125b +
                     // paint path is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it
                     // moved the hang to 0x11e0 by breaking winlogon's interactive init).
@@ -8024,11 +8086,12 @@ pub(crate) unsafe fn service_sec_image(
                             (atom, true)
                         } else {
                             SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
-                            SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                             print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS scrollbar=");
                             print_u64(capture.scrollbar as u64);
                             print_str(b" atom=0x");
                             print_hex(SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u32);
+                            print_str(b" hcursor=0x");
+                            print_hex_u64(GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed));
                             print_str(b" procA=");
                             print_u64(
                                 (SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64,
@@ -8044,7 +8107,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
-                        SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                         print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS capture=0 -> FALSE\n");
                         (0, true)
                     }
