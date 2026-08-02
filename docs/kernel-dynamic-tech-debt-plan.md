@@ -342,3 +342,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   hardcoded per-`pi` mechanism layout explicit for the future allocator work. Review adjustment:
   this is a mechanical split; the runtime placement data is still fixed policy and should be replaced
   by a process-slot layout allocator after the startup image manifest exists.
+- A2 continued. The executive no longer scans `nt_exe_image::HOSTED_PROCESS_IMAGES` to seed hosted
+  executable metadata. `hosted_bootstrap.rs` now exposes explicit bootstrap image descriptors, and
+  `service_sec_image` registers each descriptor only at the point where that PE was actually loaded
+  for the current run. This removes the last executive-side dependency on the historical hosted-image
+  slice and makes missing boot images a property of the load path, not a hidden catalog filter. Review
+  adjustment: the compatibility slice and static lookup wrappers remain inside `nt-exe-image` for
+  crate tests/legacy callers; the executive path is now runtime-catalog based. Remaining A2 debt is
+  replacing the bootstrap descriptor functions with a real boot/session image manifest source.

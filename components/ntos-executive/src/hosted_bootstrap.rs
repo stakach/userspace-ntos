@@ -5,11 +5,34 @@
 //! reach back into the historical descriptor table.
 #![allow(clippy::all)]
 
-pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+fn hosted_bootstrap_image(
+    pi: usize,
+    top_badge: u64,
+    leaf: &[u8],
+    role: nt_exe_image::HostedProcessRole,
+    nt_image_path: &[u8],
+    command_line: &[u8],
+    image_root: nt_exe_image::HostedImageRoot,
+    probe_fragment: &[u8],
+) -> nt_exe_image::OwnedHostedProcessImage {
     nt_exe_image::OwnedHostedProcessImage::new(
+        pi,
+        top_badge,
+        leaf,
+        leaf,
+        role,
+        nt_image_path,
+        command_line,
+        image_root,
+        probe_fragment,
+    )
+    .expect("hosted bootstrap image descriptor is static and validated")
+}
+
+pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
         0,
         nt_exe_image::SMSS_TOP_BADGE,
-        b"smss.exe",
         b"smss.exe",
         nt_exe_image::HostedProcessRole::NativeSession,
         b"\\SystemRoot\\System32\\smss.exe",
@@ -17,35 +40,93 @@ pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
         nt_exe_image::HostedImageRoot::System32,
         b"",
     )
-    .expect("SMSS bootstrap image descriptor is static and validated")
 }
 
-pub(crate) fn seed_hosted_exe_image_catalog(
+pub(crate) fn csrss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        1,
+        nt_exe_image::CSRSS_TOP_BADGE,
+        b"csrss.exe",
+        nt_exe_image::HostedProcessRole::Win32Subsystem,
+        b"\\SystemRoot\\System32\\csrss.exe",
+        b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
+        nt_exe_image::HostedImageRoot::System32,
+        b"csrss",
+    )
+}
+
+pub(crate) fn winlogon_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        2,
+        nt_exe_image::WINLOGON_TOP_BADGE,
+        b"winlogon.exe",
+        nt_exe_image::HostedProcessRole::InteractiveLogon,
+        b"\\SystemRoot\\System32\\winlogon.exe",
+        b"winlogon.exe",
+        nt_exe_image::HostedImageRoot::System32,
+        b"winlogon",
+    )
+}
+
+pub(crate) fn services_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        3,
+        nt_exe_image::SERVICES_TOP_BADGE,
+        b"services.exe",
+        nt_exe_image::HostedProcessRole::NonInteractiveService,
+        b"\\SystemRoot\\System32\\services.exe",
+        b"services.exe",
+        nt_exe_image::HostedImageRoot::System32,
+        b"services",
+    )
+}
+
+pub(crate) fn lsass_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        4,
+        nt_exe_image::LSASS_TOP_BADGE,
+        b"lsass.exe",
+        nt_exe_image::HostedProcessRole::NonInteractiveService,
+        b"\\SystemRoot\\System32\\lsass.exe",
+        b"lsass.exe",
+        nt_exe_image::HostedImageRoot::System32,
+        b"lsass",
+    )
+}
+
+pub(crate) fn userinit_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        5,
+        nt_exe_image::USERINIT_TOP_BADGE,
+        b"userinit.exe",
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+        b"\\SystemRoot\\System32\\userinit.exe",
+        b"userinit.exe",
+        nt_exe_image::HostedImageRoot::System32,
+        b"userinit",
+    )
+}
+
+pub(crate) fn explorer_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+    hosted_bootstrap_image(
+        6,
+        nt_exe_image::EXPLORER_TOP_BADGE,
+        b"explorer.exe",
+        nt_exe_image::HostedProcessRole::InteractiveShell,
+        b"\\SystemRoot\\explorer.exe",
+        b"explorer.exe",
+        nt_exe_image::HostedImageRoot::SystemRoot,
+        b"explorer",
+    )
+}
+
+pub(crate) fn register_loaded_hosted_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
-    smss_pe: &nt_pe_loader::PeFile,
-    csrss_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    winlogon_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    services_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    lsass_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    userinit_pe: &Option<nt_pe_loader::PeFile<'static>>,
-    explorer_pe: &Option<nt_pe_loader::PeFile<'static>>,
-) {
-    let loaded = [
-        (b"smss.exe" as &[u8], !smss_pe.bytes().is_empty()),
-        (b"csrss.exe" as &[u8], csrss_pe.is_some()),
-        (b"winlogon.exe" as &[u8], winlogon_pe.is_some()),
-        (b"services.exe" as &[u8], services_pe.is_some()),
-        (b"lsass.exe" as &[u8], lsass_pe.is_some()),
-        (b"userinit.exe" as &[u8], userinit_pe.is_some()),
-        (b"explorer.exe" as &[u8], explorer_pe.is_some()),
-    ];
-    for image in nt_exe_image::HOSTED_PROCESS_IMAGES {
-        if loaded
-            .iter()
-            .any(|(leaf, present)| *present && leaf.eq_ignore_ascii_case(image.leaf))
-            && catalog.get_by_leaf(image.leaf).is_none()
-        {
-            let _ = catalog.register_ref(nt_exe_image::HostedProcessImageRef::from(image));
-        }
+    image: nt_exe_image::OwnedHostedProcessImage,
+    loaded: bool,
+) -> Result<(), nt_exe_image::HostedImageRegistrationError> {
+    if loaded {
+        catalog.register(image)?;
     }
+    Ok(())
 }
