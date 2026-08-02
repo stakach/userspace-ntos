@@ -269,11 +269,28 @@ fn hosted_top_badge_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
     nt_handler.hosted_process_top_badge(pi).unwrap_or(0)
 }
 
+fn hosted_top_badge_for_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<u64> {
+    (0..MAX_PI).find_map(|pi| {
+        (nt_handler.hosted_process_role(pi) == Some(role))
+            .then(|| nt_handler.hosted_process_top_badge(pi))
+            .flatten()
+    })
+}
+
 fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     (0..MAX_PI).find(|&pi| {
         hosted_process_runtime_for_pi(pi).is_some()
             && nt_handler.hosted_process_top_badge(pi) == Some(badge)
     })
+}
+
+fn hosted_non_native_top_level_badge(nt_handler: &ExecNtHandler, badge: u64) -> bool {
+    hosted_pi_for_top_badge(nt_handler, badge)
+        .and_then(|pi| nt_handler.hosted_process_role(pi))
+        .is_some_and(|role| role != nt_exe_image::HostedProcessRole::NativeSession)
 }
 
 fn hosted_pi_for_mechanism_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
@@ -6026,13 +6043,8 @@ pub(crate) unsafe fn service_sec_image(
                 park_caller = true;
                 result = 0;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
-                && (badge == CSRSS_BADGE
-                    || badge == WINLOGON_BADGE
+                && (hosted_non_native_top_level_badge(&nt_handler, badge)
                     || is_wl_worker
-                    || badge == SERVICES_BADGE
-                    || badge == LSASS_BADGE
-                    || badge == USERINIT_BADGE
-                    || badge == EXPLORER_BADGE
                     || (is_tp_worker && pi != 0))
             {
                 let dialog_modal_expected_ssn = if pi == 2 {
@@ -6134,7 +6146,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
                     } else {
                         wl_park_defer_quiesce =
-                            userinit_shell_frontier_pending(crash_parked, wait_parked);
+                            userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
                         print_str(if wl_park_defer_quiesce {
                             b"[wl-main] SAS queue empty at main-loop GetMessage -> parking while userinit advances to shell frontier\n"
                         } else {
@@ -6230,11 +6242,25 @@ pub(crate) unsafe fn service_sec_image(
                             // the grace is BOUNDED so a boot where nothing else can run still reaches
                             // the gate rather than blocking in the loop's recv forever.
                             const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
-                            let defer = (badge != WINLOGON_BADGE
-                                && badge != USERINIT_BADGE
+                            let winlogon_top_badge = hosted_top_badge_for_role(
+                                &nt_handler,
+                                nt_exe_image::HostedProcessRole::InteractiveLogon,
+                            )
+                            .expect("winlogon hosted metadata must be registered before GUI pump");
+                            let userinit_top_badge = hosted_top_badge_for_role(
+                                &nt_handler,
+                                nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+                            )
+                            .expect("userinit hosted metadata must be registered before GUI pump");
+                            let defer = (badge != winlogon_top_badge
+                                && badge != userinit_top_badge
                                 && n < EMPTY_QUEUE_PARK_GRACE)
-                                || (owner_top_badge_for(&nt_handler, badge) != USERINIT_BADGE
-                                    && userinit_shell_frontier_pending(crash_parked, wait_parked));
+                                || (owner_top_badge_for(&nt_handler, badge) != userinit_top_badge
+                                    && userinit_shell_frontier_pending(
+                                        &nt_handler,
+                                        crash_parked,
+                                        wait_parked,
+                                    ));
                             if n < 8 {
                                 print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
                                 print_u64(pi as u64);
@@ -7884,7 +7910,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled[pi] = *filled_pages;
                     crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
                     let userinit_shell_pending =
-                        userinit_shell_frontier_pending(crash_parked, wait_parked);
+                        userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
                     if !wl_park_defer_quiesce
                         && !userinit_shell_pending
                         && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
@@ -13472,11 +13498,23 @@ fn trace_indefinite_wait_park(
 }
 
 #[inline]
-fn userinit_shell_frontier_pending(crash_parked: u64, wait_parked: u64) -> bool {
-    let userinit_bit = 1u64 << USERINIT_BADGE;
-    USERINIT_SPAWNED.load(Ordering::Relaxed) == 1
-        && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
-        && (crash_parked | wait_parked) & userinit_bit == 0
+fn userinit_shell_frontier_pending(
+    nt_handler: &ExecNtHandler,
+    crash_parked: u64,
+    wait_parked: u64,
+) -> bool {
+    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 1
+        || USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) != 0
+    {
+        return false;
+    }
+    let userinit_badge = hosted_top_badge_for_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+    )
+    .expect("userinit hosted metadata must be registered once userinit is spawned");
+    let userinit_bit = 1u64 << userinit_badge;
+    (crash_parked | wait_parked) & userinit_bit == 0
 }
 
 fn pi_is_top_level(nt_handler: &ExecNtHandler, badge: u64) -> bool {

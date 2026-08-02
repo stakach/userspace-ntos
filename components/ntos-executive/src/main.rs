@@ -265,9 +265,7 @@ pub const LSASS_HEAP_MIRROR_VA: u64 = 0x0000_0100_12A0_0000; // own PT (spawn_se
 pub const LSASS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_12C0_0000; // own PT (spawn_sec_image creates it)
 pub const LSASS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1077_0000; // FILEBUF PT (past services' 0x1076)
 /// The 6th hosted process — userinit.exe, launched by winlogon's CreateProcessAsUserW after an
-/// interactive logon. Badge 27 is the first free thread badge after the fixed 16..25 TP range and
-/// the LSA worker at 26. Its executive mirrors occupy the free band immediately below FILE POOL.
-pub const USERINIT_BADGE: u64 = 27;
+/// interactive logon. Its executive mirrors occupy the free band immediately below FILE POOL.
 pub const USERINIT_STACK_MIRROR_VA: u64 = 0x0000_0100_1480_0000;
 pub const USERINIT_ENV_SCRATCH_VA: u64 = 0x0000_0100_1490_0000;
 pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
@@ -275,7 +273,6 @@ pub const USERINIT_IMAGE_MIRROR_VA: u64 = 0x0000_0100_14C0_0000;
 /// The 7th hosted process — explorer.exe, launched by userinit's StartShell. Its image is at
 /// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). The 0x3900 scratch window is
 /// the next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
-pub const EXPLORER_BADGE: u64 = 28;
 pub const EXPLORER_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 6 * DEMAND_SCRATCH_WINDOW;
 pub const EXPLORER_STACK_MIRROR_VA: u64 = 0x0000_0100_3D00_0000;
 pub const EXPLORER_ENV_SCRATCH_VA: u64 = 0x0000_0100_3D10_0000;

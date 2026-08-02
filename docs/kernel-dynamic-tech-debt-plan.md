@@ -387,3 +387,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   no longer names each bootstrap child as a separate local. Review adjustment: the manifest itself is
   still compiled into the executive until the loader/session manager can hand off bootstrap image
   policy.
+- A2 cleanup. Removed the root-module `USERINIT_BADGE` and `EXPLORER_BADGE` identity constants.
+  Win32k service admission now recognizes non-native top-level hosted processes through registered
+  hosted-process metadata, and the userinit shell-frontier wait mask derives userinit's top badge
+  from its registered `InteractiveShellBootstrap` role. Review adjustment: several older
+  winlogon/LSASS-specific frontier checks still compare against their transport badges and should be
+  handled in a focused pass.
