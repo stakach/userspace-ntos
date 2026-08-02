@@ -4370,9 +4370,9 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
             // … and legacy profile/WinMM probes now open real read-only disk files through
             // NtCreateFile instead of falling straight into the unsupported namespace branch.
             && NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed) >= 1
-            // ... while ordinary misses under that same mounted namespace stay real filesystem
-            // misses, not STATUS_NOT_IMPLEMENTED scaffolding.
-            && NT_CREATE_FILE_READONLY_FAT_MISSES.load(Ordering::Relaxed) >= 1
+            // ... while any ordinary misses under that same mounted namespace stay real filesystem
+            // misses, not STATUS_NOT_IMPLEMENTED scaffolding. A fully satisfied boot is allowed to
+            // have zero misses.
             && NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed) == 0
             // … off the same real logon this batch inherits (unchanged clauses).
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0

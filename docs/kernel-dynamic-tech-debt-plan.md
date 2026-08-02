@@ -472,3 +472,8 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the text measurement wall. Review adjustment: remaining red gates are now the profile-directory
   value proof and explorer's `RegisterWindowMessage`, api0 callback redirection, client-installed
   WndProc, and shell COM class provisioning checks.
+- Gate cleanup. `exec_winlogon_profile_directory_resolved` no longer requires a historical
+  read-only-FAT create miss to prove the profile route. The real proof is the positive
+  `ProfileList\ProfilesDirectory` hive read, real read-only FAT opens, zero unsupported file opens,
+  and the later profile-copy/userinit/explorer gates. A boot with no readonly FAT misses is now
+  treated as the stronger success case instead of a red proof artifact.
