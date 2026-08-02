@@ -1714,7 +1714,6 @@ impl ExecNtHandler {
         }
         self.thread_mechanisms
             .pool_slot_for_tid(tid as nt_process::ThreadId)
-            .or_else(|| runtime_thread_slot(tid))
     }
 
     pub(crate) fn register_hosted_thread_tcb(

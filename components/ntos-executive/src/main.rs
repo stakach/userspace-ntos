@@ -9056,17 +9056,6 @@ fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
     }
 }
 
-fn runtime_thread_slot(tid: u64) -> Option<(usize, usize)> {
-    for pi in 0..MAX_PI {
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            if PM_POOL_TID[pi][slot].load(Ordering::Relaxed) == tid {
-                return Some((pi, slot));
-            }
-        }
-    }
-    None
-}
-
 unsafe fn pipe_io_cancel_thread(tid: u64) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let mut reply_caps = [0u64; PIPE_WAITER_N];

@@ -115,3 +115,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   through `pm_pool_tid_for_slot`. Review adjustment: remaining direct `PM_PIDS`/`PM_POOL_TID`
   writes are self-test temporary slots or the centralized mirror helper layer; remaining raw
   runtime read helpers should move behind handler-owned runtime lookup APIs before A3 can close.
+- A3 continued. User-callback TEB aliasing no longer reads `PM_TIDS`; main-thread callback identity
+  is accepted through the registered hosted image top badge, and explorer aliasing checks the hosted
+  role/leaf instead of mirror state. Deleted the old `runtime_thread_slot` scanner, so
+  `pm_pool_slot_for_tid` is now backed only by `ThreadMechanismTable`. Review adjustment:
+  `hosted_thread_tcb_cell` still has a main-thread `PM_TIDS` fallback for callback TCB lookup; that
+  should be replaced by carrying/resolving callback TCB identity through the registered thread
+  runtime before A3 closes.

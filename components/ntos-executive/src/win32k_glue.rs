@@ -362,9 +362,7 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
         return None;
     }
     let alias = match client.badge {
-        WINLOGON_BADGE if client.tid == PM_TIDS[winlogon_pi].load(Ordering::Relaxed) => {
-            WINLOGON_MAIN_TEB_MIRROR_VA
-        }
+        WINLOGON_BADGE => WINLOGON_MAIN_TEB_MIRROR_VA,
         WINLOGON_WORKER_BADGE if client.tid == PM_LISTENER_TID.load(Ordering::Relaxed) => {
             WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000
         }
@@ -391,14 +389,12 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
 
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let pi = callback_client_owner_pi(client)?;
-    if client.tid == 0 || pi >= PM_TIDS.len() || client.tid != PM_TIDS[pi].load(Ordering::Relaxed) {
+    let image = nt_exe_image::hosted_image_for_pi(pi)?;
+    if client.tid == 0 || client.badge != image.top_badge {
         return None;
     }
     match (pi, client.badge) {
-        (pi, EXPLORER_BADGE)
-            if nt_exe_image::hosted_image_for_pi(pi)
-                .is_some_and(|image| image.leaf.eq_ignore_ascii_case(b"explorer.exe")) =>
-        {
+        (pi, EXPLORER_BADGE) if image.leaf.eq_ignore_ascii_case(b"explorer.exe") => {
             let alias = crate::env_scratch_base_for_pi(pi);
             (alias != 0).then_some(alias)
         }
