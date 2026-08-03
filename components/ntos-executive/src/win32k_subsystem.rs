@@ -452,9 +452,9 @@ pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
 /// `W32Data = PsGetCurrentProcessWin32Process(); if (Create && !(W32PF_CREATEDWINORDC|W32PF_MANUALGUICHECK))
 ///  co_AddGuiApp(W32Data);` where `co_AddGuiApp` (RVA 0x7a080) sets W32PF_CREATEDWINORDC, does
 /// `InterlockedIncrement(&NrGuiAppsRunning@0x20be88)` and, on the 0→1 transition, calls
-/// `co_IntInitializeDesktopGraphics` (RVA 0xfca10) — the REAL InitVideo (framebuf surface + SM_CX/CYSCREEN)
+/// `co_IntInitializeDesktopGraphics` (RVA 0xfca10) — the REAL InitVideo (display surface + SM_CX/CYSCREEN)
 /// whose tail runs `co_IntShowDesktop(IntGetActiveDesktop(), SM_CX, SM_CY, TRUE)` = the authentic
-/// IntPaintDesktop that blits 0x003a6ea5 via framebuf's EngCopyBits. This is the exact call win32k makes
+/// IntPaintDesktop that blits 0x003a6ea5 through the selected display DLL. This is the exact call win32k makes
 /// from `DceCreateDisplayDC` (windc.c:44) on the first display-DC alloc.
 pub const CO_INT_GRAPHICS_CHECK_RVA: u64 = 0x7a100;
 
@@ -710,7 +710,7 @@ pub const WIN32K_USERVM_FRAMES: u64 = 1024; // 4 MiB, pre-mapped (64 GDI-pool se
 /// executive + win32k map the same frames here). At bring-up the host feeds these bytes to
 /// win32k's `IntGdiAddFontMemResource` so the desktop-graphics font realize finds a real font (the
 /// registry Fonts key is empty + `\SystemRoot\Fonts` doesn't exist, so no font loads naturally).
-/// Own 2 MiB PT window at 0x06E0 (free in both VSpaces: after FRAMEBUFBUF 0x06C0, before AUX_PT 0x0700).
+/// Own 2 MiB PT window at 0x06E0 (free in both VSpaces: after the win32k image window, before AUX_PT 0x0700).
 pub const FONTBUF_VADDR: u64 = 0x0000_0100_06E0_0000;
 pub const FONTBUF_FRAMES: u64 = 64; // 256 KiB (arial.ttf = 180,144 B)
 /// `IntGdiAddFontMemResource(PVOID Buffer, DWORD dwSize, PDWORD pNumAdded)` — win32k RVA. Found via
@@ -4567,7 +4567,7 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         }
         write_unaligned((buf + 0x10) as *mut u64, driver.image); // ImageAddress
         write_unaligned((buf + 0x18) as *mut u64, driver.image); // SectionPointer (non-null placeholder)
-        write_unaligned((buf + 0x20) as *mut u64, driver.entry); // EntryPoint (= DrvEnableDriver for framebuf)
+        write_unaligned((buf + 0x20) as *mut u64, driver.entry); // EntryPoint (= DrvEnableDriver for display DLL)
         write_unaligned((buf + 0x28) as *mut u64, driver.expdir); // ExportSectionPointer
         write_unaligned((buf + 0x30) as *mut u32, driver.image_len); // ImageLength
         print_str(b"[win32k gdidrv] hosted ");
@@ -4580,21 +4580,22 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
     0
 }
 
-// --- video-device registry mirror + framebuf miniport IOCTL intercept ------------------------
+// --- video-device registry mirror + display miniport IOCTL intercept -------------------------
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
 // win32ss/user/ntuser/display.c) read the video device map from the registry (RegOpenKey→ZwOpenKey,
 // RegQueryValue/RegReadDWORD→ZwQueryValueKey). Until those imports can call the executive
 // Configuration Manager directly, the executive publishes the small display/keyboard key set into a
 // bounded mirror when the backing driver image is actually loaded. The trampolines below only serve
-// registered mirror keys/values, and the framebuf miniport IOCTL intercept feeds the BOOTBOOT
+// registered mirror keys/values, and the display miniport IOCTL intercept feeds the BOOTBOOT
 // framebuffer.
 
-// A DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
-// handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
-// stable). Zeroed sub-regions of DATA page 0.
-const FAKE_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
-const FAKE_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
+// A DEVICE_OBJECT / FILE_OBJECT for the registered \Device\Video0 route. win32k passes the
+// DeviceObject as the miniport handle to the display driver + EngDeviceIoControl, which this host
+// intercepts. The object bodies are stable zeroed sub-regions of DATA page 0 until the real video
+// miniport device object exists.
+const VIDEO_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
+const VIDEO_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
@@ -4603,7 +4604,7 @@ const REG_DWORD: u32 = 4;
 const REG_MULTI_SZ: u32 = 7;
 const WIN32K_REG_KEY_CAP: usize = 8;
 const WIN32K_REG_VALUE_CAP: usize = 16;
-const WIN32K_REG_PATTERN_CAP: usize = 64;
+const WIN32K_REG_PATTERN_CAP: usize = 96;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
 const WIN32K_REG_VALUE_ASCII_CAP: usize = 96;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
@@ -4664,8 +4665,18 @@ static mut WIN32K_REG_KEYS: [Win32kRegKeyMirror; WIN32K_REG_KEY_CAP] =
     [Win32kRegKeyMirror::EMPTY; WIN32K_REG_KEY_CAP];
 static mut WIN32K_REG_VALUES: [Win32kRegValueMirror; WIN32K_REG_VALUE_CAP] =
     [Win32kRegValueMirror::EMPTY; WIN32K_REG_VALUE_CAP];
-static mut WIN32K_FRAMEBUF_REGISTRY_READY: bool = false;
+static mut WIN32K_DISPLAY_REGISTRY_READY: bool = false;
+static mut WIN32K_DISPLAY_DEVICE_READY: bool = false;
 static mut WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY: bool = false;
+
+pub(crate) struct DisplayRegistrySpec<'a> {
+    pub(crate) service_key_pattern: &'a [u8],
+    pub(crate) service_registry_path: &'a [u8],
+    pub(crate) installed_display_driver: &'a [u8],
+    pub(crate) display_driver_leaf: &'a [u8],
+    pub(crate) device_description: &'a [u8],
+    pub(crate) vga_compatible: u32,
+}
 
 fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
     ascii_eq_ignore_case(a, b)
@@ -4773,18 +4784,24 @@ fn registered_win32k_reg_value(
     value
 }
 
-fn register_framebuf_registry_mirror() -> bool {
+fn register_display_registry_mirror(spec: &DisplayRegistrySpec<'_>) -> bool {
+    if spec.service_key_pattern.is_empty()
+        || spec.service_registry_path.is_empty()
+        || spec.installed_display_driver.is_empty()
+        || spec.display_driver_leaf.is_empty()
+        || spec.device_description.is_empty()
+    {
+        return false;
+    }
     unsafe {
-        if WIN32K_FRAMEBUF_REGISTRY_READY {
+        if WIN32K_DISPLAY_REGISTRY_READY {
             return true;
         }
     }
     let Some(video_map) = register_win32k_reg_key(b"HARDWARE\\DEVICEMAP\\VIDEO") else {
         return false;
     };
-    let Some(framebuf) =
-        register_win32k_reg_key(b"SYSTEM\\CURRENTCONTROLSET\\SERVICES\\FRAMEBUF\\DEVICE0")
-    else {
+    let Some(display_service) = register_win32k_reg_key(spec.service_key_pattern) else {
         return false;
     };
     let ok = register_win32k_reg_dword(video_map, b"MaxObjectNumber", 0)
@@ -4792,27 +4809,28 @@ fn register_framebuf_registry_mirror() -> bool {
             video_map,
             b"\\Device\\Video0",
             REG_SZ,
-            b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf\\Device0",
+            spec.service_registry_path,
             false,
         )
         && register_win32k_reg_wide_ascii(
-            framebuf,
+            display_service,
             b"InstalledDisplayDrivers",
             REG_MULTI_SZ,
-            b"framebuf",
+            spec.installed_display_driver,
             true,
         )
         && register_win32k_reg_wide_ascii(
-            framebuf,
+            display_service,
             b"Device Description",
             REG_SZ,
-            b"BOOTBOOT Framebuffer",
+            spec.device_description,
             false,
         )
-        && register_win32k_reg_dword(framebuf, b"VgaCompatible", 0);
+        && register_win32k_reg_dword(display_service, b"VgaCompatible", spec.vga_compatible);
     if ok {
         unsafe {
-            WIN32K_FRAMEBUF_REGISTRY_READY = true;
+            WIN32K_DISPLAY_REGISTRY_READY = true;
+            WIN32K_DISPLAY_DEVICE_READY = true;
         }
     }
     ok
@@ -5031,17 +5049,25 @@ extern "win64" fn s_zw_query_value_key(
 
 /// `NTSTATUS IoGetDeviceObjectPointer(PUNICODE_STRING, ACCESS_MASK, PFILE_OBJECT*, PDEVICE_OBJECT*)`.
 extern "win64" fn s_io_get_device_object_pointer(
-    _name: u64,
+    name: u64,
     _access: u64,
     fileobj_out: *mut u64,
     devobj_out: *mut u64,
 ) -> i32 {
     unsafe {
+        if !WIN32K_DISPLAY_DEVICE_READY || name == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        let len = read_unaligned(name as *const u16) as usize;
+        let buf = read_unaligned((name + 8) as *const u64);
+        if !wstr_eq_ascii(buf, len, b"\\Device\\Video0") {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
         if !fileobj_out.is_null() {
-            write_unaligned(fileobj_out, FAKE_FILE_OBJECT);
+            write_unaligned(fileobj_out, VIDEO_FILE_OBJECT);
         }
         if !devobj_out.is_null() {
-            write_unaligned(devobj_out, FAKE_DEVICE_OBJECT);
+            write_unaligned(devobj_out, VIDEO_DEVICE_OBJECT);
         }
     }
     0
@@ -5081,8 +5107,8 @@ unsafe fn fill_video_mode(out: u64) {
 }
 
 /// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in `load_into`,
-/// so BOTH framebuf's imported calls AND win32k's own internal calls route here without a real
-/// miniport/DeviceObject). Services the video IOCTLs framebuf.dll issues, feeding it the BOOTBOOT
+/// so BOTH the display DLL's imported calls AND win32k's own internal calls route here without a real
+/// miniport/DeviceObject). Services the video IOCTLs the display DLL issues, feeding it the BOOTBOOT
 /// framebuffer. Returns 0 (ERROR_SUCCESS) on handled, nonzero on unhandled (benign for the optional
 /// IOCTLs — the callers only check zero/non-zero). win64: rcx=hDev, rdx=ioctl, r8=inbuf, r9=inlen,
 /// stack: outbuf, outlen, bytesret.
@@ -5143,7 +5169,7 @@ extern "win64" fn s_eng_device_io_control(
 
 /// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
 /// while win32k's image is mapped RW in the executive (before spawn maps it RX). 12 bytes:
-/// `mov rax, imm64 (48 B8 ..); jmp rax (FF E0)`. Both framebuf's IAT-resolved import AND win32k's own
+/// `mov rax, imm64 (48 B8 ..); jmp rax (FF E0)`. Both the display DLL's IAT-resolved import AND win32k's own
 /// internal EngDeviceIoControl callers then route to our video-IOCTL handler.
 unsafe fn patch_eng_device_io_control() {
     let va = pe_export_lookup(WIN32K_CODE_VA, b"EngDeviceIoControl\0");
@@ -6170,7 +6196,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
         }
     }
 
-    // Patch win32k's EngDeviceIoControl export to our video-IOCTL intercept (so framebuf's imported
+    // Patch win32k's EngDeviceIoControl export to our video-IOCTL intercept (so the display DLL's imported
     // calls AND win32k's own internal miniport IOCTLs route to us — no real DeviceObject needed).
     patch_eng_device_io_control();
 
@@ -6965,10 +6991,10 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     // window's WM_PAINT/WM_ERASEBKGND. Our single-threaded host short-circuits the SAS window's WINDOWPROC
     // callbacks (BATCH 45) and never runs a message loop, so that natural DC-alloc never happens. The
     // FAITHFUL trigger — the SAME function win32k itself calls — is `co_IntGraphicsCheck(TRUE)`: it runs the
-    // REAL `co_AddGuiApp → co_IntInitializeDesktopGraphics` (framebuf surface init via PDEVOBJ_lChangeDisplay
+    // REAL `co_AddGuiApp → co_IntInitializeDesktopGraphics` (display surface init via PDEVOBJ_lChangeDisplay
     // Settings + IntGdiCreateDC(L"DISPLAY") + IntCreatePrimarySurface) whose tail does
     // `co_IntShowDesktop(IntGetActiveDesktop()=gpdeskInputDesktop, SM_CX, SM_CY, bRedraw=TRUE)` = the genuine
-    // IntPaintDesktop that blits 0x003a6ea5 to the BOOTBOOT framebuffer through framebuf.dll's EngCopyBits.
+    // IntPaintDesktop that blits 0x003a6ea5 to the BOOTBOOT framebuffer through the selected display DLL.
     // NOTHING is faked — win32k's own GDI paints the pixels; we only supply the DC-alloc trigger our missing
     // message loop would otherwise supply, at the authentic point (right after the desktop is made current).
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
@@ -7896,7 +7922,7 @@ unsafe fn establish_client_and_dispatch() {
 // LDEVOBJ_bLoadImage -> ZwSetSystemInformation(SystemLoadGdiDriverInformation). The executive
 // (privileged) PRE-LOADS dxg.sys + its dxgthk.sys dependency into win32k's VSpace at bring-up
 // (parse, map W^X, relocs, resolve imports), then the ZwSetSystemInformation trampoline reports
-// the pre-loaded image to win32k. This is the reusable driver-loader for framebuf.dll later.
+// the pre-loaded image to win32k. This is the reusable driver-loader used by display DLL hosting.
 
 /// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
 pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;
@@ -7908,9 +7934,9 @@ pub const DXG_LOAD_FRAMES: u64 = 16;
 /// 248 frames (one 2 MiB PT, 2 MiB-aligned at 0x0870). win32k statically imports 34 FT_* from it.
 pub const FTFD_VA: u64 = 0x0000_0100_0870_0000;
 pub const FTFD_LOAD_FRAMES: u64 = 248;
-/// framebuf.dll (generic linear-framebuffer display driver) loaded-image base in win32k's VSpace.
-/// size_of_image 0x8000 -> 8 frames (its own 2 MiB PT at 0x0890). win32k loads it dynamically via
-/// ZwSetSystemInformation (like dxg); framebuf's PE entry (RVA 0x1260) IS its DrvEnableDriver.
+/// Display driver loaded-image base in win32k's VSpace. ReactOS' current registry selects the
+/// linear-framebuffer driver, whose size_of_image is 0x8000, so this reserves one 8-frame PT window.
+/// win32k loads the selected display DLL dynamically via ZwSetSystemInformation.
 pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
 pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 /// Keyboard layout DLL loaded-image base in win32k's VSpace. size_of_image 0x4000 -> 4 frames;
@@ -7918,30 +7944,34 @@ pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 /// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
 pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
 pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
-/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. framebuf's
-/// DrvEnableSurface issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns
-/// this VA as FrameBufferBase, so framebuf writes pixels straight to the real framebuffer.
+/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. The display
+/// driver issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns this VA as
+/// FrameBufferBase, so the driver writes pixels straight to the real framebuffer.
 /// 1024x768x32 scanline 4096 = 0x300000 = 768 pages (2 PTs at 0x0900/0x0920).
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 pub const WIN32K_FB_SIZE: u64 = 0x30_0000;
 
-/// Record the loaded framebuf.dll info (called by the executive after `load_driver_into(framebuf)`).
-/// framebuf has NO export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` special-
-/// cases to `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
-pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
+/// Record the loaded display DLL info selected from the SYSTEM hive. Some ReactOS display DLLs have
+/// no export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` can special-case to
+/// `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
+pub fn record_display_driver(
+    spec: &DisplayRegistrySpec<'_>,
+    entry_rva: u32,
+    export_dir_rva: u32,
+    image_len: u32,
+) -> bool {
     let expd = if export_dir_rva != 0 {
         FRAMEBUF_VA + export_dir_rva as u64
     } else {
         0
     };
-    let _ = register_gdi_driver_image(
-        b"framebuf.dll",
+    register_gdi_driver_image(
+        spec.display_driver_leaf,
         FRAMEBUF_VA,
         FRAMEBUF_VA + entry_rva as u64,
         expd,
         image_len,
-    );
-    let _ = register_framebuf_registry_mirror();
+    ) && register_display_registry_mirror(spec)
 }
 
 /// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find

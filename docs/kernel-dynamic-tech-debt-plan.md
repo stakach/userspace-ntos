@@ -721,3 +721,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none` passed. Review adjustment: D1 still has display/DirectX preloads and D3 still
   has the hosted-process keyboard-layout key sentinel plus the display registry/device mirror.
+- D1/D3 continued. The win32k display host path no longer pre-stages `framebuf.dll` through the
+  storage host or publishes a fixed `Services\framebuf\Device0` registry mirror. The executive scans
+  the real SYSTEM hive `ControlSet001\Services\*\Device0`, requires `InstalledDisplayDrivers`,
+  `Device Description`, and `VgaCompatible`, validates that the selected display DLL exists on the
+  mounted ReactOS filesystem, loads `reactos\system32\<selected display DLL>` through the dynamic
+  pool loader, and registers the selected service/device-map values back to win32k. The old
+  `FRAMEBUFBUF` mapping and storage-host file read are gone, and `IoGetDeviceObjectPointer` now
+  succeeds only for the registered `\Device\Video0` route after display registration. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs`,
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. Review adjustment: D1 still has DirectX/font preloads and
+  broader service-control launch ordering; D3 still has a bounded win32k registry mirror and a
+  temporary video object body until the Configuration Manager and real display miniport device stack
+  can serve these imports directly.

@@ -1,6 +1,6 @@
 //! `win32k_glue` — the executive-side win32k client plumbing: RO-map win32k's
 //! USER heap into csrss, per-client cross-AS page attach (w32_*), the DirectX/
-//! ftfd/framebuffer driver loaders, and the win32k syscall dispatch + backtrace.
+//! ftfd/display driver loaders, and the win32k syscall dispatch + backtrace.
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
@@ -3242,7 +3242,7 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
 /// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,
 /// to load) and win32k (W^X, to run). Reuses [`win32k_subsystem::load_driver_into`]. `dxgthk_base` names
 /// a prior-loaded dxgthk for import resolution (0 for a leaf). Returns (entry_rva, export_dir_rva,
-/// size_of_image). The reusable driver-loader mechanism (framebuf.dll will use it too).
+/// size_of_image). The reusable driver-loader mechanism is also used by display DLL hosting.
 pub(crate) unsafe fn load_one_driver(
     src_va: u64,
     dst_va: u64,
@@ -3369,35 +3369,26 @@ pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
     }
 }
 
-/// Host framebuf.dll (the display driver) into win32k's VSpace + map the BOOTBOOT framebuffer into
-/// win32k. win32k loads framebuf DYNAMICALLY (like dxg) via ZwSetSystemInformation when it enables the
-/// display device (co_IntInitializeDesktopGraphics → PDEVOBJ_Create → LDEVOBJ_pLoadDriver("framebuf")),
-/// so pre-load it + record it for the s_zw_set_system_information trampoline. framebuf's video-miniport
-/// IOCTLs (DrvEnablePDEV/DrvEnableSurface) are serviced by the patched EngDeviceIoControl intercept,
-/// which returns WIN32K_FB_VA — the fb frames mapped here.
-pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
-    let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x8C) as *const u32);
-    if sz == 0 {
-        print_str(b"[win32k-svc] framebuf.dll not staged - display gate will fail\n");
-        return;
+fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
+    if driver_leaf.is_empty()
+        || driver_leaf.len() > 32
+        || !driver_leaf.iter().copied().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+        || driver_leaf.windows(2).any(|w| w == b"..")
+    {
+        return None;
     }
-    match load_one_driver(
-        FRAMEBUFBUF_VADDR,
-        win32k_subsystem::FRAMEBUF_VA,
-        win32k_subsystem::FRAMEBUF_LOAD_FRAMES,
-        host_pml4,
-        0,
-    ) {
-        Some((entry, expdir, len)) => {
-            win32k_subsystem::record_framebuf(entry, expdir, len);
-            print_str(b"[win32k-svc] hosted framebuf.dll: entry_rva=0x");
-            print_hex(entry);
-            print_str(b" (DrvEnableDriver) len=0x");
-            print_hex(len);
-            print_str(b"\n");
-        }
-        None => print_str(b"[win32k-svc] framebuf load failed\n"),
+    let prefix = b"reactos\\system32\\";
+    if prefix.len() + driver_leaf.len() > out.len() {
+        return None;
     }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..prefix.len() + driver_leaf.len()].copy_from_slice(driver_leaf);
+    Some(prefix.len() + driver_leaf.len())
+}
+
+unsafe fn map_bootboot_framebuffer_into_win32k(host_pml4: u64) {
     // Map the BOOTBOOT framebuffer (Phase-0a fb device frames) into win32k at WIN32K_FB_VA, RW.
     let base = FB_FRAME_BASE.load(Ordering::Relaxed);
     let count = FB_FRAME_COUNT.load(Ordering::Relaxed);
@@ -3429,23 +3420,53 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
     }
 }
 
-fn keyboard_layout_driver_path(layout_file: &[u8], out: &mut [u8]) -> Option<usize> {
-    if layout_file.is_empty()
-        || layout_file.len() > 24
-        || !layout_file.iter().copied().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
-        })
-        || layout_file.windows(2).any(|w| w == b"..")
-    {
-        return None;
+/// Host the display driver selected by SYSTEM hive service metadata into win32k's VSpace + map the
+/// BOOTBOOT framebuffer into win32k. win32k loads the display DLL dynamically via
+/// ZwSetSystemInformation when it enables the display device, so the executive preloads the selected
+/// DLL and records its registry/device metadata for the narrow win32k import bridge.
+pub(crate) unsafe fn load_display_driver(
+    host_pml4: u64,
+    spec: &win32k_subsystem::DisplayRegistrySpec<'_>,
+) {
+    let Some(fs) = exec_fs() else {
+        print_str(b"[win32k-svc] display DLL unavailable - executive FS not mounted\n");
+        return;
+    };
+    let mut path = [0u8; 64];
+    let Some(path_len) = system32_driver_path(spec.display_driver_leaf, &mut path) else {
+        print_str(b"[win32k-svc] display DLL leaf rejected by loader policy\n");
+        return;
+    };
+    let Some((src_va, sz)) = load_file_to_pool(&fs, &path[..path_len]) else {
+        print_str(b"[win32k-svc] display DLL not found by registry path: ");
+        print_str(&path[..path_len]);
+        print_str(b"\n");
+        return;
+    };
+    match load_one_driver(
+        src_va,
+        win32k_subsystem::FRAMEBUF_VA,
+        win32k_subsystem::FRAMEBUF_LOAD_FRAMES,
+        host_pml4,
+        0,
+    ) {
+        Some((entry, expdir, len)) => {
+            let recorded = win32k_subsystem::record_display_driver(spec, entry, expdir, len);
+            print_str(b"[win32k-svc] hosted display driver ");
+            print_str(spec.display_driver_leaf);
+            print_str(b": file_size=");
+            print_u64(sz as u64);
+            print_str(b" entry_rva=0x");
+            print_hex(entry);
+            print_str(b" len=0x");
+            print_hex(len);
+            print_str(b" recorded=");
+            print_u64(recorded as u64);
+            print_str(b"\n");
+        }
+        None => print_str(b"[win32k-svc] display DLL load failed\n"),
     }
-    let prefix = b"reactos\\system32\\";
-    if prefix.len() + layout_file.len() > out.len() {
-        return None;
-    }
-    out[..prefix.len()].copy_from_slice(prefix);
-    out[prefix.len()..prefix.len() + layout_file.len()].copy_from_slice(layout_file);
-    Some(prefix.len() + layout_file.len())
+    map_bootboot_framebuffer_into_win32k(host_pml4);
 }
 
 /// Host the keyboard layout DLL selected by the registry into win32k's VSpace. win32k loads keyboard
@@ -3462,7 +3483,7 @@ pub(crate) unsafe fn load_keyboard_layout_driver(
         return;
     };
     let mut path = [0u8; 64];
-    let Some(path_len) = keyboard_layout_driver_path(layout_file, &mut path) else {
+    let Some(path_len) = system32_driver_path(layout_file, &mut path) else {
         print_str(b"[win32k-svc] keyboard layout DLL leaf rejected by loader policy\n");
         return;
     };

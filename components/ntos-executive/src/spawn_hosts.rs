@@ -469,7 +469,7 @@ pub(crate) unsafe fn spawn_storage_host(
         pts: 1,
     };
     n += 1;
-    // dxg/dxgthk/ftfd/framebuf/font staging buffers (one PT each).
+    // dxg/dxgthk/ftfd/font staging buffers (one PT each).
     for (start, vaddr, frames) in [
         (
             DXGBUF_START.load(Ordering::Relaxed),
@@ -485,11 +485,6 @@ pub(crate) unsafe fn spawn_storage_host(
             FTFDBUF_START.load(Ordering::Relaxed),
             FTFDBUF_VADDR,
             FTFDBUF_FRAMES,
-        ),
-        (
-            FRAMEBUFBUF_START.load(Ordering::Relaxed),
-            FRAMEBUFBUF_VADDR,
-            FRAMEBUFBUF_FRAMES,
         ),
         (
             FONTBUF_START.load(Ordering::Relaxed),

@@ -1083,10 +1083,6 @@ pub const DXGTHKBUF_FRAMES: u64 = 8;
 /// (245 frames span 0x0670_0000..0x067f_5000, clear of WIN32K_CODE_VA at 0x0680). ftfd size=1,000,960 B.
 pub const FTFDBUF_VADDR: u64 = 0x0000_0100_0670_0000;
 pub const FTFDBUF_FRAMES: u64 = 245;
-/// Raw framebuf.dll staging buffer (display driver, 12 KiB / size_of_image 0x8000). Own PT window at
-/// 0x06C0 — free between the win32k image (0x0680..0x06A2) and the aux window (0x0700).
-pub const FRAMEBUFBUF_VADDR: u64 = 0x0000_0100_06C0_0000;
-pub const FRAMEBUFBUF_FRAMES: u64 = 8;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -10094,6 +10090,195 @@ fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<
     Some(n)
 }
 
+const DISPLAY_SERVICE_NAME_CAP: usize = 32;
+const DISPLAY_SERVICE_KEY_CAP: usize = 96;
+const DISPLAY_REGISTRY_PATH_CAP: usize = 96;
+const DISPLAY_DRIVER_VALUE_CAP: usize = 32;
+const DISPLAY_DRIVER_LEAF_CAP: usize = 32;
+const DISPLAY_DESCRIPTION_CAP: usize = 96;
+
+struct SystemHiveDisplayDriverSpec {
+    service_name: [u8; DISPLAY_SERVICE_NAME_CAP],
+    service_name_len: usize,
+    service_key_pattern: [u8; DISPLAY_SERVICE_KEY_CAP],
+    service_key_pattern_len: usize,
+    service_registry_path: [u8; DISPLAY_REGISTRY_PATH_CAP],
+    service_registry_path_len: usize,
+    installed_display_driver: [u8; DISPLAY_DRIVER_VALUE_CAP],
+    installed_display_driver_len: usize,
+    display_driver_leaf: [u8; DISPLAY_DRIVER_LEAF_CAP],
+    display_driver_leaf_len: usize,
+    device_description: [u8; DISPLAY_DESCRIPTION_CAP],
+    device_description_len: usize,
+    vga_compatible: u32,
+}
+
+impl SystemHiveDisplayDriverSpec {
+    fn empty() -> Self {
+        Self {
+            service_name: [0; DISPLAY_SERVICE_NAME_CAP],
+            service_name_len: 0,
+            service_key_pattern: [0; DISPLAY_SERVICE_KEY_CAP],
+            service_key_pattern_len: 0,
+            service_registry_path: [0; DISPLAY_REGISTRY_PATH_CAP],
+            service_registry_path_len: 0,
+            installed_display_driver: [0; DISPLAY_DRIVER_VALUE_CAP],
+            installed_display_driver_len: 0,
+            display_driver_leaf: [0; DISPLAY_DRIVER_LEAF_CAP],
+            display_driver_leaf_len: 0,
+            device_description: [0; DISPLAY_DESCRIPTION_CAP],
+            device_description_len: 0,
+            vga_compatible: 0,
+        }
+    }
+
+    fn win32k_spec(&self) -> win32k_subsystem::DisplayRegistrySpec<'_> {
+        win32k_subsystem::DisplayRegistrySpec {
+            service_key_pattern: &self.service_key_pattern[..self.service_key_pattern_len],
+            service_registry_path: &self.service_registry_path[..self.service_registry_path_len],
+            installed_display_driver: &self.installed_display_driver
+                [..self.installed_display_driver_len],
+            display_driver_leaf: &self.display_driver_leaf[..self.display_driver_leaf_len],
+            device_description: &self.device_description[..self.device_description_len],
+            vga_compatible: self.vga_compatible,
+        }
+    }
+
+    fn service_name(&self) -> &[u8] {
+        &self.service_name[..self.service_name_len]
+    }
+}
+
+fn registry_copy_ascii_lower_str(s: &str, out: &mut [u8]) -> Option<usize> {
+    if s.is_empty() || s.len() > out.len() {
+        return None;
+    }
+    let mut n = 0usize;
+    for b in s.bytes() {
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return None;
+        }
+        out[n] = b.to_ascii_lowercase();
+        n += 1;
+    }
+    Some(n)
+}
+
+fn registry_append_bytes(out: &mut [u8], mut pos: usize, bytes: &[u8]) -> Option<usize> {
+    if pos + bytes.len() > out.len() {
+        return None;
+    }
+    out[pos..pos + bytes.len()].copy_from_slice(bytes);
+    pos += bytes.len();
+    Some(pos)
+}
+
+fn registry_build_display_service_paths(
+    service_name: &[u8],
+    key_pattern: &mut [u8],
+    registry_path: &mut [u8],
+) -> Option<(usize, usize)> {
+    let mut key_len =
+        registry_append_bytes(key_pattern, 0, b"SYSTEM\\CURRENTCONTROLSET\\SERVICES\\")?;
+    key_len = registry_append_bytes(key_pattern, key_len, service_name)?;
+    key_len = registry_append_bytes(key_pattern, key_len, b"\\DEVICE0")?;
+
+    let mut path_len = registry_append_bytes(
+        registry_path,
+        0,
+        b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\",
+    )?;
+    path_len = registry_append_bytes(registry_path, path_len, service_name)?;
+    path_len = registry_append_bytes(registry_path, path_len, b"\\Device0")?;
+    Some((key_len, path_len))
+}
+
+fn registry_display_driver_leaf(installed_driver: &[u8], out: &mut [u8]) -> Option<usize> {
+    if installed_driver.is_empty() || installed_driver.len() > out.len() {
+        return None;
+    }
+    if !registry_driver_leaf_is_safe(installed_driver) {
+        return None;
+    }
+    out[..installed_driver.len()].copy_from_slice(installed_driver);
+    let mut n = installed_driver.len();
+    if !installed_driver.contains(&b'.') {
+        n = registry_append_bytes(out, n, b".dll")?;
+    }
+    if !registry_driver_leaf_is_safe(&out[..n]) {
+        return None;
+    }
+    Some(n)
+}
+
+fn system_hive_display_driver_spec() -> Option<SystemHiveDisplayDriverSpec> {
+    let hive = system_hive_regf()?;
+    let services = hive.open_key("ControlSet001\\Services")?;
+    for (service_name, service_key) in hive.subkeys(services) {
+        let Some(device_key) = hive.open_key_from(service_key, "Device0") else {
+            continue;
+        };
+        let Some(installed_value) = hive.value(device_key, "InstalledDisplayDrivers") else {
+            continue;
+        };
+        let Some(description_value) = hive.value(device_key, "Device Description") else {
+            continue;
+        };
+        let Some(vga_compatible) = hive
+            .value(device_key, "VgaCompatible")
+            .and_then(|(_, data)| registry_dword_from_bytes(&data))
+        else {
+            continue;
+        };
+
+        let mut spec = SystemHiveDisplayDriverSpec::empty();
+        let Some(service_name_len) =
+            registry_copy_ascii_lower_str(&service_name, &mut spec.service_name)
+        else {
+            continue;
+        };
+        let Some(installed_len) =
+            registry_utf16_ascii(&installed_value.1, &mut spec.installed_display_driver)
+        else {
+            continue;
+        };
+        let Some(display_leaf_len) = registry_display_driver_leaf(
+            &spec.installed_display_driver[..installed_len],
+            &mut spec.display_driver_leaf,
+        ) else {
+            continue;
+        };
+        if unsafe { !crate::fs_loader::sys32_exists(&spec.display_driver_leaf[..display_leaf_len]) }
+        {
+            continue;
+        }
+        let Some(description_len) =
+            registry_utf16_ascii(&description_value.1, &mut spec.device_description)
+        else {
+            continue;
+        };
+        let Some((service_key_pattern_len, service_registry_path_len)) =
+            registry_build_display_service_paths(
+                &spec.service_name[..service_name_len],
+                &mut spec.service_key_pattern,
+                &mut spec.service_registry_path,
+            )
+        else {
+            continue;
+        };
+
+        spec.service_name_len = service_name_len;
+        spec.service_key_pattern_len = service_key_pattern_len;
+        spec.service_registry_path_len = service_registry_path_len;
+        spec.installed_display_driver_len = installed_len;
+        spec.display_driver_leaf_len = display_leaf_len;
+        spec.device_description_len = description_len;
+        spec.vga_compatible = vga_compatible;
+        return Some(spec);
+    }
+    None
+}
+
 /// ★ BYPASS SWITCH for setup's locale step (see `provision_default_user_locale`). `false` leaves
 /// `HKU\.DEFAULT\Control Panel\International` valueless, exactly as the ISO ships it, and
 /// `winlogon!SetDefaultLanguage(Session)` fails again -> `HandleLogon` aborts into
@@ -13013,8 +13198,6 @@ static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the raw ftfd.dll staged into FTFDBUF (FreeType font driver).
 static FTFDBUF_START: AtomicU64 = AtomicU64::new(0);
-/// Frame-cap base of the raw framebuf.dll staged into FRAMEBUFBUF (display driver).
-static FRAMEBUFBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the staged system font (arial.ttf) in FONTBUF (fed to IntGdiAddFontMemResource).
 static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
@@ -13064,7 +13247,7 @@ pub(crate) static USERINIT_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
 /// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
-/// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
+/// (the display DLL's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA so GDI writes pixels to the real fb).
 static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
@@ -13110,7 +13293,7 @@ pub(crate) static WINLOGON_PAINT_DONE: AtomicU64 = AtomicU64::new(0);
 /// and is this color except for the exact cursor overlay sample.
 const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
 /// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
-/// confirm GDI/framebuf drew pixels).
+/// confirm GDI/display-driver pixels landed).
 const FB_VADDR: u64 = 0x0000_0200_0000_0000;
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
@@ -14495,7 +14678,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // geometry in BootInfo and hands its physical memory over as the LAST device
     // untyped (is_device=1, paddr == fb_paddr). Map every framebuffer frame into
     // our VSpace, write a recognizable pattern, and read pixels back — proving the
-    // display path a win32k/framebuf display driver will later drive. Headless QEMU
+    // display path a win32k display driver will later drive. Headless QEMU
     // won't SHOW the pixels, but the map+write+readback proves the mapping is real.
     {
         let fb_paddr = bi.fb_paddr;
@@ -14566,7 +14749,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let base_slot = claim_device_pages(bi, fb_paddr, FB_VADDR, n_pages);
             map_ok = base_slot != 0;
             // Retain the fb frame-cap base + count so the win32k bring-up can map the SAME physical
-            // frames into win32k's VSpace (framebuf.dll draws pixels there → the real framebuffer).
+            // frames into win32k's VSpace (the display DLL draws pixels there -> the real framebuffer).
             FB_FRAME_BASE.store(base_slot, Ordering::Relaxed);
             FB_FRAME_COUNT.store(n_pages, Ordering::Relaxed);
             check(b"exec_framebuffer_map", map_ok, &mut passed);
@@ -14578,7 +14761,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 const MAGENTA: u32 = 0x00FF_00FF;
                 const GREEN: u32 = 0x0000_FF00;
                 let fb = FB_VADDR as *mut u32;
-                // Fill the WHOLE framebuffer magenta (not just line 0) so that a later GDI/framebuf
+                // Fill the WHOLE framebuffer magenta (not just line 0) so that a later GDI/display
                 // draw (the desktop-graphics init) is reliably detectable by a readback anywhere.
                 let total_px = (fb_size / 4) as usize;
                 for x in 0..total_px {
@@ -15324,7 +15507,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (&DXGBUF_START, DXGBUF_VADDR, DXGBUF_FRAMES),
                 (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
                 (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
-                (&FRAMEBUFBUF_START, FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
                 (
                     &FONTBUF_START,
                     win32k_subsystem::FONTBUF_VADDR,
@@ -15564,7 +15746,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &mut passed,
             );
             // P7-A: the WHOLE ReactOS stack (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32
-            // client stack + NLS + win32k/dxg/ftfd/framebuf/arial/winlogon + the SYSTEM hive) was
+            // client stack + NLS + win32k/dxg/ftfd/arial/winlogon + the SYSTEM hive) was
             // sourced BY PATH from the real \reactos install tree — ZERO fallbacks to a flat ::NAME.
             let fs_hits = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA0) as *const u32);
             let fs_fallbacks =
@@ -16411,10 +16593,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // Host ftfd.dll (FreeType font driver) + patch win32k's IAT for its 34 FT_* imports so
                 // InitFontSupport → FT_Init_FreeType initialises the font subsystem for real.
                 load_ftfd_driver(host_pml4);
-                // Host framebuf.dll (display driver) + map the BOOTBOOT framebuffer into win32k, so
-                // win32k's desktop-graphics init (PDEVOBJ_Create → DrvEnablePDEV/DrvEnableSurface) can
-                // enable the primary surface on the real framebuffer → PIXELS.
-                load_framebuf_driver(host_pml4);
+                // Host the display driver selected from the real SYSTEM hive and map the BOOTBOOT
+                // framebuffer into win32k, so desktop-graphics init can enable a primary surface on
+                // the real framebuffer.
+                if let Some(display_spec) = system_hive_display_driver_spec() {
+                    let display_spec_view = display_spec.win32k_spec();
+                    print_str(b"[win32k-svc] display service=");
+                    print_str(display_spec.service_name());
+                    print_str(b" driver=");
+                    print_str(display_spec_view.display_driver_leaf);
+                    print_str(b" description=");
+                    print_str(display_spec_view.device_description);
+                    print_str(b"\n");
+                    load_display_driver(host_pml4, &display_spec_view);
+                } else {
+                    print_str(
+                        b"[win32k-svc] no loadable display Device0 in SYSTEM hive and ReactOS FS\n",
+                    );
+                }
                 // Host the keyboard-layout DLL selected by the real registry layout key so win32k's
                 // NtUserLoadKeyboardLayoutEx path can resolve KbdLayerDescriptor without a synthetic
                 // HKL result.

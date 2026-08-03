@@ -513,13 +513,6 @@ pub(crate) unsafe fn storage_probe(
                 0x88u64,
             ),
             (
-                b"reactos\\system32\\framebuf.dll".as_slice(),
-                b"FRAMEBUFDLL",
-                FRAMEBUFBUF_VADDR,
-                FRAMEBUFBUF_FRAMES,
-                0x8Cu64,
-            ),
-            (
                 b"reactos\\Fonts\\arial.ttf".as_slice(),
                 b"ARIAL   TTF",
                 win32k_subsystem::FONTBUF_VADDR,
@@ -632,7 +625,7 @@ pub(crate) unsafe fn storage_probe(
         }
         // P7-A proof: publish the by-path hit/miss tally. verdict 0x200 = the WHOLE ReactOS stack
         // (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32 client stack + NLS + win32k/dxg/ftfd/
-        // framebuf/arial/winlogon + the SYSTEM hive) was sourced BY PATH from the real \reactos tree
+        // arial/winlogon + the SYSTEM hive) was sourced BY PATH from the real \reactos tree
         // with ZERO fallbacks to a flat ::NAME file.
         core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0xA0) as *mut u32, fs_hits);
         core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0xA4) as *mut u32, fs_miss);
