@@ -1123,42 +1123,65 @@ impl DispatchContext {
     };
 }
 
+pub const CLIENT_TOKEN_USER_SID_MAX: usize = 68;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ActiveCallbackFrame {
-    request: CallbackHeader,
+pub struct ActiveCallbackClient {
     client_tcb: u64,
     client_runtime_role: u32,
     client_process_role: u32,
     client_top_badge: u64,
-    saved_user_context: [u64; 20],
-    outer_resume_ip: u64,
-    redirected: bool,
-    callback_window: Option<ClientCallbackWindowState>,
-    dispatch_context: DispatchContext,
-    /// The executive-bridged `CLIENTINFO.CallbackWnd` triple published for THIS frame
-    /// (`hWnd`, client `PWND`, `pActCtx`); `[0]  == 0` means nothing was bridged.
-    bridged_window: [u64; 3],
+    client_pid: u64,
+    client_teb: u64,
+    client_peb_mirror: u64,
+    client_scratch_base: u64,
+    client_eprocess: u64,
+    client_ethread: u64,
+    client_token_authentication_id: u64,
+    client_token_user_sid: [u8; CLIENT_TOKEN_USER_SID_MAX],
+    client_token_user_sid_len: u32,
 }
 
-impl ActiveCallbackFrame {
-    const fn empty() -> Self {
+impl ActiveCallbackClient {
+    pub const fn empty() -> Self {
         Self {
-            request: CallbackHeader::idle(0, 0, 0, 0),
             client_tcb: 0,
             client_runtime_role: 0,
             client_process_role: 0,
             client_top_badge: 0,
-            saved_user_context: [0; 20],
-            outer_resume_ip: 0,
-            redirected: false,
-            callback_window: None,
-            dispatch_context: DispatchContext::EMPTY,
-            bridged_window: [0; 3],
+            client_pid: 0,
+            client_teb: 0,
+            client_peb_mirror: 0,
+            client_scratch_base: 0,
+            client_eprocess: 0,
+            client_ethread: 0,
+            client_token_authentication_id: 0,
+            client_token_user_sid: [0; CLIENT_TOKEN_USER_SID_MAX],
+            client_token_user_sid_len: 0,
         }
     }
 
-    pub const fn request(&self) -> &CallbackHeader {
-        &self.request
+    pub const fn new(
+        client_tcb: u64,
+        client_runtime_role: u32,
+        client_process_role: u32,
+        client_top_badge: u64,
+    ) -> Self {
+        Self {
+            client_tcb,
+            client_runtime_role,
+            client_process_role,
+            client_top_badge,
+            client_pid: 0,
+            client_teb: 0,
+            client_peb_mirror: 0,
+            client_scratch_base: 0,
+            client_eprocess: 0,
+            client_ethread: 0,
+            client_token_authentication_id: 0,
+            client_token_user_sid: [0; CLIENT_TOKEN_USER_SID_MAX],
+            client_token_user_sid_len: 0,
+        }
     }
 
     pub const fn client_tcb(&self) -> u64 {
@@ -1175,6 +1198,157 @@ impl ActiveCallbackFrame {
 
     pub const fn client_top_badge(&self) -> u64 {
         self.client_top_badge
+    }
+
+    pub const fn client_pid(&self) -> u64 {
+        self.client_pid
+    }
+
+    pub const fn client_teb(&self) -> u64 {
+        self.client_teb
+    }
+
+    pub const fn client_peb_mirror(&self) -> u64 {
+        self.client_peb_mirror
+    }
+
+    pub const fn client_scratch_base(&self) -> u64 {
+        self.client_scratch_base
+    }
+
+    pub const fn client_eprocess(&self) -> u64 {
+        self.client_eprocess
+    }
+
+    pub const fn client_ethread(&self) -> u64 {
+        self.client_ethread
+    }
+
+    pub const fn client_token_authentication_id(&self) -> u64 {
+        self.client_token_authentication_id
+    }
+
+    pub const fn client_token_user_sid(&self) -> &[u8; CLIENT_TOKEN_USER_SID_MAX] {
+        &self.client_token_user_sid
+    }
+
+    pub const fn client_token_user_sid_len(&self) -> u32 {
+        self.client_token_user_sid_len
+    }
+
+    pub fn with_process_identity(
+        mut self,
+        client_pid: u64,
+        client_teb: u64,
+        client_peb_mirror: u64,
+        client_scratch_base: u64,
+        client_eprocess: u64,
+        client_ethread: u64,
+    ) -> Self {
+        self.client_pid = client_pid;
+        self.client_teb = client_teb;
+        self.client_peb_mirror = client_peb_mirror;
+        self.client_scratch_base = client_scratch_base;
+        self.client_eprocess = client_eprocess;
+        self.client_ethread = client_ethread;
+        self
+    }
+
+    pub fn with_token(
+        mut self,
+        authentication_id: u64,
+        user_sid: [u8; CLIENT_TOKEN_USER_SID_MAX],
+        user_sid_len: u32,
+    ) -> Self {
+        self.client_token_authentication_id = authentication_id;
+        self.client_token_user_sid = user_sid;
+        self.client_token_user_sid_len = user_sid_len.min(CLIENT_TOKEN_USER_SID_MAX as u32);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveCallbackFrame {
+    request: CallbackHeader,
+    client: ActiveCallbackClient,
+    saved_user_context: [u64; 20],
+    outer_resume_ip: u64,
+    redirected: bool,
+    callback_window: Option<ClientCallbackWindowState>,
+    dispatch_context: DispatchContext,
+    /// The executive-bridged `CLIENTINFO.CallbackWnd` triple published for THIS frame
+    /// (`hWnd`, client `PWND`, `pActCtx`); `[0]  == 0` means nothing was bridged.
+    bridged_window: [u64; 3],
+}
+
+impl ActiveCallbackFrame {
+    const fn empty() -> Self {
+        Self {
+            request: CallbackHeader::idle(0, 0, 0, 0),
+            client: ActiveCallbackClient::empty(),
+            saved_user_context: [0; 20],
+            outer_resume_ip: 0,
+            redirected: false,
+            callback_window: None,
+            dispatch_context: DispatchContext::EMPTY,
+            bridged_window: [0; 3],
+        }
+    }
+
+    pub const fn request(&self) -> &CallbackHeader {
+        &self.request
+    }
+
+    pub const fn client_tcb(&self) -> u64 {
+        self.client.client_tcb()
+    }
+
+    pub const fn client_runtime_role(&self) -> u32 {
+        self.client.client_runtime_role()
+    }
+
+    pub const fn client_process_role(&self) -> u32 {
+        self.client.client_process_role()
+    }
+
+    pub const fn client_top_badge(&self) -> u64 {
+        self.client.client_top_badge()
+    }
+
+    pub const fn client_pid(&self) -> u64 {
+        self.client.client_pid()
+    }
+
+    pub const fn client_teb(&self) -> u64 {
+        self.client.client_teb()
+    }
+
+    pub const fn client_peb_mirror(&self) -> u64 {
+        self.client.client_peb_mirror()
+    }
+
+    pub const fn client_scratch_base(&self) -> u64 {
+        self.client.client_scratch_base()
+    }
+
+    pub const fn client_eprocess(&self) -> u64 {
+        self.client.client_eprocess()
+    }
+
+    pub const fn client_ethread(&self) -> u64 {
+        self.client.client_ethread()
+    }
+
+    pub const fn client_token_authentication_id(&self) -> u64 {
+        self.client.client_token_authentication_id()
+    }
+
+    pub const fn client_token_user_sid(&self) -> &[u8; CLIENT_TOKEN_USER_SID_MAX] {
+        self.client.client_token_user_sid()
+    }
+
+    pub const fn client_token_user_sid_len(&self) -> u32 {
+        self.client.client_token_user_sid_len()
     }
 
     pub const fn dispatch_context(&self) -> &DispatchContext {
@@ -1316,8 +1490,24 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         client_process_role: u32,
         client_top_badge: u64,
     ) -> Result<(), ValidationError> {
+        self.push_with_active_client_metadata(
+            request,
+            ActiveCallbackClient::new(
+                client_tcb,
+                client_runtime_role,
+                client_process_role,
+                client_top_badge,
+            ),
+        )
+    }
+
+    pub fn push_with_active_client_metadata(
+        &mut self,
+        request: CallbackHeader,
+        client: ActiveCallbackClient,
+    ) -> Result<(), ValidationError> {
         validate_request(&request)?;
-        if client_tcb <= 1 {
+        if client.client_tcb <= 1 {
             return Err(ValidationError::State);
         }
         if self.len == DEPTH {
@@ -1325,10 +1515,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         }
         self.frames[self.len] = ActiveCallbackFrame {
             request,
-            client_tcb,
-            client_runtime_role,
-            client_process_role,
-            client_top_badge,
+            client,
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
@@ -2742,10 +2929,20 @@ mod tests {
         b.client_tid = 21;
         b.client_badge = 13;
         stack
-            .push_with_client_runtime_role(a, 0xaaa0, 0x11)
+            .push_with_active_client_metadata(
+                a,
+                ActiveCallbackClient::new(0xaaa0, 0x11, 0x31, 0x41)
+                    .with_process_identity(0x51, 0x61, 0x71, 0x81, 0x91, 0xa1)
+                    .with_token(0xb1, [0xaa; CLIENT_TOKEN_USER_SID_MAX], 0x12),
+            )
             .unwrap();
         stack
-            .push_with_client_runtime_role(b, 0xbbb0, 0x22)
+            .push_with_active_client_metadata(
+                b,
+                ActiveCallbackClient::new(0xbbb0, 0x22, 0x32, 0x42)
+                    .with_process_identity(0x52, 0x62, 0x72, 0x82, 0x92, 0xa2)
+                    .with_token(0xb2, [0xbb; CLIENT_TOKEN_USER_SID_MAX], 0x13),
+            )
             .unwrap();
         let ca = CallbackCorrelation::from_request(&a);
         let cb = CallbackCorrelation::from_request(&b);
@@ -2777,6 +2974,17 @@ mod tests {
         let popped_a = stack.pop(ca).unwrap();
         assert_eq!(popped_a.client_tcb(), 0xaaa0);
         assert_eq!(popped_a.client_runtime_role(), 0x11);
+        assert_eq!(popped_a.client_process_role(), 0x31);
+        assert_eq!(popped_a.client_top_badge(), 0x41);
+        assert_eq!(popped_a.client_pid(), 0x51);
+        assert_eq!(popped_a.client_teb(), 0x61);
+        assert_eq!(popped_a.client_peb_mirror(), 0x71);
+        assert_eq!(popped_a.client_scratch_base(), 0x81);
+        assert_eq!(popped_a.client_eprocess(), 0x91);
+        assert_eq!(popped_a.client_ethread(), 0xa1);
+        assert_eq!(popped_a.client_token_authentication_id(), 0xb1);
+        assert_eq!(popped_a.client_token_user_sid()[0], 0xaa);
+        assert_eq!(popped_a.client_token_user_sid_len(), 0x12);
         assert_eq!(popped_a.dispatch_context().ssn, 0x1050);
         assert_eq!(popped_a.outer_resume_ip(), 0xdead);
         assert_eq!(stack.len(), 1);
@@ -2789,6 +2997,17 @@ mod tests {
         let popped_b = stack.pop(cb).unwrap();
         assert_eq!(popped_b.client_tcb(), 0xbbb0);
         assert_eq!(popped_b.client_runtime_role(), 0x22);
+        assert_eq!(popped_b.client_process_role(), 0x32);
+        assert_eq!(popped_b.client_top_badge(), 0x42);
+        assert_eq!(popped_b.client_pid(), 0x52);
+        assert_eq!(popped_b.client_teb(), 0x62);
+        assert_eq!(popped_b.client_peb_mirror(), 0x72);
+        assert_eq!(popped_b.client_scratch_base(), 0x82);
+        assert_eq!(popped_b.client_eprocess(), 0x92);
+        assert_eq!(popped_b.client_ethread(), 0xa2);
+        assert_eq!(popped_b.client_token_authentication_id(), 0xb2);
+        assert_eq!(popped_b.client_token_user_sid()[0], 0xbb);
+        assert_eq!(popped_b.client_token_user_sid_len(), 0x13);
         assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
         assert!(stack.is_empty());
     }

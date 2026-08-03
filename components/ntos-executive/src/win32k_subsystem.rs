@@ -3214,6 +3214,8 @@ static WIN32K_THREAD_CTX_W32THREAD: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
 static WIN32K_CLIENT_PROCESS_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PENDING_OB_UNCACHED_WINSTA: AtomicU64 = AtomicU64::new(0);
@@ -3516,6 +3518,147 @@ unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {
         (WIN32K_SHARED_VADDR + SH_CTX_W32THREAD) as *mut u64,
         w32thread,
     );
+}
+
+pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
+    pi: u32,
+    pid: u64,
+    tid: u64,
+    supplied_eprocess: u64,
+    supplied_ethread: u64,
+    process_role: u64,
+) -> bool {
+    if pid == 0 || tid == 0 {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume missing pid/tid pi=");
+            print_u64(pi as u64);
+            print_str(b" pid=");
+            print_u64(pid);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b"\n");
+        }
+        return false;
+    }
+    let Some(process_index) = process_context_index_for_pid(pid) else {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume unknown pid=");
+            print_u64(pid);
+            print_str(b" pi=");
+            print_u64(pi as u64);
+            print_str(b"\n");
+        }
+        return false;
+    };
+    let Some(thread_index) = thread_context_index_for_tid(tid) else {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume unknown tid=");
+            print_u64(tid);
+            print_str(b" pi=");
+            print_u64(pi as u64);
+            print_str(b"\n");
+        }
+        return false;
+    };
+    if WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed) != pi as u64
+        || WIN32K_THREAD_CTX_PIS[thread_index].load(Ordering::Relaxed) != pi as u64
+    {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume pi mismatch pi=");
+            print_u64(pi as u64);
+            print_str(b" pid=");
+            print_u64(pid);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b"\n");
+        }
+        return false;
+    }
+    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
+    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let w32process = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+    let w32thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+    if eprocess == 0
+        || ethread == 0
+        || w32process == 0
+        || w32thread == 0
+        || (supplied_eprocess != 0 && supplied_eprocess != eprocess)
+        || (supplied_ethread != 0 && supplied_ethread != ethread)
+    {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume object mismatch pi=");
+            print_u64(pi as u64);
+            print_str(b" pid=");
+            print_u64(pid);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b" eprocess=0x");
+            print_hex((eprocess >> 32) as u32);
+            print_hex(eprocess as u32);
+            print_str(b" ethread=0x");
+            print_hex((ethread >> 32) as u32);
+            print_hex(ethread as u32);
+            print_str(b" pti=0x");
+            print_hex((w32thread >> 32) as u32);
+            print_hex(w32thread as u32);
+            print_str(b"\n");
+        }
+        return false;
+    }
+
+    WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
+    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
+    write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
+    write_volatile(SLOT_W32THREAD as *mut u64, w32thread);
+    write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, w32thread);
+    write_volatile(w32thread as *mut u64, ethread);
+    sync_threadinfo_process(w32thread);
+    publish_selected_context(process_index, thread_index);
+
+    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+        && BOUND_DESK_PDESKINFO != 0
+        && BOUND_DESK_BODY != 0
+    {
+        write_volatile((w32thread + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
+        write_volatile(
+            (w32thread + THREADINFO_PDESKINFO_OFF) as *mut u64,
+            BOUND_DESK_PDESKINFO,
+        );
+        let pci = read_volatile((w32thread + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+        if pci != 0 {
+            write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
+        }
+    }
+
+    let n = WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES.fetch_add(1, Ordering::Relaxed);
+    if n < 24 {
+        let refs = read_volatile((w32thread + 0x2f8) as *const u64);
+        let locks = read_volatile((w32thread + 0x344) as *const u32);
+        print_str(b"[win32k-context] callback resume selected pi=");
+        print_u64(pi as u64);
+        print_str(b" pid=");
+        print_u64(pid);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" pti=0x");
+        print_hex((w32thread >> 32) as u32);
+        print_hex(w32thread as u32);
+        print_str(b" refs=0x");
+        print_hex((refs >> 32) as u32);
+        print_hex(refs as u32);
+        print_str(b" locks=");
+        print_u64(locks as u64);
+        print_str(b"\n");
+    }
+    true
 }
 
 unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) -> Option<usize> {
@@ -4841,7 +4984,31 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             // TAG rides in MR0.
             let (_label, tag, _, _, _) = crate::driver_launch::call_on(out);
             match tag {
-                W32_USER_CALLBACK_RESUME_LABEL => break,
+                W32_USER_CALLBACK_RESUME_LABEL => {
+                    let client_pi =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
+                    let process_id =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
+                    let thread_id =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_THREAD_ID) as *const u64);
+                    let supplied_eprocess =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
+                    let supplied_ethread =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
+                    let process_role =
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
+                    if !restore_current_context_for_user_callback_resume(
+                        client_pi as u32,
+                        process_id,
+                        thread_id,
+                        supplied_eprocess,
+                        supplied_ethread,
+                        process_role,
+                    ) {
+                        return 0xC000_000Du32 as i32;
+                    }
+                    break;
+                }
                 W32_DISPATCH_LABEL => {
                     let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),

@@ -657,3 +657,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   LSA auth-port/logon, profile-copy/load, userinit, and explorer gates are red again. The next
   target is to restore the real SAS/dialog route on top of the stricter dynamic process/thread and
   service-callback boundaries, without reintroducing synthetic success paths.
+- C3/F1 repair. User-callback resume context is now owned by the active callback frame instead of
+  process-wide callback-client globals. The executive stages PID/TID, `EPROCESS`/`ETHREAD`, process
+  role, top badge, PEB/TEB, scratch, and token-authentication SID facts through the shared callback
+  frame, and win32k restores the current GUI/KPCR/THREADINFO context from that frame before resuming
+  a parked continuation. The nested proof now drains real chained callback returns before declaring
+  win32k idle, and the dead-client proof targets the most recent real WndProc callback with a real
+  no-moving `SWP_FRAMECHANGED`/`WM_WINDOWPOSCHANGING` route instead of arming a synthetic callback.
+  Validation: `cargo fmt --all`, `cargo test -p nt-user-callback`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-callback-resume-rerun-20260803.log` passed. The boot log
+  reached `276/276`, including `PASS exec_user_callback_real_api0_nested_roundtrip`, `PASS
+  exec_user_callback_dead_client_unwind`, `PASS exec_win32k_transport_call_nested`, `PASS
+  exec_msgina_logon_dialog_painted`, and `PASS exec_explorer_process_spawned`. Review adjustment:
+  the SAS/dialog/profile/userinit/explorer regression is closed again. Remaining open items are the
+  hosted-image manifest handoff, provider-owned service GUI/GDI state, the driver/registry and LPC
+  discovery workstreams, and the real WM_PAINT queue/framebuffer path.

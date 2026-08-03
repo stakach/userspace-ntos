@@ -643,9 +643,13 @@ pub(crate) struct PumpChannel {
 #[derive(Clone, Copy)]
 pub(crate) struct UserCallbackClient {
     pub pi: u32,
+    pub pid: u64,
     pub badge: u64,
     pub tid: u64,
     pub tcb: u64,
+    pub teb: u64,
+    pub eprocess: u64,
+    pub ethread: u64,
     pub role: Option<HostedThreadRole>,
     pub process_role: Option<nt_exe_image::HostedProcessRole>,
     pub top_badge: u64,
