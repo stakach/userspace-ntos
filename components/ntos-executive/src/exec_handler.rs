@@ -8135,31 +8135,9 @@ impl ExecNtHandler {
         })
     }
 
-    pub(crate) unsafe fn model_csr_request_reply(&mut self, reqmsg: u64) -> u32 {
-        let api_number = {
-            let mut b = [0u8; 4];
-            if self.xas_read(reqmsg + 0x30, &mut b) {
-                u32::from_le_bytes(b)
-            } else {
-                0xFFFF_FFFF
-            }
-        };
-        // CSR_API_MESSAGE.Status = STATUS_SUCCESS and Header.u2.s2.Type = LPC_REPLY.
-        let _ = self.xas_try_write_buf(reqmsg + 0x34, &0u32.to_le_bytes());
-        let _ = self.xas_try_write_buf(
-            reqmsg + 0x04,
-            &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
-        );
-        print_str(b"[csr-msg] CsrClientCallServer ApiNumber=0x");
-        print_hex(api_number);
-        print_str(b" -> modeled reply Status=SUCCESS (direct message fallback)\n");
-        CSR_API_MODELED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        0
-    }
-
     pub(crate) unsafe fn model_lpc_request_reply(&mut self, reqmsg: u64) -> u32 {
-        // Generic LPC fallback for modeled non-CSR ports. Keep it out of CSR message-plane accounting:
-        // `CSR_API_MODELED_FALLBACKS` must mean a \Windows\ApiPort request avoided the real CSR worker.
+        // Generic LPC fallback for modeled non-CSR ports. CSR's \Windows\ApiPort message plane has
+        // no modeled success path; it must rendezvous with the real CsrApiRequestThread.
         let _ = self.xas_try_write_buf(reqmsg + 0x34, &0u32.to_le_bytes());
         let _ = self.xas_try_write_buf(
             reqmsg + 0x04,
@@ -8263,32 +8241,42 @@ impl ExecNtHandler {
             None => return 0xC000_0001,
         };
         let pml4 = ctx.pml4;
-        // (1) Connect through the broker (Pending under Manual). ★ AUTHENTIC accept (mirrors SM path
-        // B): rather than modeling the acceptor here, RECORD the pending connection id + the caller's
-        // *PortHandle so the LOOP drives `csr_rendezvous` — csrss's REAL CsrApiRequestThread issues the
-        // NtReplyWaitReceivePort → CsrApiHandleConnectionRequest → NtAcceptConnectPort →
-        // NtCompleteConnectPort. The loop overrides the client handle + writes *PortHandle after the
-        // rendezvous. Only if the broker connect is NOT pending do we write a modeled handle here.
-        // IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
-        let mut client_handle = 0u64;
+        // (1) Connect through the broker (Pending under Manual). Authentic accept mirrors the SM path:
+        // record the pending connection id + caller *PortHandle so the loop drives `csr_rendezvous`.
+        // csrss's real CsrApiRequestThread must issue NtReplyWaitReceivePort →
+        // CsrApiHandleConnectionRequest → NtAcceptConnectPort → NtCompleteConnectPort. Synchronous
+        // broker handles and locally minted handles bypass that server boundary and are rejected.
+        if !self.current_process_uses_csr_client_connect() {
+            print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) from non-CSR client role -> failing\n");
+            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return 0xC000_0001;
+        }
         let mut pending = false;
         if let Some(c) = lpc_client() {
-            if let Ok(r) = c.connect_port(name16, 2, &[]) {
-                if self.current_process_uses_csr_client_connect()
-                    && r.pending
-                    && r.connection_id != 0
-                {
+            match c.connect_port(name16, 2, &[]) {
+                Ok(r) if r.pending && r.connection_id != 0 => {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
                     pending = true;
-                } else if r.handle != 0 {
-                    client_handle = r.handle;
-                    self.cache_lpc_connection(r.connection_id, r.handle, name16);
+                }
+                Ok(r) => {
+                    print_str(b"[csr] broker returned non-pending ApiPort connect; handle=0x");
+                    print_hex((r.handle >> 32) as u32);
+                    print_hex(r.handle as u32);
+                    print_str(b" conn=");
+                    print_u64(r.connection_id);
+                    print_str(b" -> failing, CSR accept must be real\n");
+                }
+                Err(_) => {
+                    print_str(b"[csr] broker failed NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n");
                 }
             }
+        } else {
+            print_str(b"[csr] LPC broker unavailable for NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n");
         }
-        if !pending && client_handle == 0 {
-            client_handle = self.mint_handle();
+        if !pending {
+            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return 0xC000_0001;
         }
         // (2) Map THIS process's CSR regions once (heap view + static server data) — per-pi. GENERAL
         // per-process plane: winlogon (pi 2), services (pi 3), and every later Win32 process each get
@@ -8398,33 +8386,16 @@ impl ExecNtHandler {
             smss_stack_write(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA); // SharedSectionHeap
             smss_stack_write(conninfo_ptr + 0x30, 8); // ServerProcessId (csrss — plausible)
         }
-        // (5) *PortHandle = &CsrApiPort (an ntdll .data global) — best-effort. On the AUTHENTIC path
-        // the loop writes it after `csr_rendezvous` produces the real client comm-port handle; here we
-        // write only the fallback (non-pending) handle. (The modeled message plane doesn't dispatch by
-        // this handle, so a silent miss is harmless.)
-        if !pending && porthandle_ptr != 0 {
-            csrss_out_write(
-                porthandle_ptr,
-                client_handle,
-                &mut *ctx.filled_pages,
-                &mut *ctx.faults,
-                ctx.scratch_base,
-                &*ctx.reg,
-                ctx.dll_pes(),
-                pml4,
-            );
-        }
+        // (5) *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
+        // communication-port handle after `csr_rendezvous` completes the pending connection.
         WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
         CSR_CONNECTED_MASK.fetch_or(1u64 << self.pi, Ordering::Relaxed);
         print_str(b"[csr] pi=");
         print_u64(self.pi as u64);
-        print_str(if pending {
-            b" NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(deferred)=0x".as_slice()
-        } else {
-            b" NtSecureConnectPort(\\Windows\\ApiPort) -> modeled accept; client=0x".as_slice()
-        });
-        print_hex((client_handle >> 32) as u32);
-        print_hex(client_handle as u32);
+        print_str(
+            b" NtSecureConnectPort(\\Windows\\ApiPort) -> queued REAL CsrApiRequestThread accept; conn=",
+        );
+        print_u64(self.csr_rendezvous_conn);
         print_str(b" ViewBase=0x");
         print_hex((WINLOGON_CSR_HEAP_VA >> 32) as u32);
         print_hex(WINLOGON_CSR_HEAP_VA as u32);
@@ -11556,9 +11527,8 @@ impl ExecNtHandler {
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
             // message DATA plane. SM requests are already driven through real SmpApiLoop. CSR API
             // requests now use the same shape when csrss's CsrApiRequestThread is parked on
-            // \Windows\ApiPort; if the real worker cannot service a particular message yet, the loop
-            // falls back to the historical modeled success reply for that message rather than wedging
-            // the boot.
+            // \Windows\ApiPort. If the real worker is unavailable, fail visibly instead of writing a
+            // modeled CSR success reply.
             NativeService::NtRequestWaitReplyPort => unsafe {
                 if self.current_process_is_smss()
                     && self.lpc_connection_is(args[0], 0, b"\\smapiport")
@@ -11577,7 +11547,9 @@ impl ExecNtHandler {
                         print_str(b"[csr-api] routing CSR request to real CsrApiRequestThread\n");
                         return 0;
                     }
-                    return self.model_csr_request_reply(args[1]);
+                    CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[csr-api] no parked real CsrApiRequestThread for \\Windows\\ApiPort request -> failing\n");
+                    return 0xC000_0001;
                 }
                 if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
                     return self.service_srm_request_reply(args[1], args[2]);

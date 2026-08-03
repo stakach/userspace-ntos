@@ -65,7 +65,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### E. LPC, CSR, SRM, And LSA
 
-- `[ ]` E1: Remove modeled CSR reply paths and require real CSR server rendezvous for connect and
+- `[x]` E1: Remove modeled CSR reply paths and require real CSR server rendezvous for connect and
   request/reply traffic.
 - `[ ]` E2: Replace fixed LPC port-name creation order with object-manager named-port lookup.
 - `[ ]` E3: Replace modeled SRM/LSA accept replies with real port messages and server-side
@@ -1344,3 +1344,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `PASS exec_explorer_process_spawned`, `PASS exec_explorer_user_callbacks_redirected`, and
   `PASS exec_lsa_worker_route`; the win32k transport proof reported `walled=0`. Review adjustment:
   workstream C is closed; the remaining open plan work is A2, D1-D3, and E1-E3.
+- E1 complete. The `\Windows\ApiPort` established-message modeled success path was removed:
+  `model_csr_request_reply` is gone, missing parked `CsrApiRequestThread` state now fails visibly,
+  and CSR connects require a pending broker connection that the real CSRSS worker accepts. The CSRSS
+  native-subsystem bootstrap now follows ReactOS' server-process path in ntdll by avoiding
+  `NtSecureConnectPort` and publishing only the minimal early `ReadOnlyStaticServerData` that
+  kernel32 reads before CSRSRV publishes its real shared section. Validation:
+  `scripts/build_ntdll_dll.sh` passed and `.tmp/full-boot-e1-r2.log` was run to the login/LSA path
+  before manual stop. The log shows real ApiPort accepts for winlogon, services, and LSASS
+  (`conn=8/9/10`), multiple `real CsrApiRequestThread reply completed` records, natural desktop
+  framebuffer readback after `NtUserSwitchDesktop`, and real IDD api0 callbacks for the logon UI.
+  Review adjustment: E3 is the next LPC frontier because the same log still reports
+  `NtConnectPort(\SeRmCommandPort) -> modeled SRM accept`; A2 and D1-D3 also remain open.

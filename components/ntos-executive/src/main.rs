@@ -10894,8 +10894,8 @@ struct ExecNtHandler {
     sm_reply_message: u64,
     /// A synchronous CSR API request on an established `\\Windows\\ApiPort` client connection. The
     /// loop delivers it to the parked real CsrApiRequestThread and resumes the client once the worker
-    /// emits its LPC reply. Falls back to the historical modeled reply if the worker cannot service
-    /// this message yet.
+    /// emits its LPC reply. Missing worker/rendezvous state fails visibly; CSR has no modeled
+    /// established-port success path.
     csr_request_port: u64,
     csr_request_message: u64,
     csr_reply_message: u64,
@@ -12662,7 +12662,8 @@ static CSR_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 /// How many established-port CSR API requests completed through the real CsrApiRequestThread.
 static CSR_API_REAL_REPLIES: AtomicU64 = AtomicU64::new(0);
-/// How many established-port CSR API requests fell back to the historical modeled success reply.
+/// Must remain zero. The historical established-port CSR modeled success path has been removed; the
+/// gate keeps this counter visible so any accidental reintroduction is obvious.
 static CSR_API_MODELED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Count of pending CSR client connects completed by the real CsrApiRequestThread
 /// rendezvous. The boot path must not use the old modeled accept fallback.

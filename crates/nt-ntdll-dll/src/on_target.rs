@@ -77,6 +77,10 @@ static mut CSR_API_PORT: u64 = 0;
 static mut CSR_PORT_MEMORY_DELTA: isize = 0;
 #[cfg(target_arch = "x86_64")]
 static mut CSR_PROCESS_ID: u64 = 0;
+#[cfg(target_arch = "x86_64")]
+static CSR_INSIDE_PROCESS: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static CSR_NATIVE_STATIC_DATA_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 /// Process-local cached IFEO roots. A loaded ntdll image has private writable data in each process,
 /// matching ReactOS's `ImageExecOptionsKey` / `Wow64ExecOptionsKey` globals.
@@ -100,6 +104,135 @@ pub unsafe fn csr_api_port() -> u64 {
 pub unsafe fn csr_port_memory_delta() -> isize {
     // SAFETY: single-writer during CSR connect; later reads are plain scalar loads.
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_PORT_MEMORY_DELTA)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_peb() -> u64 {
+    let peb: u64;
+    // SAFETY: x64 hosted processes carry the PEB pointer in TEB.Gs:[0x60].
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+    }
+    peb
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_image_subsystem() -> Option<u16> {
+    // SAFETY: the caller is the in-process loader/ntdll path; the PEB and image headers are mapped.
+    unsafe {
+        let peb = current_peb();
+        if peb == 0 {
+            return None;
+        }
+        let image = core::ptr::read_unaligned((peb + 0x10) as *const u64);
+        if image < 0x1_0000 || core::ptr::read_unaligned(image as *const u16) != 0x5A4D {
+            return None;
+        }
+        let e_lfanew = core::ptr::read_unaligned((image + 0x3C) as *const u32) as u64;
+        let nt = image + e_lfanew;
+        if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
+            return None;
+        }
+        let opt = nt + 24;
+        let magic = core::ptr::read_unaligned(opt as *const u16);
+        let subsystem_offset = match magic {
+            0x20B | 0x10B => 0x44,
+            _ => return None,
+        };
+        Some(core::ptr::read_unaligned(
+            (opt + subsystem_offset) as *const u16,
+        ))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_utf16_z(mut dst: u64, value: &str) {
+    // SAFETY: caller supplies a committed UTF-16 buffer large enough for these fixed literals.
+    unsafe {
+        for unit in value.encode_utf16() {
+            core::ptr::write_unaligned(dst as *mut u16, unit);
+            dst += 2;
+        }
+        core::ptr::write_unaligned(dst as *mut u16, 0);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_unicode_string(slot: u64, length_bytes: u16, max_bytes: u16, buffer: u64) {
+    // SAFETY: `slot` names a writable x64 UNICODE_STRING.
+    unsafe {
+        core::ptr::write_unaligned(slot as *mut u16, length_bytes);
+        core::ptr::write_unaligned((slot + 0x02) as *mut u16, max_bytes);
+        core::ptr::write_unaligned((slot + 0x08) as *mut u64, buffer);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_basic_system_information(dst: u64) {
+    // Byte layout matches nt_syscall::system_information::SystemBasicInformation::encode().
+    // SAFETY: `dst` points at writable BASE_STATIC_SERVER_DATA.SysInfo storage.
+    unsafe {
+        core::ptr::write_bytes(dst as *mut u8, 0, 0x40);
+        core::ptr::write_unaligned((dst + 0x04) as *mut u32, 10_000);
+        core::ptr::write_unaligned((dst + 0x08) as *mut u32, 0x1000);
+        core::ptr::write_unaligned((dst + 0x0c) as *mut u32, 0x40000);
+        core::ptr::write_unaligned((dst + 0x10) as *mut u32, 0);
+        core::ptr::write_unaligned((dst + 0x14) as *mut u32, 0x3ffff);
+        core::ptr::write_unaligned((dst + 0x18) as *mut u32, 0x1_0000);
+        core::ptr::write_unaligned((dst + 0x20) as *mut u64, 0x1_0000);
+        core::ptr::write_unaligned((dst + 0x28) as *mut u64, 0x0000_07ff_fffe_ffff);
+        core::ptr::write_unaligned((dst + 0x30) as *mut u64, 1);
+        core::ptr::write_unaligned((dst + 0x38) as *mut u8, 1);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_native_csr_static_data() -> u64 {
+    // ReactOS' native-subsystem fast path avoids NtSecureConnectPort, but kernel32 still reads
+    // PEB->ReadOnlyStaticServerData during process attach. CSRSRV later creates and publishes the
+    // real CSR shared section; this early block keeps the native server process on the ReactOS path
+    // without inventing a kernel ApiPort client handle.
+    if CSR_NATIVE_STATIC_DATA_PUBLISHED.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // SAFETY: current hosted process has a PEB and a process heap by the time kernel32 attaches.
+    unsafe {
+        let peb = current_peb();
+        if peb == 0 {
+            return 0xC000_0001;
+        }
+        let existing = core::ptr::read_unaligned((peb + 0x98) as *const u64);
+        if existing != 0 {
+            CSR_NATIVE_STATIC_DATA_PUBLISHED.store(true, Ordering::Relaxed);
+            return 0;
+        }
+        let static_base = nt_allocate_virtual_memory(0x4000);
+        if static_base == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        core::ptr::write_bytes(static_base as *mut u8, 0, 0x4000);
+
+        let bssd = static_base + 0x0100;
+        let windows_dir = static_base + 0x3000;
+        let system_dir = static_base + 0x3020;
+        let named_objects = static_base + 0x3060;
+
+        core::ptr::write_unaligned((static_base + 0x08) as *mut u64, bssd);
+        write_unicode_string(bssd + 0x00, 10 * 2, 11 * 2, windows_dir);
+        write_unicode_string(bssd + 0x10, 19 * 2, 20 * 2, system_dir);
+        write_unicode_string(bssd + 0x20, 17 * 2, 18 * 2, named_objects);
+        write_basic_system_information(bssd + 0x140);
+        write_utf16_z(windows_dir, "C:\\Windows");
+        write_utf16_z(system_dir, "C:\\Windows\\System32");
+        write_utf16_z(named_objects, "\\BaseNamedObjects");
+
+        let process_heap = core::ptr::read_unaligned((peb + 0x30) as *const u64);
+        core::ptr::write_volatile((peb + 0x88) as *mut u64, static_base);
+        core::ptr::write_volatile((peb + 0x90) as *mut u64, process_heap);
+        core::ptr::write_volatile((peb + 0x98) as *mut u64, static_base);
+        CSR_NATIVE_STATIC_DATA_PUBLISHED.store(true, Ordering::Relaxed);
+    }
+    0
 }
 
 /// Issue `NtRequestWaitReplyPort(CsrApiPort, message, message)` for a CSR API message.
@@ -2777,8 +2910,7 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
                     let flags = core::ptr::read_unaligned((parameters + 0x08) as *const u32);
                     let length = core::ptr::read_unaligned((parameters + 0x60) as *const u16);
                     let maximum = core::ptr::read_unaligned((parameters + 0x62) as *const u16);
-                    let raw_buffer =
-                        core::ptr::read_unaligned((parameters + 0x68) as *const u64);
+                    let raw_buffer = core::ptr::read_unaligned((parameters + 0x68) as *const u64);
                     let buffer = if flags & RTL_USER_PROCESS_PARAMETERS_NORMALIZED != 0 {
                         raw_buffer
                     } else {
@@ -3960,14 +4092,15 @@ unsafe fn secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_SECURE_CONNECT_PORT: u32 = 218;
 
-/// The CSR client connect — port of ReactOS `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`).
+/// The CSR client connect — port of ReactOS `CsrClientConnectToServer` / `CsrpConnectToServer`
+/// (`subsystems/csr/csrlib/connect.c`).
 ///
 /// Called from `CsrClientConnectToServer` (kernel32's `BaseDllInitialize` → the very first thing in
-/// its `DLL_PROCESS_ATTACH`). Builds the `\Windows\ApiPort` PortName + the PORT_VIEW / QoS /
-/// CSR_API_CONNECTINFO stack locals, issues the 9-arg `NtSecureConnectPort` (which the executive's
-/// `csr_client_connect` services — it maps the CSR heap-view + fills LpcWrite + the connectinfo),
-/// then copies `ConnectionInfo.{SharedSectionBase,SharedSectionHeap,SharedStaticServerData}` into the
-/// PEB (`ReadOnlySharedMemoryBase@0x88 / …Heap@0x90 / ReadOnlyStaticServerData@0x98`) — exactly what
+/// its `DLL_PROCESS_ATTACH`). Native subsystem images follow ReactOS' server-process path and avoid
+/// `NtSecureConnectPort`; Win32 clients build the `\Windows\ApiPort` PortName + the PORT_VIEW / QoS /
+/// CSR_API_CONNECTINFO stack locals, issue the 9-arg `NtSecureConnectPort`, then copy
+/// `ConnectionInfo.{SharedSectionBase,SharedSectionHeap,SharedStaticServerData}` into the PEB
+/// (`ReadOnlySharedMemoryBase@0x88 / …Heap@0x90 / ReadOnlyStaticServerData@0x98`) — exactly what
 /// kernel32's `DllMain` reads next (`ASSERT(Peb->ReadOnlyStaticServerData)` +
 /// `BaseStaticServerData = Peb->ReadOnlyStaticServerData[BASESRV=1]`).
 ///
@@ -3989,7 +4122,25 @@ pub unsafe fn csr_client_connect_to_server(
     connection_info_size: *mut u32,
     server_to_server: *mut u8,
 ) -> u64 {
-    // A CSR client (not a server-to-server call).
+    const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
+
+    if CSR_INSIDE_PROCESS.load(Ordering::Relaxed) {
+        if !server_to_server.is_null() {
+            // SAFETY: caller passed a writable byte or NULL (checked).
+            unsafe { core::ptr::write(server_to_server, 1) };
+        }
+        return unsafe { publish_native_csr_static_data() };
+    }
+
+    if unsafe { current_image_subsystem() } == Some(IMAGE_SUBSYSTEM_NATIVE) {
+        CSR_INSIDE_PROCESS.store(true, Ordering::Relaxed);
+        if !server_to_server.is_null() {
+            // SAFETY: caller passed a writable byte or NULL (checked).
+            unsafe { core::ptr::write(server_to_server, 1) };
+        }
+        return unsafe { publish_native_csr_static_data() };
+    }
+
     if !server_to_server.is_null() {
         // SAFETY: caller passed a writable byte or NULL (checked).
         unsafe { core::ptr::write(server_to_server, 0) };
@@ -5935,7 +6086,8 @@ unsafe fn start_pool_worker(worker_state: &AtomicU32, worker_routine: PoolThread
     }
 
     let latch = nt_rtl_work_item::WorkerStartLatch::new();
-    let mut start = nt_rtl_work_item::WorkerStart::new(worker_routine as usize as u64, latch.as_parameter());
+    let mut start =
+        nt_rtl_work_item::WorkerStart::new(worker_routine as usize as u64, latch.as_parameter());
     loop {
         let Some(action) = start.next_action() else {
             worker_state.store(WORKER_STOPPED, Ordering::Release);
@@ -6600,7 +6752,9 @@ unsafe fn apply_registered_wait_cleanup(cleanup: RtlRegisteredWaitCleanup) {
     unsafe { rtl_async_set_event(cleanup.signal_event) };
 }
 
-unsafe fn capture_registered_wait_token(flags: nt_rtl_work_item::WorkItemFlags) -> Result<u64, u32> {
+unsafe fn capture_registered_wait_token(
+    flags: nt_rtl_work_item::WorkItemFlags,
+) -> Result<u64, u32> {
     if !flags.transfers_impersonation() {
         return Ok(0);
     }
@@ -6678,8 +6832,7 @@ pub unsafe fn rtl_register_wait(
         .bits();
     let token = {
         let _guard = unsafe { rtl_async_lock() };
-        let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS)
-            .cast::<RtlRegisteredWaitSlot>();
+        let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
         let mut allocated = None;
         for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
             let slot = unsafe { &mut *slots.add(index) };
@@ -6722,11 +6875,9 @@ pub unsafe fn rtl_register_wait(
     } else {
         let cleanup = {
             let _guard = unsafe { rtl_async_lock() };
-            let Some((index, generation)) = rtl_async_handle_parts(
-                token,
-                RTL_ASYNC_WAIT_KIND,
-                RTL_REGISTERED_WAIT_CAPACITY,
-            ) else {
+            let Some((index, generation)) =
+                rtl_async_handle_parts(token, RTL_ASYNC_WAIT_KIND, RTL_REGISTERED_WAIT_CAPACITY)
+            else {
                 return STATUS_UNSUCCESSFUL_U32;
             };
             let slot = unsafe {
@@ -6745,11 +6896,9 @@ pub unsafe fn rtl_register_wait(
     let deadline_now_ms = unsafe { rtl_async_now_ms() };
     let published = {
         let _guard = unsafe { rtl_async_lock() };
-        let Some((index, generation)) = rtl_async_handle_parts(
-            token,
-            RTL_ASYNC_WAIT_KIND,
-            RTL_REGISTERED_WAIT_CAPACITY,
-        ) else {
+        let Some((index, generation)) =
+            rtl_async_handle_parts(token, RTL_ASYNC_WAIT_KIND, RTL_REGISTERED_WAIT_CAPACITY)
+        else {
             return STATUS_UNSUCCESSFUL_U32;
         };
         let slot = unsafe {
@@ -6825,7 +6974,8 @@ pub unsafe fn rtl_deregister_wait(wait_token: u64, completion_event: u64) -> u32
             return STATUS_CANT_WAIT_U32;
         }
     }
-    let (mode, internal_event) = match unsafe { registered_wait_completion_mode(completion_event) } {
+    let (mode, internal_event) = match unsafe { registered_wait_completion_mode(completion_event) }
+    {
         Ok(mode) => mode,
         Err(status) => return status,
     };
@@ -7085,8 +7235,7 @@ unsafe fn observe_one_registered_timeout(now_ms: u64) -> bool {
         if let Some(model) = slot.model.as_mut() {
             match model.observe_wait(outcome) {
                 Ok(nt_rtl_timer_wait::registered_wait::WaitAction::Invoke {
-                    timed_out,
-                    ..
+                    timed_out, ..
                 }) => {
                     slot.dispatch_pending = true;
                     slot.dispatch_timed_out = timed_out;
@@ -7133,7 +7282,10 @@ unsafe fn registered_wait_snapshot(
             break;
         }
         alertable |= request.alertable;
-        if let Some(remaining) = slot.deadline.and_then(|deadline| deadline.remaining(now_ms)) {
+        if let Some(remaining) = slot
+            .deadline
+            .and_then(|deadline| deadline.remaining(now_ms))
+        {
             timeout = Some(timeout.map_or(remaining, |current: u32| current.min(remaining)));
         }
     }
@@ -7205,8 +7357,7 @@ unsafe fn isolate_failed_registered_waits(now_ms: u64) -> bool {
     let mut entries = [(0u64, 0u64); RTL_REGISTERED_WAIT_CAPACITY];
     let len = {
         let _guard = unsafe { rtl_async_lock() };
-        let slots =
-            core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
+        let slots = core::ptr::addr_of_mut!(RTL_REGISTERED_WAITS).cast::<RtlRegisteredWaitSlot>();
         let mut len = 0usize;
         for index in 0..RTL_REGISTERED_WAIT_CAPACITY {
             let slot = unsafe { &mut *slots.add(index) };
@@ -7232,7 +7383,9 @@ unsafe fn isolate_failed_registered_waits(now_ms: u64) -> bool {
         } else if status == STATUS_TIMEOUT_U32 {
             None
         } else {
-            Some(nt_rtl_timer_wait::registered_wait::WaitOutcome::Failed(status))
+            Some(nt_rtl_timer_wait::registered_wait::WaitOutcome::Failed(
+                status,
+            ))
         };
         if let Some(outcome) = outcome {
             handled |= unsafe { observe_registered_wait(token, outcome, now_ms) };
@@ -7453,9 +7606,7 @@ unsafe fn rtl_async_execute_one_completion(timeout: Option<i64>) -> Result<bool,
     let routine: CompletionRoutine = unsafe { core::mem::transmute(key as usize) };
     let (error, transferred) =
         nt_ntdll::rtl::status::io_completion_callback_arguments(io_status[0] as u32, io_status[1]);
-    unsafe {
-        routine(error, transferred, apc_context as *mut c_void)
-    };
+    unsafe { routine(error, transferred, apc_context as *mut c_void) };
     Ok(true)
 }
 
@@ -7503,11 +7654,13 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
     if parameter.is_null()
         || !unsafe { nt_rtl_work_item::WorkerStartLatch::acknowledge_parameter(parameter) }
     {
-        unsafe { exit_work_pool_thread(
-            STATUS_INVALID_PARAMETER_U32,
-            &RTL_SCHEDULER_WORKER_STATE,
-            &RTL_SCHEDULER_WORKER_TID,
-        ) };
+        unsafe {
+            exit_work_pool_thread(
+                STATUS_INVALID_PARAMETER_U32,
+                &RTL_SCHEDULER_WORKER_STATE,
+                &RTL_SCHEDULER_WORKER_TID,
+            )
+        };
     }
     RTL_SCHEDULER_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
     RTL_SCHEDULER_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
@@ -7515,12 +7668,12 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
     loop {
         if let Some(control) = unsafe { next_registered_wait_control() } {
             match control {
-                RtlRegisteredWaitControl::Dispatch(dispatch) => {
-                    unsafe { execute_registered_wait_dispatch(dispatch) }
-                }
-                RtlRegisteredWaitControl::Cleanup(cleanup) => {
-                    unsafe { apply_registered_wait_cleanup(cleanup) }
-                }
+                RtlRegisteredWaitControl::Dispatch(dispatch) => unsafe {
+                    execute_registered_wait_dispatch(dispatch)
+                },
+                RtlRegisteredWaitControl::Cleanup(cleanup) => unsafe {
+                    apply_registered_wait_cleanup(cleanup)
+                },
             }
             continue;
         }
@@ -7538,11 +7691,13 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
             None => {
                 let wake_event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
                 if wake_event == 0 {
-                    unsafe { exit_work_pool_thread(
-                        STATUS_UNSUCCESSFUL_U32,
-                        &RTL_SCHEDULER_WORKER_STATE,
-                        &RTL_SCHEDULER_WORKER_TID,
-                    ) };
+                    unsafe {
+                        exit_work_pool_thread(
+                            STATUS_UNSUCCESSFUL_U32,
+                            &RTL_SCHEDULER_WORKER_STATE,
+                            &RTL_SCHEDULER_WORKER_TID,
+                        )
+                    };
                 }
                 let snapshot_now = unsafe { rtl_async_now_ms() };
                 let (wait_set, wait_timeout, alertable) =
@@ -7555,18 +7710,16 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
                 let mut handles = [0u64; RTL_REGISTERED_WAIT_CAPACITY + 1];
                 let handle_count = match wait_set.write_handles(wake_event, &mut handles) {
                     Ok(count) => count,
-                    Err(_) => unsafe { exit_work_pool_thread(
-                        STATUS_UNSUCCESSFUL_U32,
-                        &RTL_SCHEDULER_WORKER_STATE,
-                        &RTL_SCHEDULER_WORKER_TID,
-                    ) },
+                    Err(_) => unsafe {
+                        exit_work_pool_thread(
+                            STATUS_UNSUCCESSFUL_U32,
+                            &RTL_SCHEDULER_WORKER_STATE,
+                            &RTL_SCHEDULER_WORKER_TID,
+                        )
+                    },
                 };
                 let wait_status = unsafe {
-                    rtl_async_wait_many(
-                        &handles[..handle_count],
-                        alertable,
-                        combined_timeout,
-                    )
+                    rtl_async_wait_many(&handles[..handle_count], alertable, combined_timeout)
                 };
                 let observed_at = unsafe { rtl_async_now_ms() };
                 match wait_set.decode_status(wait_status) {
@@ -7617,11 +7770,13 @@ pub unsafe extern "system" fn rtlp_completion_worker_thread(parameter: *mut c_vo
     if parameter.is_null()
         || !unsafe { nt_rtl_work_item::WorkerStartLatch::acknowledge_parameter(parameter) }
     {
-        unsafe { exit_work_pool_thread(
-            STATUS_INVALID_PARAMETER_U32,
-            &RTL_COMPLETION_WORKER_STATE,
-            &RTL_COMPLETION_WORKER_TID,
-        ) };
+        unsafe {
+            exit_work_pool_thread(
+                STATUS_INVALID_PARAMETER_U32,
+                &RTL_COMPLETION_WORKER_STATE,
+                &RTL_COMPLETION_WORKER_TID,
+            )
+        };
     }
     RTL_COMPLETION_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
     RTL_COMPLETION_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
@@ -7629,11 +7784,13 @@ pub unsafe extern "system" fn rtlp_completion_worker_thread(parameter: *mut c_vo
     loop {
         match unsafe { rtl_async_execute_one_completion(None) } {
             Ok(true) | Ok(false) => {}
-            Err(status) => unsafe { exit_work_pool_thread(
-                status,
-                &RTL_COMPLETION_WORKER_STATE,
-                &RTL_COMPLETION_WORKER_TID,
-            ) },
+            Err(status) => unsafe {
+                exit_work_pool_thread(
+                    status,
+                    &RTL_COMPLETION_WORKER_STATE,
+                    &RTL_COMPLETION_WORKER_TID,
+                )
+            },
         }
     }
 }
@@ -8144,15 +8301,13 @@ unsafe fn rxact_open_target_key(
     if action_type == nt_ntdll::rtl::rxact::RXACT_DELETE_KEY {
         // SAFETY: stack-owned OA; NtOpenKey(KeyHandle, DELETE, OA) — SSN 125, 3 args.
         unsafe {
-            let oa =
-                inline_object_attributes(&mut oa_slot, root_directory, key_name, OBJ_CASE_INSENSITIVE);
-            syscall4(
-                SSN_NT_OPEN_KEY,
-                key_handle_out as u64,
-                ACCESS_DELETE,
-                oa,
-                0,
-            ) as u32
+            let oa = inline_object_attributes(
+                &mut oa_slot,
+                root_directory,
+                key_name,
+                OBJ_CASE_INSENSITIVE,
+            );
+            syscall4(SSN_NT_OPEN_KEY, key_handle_out as u64, ACCESS_DELETE, oa, 0) as u32
         }
     } else if action_type == nt_ntdll::rtl::rxact::RXACT_SET_VALUE_KEY {
         let mut disposition: u32 = 0;
@@ -8235,7 +8390,8 @@ unsafe fn rxact_commit(context: u64) -> u32 {
         if action.action_type == nt_ntdll::rtl::rxact::RXACT_DELETE_KEY {
             if by_handle {
                 // SAFETY: NtDeleteKey(KeyHandle) — SSN 66, 1 arg.
-                let status = unsafe { syscall4(SSN_NT_DELETE_KEY, action.key_handle, 0, 0, 0) as u32 };
+                let status =
+                    unsafe { syscall4(SSN_NT_DELETE_KEY, action.key_handle, 0, 0, 0) as u32 };
                 if (status as i32) < 0 {
                     return status;
                 }
@@ -8243,12 +8399,7 @@ unsafe fn rxact_commit(context: u64) -> u32 {
                 let mut handle: u64 = 0;
                 // SAFETY: opens the key named by the record.
                 let status = unsafe {
-                    rxact_open_target_key(
-                        root_directory,
-                        action.action_type,
-                        key_name,
-                        &mut handle,
-                    )
+                    rxact_open_target_key(root_directory, action.action_type, key_name, &mut handle)
                 };
                 if (status as i32) >= 0 {
                     // SAFETY: NtDeleteKey then NtClose on the handle we just opened.
@@ -8688,7 +8839,10 @@ pub unsafe extern "system" fn rtl_initialize_rxact(
     let context = context as u64;
     // SAFETY: RXactInitializeContext — Data = NULL, CanUseHandles = TRUE (rxact.c:62).
     unsafe {
-        core::ptr::write_unaligned((context + RXACT_CTX_ROOT_DIRECTORY) as *mut u64, root_directory);
+        core::ptr::write_unaligned(
+            (context + RXACT_CTX_ROOT_DIRECTORY) as *mut u64,
+            root_directory,
+        );
         core::ptr::write_unaligned((context + RXACT_CTX_KEY_HANDLE) as *mut u64, key_handle);
         core::ptr::write_unaligned((context + RXACT_CTX_CAN_USE_HANDLES) as *mut u8, 1);
         core::ptr::write_unaligned((context + RXACT_CTX_DATA) as *mut u64, 0);
@@ -10183,12 +10337,9 @@ pub unsafe fn rtl_dos_search_path_u(
     } else {
         Some(unsafe { core::slice::from_raw_parts(extension, wlen(extension)) })
     };
-    let Ok(candidates) = nt_ntdll::rtl::path::dos_search_path_candidates(
-        0,
-        path_units,
-        file_units,
-        extension_units,
-    ) else {
+    let Ok(candidates) =
+        nt_ntdll::rtl::path::dos_search_path_candidates(0, path_units, file_units, extension_units)
+    else {
         return 0;
     };
 

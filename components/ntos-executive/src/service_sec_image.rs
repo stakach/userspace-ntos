@@ -6482,12 +6482,9 @@ pub(crate) unsafe fn service_sec_image(
                         });
                     if completed {
                         result = 0;
-                    } else if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) != 0 {
-                        print_str(b"[csr-api] real request path unavailable before worker resume -> modeled fallback\n");
-                        result = nt_handler.model_csr_request_reply(csr_request_message) as u64;
                     } else {
                         CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        print_str(b"[csr-api] real request path failed after worker resume -> failing request\n");
+                        print_str(b"[csr-api] real CsrApiRequestThread rendezvous failed -> failing request\n");
                         result = 0xC0000001;
                         handled = false;
                     }
