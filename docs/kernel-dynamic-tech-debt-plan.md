@@ -55,7 +55,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### D. Driver, Device, And Registry Discovery
 
-- `[ ]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
+- `[~]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
   driven driver objects.
 - `[~]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
@@ -700,3 +700,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   this is still a mirror, not the final Configuration Manager/device-interface path; D3 remains open
   to feed these keys from the real SYSTEM hive and replace the video `DEVICE_OBJECT` placeholder with
   a driver-created device object.
+- D1 started. The first dynamic driver-launch proof no longer hardcodes
+  `reactos\system32\drivers\npfs.sys` or an executive-selected FSD class. The rootserver reads the
+  real SYSTEM hive `ControlSet001\Services\Npfs` service key, requires boot/system `Start`, derives
+  FSD/device class from `Type`, normalizes NT/SystemRoot `ImagePath` values into the mounted ReactOS
+  path, and passes that path/class to the existing isolated `load_driver` path. Missing or unsupported
+  registry state now fails visibly instead of falling back to a synthetic launch. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs`,
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. Review adjustment: D1 remains open for service-control
+  driven launch beyond this NPFS proof and for the win32k GDI/display/keyboard preloads that still
+  need real driver object ownership.
