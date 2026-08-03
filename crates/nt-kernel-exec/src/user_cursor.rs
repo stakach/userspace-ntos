@@ -181,6 +181,13 @@ impl<const ENTRIES: usize, const PROMOTED: usize> GlobalCursorMirror<ENTRIES, PR
         }
     }
 
+    pub fn clear(&mut self) {
+        self.entries.fill(CursorCacheEntry::EMPTY);
+        self.promoted.fill(0);
+        self.next_entry = 0;
+        self.next_promoted = 0;
+    }
+
     /// Record a real key and handle assigned by successful `NtUserSetCursorIconData`.
     pub fn observe_identity(&mut self, key: &CursorLookupKey, handle: u32) {
         if handle == 0 || ENTRIES == 0 {

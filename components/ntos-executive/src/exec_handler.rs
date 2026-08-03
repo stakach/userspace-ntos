@@ -285,7 +285,94 @@ unsafe fn publish_time_zone(
     }
 }
 
+#[inline(never)]
+fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
+    let mut v = alloc::vec::Vec::with_capacity(192);
+    v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
+    for d in [
+        b"??".as_slice(),
+        b"device",
+        b"global??",
+        b"knowndlls",
+        b"basenamedobjects",
+        b"sessions",
+        b"dosdevices",
+        b"windows",
+        b"objecttypes",
+        b"driver",
+        b"filesystem",
+        b"security",
+    ] {
+        v.push(ObjEntry::dir(d, 0));
+    }
+    let windows = v
+        .iter()
+        .position(|entry| entry.parent == 0 && entry.name() == b"windows")
+        .expect("pre-created Windows object directory");
+    v.push(ObjEntry::dir(b"windowstations", windows as u8));
+    v
+}
+
+struct BootstrapProcessManagerSeed {
+    pm: nt_process::ProcessManager,
+    pids: [nt_process::ProcessId; 3],
+    main_tids: [nt_process::ThreadId; 3],
+    pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3],
+}
+
+#[inline(never)]
+fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
+    let mut pm = nt_process::ProcessManager::new();
+    let mut bootstrap_pids: [nt_process::ProcessId; 3] = [0; 3];
+    let mut bootstrap_main_tids: [nt_process::ThreadId; 3] = [0; 3];
+    let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3] =
+        [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
+
+    pm.set_handle_no_reuse(true);
+    pm.reserve_modules(64);
+    PM_PROC_COUNT.store(0, Ordering::Relaxed);
+    PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
+    PM_IDENTITY_OK.store(0, Ordering::Relaxed);
+    PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
+    reset_hosted_gate_metadata();
+    PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
+    HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
+    PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
+
+    let smss_pid = pm.create_process("smss.exe", None, None);
+    let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
+    let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
+    bootstrap_pids.copy_from_slice(&[smss_pid, csrss_pid, winlogon_pid]);
+    for &pid in &bootstrap_pids {
+        let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
+    }
+    for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+        if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+            bootstrap_main_tids[pi] = tid;
+        }
+    }
+    for (pi, &pid) in bootstrap_pids.iter().enumerate() {
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
+                bootstrap_pool_tids[pi][slot] = tid;
+            }
+        }
+    }
+    for &pid in &bootstrap_pids {
+        pm.reserve_handles(pid, PM_HANDLE_RESERVE);
+    }
+
+    BootstrapProcessManagerSeed {
+        pm,
+        pids: bootstrap_pids,
+        main_tids: bootstrap_main_tids,
+        pool_tids: bootstrap_pool_tids,
+    }
+}
+
 impl ExecNtHandler {
+    #[inline(never)]
     pub(crate) unsafe fn initialize_in(
         slot: *mut ExecNtHandler,
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
@@ -399,191 +486,122 @@ impl ExecNtHandler {
         }
         let time_zone_information = seed_time_zone(hive.as_ref());
         unsafe { publish_time_zone(time_zone_information, nt_system_time_100ns()) };
-        let mut pm = nt_process::ProcessManager::new();
-        let mut bootstrap_pids: [nt_process::ProcessId; 3] = [0; 3];
-        let mut bootstrap_main_tids: [nt_process::ThreadId; 3] = [0; 3];
-        let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3] =
-            [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
-        // Path 1b: append-only handle values. The executive hands each hosted process its
-        // OWN dense per-process handle VALUES (real NT), then indexes external state (the
-        // per-pi DLL registry, EXE section scalars) by those values. NT-style slot reuse
-        // would recycle a value while stale bindings to the old value still exist ->
-        // mis-routing the next open; append-only keeps every value monotonic for the run.
-        pm.set_handle_no_reuse(true);
-        // Dbgk module tracking (`DbgkMapViewOfSection`'s `PEB->Ldr` equivalent): reserve the
-        // table HERE, below the per-syscall heap mark, so a later IMAGE-view record never
-        // reallocates under the bump reset. It stays EMPTY unless a DEBUG_OBJECT exists.
-        pm.reserve_modules(64);
-        PM_PROC_COUNT.store(0, Ordering::Relaxed);
-        PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
-        PM_IDENTITY_OK.store(0, Ordering::Relaxed);
-        PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
-        reset_hosted_gate_metadata();
-        PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
-        HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
-        PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
-        let smss_pid = pm.create_process("smss.exe", None, None);
-        let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
-        let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
-        bootstrap_pids.copy_from_slice(&[smss_pid, csrss_pid, winlogon_pid]);
-        for &pid in &bootstrap_pids {
-            let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
-        }
-        // Main ETHREADs are created before pools so the bootstrap main tids preserve the old
-        // identity sequence. Later hosted processes get the same setup at successful
-        // `NtCreateProcess[Ex]`.
-        for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-            if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                bootstrap_main_tids[pi] = tid;
-            }
-        }
-        for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-            for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-                if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                    let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
-                    bootstrap_pool_tids[pi][slot] = tid;
+        let BootstrapProcessManagerSeed {
+            pm,
+            pids: bootstrap_pids,
+            main_tids: bootstrap_main_tids,
+            pool_tids: bootstrap_pool_tids,
+        } = seed_bootstrap_process_manager();
+        macro_rules! write_field {
+            ($field:ident, $value:expr) => {
+                unsafe {
+                    core::ptr::addr_of_mut!((*slot).$field).write($value);
                 }
-            }
+            };
         }
-        for &pid in &bootstrap_pids {
-            pm.reserve_handles(pid, PM_HANDLE_RESERVE);
-        }
-        core::ptr::write(
-            slot,
-            ExecNtHandler {
-                hive,
-                security_hive,
-                sam_hive,
-                software_hive,
-                hive_mounts,
-                hive_mounts_dirty: false,
-                time_zone_information,
-                obj_ns: {
-                    let mut v = alloc::vec::Vec::with_capacity(192);
-                    v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
-                                                      // The standard top-level directories the object manager pre-creates. SmpInit opens
-                                                      // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
-                                                      // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
-                                                      // Names are stored folded (lowercase), matching obj lookups.
-                    for d in [
-                        b"??".as_slice(),
-                        b"device",
-                        b"global??",
-                        b"knowndlls",
-                        b"basenamedobjects",
-                        b"sessions",
-                        b"dosdevices",
-                        b"windows",
-                        b"objecttypes",
-                        b"driver",
-                        b"filesystem",
-                        b"security",
-                    ] {
-                        v.push(ObjEntry::dir(d, 0));
-                    }
-                    let windows = v
-                        .iter()
-                        .position(|entry| entry.parent == 0 && entry.name() == b"windows")
-                        .expect("pre-created Windows object directory");
-                    v.push(ObjEntry::dir(b"windowstations", windows as u8));
-                    v
-                },
-                events: nt_kernel_exec::EventStore::with_capacity(192),
-                semaphores: nt_kernel_exec::SemaphoreStore::with_capacity(192),
-                mutants: nt_kernel_exec::MutantStore::with_capacity(192),
-                global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
-                    GLOBAL_ATOM_CAPACITY,
-                )
-                .unwrap(),
-                io_completion_ports: nt_io_completion::CompletionPortTable::new(),
-                file_completion: nt_io_completion::FileCompletionTable::new(),
-                directory_opens: ExecDirectoryOpens::reset(),
-                pi: 0,
-                current_tid: 0,
-                current_badge: 0,
-                post_action: ExecPostAction::None,
-                stop: false,
-                next_handle: FAKE_HANDLE,
-                out_writes: [(0, 0); 8],
-                out_writes_n: 0,
-                loop_ctx: None,
-                exe_spawn_request: None,
-                thread_spawn_request: None,
-                remote_thread_request: None,
-                wait_park_event: -1,
-                wait_deadline_100ns: u64::MAX,
-                keyed_wait_key: u64::MAX,
-                keyed_wait_deadline_100ns: u64::MAX,
-                delay_requested: false,
-                delay_interval_100ns: 0,
-                delay_alertable: false,
-                io_completion_park_port: -1,
-                io_completion_key_out: 0,
-                io_completion_apc_out: 0,
-                io_completion_iosb_out: 0,
-                io_completion_deadline_100ns: u64::MAX,
-                io_completion_wake: None,
-                io_signal_event: -1,
-                pipe_park_fid: 0,
-                pipe_park_buffer_va: 0,
-                pipe_park_buffer_len: 0,
-                pipe_park_iosb_va: 0,
-                pipe_park_apc_context: 0,
-                pipe_park_event_obj_idx: u64::MAX,
-                pipe_park_transceive: false,
-                pipe_park_is_write: false,
-                dbgk_block_request: false,
-                pipe_write_redrive: false,
-                pipe_listen_fid: 0,
-                pipe_listen_event_handle: 0,
-                pipe_listen_iosb_va: 0,
-                pipe_connect_redrive: 0,
-                anon_event_seq: 0,
-                lpc_rendezvous_conn: 0,
-                lpc_rendezvous_out: 0,
-                sm_request_port: 0,
-                sm_request_message: 0,
-                sm_reply_message: 0,
-                csr_request_port: 0,
-                csr_request_message: 0,
-                csr_reply_message: 0,
-                csr_start_request: 0,
-                csr_rendezvous_conn: 0,
-                csr_rendezvous_out: 0,
-                // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
-                // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
-                lpc_connections: alloc::vec::Vec::with_capacity(16),
-                winlogon_csr_view: 0,
-                csr_view_mask: 0,
-                // The real Process Manager. smss/csrss/winlogon are the bootstrap set used by the SMSS
-                // subsystem handshake; post-winlogon children are created by the live
-                // `NtCreateProcess[Ex]` path that ReactOS drives. Mechanism tables below are the
-                // authoritative hosted identity map.
-                pm,
-                process_mechanisms: nt_user_host::ProcessMechanismTable::new(),
-                hosted_images,
-                process_vspaces: [0; MAX_PI],
-                temporary_process_slots: [0; MAX_PI],
-                thread_mechanisms: nt_user_host::ThreadMechanismTable::new(),
-                pool_used: [0; MAX_PI],
-                pool_suspended: [0; MAX_PI],
-                thread_runtime: HostedThreadRuntimes::reset(),
-                service_gui_clients: ServiceGuiClientRuntimes::reset(),
-                win32k_session: Win32kSessionRuntime::reset(),
-                token_store: nt_security::TokenStore::with_capacity(64),
-                token_dirty: false,
-                process_dirty: false,
-                // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
-                // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
-                // runtime and is retained past the per-syscall bump reset because the loop pins the heap
-                // high-water mark past each mutation (see `overlay_dirty`). 64 keys is ample for the
-                // SCM's volatile-key creation (the boot creates only a handful).
-                overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
-                overlay_dirty: false,
-                dll_loaded_dirty: false,
-                writable_fs_dirty: false,
-            },
+        write_field!(hive, hive);
+        write_field!(security_hive, security_hive);
+        write_field!(sam_hive, sam_hive);
+        write_field!(software_hive, software_hive);
+        write_field!(hive_mounts, hive_mounts);
+        write_field!(hive_mounts_dirty, false);
+        write_field!(time_zone_information, time_zone_information);
+        write_field!(obj_ns, build_initial_object_namespace());
+        write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
+        write_field!(
+            semaphores,
+            nt_kernel_exec::SemaphoreStore::with_capacity(192)
         );
+        write_field!(mutants, nt_kernel_exec::MutantStore::with_capacity(192));
+        write_field!(
+            global_atoms,
+            nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(GLOBAL_ATOM_CAPACITY).unwrap()
+        );
+        write_field!(
+            io_completion_ports,
+            nt_io_completion::CompletionPortTable::new()
+        );
+        write_field!(
+            file_completion,
+            nt_io_completion::FileCompletionTable::new()
+        );
+        write_field!(directory_opens, ExecDirectoryOpens::reset());
+        write_field!(pi, 0);
+        write_field!(current_tid, 0);
+        write_field!(current_badge, 0);
+        write_field!(post_action, ExecPostAction::None);
+        write_field!(stop, false);
+        write_field!(next_handle, FAKE_HANDLE);
+        write_field!(out_writes, [(0, 0); 8]);
+        write_field!(out_writes_n, 0);
+        write_field!(loop_ctx, None);
+        write_field!(exe_spawn_request, None);
+        write_field!(thread_spawn_request, None);
+        write_field!(remote_thread_request, None);
+        write_field!(wait_park_event, -1);
+        write_field!(wait_deadline_100ns, u64::MAX);
+        write_field!(keyed_wait_key, u64::MAX);
+        write_field!(keyed_wait_deadline_100ns, u64::MAX);
+        write_field!(delay_requested, false);
+        write_field!(delay_interval_100ns, 0);
+        write_field!(delay_alertable, false);
+        write_field!(io_completion_park_port, -1);
+        write_field!(io_completion_key_out, 0);
+        write_field!(io_completion_apc_out, 0);
+        write_field!(io_completion_iosb_out, 0);
+        write_field!(io_completion_deadline_100ns, u64::MAX);
+        write_field!(io_completion_wake, None);
+        write_field!(io_signal_event, -1);
+        write_field!(pipe_park_fid, 0);
+        write_field!(pipe_park_buffer_va, 0);
+        write_field!(pipe_park_buffer_len, 0);
+        write_field!(pipe_park_iosb_va, 0);
+        write_field!(pipe_park_apc_context, 0);
+        write_field!(pipe_park_event_obj_idx, u64::MAX);
+        write_field!(pipe_park_transceive, false);
+        write_field!(pipe_park_is_write, false);
+        write_field!(dbgk_block_request, false);
+        write_field!(pipe_write_redrive, false);
+        write_field!(pipe_listen_fid, 0);
+        write_field!(pipe_listen_event_handle, 0);
+        write_field!(pipe_listen_iosb_va, 0);
+        write_field!(pipe_connect_redrive, 0);
+        write_field!(anon_event_seq, 0);
+        write_field!(lpc_rendezvous_conn, 0);
+        write_field!(lpc_rendezvous_out, 0);
+        write_field!(sm_request_port, 0);
+        write_field!(sm_request_message, 0);
+        write_field!(sm_reply_message, 0);
+        write_field!(csr_request_port, 0);
+        write_field!(csr_request_message, 0);
+        write_field!(csr_reply_message, 0);
+        write_field!(csr_start_request, 0);
+        write_field!(csr_rendezvous_conn, 0);
+        write_field!(csr_rendezvous_out, 0);
+        write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
+        write_field!(winlogon_csr_view, 0);
+        write_field!(csr_view_mask, 0);
+        write_field!(pm, pm);
+        write_field!(
+            process_mechanisms,
+            nt_user_host::ProcessMechanismTable::new()
+        );
+        write_field!(hosted_images, hosted_images);
+        write_field!(process_vspaces, [0; MAX_PI]);
+        write_field!(temporary_process_slots, [0; MAX_PI]);
+        write_field!(thread_mechanisms, nt_user_host::ThreadMechanismTable::new());
+        write_field!(pool_used, [0; MAX_PI]);
+        write_field!(pool_suspended, [0; MAX_PI]);
+        write_field!(thread_runtime, HostedThreadRuntimes::reset());
+        write_field!(service_gui_clients, ServiceGuiClientRuntimes::reset());
+        write_field!(win32k_session, Win32kSessionRuntime::reset());
+        write_field!(token_store, nt_security::TokenStore::with_capacity(64));
+        write_field!(token_dirty, false);
+        write_field!(process_dirty, false);
+        write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
+        write_field!(overlay_dirty, false);
+        write_field!(dll_loaded_dirty, false);
+        write_field!(writable_fs_dirty, false);
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];

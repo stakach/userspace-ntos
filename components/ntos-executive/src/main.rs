@@ -11089,6 +11089,7 @@ struct ExecNtHandler {
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
     core::mem::MaybeUninit::uninit();
 
+#[inline(never)]
 unsafe fn reset_exec_nt_handler(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
 ) -> &'static mut ExecNtHandler {
@@ -16090,8 +16091,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         if win32k_size > 0 && win32kbuf_start != 0 {
             // Executive-side PTs + frames: CODE (544 frames, 2 PTs, mapped RW to load into),
-            // POOL (256), DATA (4), and the shared handoff page. DATA + SHARED are mapped in the
-            // executive (load_into writes the cells + the entry rva); POOL is host-only.
+            // POOL, DATA, and the shared handoff page. DATA + SHARED are mapped in the executive
+            // (load_into writes the cells + the entry rva); POOL is also mapped because the
+            // executive-side win32k bridge allocates provider-owned object bodies there.
             for p in 0..2u64 {
                 let cpt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
@@ -16119,6 +16121,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = alloc_frame();
             }
             WIN32K_POOL_FRAME_BASE.store(pool_base, Ordering::Relaxed);
+            for page_table in 0..(win32k_subsystem::WIN32K_POOL_FRAMES + 511) / 512 {
+                let pt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                let _ = paging_struct_map(
+                    pt,
+                    LBL_X86_PAGE_TABLE_MAP,
+                    win32k_subsystem::WIN32K_POOL_VADDR + page_table * 0x20_0000,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            for frame in 0..win32k_subsystem::WIN32K_POOL_FRAMES {
+                let _ = page_map(
+                    pool_base + frame,
+                    win32k_subsystem::WIN32K_POOL_VADDR + frame * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
             let data_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES {
                 let _ = alloc_frame();
@@ -16161,7 +16181,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             }
             // The aux-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718 + ARG
-            // @0x071A; the pool is host-only, in its own window, so not mapped in the executive).
+            // @0x071A; the pool has its own executive-visible window above).
             let ppt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
             let _ = paging_struct_map(

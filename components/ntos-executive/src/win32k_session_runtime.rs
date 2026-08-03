@@ -63,8 +63,36 @@ impl Win32kSessionRuntimeState {
         }
     }
 
+    #[inline(never)]
     fn clear(&mut self) {
-        *self = Self::new();
+        self.stock_objects.clear();
+        self.cursor_mirror.clear();
+        self.builtin_class_mirror.clear();
+        self.class_atom_name_mirror.clear();
+        self.stock_objects_observed = 0;
+        self.service_stock_hits = 0;
+        self.service_stock_misses = 0;
+        self.cursor_identities_observed = 0;
+        self.cursor_promotions = 0;
+        self.userinit_cursor_hits = 0;
+        self.userinit_cursor_handle = 0;
+        self.builtin_classes_observed = 0;
+        self.userinit_builtin_class_hits = 0;
+        self.userinit_builtin_class_misses = 0;
+        self.userinit_builtin_class_mask = 0;
+        self.userinit_dialog_class_atom = 0;
+        self.class_atom_names_observed = 0;
+        self.class_atom_name_serves = 0;
+        self.class_atom_name_failures = 0;
+        self.scrollbar_class_atom = 0;
+        self.scrollbar_class_cursor = 0;
+        self.userinit_scrollbar_queries = 0;
+        self.userinit_scrollbar_copyouts = 0;
+        self.userinit_scrollbar_errors = 0;
+        self.userinit_scrollbar_atom = 0;
+        self.userinit_scrollbar_style = 0;
+        self.userinit_scrollbar_extra = 0;
+        self.userinit_scrollbar_proc = 0;
     }
 
     fn observe_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
@@ -242,6 +270,7 @@ pub(crate) struct Win32kSessionAtomScrollbarCounters {
 }
 
 impl Win32kSessionRuntime {
+    #[inline(never)]
     pub(crate) fn reset() -> Self {
         let state = core::ptr::addr_of_mut!(WIN32K_SESSION_RUNTIME_WORK);
         // SAFETY: `service_sec_image` is serialized and the live handler is the sole owner.

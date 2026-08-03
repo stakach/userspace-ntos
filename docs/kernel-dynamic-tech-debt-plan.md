@@ -989,3 +989,24 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: D3 remains open for replacing the bounded win32k
   registry mirror with direct Configuration Manager/device-interface service, but the Video0 object
   body is no longer a compile-time placeholder cell.
+- A2/C3/F1 repair. The SEC_IMAGE service loop and `ExecNtHandler` construction no longer stage
+  large hosted-image, process, and win32k session runtime state on the bounded rootserver stack.
+  The loop consumes bootstrap load specs one at a time, moves serialized work arrays into BSS slots,
+  clears win32k session mirrors in place, and initializes `ExecNtHandler` field-by-field inside its
+  existing `MaybeUninit` slot instead of returning a large aggregate by value. Release prologues are
+  back under the 16 KiB stack budget (`service_sec_image` about `0x1cf8`, `initialize_in` about
+  `0x2d68`). The same repair maps the registered win32k pool into the executive VSpace because the
+  dynamic bridge allocates provider-owned object bodies through win32k's own pool allocator. There
+  is no synthetic object fallback: missing pool mapping still faults visibly, and successful object
+  bodies come from provider-owned pool state. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `components/ntos-executive/build.sh`, and
+  `.tmp/full-boot-service-stack-final-20260804-014218.log` passed the old SEC_IMAGE and win32k-pool
+  faults, reached CSRSS real loader/session startup, initialized win32k for CSRSS, spawned winlogon
+  via SMSS/CSR, drove real winlogon win32k/user callbacks with natural desktop framebuffer readback,
+  and continued into dynamic `services.exe` process/thread GUI attach before the run was manually
+  stopped for checkpointing. Review adjustment: this closes the stack regression introduced by the
+  runtime-dynamic cleanup, but A2 remains open for replacing the bootstrap manifest/runtime-layout
+  descriptors with a session-manager handoff, C3/F1 remain open for the remaining provider-owned
+  service GUI/GDI model, and F2/F3 remain open for final real WM_PAINT queue and dialog framebuffer
+  proof.

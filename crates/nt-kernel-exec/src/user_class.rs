@@ -149,6 +149,11 @@ impl<const N: usize> BuiltinClassMirror<N> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.entries.fill(Entry::EMPTY);
+        self.next = 0;
+    }
+
     pub fn observe(&mut self, key: &BuiltinClassKey, atom: u16) {
         if N == 0 || atom == 0 {
             return;
@@ -218,6 +223,11 @@ impl<const N: usize> ClassAtomNameMirror<N> {
             entries: [ClassAtomNameEntry::EMPTY; N],
             next: 0,
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.fill(ClassAtomNameEntry::EMPTY);
+        self.next = 0;
     }
 
     pub fn observe(&mut self, atom: u16, units: &[u16]) -> bool {

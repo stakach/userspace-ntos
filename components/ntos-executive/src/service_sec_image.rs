@@ -20,6 +20,24 @@ static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
+static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
+static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
+static mut SERVICE_DLL_PD_CREATED_WORK: [bool; MAX_PI] = [false; MAX_PI];
+static mut SERVICE_DLL_PT_BITS_WORK: [[u64; DLL_ARENA_PT_WORDS]; MAX_PI] =
+    [[0; DLL_ARENA_PT_WORDS]; MAX_PI];
+static mut SERVICE_HOSTED_BOOTSTRAP_PES_WORK: [Option<nt_pe_loader::PeFile<'static>>;
+    HOSTED_BOOTSTRAP_LOAD_COUNT] = [const { None }; HOSTED_BOOTSTRAP_LOAD_COUNT];
+static mut SERVICE_HOSTED_BOOTSTRAP_POOL_VAS_WORK: [u64; HOSTED_BOOTSTRAP_LOAD_COUNT] =
+    [0; HOSTED_BOOTSTRAP_LOAD_COUNT];
+static mut SERVICE_PROCS_WORK: [ProcExec; MAX_PI] = [ProcExec::empty(); MAX_PI];
+static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<8> = nt_exe_image::ImageTable::new();
+static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog<8> =
+    nt_exe_image::OwnedHostedImageCatalog::new();
+static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
+    HostedLoadedImageTable::new();
+static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue<DELAY_WAITER_N> =
+    nt_delay_execution::Queue::new();
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -148,6 +166,36 @@ fn sec_image_forward_run() -> u64 {
 
 fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
     nt_handler.hosted_thread_tcb(tid).unwrap_or(0)
+}
+
+#[inline(never)]
+unsafe fn reset_service_exe_images_work() -> &'static mut nt_exe_image::ImageTable<8> {
+    let slot = core::ptr::addr_of_mut!(SERVICE_EXE_IMAGES_WORK);
+    core::ptr::write(slot, nt_exe_image::ImageTable::new());
+    &mut *slot
+}
+
+#[inline(never)]
+unsafe fn reset_service_exe_image_catalog_work(
+) -> &'static mut nt_exe_image::OwnedHostedImageCatalog<8> {
+    let slot = core::ptr::addr_of_mut!(SERVICE_EXE_IMAGE_CATALOG_WORK);
+    core::ptr::write(slot, nt_exe_image::OwnedHostedImageCatalog::new());
+    &mut *slot
+}
+
+#[inline(never)]
+unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoadedImageTable {
+    let slot = core::ptr::addr_of_mut!(SERVICE_HOSTED_LOADED_IMAGES_WORK);
+    core::ptr::write(slot, HostedLoadedImageTable::new());
+    &mut *slot
+}
+
+#[inline(never)]
+unsafe fn reset_service_delay_queue_work() -> &'static mut nt_delay_execution::Queue<DELAY_WAITER_N>
+{
+    let slot = core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
+    core::ptr::write(slot, nt_delay_execution::Queue::<DELAY_WAITER_N>::new());
+    &mut *slot
 }
 
 unsafe fn load_hosted_bootstrap_image(
@@ -2451,11 +2499,14 @@ pub(crate) unsafe fn service_sec_image(
     // chain (see FILLED_WORK). Loaded from / saved to `pfilled[pi]` around each dispatch below.
     let filled_pages: &mut [u64; 512] = &mut *core::ptr::addr_of_mut!(FILLED_WORK);
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
-    let mut ssn_ring = [0u16; 32];
-    let mut ssn_ring_badge = [0u8; 32];
+    let ssn_ring = &mut *core::ptr::addr_of_mut!(SERVICE_SSN_RING_WORK);
+    ssn_ring.fill(0);
+    let ssn_ring_badge = &mut *core::ptr::addr_of_mut!(SERVICE_SSN_RING_BADGE_WORK);
+    ssn_ring_badge.fill(0);
     // winlogon-main-only ring (badge==WINLOGON_BADGE) — isolate winlogon's sequence from the
     // services (badge 6) noise that dominates the shared ring, to diagnose the StartLsass wall.
-    let mut wl_ring = [0u16; 48];
+    let wl_ring = &mut *core::ptr::addr_of_mut!(SERVICE_WL_RING_WORK);
+    wl_ring.fill(0);
     let mut wl_ri = 0usize;
     let mut ssn_ri = 0usize;
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
@@ -2463,11 +2514,11 @@ pub(crate) unsafe fn service_sec_image(
     // migrated create-handle handlers and the remaining ladder cases (NtCreateSection/Process/File).
     let mut csrss_process_handle = 0u64;
     // Generic owner-local file/section/spawn state for hosted executable images.
-    let mut exe_images = nt_exe_image::ImageTable::<8>::new();
-    let mut exe_image_catalog = nt_exe_image::OwnedHostedImageCatalog::<8>::new();
+    let exe_images = reset_service_exe_images_work();
+    let exe_image_catalog = reset_service_exe_image_catalog_work();
     reset_hosted_process_runtimes();
     register_loaded_hosted_image(
-        &mut exe_image_catalog,
+        exe_image_catalog,
         smss_bootstrap_image(),
         SMSS_PROCESS_RUNTIME,
         !pe.bytes().is_empty(),
@@ -2479,8 +2530,12 @@ pub(crate) unsafe fn service_sec_image(
     // Per-process (indexed by pi: 0=smss, 1=csrss, 2=winlogon): the DLL page-directory once-flag +
     // a bitset of which arena PT windows are reserved in that process's VSpace. Compact DLLs may
     // share a PT and large DLLs may span several.
-    let mut dll_pd_created = [false; MAX_PI];
-    let mut dll_pt_bits = [[0u64; DLL_ARENA_PT_WORDS]; MAX_PI];
+    let dll_pd_created = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PD_CREATED_WORK);
+    dll_pd_created.fill(false);
+    let dll_pt_bits = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PT_BITS_WORK);
+    for entry in dll_pt_bits.iter_mut() {
+        entry.fill(0);
+    }
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -2495,25 +2550,37 @@ pub(crate) unsafe fn service_sec_image(
     // call has no FS/pool, so skip the reads there. The bootstrap manifest supplies disk paths,
     // image identity, and runtime layout; each loaded PE is relocated to PE_LOAD_BASE and published
     // into the loaded-image registry below.
-    let bootstrap_load_specs = hosted_bootstrap_load_specs();
-    let csrss_pi = bootstrap_load_specs
-        .iter()
-        .find(|spec| spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem)
-        .map(|spec| spec.image.pi)
-        .expect("bootstrap manifest must include CSRSS");
-    let mut hosted_bootstrap_pes: [Option<nt_pe_loader::PeFile<'static>>;
-        HOSTED_BOOTSTRAP_LOAD_COUNT] = core::array::from_fn(|_| None);
-    let mut hosted_bootstrap_pool_vas = [0u64; HOSTED_BOOTSTRAP_LOAD_COUNT];
-    for (index, spec) in bootstrap_load_specs.iter().copied().enumerate() {
+    let mut csrss_pi = usize::MAX;
+    for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
+        let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
+        if spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem {
+            csrss_pi = spec.image.pi;
+            break;
+        }
+    }
+    assert!(
+        csrss_pi != usize::MAX,
+        "bootstrap manifest must include CSRSS"
+    );
+    let hosted_bootstrap_pes = &mut *core::ptr::addr_of_mut!(SERVICE_HOSTED_BOOTSTRAP_PES_WORK);
+    for entry in hosted_bootstrap_pes.iter_mut() {
+        *entry = None;
+    }
+    let hosted_bootstrap_pool_vas =
+        &mut *core::ptr::addr_of_mut!(SERVICE_HOSTED_BOOTSTRAP_POOL_VAS_WORK);
+    hosted_bootstrap_pool_vas.fill(0);
+    for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
+        let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
         let (loaded_pe, pool_va) =
-            load_hosted_bootstrap_image(&mut exe_image_catalog, ntdll.is_some(), spec);
+            load_hosted_bootstrap_image(exe_image_catalog, ntdll.is_some(), spec);
         hosted_bootstrap_pes[index] = loaded_pe;
         hosted_bootstrap_pool_vas[index] = pool_va;
     }
-    let mut hosted_loaded_images = HostedLoadedImageTable::new();
-    for (index, spec) in bootstrap_load_specs.iter().copied().enumerate() {
+    let hosted_loaded_images = reset_service_hosted_loaded_images_work();
+    for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
+        let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
         register_loaded_hosted_bootstrap_pe(
-            &mut hosted_loaded_images,
+            hosted_loaded_images,
             spec,
             &hosted_bootstrap_pes[index],
             hosted_bootstrap_pool_vas[index],
@@ -2603,11 +2670,10 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let mut nt_handler = reset_exec_nt_handler(
-        &exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<8>,
-    );
+    let mut nt_handler =
+        reset_exec_nt_handler(exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<8>);
     nt_handler.register_main_thread_tcb(0, main_tcb);
-    let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
+    let delay_queue = reset_service_delay_queue_work();
     if ntdll.is_some() {
         publish_kuser_clocks();
         let alias = kuser_page_alias_get(0);
@@ -2647,7 +2713,10 @@ pub(crate) unsafe fn service_sec_image(
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
-    let mut procs = [ProcExec::empty(); MAX_PI];
+    let procs = &mut *core::ptr::addr_of_mut!(SERVICE_PROCS_WORK);
+    for proc in procs.iter_mut() {
+        *proc = ProcExec::empty();
+    }
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler
             .pm_pid_for_pi(i)
@@ -2952,7 +3021,7 @@ pub(crate) unsafe fn service_sec_image(
             && crate::WATCHDOG_ARMED.load(Ordering::Relaxed) == 0
             && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
         {
-            crate::watchdog_arm(&delay_queue);
+            crate::watchdog_arm(delay_queue);
         }
         // Keep the client-side TEB-tail watch armed from winlogon's SPAWN on (bounded by
         // WL_TEB2_MAX_CYCLES). Arming it at the post-logon milestone was measured to be TOO LATE —
@@ -2969,7 +3038,7 @@ pub(crate) unsafe fn service_sec_image(
         let pump_ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
-            delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
+            delay_timer_interrupt(delay_queue, &mut nt_handler);
         }
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
@@ -2990,7 +3059,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex_u64(m0);
                 print_str(b"\n");
             }
-            delay_timer_interrupt(&mut delay_queue, &mut nt_handler);
+            delay_timer_interrupt(delay_queue, &mut nt_handler);
             // ★ THE DEADMAN'S TEETH. `watchdog_on_tick` (inside `recv_full_r12`) has already
             // REPORTED the deadlock; this is where the boot acts on it — quiesce and run the gate,
             // so a deadlock ends as a gate line with a diagnosis instead of `RUNEXIT=124`.
@@ -5488,13 +5557,13 @@ pub(crate) unsafe fn service_sec_image(
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
                     pml4,
-                    procs: &mut procs,
+                    procs,
                     pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
-                    hosted_loaded_images: &hosted_loaded_images as *const HostedLoadedImageTable,
-                    exe_images: &mut exe_images as *mut nt_exe_image::ImageTable<8>,
-                    exe_image_catalog: &mut exe_image_catalog
+                    hosted_loaded_images: hosted_loaded_images as *const HostedLoadedImageTable,
+                    exe_images: exe_images as *mut nt_exe_image::ImageTable<8>,
+                    exe_image_catalog: exe_image_catalog
                         as *mut nt_exe_image::OwnedHostedImageCatalog<8>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
@@ -5521,8 +5590,8 @@ pub(crate) unsafe fn service_sec_image(
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: &mut dll_pd_created as *mut [bool; MAX_PI],
-                    dll_pt_bits: &mut dll_pt_bits as *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
+                    dll_pd_created: dll_pd_created as *mut [bool; MAX_PI],
+                    dll_pt_bits: dll_pt_bits as *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
@@ -5559,7 +5628,7 @@ pub(crate) unsafe fn service_sec_image(
                             let _ = csr_rendezvous(
                                 0,
                                 procs[csrss_pi].pml4,
-                                loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                                loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                                     .expect("CSRSS PE must be registered before CSR API start"),
                                 procs[csrss_pi].img_end,
                                 nt_base,
@@ -5594,7 +5663,7 @@ pub(crate) unsafe fn service_sec_image(
                             let _ = tcb_resume(tcb);
                             if !csr_sb_startup(
                                 procs[csrss_pi].pml4,
-                                loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                                loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                                     .expect("CSRSS PE must be registered before CSR SB startup"),
                                 procs[csrss_pi].img_end,
                                 nt_base,
@@ -5637,11 +5706,8 @@ pub(crate) unsafe fn service_sec_image(
                             SVC_LISTENER_TERMINATED.store(1, Ordering::Relaxed);
                         }
                         let reply_dropped = drop_current_syscall_reply();
-                        let mechanism_deleted = terminate_hosted_thread_mechanism(
-                            tid,
-                            &mut delay_queue,
-                            &mut nt_handler,
-                        );
+                        let mechanism_deleted =
+                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
                         if reply_dropped && mechanism_deleted {
                             PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -5677,11 +5743,8 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                     ExecPostAction::TerminateRemoteThread { tid } => {
-                        let _ = terminate_hosted_thread_mechanism(
-                            tid,
-                            &mut delay_queue,
-                            &mut nt_handler,
-                        );
+                        let _ =
+                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
                     }
                     ExecPostAction::TerminateProcess {
                         process_index,
@@ -5701,13 +5764,13 @@ pub(crate) unsafe fn service_sec_image(
                         let reclaimed = terminate_hosted_process_mechanisms(
                             process_index,
                             preserve_tid,
-                            &mut delay_queue,
+                            delay_queue,
                             &mut nt_handler,
                         );
                         let current_deleted = if drop_reply && current_tid != 0 {
                             terminate_hosted_thread_mechanism(
                                 current_tid,
-                                &mut delay_queue,
+                                delay_queue,
                                 &mut nt_handler,
                             )
                         } else {
@@ -6001,16 +6064,16 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(request) = nt_handler.exe_spawn_request {
                     let is_csrss_spawn = request.leaf().eq_ignore_ascii_case(b"csrss.exe");
                     if let Some(spec) =
-                        hosted_exe_spawn_for(request, &exe_image_catalog, &hosted_loaded_images)
+                        hosted_exe_spawn_for(request, &*exe_image_catalog, &*hosted_loaded_images)
                     {
                         if spec.spawned.load(Ordering::Relaxed) == 0 {
                             match spawn_requested_hosted_exe(
                                 request,
                                 spec,
                                 fault_ep,
-                                &mut procs,
+                                procs,
                                 &mut nt_handler,
-                                &mut exe_images,
+                                exe_images,
                             ) {
                                 Ok(process_handle) if is_csrss_spawn => {
                                     csrss_process_handle = process_handle;
@@ -6030,7 +6093,7 @@ pub(crate) unsafe fn service_sec_image(
                     spawn_requested_local_thread(
                         &mut nt_handler,
                         request,
-                        &procs,
+                        &*procs,
                         pml4,
                         sp,
                         fault_ep,
@@ -6176,7 +6239,7 @@ pub(crate) unsafe fn service_sec_image(
                         nt_end,
                         ntdll.map(|(_, p)| p),
                         procs[csrss_pi].pml4,
-                        loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                        loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                             .expect("CSRSS PE must be registered before SM rendezvous"),
                         procs[csrss_pi].img_end,
                         &reg,
@@ -6233,7 +6296,7 @@ pub(crate) unsafe fn service_sec_image(
                         nt_end,
                         ntdll.map(|(_, p)| p),
                         procs[csrss_pi].pml4,
-                        loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                        loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                             .expect("CSRSS PE must be registered before SM API rendezvous"),
                         procs[csrss_pi].img_end,
                         &reg,
@@ -6252,7 +6315,7 @@ pub(crate) unsafe fn service_sec_image(
                     let csr_request_port = nt_handler.csr_request_port;
                     let csr_request_message = nt_handler.csr_request_message;
                     let csr_reply_message = nt_handler.csr_reply_message;
-                    let completed = loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                    let completed = loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                         .is_some_and(|pe| {
                             csr_api_request_rendezvous(
                                 csr_request_port,
@@ -6297,7 +6360,7 @@ pub(crate) unsafe fn service_sec_image(
                     let have_thread = nt_handler
                         .hosted_thread_tcb_for_role(csrss_pi, HostedThreadRole::CsrApi)
                         .is_some()
-                        && loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi).is_some();
+                        && loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi).is_some();
                     if !have_thread {
                         CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
                         print_str(b"[csr-rdv] no real CSR thread -> failing pending connect\n");
@@ -6312,7 +6375,7 @@ pub(crate) unsafe fn service_sec_image(
                         let client_handle = csr_rendezvous(
                             conn_id,
                             procs[csrss_pi].pml4,
-                            loaded_hosted_pe_by_pi(&hosted_loaded_images, csrss_pi)
+                            loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                                 .expect("CSRSS PE must be registered before CSR rendezvous"),
                             procs[csrss_pi].img_end,
                             nt_base,
@@ -9803,7 +9866,7 @@ pub(crate) unsafe fn service_sec_image(
                     sp,
                     flags,
                 ) {
-                    delay_timer_rearm(&delay_queue);
+                    delay_timer_rearm(delay_queue);
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
@@ -9826,7 +9889,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             if let Some(deadline) = park_delay_deadline {
                 if delay_park(
-                    &mut delay_queue,
+                    delay_queue,
                     deadline,
                     reply_main,
                     resume_ip,
@@ -9870,7 +9933,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
-                    delay_timer_rearm(&delay_queue);
+                    delay_timer_rearm(delay_queue);
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
@@ -9923,7 +9986,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
-                    delay_timer_rearm(&delay_queue);
+                    delay_timer_rearm(delay_queue);
                     // An INDEFINITE (no-deadline) wait by a top-level process is quiesce-relevant: if
                     // every live process is now parked, no signaler remains → run the gate. A
                     // deadline-bounded wait is timer-woken, so it never deadlocks — don't count it.
@@ -9972,7 +10035,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_wait_deadline,
                 ) {
-                    delay_timer_rearm(&delay_queue);
+                    delay_timer_rearm(delay_queue);
                     print_str(b"[wait] pi=");
                     print_u64(pi as u64);
                     print_str(b" NtWaitForMultipleObjects(");
@@ -10262,11 +10325,8 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
                 let mut terminate_victim = |victim_tid: u64| {
-                    let terminated = terminate_hosted_thread_mechanism(
-                        victim_tid,
-                        &mut delay_queue,
-                        &mut nt_handler,
-                    );
+                    let terminated =
+                        terminate_hosted_thread_mechanism(victim_tid, delay_queue, &mut nt_handler);
                     win32k_glue::DeadClientVictimTermination {
                         terminated,
                         tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
@@ -12100,7 +12160,7 @@ pub(crate) unsafe fn service_sec_image(
 
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
-        delay_timer_shutdown(&delay_queue);
+        delay_timer_shutdown(delay_queue);
 
         // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
         //

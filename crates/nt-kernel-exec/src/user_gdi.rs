@@ -20,6 +20,10 @@ impl StockObjectMirror {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.handles.fill(0);
+    }
+
     pub fn observe(&mut self, object_id: u32, handle: u32) -> bool {
         let Some(slot) = self.handles.get_mut(object_id as usize) else {
             return false;

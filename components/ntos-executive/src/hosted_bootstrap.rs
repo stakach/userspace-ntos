@@ -153,9 +153,11 @@ pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
     SMSS_BOOTSTRAP_MANIFEST.image()
 }
 
-pub(crate) fn hosted_bootstrap_load_specs() -> [HostedBootstrapLoadSpec; HOSTED_BOOTSTRAP_LOAD_COUNT]
-{
-    core::array::from_fn(|i| HOSTED_BOOTSTRAP_MANIFEST[i].load_spec())
+pub(crate) fn hosted_bootstrap_load_spec(index: usize) -> Option<HostedBootstrapLoadSpec> {
+    HOSTED_BOOTSTRAP_MANIFEST
+        .get(index)
+        .copied()
+        .map(HostedBootstrapManifestEntry::load_spec)
 }
 
 pub(crate) fn register_loaded_hosted_image(
