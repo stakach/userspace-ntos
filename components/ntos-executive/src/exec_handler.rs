@@ -1827,16 +1827,6 @@ impl ExecNtHandler {
         self.win32k_session.observe_stock_object(object_id, handle)
     }
 
-    pub(crate) fn lookup_service_win32k_stock_object(&mut self, object_id: u32) -> Option<u32> {
-        let hit = self.win32k_session.lookup_stock_object(object_id);
-        if hit.is_some() {
-            self.win32k_session.record_service_stock_hit();
-        } else {
-            self.win32k_session.record_service_stock_miss();
-        }
-        hit
-    }
-
     pub(crate) fn lookup_global_cursor(
         &self,
         key: &nt_kernel_exec::user_cursor::CursorLookupKey,

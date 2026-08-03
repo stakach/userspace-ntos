@@ -1030,3 +1030,12 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `components/ntos-executive/build.sh`, `git diff --check`, and
   `.tmp/full-boot-service-bitmap-no-default-20260804-015323.log` passed through natural framebuffer
   readback, dynamic `services.exe`, the new service bitmap NULL path, and dynamic `lsass.exe` spawn.
+- C3/F1 cleanup. Removed the service `NtGdiGetStockObject` mirror path and deleted the
+  `nt-kernel-exec` stock-handle mirror module. Service stock-object requests now dispatch to the
+  real win32k provider instead of reusing executive-learned handles, while the userinit gate keeps
+  only a small observation counter proving real stock objects were returned by win32k. Review
+  adjustment: F1 remains open for the cursor/class and ScrollBar classinfo service mirrors; C3
+  remains open for proving each remaining service branch is either provider-owned dispatch or a
+  narrow kernel callback. Validation: `rustfmt`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, stale-reference `rg`, and `git diff --check`.

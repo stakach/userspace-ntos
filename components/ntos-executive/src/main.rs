@@ -3181,7 +3181,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
     let cursor_class = win32k_session_cursor_class_counters();
     let atom_scrollbar = win32k_session_atom_scrollbar_counters();
-    let (stock_observed, stock_hits, stock_misses) = win32k_session_stock_counters();
+    let stock_observed = win32k_session_stock_counters();
     let (font_seeds, font_successes, font_failures) = win32k_subsystem::client_system_font_proofs();
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
@@ -3223,10 +3223,6 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(cursor_class.builtin_classes_observed);
     print_str(b" gdi-stock-observed=");
     print_u64(stock_observed);
-    print_str(b" svc-stock-hits/misses=");
-    print_u64(stock_hits);
-    print_str(b"/");
-    print_u64(stock_misses);
     print_str(b" class-hits/misses=");
     print_u64(cursor_class.userinit_builtin_class_hits);
     print_str(b"/");

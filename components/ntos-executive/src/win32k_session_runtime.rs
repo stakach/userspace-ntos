@@ -1,11 +1,11 @@
+const WIN32K_STOCK_OBJECT_COUNT: u32 = 22;
+
 struct Win32kSessionRuntimeState {
-    stock_objects: nt_kernel_exec::user_gdi::StockObjectMirror,
+    stock_object_observed_mask: u32,
     cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror<32, 16>,
     builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror<16>,
     class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror<128>,
     stock_objects_observed: u64,
-    service_stock_hits: u64,
-    service_stock_misses: u64,
     cursor_identities_observed: u64,
     cursor_promotions: u64,
     userinit_cursor_hits: u64,
@@ -32,13 +32,11 @@ struct Win32kSessionRuntimeState {
 impl Win32kSessionRuntimeState {
     const fn new() -> Self {
         Self {
-            stock_objects: nt_kernel_exec::user_gdi::StockObjectMirror::new(),
+            stock_object_observed_mask: 0,
             cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror::new(),
             builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror::new(),
             class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror::new(),
             stock_objects_observed: 0,
-            service_stock_hits: 0,
-            service_stock_misses: 0,
             cursor_identities_observed: 0,
             cursor_promotions: 0,
             userinit_cursor_hits: 0,
@@ -65,13 +63,11 @@ impl Win32kSessionRuntimeState {
 
     #[inline(never)]
     fn clear(&mut self) {
-        self.stock_objects.clear();
+        self.stock_object_observed_mask = 0;
         self.cursor_mirror.clear();
         self.builtin_class_mirror.clear();
         self.class_atom_name_mirror.clear();
         self.stock_objects_observed = 0;
-        self.service_stock_hits = 0;
-        self.service_stock_misses = 0;
         self.cursor_identities_observed = 0;
         self.cursor_promotions = 0;
         self.userinit_cursor_hits = 0;
@@ -96,23 +92,16 @@ impl Win32kSessionRuntimeState {
     }
 
     fn observe_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
-        let observed = self.stock_objects.observe(object_id, handle);
-        if observed {
-            self.stock_objects_observed = self.stock_objects_observed.saturating_add(1);
+        if handle == 0 || object_id >= WIN32K_STOCK_OBJECT_COUNT {
+            return false;
         }
-        observed
-    }
-
-    fn lookup_stock_object(&self, object_id: u32) -> Option<u32> {
-        self.stock_objects.lookup(object_id)
-    }
-
-    fn record_service_stock_hit(&mut self) {
-        self.service_stock_hits = self.service_stock_hits.saturating_add(1);
-    }
-
-    fn record_service_stock_miss(&mut self) {
-        self.service_stock_misses = self.service_stock_misses.saturating_add(1);
+        let bit = 1u32 << object_id;
+        if self.stock_object_observed_mask & bit != 0 {
+            return false;
+        }
+        self.stock_object_observed_mask |= bit;
+        self.stock_objects_observed = self.stock_objects_observed.saturating_add(1);
+        true
     }
 
     fn observe_cursor_identity(
@@ -283,21 +272,6 @@ impl Win32kSessionRuntime {
         unsafe { (&mut *self.state).observe_stock_object(object_id, handle) }
     }
 
-    pub(crate) fn lookup_stock_object(&self, object_id: u32) -> Option<u32> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.state).lookup_stock_object(object_id) }
-    }
-
-    pub(crate) fn record_service_stock_hit(&mut self) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).record_service_stock_hit() };
-    }
-
-    pub(crate) fn record_service_stock_miss(&mut self) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).record_service_stock_miss() };
-    }
-
     pub(crate) fn observe_cursor_identity(
         &mut self,
         key: &nt_kernel_exec::user_cursor::CursorLookupKey,
@@ -425,15 +399,11 @@ impl Win32kSessionRuntime {
     }
 }
 
-pub(crate) fn win32k_session_stock_counters() -> (u64, u64, u64) {
+pub(crate) fn win32k_session_stock_counters() -> u64 {
     let state = core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK);
     // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
     let state = unsafe { &*state };
-    (
-        state.stock_objects_observed,
-        state.service_stock_hits,
-        state.service_stock_misses,
-    )
+    state.stock_objects_observed
 }
 
 pub(crate) fn win32k_session_cursor_class_counters() -> Win32kSessionCursorClassCounters {

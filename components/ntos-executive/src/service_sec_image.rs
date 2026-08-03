@@ -8443,8 +8443,8 @@ pub(crate) unsafe fn service_sec_image(
                 //
                 // The gate is driven by the live EPROCESS image role, not the launch slot:
                 // services.exe and lsass.exe are non-interactive service hosts on a WSS_NOIO window
-                // station, and neither should enter win32k's interactive cursor/class/stock-object
-                // EngCopyBits path while initializing service DLLs.
+                // station, and neither should enter win32k's interactive cursor/class EngCopyBits
+                // path while initializing service DLLs.
                 let svc_wss_noio_window_station = if svc_noninteractive {
                     nt_handler
                         .primary_token_authentication_id_for_pi(pi)
@@ -8714,26 +8714,6 @@ pub(crate) unsafe fn service_sec_image(
                     // WSS_NOIO. A display DC open has the real NULL outcome for that station state.
                     print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) WSS_NOIO DC -> NULL\n");
                     (0, true)
-                } else if m0 == 0x10d4 && svc_noninteractive {
-                    // NtGdiGetStockObject returns session-global stock handles. Reuse only handles
-                    // learned from real win32k calls, so service-side gdi32 validates them through
-                    // the live shared GDI table instead of receiving an invented handle index.
-                    let object_id = a0 as u32;
-                    let hit = nt_handler.lookup_service_win32k_stock_object(object_id);
-                    if let Some(handle) = hit {
-                        print_str(b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR object=");
-                        print_u64(object_id as u64);
-                        print_str(b" -> real handle 0x");
-                        print_hex(handle);
-                        print_str(b"\n");
-                    } else {
-                        print_str(
-                            b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR MISS object=",
-                        );
-                        print_u64(object_id as u64);
-                        print_str(b" -> NULL\n");
-                    }
-                    (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x106c && svc_noninteractive {
                     // Bitmap handles are process-owned GDI objects. Noninteractive service clients
                     // do not yet have provider-owned service GDI object allocation, so every service
