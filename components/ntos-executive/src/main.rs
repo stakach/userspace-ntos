@@ -9895,11 +9895,10 @@ fn registry_dword_from_bytes(data: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
 }
 
-fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
+fn registry_utf16_ascii(data: &[u8], out: &mut [u8]) -> Option<usize> {
     if data.len() < 2 {
         return None;
     }
-    let mut tmp = [0u8; 160];
     let mut n = 0usize;
     let mut i = 0usize;
     while i + 1 < data.len() {
@@ -9907,20 +9906,26 @@ fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
         if unit == 0 {
             break;
         }
-        if unit > 0x7f || n >= tmp.len() {
+        if unit > 0x7f || n >= out.len() {
             return None;
         }
         let mut b = unit as u8;
         if b == b'/' {
             b = b'\\';
         }
-        tmp[n] = b.to_ascii_lowercase();
+        out[n] = b.to_ascii_lowercase();
         n += 1;
         i += 2;
     }
     if n == 0 {
         return None;
     }
+    Some(n)
+}
+
+fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut tmp = [0u8; 160];
+    let n = registry_utf16_ascii(data, &mut tmp)?;
 
     let mut s = &tmp[..n];
     if s.starts_with(b"\\??\\") {
@@ -9969,16 +9974,20 @@ fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(normalized.len())
 }
 
-fn system_hive_driver_launch_spec(
-    service_name: &str,
-    out_path: &mut [u8],
-) -> Option<(usize, driver_launch::DriverClass)> {
+fn system_hive_regf() -> Option<RegfHive<'static>> {
     let hive_size = REAL_HIVE_SIZE.load(Ordering::Relaxed) as usize;
     if hive_size == 0 {
         return None;
     }
     let bytes = unsafe { core::slice::from_raw_parts(HIVEBUF_VADDR as *const u8, hive_size) };
-    let hive = RegfHive::new(bytes)?;
+    RegfHive::new(bytes)
+}
+
+fn system_hive_driver_launch_spec(
+    service_name: &str,
+    out_path: &mut [u8],
+) -> Option<(usize, driver_launch::DriverClass)> {
+    let hive = system_hive_regf()?;
     let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
     key_path.push_str(service_name);
     let key = hive.open_key(&key_path)?;
@@ -10003,6 +10012,86 @@ fn system_hive_driver_launch_spec(
     };
     let path_len = registry_utf16_ascii_path(&image_path.1, out_path)?;
     Some((path_len, class))
+}
+
+fn registry_ascii_hex_digit(b: u8) -> bool {
+    b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+}
+
+fn registry_layout_id_from_value(data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut tmp = [0u8; 16];
+    let n = registry_utf16_ascii(data, &mut tmp)?;
+    let src = &tmp[..n];
+    if !src.iter().copied().all(registry_ascii_hex_digit) {
+        return None;
+    }
+    match n {
+        8 => {
+            if out.len() < 8 {
+                return None;
+            }
+            out[..8].copy_from_slice(src);
+            Some(8)
+        }
+        4 => {
+            if out.len() < 8 {
+                return None;
+            }
+            out[..4].copy_from_slice(b"0000");
+            out[4..8].copy_from_slice(src);
+            Some(8)
+        }
+        _ => None,
+    }
+}
+
+fn default_hive_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
+    // DEFHIVEBUF is a fixed executive-lifetime mapping, and `default_hive_bytes` bounds the slice by
+    // the storage-host reported hive size before exposing it.
+    let hive = unsafe { writable_fs::default_hive_bytes() }.and_then(RegfHive::new)?;
+    let key = hive.open_key("Keyboard Layout\\Preload")?;
+    let value = hive.value(key, "1")?;
+    registry_layout_id_from_value(&value.1, out)
+}
+
+fn system_hive_nls_keyboard_layout_id(out: &mut [u8]) -> Option<usize> {
+    let hive = system_hive_regf()?;
+    let key = hive.open_key("ControlSet001\\Control\\Nls\\Language")?;
+    let value = hive.value(key, "Default")?;
+    registry_layout_id_from_value(&value.1, out)
+}
+
+fn registry_keyboard_layout_id(out: &mut [u8]) -> Option<(usize, &'static [u8])> {
+    if let Some(n) = default_hive_keyboard_layout_id(out) {
+        return Some((n, b"default-preload"));
+    }
+    system_hive_nls_keyboard_layout_id(out).map(|n| (n, b"system-nls-default".as_slice()))
+}
+
+fn registry_driver_leaf_is_safe(leaf: &[u8]) -> bool {
+    !leaf.is_empty()
+        && leaf.iter().copied().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+        && !leaf.windows(2).any(|w| w == b"..")
+}
+
+fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<usize> {
+    if layout_id.len() != 8 || !layout_id.iter().copied().all(registry_ascii_hex_digit) {
+        return None;
+    }
+    let hive = system_hive_regf()?;
+    let mut key_path = alloc::string::String::from("ControlSet001\\Control\\Keyboard Layouts\\");
+    for &b in layout_id {
+        key_path.push(b as char);
+    }
+    let key = hive.open_key(&key_path)?;
+    let value = hive.value(key, "Layout File")?;
+    let n = registry_utf16_ascii(&value.1, out)?;
+    if !registry_driver_leaf_is_safe(&out[..n]) {
+        return None;
+    }
+    Some(n)
 }
 
 /// ★ BYPASS SWITCH for setup's locale step (see `provision_default_user_locale`). `false` leaves
@@ -16326,9 +16415,38 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // win32k's desktop-graphics init (PDEVOBJ_Create → DrvEnablePDEV/DrvEnableSurface) can
                 // enable the primary surface on the real framebuffer → PIXELS.
                 load_framebuf_driver(host_pml4);
-                // Host kbdus.dll by path so win32k's real NtUserLoadKeyboardLayoutEx path can load
-                // the US layout and resolve KbdLayerDescriptor without a synthetic HKL result.
-                load_kbdus_driver(host_pml4);
+                // Host the keyboard-layout DLL selected by the real registry layout key so win32k's
+                // NtUserLoadKeyboardLayoutEx path can resolve KbdLayerDescriptor without a synthetic
+                // HKL result.
+                let mut layout_id = [0u8; 8];
+                let mut layout_file = [0u8; 24];
+                if let Some((layout_id_len, layout_source)) =
+                    registry_keyboard_layout_id(&mut layout_id)
+                {
+                    if let Some(layout_file_len) = system_hive_keyboard_layout_file(
+                        &layout_id[..layout_id_len],
+                        &mut layout_file,
+                    ) {
+                        print_str(b"[win32k-svc] keyboard layout id=");
+                        print_str(&layout_id[..layout_id_len]);
+                        print_str(b" source=");
+                        print_str(layout_source);
+                        print_str(b" file=");
+                        print_str(&layout_file[..layout_file_len]);
+                        print_str(b"\n");
+                        load_keyboard_layout_driver(
+                            host_pml4,
+                            &layout_id[..layout_id_len],
+                            &layout_file[..layout_file_len],
+                        );
+                    } else {
+                        print_str(
+                            b"[win32k-svc] keyboard layout key missing Layout File in SYSTEM hive\n",
+                        );
+                    }
+                } else {
+                    print_str(b"[win32k-svc] no keyboard layout id in DEFAULT/SYSTEM hives\n");
+                }
             }
 
             let verdict = core::ptr::read_volatile(

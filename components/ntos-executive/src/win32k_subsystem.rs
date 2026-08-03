@@ -4665,7 +4665,7 @@ static mut WIN32K_REG_KEYS: [Win32kRegKeyMirror; WIN32K_REG_KEY_CAP] =
 static mut WIN32K_REG_VALUES: [Win32kRegValueMirror; WIN32K_REG_VALUE_CAP] =
     [Win32kRegValueMirror::EMPTY; WIN32K_REG_VALUE_CAP];
 static mut WIN32K_FRAMEBUF_REGISTRY_READY: bool = false;
-static mut WIN32K_KBDUS_REGISTRY_READY: bool = false;
+static mut WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY: bool = false;
 
 fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
     ascii_eq_ignore_case(a, b)
@@ -4818,19 +4818,33 @@ fn register_framebuf_registry_mirror() -> bool {
     ok
 }
 
-fn register_kbdus_registry_mirror() -> bool {
+fn register_keyboard_layout_registry_mirror(layout_id: &[u8], layout_file: &[u8]) -> bool {
+    if layout_id.len() != 8
+        || !layout_id
+            .iter()
+            .copied()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || layout_file.is_empty()
+        || layout_file.len() > WIN32K_REG_VALUE_ASCII_CAP
+    {
+        return false;
+    }
     unsafe {
-        if WIN32K_KBDUS_REGISTRY_READY {
+        if WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY {
             return true;
         }
     }
-    let Some(kbd) = register_win32k_reg_key(b"KEYBOARD LAYOUTS\\00000409") else {
+    let mut key_pattern = [0u8; 32];
+    let prefix = b"KEYBOARD LAYOUTS\\";
+    key_pattern[..prefix.len()].copy_from_slice(prefix);
+    key_pattern[prefix.len()..prefix.len() + layout_id.len()].copy_from_slice(layout_id);
+    let Some(kbd) = register_win32k_reg_key(&key_pattern[..prefix.len() + layout_id.len()]) else {
         return false;
     };
-    let ok = register_win32k_reg_wide_ascii(kbd, b"Layout File", REG_SZ, b"kbdus.dll", false);
+    let ok = register_win32k_reg_wide_ascii(kbd, b"Layout File", REG_SZ, layout_file, false);
     if ok {
         unsafe {
-            WIN32K_KBDUS_REGISTRY_READY = true;
+            WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY = true;
         }
     }
     ok
@@ -7899,11 +7913,11 @@ pub const FTFD_LOAD_FRAMES: u64 = 248;
 /// ZwSetSystemInformation (like dxg); framebuf's PE entry (RVA 0x1260) IS its DrvEnableDriver.
 pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
 pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
-/// kbdus.dll (keyboard layout DLL) loaded-image base in win32k's VSpace. size_of_image 0x4000 ->
-/// 4 frames; reserve 8 frames in its own PT-aligned window. win32k loads it dynamically via
+/// Keyboard layout DLL loaded-image base in win32k's VSpace. size_of_image 0x4000 -> 4 frames;
+/// reserve 8 frames in its own PT-aligned window. win32k loads the registry-selected layout DLL via
 /// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
-pub const KBDUS_VA: u64 = 0x0000_0100_08A0_0000;
-pub const KBDUS_LOAD_FRAMES: u64 = 8;
+pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
+pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
 /// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. framebuf's
 /// DrvEnableSurface issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns
 /// this VA as FrameBufferBase, so framebuf writes pixels straight to the real framebuffer.
@@ -7930,22 +7944,27 @@ pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     let _ = register_framebuf_registry_mirror();
 }
 
-/// Record the loaded kbdus.dll info (called by the executive after `load_driver_into(kbdus)`).
-/// win32k uses the export directory to find KbdLayerDescriptor; the PE entry may be zero.
-pub fn record_kbdus(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
+/// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find
+/// KbdLayerDescriptor; the PE entry may be zero.
+pub fn record_keyboard_layout_driver(
+    layout_id: &[u8],
+    layout_file: &[u8],
+    entry_rva: u32,
+    export_dir_rva: u32,
+    image_len: u32,
+) -> bool {
     let expd = if export_dir_rva != 0 {
-        KBDUS_VA + export_dir_rva as u64
+        KEYBOARD_LAYOUT_VA + export_dir_rva as u64
     } else {
         0
     };
-    let _ = register_gdi_driver_image(
-        b"kbdus.dll",
-        KBDUS_VA,
-        KBDUS_VA + entry_rva as u64,
+    register_gdi_driver_image(
+        layout_file,
+        KEYBOARD_LAYOUT_VA,
+        KEYBOARD_LAYOUT_VA + entry_rva as u64,
         expd,
         image_len,
-    );
-    let _ = register_kbdus_registry_mirror();
+    ) && register_keyboard_layout_registry_mirror(layout_id, layout_file)
 }
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export

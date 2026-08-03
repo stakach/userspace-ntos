@@ -711,3 +711,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   --target x86_64-unknown-none` passed. Review adjustment: D1 remains open for service-control
   driven launch beyond this NPFS proof and for the win32k GDI/display/keyboard preloads that still
   need real driver object ownership.
+- D1/D3 continued. The win32k keyboard-layout host path no longer names `kbdus.dll` or publishes a
+  fixed `Keyboard Layouts\00000409` registry mirror. The executive derives the layout id from real
+  registry state (`HKU\.Default\Keyboard Layout\Preload\1`, with SYSTEM NLS default as another real
+  registry source), reads that layout key's SYSTEM hive `Layout File`, validates the DLL leaf, loads
+  `reactos\system32\<Layout File>`, registers the selected DLL with the GDI-driver table, and mirrors
+  only the selected layout id/file pair back to win32k. Missing registry state now logs a visible
+  keyboard-layout load failure; there is no hardcoded DLL success path. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: D1 still has display/DirectX preloads and D3 still
+  has the hosted-process keyboard-layout key sentinel plus the display registry/device mirror.

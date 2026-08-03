@@ -3429,29 +3429,67 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
     }
 }
 
-/// Host kbdus.dll (the US keyboard layout DLL) into win32k's VSpace. win32k loads keyboard layouts
-/// dynamically from UserLoadKbdDll via EngLoadImage -> ZwSetSystemInformation, then looks up the
-/// KbdLayerDescriptor export. Source it by path from the mounted ReactOS filesystem instead of
-/// extending the fixed storage-host staging table.
-pub(crate) unsafe fn load_kbdus_driver(host_pml4: u64) {
+fn keyboard_layout_driver_path(layout_file: &[u8], out: &mut [u8]) -> Option<usize> {
+    if layout_file.is_empty()
+        || layout_file.len() > 24
+        || !layout_file.iter().copied().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+        || layout_file.windows(2).any(|w| w == b"..")
+    {
+        return None;
+    }
+    let prefix = b"reactos\\system32\\";
+    if prefix.len() + layout_file.len() > out.len() {
+        return None;
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..prefix.len() + layout_file.len()].copy_from_slice(layout_file);
+    Some(prefix.len() + layout_file.len())
+}
+
+/// Host the keyboard layout DLL selected by the registry into win32k's VSpace. win32k loads keyboard
+/// layouts dynamically from UserLoadKbdDll via EngLoadImage -> ZwSetSystemInformation, then looks up
+/// the KbdLayerDescriptor export. The layout id and DLL leaf are supplied by the caller from the
+/// DEFAULT/SYSTEM hive state.
+pub(crate) unsafe fn load_keyboard_layout_driver(
+    host_pml4: u64,
+    layout_id: &[u8],
+    layout_file: &[u8],
+) {
     let Some(fs) = exec_fs() else {
-        print_str(b"[win32k-svc] kbdus.dll unavailable - executive FS not mounted\n");
+        print_str(b"[win32k-svc] keyboard layout DLL unavailable - executive FS not mounted\n");
         return;
     };
-    let Some((src_va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\kbdus.dll") else {
-        print_str(b"[win32k-svc] kbdus.dll not found by path - keyboard layout gate will fail\n");
+    let mut path = [0u8; 64];
+    let Some(path_len) = keyboard_layout_driver_path(layout_file, &mut path) else {
+        print_str(b"[win32k-svc] keyboard layout DLL leaf rejected by loader policy\n");
+        return;
+    };
+    let Some((src_va, sz)) = load_file_to_pool(&fs, &path[..path_len]) else {
+        print_str(b"[win32k-svc] keyboard layout DLL not found by registry path: ");
+        print_str(&path[..path_len]);
+        print_str(b"\n");
         return;
     };
     match load_one_driver(
         src_va,
-        win32k_subsystem::KBDUS_VA,
-        win32k_subsystem::KBDUS_LOAD_FRAMES,
+        win32k_subsystem::KEYBOARD_LAYOUT_VA,
+        win32k_subsystem::KEYBOARD_LAYOUT_LOAD_FRAMES,
         host_pml4,
         0,
     ) {
         Some((entry, expdir, len)) => {
-            win32k_subsystem::record_kbdus(entry, expdir, len);
-            print_str(b"[win32k-svc] hosted kbdus.dll: file_size=");
+            let recorded = win32k_subsystem::record_keyboard_layout_driver(
+                layout_id,
+                layout_file,
+                entry,
+                expdir,
+                len,
+            );
+            print_str(b"[win32k-svc] hosted keyboard layout ");
+            print_str(layout_file);
+            print_str(b": file_size=");
             print_u64(sz as u64);
             print_str(b" entry_rva=0x");
             print_hex(entry);
@@ -3459,9 +3497,11 @@ pub(crate) unsafe fn load_kbdus_driver(host_pml4: u64) {
             print_hex(expdir);
             print_str(b" len=0x");
             print_hex(len);
+            print_str(b" recorded=");
+            print_u64(recorded as u64);
             print_str(b"\n");
         }
-        None => print_str(b"[win32k-svc] kbdus load failed\n"),
+        None => print_str(b"[win32k-svc] keyboard layout DLL load failed\n"),
     }
 }
 
