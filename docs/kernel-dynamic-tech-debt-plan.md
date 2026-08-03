@@ -77,9 +77,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   object ownership.
 - `[x]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
-- `[x]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
+- `[~]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
   queue state produced by real window invalidation and dispatch.
-- `[x]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
+- `[~]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
 
 ## Review Log
 
@@ -1115,7 +1115,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   shows real staged winlogon `NtUserGetAtomName` returns for atom `0x8002` and no old
   `RVA=0x001cbddb` wall. Review adjustment: C3 remains open. This unblocks the later post-SAS
   Winlogon-key path enough to expose the next provider-boundary/user-callback frontier:
-  `WM_NCCREATE` api0 reaches nested `NtUserCallOneParam(0x1080)`, fails to unwind that nested
+  `WM_NCCREATE` api0 reaches nested `NtUserDefSetText(0x1080)`, fails to unwind that nested
   dispatch, and leaves one outstanding callback continuation. Noninteractive service/LSASS
   `NtGdiOpenDCW(0x10de)` still returns win32k's real NULL/PDEV failure and should stay visible until
   D3's display-device/registry ownership is replaced by real driver-created state.
+- C3 continued. `NtUserDefSetText(0x1080)` now has a required provider-owned
+  cross-address-space input boundary for interactive GUI clients. Winlogon/Userinit/Explorer
+  callers no longer pass a raw client `LARGE_STRING` graph into isolated win32k: the executive
+  probes the descriptor, validates `Length`/`MaximumLength`/ANSI shape, stages the string and a
+  provider-owned descriptor in the win32k argument frame, preserves empty-buffer descriptors, and
+  fails visibly with `FALSE` on invalid input instead of fabricating success. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-defsettext-winlogon-marshalled.log` passed the
+  harness desktop gate with `234/275 executive->isolated-service checks passed`. The log shows real
+  staged winlogon `NtUserDefSetText` returns and no old `RVA=0xf9c82997` wall. Review adjustment:
+  C3 remains open for a final audit of remaining win32k/client marshalling branches. F3/F4 are
+  re-opened as the active user-callback frontier: with the `0x1080` wall removed, the run now
+  creates and correlates IDD_LOGON (`modal-ready=1`) but then observes the correlated dialog being
+  destroyed before the modal paint proof, so the current source no longer satisfies the older green
+  modal/framebuffer checklist recorded before the service USER/GDI fallback cleanup sequence.

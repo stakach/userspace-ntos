@@ -21,6 +21,7 @@ static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -1335,6 +1336,16 @@ fn le_u64_at(raw: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
 }
 
+#[derive(Clone, Copy)]
+struct CapturedStringArg {
+    desc: u64,
+    length: u64,
+    maximum: u64,
+    buffer: u64,
+    staged_buffer: u64,
+    ansi: bool,
+}
+
 /// Is `va` inside the client's MAIN IMAGE window? Every hosted process is loaded at the SAME
 /// `PE_LOAD_BASE`, so these VAs COLLIDE across clients: win32k's per-client demand window can observe
 /// an empty/other-client page at such a VA WITHOUT faulting, so the demand-fault client-frame sharing
@@ -1361,66 +1372,108 @@ unsafe fn capture_client_string_arg(
     nfilled: usize,
     scratch_base: u64,
 ) -> u64 {
+    try_capture_client_string_arg(pi, sp_va, large, false, filled_pages, nfilled, scratch_base)
+        .map(|capture| capture.desc)
+        .unwrap_or(sp_va)
+}
+
+unsafe fn try_capture_client_string_arg(
+    pi: u64,
+    sp_va: u64,
+    large: bool,
+    capture_empty_buffer: bool,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedStringArg> {
     if sp_va == 0 {
-        return sp_va;
+        return None;
     }
     let mut sd = [0u8; 16];
     if !img_spawn::client_copyin_mapped(pi, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
-        return sp_va;
+        return None;
     }
-    let length = if large {
-        u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64
+    let (length, maximum, ansi) = if large {
+        let maximum_and_ansi = u32::from_le_bytes(sd[4..8].try_into().unwrap());
+        (
+            u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64,
+            (maximum_and_ansi & 0x7fff_ffff) as u64,
+            maximum_and_ansi & 0x8000_0000 != 0,
+        )
     } else {
-        u16::from_le_bytes([sd[0], sd[1]]) as u64
+        (
+            u16::from_le_bytes([sd[0], sd[1]]) as u64,
+            u16::from_le_bytes([sd[2], sd[3]]) as u64,
+            false,
+        )
     };
     let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
-    if length + 2 > RC_ARG_BUF_CAP || (length != 0 && buffer == 0) {
-        return sp_va;
+    let terminator_bytes = if ansi { 1 } else { 2 };
+    if (!ansi && length & 1 != 0)
+        || maximum < length
+        || length.checked_add(terminator_bytes).is_none()
+        || length + terminator_bytes > RC_ARG_BUF_CAP
+        || (length != 0 && buffer == 0)
+        || buffer.checked_add(length).is_none()
+    {
+        return None;
     }
+    let stage_buffer = length != 0 || (capture_empty_buffer && buffer != 0);
     let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
-    let desc =
-        win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
+    let desc = rc_arg_slot_base(slot);
     let buf = desc + 0x20;
-    let captured_buffer = if length == 0 {
-        buffer
-    } else {
+    let captured_buffer = if stage_buffer {
         let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
-        if !img_spawn::client_copyin_mapped(
-            pi,
-            buffer,
-            &mut chars[..length as usize],
-            filled_pages,
-            nfilled,
-            scratch_base,
-        ) {
-            return sp_va;
+        if length != 0
+            && !img_spawn::client_copyin_mapped(
+                pi,
+                buffer,
+                &mut chars[..length as usize],
+                filled_pages,
+                nfilled,
+                scratch_base,
+            )
+        {
+            return None;
         }
-        core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
-        core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
+        core::ptr::write_bytes(desc as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+        if length != 0 {
+            core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
+        }
+        if ansi {
+            core::ptr::write_volatile((buf + length) as *mut u8, 0);
+        } else {
+            core::ptr::write_volatile((buf + length) as *mut u16, 0);
+        }
         buf
+    } else {
+        core::ptr::write_bytes(desc as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+        buffer
+    };
+    let staged_maximum = if stage_buffer || length != 0 {
+        length + terminator_bytes
+    } else {
+        maximum
     };
     if large {
         // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32), Buffer(u64). Preserve bAnsi.
-        let ansi_bit = u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x8000_0000;
+        let ansi_bit = if ansi { 0x8000_0000 } else { 0 };
         core::ptr::write_volatile(desc as *mut u32, length as u32);
-        let maximum = if length == 0 {
-            u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x7fff_ffff
-        } else {
-            length as u32 + 2
-        };
-        core::ptr::write_volatile((desc + 4) as *mut u32, maximum | ansi_bit);
+        core::ptr::write_volatile((desc + 4) as *mut u32, staged_maximum as u32 | ansi_bit);
     } else {
         core::ptr::write_volatile(desc as *mut u16, length as u16);
-        let maximum = if length == 0 {
-            u16::from_le_bytes([sd[2], sd[3]])
-        } else {
-            (length + 2) as u16
-        };
-        core::ptr::write_volatile((desc + 2) as *mut u16, maximum);
+        core::ptr::write_volatile((desc + 2) as *mut u16, staged_maximum as u16);
         core::ptr::write_volatile((desc + 4) as *mut u32, 0); // explicit x64 padding
     }
     core::ptr::write_volatile((desc + 8) as *mut u64, captured_buffer);
-    desc
+    Some(CapturedStringArg {
+        desc,
+        length,
+        maximum,
+        buffer,
+        staged_buffer: captured_buffer,
+        ansi,
+    })
 }
 
 unsafe fn capture_client_devmodew_arg(
@@ -1577,6 +1630,7 @@ unsafe fn capture_client_string_arg_if_main_image(
     let desc =
         win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
     let buf = desc + 0x20;
+    core::ptr::write_bytes(desc as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
     core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
     core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
     if large {
@@ -6580,6 +6634,7 @@ pub(crate) unsafe fn service_sec_image(
                             | nt_exe_image::HostedProcessRole::InteractiveShell
                     )
                 );
+                let interactive_gui_client = winlogon_gui_client || shell_gui_client;
                 let uses_client_gdi = matches!(
                     process_role,
                     Some(
@@ -7085,6 +7140,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut message_call_copyout = (0u64, 0u64, 0usize);
                 let mut message_call_probe_failed = false;
                 let mut get_atom_name_probe_failed = false;
+                let mut def_set_text_probe_failed = false;
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -7966,11 +8022,11 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         );
                     }
-                } else if m0 == 0x1080 && shell_gui_client {
+                } else if m0 == 0x1080 && interactive_gui_client {
                     // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from
                     // DefWindowProc while win32k is parked in a user callback; capture the counted
                     // string before isolated win32k probes the client's raw pointer graph.
-                    if explorer_gui_client {
+                    if d_a1 != 0 {
                         prefill_client_large_string_pages(
                             pi as u64,
                             d_a1,
@@ -7980,15 +8036,43 @@ pub(crate) unsafe fn service_sec_image(
                             &reg,
                             &dll_pes,
                         );
+                        match try_capture_client_string_arg(
+                            pi as u64,
+                            d_a1,
+                            true,
+                            true,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            Some(capture) => {
+                                d_a1 = capture.desc;
+                                let n = DEF_SET_TEXT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                                if n < 16 {
+                                    print_str(b"[w32marshal] NtUserDefSetText pi=");
+                                    print_u64(pi as u64);
+                                    print_str(b" hwnd=0x");
+                                    print_hex_u64(a0);
+                                    print_str(b" desc=0x");
+                                    print_hex_u64(a1);
+                                    print_str(b" len=");
+                                    print_u64(capture.length);
+                                    print_str(b" max=");
+                                    print_u64(capture.maximum);
+                                    print_str(b" ansi=");
+                                    print_u64(capture.ansi as u64);
+                                    print_str(b" buf=0x");
+                                    print_hex_u64(capture.buffer);
+                                    print_str(b" staged=0x");
+                                    print_hex_u64(capture.staged_buffer);
+                                    print_str(b"\n");
+                                }
+                            }
+                            None => {
+                                def_set_text_probe_failed = true;
+                            }
+                        }
                     }
-                    d_a1 = capture_client_string_arg(
-                        pi as u64,
-                        d_a1,
-                        true,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
                 } else if m0 == 0x1041 && a0 == 0x14 {
                     // SystemParametersInfoW(SPI_SETDESKWALLPAPER) passes a user-mode UNICODE_STRING
                     // descriptor, and that descriptor's Buffer is another user pointer. Capture the graph
@@ -8434,6 +8518,18 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" desc=0x");
                         print_hex_u64(a1);
                         print_str(b" -> 0\n");
+                    }
+                    (0, true)
+                } else if def_set_text_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserDefSetText input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a0);
+                        print_str(b" desc=0x");
+                        print_hex_u64(a1);
+                        print_str(b" -> FALSE\n");
                     }
                     (0, true)
                 } else if create_window_probe_failed {
