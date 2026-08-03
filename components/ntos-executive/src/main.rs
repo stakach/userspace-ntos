@@ -16141,6 +16141,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
                 let _ = alloc_frame();
             }
+            // Bulk provider argument staging for large GDI client buffers.
+            let bulk_arg_base = alloc_frame();
+            for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
+                let _ = alloc_frame();
+            }
             // KUSER_SHARED_DATA for win32k's kernel-mode high canonical mapping. It is initialized
             // through an executive scratch alias below, then mapped into the component after its
             // high-VA paging chain exists.
@@ -16200,6 +16205,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(arg_base + i),
                     win32k_subsystem::WIN32K_ARG_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            let bulk_arg_pt = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                bulk_arg_pt,
+            );
+            let _ = paging_struct_map(
+                bulk_arg_pt,
+                LBL_X86_PAGE_TABLE_MAP,
+                win32k_subsystem::WIN32K_BULK_ARG_VADDR,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            for i in 0..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
+                let _ = page_map(
+                    copy_cap(bulk_arg_base + i),
+                    win32k_subsystem::WIN32K_BULK_ARG_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -16379,6 +16406,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     count: win32k_subsystem::WIN32K_ARG_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
+                };
+                n += 1;
+                // Bulk provider argument staging (own PT window, aliased frames).
+                regions[n] = Region {
+                    source: FrameSource::Alias(bulk_arg_base),
+                    base_va: win32k_subsystem::WIN32K_BULK_ARG_VADDR,
+                    count: win32k_subsystem::WIN32K_BULK_ARG_FRAMES,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: pts_for(win32k_subsystem::WIN32K_BULK_ARG_FRAMES),
                 };
                 n += 1;
                 // Session-heap + Mm-view arena (own window + PTs, aliased frames).

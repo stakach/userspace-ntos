@@ -1136,8 +1136,6 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   destroyed before the modal paint proof, so the current source no longer satisfies the older green
   modal/framebuffer checklist recorded before the service USER/GDI fallback cleanup sequence.
 
-### 2026-08-04
-
 - C3 continued. `NtGdiStretchDIBitsInternal(0x1082)` now has a provider-owned
   cross-address-space input boundary for interactive GUI clients. The executive reads the complete
   ReactOS x64 stack tail, stages the optional DIB bits and required `BITMAPINFO` in the win32k arg
@@ -1209,3 +1207,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   (`non-desktop=0`). The post-quiesce nested/dead-client proof also remains open because the current
   raw `WM_NULL`/frame-change probes do not arm a callback (`callback-parked=0`); the failed
   RedrawWindow/WM_PAINT proof-harness experiment was not kept.
+- C3/F3 continued. `NtGdiStretchDIBitsInternal(0x1082)` now stages bulk DIB/BMI input through a
+  dedicated 2 MiB provider argument window shared between the executive and isolated win32k instead
+  of reusing the generic 16 KiB argument frame. This keeps larger icon/control DIB payloads on the
+  real provider-owned path and preserves visible failure semantics with bounded reason/size
+  diagnostics for missing stacks, unreadable client tails, invalid layouts, overflows, and copy-in
+  faults. Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/win32k_subsystem.rs components/ntos-executive/src/main.rs
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-bulk-gdi-stage.log` were run. The boot was manually stopped after it became a live
+  long-running session, so it has no final `[microtest done]` sentinel, but it advanced through
+  winlogon into services and LSASS, recorded `winlogon` `0x1082=93`, staged 4096-byte
+  `NtGdiStretchDIBitsInternal` payloads at `0x10007200000`, and contains no
+  `NtGdiStretchDIBitsInternal input probe failed` or `StretchDIBits failed` signatures. Review
+  adjustment: C3 remains open for the final win32k/client marshalling audit, while F3/F4 remain open
+  until the modal paint queue and credential framebuffer proof have a terminating, natural gate.

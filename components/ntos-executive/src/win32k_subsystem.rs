@@ -116,6 +116,11 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
 pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
 pub const WIN32K_ARG_FRAMES: u64 = 4;
+/// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
+/// scalar argument tails. `NtGdiStretchDIBitsInternal` can receive DIB payloads far larger than the
+/// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
+pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
+pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).

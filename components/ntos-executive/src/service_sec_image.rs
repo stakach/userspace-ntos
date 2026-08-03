@@ -47,13 +47,21 @@ const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
-const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize = 0x4000;
+const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
+    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
 const WM_QUIT: u32 = 0x0012;
+const STRETCH_DIBITS_FAIL_MISSING_SP: u64 = 1;
+const STRETCH_DIBITS_FAIL_STACK_TAIL: u64 = 2;
+const STRETCH_DIBITS_FAIL_LAYOUT: u64 = 3;
+const STRETCH_DIBITS_FAIL_BITS_OVERFLOW: u64 = 4;
+const STRETCH_DIBITS_FAIL_BMI_OVERFLOW: u64 = 5;
+const STRETCH_DIBITS_FAIL_BITS_COPY: u64 = 6;
+const STRETCH_DIBITS_FAIL_BMI_COPY: u64 = 7;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     value.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -7056,6 +7064,10 @@ pub(crate) unsafe fn service_sec_image(
                 let mut stretch_dibits_stack_args = [0u64; 12];
                 let mut stretch_dibits_stack_arg_count = 0usize;
                 let mut stretch_dibits_probe_failed = false;
+                let mut stretch_dibits_probe_failure = 0u64;
+                let mut stretch_dibits_probe_aux0 = 0u64;
+                let mut stretch_dibits_probe_aux1 = 0u64;
+                let mut stretch_dibits_probe_aux2 = 0u64;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -7327,6 +7339,7 @@ pub(crate) unsafe fn service_sec_image(
                     // isolated win32k validates pbmi/pjInit, preserving the original scalar argument tail.
                     if sp == 0 {
                         stretch_dibits_probe_failed = true;
+                        stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_MISSING_SP;
                     } else {
                         let mut tail_ok = true;
                         let mut i = 0usize;
@@ -7341,6 +7354,8 @@ pub(crate) unsafe fn service_sec_image(
                                 Some(value) => stretch_dibits_stack_args[i] = value,
                                 None => {
                                     tail_ok = false;
+                                    stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_STACK_TAIL;
+                                    stretch_dibits_probe_aux0 = i as u64;
                                     break;
                                 }
                             }
@@ -7353,13 +7368,19 @@ pub(crate) unsafe fn service_sec_image(
                             let pbmi = stretch_dibits_stack_args[6];
                             let cj_max_info = stretch_dibits_stack_args[9];
                             let cj_max_bits = stretch_dibits_stack_args[10];
-                            let base = win32k_subsystem::WIN32K_ARG_VADDR;
+                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
                             let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
                             let mut offset = 0u64;
                             let mut layout_ok = pbmi != 0
                                 && cj_max_info >= 12
                                 && cj_max_info <= cap
                                 && cj_max_bits <= cap;
+                            if !layout_ok {
+                                stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_LAYOUT;
+                                stretch_dibits_probe_aux0 = pbmi;
+                                stretch_dibits_probe_aux1 = cj_max_info;
+                                stretch_dibits_probe_aux2 = cj_max_bits;
+                            }
                             let staged_bits = if layout_ok && pj_init != 0 {
                                 let out = base + offset;
                                 let bits_reserved = if cj_max_bits == 0 { 8 } else { cj_max_bits };
@@ -7368,7 +7389,14 @@ pub(crate) unsafe fn service_sec_image(
                                     .and_then(|next| align_up_u64(next, 8))
                                 {
                                     Some(next) if next <= cap => offset = next,
-                                    _ => layout_ok = false,
+                                    _ => {
+                                        layout_ok = false;
+                                        stretch_dibits_probe_failure =
+                                            STRETCH_DIBITS_FAIL_BITS_OVERFLOW;
+                                        stretch_dibits_probe_aux0 = offset;
+                                        stretch_dibits_probe_aux1 = bits_reserved;
+                                        stretch_dibits_probe_aux2 = cap;
+                                    }
                                 }
                                 out
                             } else {
@@ -7381,7 +7409,14 @@ pub(crate) unsafe fn service_sec_image(
                                     .and_then(|next| align_up_u64(next, 8))
                                 {
                                     Some(next) if next <= cap => offset = next,
-                                    _ => layout_ok = false,
+                                    _ => {
+                                        layout_ok = false;
+                                        stretch_dibits_probe_failure =
+                                            STRETCH_DIBITS_FAIL_BMI_OVERFLOW;
+                                        stretch_dibits_probe_aux0 = offset;
+                                        stretch_dibits_probe_aux1 = cj_max_info;
+                                        stretch_dibits_probe_aux2 = cap;
+                                    }
                                 }
                                 out
                             } else {
@@ -7419,7 +7454,12 @@ pub(crate) unsafe fn service_sec_image(
                                         scratch_base,
                                     )
                                 };
-                                let copied_bmi = if copied_bits {
+                                if !copied_bits {
+                                    stretch_dibits_probe_failed = true;
+                                    stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_BITS_COPY;
+                                    stretch_dibits_probe_aux0 = pj_init;
+                                    stretch_dibits_probe_aux1 = cj_max_bits;
+                                } else {
                                     prefill_client_copyin_dll_range_pages(
                                         pi as u64,
                                         pbmi,
@@ -7432,49 +7472,51 @@ pub(crate) unsafe fn service_sec_image(
                                         staged_pbmi as *mut u8,
                                         cj_max_info as usize,
                                     );
-                                    img_spawn::client_copyin_mapped(
+                                    if img_spawn::client_copyin_mapped(
                                         pi as u64,
                                         pbmi,
                                         bmi_out,
                                         filled_pages,
                                         faults as usize,
                                         scratch_base,
-                                    )
-                                } else {
-                                    false
-                                };
-                                if copied_bmi {
-                                    stretch_dibits_stack_args[5] = staged_bits;
-                                    stretch_dibits_stack_args[6] = staged_pbmi;
-                                    stretch_dibits_stack_arg_count =
-                                        stretch_dibits_stack_args.len();
-                                    let n = STRETCH_DIBITS_MARSHAL_TRACE
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    if n < 24 {
-                                        print_str(b"[w32marshal] NtGdiStretchDIBitsInternal pi=");
-                                        print_u64(pi as u64);
-                                        print_str(b" hdc=0x");
-                                        print_hex_u64(a0);
-                                        print_str(b" bits=0x");
-                                        print_hex_u64(pj_init);
-                                        print_str(b" bmi=0x");
-                                        print_hex_u64(pbmi);
-                                        print_str(b" info=");
-                                        print_u64(cj_max_info);
-                                        print_str(b" bits-bytes=");
-                                        print_u64(cj_max_bits);
-                                        print_str(b" rop=0x");
-                                        print_hex(stretch_dibits_stack_args[8] as u32);
-                                        print_str(b" staged=0x");
-                                        print_hex_u64(staged_bits);
-                                        print_str(b"/0x");
-                                        print_hex_u64(staged_pbmi);
-                                        print_str(b" bytes=");
-                                        print_u64(offset);
-                                        print_str(b"\n");
+                                    ) {
+                                        stretch_dibits_stack_args[5] = staged_bits;
+                                        stretch_dibits_stack_args[6] = staged_pbmi;
+                                        stretch_dibits_stack_arg_count =
+                                            stretch_dibits_stack_args.len();
+                                        let n = STRETCH_DIBITS_MARSHAL_TRACE
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if n < 24 {
+                                            print_str(
+                                                b"[w32marshal] NtGdiStretchDIBitsInternal pi=",
+                                            );
+                                            print_u64(pi as u64);
+                                            print_str(b" hdc=0x");
+                                            print_hex_u64(a0);
+                                            print_str(b" bits=0x");
+                                            print_hex_u64(pj_init);
+                                            print_str(b" bmi=0x");
+                                            print_hex_u64(pbmi);
+                                            print_str(b" info=");
+                                            print_u64(cj_max_info);
+                                            print_str(b" bits-bytes=");
+                                            print_u64(cj_max_bits);
+                                            print_str(b" rop=0x");
+                                            print_hex(stretch_dibits_stack_args[8] as u32);
+                                            print_str(b" staged=0x");
+                                            print_hex_u64(staged_bits);
+                                            print_str(b"/0x");
+                                            print_hex_u64(staged_pbmi);
+                                            print_str(b" bytes=");
+                                            print_u64(offset);
+                                            print_str(b"\n");
+                                        }
+                                    } else {
+                                        stretch_dibits_probe_failed = true;
+                                        stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_BMI_COPY;
+                                        stretch_dibits_probe_aux0 = pbmi;
+                                        stretch_dibits_probe_aux1 = cj_max_info;
                                     }
-                                } else {
-                                    stretch_dibits_probe_failed = true;
                                 }
                             }
                         }
@@ -8536,6 +8578,22 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex_u64(a0);
                         print_str(b" sp=0x");
                         print_hex_u64(sp);
+                        print_str(b" reason=");
+                        print_u64(stretch_dibits_probe_failure);
+                        print_str(b" bits=0x");
+                        print_hex_u64(stretch_dibits_stack_args[5]);
+                        print_str(b" bmi=0x");
+                        print_hex_u64(stretch_dibits_stack_args[6]);
+                        print_str(b" info=");
+                        print_u64(stretch_dibits_stack_args[9]);
+                        print_str(b" bits-bytes=");
+                        print_u64(stretch_dibits_stack_args[10]);
+                        print_str(b" aux=");
+                        print_u64(stretch_dibits_probe_aux0);
+                        print_str(b"/");
+                        print_u64(stretch_dibits_probe_aux1);
+                        print_str(b"/");
+                        print_u64(stretch_dibits_probe_aux2);
                         print_str(b" -> 0\n");
                     }
                     (0, true)
