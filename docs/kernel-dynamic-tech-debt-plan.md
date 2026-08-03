@@ -1039,3 +1039,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   narrow kernel callback. Validation: `rustfmt`, `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
   `components/ntos-executive/build.sh`, stale-reference `rg`, and `git diff --check`.
+- C3/F1 cleanup. Moved the remaining cursor, built-in-class, and class-atom-name storage out of
+  `nt-kernel-exec`; that crate now keeps only USER identity parsing/layout helpers, while
+  `Win32kSessionRuntime` owns the bounded session catalogs for real win32k observations and
+  promotions. Service and shell diagnostics now report these paths as `SESSION` hits/misses, and
+  `NtGdiCreatePatternBrushInternal` reports `SERVICE-GDI owner missing` instead of mirror language.
+  Review adjustment: F1/C3 remain open for replacing the WSS_NOIO service cursor/class/ScrollBar
+  narrow session queries with real per-process service USER/GDI ownership and for proving each
+  remaining service branch is provider-owned dispatch or an explicit kernel callback. Validation:
+  `rustfmt`, `cargo test -p nt-kernel-exec`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `components/ntos-executive/build.sh`,
+  stale-reference `rg`, and `git diff --check`.

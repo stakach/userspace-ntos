@@ -1,10 +1,224 @@
 const WIN32K_STOCK_OBJECT_COUNT: u32 = 22;
 
+type CursorLookupKey = nt_kernel_exec::user_cursor::CursorLookupKey;
+type BuiltinClassKey = nt_kernel_exec::user_class::BuiltinClassKey;
+
+#[derive(Clone, Copy)]
+struct CursorCatalogEntry {
+    key: Option<CursorLookupKey>,
+    handle: u32,
+}
+
+impl CursorCatalogEntry {
+    const EMPTY: Self = Self {
+        key: None,
+        handle: 0,
+    };
+}
+
+/// Session-owned view of real cursor handles published by win32k.
+///
+/// A handle becomes visible to another client only after the real win32k path has both observed the
+/// cursor identity and promoted that handle through `NtUserSetSystemCursor`.
+struct SessionGlobalCursorCatalog<const ENTRIES: usize, const PROMOTED: usize> {
+    entries: [CursorCatalogEntry; ENTRIES],
+    promoted: [u32; PROMOTED],
+    next_entry: usize,
+    next_promoted: usize,
+}
+
+impl<const ENTRIES: usize, const PROMOTED: usize> SessionGlobalCursorCatalog<ENTRIES, PROMOTED> {
+    const fn new() -> Self {
+        Self {
+            entries: [CursorCatalogEntry::EMPTY; ENTRIES],
+            promoted: [0; PROMOTED],
+            next_entry: 0,
+            next_promoted: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(CursorCatalogEntry::EMPTY);
+        self.promoted.fill(0);
+        self.next_entry = 0;
+        self.next_promoted = 0;
+    }
+
+    fn observe_identity(&mut self, key: &CursorLookupKey, handle: u32) {
+        if handle == 0 || ENTRIES == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry
+                .key
+                .is_some_and(|existing| existing.same_identity(key))
+        }) {
+            entry.handle = handle;
+            return;
+        }
+        self.entries[self.next_entry] = CursorCatalogEntry {
+            key: Some(*key),
+            handle,
+        };
+        self.next_entry = (self.next_entry + 1) % ENTRIES;
+    }
+
+    fn promote(&mut self, handle: u32) {
+        if handle == 0 || PROMOTED == 0 || self.promoted.contains(&handle) {
+            return;
+        }
+        self.promoted[self.next_promoted] = handle;
+        self.next_promoted = (self.next_promoted + 1) % PROMOTED;
+    }
+
+    fn lookup(&self, key: &CursorLookupKey) -> Option<u32> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .key
+                    .is_some_and(|existing| existing.same_identity(key))
+                    && self.promoted.contains(&entry.handle)
+            })
+            .map(|entry| entry.handle)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BuiltinClassCatalogEntry {
+    key: Option<BuiltinClassKey>,
+    atom: u16,
+}
+
+impl BuiltinClassCatalogEntry {
+    const EMPTY: Self = Self { key: None, atom: 0 };
+}
+
+struct SessionBuiltinClassCatalog<const N: usize> {
+    entries: [BuiltinClassCatalogEntry; N],
+    next: usize,
+}
+
+impl<const N: usize> SessionBuiltinClassCatalog<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [BuiltinClassCatalogEntry::EMPTY; N],
+            next: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(BuiltinClassCatalogEntry::EMPTY);
+        self.next = 0;
+    }
+
+    fn observe(&mut self, key: &BuiltinClassKey, atom: u16) {
+        if N == 0 || atom == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry
+                .key
+                .is_some_and(|existing| existing.same_identity(key))
+        }) {
+            entry.atom = atom;
+            return;
+        }
+        self.entries[self.next] = BuiltinClassCatalogEntry {
+            key: Some(*key),
+            atom,
+        };
+        self.next = (self.next + 1) % N;
+    }
+
+    fn lookup(&self, key: &BuiltinClassKey) -> Option<u16> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .key
+                    .is_some_and(|existing| existing.same_identity(key))
+            })
+            .map(|entry| entry.atom)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClassAtomNameCatalogEntry {
+    atom: u16,
+    len: u16,
+    units: [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+}
+
+impl ClassAtomNameCatalogEntry {
+    const EMPTY: Self = Self {
+        atom: 0,
+        len: 0,
+        units: [0; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+    };
+}
+
+/// Session-owned class-atom names learned from real successful win32k registrations.
+struct SessionClassAtomNameCatalog<const N: usize> {
+    entries: [ClassAtomNameCatalogEntry; N],
+    next: usize,
+}
+
+impl<const N: usize> SessionClassAtomNameCatalog<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [ClassAtomNameCatalogEntry::EMPTY; N],
+            next: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(ClassAtomNameCatalogEntry::EMPTY);
+        self.next = 0;
+    }
+
+    fn observe(&mut self, atom: u16, units: &[u16]) -> bool {
+        if N == 0
+            || atom == 0
+            || units.is_empty()
+            || units.len() > nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP
+        {
+            return false;
+        }
+        let entry = if let Some(existing) = self.entries.iter_mut().find(|entry| entry.atom == atom)
+        {
+            existing
+        } else {
+            let entry = &mut self.entries[self.next];
+            self.next = (self.next + 1) % N;
+            entry
+        };
+        entry.atom = atom;
+        entry.len = units.len() as u16;
+        entry.units.fill(0);
+        entry.units[..units.len()].copy_from_slice(units);
+        true
+    }
+
+    fn copy_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.atom == atom && entry.len != 0)?;
+        let len = entry.len as usize;
+        if out.len() < len {
+            return None;
+        }
+        out[..len].copy_from_slice(&entry.units[..len]);
+        Some(len)
+    }
+}
+
 struct Win32kSessionRuntimeState {
     stock_object_observed_mask: u32,
-    cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror<32, 16>,
-    builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror<16>,
-    class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror<128>,
+    cursor_catalog: SessionGlobalCursorCatalog<32, 16>,
+    builtin_class_catalog: SessionBuiltinClassCatalog<16>,
+    class_atom_name_catalog: SessionClassAtomNameCatalog<128>,
     stock_objects_observed: u64,
     cursor_identities_observed: u64,
     cursor_promotions: u64,
@@ -33,9 +247,9 @@ impl Win32kSessionRuntimeState {
     const fn new() -> Self {
         Self {
             stock_object_observed_mask: 0,
-            cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror::new(),
-            builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror::new(),
-            class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror::new(),
+            cursor_catalog: SessionGlobalCursorCatalog::new(),
+            builtin_class_catalog: SessionBuiltinClassCatalog::new(),
+            class_atom_name_catalog: SessionClassAtomNameCatalog::new(),
             stock_objects_observed: 0,
             cursor_identities_observed: 0,
             cursor_promotions: 0,
@@ -64,9 +278,9 @@ impl Win32kSessionRuntimeState {
     #[inline(never)]
     fn clear(&mut self) {
         self.stock_object_observed_mask = 0;
-        self.cursor_mirror.clear();
-        self.builtin_class_mirror.clear();
-        self.class_atom_name_mirror.clear();
+        self.cursor_catalog.clear();
+        self.builtin_class_catalog.clear();
+        self.class_atom_name_catalog.clear();
         self.stock_objects_observed = 0;
         self.cursor_identities_observed = 0;
         self.cursor_promotions = 0;
@@ -109,21 +323,21 @@ impl Win32kSessionRuntimeState {
         key: &nt_kernel_exec::user_cursor::CursorLookupKey,
         handle: u32,
     ) {
-        self.cursor_mirror.observe_identity(key, handle);
+        self.cursor_catalog.observe_identity(key, handle);
         if handle != 0 {
             self.cursor_identities_observed = self.cursor_identities_observed.saturating_add(1);
         }
     }
 
     fn promote_cursor(&mut self, handle: u32) {
-        self.cursor_mirror.promote(handle);
+        self.cursor_catalog.promote(handle);
         if handle != 0 {
             self.cursor_promotions = self.cursor_promotions.saturating_add(1);
         }
     }
 
     fn lookup_cursor(&self, key: &nt_kernel_exec::user_cursor::CursorLookupKey) -> Option<u32> {
-        self.cursor_mirror.lookup_global(key)
+        self.cursor_catalog.lookup(key)
     }
 
     fn record_userinit_cursor_hit(&mut self, handle: u32) {
@@ -136,7 +350,7 @@ impl Win32kSessionRuntimeState {
         key: &nt_kernel_exec::user_class::BuiltinClassKey,
         atom: u16,
     ) {
-        self.builtin_class_mirror.observe(key, atom);
+        self.builtin_class_catalog.observe(key, atom);
         if atom != 0 {
             self.builtin_classes_observed = self.builtin_classes_observed.saturating_add(1);
         }
@@ -146,7 +360,7 @@ impl Win32kSessionRuntimeState {
         &self,
         key: &nt_kernel_exec::user_class::BuiltinClassKey,
     ) -> Option<u16> {
-        self.builtin_class_mirror.lookup(key)
+        self.builtin_class_catalog.lookup(key)
     }
 
     fn record_userinit_builtin_class_hit(&mut self, fn_id: u32, atom: u16) {
@@ -164,7 +378,7 @@ impl Win32kSessionRuntimeState {
     }
 
     fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
-        let observed = self.class_atom_name_mirror.observe(atom, units);
+        let observed = self.class_atom_name_catalog.observe(atom, units);
         if observed {
             self.class_atom_names_observed = self.class_atom_names_observed.saturating_add(1);
         }
@@ -172,7 +386,7 @@ impl Win32kSessionRuntimeState {
     }
 
     fn copy_class_atom_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
-        self.class_atom_name_mirror.copy_name(atom, out)
+        self.class_atom_name_catalog.copy_name(atom, out)
     }
 
     fn record_class_atom_name_serve(&mut self) {

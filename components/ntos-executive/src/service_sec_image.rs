@@ -2160,7 +2160,7 @@ unsafe fn capture_registered_class_atom_name(
     Some(CapturedClassAtomName { len, units })
 }
 
-unsafe fn copy_class_atom_name_from_mirror(
+unsafe fn copy_class_atom_name_from_session(
     nt_handler: &mut ExecNtHandler,
     pi: u64,
     atom: u16,
@@ -8463,15 +8463,16 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 // Shell GUI clients ask win32k for class atom names from inside nested user
                 // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
-                // mirror-backed names are served before dispatch; misses stay visible.
-                let class_atom_name_mirror_result = if m0 == 0x10ad && shell_gui_client {
+                // session atom names observed from real registrations are served before dispatch;
+                // misses stay visible.
+                let class_atom_name_session_result = if m0 == 0x10ad && shell_gui_client {
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     crate::ke_gdi_flush_user_batch(pi, client_teb);
-                    let mirrored = copy_class_atom_name_from_mirror(
+                    let session_bytes = copy_class_atom_name_from_session(
                         &mut *nt_handler,
                         pi as u64,
                         a0 as u16,
@@ -8480,14 +8481,14 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     );
-                    if mirrored.is_none() {
-                        print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) MIRROR MISS pi=");
+                    if session_bytes.is_none() {
+                        print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) SESSION MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" atom=0x");
                         print_hex(a0 as u32);
                         print_str(b" -> bytes=0\n");
                     }
-                    Some(mirrored.unwrap_or(0))
+                    Some(session_bytes.unwrap_or(0))
                 } else {
                     None
                 };
@@ -8495,8 +8496,8 @@ pub(crate) unsafe fn service_sec_image(
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0, false)
-                } else if let Some(mirror_bytes) = class_atom_name_mirror_result {
-                    print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) MIRROR pi=");
+                } else if let Some(mirror_bytes) = class_atom_name_session_result {
+                    print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) SESSION pi=");
                     print_u64(pi as u64);
                     print_str(b" atom=0x");
                     print_hex(a0 as u32);
@@ -8518,13 +8519,13 @@ pub(crate) unsafe fn service_sec_image(
                         if userinit_gui_client {
                             nt_handler.record_userinit_global_cursor_hit(handle);
                         }
-                        print_str(b"[win32k-svc] shell global cursor mirror HIT pi=");
+                        print_str(b"[win32k-svc] shell global cursor SESSION HIT pi=");
                         print_u64(pi as u64);
                         print_str(b" -> real HCURSOR 0x");
                         print_hex(handle);
                         print_str(b"\n");
                     } else {
-                        print_str(b"[win32k-svc] shell global cursor mirror MISS pi=");
+                        print_str(b"[win32k-svc] shell global cursor SESSION MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" -> NULL\n");
                     }
@@ -8542,7 +8543,7 @@ pub(crate) unsafe fn service_sec_image(
                         if userinit_gui_client {
                             nt_handler.record_userinit_builtin_class_hit(key.fn_id(), atom);
                         }
-                        print_str(b"[win32k-svc] shell builtin class mirror HIT pi=");
+                        print_str(b"[win32k-svc] shell builtin class SESSION HIT pi=");
                         print_u64(pi as u64);
                         print_str(b" fnid=0x");
                         print_hex(key.fn_id());
@@ -8553,7 +8554,7 @@ pub(crate) unsafe fn service_sec_image(
                         if userinit_gui_client {
                             nt_handler.record_userinit_builtin_class_miss();
                         }
-                        print_str(b"[win32k-svc] shell builtin class mirror MISS pi=");
+                        print_str(b"[win32k-svc] shell builtin class SESSION MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" -> atom 0\n");
                     }
@@ -8642,14 +8643,14 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(handle) = hit {
                         remember_scrollbar_cursor(&mut *nt_handler, handle);
                         print_str(
-                            b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) MIRROR pi=",
+                            b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SESSION pi=",
                         );
                         print_u64(pi as u64);
                         print_str(b" -> real HCURSOR 0x");
                         print_hex(handle);
                         print_str(b"\n");
                     } else {
-                        print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) MIRROR MISS pi=");
+                        print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SESSION MISS pi=");
                         print_u64(pi as u64);
                         print_str(b" -> NULL\n");
                     }
@@ -8673,7 +8674,7 @@ pub(crate) unsafe fn service_sec_image(
                         None
                     };
                     if let Some(atom) = hit {
-                        print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) MIRROR pi=");
+                        print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SESSION pi=");
                         print_u64(pi as u64);
                         print_str(b" fnid=0x");
                         print_hex(register_class_fn_id);
@@ -8682,7 +8683,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     } else {
                         print_str(
-                            b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) MIRROR MISS pi=",
+                            b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SESSION MISS pi=",
                         );
                         print_u64(pi as u64);
                         print_str(b" fnid=0x");
@@ -8694,7 +8695,7 @@ pub(crate) unsafe fn service_sec_image(
                     // ReactOS NtUserInitializeClientPfnArrays returns STATUS_SUCCESS once the
                     // session-global client PFN arrays have already been initialized. Winlogon's
                     // interactive setup does that first; WSS_NOIO service processes only need their
-                    // client PFNs captured for later service-owned classinfo mirrors.
+                    // client PFNs captured for later service-owned classinfo queries.
                     let captured = capture_service_client_pfn_arrays(
                         &mut *nt_handler,
                         pi,
@@ -8734,7 +8735,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Pattern brushes are process-owned GDI objects, not stock handles. A
                     // non-interactive service cannot receive an invented brush handle; fail visibly
                     // until real provider-owned service GDI object allocation is available.
-                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) MIRROR MISS hbm=0x");
+                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) SERVICE-GDI owner missing hbm=0x");
                     print_hex(a0 as u32);
                     print_str(b" -> NULL\n");
                     (0, true)
@@ -8754,7 +8755,7 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         ) {
                             nt_handler.record_service_scrollbar_classinfo_hit();
-                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR ScrollBar atom=0x");
+                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION ScrollBar atom=0x");
                             print_hex(atom as u32);
                             print_str(b" ansi=");
                             print_u64(capture.ansi as u64);
@@ -8763,7 +8764,7 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             nt_handler.record_service_scrollbar_classinfo_miss();
                             let debug = nt_handler.service_scrollbar_debug(pi);
-                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS scrollbar=");
+                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION MISS scrollbar=");
                             print_u64(capture.scrollbar as u64);
                             print_str(b" atom=0x");
                             print_hex(debug.scrollbar_atom as u32);
@@ -8780,7 +8781,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         nt_handler.record_service_scrollbar_classinfo_miss();
-                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS capture=0 -> FALSE\n");
+                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION MISS capture=0 -> FALSE\n");
                         (0, true)
                     }
                 } else {

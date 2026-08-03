@@ -1,4 +1,4 @@
-//! Bounded identities for the USER global cursor/icon cache.
+//! Bounded identities for USER cursor/icon lookups.
 //!
 //! ReactOS keys shared cursors by module name, resource name (or integer resource), and whether the
 //! object is an icon. Cursor dimensions are intentionally not part of the lookup: win32k's
@@ -96,8 +96,6 @@ pub enum CursorResource {
 }
 
 impl CursorResource {
-    const EMPTY: Self = Self::Atom(0);
-
     pub const fn atom(atom: u16) -> Self {
         Self::Atom(atom)
     }
@@ -123,12 +121,6 @@ pub struct CursorLookupKey {
 }
 
 impl CursorLookupKey {
-    const EMPTY: Self = Self {
-        module: CursorText::EMPTY,
-        resource: CursorResource::EMPTY,
-        icon_kind: 0,
-    };
-
     pub fn new(module: &[u16], resource: CursorResource, icon_kind: u32) -> Option<Self> {
         Some(Self {
             module: CursorText::new(module)?,
@@ -137,103 +129,10 @@ impl CursorLookupKey {
         })
     }
 
-    fn equals(&self, other: &Self) -> bool {
+    pub fn same_identity(&self, other: &Self) -> bool {
         self.icon_kind == other.icon_kind
             && self.module.equals_case_insensitive(&other.module)
             && self.resource.same_identity(&other.resource)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CursorCacheEntry {
-    key: CursorLookupKey,
-    handle: u32,
-    occupied: bool,
-}
-
-impl CursorCacheEntry {
-    const EMPTY: Self = Self {
-        key: CursorLookupKey::EMPTY,
-        handle: 0,
-        occupied: false,
-    };
-}
-
-/// Mirror of only the cursor identities and handles observed from real win32k calls.
-///
-/// A lookup becomes externally visible only after `NtUserSetSystemCursor` has successfully promoted
-/// its handle. This matches the second, global-list search in ReactOS and prevents exporting a
-/// process-owned USER handle to another process.
-pub struct GlobalCursorMirror<const ENTRIES: usize, const PROMOTED: usize> {
-    entries: [CursorCacheEntry; ENTRIES],
-    promoted: [u32; PROMOTED],
-    next_entry: usize,
-    next_promoted: usize,
-}
-
-impl<const ENTRIES: usize, const PROMOTED: usize> GlobalCursorMirror<ENTRIES, PROMOTED> {
-    pub const fn new() -> Self {
-        Self {
-            entries: [CursorCacheEntry::EMPTY; ENTRIES],
-            promoted: [0; PROMOTED],
-            next_entry: 0,
-            next_promoted: 0,
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.fill(CursorCacheEntry::EMPTY);
-        self.promoted.fill(0);
-        self.next_entry = 0;
-        self.next_promoted = 0;
-    }
-
-    /// Record a real key and handle assigned by successful `NtUserSetCursorIconData`.
-    pub fn observe_identity(&mut self, key: &CursorLookupKey, handle: u32) {
-        if handle == 0 || ENTRIES == 0 {
-            return;
-        }
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.occupied && entry.key.equals(key))
-        {
-            entry.handle = handle;
-            return;
-        }
-        self.entries[self.next_entry] = CursorCacheEntry {
-            key: *key,
-            handle,
-            occupied: true,
-        };
-        self.next_entry = (self.next_entry + 1) % ENTRIES;
-    }
-
-    /// Record that real win32k successfully promoted `handle` into its global cursor list.
-    pub fn promote(&mut self, handle: u32) {
-        if handle == 0 || PROMOTED == 0 || self.promoted.contains(&handle) {
-            return;
-        }
-        self.promoted[self.next_promoted] = handle;
-        self.next_promoted = (self.next_promoted + 1) % PROMOTED;
-    }
-
-    /// Return the real globally promoted handle for an exact lookup, or `None` on a cache miss.
-    pub fn lookup_global(&self, key: &CursorLookupKey) -> Option<u32> {
-        self.entries
-            .iter()
-            .find(|entry| {
-                entry.occupied && entry.key.equals(key) && self.promoted.contains(&entry.handle)
-            })
-            .map(|entry| entry.handle)
-    }
-}
-
-impl<const ENTRIES: usize, const PROMOTED: usize> Default
-    for GlobalCursorMirror<ENTRIES, PROMOTED>
-{
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -252,43 +151,14 @@ mod tests {
     }
 
     #[test]
-    fn exports_only_real_promoted_handles() {
-        let key = key(
-            "C:\\ReactOS\\system32\\user32.dll",
-            CursorResource::atom(32512),
-            0,
-        );
-        let mut mirror = GlobalCursorMirror::<8, 4>::new();
-        mirror.observe_identity(&key, 0x0002_0024);
-        assert_eq!(mirror.lookup_global(&key), None);
-        mirror.promote(0x0002_0024);
-        assert_eq!(mirror.lookup_global(&key), Some(0x0002_0024));
-    }
-
-    #[test]
     fn matching_is_case_insensitive_but_other_fields_are_exact() {
         let original = key("C:\\ReactOS\\USER32.DLL", named("Arrow"), 0);
         let same = key("c:\\reactos\\user32.dll", named("aRRoW"), 0);
         let atom = key("c:\\reactos\\user32.dll", CursorResource::atom(32512), 0);
         let icon = key("c:\\reactos\\user32.dll", named("arrow"), 1);
-        let mut mirror = GlobalCursorMirror::<8, 4>::new();
-        mirror.observe_identity(&original, 0x0002_0024);
-        mirror.promote(0x0002_0024);
-        assert_eq!(mirror.lookup_global(&same), Some(0x0002_0024));
-        assert_eq!(mirror.lookup_global(&atom), None);
-        assert_eq!(mirror.lookup_global(&icon), None);
-    }
-
-    #[test]
-    fn duplicate_observation_updates_the_real_handle() {
-        let key = key("user32.dll", CursorResource::atom(32512), 0);
-        let mut mirror = GlobalCursorMirror::<2, 2>::new();
-        mirror.observe_identity(&key, 0x1111);
-        mirror.observe_identity(&key, 0x2222);
-        mirror.promote(0x1111);
-        assert_eq!(mirror.lookup_global(&key), None);
-        mirror.promote(0x2222);
-        assert_eq!(mirror.lookup_global(&key), Some(0x2222));
+        assert!(original.same_identity(&same));
+        assert!(!original.same_identity(&atom));
+        assert!(!original.same_identity(&icon));
     }
 
     #[test]
@@ -359,23 +229,14 @@ mod tests {
         let lower = key("módulo.dll", named("flèche"), 1);
         let upper = key("MÓDULO.DLL", named("FLÈCHE"), 1);
         let noncanonical_bool = key("MÓDULO.DLL", named("FLÈCHE"), 2);
-        let mut mirror = GlobalCursorMirror::<2, 2>::new();
-        mirror.observe_identity(&lower, 0x20024);
-        mirror.promote(0x20024);
-        assert_eq!(mirror.lookup_global(&upper), Some(0x20024));
-        assert_eq!(mirror.lookup_global(&noncanonical_bool), None);
+        assert!(lower.same_identity(&upper));
+        assert!(!lower.same_identity(&noncanonical_bool));
     }
 
     #[test]
     fn cursor_dimensions_are_deliberately_not_in_the_identity() {
         let first = key("user32.dll", CursorResource::atom(32512), 0);
         let different_size_same_key = key("user32.dll", CursorResource::atom(32512), 0);
-        let mut mirror = GlobalCursorMirror::<2, 2>::new();
-        mirror.observe_identity(&first, 0x20024);
-        mirror.promote(0x20024);
-        assert_eq!(
-            mirror.lookup_global(&different_size_same_key),
-            Some(0x20024)
-        );
+        assert!(first.same_identity(&different_size_same_key));
     }
 }

@@ -3233,7 +3233,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_hex(cursor_class.userinit_dialog_class_atom as u32);
     print_str(b" class-atom-names=");
     print_u64(atom_scrollbar.class_atom_names_observed);
-    print_str(b" atom-name-mirror-serves/failures=");
+    print_str(b" atom-name-session-serves/failures=");
     print_u64(atom_scrollbar.class_atom_name_serves);
     print_str(b"/");
     print_u64(atom_scrollbar.class_atom_name_failures);
@@ -3388,7 +3388,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(win32k_pool_exhaustions);
     print_str(b" class-atom-names=");
     print_u64(atom_scrollbar.class_atom_names_observed);
-    print_str(b" atom-name-mirror-serves/failures=");
+    print_str(b" atom-name-session-serves/failures=");
     print_u64(atom_scrollbar.class_atom_name_serves);
     print_str(b"/");
     print_u64(atom_scrollbar.class_atom_name_failures);
