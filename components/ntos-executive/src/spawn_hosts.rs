@@ -653,6 +653,12 @@ pub(crate) struct UserCallbackClient {
     pub peb_mirror: u64,
     /// Executive scratch mapping used to access this process's demand-paged user buffers.
     pub scratch_base: u64,
+    /// Packed primary-token AuthenticationId LUID (`HighPart << 32 | LowPart`) for this caller.
+    pub token_authentication_id: u64,
+    /// Native TOKEN_USER SID bytes for the caller's primary token.
+    pub token_user_sid: [u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX],
+    /// Valid byte length in `token_user_sid`.
+    pub token_user_sid_len: u32,
 }
 
 /// win32k demand-fault verbosity budget: print the first 60 demand faults per dispatch (matches the

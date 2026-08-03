@@ -1044,8 +1044,7 @@ mod tests {
             csr_client_call_lengths((MAXSHORT - CSR_API_MESSAGE_SIZE) as u32),
             Some((
                 (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_PORT_DATA_PREFIX_LEN) as u16,
-                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET)
-                    as u16
+                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET) as u16
             ))
         );
         assert_eq!(

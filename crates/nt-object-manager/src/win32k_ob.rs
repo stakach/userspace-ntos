@@ -211,10 +211,7 @@ impl ObHandleTable {
             .map(|(_, b)| *b)
     }
 
-    /// Register `body` under `kind` at a fresh slot and return its client-visible `HANDLE`
-    /// (`idx << 2`), or 0 if the table is full. A `WindowStation` registration is also cached as
-    /// the single input window station.
-    pub fn register(&mut self, kind: ObKind, body: u64) -> u64 {
+    fn register_inner(&mut self, kind: ObKind, body: u64, cache_window_station: bool) -> u64 {
         let idx = (1..self.next)
             .find(|&idx| self.slots[idx].is_none())
             .unwrap_or(self.next);
@@ -226,11 +223,44 @@ impl ObHandleTable {
         }
         self.slots[idx] = Some((kind, body));
         let handle = (idx as u64) << 2;
-        if kind == ObKind::WindowStation {
+        if cache_window_station && kind == ObKind::WindowStation {
             self.winsta_handle = handle;
             self.winsta_body = body;
         }
         handle
+    }
+
+    /// Register `body` under `kind` at a fresh slot and return its client-visible `HANDLE`
+    /// (`idx << 2`), or 0 if the table is full. A `WindowStation` registration is also cached as
+    /// the single input window station.
+    pub fn register(&mut self, kind: ObKind, body: u64) -> u64 {
+        self.register_inner(kind, body, true)
+    }
+
+    /// Register `body` under `kind` without changing the cached input window station. Noninteractive
+    /// service window stations are real `WindowStation` objects, but they must not replace WinSta0
+    /// as the interactive station later host code uses for GUI-client inheritance.
+    pub fn register_uncached(&mut self, kind: ObKind, body: u64) -> u64 {
+        self.register_inner(kind, body, false)
+    }
+
+    /// Find a canonical handle for an object body of the expected kind.
+    pub fn handle_for_body(&self, kind: ObKind, body: u64) -> Option<u64> {
+        if body == 0 {
+            return None;
+        }
+        for (idx, slot) in self.slots.iter().enumerate().skip(1) {
+            if slot == &Some((kind, body)) {
+                return Some((idx as u64) << 2);
+            }
+        }
+        None
+    }
+
+    /// Create a closeable alias for an object body of the expected kind.
+    pub fn duplicate_by_body(&mut self, kind: ObKind, body: u64) -> Option<u64> {
+        let handle = self.handle_for_body(kind, body)?;
+        self.duplicate(handle)
     }
 
     /// Create a distinct high-range handle alias for an existing win32k object. Keeping aliases out
@@ -297,6 +327,13 @@ impl ObHandleTable {
         self.register(kind, object)
     }
 
+    /// Register the latched object without replacing the cached input window station.
+    pub fn insert_pending_uncached(&mut self, object: u64) -> u64 {
+        let kind = self.pending.map(|(k, _)| k).unwrap_or(ObKind::Other);
+        self.pending = None;
+        self.register_uncached(kind, object)
+    }
+
     /// The cached input window-station handle (0 if none has been created yet).
     pub fn cached_winsta_handle(&self) -> u64 {
         self.winsta_handle
@@ -331,7 +368,8 @@ pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
 }
 
 /// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
-/// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized.
+/// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized or the
+/// thread entry is already linked elsewhere.
 ///
 /// # Safety
 /// `desktop_body` and `thread_body` must point to writable DESKTOP/THREADINFO bodies containing
@@ -343,11 +381,46 @@ pub unsafe fn link_thread_to_desktop(desktop_body: *mut u8, thread_body: *mut u8
     if tail.is_null() {
         return false;
     }
+    let entry_flink = core::ptr::read_unaligned(entry as *const u64);
+    let entry_blink = core::ptr::read_unaligned(entry.add(8) as *const u64);
+    if (entry_flink != 0 || entry_blink != 0)
+        && (entry_flink != entry as u64 || entry_blink != entry as u64)
+    {
+        return false;
+    }
 
     core::ptr::write_unaligned(entry as *mut u64, head as u64);
     core::ptr::write_unaligned(entry.add(8) as *mut u64, tail as u64);
     core::ptr::write_unaligned(tail as *mut u64, entry as u64);
     core::ptr::write_unaligned(head.add(8) as *mut u64, entry as u64);
+    true
+}
+
+/// Remove `THREADINFO.PtiLink` from its current desktop list, matching `RemoveEntryList`, then
+/// reset the entry to a self-referential empty list head. Returns `false` if the entry's backlinks
+/// are not a valid linked-list membership.
+///
+/// # Safety
+/// `thread_body` must point to a writable THREADINFO body containing [`thread_info::PTI_LINK`].
+pub unsafe fn unlink_thread_from_desktop(thread_body: *mut u8) -> bool {
+    let entry = thread_body.add(thread_info::PTI_LINK);
+    let flink = core::ptr::read_unaligned(entry as *const u64) as *mut u8;
+    let blink = core::ptr::read_unaligned(entry.add(8) as *const u64) as *mut u8;
+    if flink.is_null() || blink.is_null() {
+        return false;
+    }
+    if flink == entry && blink == entry {
+        return true;
+    }
+    let flink_blink = core::ptr::read_unaligned(flink.add(8) as *const u64);
+    let blink_flink = core::ptr::read_unaligned(blink as *const u64);
+    if flink_blink != entry as u64 || blink_flink != entry as u64 {
+        return false;
+    }
+    core::ptr::write_unaligned(flink.add(8) as *mut u64, blink as u64);
+    core::ptr::write_unaligned(blink as *mut u64, flink as u64);
+    core::ptr::write_unaligned(entry as *mut u64, entry as u64);
+    core::ptr::write_unaligned(entry.add(8) as *mut u64, entry as u64);
     true
 }
 
@@ -559,6 +632,37 @@ mod tests {
     }
 
     #[test]
+    fn uncached_window_station_does_not_replace_input_station() {
+        let mut t = ObHandleTable::new();
+        let input = t.register(ObKind::WindowStation, 0x7700_0000);
+        let service = t.register_uncached(ObKind::WindowStation, 0x8800_0000);
+        assert_ne!(service, 0);
+        assert_eq!(t.cached_winsta_handle(), input);
+        assert_eq!(t.cached_winsta_body(), 0x7700_0000);
+        assert_eq!(
+            t.lookup(service),
+            Some((ObKind::WindowStation, 0x8800_0000))
+        );
+    }
+
+    #[test]
+    fn body_pointer_open_uses_a_closeable_alias() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::Desktop, 0xD00D_0000);
+        assert_eq!(
+            t.handle_for_body(ObKind::Desktop, 0xD00D_0000),
+            Some(original)
+        );
+        let alias = t
+            .duplicate_by_body(ObKind::Desktop, 0xD00D_0000)
+            .expect("alias");
+        assert_ne!(alias, original);
+        assert_eq!(t.lookup(alias), Some((ObKind::Desktop, 0xD00D_0000)));
+        assert!(t.close(alias));
+        assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
+    }
+
+    #[test]
     fn table_full_returns_null_handle() {
         let mut t = ObHandleTable::new();
         for i in 1..OB_TABLE_LEN {
@@ -611,6 +715,66 @@ mod tests {
             assert_eq!(core::ptr::read_unaligned((head + 8) as *const u64), entry);
             assert_eq!(core::ptr::read_unaligned(entry as *const u64), head);
             assert_eq!(core::ptr::read_unaligned((entry + 8) as *const u64), head);
+        }
+    }
+
+    #[test]
+    fn desktop_thread_unlink_restores_empty_membership() {
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut thread = [0u8; 0x300];
+        let head = unsafe { body.as_mut_ptr().add(desktop::PTI_LIST) } as u64;
+        let entry = unsafe { thread.as_mut_ptr().add(thread_info::PTI_LINK) } as u64;
+        unsafe {
+            init_desktop_body(body.as_mut_ptr(), 0x1000);
+            assert!(link_thread_to_desktop(
+                body.as_mut_ptr(),
+                thread.as_mut_ptr()
+            ));
+            assert!(unlink_thread_from_desktop(thread.as_mut_ptr()));
+            assert_eq!(core::ptr::read_unaligned(head as *const u64), head);
+            assert_eq!(core::ptr::read_unaligned((head + 8) as *const u64), head);
+            assert_eq!(core::ptr::read_unaligned(entry as *const u64), entry);
+            assert_eq!(core::ptr::read_unaligned((entry + 8) as *const u64), entry);
+        }
+    }
+
+    #[test]
+    fn desktop_thread_link_rejects_live_membership() {
+        let mut first = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut second = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut thread = [0u8; 0x300];
+        unsafe {
+            init_desktop_body(first.as_mut_ptr(), 0x1000);
+            init_desktop_body(second.as_mut_ptr(), 0x2000);
+            assert!(link_thread_to_desktop(
+                first.as_mut_ptr(),
+                thread.as_mut_ptr()
+            ));
+            assert!(!link_thread_to_desktop(
+                second.as_mut_ptr(),
+                thread.as_mut_ptr()
+            ));
+            assert!(unlink_thread_from_desktop(thread.as_mut_ptr()));
+            assert!(link_thread_to_desktop(
+                second.as_mut_ptr(),
+                thread.as_mut_ptr()
+            ));
+        }
+    }
+
+    #[test]
+    fn desktop_thread_unlink_rejects_corrupt_membership() {
+        let mut thread = [0u8; 0x300];
+        let mut scratch = [0u8; 0x20];
+        let entry = unsafe { thread.as_mut_ptr().add(thread_info::PTI_LINK) } as u64;
+        let flink = scratch.as_mut_ptr() as u64;
+        let blink = unsafe { scratch.as_mut_ptr().add(0x10) } as u64;
+        unsafe {
+            core::ptr::write_unaligned(entry as *mut u64, flink);
+            core::ptr::write_unaligned((entry + 8) as *mut u64, blink);
+            core::ptr::write_unaligned((flink + 8) as *mut u64, 0);
+            core::ptr::write_unaligned(blink as *mut u64, 0);
+            assert!(!unlink_thread_from_desktop(thread.as_mut_ptr()));
         }
     }
 

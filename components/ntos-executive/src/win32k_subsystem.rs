@@ -75,6 +75,9 @@ pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// 9 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
 pub const WIN32K_DATA_FRAMES: u64 = 9;
+/// Per-dispatch primary-token user SID bytes. The shared dispatch page carries a pointer to this
+/// data-region buffer so the callback frame can remain at its fixed `0x200` offset.
+pub const WIN32K_TOKEN_USER_SID_VADDR: u64 = WIN32K_DATA_VADDR + 0x5000;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
 /// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
 pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
@@ -258,12 +261,16 @@ pub const SH_CTX_ETHREAD: u64 = 0x198; // out: selected ETHREAD body
 pub const SH_CTX_W32PROCESS: u64 = 0x1A0; // out: win32k W32PROCESS parked on EPROCESS, or 0
 pub const SH_CTX_W32THREAD: u64 = 0x1A8; // out: win32k W32THREAD parked on ETHREAD, or 0
 pub const SH_REQ_PROCESS_ROLE: u64 = 0x1B0; // in: registered hosted-process role code
+pub const SH_REQ_TOKEN_AUTH: u64 = 0x1B8; // in: packed primary-token AuthenticationId LUID
+pub const SH_REQ_TOKEN_USER_SID_LEN: u64 = 0x1C0; // in: native user SID byte length
+pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native user SID bytes
+pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
 pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
-const _: () = assert!(SH_REQ_PROCESS_ROLE < SH_USER_CALLBACK);
+const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 pub const HOSTED_PROCESS_ROLE_NONE: u64 = 0;
@@ -741,45 +748,627 @@ extern "win64" fn s_true() -> u64 {
 }
 extern "win64" fn s_void() {}
 
-/// `NTSTATUS SeQueryAuthenticationIdToken(PACCESS_TOKEN Token, PLUID AuthenticationId)`.
-///
-/// The ONE Se* function on the boot/connect path (backlog item 3, Se→nt-security): win32k's
-/// `GetProcessLuid` (→ `IntResolveDesktop` → `InitThreadCallback`, the per-thread win32k connect
-/// callout) calls it while a GUI thread attaches; a failing/zero-LUID result aborts desktop
-/// resolution. Model the SYSTEM subject (the init path runs as Local System): write the well-known
-/// SYSTEM logon-session LUID + return STATUS_SUCCESS. Behavior-preserving — the prior `s_zero` stub
-/// already returned SUCCESS(0); this additionally fills a genuine LUID
-/// (`nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID`) into the caller's out-param.
-extern "win64" fn s_se_query_authentication_id_token(_token: u64, luid_out: *mut u32) -> i32 {
-    if !luid_out.is_null() {
-        // SAFETY: luid_out is win32k's stack-local &LUID (2 x u32); the component stack is mapped.
-        unsafe {
+const STATUS_INVALID_PARAMETER_I32: i32 = 0xC000_000Du32 as i32;
+const STATUS_NO_TOKEN_I32: i32 = 0xC000_007Cu32 as i32;
+const STATUS_ACCESS_VIOLATION_I32: i32 = 0xC000_0005u32 as i32;
+const STATUS_INVALID_HANDLE_I32: i32 = 0xC000_0008u32 as i32;
+const STATUS_BUFFER_TOO_SMALL_I32: i32 = 0xC000_0023u32 as i32;
+const STATUS_INVALID_INFO_CLASS_I32: i32 = 0xC000_0003u32 as i32;
+const STATUS_UNKNOWN_REVISION_I32: i32 = 0xC000_0058u32 as i32;
+const STATUS_REVISION_MISMATCH_I32: i32 = 0xC000_0059u32 as i32;
+const STATUS_INVALID_ACL_I32: i32 = 0xC000_0077u32 as i32;
+const STATUS_INVALID_SID_I32: i32 = 0xC000_0078u32 as i32;
+const STATUS_ALLOTTED_SPACE_EXCEEDED_I32: i32 = 0xC000_0099u32 as i32;
+const STATUS_BAD_DESCRIPTOR_FORMAT_I32: i32 = 0xC000_00E7u32 as i32;
+const WIN32K_PRIMARY_TOKEN_MAGIC: u64 = 0x544f_4b45_4e4c_5549; // "TOKENLUI"
+const WIN32K_PRIMARY_TOKEN_BYTES: u64 = 0x70;
+const TOKEN_AUTHENTICATION_ID_OFF: u64 = 0x08;
+const TOKEN_EPROCESS_OFF: u64 = 0x10;
+const TOKEN_PID_OFF: u64 = 0x18;
+const TOKEN_USER_SID_LEN_OFF: u64 = 0x20;
+const TOKEN_USER_SID_OFF: u64 = 0x28;
+const TOKEN_INFORMATION_CLASS_USER: u64 = 1;
+const TOKEN_QUERY_ACCESS: u64 = 0x0008;
+const WIN32K_TOKEN_HANDLE_BASE: u64 = 0x0000_0000_5E70_0000;
+const WIN32K_TOKEN_HANDLE_CAP: usize = 16;
+const SECURITY_DESCRIPTOR_REVISION_U64: u64 = 1;
+const SECURITY_DESCRIPTOR_ABSOLUTE_BYTES: usize = 0x28;
+const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 0x14;
+const SD_CONTROL_OFF: u64 = 0x02;
+const SD_OWNER_OFF: u64 = 0x08;
+const SD_GROUP_OFF: u64 = 0x10;
+const SD_SACL_OFF: u64 = 0x18;
+const SD_DACL_OFF: u64 = 0x20;
+const SD_REL_OWNER_OFF: u64 = 0x04;
+const SD_REL_GROUP_OFF: u64 = 0x08;
+const SD_REL_SACL_OFF: u64 = 0x0C;
+const SD_REL_DACL_OFF: u64 = 0x10;
+const SE_OWNER_DEFAULTED: u16 = 0x0001;
+const SE_GROUP_DEFAULTED: u16 = 0x0002;
+const SE_DACL_PRESENT: u16 = 0x0004;
+const SE_DACL_DEFAULTED: u16 = 0x0008;
+const SE_SELF_RELATIVE: u16 = 0x8000;
+const ACL_HEADER_BYTES: usize = 8;
+const ACL_REVISION_MIN: u64 = 2;
+const ACL_REVISION_MAX: u64 = 4;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const KNOWN_ACE_HEADER_BYTES: usize = 8; // ACE_HEADER + ACCESS_MASK; SidStart follows.
+const SID_HEADER_BYTES: usize = 8;
+const SID_MAX_SUB_AUTHORITIES: usize = 15;
+const VALID_INHERIT_FLAGS: u64 = 0x1F;
+
+fn local_system_sid_native() -> ([u8; WIN32K_TOKEN_USER_SID_MAX], usize) {
+    let mut sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
+    let len = nt_security::Sid::local_system()
+        .write_native(&mut sid)
+        .unwrap_or(0);
+    (sid, len)
+}
+
+fn native_sid_len(sid: &[u8], supplied_len: usize) -> Option<usize> {
+    if supplied_len < 8 || supplied_len > WIN32K_TOKEN_USER_SID_MAX || supplied_len > sid.len() {
+        return None;
+    }
+    if sid[0] != 1 {
+        return None;
+    }
+    let subauths = sid[1] as usize;
+    if subauths > 15 {
+        return None;
+    }
+    let expected = 8usize.checked_add(subauths.checked_mul(4)?)?;
+    (expected == supplied_len).then_some(expected)
+}
+
+unsafe fn record_process_token_context(
+    process_index: usize,
+    token_authentication_id: u64,
+    token_user_sid: &[u8],
+    token_user_sid_len: usize,
+) -> bool {
+    let token_user_sid_len = native_sid_len(token_user_sid, token_user_sid_len).unwrap_or(0);
+    if process_index >= WIN32K_GUI_PROCESS_CAP
+        || token_authentication_id == 0
+        || token_user_sid_len == 0
+        || token_user_sid_len > WIN32K_TOKEN_USER_SID_MAX
+        || token_user_sid_len > token_user_sid.len()
+    {
+        let n = WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            let pid = if process_index < WIN32K_GUI_PROCESS_CAP {
+                WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed)
+            } else {
+                0
+            };
+            print_str(b"[win32k-token] ERROR: missing primary-token AuthenticationId pid=");
+            print_u64(pid);
+            print_str(b" process-index=");
+            print_u64(process_index as u64);
+            print_str(b" sid-len=");
+            print_u64(token_user_sid_len as u64);
+            print_str(b"\n");
+        }
+        return false;
+    }
+    WIN32K_PROCESS_CTX_TOKEN_AUTH[process_index].store(token_authentication_id, Ordering::Relaxed);
+
+    let token = ensure_primary_token_object(process_index);
+    if token == 0 {
+        return false;
+    }
+    write_volatile(
+        (token + TOKEN_USER_SID_LEN_OFF) as *mut u64,
+        token_user_sid_len as u64,
+    );
+    let sid_base = (token + TOKEN_USER_SID_OFF) as *mut u8;
+    let mut i = 0usize;
+    while i < WIN32K_TOKEN_USER_SID_MAX {
+        let byte = if i < token_user_sid_len {
+            token_user_sid[i]
+        } else {
+            0
+        };
+        write_volatile(sid_base.add(i), byte);
+        i += 1;
+    }
+    true
+}
+
+unsafe fn ensure_primary_token_object(process_index: usize) -> u64 {
+    if process_index >= WIN32K_GUI_PROCESS_CAP {
+        return 0;
+    }
+    let token_authentication_id =
+        WIN32K_PROCESS_CTX_TOKEN_AUTH[process_index].load(Ordering::Relaxed);
+    if token_authentication_id == 0 {
+        return 0;
+    }
+    let existing = WIN32K_PROCESS_CTX_PRIMARY_TOKEN[process_index].load(Ordering::Relaxed);
+    let token = if existing != 0 {
+        existing
+    } else {
+        let allocated = allocate_kernel_object_body(WIN32K_PRIMARY_TOKEN_BYTES);
+        if allocated == 0 {
+            return 0;
+        }
+        write_volatile(allocated as *mut u64, WIN32K_PRIMARY_TOKEN_MAGIC);
+        WIN32K_PROCESS_CTX_PRIMARY_TOKEN[process_index].store(allocated, Ordering::Relaxed);
+        allocated
+    };
+    write_volatile(
+        (token + TOKEN_AUTHENTICATION_ID_OFF) as *mut u64,
+        token_authentication_id,
+    );
+    write_volatile(
+        (token + TOKEN_EPROCESS_OFF) as *mut u64,
+        WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed),
+    );
+    write_volatile(
+        (token + TOKEN_PID_OFF) as *mut u64,
+        WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed),
+    );
+    token
+}
+
+unsafe fn token_context_index(token: u64) -> Option<usize> {
+    if token == 0 {
+        return None;
+    }
+    for index in 0..WIN32K_GUI_PROCESS_CAP {
+        if WIN32K_PROCESS_CTX_PRIMARY_TOKEN[index].load(Ordering::Relaxed) == token {
+            if read_volatile(token as *const u64) != WIN32K_PRIMARY_TOKEN_MAGIC {
+                return None;
+            }
+            return Some(index);
+        }
+    }
+    None
+}
+
+unsafe fn primary_token_authentication_id(token: u64) -> Option<u64> {
+    token_context_index(token).and_then(|_| {
+        let auth = read_volatile((token + TOKEN_AUTHENTICATION_ID_OFF) as *const u64);
+        (auth != 0).then_some(auth)
+    })
+}
+
+unsafe fn primary_token_user_sid(token: u64, out: &mut [u8; WIN32K_TOKEN_USER_SID_MAX]) -> Option<usize> {
+    token_context_index(token)?;
+    let len = read_volatile((token + TOKEN_USER_SID_LEN_OFF) as *const u64) as usize;
+    if len == 0 || len > WIN32K_TOKEN_USER_SID_MAX {
+        return None;
+    }
+    let sid_base = (token + TOKEN_USER_SID_OFF) as *const u8;
+    let mut i = 0usize;
+    while i < WIN32K_TOKEN_USER_SID_MAX {
+        out[i] = if i < len {
+            read_volatile(sid_base.add(i))
+        } else {
+            0
+        };
+        i += 1;
+    }
+    Some(len)
+}
+
+unsafe fn token_handle_slot(handle: u64) -> Option<usize> {
+    let index = handle.checked_sub(WIN32K_TOKEN_HANDLE_BASE)? / 4;
+    (index < WIN32K_TOKEN_HANDLE_CAP as u64).then_some(index as usize)
+}
+
+unsafe fn register_token_handle(token: u64) -> u64 {
+    if token_context_index(token).is_none() {
+        return 0;
+    }
+    for index in 0..WIN32K_TOKEN_HANDLE_CAP {
+        if WIN32K_TOKEN_HANDLE_TOKENS[index].load(Ordering::Relaxed) == 0 {
+            let handle = WIN32K_TOKEN_HANDLE_BASE + (index as u64) * 4;
+            WIN32K_TOKEN_HANDLE_TOKENS[index].store(token, Ordering::Relaxed);
+            return handle;
+        }
+    }
+    0
+}
+
+unsafe fn token_for_handle(handle: u64) -> Option<u64> {
+    let slot = token_handle_slot(handle)?;
+    let token = WIN32K_TOKEN_HANDLE_TOKENS[slot].load(Ordering::Relaxed);
+    (token_context_index(token).is_some()).then_some(token)
+}
+
+unsafe fn close_token_handle(handle: u64) -> bool {
+    let Some(slot) = token_handle_slot(handle) else {
+        return false;
+    };
+    WIN32K_TOKEN_HANDLE_TOKENS[slot].swap(0, Ordering::Relaxed) != 0
+}
+
+fn round_up4(value: usize) -> Option<usize> {
+    value.checked_add(3).map(|v| v & !3)
+}
+
+unsafe fn zero_component_bytes(dst: u64, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        write_volatile((dst + i as u64) as *mut u8, 0);
+        i += 1;
+    }
+}
+
+unsafe fn copy_component_bytes(dst: u64, src: u64, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        let byte = read_volatile((src + i as u64) as *const u8);
+        write_volatile((dst + i as u64) as *mut u8, byte);
+        i += 1;
+    }
+}
+
+unsafe fn sid_len_from_ptr(sid: u64) -> Option<usize> {
+    if sid == 0 {
+        return None;
+    }
+    let revision = read_volatile(sid as *const u8);
+    let subauths = read_volatile((sid + 1) as *const u8) as usize;
+    if revision != 1 || subauths > SID_MAX_SUB_AUTHORITIES {
+        return None;
+    }
+    SID_HEADER_BYTES.checked_add(subauths.checked_mul(4)?)
+}
+
+unsafe fn acl_size_from_ptr(acl: u64) -> Option<usize> {
+    if acl == 0 {
+        return None;
+    }
+    let revision = read_volatile(acl as *const u8) as u64;
+    let size = read_unaligned((acl + 2) as *const u16) as usize;
+    if !(ACL_REVISION_MIN..=ACL_REVISION_MAX).contains(&revision) || size < ACL_HEADER_BYTES {
+        return None;
+    }
+    Some(size)
+}
+
+unsafe fn acl_first_free_offset(acl: u64) -> Option<usize> {
+    let acl_size = acl_size_from_ptr(acl)?;
+    let ace_count = read_unaligned((acl + 4) as *const u16) as usize;
+    let mut offset = ACL_HEADER_BYTES;
+    let mut index = 0usize;
+    while index < ace_count {
+        if offset.checked_add(4)? > acl_size {
+            return None;
+        }
+        let ace_size = read_unaligned((acl + offset as u64 + 2) as *const u16) as usize;
+        if ace_size < 4 || offset.checked_add(ace_size)? > acl_size {
+            return None;
+        }
+        offset += ace_size;
+        index += 1;
+    }
+    Some(offset)
+}
+
+unsafe fn sd_component_len_sid(ptr: u64) -> Option<usize> {
+    if ptr == 0 {
+        return Some(0);
+    }
+    round_up4(sid_len_from_ptr(ptr)?)
+}
+
+unsafe fn sd_component_len_acl(ptr: u64) -> Option<usize> {
+    if ptr == 0 {
+        return Some(0);
+    }
+    round_up4(acl_size_from_ptr(ptr)?)
+}
+
+/// `NTSTATUS RtlCreateSecurityDescriptor(PSECURITY_DESCRIPTOR, ULONG)`.
+extern "win64" fn s_rtl_create_security_descriptor(sd: u64, revision: u64) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if revision != SECURITY_DESCRIPTOR_REVISION_U64 {
+        return STATUS_UNKNOWN_REVISION_I32;
+    }
+    unsafe {
+        zero_component_bytes(sd, SECURITY_DESCRIPTOR_ABSOLUTE_BYTES);
+        write_volatile(sd as *mut u8, SECURITY_DESCRIPTOR_REVISION_U64 as u8);
+    }
+    0
+}
+
+/// `ULONG RtlLengthSid(PSID)`.
+extern "win64" fn s_rtl_length_sid(sid: u64) -> u64 {
+    unsafe { sid_len_from_ptr(sid).unwrap_or(0) as u64 }
+}
+
+/// `NTSTATUS RtlCreateAcl(PACL, ULONG, ULONG)`.
+extern "win64" fn s_rtl_create_acl(acl: u64, acl_size: u64, acl_revision: u64) -> i32 {
+    if acl == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if acl_size < ACL_HEADER_BYTES as u64 {
+        return STATUS_BUFFER_TOO_SMALL_I32;
+    }
+    if !(ACL_REVISION_MIN..=ACL_REVISION_MAX).contains(&acl_revision) || acl_size > u16::MAX as u64
+    {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let Some(rounded_size) = round_up4(acl_size as usize) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    if rounded_size > u16::MAX as usize {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe {
+        write_volatile(acl as *mut u8, acl_revision as u8);
+        write_volatile((acl + 1) as *mut u8, 0);
+        write_unaligned((acl + 2) as *mut u16, rounded_size as u16);
+        write_unaligned((acl + 4) as *mut u16, 0);
+        write_unaligned((acl + 6) as *mut u16, 0);
+    }
+    0
+}
+
+/// `NTSTATUS RtlAddAccessAllowedAceEx(PACL, ULONG, ULONG, ACCESS_MASK, PSID)`.
+extern "win64" fn s_rtl_add_access_allowed_ace_ex(
+    acl: u64,
+    revision: u64,
+    flags: u64,
+    access_mask: u64,
+    sid: u64,
+) -> i32 {
+    if acl == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    let Some(sid_len) = (unsafe { sid_len_from_ptr(sid) }) else {
+        return STATUS_INVALID_SID_I32;
+    };
+    unsafe {
+        let acl_revision = read_volatile(acl as *const u8) as u64;
+        if acl_revision > ACL_REVISION_MAX || revision > ACL_REVISION_MAX {
+            return STATUS_REVISION_MISMATCH_I32;
+        }
+        if acl_revision < ACL_REVISION_MIN {
+            return STATUS_INVALID_ACL_I32;
+        }
+        if flags & !VALID_INHERIT_FLAGS != 0 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let Some(acl_size) = acl_size_from_ptr(acl) else {
+            return STATUS_INVALID_ACL_I32;
+        };
+        let Some(first_free) = acl_first_free_offset(acl) else {
+            return STATUS_INVALID_ACL_I32;
+        };
+        let Some(ace_size) = sid_len.checked_add(KNOWN_ACE_HEADER_BYTES) else {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED_I32;
+        };
+        if first_free.checked_add(ace_size).unwrap_or(usize::MAX) > acl_size {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED_I32;
+        }
+        let ace = acl + first_free as u64;
+        write_volatile(ace as *mut u8, ACCESS_ALLOWED_ACE_TYPE);
+        write_volatile((ace + 1) as *mut u8, flags as u8);
+        write_unaligned((ace + 2) as *mut u16, ace_size as u16);
+        write_unaligned((ace + 4) as *mut u32, access_mask as u32);
+        copy_component_bytes(ace + KNOWN_ACE_HEADER_BYTES as u64, sid, sid_len);
+
+        let ace_count = read_unaligned((acl + 4) as *const u16);
+        write_unaligned((acl + 4) as *mut u16, ace_count.wrapping_add(1));
+        if revision > acl_revision {
+            write_volatile(acl as *mut u8, revision as u8);
+        }
+    }
+    0
+}
+
+/// `NTSTATUS RtlSetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN)`.
+extern "win64" fn s_rtl_set_dacl_security_descriptor(
+    sd: u64,
+    dacl_present: u64,
+    dacl: u64,
+    dacl_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION_I32;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if dacl_present != 0 {
+            control |= SE_DACL_PRESENT;
+            write_unaligned((sd + SD_DACL_OFF) as *mut u64, dacl);
+        } else {
+            control &= !SE_DACL_PRESENT;
+            write_unaligned((sd + SD_DACL_OFF) as *mut u64, 0);
+        }
+        if dacl_defaulted != 0 {
+            control |= SE_DACL_DEFAULTED;
+        } else {
+            control &= !SE_DACL_DEFAULTED;
+        }
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    0
+}
+
+/// `NTSTATUS RtlSetOwnerSecurityDescriptor(PSECURITY_DESCRIPTOR, PSID, BOOLEAN)`.
+extern "win64" fn s_rtl_set_owner_security_descriptor(
+    sd: u64,
+    owner: u64,
+    owner_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION_I32;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if owner_defaulted != 0 {
+            control |= SE_OWNER_DEFAULTED;
+        } else {
+            control &= !SE_OWNER_DEFAULTED;
+        }
+        write_unaligned((sd + SD_OWNER_OFF) as *mut u64, owner);
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    0
+}
+
+/// `NTSTATUS RtlSetGroupSecurityDescriptor(PSECURITY_DESCRIPTOR, PSID, BOOLEAN)`.
+extern "win64" fn s_rtl_set_group_security_descriptor(
+    sd: u64,
+    group: u64,
+    group_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION_I32;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if group_defaulted != 0 {
+            control |= SE_GROUP_DEFAULTED;
+        } else {
+            control &= !SE_GROUP_DEFAULTED;
+        }
+        write_unaligned((sd + SD_GROUP_OFF) as *mut u64, group);
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    0
+}
+
+/// `NTSTATUS RtlAbsoluteToSelfRelativeSD(PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR, PULONG)`.
+extern "win64" fn s_rtl_absolute_to_self_relative_sd(
+    absolute_sd: u64,
+    self_relative_sd: u64,
+    buffer_length: *mut u32,
+) -> i32 {
+    if absolute_sd == 0 || buffer_length.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        if read_volatile(absolute_sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION_I32;
+        }
+        let control = read_unaligned((absolute_sd + SD_CONTROL_OFF) as *const u16);
+        if control & SE_SELF_RELATIVE != 0 {
+            return STATUS_BAD_DESCRIPTOR_FORMAT_I32;
+        }
+
+        let owner = read_unaligned((absolute_sd + SD_OWNER_OFF) as *const u64);
+        let group = read_unaligned((absolute_sd + SD_GROUP_OFF) as *const u64);
+        let sacl = read_unaligned((absolute_sd + SD_SACL_OFF) as *const u64);
+        let dacl = read_unaligned((absolute_sd + SD_DACL_OFF) as *const u64);
+        let Some(owner_len) = sd_component_len_sid(owner) else {
+            return STATUS_INVALID_SID_I32;
+        };
+        let Some(group_len) = sd_component_len_sid(group) else {
+            return STATUS_INVALID_SID_I32;
+        };
+        let Some(sacl_len) = sd_component_len_acl(sacl) else {
+            return STATUS_INVALID_ACL_I32;
+        };
+        let Some(dacl_len) = sd_component_len_acl(dacl) else {
+            return STATUS_INVALID_ACL_I32;
+        };
+        let Some(total_len) = SECURITY_DESCRIPTOR_RELATIVE_BYTES
+            .checked_add(owner_len)
+            .and_then(|v| v.checked_add(group_len))
+            .and_then(|v| v.checked_add(sacl_len))
+            .and_then(|v| v.checked_add(dacl_len))
+        else {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED_I32;
+        };
+
+        let caller_len = read_unaligned(buffer_length);
+        if caller_len < total_len as u32 {
+            write_unaligned(buffer_length, total_len as u32);
+            return STATUS_BUFFER_TOO_SMALL_I32;
+        }
+        if self_relative_sd == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+
+        zero_component_bytes(self_relative_sd, total_len);
+        copy_component_bytes(self_relative_sd, absolute_sd, 4);
+        let mut current = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
+        if sacl_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, sacl, sacl_len);
             write_unaligned(
-                luid_out,
-                nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW,
+                (self_relative_sd + SD_REL_SACL_OFF) as *mut u32,
+                current as u32,
             );
+            current += sacl_len;
+        }
+        if dacl_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, dacl, dacl_len);
             write_unaligned(
-                luid_out.add(1),
-                nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32,
+                (self_relative_sd + SD_REL_DACL_OFF) as *mut u32,
+                current as u32,
+            );
+            current += dacl_len;
+        }
+        if owner_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, owner, owner_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_OWNER_OFF) as *mut u32,
+                current as u32,
+            );
+            current += owner_len;
+        }
+        if group_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, group, group_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_GROUP_OFF) as *mut u32,
+                current as u32,
             );
         }
+        let rel_control = control | SE_SELF_RELATIVE;
+        write_unaligned((self_relative_sd + SD_CONTROL_OFF) as *mut u16, rel_control);
+        write_unaligned(buffer_length, total_len as u32);
+    }
+    0
+}
+
+/// `NTSTATUS SeQueryAuthenticationIdToken(PACCESS_TOKEN Token, PLUID AuthenticationId)`.
+///
+/// win32k's `GetProcessLuid` obtains `Process->Token` through `PsReferencePrimaryToken` and then
+/// calls this routine. The executive serializes the selected process's real ProcessManager primary
+/// token AuthenticationId into the win32k dispatch request; the component exposes that metadata as a
+/// kernel token object and fails visibly for unknown token pointers.
+extern "win64" fn s_se_query_authentication_id_token(token: u64, luid_out: *mut u32) -> i32 {
+    if luid_out.is_null() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let Some(auth) = (unsafe { primary_token_authentication_id(token) }) else {
+        return STATUS_NO_TOKEN_I32;
+    };
+    // SAFETY: luid_out is win32k's stack-local &LUID (2 x u32); the component stack is mapped.
+    unsafe {
+        write_unaligned(luid_out, auth as u32);
+        write_unaligned(luid_out.add(1), (auth >> 32) as u32);
     }
     0 // STATUS_SUCCESS
 }
 
-/// A synthetic non-null SYSTEM primary-token marker stored in captured subject contexts. The host's
-/// `SePrivilegeCheck` models the SYSTEM subject via `nt_security` `SYSTEM_PRIVILEGE_LUIDS` and never
-/// dereferences this pointer; it exists only so a captured context has a non-null `PrimaryToken`.
-const PH_SYSTEM_TOKEN: u64 = 0x0000_0000_5E5E_0018; // "Se" + S-1-5-18 (LocalSystem) marker
-
 /// `void SeCaptureSubjectContext(PSECURITY_SUBJECT_CONTEXT SubjectContext)`. Snapshot the caller's
-/// security identity into `SubjectContext`. The win32k init/shutdown caller runs as Local System, so
-/// capture the SYSTEM subject (no impersonation, PrimaryToken = the SYSTEM marker). Off the boot/paint
-/// path (only `HasPrivilege` → `UserInitiateShutdown` calls it).
+/// security identity into `SubjectContext` from the currently selected process primary token.
 extern "win64" fn s_se_capture_subject_context(ctx: *mut u8) {
     if !ctx.is_null() {
         // SAFETY: ctx is win32k's stack-local SECURITY_SUBJECT_CONTEXT (0x20 bytes); stack is mapped.
-        unsafe { nt_security::se_exports::capture_system_subject_context(ctx, PH_SYSTEM_TOKEN) };
+        unsafe {
+            let primary = current_process_context_index()
+                .map(|index| ensure_primary_token_object(index))
+                .unwrap_or(0);
+            nt_security::se_exports::capture_system_subject_context(ctx, primary);
+        }
     }
 }
 
@@ -862,11 +1451,223 @@ extern "win64" fn s_current_process() -> u64 {
 extern "win64" fn s_current_thread() -> u64 {
     unsafe { current_ethread() }
 }
+/// `HANDLE PsGetProcessId(PEPROCESS Process)` — resolve a process body back to its selected PID.
+extern "win64" fn s_ps_get_process_id(process: u64) -> u64 {
+    unsafe {
+        process_context_index_for_eprocess(process)
+            .map(|index| WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+/// `HANDLE PsGetCurrentThreadId()` — the routed client's current TID.
+extern "win64" fn s_ps_get_current_thread_id() -> u64 {
+    WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed)
+}
+
+/// `HANDLE PsGetThreadId(PETHREAD Thread)` — resolve a thread body back to its selected TID.
+extern "win64" fn s_ps_get_thread_id(thread: u64) -> u64 {
+    unsafe {
+        if let Some(index) = thread_context_index_for_ethread(thread) {
+            return WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed);
+        }
+        if thread != 0 {
+            read_volatile((thread + ETHREAD_CID_UNIQUE_THREAD_OFF) as *const u64)
+        } else {
+            0
+        }
+    }
+}
+
+/// `HANDLE PsGetThreadProcessId(PETHREAD Thread)` — resolve a thread body to its owning PID.
+extern "win64" fn s_ps_get_thread_process_id(thread: u64) -> u64 {
+    unsafe {
+        if let Some(index) = thread_context_index_for_ethread(thread) {
+            return WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
+        }
+        if thread != 0 {
+            read_volatile((thread + ETHREAD_CID_UNIQUE_PROCESS_OFF) as *const u64)
+        } else {
+            0
+        }
+    }
+}
+
+/// `PEPROCESS PsGetThreadProcess(PETHREAD Thread)` — return the owning process object for a known
+/// ETHREAD. Unknown thread objects return NULL rather than the current process.
+extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
+    unsafe {
+        if let Some(index) = thread_context_index_for_ethread(thread) {
+            let pid = WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
+            return eprocess_for_pid(pid);
+        }
+        if thread != 0 {
+            let process = read_volatile((thread + ETHREAD_THREADS_PROCESS_OFF) as *const u64);
+            if process_context_index_for_eprocess(process).is_some() {
+                return process;
+            }
+        }
+        0
+    }
+}
+
+/// `PACCESS_TOKEN PsReferencePrimaryToken(PEPROCESS Process)` — reference the selected process's
+/// primary-token object. The token metadata is owned by the executive ProcessManager and delivered
+/// in the win32k dispatch request; missing metadata is a visible NULL result.
+extern "win64" fn s_ps_reference_primary_token(process: u64) -> u64 {
+    unsafe {
+        let Some(index) = process_context_index_for_eprocess(process) else {
+            let n = WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[win32k-token] ERROR: PsReferencePrimaryToken unknown EPROCESS=0x");
+                print_hex((process >> 32) as u32);
+                print_hex(process as u32);
+                print_str(b"\n");
+            }
+            return 0;
+        };
+        let token = ensure_primary_token_object(index);
+        if token == 0 {
+            let n = WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[win32k-token] ERROR: PsReferencePrimaryToken missing token pid=");
+                print_u64(WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed));
+                print_str(b"\n");
+            }
+        }
+        token
+    }
+}
+
+/// `PACCESS_TOKEN PsReferenceImpersonationToken(...)` — no hosted win32k caller currently carries a
+/// thread impersonation token in the component context, so report the native no-token shape.
+extern "win64" fn s_ps_reference_impersonation_token(
+    _thread: u64,
+    copy_on_open: *mut u8,
+    effective_only: *mut u8,
+    impersonation_level: *mut u32,
+) -> u64 {
+    unsafe {
+        if !copy_on_open.is_null() {
+            write_unaligned(copy_on_open, 0);
+        }
+        if !effective_only.is_null() {
+            write_unaligned(effective_only, 0);
+        }
+        if !impersonation_level.is_null() {
+            write_unaligned(impersonation_level, 0);
+        }
+    }
+    0
+}
+
+/// `NTSTATUS ZwOpenThreadToken(HANDLE ThreadHandle, ACCESS_MASK DesiredAccess, BOOLEAN OpenAsSelf,
+/// PHANDLE TokenHandle)`. No hosted win32k thread currently carries an impersonation token, so the
+/// native result is `STATUS_NO_TOKEN` and the caller can fall back to `ZwOpenProcessToken`.
+extern "win64" fn s_zw_open_thread_token(
+    _thread_handle: u64,
+    _desired_access: u64,
+    _open_as_self: u64,
+    token_handle: *mut u64,
+) -> i32 {
+    if token_handle.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        write_unaligned(token_handle, 0);
+    }
+    STATUS_NO_TOKEN_I32
+}
+
+/// `NTSTATUS ZwOpenProcessToken(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+/// PHANDLE TokenHandle)`. Open a handle to the selected GUI process's primary token object.
+extern "win64" fn s_zw_open_process_token(
+    process_handle: u64,
+    desired_access: u64,
+    token_handle: *mut u64,
+) -> i32 {
+    if token_handle.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        write_unaligned(token_handle, 0);
+        if desired_access & TOKEN_QUERY_ACCESS == 0 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        if process_handle != u64::MAX && process_handle != FAKE_PROCESS_HANDLE {
+            return STATUS_INVALID_HANDLE_I32;
+        }
+        let Some(index) = current_process_context_index() else {
+            return STATUS_INVALID_HANDLE_I32;
+        };
+        let token = ensure_primary_token_object(index);
+        if token == 0 {
+            return STATUS_NO_TOKEN_I32;
+        }
+        let handle = register_token_handle(token);
+        if handle == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        write_unaligned(token_handle, handle);
+        0
+    }
+}
+
+/// `NTSTATUS ZwQueryInformationToken(HANDLE TokenHandle, TOKEN_INFORMATION_CLASS Class,
+/// PVOID Buffer, ULONG Length, PULONG ReturnLength)`. The service window-station security path only
+/// needs `TokenUser`; return the native `TOKEN_USER` layout from the process primary token.
+extern "win64" fn s_zw_query_information_token(
+    token_handle: u64,
+    token_information_class: u64,
+    token_information: u64,
+    token_information_length: u64,
+    return_length: *mut u32,
+) -> i32 {
+    if return_length.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if token_information_class != TOKEN_INFORMATION_CLASS_USER {
+        return STATUS_INVALID_INFO_CLASS_I32;
+    }
+    let Some(token) = (unsafe { token_for_handle(token_handle) }) else {
+        return STATUS_INVALID_HANDLE_I32;
+    };
+    let mut sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
+    let Some(sid_len) = (unsafe { primary_token_user_sid(token, &mut sid) }) else {
+        return STATUS_NO_TOKEN_I32;
+    };
+    let needed = 16usize + sid_len;
+    unsafe {
+        write_unaligned(return_length, needed as u32);
+    }
+    if token_information_length < needed as u64 {
+        return STATUS_BUFFER_TOO_SMALL_I32;
+    }
+    if token_information == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        write_unaligned(token_information as *mut u64, token_information + 16);
+        write_unaligned((token_information + 8) as *mut u32, 0);
+        write_unaligned((token_information + 12) as *mut u32, 0);
+        let sid_out = (token_information + 16) as *mut u8;
+        let mut i = 0usize;
+        while i < sid_len {
+            write_volatile(sid_out.add(i), sid[i]);
+            i += 1;
+        }
+    }
+    0
+}
+
 /// `NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCESS *Process)` — resolve a PID to
 /// its runtime-owned EPROCESS body. Unknown non-zero PIDs remain visible as failure so callers do not
 /// silently attach to the wrong GUI process identity.
 extern "win64" fn s_ps_lookup_process_by_id(process_id: u64, process_out: *mut u64) -> i32 {
     unsafe {
+        if process_id == 0 {
+            return 0xC000_000Bu32 as i32; // STATUS_INVALID_CID
+        }
         let process = eprocess_for_pid(process_id);
         if process == 0 {
             return 0xC000_000Bu32 as i32; // STATUS_INVALID_CID
@@ -920,7 +1721,7 @@ extern "win64" fn s_get_thread_win32thread(thread: u64) -> u64 {
                 return field;
             }
         }
-        current_w32thread()
+        0
     }
 }
 /// `VOID PsSetProcessWin32Process(PEPROCESS Process, PVOID W32Process, PVOID OldValue)` — park the
@@ -1021,8 +1822,8 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // semantics (handle minting, the registry, the create→insert latch, the single-instance
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
-    init_desktop_body, link_thread_to_desktop, ObHandleTable, ObKind, DESKTOPINFO_SIZE,
-    DESKTOP_BODY_SIZE,
+    init_desktop_body, link_thread_to_desktop, unlink_thread_from_desktop, ObHandleTable, ObKind,
+    DESKTOPINFO_SIZE, DESKTOP_BODY_SIZE,
 };
 
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
@@ -1219,6 +2020,134 @@ unsafe fn alloc_desktop_body() -> u64 {
     desk
 }
 
+unsafe fn object_attributes_unicode_buffer(object_attributes: u64) -> Option<(u64, usize)> {
+    if object_attributes == 0 {
+        return None;
+    }
+    let ustr = read_unaligned((object_attributes + 0x10) as *const u64);
+    if ustr == 0 {
+        return None;
+    }
+    let length = read_unaligned(ustr as *const u16) as usize;
+    let buffer = read_unaligned((ustr + 8) as *const u64);
+    if length == 0 || length & 1 != 0 || buffer == 0 {
+        return None;
+    }
+    let units = length / 2;
+    (units <= 512).then_some((buffer, units))
+}
+
+fn ascii_u16_eq_ignore_case(unit: u16, ascii: u8) -> bool {
+    let lower = if unit >= b'A' as u16 && unit <= b'Z' as u16 {
+        unit + 0x20
+    } else {
+        unit
+    };
+    lower == ascii.to_ascii_lowercase() as u16
+}
+
+unsafe fn object_attributes_name_contains_ascii(object_attributes: u64, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
+        return false;
+    };
+    if units < needle.len() {
+        return false;
+    }
+    let mut index = 0usize;
+    while index + needle.len() <= units {
+        let mut matched = true;
+        let mut offset = 0usize;
+        while offset < needle.len() {
+            let unit = read_unaligned((buffer + ((index + offset) * 2) as u64) as *const u16);
+            if !ascii_u16_eq_ignore_case(unit, needle[offset]) {
+                matched = false;
+                break;
+            }
+            offset += 1;
+        }
+        if matched {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+unsafe fn object_attributes_name_leaf_eq_ascii(object_attributes: u64, leaf: &[u8]) -> bool {
+    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
+        return false;
+    };
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < units {
+        let unit = read_unaligned((buffer + (index * 2) as u64) as *const u16);
+        if unit == b'\\' as u16 || unit == b'/' as u16 {
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if units - start != leaf.len() {
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset < leaf.len() {
+        let unit = read_unaligned((buffer + ((start + offset) * 2) as u64) as *const u16);
+        if !ascii_u16_eq_ignore_case(unit, leaf[offset]) {
+            return false;
+        }
+        offset += 1;
+    }
+    true
+}
+
+unsafe fn current_token_authentication_id() -> u64 {
+    current_process_context_index()
+        .map(|index| WIN32K_PROCESS_CTX_TOKEN_AUTH[index].load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+unsafe fn service_winsta_index_for_auth(token_authentication_id: u64) -> Option<usize> {
+    if token_authentication_id == 0 {
+        return None;
+    }
+    for index in 0..WIN32K_SERVICE_WINSTA_CAP {
+        if WIN32K_SERVICE_WINSTA_AUTHS[index].load(Ordering::Relaxed) == token_authentication_id {
+            return Some(index);
+        }
+    }
+    None
+}
+
+unsafe fn record_service_window_station(handle: u64, body: u64) {
+    let token_authentication_id = current_token_authentication_id();
+    if token_authentication_id == 0 || handle == 0 || body == 0 {
+        return;
+    }
+    if let Some(index) = service_winsta_index_for_auth(token_authentication_id) {
+        WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
+        WIN32K_SERVICE_WINSTA_BODIES[index].store(body, Ordering::Relaxed);
+        return;
+    }
+    for index in 0..WIN32K_SERVICE_WINSTA_CAP {
+        if WIN32K_SERVICE_WINSTA_AUTHS[index].load(Ordering::Relaxed) == 0 {
+            WIN32K_SERVICE_WINSTA_AUTHS[index].store(token_authentication_id, Ordering::Relaxed);
+            WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
+            WIN32K_SERVICE_WINSTA_BODIES[index].store(body, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+unsafe fn service_window_station_handle_for_current_token() -> u64 {
+    let token_authentication_id = current_token_authentication_id();
+    service_winsta_index_for_auth(token_authentication_id)
+        .map(|index| WIN32K_SERVICE_WINSTA_HANDLES[index].load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,
 /// ACCESS_MASK DesiredAccess, PVOID ParseContext, PHANDLE Handle)`.
 /// - DESKTOP (ParseContext != NULL = a create-open): allocate a real DESKTOP, write *Handle, set
@@ -1228,7 +2157,7 @@ unsafe fn alloc_desktop_body() -> u64 {
 ///   already created the input winsta, OPEN it (write its handle, SUCCESS); otherwise report
 ///   STATUS_OBJECT_NAME_NOT_FOUND so IntCreateWindowStation falls through to ObCreateObject/Insert.
 extern "win64" fn s_ob_open_object_by_name(
-    _object_attributes: u64,
+    object_attributes: u64,
     obj_type: u64,
     _access_mode: u64,
     _access_state: u64,
@@ -1254,22 +2183,121 @@ extern "win64" fn s_ob_open_object_by_name(
                 0
             }
             Some(ObKind::WindowStation) => {
-                let cached = table.cached_winsta_handle();
-                if cached != 0 {
-                    if !handle.is_null() {
-                        write_unaligned(handle, cached);
+                let service =
+                    object_attributes_name_contains_ascii(object_attributes, b"service-");
+                if service {
+                    let handle_for_service = service_window_station_handle_for_current_token();
+                    if handle_for_service != 0 {
+                        if !handle.is_null() {
+                            write_unaligned(handle, handle_for_service);
+                        }
+                        if parse_context != 0 {
+                            write_volatile(parse_context as *mut u8, 0);
+                        }
+                        return 0;
                     }
-                    if parse_context != 0 {
-                        write_volatile(parse_context as *mut u8, 0); // opened existing, not created
-                    }
-                    return 0;
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
-                // No existing winsta → force IntCreateWindowStation's create path.
+                if object_attributes_name_leaf_eq_ascii(object_attributes, b"winsta0") {
+                    let cached = table.cached_winsta_handle();
+                    if cached != 0 {
+                        if !handle.is_null() {
+                            write_unaligned(handle, cached);
+                        }
+                        if parse_context != 0 {
+                            write_volatile(parse_context as *mut u8, 0); // opened existing, not created
+                        }
+                        return 0;
+                    }
+                }
+                if object_attributes == 0 {
+                    let cached = table.cached_winsta_handle();
+                    if cached != 0 {
+                        if !handle.is_null() {
+                            write_unaligned(handle, cached);
+                        }
+                        if parse_context != 0 {
+                            write_volatile(parse_context as *mut u8, 0);
+                        }
+                        return 0;
+                    }
+                }
+                // No matching winsta exists → force IntCreateWindowStation's create path.
                 STATUS_OBJECT_NAME_NOT_FOUND
             }
-            // Unknown object type: preserve the old benign behaviour (success, no handle).
-            _ => 0,
+            // Unknown object type: fail visibly; object-manager imports must be modeled by type.
+            _ => STATUS_OBJECT_NAME_NOT_FOUND,
         }
+    }
+}
+
+/// `NTSTATUS ObOpenObjectByPointer(PVOID Object, ULONG HandleAttributes, PACCESS_STATE,
+/// ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode, PHANDLE Handle)`.
+extern "win64" fn s_ob_open_object_by_pointer(
+    object: u64,
+    _handle_attributes: u64,
+    _access_state: u64,
+    _desired_access: u64,
+    obj_type: u64,
+    _access_mode: u64,
+    handle: *mut u64,
+) -> i32 {
+    if handle.is_null() {
+        return 0xC000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
+    }
+    unsafe {
+        write_unaligned(handle, 0);
+        let process_ty = nt_object_manager::object_type::process_object_type_addr();
+        if obj_type == process_ty && process_context_index_for_eprocess(object).is_some() {
+            write_unaligned(handle, FAKE_PROCESS_HANDLE);
+            return 0;
+        }
+        let Some(kind) = classify_type(obj_type) else {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        };
+        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+        match table.duplicate_by_body(kind, object) {
+            Some(alias) => {
+                write_unaligned(handle, alias);
+                0
+            }
+            None if table.handle_for_body(kind, object).is_none() => 0xC000_0008u32 as i32,
+            None => 0xC000_009Au32 as i32,
+        }
+    }
+}
+
+/// `BOOLEAN ObFindHandleForObject(PEPROCESS Process, PVOID Object, POBJECT_TYPE ObjectType,
+/// POBJECT_HANDLE_INFORMATION HandleInformation, PHANDLE Handle)` — this host does not synthesize
+/// inherited USER handles; it only resolves explicit object-body searches.
+extern "win64" fn s_ob_find_handle_for_object(
+    _process: u64,
+    object: u64,
+    obj_type: u64,
+    handle_info: *mut u8,
+    handle: *mut u64,
+) -> u8 {
+    unsafe {
+        if !handle.is_null() {
+            write_unaligned(handle, 0);
+        }
+        let Some(kind) = classify_type(obj_type) else {
+            return 0;
+        };
+        if object == 0 {
+            return 0;
+        }
+        let Some(found) = (&*core::ptr::addr_of!(OBJ_TABLE)).handle_for_body(kind, object) else {
+            return 0;
+        };
+        if !handle.is_null() {
+            write_unaligned(handle, found);
+        }
+        if !handle_info.is_null() {
+            write_unaligned(handle_info as *mut u32, 0);
+            write_unaligned(handle_info.add(4) as *mut u32, u32::MAX);
+        }
+        1
     }
 }
 
@@ -1280,7 +2308,7 @@ extern "win64" fn s_ob_open_object_by_name(
 extern "win64" fn s_ob_create_object(
     _probe_mode: u64,
     obj_type: u64,
-    _object_attributes: u64,
+    object_attributes: u64,
     _owner_mode: u64,
     _parse_context: u64,
     body_size: u64,
@@ -1297,6 +2325,9 @@ extern "win64" fn s_ob_create_object(
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         let kind = classify_type(obj_type).unwrap_or(ObKind::Other);
         table.latch_pending(kind, body);
+        let uncached_winsta = kind == ObKind::WindowStation
+            && object_attributes_name_contains_ascii(object_attributes, b"service-");
+        WIN32K_PENDING_OB_UNCACHED_WINSTA.store(uncached_winsta as u64, Ordering::Relaxed);
         if !object_out.is_null() {
             write_unaligned(object_out, body);
         }
@@ -1317,7 +2348,15 @@ extern "win64" fn s_ob_insert_object(
 ) -> i32 {
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-        let h = table.insert_pending(object);
+        let uncached_winsta = WIN32K_PENDING_OB_UNCACHED_WINSTA.swap(0, Ordering::Relaxed) != 0;
+        let h = if uncached_winsta {
+            table.insert_pending_uncached(object)
+        } else {
+            table.insert_pending(object)
+        };
+        if uncached_winsta {
+            record_service_window_station(h, object);
+        }
         if !handle.is_null() {
             write_unaligned(handle, h);
         }
@@ -1457,6 +2496,12 @@ extern "win64" fn s_zw_duplicate_object(
 /// `ObCloseHandle`: duplicated aliases have handle lifetime; canonical pool-backed objects have
 /// session lifetime in this host and remain registered after a successful close.
 extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
+    if handle == FAKE_PROCESS_HANDLE {
+        return 0;
+    }
+    if unsafe { close_token_handle(handle) } {
+        return 0;
+    }
     let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
     if table.close(handle) || table.lookup(handle).is_some() {
         0
@@ -2146,6 +3191,12 @@ static WIN32K_PROCESS_CTX_EPROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
 static WIN32K_PROCESS_CTX_W32PROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
+static WIN32K_PROCESS_CTX_TOKEN_AUTH: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
+static WIN32K_PROCESS_CTX_PRIMARY_TOKEN: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
+static WIN32K_TOKEN_HANDLE_TOKENS: [AtomicU64; WIN32K_TOKEN_HANDLE_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_TOKEN_HANDLE_CAP];
 static WIN32K_THREAD_CTX_TIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
 static WIN32K_THREAD_CTX_PIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
@@ -2163,8 +3214,19 @@ static WIN32K_THREAD_CTX_W32THREAD: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
 static WIN32K_CLIENT_PROCESS_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PENDING_OB_UNCACHED_WINSTA: AtomicU64 = AtomicU64::new(0);
+const WIN32K_SERVICE_WINSTA_CAP: usize = 8;
+static WIN32K_SERVICE_WINSTA_AUTHS: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
+static WIN32K_SERVICE_WINSTA_HANDLES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
+static WIN32K_SERVICE_WINSTA_BODIES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_NONINTERACTIVE_WINSTA_SKIPS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CSRSS_BOOTSTRAP_REKEYS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_HANDLE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_BODY: AtomicU64 = AtomicU64::new(0);
@@ -2581,6 +3643,9 @@ unsafe fn adopt_bootstrap_csrss_context(
     teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
+    token_authentication_id: u64,
+    token_user_sid: &[u8],
+    token_user_sid_len: usize,
 ) -> Option<(usize, usize)> {
     if pid == 0 || tid == 0 {
         return None;
@@ -2609,6 +3674,14 @@ unsafe fn adopt_bootstrap_csrss_context(
     WIN32K_PROCESS_CTX_PIDS[process_index].store(pid, Ordering::Relaxed);
     WIN32K_PROCESS_CTX_PIS[process_index].store(pi as u64, Ordering::Relaxed);
     initialize_eprocess_body(eprocess, pid);
+    if !record_process_token_context(
+        process_index,
+        token_authentication_id,
+        token_user_sid,
+        token_user_sid_len,
+    ) {
+        return None;
+    }
 
     let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
     if ppi != 0 {
@@ -2669,6 +3742,9 @@ unsafe fn select_win32k_client_context(
     supplied_eprocess: u64,
     supplied_ethread: u64,
     process_role: u64,
+    token_authentication_id: u64,
+    token_user_sid: &[u8],
+    token_user_sid_len: usize,
 ) -> Option<(usize, usize)> {
     let pi = checked_client_index(pi)?;
     let (pid, tid) = derive_client_identity(pi, process_id, thread_id, client_teb)?;
@@ -2680,11 +3756,22 @@ unsafe fn select_win32k_client_context(
             client_teb,
             supplied_eprocess,
             supplied_ethread,
+            token_authentication_id,
+            token_user_sid,
+            token_user_sid_len,
         ) {
             return Some(adopted);
         }
     }
     let process_index = ensure_process_context(pi, pid, supplied_eprocess)?;
+    if !record_process_token_context(
+        process_index,
+        token_authentication_id,
+        token_user_sid,
+        token_user_sid_len,
+    ) {
+        return None;
+    }
     let thread_index = ensure_thread_context(pi, pid, tid, client_teb, supplied_ethread)?;
     let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
     let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
@@ -2707,6 +3794,7 @@ unsafe fn select_win32k_client_context(
 }
 
 unsafe fn ensure_bootstrap_win32k_context() -> Option<(usize, usize)> {
+    let (system_sid, system_sid_len) = local_system_sid_native();
     select_win32k_client_context(
         WIN32K_BOOTSTRAP_PI as u64,
         FAKE_PROCESS_HANDLE,
@@ -2715,10 +3803,14 @@ unsafe fn ensure_bootstrap_win32k_context() -> Option<(usize, usize)> {
         0,
         0,
         HOSTED_PROCESS_ROLE_NONE,
+        nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW as u64
+            | ((nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32 as u64) << 32),
+        &system_sid,
+        system_sid_len,
     )
 }
 
-unsafe fn ensure_win32k_process_attached(process_index: usize) -> bool {
+unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64) -> bool {
     if process_index >= WIN32K_GUI_PROCESS_CAP {
         return false;
     }
@@ -2770,16 +3862,41 @@ unsafe fn ensure_win32k_process_attached(process_index: usize) -> bool {
         SLOT_W32PROCESS as *mut u64,
         WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed),
     );
+    link_processinfo_to_eprocess(process_index);
+    if process_role == HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
+        let n = WIN32K_NONINTERACTIVE_WINSTA_SKIPS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
+            let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
+            let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+            print_str(b"[win32k-host] noninteractive service keeps winsta/desktop unresolved pid=");
+            print_u64(pid);
+            print_str(b" pi=");
+            print_u64(pi);
+            print_str(b" ppi=0x");
+            print_hex((ppi >> 32) as u32);
+            print_hex(ppi as u32);
+            print_str(b"\n");
+        }
+    } else {
+        seed_inherited_process_window_station(process_index);
+    }
+    true
+}
+
+unsafe fn link_processinfo_to_eprocess(process_index: usize) {
     let process = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
     let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
-    if process != 0 && ppi != 0 {
-        let field = (process + EPROCESS_WIN32PROCESS_OFF) as *mut u64;
-        if read_volatile(field) == 0 {
-            write_volatile(field, ppi);
-        }
+    if process == 0 || ppi == 0 {
+        return;
     }
-    seed_inherited_process_window_station(process_index);
-    true
+    let eprocess_win32 = (process + EPROCESS_WIN32PROCESS_OFF) as *mut u64;
+    if read_volatile(eprocess_win32) == 0 {
+        write_volatile(eprocess_win32, ppi);
+    }
+    if read_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *const u64) == 0 {
+        write_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *mut u64, process);
+    }
 }
 
 unsafe fn seed_inherited_process_window_station(process_index: usize) {
@@ -2794,10 +3911,8 @@ unsafe fn seed_inherited_process_window_station(process_index: usize) {
         return;
     }
 
+    link_processinfo_to_eprocess(process_index);
     let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    if eprocess != 0 && read_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *const u64) == 0 {
-        write_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *mut u64, eprocess);
-    }
     if eprocess != 0 && s_ps_get_process_winsta(eprocess) == 0 {
         s_ps_set_process_winsta(eprocess, winsta_handle);
     }
@@ -3980,6 +5095,14 @@ fn register_trampolines() {
         "ObOpenObjectByName",
         s_ob_open_object_by_name as usize as u64,
     );
+    reg.bind(
+        "ObOpenObjectByPointer",
+        s_ob_open_object_by_pointer as usize as u64,
+    );
+    reg.bind(
+        "ObFindHandleForObject",
+        s_ob_find_handle_for_object as usize as u64,
+    );
     reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
@@ -4123,6 +5246,30 @@ fn register_trampolines() {
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind(
+        "ZwOpenThreadToken",
+        s_zw_open_thread_token as usize as u64,
+    );
+    reg.bind(
+        "NtOpenThreadToken",
+        s_zw_open_thread_token as usize as u64,
+    );
+    reg.bind(
+        "ZwOpenProcessToken",
+        s_zw_open_process_token as usize as u64,
+    );
+    reg.bind(
+        "NtOpenProcessToken",
+        s_zw_open_process_token as usize as u64,
+    );
+    reg.bind(
+        "ZwQueryInformationToken",
+        s_zw_query_information_token as usize as u64,
+    );
+    reg.bind(
+        "NtQueryInformationToken",
+        s_zw_query_information_token as usize as u64,
+    );
     // --- batch 3: CRT mem intrinsics (dxg.sys imports) ---
     reg.bind("memcpy", s_memcpy as usize as u64);
     reg.bind("RtlCopyMemory", s_memcpy as usize as u64);
@@ -4139,9 +5286,23 @@ fn register_trampolines() {
         "PsGetCurrentThreadProcessId",
         s_current_process_id as usize as u64,
     );
+    reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
+    reg.bind(
+        "PsGetCurrentThreadId",
+        s_ps_get_current_thread_id as usize as u64,
+    );
+    reg.bind("PsGetThreadId", s_ps_get_thread_id as usize as u64);
+    reg.bind(
+        "PsGetThreadProcessId",
+        s_ps_get_thread_process_id as usize as u64,
+    );
     reg.bind("IoGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind(
+        "PsGetThreadProcess",
+        s_ps_get_thread_process as usize as u64,
+    );
     reg.bind(
         "PsLookupProcessByProcessId",
         s_ps_lookup_process_by_id as usize as u64,
@@ -4180,6 +5341,14 @@ fn register_trampolines() {
         "PsEstablishWin32Callouts",
         s_establish_win32_callouts as usize as u64,
     );
+    reg.bind(
+        "PsReferencePrimaryToken",
+        s_ps_reference_primary_token as usize as u64,
+    );
+    reg.bind(
+        "PsReferenceImpersonationToken",
+        s_ps_reference_impersonation_token as usize as u64,
+    );
     // --- batch 4: misc scalars ---
     reg.bind(
         "IoGetDeviceObjectPointer",
@@ -4215,6 +5384,33 @@ fn register_trampolines() {
     reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
     reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
     reg.bind("ExGetPreviousMode", s_true as usize as u64);
+    // --- batch 5: RTL security descriptors / ACLs / SIDs ---
+    reg.bind(
+        "RtlCreateSecurityDescriptor",
+        s_rtl_create_security_descriptor as usize as u64,
+    );
+    reg.bind(
+        "RtlSetDaclSecurityDescriptor",
+        s_rtl_set_dacl_security_descriptor as usize as u64,
+    );
+    reg.bind("RtlLengthSid", s_rtl_length_sid as usize as u64);
+    reg.bind("RtlCreateAcl", s_rtl_create_acl as usize as u64);
+    reg.bind(
+        "RtlAddAccessAllowedAceEx",
+        s_rtl_add_access_allowed_ace_ex as usize as u64,
+    );
+    reg.bind(
+        "RtlSetOwnerSecurityDescriptor",
+        s_rtl_set_owner_security_descriptor as usize as u64,
+    );
+    reg.bind(
+        "RtlSetGroupSecurityDescriptor",
+        s_rtl_set_group_security_descriptor as usize as u64,
+    );
+    reg.bind(
+        "RtlAbsoluteToSelfRelativeSD",
+        s_rtl_absolute_to_self_relative_sd as usize as u64,
+    );
     // --- batch 5: Se → nt-security (backlog item 3, COMPLETE — all 7 Se imports real) ---
     // SeQueryAuthenticationIdToken is the only Se* on the boot/connect path (win32k GetProcessLuid);
     // return the SYSTEM auth LUID + SUCCESS. The SeExports DATA cell resolves to a real SE_EXPORTS
@@ -4624,6 +5820,20 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let supplied_eprocess = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
     let supplied_ethread = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
     let process_role = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
+    let token_authentication_id =
+        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_AUTH) as *const u64);
+    let token_user_sid_len =
+        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_USER_SID_LEN) as *const u64) as usize;
+    let token_user_sid_ptr =
+        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_TOKEN_USER_SID_PTR) as *const u64);
+    let mut token_user_sid = [0u8; WIN32K_TOKEN_USER_SID_MAX];
+    if token_user_sid_ptr != 0 && token_user_sid_len <= WIN32K_TOKEN_USER_SID_MAX {
+        let mut sid_i = 0usize;
+        while sid_i < WIN32K_TOKEN_USER_SID_MAX {
+            token_user_sid[sid_i] = read_volatile((token_user_sid_ptr + sid_i as u64) as *const u8);
+            sid_i += 1;
+        }
+    }
     let top_level =
         read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0;
     let Some((process_index, thread_index)) = select_win32k_client_context(
@@ -4634,10 +5844,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         supplied_eprocess,
         supplied_ethread,
         process_role,
+        token_authentication_id,
+        &token_user_sid,
+        token_user_sid_len,
     ) else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
-    if !ensure_win32k_process_attached(process_index)
+    if !ensure_win32k_process_attached(process_index, process_role)
         || !ensure_win32k_threadinfo(thread_index, client_teb)
     {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
@@ -5663,10 +6876,28 @@ unsafe fn prepare_set_thread_desktop(hdesk: u64) {
         return;
     }
 
+    if !unlink_thread_from_desktop(pti as *mut u8) {
+        let n = WIN32K_SET_THREAD_DESKTOP_PREPARES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            let flink = read_volatile((pti + THREADINFO_PTI_LINK_OFF) as *const u64);
+            let blink = read_volatile((pti + THREADINFO_PTI_LINK_OFF + 8) as *const u64);
+            print_str(b"[win32k-host] ERROR: cannot clear corrupt desktop membership pti=0x");
+            print_hex((pti >> 32) as u32);
+            print_hex(pti as u32);
+            print_str(b" flink=0x");
+            print_hex((flink >> 32) as u32);
+            print_hex(flink as u32);
+            print_str(b" blink=0x");
+            print_hex((blink >> 32) as u32);
+            print_hex(blink as u32);
+            print_str(b"\n");
+        }
+        return;
+    }
+
     write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, 0);
     write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, 0);
     write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, 0);
-    initialize_list_head(pti + THREADINFO_PTI_LINK_OFF);
 
     let n = WIN32K_SET_THREAD_DESKTOP_PREPARES.fetch_add(1, Ordering::Relaxed);
     if n < 16 {
@@ -6034,6 +7265,14 @@ unsafe fn create_winsta_and_desktop() {
         // `mov rcx,[pti+0x80]` (pti->pDeskInfo) — NULL before this, a real DESKTOPINFO after.
         let pti = current_w32thread();
         let desk_pdeskinfo = read_volatile((desk_body + 0x08) as *const u64); // DESKTOP.pDeskInfo
+        let pti_link = pti + THREADINFO_PTI_LINK_OFF;
+        let link_flink = read_volatile(pti_link as *const u64);
+        let link_blink = read_volatile((pti_link + 8) as *const u64);
+        if (link_flink != 0 || link_blink != 0)
+            && !unlink_thread_from_desktop(pti as *mut u8)
+        {
+            print_str(b"[win32k-host] WARN: failed to unlink old desktop membership before Default bind\n");
+        }
         if !link_thread_to_desktop(desk_body as *mut u8, pti as *mut u8) {
             print_str(b"[win32k-host] WARN: failed to link dispatch thread into Default desktop\n");
         }

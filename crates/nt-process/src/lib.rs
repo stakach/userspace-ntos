@@ -1053,9 +1053,7 @@ impl ProcessManager {
 
     /// Read back the parked `ETHREAD` body pointer.
     pub fn thread_kernel_object(&self, tid: ThreadId) -> Option<u64> {
-        self.threads
-            .get(&tid)
-            .and_then(|t| t.kernel_thread_object)
+        self.threads.get(&tid).and_then(|t| t.kernel_thread_object)
     }
 
     /// Reverse-map an `ETHREAD` body pointer to the owning TID.

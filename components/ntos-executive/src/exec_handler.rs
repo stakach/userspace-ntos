@@ -2028,6 +2028,25 @@ impl ExecNtHandler {
         self.hosted_process_image(pi).map(|image| image.role)
     }
 
+    pub(crate) fn primary_token_authentication_id_for_pi(
+        &self,
+        pi: usize,
+    ) -> Option<nt_security::Luid> {
+        let pid = self.pm_pid_for_pi(pi)?;
+        let token = self.pm.process_primary_token(pid)?;
+        Some(self.token_store.statistics(token)?.authentication_id)
+    }
+
+    pub(crate) fn primary_token_user_sid_for_pi(
+        &self,
+        pi: usize,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let pid = self.pm_pid_for_pi(pi)?;
+        let token = self.pm.process_primary_token(pid)?;
+        self.token_store.get(token)?.user.write_native(out)
+    }
+
     pub(crate) fn hosted_process_top_badge(&self, pi: usize) -> Option<u64> {
         self.hosted_process_image(pi).map(|image| image.top_badge)
     }

@@ -210,6 +210,29 @@ fn loaded_hosted_pe_by_pi<'a>(
     unsafe { loaded_images.pe_by_pi(pi) }
 }
 
+#[derive(Clone, Copy)]
+struct Win32kTokenContext {
+    authentication_id: u64,
+    user_sid: [u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX],
+    user_sid_len: u32,
+}
+
+fn win32k_token_context(nt_handler: &ExecNtHandler, pi: usize) -> Win32kTokenContext {
+    let authentication_id = nt_handler
+        .primary_token_authentication_id_for_pi(pi)
+        .map(|luid| luid.low as u64 | ((luid.high as u32 as u64) << 32))
+        .unwrap_or(0);
+    let mut user_sid = [0u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX];
+    let user_sid_len = nt_handler
+        .primary_token_user_sid_for_pi(pi, &mut user_sid)
+        .unwrap_or(0) as u32;
+    Win32kTokenContext {
+        authentication_id,
+        user_sid,
+        user_sid_len,
+    }
+}
+
 fn win32k_client_context_for_thread(
     nt_handler: &ExecNtHandler,
     pi: usize,
@@ -222,6 +245,7 @@ fn win32k_client_context_for_thread(
     scratch_base: u64,
 ) -> win32k_glue::Win32kClientContext {
     let pid = nt_handler.pm_pid_for_pi(pi).unwrap_or(0);
+    let token = win32k_token_context(nt_handler, pi);
     win32k_glue::Win32kClientContext {
         pi: pi as u32,
         pid: pid as u64,
@@ -239,6 +263,9 @@ fn win32k_client_context_for_thread(
         teb,
         peb_mirror,
         scratch_base,
+        token_authentication_id: token.authentication_id,
+        token_user_sid: token.user_sid,
+        token_user_sid_len: token.user_sid_len,
     }
 }
 
@@ -354,6 +381,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     client_teb: u64,
     peb_mirror: u64,
     scratch_base: u64,
+    token: Win32kTokenContext,
 ) -> bool {
     let sas1 = WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed);
     let sas2 = WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed);
@@ -436,6 +464,9 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
             teb: client_teb,
             peb_mirror,
             scratch_base,
+            token_authentication_id: token.authentication_id,
+            token_user_sid: token.user_sid,
+            token_user_sid_len: token.user_sid_len,
         },
     );
     print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
@@ -6697,6 +6728,7 @@ pub(crate) unsafe fn service_sec_image(
                             client_teb,
                             peb_mirror,
                             scratch_base,
+                            win32k_token_context(&nt_handler, pi),
                         ) {
                             let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
                             // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
@@ -8630,6 +8662,7 @@ pub(crate) unsafe fn service_sec_image(
                             client_teb,
                             peb_mirror,
                             scratch_base,
+                            win32k_token_context(&nt_handler, pi),
                         );
                     }
                     r

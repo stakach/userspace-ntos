@@ -637,3 +637,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `lsass.exe`) reaching `NtUserProcessConnect`; they must either acquire real provider-owned GUI
   process state through the same dynamic identity route or fail before entering win32k, with no
   executive-owned fake success path.
+- C3/F1 repair. api7 client-thread-startup callbacks now admit every registered hosted callback
+  owner instead of being winlogon-only, while api0 and other user callbacks remain restricted to
+  interactive GUI roles. The callback frame also carries primary-token AuthenticationId/SID context
+  into win32k dispatch state so server-side security helpers can read caller token facts from a real
+  per-process token record rather than a process-name special case. Focused validation passed:
+  `cargo test -p nt-object-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
+- B1/C3 repair. `NtUserSetThreadDesktop` preparation no longer zeroes `THREADINFO.rpdesk` while
+  leaving `THREADINFO.PtiLink` on a ReactOS desktop list. `nt-object-manager` now exposes checked
+  desktop thread-list unlink/link helpers, rejects live duplicate membership, and restores an empty
+  self-linked `PtiLink` before the executive clears desktop fields for a real switch. Validation:
+  `.tmp/full-boot-ptilink-unlink-20260803.log` reached `RUN_RC=0`, cleared the previous winlogon
+  `NtUserSetThreadDesktop` fail-fast at win32k RVA `0x24b8a`, and passed
+  `exec_win32k_desktop_painted` with natural `NtUserSwitchDesktop` framebuffer readback. Review
+  adjustment: this boot regressed earlier full-stack green gates after the desktop switch:
+  `exec_winlogon_sas_window`, real api0 nested/dead-client proofs, IDD_LOGON correlation/paint,
+  LSA auth-port/logon, profile-copy/load, userinit, and explorer gates are red again. The next
+  target is to restore the real SAS/dialog route on top of the stricter dynamic process/thread and
+  service-callback boundaries, without reintroducing synthetic success paths.

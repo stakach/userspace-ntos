@@ -59,6 +59,11 @@ static USER_CALLBACK_CLIENT_PEB: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_TEB: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_TOKEN_AUTH: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_TOKEN_USER_SID_LEN: AtomicU64 = AtomicU64::new(0);
+const TOKEN_USER_SID_WORDS: usize = (win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX + 7) / 8;
+static USER_CALLBACK_CLIENT_TOKEN_USER_SID: [AtomicU64; TOKEN_USER_SID_WORDS] =
+    [const { AtomicU64::new(0) }; TOKEN_USER_SID_WORDS];
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -95,6 +100,56 @@ static WIN32K_NEXT_DISPATCH_DEBUG_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
 static USER_CALLBACK_WINDOW_REASSERTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINDOW_REPAIRS: AtomicU64 = AtomicU64::new(0);
+const SYSTEM_TOKEN_AUTHENTICATION_ID: u64 = nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW
+    as u64
+    | ((nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32 as u64) << 32);
+
+fn local_system_sid_native() -> ([u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX], u32) {
+    let mut sid = [0u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX];
+    let len = nt_security::Sid::local_system()
+        .write_native(&mut sid)
+        .unwrap_or(0);
+    (sid, len as u32)
+}
+
+fn store_callback_client_sid(sid: &[u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX], len: u32) {
+    USER_CALLBACK_CLIENT_TOKEN_USER_SID_LEN.store(len as u64, Ordering::Relaxed);
+    let mut word_index = 0usize;
+    while word_index < TOKEN_USER_SID_WORDS {
+        let mut word = 0u64;
+        let mut byte_index = 0usize;
+        while byte_index < 8 {
+            let index = word_index * 8 + byte_index;
+            if index < sid.len() {
+                word |= (sid[index] as u64) << (byte_index * 8);
+            }
+            byte_index += 1;
+        }
+        USER_CALLBACK_CLIENT_TOKEN_USER_SID[word_index].store(word, Ordering::Relaxed);
+        word_index += 1;
+    }
+}
+
+fn load_callback_client_sid() -> ([u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX], u32) {
+    let mut sid = [0u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX];
+    let mut word_index = 0usize;
+    while word_index < TOKEN_USER_SID_WORDS {
+        let word = USER_CALLBACK_CLIENT_TOKEN_USER_SID[word_index].load(Ordering::Relaxed);
+        let mut byte_index = 0usize;
+        while byte_index < 8 {
+            let index = word_index * 8 + byte_index;
+            if index < sid.len() {
+                sid[index] = ((word >> (byte_index * 8)) & 0xFF) as u8;
+            }
+            byte_index += 1;
+        }
+        word_index += 1;
+    }
+    (
+        sid,
+        USER_CALLBACK_CLIENT_TOKEN_USER_SID_LEN.load(Ordering::Relaxed) as u32,
+    )
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum UserCallbackDisposition {
@@ -117,6 +172,9 @@ pub(crate) struct Win32kClientContext {
     pub teb: u64,
     pub peb_mirror: u64,
     pub scratch_base: u64,
+    pub token_authentication_id: u64,
+    pub token_user_sid: [u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX],
+    pub token_user_sid_len: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -570,11 +628,20 @@ fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> O
         return Some(pi);
     }
     match client.role {
-        Some(HostedThreadRole::WinlogonListener | HostedThreadRole::WinlogonWorker { .. })
-            if callback_client_is_winlogon(client) =>
-        {
-            Some(pi)
-        }
+        Some(
+            HostedThreadRole::Main
+            | HostedThreadRole::SmLoop
+            | HostedThreadRole::CsrApi
+            | HostedThreadRole::CsrSbApi
+            | HostedThreadRole::WinlogonListener
+            | HostedThreadRole::WinlogonWorker { .. }
+            | HostedThreadRole::ServicesListener
+            | HostedThreadRole::ScmWorker
+            | HostedThreadRole::LsassListener
+            | HostedThreadRole::LsassListener2
+            | HostedThreadRole::LsassListener3
+            | HostedThreadRole::LsaWorker,
+        ) => Some(pi),
         _ => None,
     }
 }
@@ -602,7 +669,16 @@ fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> 
     }
 }
 
-fn client_callbacks_supported(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+fn client_callback_supported_for_api(
+    client: crate::spawn_hosts::UserCallbackClient,
+    api_index: u32,
+) -> bool {
+    if callback_client_owner_pi(client).is_none() {
+        return false;
+    }
+    if api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP {
+        return true;
+    }
     matches!(
         client.process_role,
         Some(
@@ -1005,7 +1081,7 @@ pub(crate) unsafe fn service_user_callback(
     // further callbacks (cleanup/`WM_DESTROY`-ish paths) as it unwinds, and each one now returns an
     // error immediately instead of suspending the component again.
     let client_dead = user_callback_client_dead(client.pi);
-    if client_callbacks_supported(client)
+    if client_callback_supported_for_api(client, request.api_index)
         && client.tcb > 1
         && contract_valid
         && !client_dead
@@ -1085,6 +1161,9 @@ pub(crate) unsafe fn service_user_callback(
             USER_CALLBACK_DISPATCHER.store(dispatcher, Ordering::Relaxed);
             USER_CALLBACK_CLIENT_PEB.store(client.peb_mirror, Ordering::Relaxed);
             USER_CALLBACK_CLIENT_SCRATCH.store(client.scratch_base, Ordering::Relaxed);
+            USER_CALLBACK_CLIENT_TOKEN_AUTH
+                .store(client.token_authentication_id, Ordering::Relaxed);
+            store_callback_client_sid(&client.token_user_sid, client.token_user_sid_len);
             USER_CALLBACK_CLIENT_PID.store(
                 core::ptr::read_volatile(
                     (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_REQ_PROCESS_ID)
@@ -1172,7 +1251,9 @@ pub(crate) unsafe fn service_user_callback(
             STATUS_THREAD_IS_TERMINATING
         } else if owner_mismatch {
             STATUS_UNSUCCESSFUL
-        } else if contract.is_none() || !callback_client_is_winlogon(client) {
+        } else if contract.is_none()
+            || !client_callback_supported_for_api(client, request.api_index)
+        {
             STATUS_NOT_SUPPORTED
         } else if !contract_valid {
             STATUS_INFO_LENGTH_MISMATCH
@@ -1391,6 +1472,7 @@ unsafe fn resume_suspended_user_callback_component(
     client_process_role: Option<nt_exe_image::HostedProcessRole>,
     client_top_badge: u64,
 ) -> crate::spawn_hosts::PumpResult {
+    let (token_user_sid, token_user_sid_len) = load_callback_client_sid();
     let client = crate::spawn_hosts::UserCallbackClient {
         pi: request.client_pi,
         badge: request.client_badge,
@@ -1401,6 +1483,9 @@ unsafe fn resume_suspended_user_callback_component(
         top_badge: client_top_badge,
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
+        token_authentication_id: USER_CALLBACK_CLIENT_TOKEN_AUTH.load(Ordering::Relaxed),
+        token_user_sid,
+        token_user_sid_len,
     };
     let channel = crate::spawn_hosts::PumpChannel {
         fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
@@ -1823,6 +1908,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
 
     let mut proof = 0u64;
+    let (system_sid, system_sid_len) = local_system_sid_native();
     let WinlogonCallbackThread {
         badge,
         tid,
@@ -1867,6 +1953,9 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
+        token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
+        token_user_sid: system_sid,
+        token_user_sid_len: system_sid_len,
     };
 
     // (1) SUSPEND an outer dispatch inside a REAL user-mode callback.
@@ -2036,6 +2125,7 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
 
     let mut proof = 0u64;
+    let (system_sid, system_sid_len) = local_system_sid_native();
     // (0) VICTIM SELECTION — caller supplies an expendable winlogon (pi 2) worker thread resolved
     // from the registered hosted-thread runtime table.
     let WinlogonCallbackThread {
@@ -2083,6 +2173,9 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         teb,
         peb_mirror: WINLOGON_PEB_MIRROR,
         scratch_base,
+        token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
+        token_user_sid: system_sid,
+        token_user_sid_len: system_sid_len,
     };
     // (1) Drive a REAL win32k dispatch that reaches a client window procedure. WM_NULL is the
     // do-nothing message, so the only observable effect is the reverse transition itself.
@@ -2433,6 +2526,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         previous_dispatch,
     );
     if component.callback_suspended {
+        let (token_user_sid, token_user_sid_len) = load_callback_client_sid();
         let chained_client = Win32kClientContext {
             pi: request.client_pi,
             pid: USER_CALLBACK_CLIENT_PID.load(Ordering::Relaxed),
@@ -2447,6 +2541,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
             scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
+            token_authentication_id: USER_CALLBACK_CLIENT_TOKEN_AUTH.load(Ordering::Relaxed),
+            token_user_sid,
+            token_user_sid_len,
         };
         if !redirect_pending_user_callback(
             chained_client,
@@ -3225,6 +3322,7 @@ pub(crate) unsafe fn load_kbdus_driver(host_pml4: u64) {
 /// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (u64, bool) {
     let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
+    let (system_sid, system_sid_len) = local_system_sid_native();
     win32k_dispatch_wide(
         ssn,
         a0,
@@ -3250,6 +3348,9 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             teb: 0,
             peb_mirror: 0,
             scratch_base: crate::SM_FILL_SCRATCH_BASE,
+            token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
+            token_user_sid: system_sid,
+            token_user_sid_len: system_sid_len,
         },
     )
 }
@@ -3401,6 +3502,31 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         callback_process_role_code(client.process_role) as u64,
     );
     core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_TOKEN_AUTH) as *mut u64,
+        client.token_authentication_id,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_TOKEN_USER_SID_LEN) as *mut u64,
+        client.token_user_sid_len as u64,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_TOKEN_USER_SID_PTR) as *mut u64,
+        win32k_subsystem::WIN32K_TOKEN_USER_SID_VADDR,
+    );
+    let mut sid_i = 0usize;
+    while sid_i < win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX {
+        let byte = if sid_i < client.token_user_sid_len as usize {
+            client.token_user_sid[sid_i]
+        } else {
+            0
+        };
+        core::ptr::write_volatile(
+            (win32k_subsystem::WIN32K_TOKEN_USER_SID_VADDR + sid_i as u64) as *mut u8,
+            byte,
+        );
+        sid_i += 1;
+    }
+    core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_DEBUG_FLAGS) as *mut u64,
         debug_flags,
     );
@@ -3475,6 +3601,9 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
             top_badge: client.top_badge,
             peb_mirror: client.peb_mirror,
             scratch_base: client.scratch_base,
+            token_authentication_id: client.token_authentication_id,
+            token_user_sid: client.token_user_sid,
+            token_user_sid_len: client.token_user_sid_len,
         }),
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
