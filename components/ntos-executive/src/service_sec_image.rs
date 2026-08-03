@@ -16,6 +16,7 @@ static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CREATE_DIB_SECTION_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +72,10 @@ const CREATE_DIBITMAP_FAIL_BITS_OVERFLOW: u64 = 4;
 const CREATE_DIBITMAP_FAIL_BMI_OVERFLOW: u64 = 5;
 const CREATE_DIBITMAP_FAIL_BITS_COPY: u64 = 6;
 const CREATE_DIBITMAP_FAIL_BMI_COPY: u64 = 7;
+const CREATE_DIB_SECTION_FAIL_MISSING_SP: u64 = 1;
+const CREATE_DIB_SECTION_FAIL_STACK_TAIL: u64 = 2;
+const CREATE_DIB_SECTION_FAIL_LAYOUT: u64 = 3;
+const CREATE_DIB_SECTION_FAIL_BMI_COPY: u64 = 4;
 const CBM_INIT: u64 = 0x04;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
@@ -7120,6 +7125,14 @@ pub(crate) unsafe fn service_sec_image(
                 let mut create_bitmap_stack_args = [0u64; 1];
                 let mut create_bitmap_stack_arg_count = 0usize;
                 let mut create_bitmap_probe_failed = false;
+                let mut create_dib_section_stack_args = [0u64; 5];
+                let mut create_dib_section_stack_arg_count = 0usize;
+                let mut create_dib_section_probe_failed = false;
+                let mut create_dib_section_probe_failure = 0u64;
+                let mut create_dib_section_probe_aux0 = 0u64;
+                let mut create_dib_section_probe_aux1 = 0u64;
+                let mut create_dib_section_probe_aux2 = 0u64;
+                let mut create_dib_section_bits_copyout = (0u64, 0u64);
                 let mut create_dibitmap_stack_args = [0u64; 7];
                 let mut create_dibitmap_stack_arg_count = 0usize;
                 let mut create_dibitmap_probe_failed = false;
@@ -7440,6 +7453,140 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         create_bitmap_probe_failed = true;
+                    }
+                } else if m0 == 0x109b && uses_client_gdi {
+                    // NtGdiCreateDIBSection takes a caller-owned BITMAPINFO in a3 and writes the
+                    // returned DIB storage pointer through the fifth stack-tail argument. Stage both
+                    // endpoints so isolated win32k never probes explorer's raw heap/stack VAs.
+                    if sp == 0 {
+                        create_dib_section_probe_failed = true;
+                        create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_MISSING_SP;
+                    } else {
+                        let mut tail_ok = true;
+                        let mut i = 0usize;
+                        while i < create_dib_section_stack_args.len() {
+                            match client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28 + i as u64 * 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                Some(value) => create_dib_section_stack_args[i] = value,
+                                None => {
+                                    tail_ok = false;
+                                    create_dib_section_probe_failure =
+                                        CREATE_DIB_SECTION_FAIL_STACK_TAIL;
+                                    create_dib_section_probe_aux0 = i as u64;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        if !tail_ok {
+                            create_dib_section_probe_failed = true;
+                        } else {
+                            let i_usage = create_dib_section_stack_args[0] as u32 as u64;
+                            let cj_header = create_dib_section_stack_args[1] as u32 as u64;
+                            let fl = create_dib_section_stack_args[2] as u32 as u64;
+                            let color_space = create_dib_section_stack_args[3];
+                            let client_bits_out = create_dib_section_stack_args[4];
+                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
+                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let mut layout_ok = a3 != 0 && cj_header >= 12 && cj_header <= cap;
+                            if !layout_ok {
+                                create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                create_dib_section_probe_aux0 = a3;
+                                create_dib_section_probe_aux1 = cj_header;
+                                create_dib_section_probe_aux2 = cap;
+                            }
+                            let staged_bmi = base;
+                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
+                                match align_up_u64(cj_header, 8) {
+                                    Some(offset) if offset + 8 <= cap => base + offset,
+                                    _ => {
+                                        layout_ok = false;
+                                        create_dib_section_probe_failure =
+                                            CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                        create_dib_section_probe_aux0 = cj_header;
+                                        create_dib_section_probe_aux1 = 8;
+                                        create_dib_section_probe_aux2 = cap;
+                                        0
+                                    }
+                                }
+                            } else {
+                                0
+                            };
+                            if !layout_ok {
+                                create_dib_section_probe_failed = true;
+                            } else {
+                                core::ptr::write_bytes(
+                                    base as *mut u8,
+                                    0,
+                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
+                                );
+                                prefill_client_copyin_dll_range_pages(
+                                    pi as u64,
+                                    a3,
+                                    cj_header as usize,
+                                    scratch_base,
+                                    &reg,
+                                    &dll_pes,
+                                );
+                                let bmi_out = core::slice::from_raw_parts_mut(
+                                    staged_bmi as *mut u8,
+                                    cj_header as usize,
+                                );
+                                if img_spawn::client_copyin_mapped(
+                                    pi as u64,
+                                    a3,
+                                    bmi_out,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    d_a2 = a2 as u32 as u64;
+                                    d_a3 = staged_bmi;
+                                    create_dib_section_stack_args =
+                                        [i_usage, cj_header, fl, color_space, staged_bits_out];
+                                    create_dib_section_stack_arg_count =
+                                        create_dib_section_stack_args.len();
+                                    create_dib_section_bits_copyout =
+                                        (client_bits_out, staged_bits_out);
+                                    let n = CREATE_DIB_SECTION_MARSHAL_TRACE
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if n < 24 {
+                                        print_str(b"[w32marshal] NtGdiCreateDIBSection pi=");
+                                        print_u64(pi as u64);
+                                        print_str(b" hdc=0x");
+                                        print_hex_u64(a0);
+                                        print_str(b" section=0x");
+                                        print_hex_u64(a1);
+                                        print_str(b" offset=0x");
+                                        print_hex(a2 as u32);
+                                        print_str(b" bmi=0x");
+                                        print_hex_u64(a3);
+                                        print_str(b" usage=0x");
+                                        print_hex(i_usage as u32);
+                                        print_str(b" header=");
+                                        print_u64(cj_header);
+                                        print_str(b" out=0x");
+                                        print_hex_u64(client_bits_out);
+                                        print_str(b" staged=0x");
+                                        print_hex_u64(staged_bmi);
+                                        print_str(b"/0x");
+                                        print_hex_u64(staged_bits_out);
+                                        print_str(b"\n");
+                                    }
+                                } else {
+                                    create_dib_section_probe_failed = true;
+                                    create_dib_section_probe_failure =
+                                        CREATE_DIB_SECTION_FAIL_BMI_COPY;
+                                    create_dib_section_probe_aux0 = a3;
+                                    create_dib_section_probe_aux1 = cj_header;
+                                }
+                            }
+                        }
                     }
                 } else if m0 == 0x10a0 && uses_client_gdi {
                     // NtGdiCreateDIBitmapInternal receives a DIB bits pointer and BITMAPINFO in the
@@ -8913,6 +9060,34 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if create_dib_section_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiCreateDIBSection input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hdc=0x");
+                        print_hex_u64(a0);
+                        print_str(b" bmi=0x");
+                        print_hex_u64(a3);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" reason=");
+                        print_u64(create_dib_section_probe_failure);
+                        print_str(b" usage=0x");
+                        print_hex(create_dib_section_stack_args[0] as u32);
+                        print_str(b" header=");
+                        print_u64(create_dib_section_stack_args[1] as u32 as u64);
+                        print_str(b" out=0x");
+                        print_hex_u64(create_dib_section_stack_args[4]);
+                        print_str(b" aux=");
+                        print_u64(create_dib_section_probe_aux0);
+                        print_str(b"/");
+                        print_u64(create_dib_section_probe_aux1);
+                        print_str(b"/");
+                        print_u64(create_dib_section_probe_aux2);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if create_dibitmap_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9093,6 +9268,9 @@ pub(crate) unsafe fn service_sec_image(
                         && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
                     let create_bitmap_staged_stack = m0 == 0x106c
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
+                    let create_dib_section_staged_stack = m0 == 0x109b
+                        && create_dib_section_stack_arg_count
+                            == create_dib_section_stack_args.len();
                     let create_dibitmap_staged_stack = m0 == 0x10a0
                         && create_dibitmap_stack_arg_count == create_dibitmap_stack_args.len();
                     let stretch_dibits_staged_stack = m0 == 0x1082
@@ -9120,6 +9298,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &build_hwnd_list_stack_args)
                     } else if create_bitmap_staged_stack {
                         (sp, &create_bitmap_stack_args)
+                    } else if create_dib_section_staged_stack {
+                        (sp, &create_dib_section_stack_args)
                     } else if create_dibitmap_staged_stack {
                         (sp, &create_dibitmap_stack_args)
                     } else if stretch_dibits_staged_stack {
@@ -9344,6 +9524,31 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(client_buffer);
                                 print_str(b" bytes=");
                                 print_u64(output_bytes as u64);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if create_dib_section_staged_stack && r.1 && r.0 != 0 {
+                        let (client_bits_out, staged_bits_out) = create_dib_section_bits_copyout;
+                        let bits_ok = client_bits_out == 0
+                            || img_spawn::client_copyout_mapped(
+                                pi as u64,
+                                client_bits_out,
+                                core::slice::from_raw_parts(staged_bits_out as *const u8, 8),
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                        if !bits_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtGdiCreateDIBSection bits copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" out=0x");
+                                print_hex_u64(client_bits_out);
                                 print_str(b"\n");
                             }
                             r = (0, true);

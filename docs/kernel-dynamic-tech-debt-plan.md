@@ -1288,3 +1288,24 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   open for the final win32k/client marshalling audit. The persistent red gates remain
   `exec_user_callback_real_api0_nested_roundtrip`, `exec_user_callback_dead_client_unwind`,
   `exec_win32k_transport_call_nested`, and `exec_lsa_worker_route`.
+- C3 repair. `NtGdiCreateDIBSection(0x109b)` now stages the caller-owned `BITMAPINFO` and optional
+  `PVOID *Bits` output through the provider bulk argument window before isolated win32k dispatch.
+  The ReactOS x64 stack-tail `DWORD`/`UINT`/`FLONG` scalars are canonicalized to their declared
+  32-bit shape while `dwColorSpace` keeps pointer width, and failures for missing stacks, unreadable
+  client tails, invalid layouts, BITMAPINFO copy-in, or Bits copy-out return visible NULL results
+  instead of forwarding raw explorer heap/stack pointers. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-createdibsection.log` passed through the microtest sentinel with
+  `271/275 executive->isolated-service checks passed`, `PASS exec_win32k_desktop_painted`,
+  `PASS exec_msgina_logon_dialog_painted`, `PASS exec_msgina_credential_keystrokes_delivered`,
+  `PASS exec_lsa_logon_user_reached`, `PASS exec_winlogon_user_shell_activated`, `PASS
+  exec_userinit_process_spawned`, `PASS exec_explorer_process_spawned`, and `PASS
+  exec_explorer_shell_com_classes_served`. The old explorer `0x109b -> WALL` route is gone:
+  observed `NtGdiCreateDIBSection` calls were marshalled and returned handles, including nested api0
+  dispatches. Review adjustment: C3 remains open because the next explorer nested win32k wall is
+  now `NtGdi*`/USER SSN `0x104e`, which still contaminates the transport proof gates. The persistent
+  red gates remain `exec_user_callback_real_api0_nested_roundtrip`,
+  `exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`, and
+  `exec_lsa_worker_route`.
