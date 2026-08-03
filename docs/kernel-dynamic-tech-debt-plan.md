@@ -1102,3 +1102,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `.tmp/full-boot-shell-session-catalog-removed.log` passed the harness desktop gate with
   `230/275 executive->isolated-service checks passed`; the boot log contains no old shell `SESSION`
   catalog hit/miss lines.
+- C3 continued. `NtUserGetAtomName(0x10ad)` now has a provider-owned cross-address-space output
+  boundary. The executive captures the caller `UNICODE_STRING`, stages the descriptor and writable
+  buffer in the win32k argument frame, forwards only provider-owned pointers, and copies the returned
+  atom name bytes back to the caller buffer without restoring the descriptor, matching ReactOS'
+  observed contract for this syscall. Invalid output descriptors fail visibly with a zero return
+  instead of sending a foreign pointer into isolated win32k. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and `.tmp/full-boot-get-atom-name-marshalled.log`
+  passed the harness desktop gate with `229/275 executive->isolated-service checks passed`. The log
+  shows real staged winlogon `NtUserGetAtomName` returns for atom `0x8002` and no old
+  `RVA=0x001cbddb` wall. Review adjustment: C3 remains open. This unblocks the later post-SAS
+  Winlogon-key path enough to expose the next provider-boundary/user-callback frontier:
+  `WM_NCCREATE` api0 reaches nested `NtUserCallOneParam(0x1080)`, fails to unwind that nested
+  dispatch, and leaves one outstanding callback continuation. Noninteractive service/LSASS
+  `NtGdiOpenDCW(0x10de)` still returns win32k's real NULL/PDEV failure and should stay visible until
+  D3's display-device/registry ownership is replaced by real driver-created state.

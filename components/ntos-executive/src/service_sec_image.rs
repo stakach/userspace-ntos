@@ -20,6 +20,7 @@ static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -1659,6 +1660,14 @@ struct CapturedGetClassName {
     maximum: u16,
 }
 
+#[derive(Clone, Copy)]
+struct CapturedGetAtomName {
+    buffer_client: u64,
+    desc_out: u64,
+    buffer_out: u64,
+    maximum: u16,
+}
+
 fn rc_arg_slot_base(slot: u64) -> u64 {
     win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT
 }
@@ -1886,6 +1895,72 @@ unsafe fn copy_back_get_class_name(
         scratch_base,
     );
     text_ok && desc_ok
+}
+
+unsafe fn capture_get_atom_name_out(
+    pi: u64,
+    atom_name: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedGetAtomName> {
+    if atom_name == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        atom_name,
+        &mut raw,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    let maximum = u16::from_le_bytes([raw[2], raw[3]]);
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if maximum < 2 || buffer == 0 {
+        return None;
+    }
+
+    let staged_max = (maximum as u64).min(RC_ARG_BUF_CAP) as u16;
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc_out = rc_arg_slot_base(slot);
+    let buffer_out = desc_out + 0x20;
+    core::ptr::write_bytes(desc_out as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    raw[2..4].copy_from_slice(&staged_max.to_le_bytes());
+    raw[8..16].copy_from_slice(&buffer_out.to_le_bytes());
+    core::ptr::copy_nonoverlapping(raw.as_ptr(), desc_out as *mut u8, raw.len());
+    Some(CapturedGetAtomName {
+        buffer_client: buffer,
+        desc_out,
+        buffer_out,
+        maximum,
+    })
+}
+
+unsafe fn copy_back_get_atom_name(
+    pi: u64,
+    capture: CapturedGetAtomName,
+    chars_returned: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    let byte_len = chars_returned.saturating_mul(2).min(RC_ARG_BUF_CAP);
+    let copy_len = (byte_len + 2)
+        .min(capture.maximum as u64)
+        .min(RC_ARG_BUF_CAP) as usize;
+    let text = core::slice::from_raw_parts(capture.buffer_out as *const u8, copy_len);
+    img_spawn::client_write_mapped(
+        pi,
+        capture.buffer_client,
+        text,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
 }
 
 unsafe fn capture_register_class_graph(
@@ -7009,6 +7084,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut message_call_stack_arg_count = 0usize;
                 let mut message_call_copyout = (0u64, 0u64, 0usize);
                 let mut message_call_probe_failed = false;
+                let mut get_atom_name_probe_failed = false;
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -8041,6 +8117,36 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let userinit_gui_client = nt_handler.hosted_process_role(pi)
                     == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
+                let get_atom_name_capture = if m0 == 0x10ad {
+                    let capture = capture_get_atom_name_out(
+                        pi as u64,
+                        a1,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let Some(capture) = capture {
+                        d_a1 = capture.desc_out;
+                        let n = GET_ATOM_NAME_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 16 {
+                            print_str(b"[w32marshal] NtUserGetAtomName pi=");
+                            print_u64(pi as u64);
+                            print_str(b" atom=0x");
+                            print_hex(a0 as u32);
+                            print_str(b" desc=0x");
+                            print_hex_u64(a1);
+                            print_str(b" max=");
+                            print_u64(capture.maximum as u64);
+                            print_str(b"\n");
+                        }
+                        Some(capture)
+                    } else {
+                        get_atom_name_probe_failed = true;
+                        None
+                    }
+                } else {
+                    None
+                };
                 let get_class_info_ansi = if m0 == 0x10bd {
                     client_read_u64_mapped(
                         pi as u64,
@@ -8316,6 +8422,18 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" sp=0x");
                         print_hex_u64(sp);
                         print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
+                } else if get_atom_name_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserGetAtomName output probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" atom=0x");
+                        print_hex(a0 as u32);
+                        print_str(b" desc=0x");
+                        print_hex_u64(a1);
+                        print_str(b" -> 0\n");
                     }
                     (0, true)
                 } else if create_window_probe_failed {
@@ -8896,6 +9014,20 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(capture) = get_class_name_capture {
                         if st != 0
                             && !copy_back_get_class_name(
+                                pi as u64,
+                                capture,
+                                st,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            )
+                        {
+                            st = 0;
+                        }
+                    }
+                    if let Some(capture) = get_atom_name_capture {
+                        if st != 0
+                            && !copy_back_get_atom_name(
                                 pi as u64,
                                 capture,
                                 st,
