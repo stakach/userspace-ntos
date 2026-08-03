@@ -802,3 +802,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Winlogon SAS/dialog path; it is `exec_desktop_shell_frontier`, the callback dead-client/nested
   transport selftests, `exec_lsa_worker_route`, `exec_userinit_shell_image_attempted`, and the
   downstream explorer gates.
+- C3 repair. `NtUserLoadKeyboardLayoutEx` now stages its client-owned stack-tail
+  `PUNICODE_STRING` KLID argument into the provider-owned win32k argument frame, forwards the real
+  `dwNewKL`/`Flags` tail values, and returns visible NULL failure on bad probes instead of letting
+  isolated win32k dereference a hosted-client descriptor. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
+  `git diff --check`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. The full boot attempt
+  `.tmp/full-boot-load-kbd-layout-20260803-224605.log` reached 272/276 checks, clearing the old
+  userinit `0x125c` wall and passing the userinit shell-image and explorer spawn/callback/WndProc/COM
+  gates. Review adjustment: the live red frontier is now explorer `NtGdiGetCharWidthW` (`0x10cb`),
+  which faults inside isolated win32k on caller output/input pointer handling, plus the callback
+  nested/dead-client proof counters and `exec_lsa_worker_route`.

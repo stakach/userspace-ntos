@@ -17,6 +17,7 @@ static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -1471,6 +1472,61 @@ unsafe fn capture_client_devmodew_arg(
     }
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), staged as *mut u8, size);
     staged
+}
+
+unsafe fn capture_required_client_unicode_string_arg(
+    pi: u64,
+    descriptor: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    if descriptor == 0 {
+        return None;
+    }
+    let mut sd = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        descriptor,
+        &mut sd,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    let length = u16::from_le_bytes([sd[0], sd[1]]) as usize;
+    let maximum = u16::from_le_bytes([sd[2], sd[3]]) as usize;
+    let buffer = u64::from_le_bytes(sd[8..16].try_into().unwrap());
+    if length & 1 != 0 || length > maximum || length + 2 > RC_ARG_BUF_CAP as usize || buffer == 0 {
+        return None;
+    }
+    let probe_len = length.max(2);
+    let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        buffer,
+        &mut chars[..probe_len],
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc = rc_arg_slot_base(slot);
+    let buf = desc + 0x20;
+    core::ptr::write_bytes(desc as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    if length != 0 {
+        core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length);
+    }
+    core::ptr::write_volatile((buf + length as u64) as *mut u16, 0);
+    core::ptr::write_volatile(desc as *mut u16, length as u16);
+    core::ptr::write_volatile((desc + 2) as *mut u16, (length + 2) as u16);
+    core::ptr::write_volatile((desc + 4) as *mut u32, 0);
+    core::ptr::write_volatile((desc + 8) as *mut u64, buf);
+    Some(desc)
 }
 
 /// Legacy `NtUserCreateWindowEx` capture: only rebase counted strings whose buffers live in the
@@ -7089,6 +7145,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
                 let mut text_extent_probe_failed = false;
+                let mut load_keyboard_layout_stack_args = [0u64; 3];
+                let mut load_keyboard_layout_stack_arg_count = 0usize;
+                let mut load_keyboard_layout_probe_failed = false;
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -7338,6 +7397,69 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         create_bitmap_probe_failed = true;
                     }
+                } else if m0 == 0x125c && sp != 0 {
+                    // NtUserLoadKeyboardLayoutEx has a client PUNICODE_STRING KLID in its stack
+                    // tail. ReactOS probes/copies it before loading the layout; isolated win32k must
+                    // see a provider-owned descriptor and tail, not the hosted caller's raw stack.
+                    let pusz_klid = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x28,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let dw_new_kl = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x30,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let flags = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x38,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let (Some(pusz_klid), Some(dw_new_kl), Some(flags)) =
+                        (pusz_klid, dw_new_kl, flags)
+                    {
+                        if let Some(staged_klid) = capture_required_client_unicode_string_arg(
+                            pi as u64,
+                            pusz_klid,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            load_keyboard_layout_stack_args = [staged_klid, dw_new_kl, flags];
+                            load_keyboard_layout_stack_arg_count =
+                                load_keyboard_layout_stack_args.len();
+                            let n =
+                                LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 8 {
+                                let length =
+                                    core::ptr::read_unaligned(staged_klid as *const u16) as u64;
+                                print_str(b"[w32marshal] NtUserLoadKeyboardLayoutEx pi=");
+                                print_u64(pi as u64);
+                                print_str(b" klid=0x");
+                                print_hex_u64(pusz_klid);
+                                print_str(b" bytes=");
+                                print_u64(length);
+                                print_str(b" new=0x");
+                                print_hex(dw_new_kl as u32);
+                                print_str(b" flags=0x");
+                                print_hex(flags as u32);
+                                print_str(b"\n");
+                            }
+                        } else {
+                            load_keyboard_layout_probe_failed = true;
+                        }
+                    } else {
+                        load_keyboard_layout_probe_failed = true;
+                    }
+                } else if m0 == 0x125c {
+                    load_keyboard_layout_probe_failed = true;
                 } else if m0 == 0x11d9 && hosted_process_uses_client_gdi(&nt_handler, pi) {
                     // NtGdiGetTextExtentExW has one client input buffer and three possible output
                     // buffers in its stack tail. Isolated win32k must see only win32k-owned VAs; the
@@ -8207,6 +8329,16 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if load_keyboard_layout_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserLoadKeyboardLayoutEx KLID probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if create_window_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -8451,6 +8583,9 @@ pub(crate) unsafe fn service_sec_image(
                         && register_class_stack_arg_count == register_class_stack_args.len();
                     let create_window_staged_stack = m0 == 0x1077
                         && create_window_stack_arg_count == create_window_stack_args.len();
+                    let load_keyboard_layout_staged_stack = m0 == 0x125c
+                        && load_keyboard_layout_stack_arg_count
+                            == load_keyboard_layout_stack_args.len();
                     // Keep the original SP in the dispatch context for callback/completion
                     // observers. win32k_dispatch_wide still sends SH_REQ_CALLER_SP=0 when
                     // stack_args is non-empty, so the component consumes only the staged tail.
@@ -8467,6 +8602,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &register_class_stack_args)
                     } else if create_window_staged_stack {
                         (sp, &create_window_stack_args)
+                    } else if load_keyboard_layout_staged_stack {
+                        (sp, &load_keyboard_layout_stack_args)
                     } else {
                         (sp, &[])
                     };
