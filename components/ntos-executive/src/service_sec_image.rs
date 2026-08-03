@@ -1334,10 +1334,6 @@ const DEVMODEW_MIN_BYTES: usize = 0x48;
 const RC_ARG_BUF_CAP: u64 = 0x0200;
 static RC_ARG_CAPTURE_NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn le_u64_at(raw: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
-}
-
 #[derive(Clone, Copy)]
 struct CapturedStringArg {
     desc: u64,
@@ -1346,15 +1342,6 @@ struct CapturedStringArg {
     buffer: u64,
     staged_buffer: u64,
     ansi: bool,
-}
-
-/// Is `va` inside the client's MAIN IMAGE window? Every hosted process is loaded at the SAME
-/// `PE_LOAD_BASE`, so these VAs COLLIDE across clients: win32k's per-client demand window can observe
-/// an empty/other-client page at such a VA WITHOUT faulting, so the demand-fault client-frame sharing
-/// never runs and win32k reads zeros. Client stack/heap VAs do not have this problem (they are
-/// recorded per-process and resolve correctly), so only this range needs legacy create-window capture.
-fn client_image_range(va: u64) -> bool {
-    va >= PE_LOAD_BASE && va < PE_LOAD_BASE + IMAGE_MIRROR_WINDOW
 }
 
 /// Capture a client counted-string argument (`UNICODE_STRING` when `large` is false, `LARGE_STRING`
@@ -1587,66 +1574,6 @@ unsafe fn capture_required_client_unicode_string_arg(
     core::ptr::write_volatile((desc + 4) as *mut u32, 0);
     core::ptr::write_volatile((desc + 8) as *mut u64, buf);
     Some(desc)
-}
-
-/// Legacy `NtUserCreateWindowEx` capture: only rebase counted strings whose buffers live in the
-/// colliding main-image range. Completed-dispatch observers inspect the argument vector that was sent
-/// to win32k, so non-explorer stack/heap/DLL strings must remain untouched until those observers carry
-/// their own saved original argument copy.
-unsafe fn capture_client_string_arg_if_main_image(
-    pi: u64,
-    sp_va: u64,
-    large: bool,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> u64 {
-    if sp_va == 0 {
-        return sp_va;
-    }
-    let mut sd = [0u8; 16];
-    if !img_spawn::client_copyin_mapped(pi, sp_va, &mut sd, filled_pages, nfilled, scratch_base) {
-        return sp_va;
-    }
-    let length = if large {
-        u32::from_le_bytes(sd[0..4].try_into().unwrap()) as u64
-    } else {
-        u16::from_le_bytes([sd[0], sd[1]]) as u64
-    };
-    let buffer = le_u64_at(&sd, 8);
-    if length == 0 || buffer == 0 || length + 2 > RC_ARG_BUF_CAP || !client_image_range(buffer) {
-        return sp_va;
-    }
-    let mut chars = [0u8; RC_ARG_BUF_CAP as usize];
-    if !img_spawn::client_copyin_mapped(
-        pi,
-        buffer,
-        &mut chars[..length as usize],
-        filled_pages,
-        nfilled,
-        scratch_base,
-    ) {
-        return sp_va;
-    }
-    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
-    let desc =
-        win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT;
-    let buf = desc + 0x20;
-    core::ptr::write_bytes(desc as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
-    core::ptr::copy_nonoverlapping(chars.as_ptr(), buf as *mut u8, length as usize);
-    core::ptr::write_volatile((buf + length) as *mut u16, 0); // UNICODE_NULL terminate
-    if large {
-        // LARGE_STRING: Length(u32), MaximumLength:31|bAnsi:1 (u32). Preserve bAnsi.
-        let ansi_bit = u32::from_le_bytes(sd[4..8].try_into().unwrap()) & 0x8000_0000;
-        core::ptr::write_volatile(desc as *mut u32, length as u32);
-        core::ptr::write_volatile((desc + 4) as *mut u32, (length as u32 + 2) | ansi_bit);
-    } else {
-        core::ptr::write_volatile(desc as *mut u16, length as u16);
-        core::ptr::write_volatile((desc + 2) as *mut u16, (length + 2) as u16);
-        core::ptr::write_volatile((desc + 4) as *mut u32, 0); // explicit x64 padding
-    }
-    core::ptr::write_volatile((desc + 8) as *mut u64, buf);
-    desc
 }
 
 unsafe fn stage_unicode_string_descriptor_for_win32k(
@@ -8099,91 +8026,68 @@ pub(crate) unsafe fn service_sec_image(
                             create_window_probe_failed = true;
                         }
                     }
-                    if explorer_gui_client {
-                        // Explorer reaches this path with create-window strings outside the main image
-                        // window. Capture them generically so isolated win32k never sees foreign VAs.
-                        prefill_client_large_string_pages(
-                            pi as u64,
-                            d_a1,
-                            scratch_base,
-                            &mut faults,
-                            filled_pages,
-                            &reg,
-                            &dll_pes,
-                        );
-                        prefill_client_large_string_pages(
-                            pi as u64,
-                            d_a2,
-                            scratch_base,
-                            &mut faults,
-                            filled_pages,
-                            &reg,
-                            &dll_pes,
-                        );
-                        prefill_client_large_string_pages(
-                            pi as u64,
-                            d_a3,
-                            scratch_base,
-                            &mut faults,
-                            filled_pages,
-                            &reg,
-                            &dll_pes,
-                        );
-                        let original_a1 = d_a1;
-                        let original_a2 = d_a2;
-                        let original_a3 = d_a3;
-                        d_a1 = capture_client_string_arg(
-                            pi as u64,
-                            d_a1,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        d_a2 = capture_client_string_arg(
-                            pi as u64,
-                            d_a2,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        d_a3 = capture_client_string_arg(
-                            pi as u64,
-                            d_a3,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        if d_a1 != original_a1 || d_a2 != original_a2 || d_a3 != original_a3 {
-                            EXPLORER_CREATE_WINDOW_STRING_CAPTURES.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        d_a1 = capture_client_string_arg_if_main_image(
-                            pi as u64,
-                            d_a1,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        d_a2 = capture_client_string_arg_if_main_image(
-                            pi as u64,
-                            d_a2,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
-                        d_a3 = capture_client_string_arg_if_main_image(
-                            pi as u64,
-                            d_a3,
-                            true,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        );
+                    // CreateWindowEx class/version/window names are client-owned LARGE_STRING
+                    // graphs, even for built-in controls whose literals live in user32.dll (for
+                    // example ComboLBox during the msgina logon dialog). Isolated win32k must see a
+                    // provider-owned copy or fail visibly on an unreadable graph.
+                    prefill_client_large_string_pages(
+                        pi as u64,
+                        d_a1,
+                        scratch_base,
+                        &mut faults,
+                        filled_pages,
+                        &reg,
+                        &dll_pes,
+                    );
+                    prefill_client_large_string_pages(
+                        pi as u64,
+                        d_a2,
+                        scratch_base,
+                        &mut faults,
+                        filled_pages,
+                        &reg,
+                        &dll_pes,
+                    );
+                    prefill_client_large_string_pages(
+                        pi as u64,
+                        d_a3,
+                        scratch_base,
+                        &mut faults,
+                        filled_pages,
+                        &reg,
+                        &dll_pes,
+                    );
+                    let original_a1 = d_a1;
+                    let original_a2 = d_a2;
+                    let original_a3 = d_a3;
+                    d_a1 = capture_client_string_arg(
+                        pi as u64,
+                        d_a1,
+                        true,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    d_a2 = capture_client_string_arg(
+                        pi as u64,
+                        d_a2,
+                        true,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    d_a3 = capture_client_string_arg(
+                        pi as u64,
+                        d_a3,
+                        true,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if explorer_gui_client
+                        && (d_a1 != original_a1 || d_a2 != original_a2 || d_a3 != original_a3)
+                    {
+                        EXPLORER_CREATE_WINDOW_STRING_CAPTURES.fetch_add(1, Ordering::Relaxed);
                     }
                 } else if m0 == 0x1080 && interactive_gui_client {
                     // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from

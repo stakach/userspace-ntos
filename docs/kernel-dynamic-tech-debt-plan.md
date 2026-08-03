@@ -1189,3 +1189,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   microtest sentinel. Review adjustment: D3 remains open until a real hosted
   videoprt/display-miniport stack creates the device object/interface and Configuration Manager
   publishes `HARDWARE\DEVICEMAP\VIDEO`.
+- C3 repair. `NtUserCreateWindowEx(0x1077)` now stages class/version/window `LARGE_STRING` graphs
+  for every GUI client instead of only capturing explorer strings or buffers inside the colliding
+  main-image range. Built-in control names such as msgina's `ComboLBox` live in user32.dll, so
+  isolated win32k must receive provider-owned counted strings regardless of which image backs the
+  caller buffer. The legacy main-image-only capture helper and its colliding-image predicate were
+  removed; unreadable string graphs now fail through the shared capture/probe path instead of being
+  hidden by a synthetic create-window result. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-create-window-strings-all-gui-final.log` passed the desktop gate with
+  `PASS exec_win32k_desktop_painted`, `PASS exec_msgina_idd_logon_correlated`, IDD_LOGON modal pump
+  observation `steps=3/3 completed=1 paints=830`, `233/275 executive->isolated-service checks
+  passed`, and no `ComboLBox`, class-not-found, listbox, or `co_UserCreateWindowEx failed`
+  signatures. Review adjustment: C3 remains open for the broader win32k/client marshalling audit.
+  F3/F4 remain open because `exec_msgina_modal_paint_prefix` and
+  `exec_msgina_logon_dialog_painted` still fail with a desktop-colored credential rect
+  (`non-desktop=0`). The post-quiesce nested/dead-client proof also remains open because the current
+  raw `WM_NULL`/frame-change probes do not arm a callback (`callback-parked=0`); the failed
+  RedrawWindow/WM_PAINT proof-harness experiment was not kept.
