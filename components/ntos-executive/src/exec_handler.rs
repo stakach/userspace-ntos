@@ -8485,14 +8485,6 @@ impl ExecNtHandler {
         {
             return Some(SYNTH_CPU_KEY);
         }
-        // \Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Winlogon — back this ONE
-        // key's EXISTENCE synthetically (msgina GetRegistrySettings). This check deliberately
-        // stays AHEAD of the SOFTWARE mount below: msgina wants its value reads to MISS so it
-        // applies its documented registry defaults, and that is what produced the desktop paint.
-        // Every OTHER Software key comes from the real hive. See SYNTH_WINLOGON_KEY.
-        if is_winlogon_key_comps(&comps[2..]) {
-            return Some(SYNTH_WINLOGON_KEY);
-        }
         // The 4th mount — the REAL 471040 B SOFTWARE hive at `\Registry\Machine\SOFTWARE`. Placed
         // last so no pre-existing resolution changes: before it, every non-Winlogon Software key
         // fell out of this function as `None`.
@@ -9044,25 +9036,10 @@ impl ExecNtHandler {
                 if let Some(status) = self.open_user_namespace_key(root_target, &path, oa, args) {
                     return status;
                 }
-                // winlogon (pi 2) — msgina's `GetRegistrySettings` (WlxInitialize) opens the Winlogon
-                // key `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`. advapi32's
-                // `RegOpenKeyExW(HKLM, subkey)` first maps HKLM by opening `\Registry\Machine`, then
-                // opens the subkey relative to that handle. BOTH names are `RTL_CONSTANT_STRING`
-                // literals in `.rdata` pages winlogon/advapi32 never touch, so the pi==2 copyin mirror
-                // returns EMPTY for each → recover the real name from the backing PE image
-                // (`read_objattr_name_pe`, cross-AS via the registered DLL). Two exact, scoped matches:
-                //   (a) `\Registry\Machine` predefined-HKLM open → hand back a machine-root key so
-                //       advapi32's HKLM mapping SUCCEEDS. (Post-`SERVICES_CREATE_STARTED` the generic
-                //       empty-name branch below returns NOT_FOUND — which BROKE this open → the msgina
-                //       WlxShutdown(NULL) crash. Matching the recovered name distinguishes it from the
-                //       BasepIsProcessAllowed AppCertDlls empty-name open that must still miss.)
-                //   (b) the Winlogon subkey (relative to that root) → back its existence with
-                //       SYNTH_WINLOGON_KEY so the open succeeds and value reads miss (msgina applies its
-                //       documented registry defaults) → WlxInitialize writes `*pWlxContext` (non-NULL) →
-                //       GinaInit succeeds → no HandleShutdown → no WlxShutdown(NULL).
-                // Both are EXACT-name matches scoped to pi==2, so no other paint-time HKLM open outcome
-                // changes (broadly succeeding HKLM opens regressed the desktop paint; see the
-                // keyboard-layout note on the machine-root target).
+                // winlogon (pi 2) — msgina's registry names are often `RTL_CONSTANT_STRING` literals
+                // in `.rdata` pages winlogon/advapi32 never touch, so the plain copyin mirror returns
+                // EMPTY. Recover the exact name from the backing PE image, then resolve only the
+                // predefined `\Registry\Machine` root and the real Winlogon SOFTWARE-hive key here.
                 if self.current_process_is_winlogon() {
                     let eff_name = if !path.is_empty() {
                         path.clone()
@@ -9077,8 +9054,24 @@ impl ExecNtHandler {
                         s
                     };
                     if is_winlogon_key(&eff_name) {
-                        WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                        return self.mint_registry_key(SYNTH_WINLOGON_KEY, args[1] as u32, args[0]);
+                        let full = if Self::key_components(&eff_name)
+                            .get(0)
+                            .is_some_and(|c| c.eq_ignore_ascii_case("Registry"))
+                        {
+                            eff_name.clone()
+                        } else {
+                            let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                            full.push_str(&eff_name);
+                            full
+                        };
+                        if let Some(kr) = self.resolve_key(&full) {
+                            if hive_sel(kr) == HIVE_SEL_SOFTWARE {
+                                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                            return self.mint_registry_key(kr, args[1] as u32, args[0]);
+                        }
+                        return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                     }
                     // COUNT ONLY — no `return`, no synthesized key, no outcome change. See
                     // `is_profile_list_key`: this open is the structural witness that the real
@@ -10104,67 +10097,6 @@ impl ExecNtHandler {
                     shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
-                } else if self.current_process_is_winlogon()
-                    && key == SYNTH_WINLOGON_KEY
-                    && name_lc == "defaultpassword"
-                {
-                    // BATCH 41 — satisfy msgina's GetRegistrySettings DefaultPassword read (msgina.c:216)
-                    // with an EMPTY REG_SZ (a single UTF-16 NUL). This makes `rc == ERROR_SUCCESS` so
-                    // `if (rc) GetLsaDefaultPassword(...)` (msgina.c:223) is NOT taken → no LsaOpenPolicy
-                    // → no `\pipe\lsarpc` RPC bind → winlogon does not stall (nor raise an RPC exception
-                    // our ntdll can't dispatch) inside GinaInit. An empty auto-logon password is a
-                    // legitimate value; AutoAdminLogon defaults FALSE so it is never used to log in.
-                    WINLOGON_DEFPWD_EMPTY.fetch_add(1, Ordering::Relaxed);
-                    Some((1u32 /* REG_SZ */, alloc::vec![0u8, 0u8]))
-                } else if key == SYNTH_WINLOGON_KEY
-                    && name_lc == "userinit"
-                    && SERVE_WINLOGON_USERINIT
-                {
-                    // ★ THE ONE VALUE `WlxActivateUserShell` CANNOT DO WITHOUT (`msgina.c:498`):
-                    // it reads `Userinit` off the Winlogon key and returns FALSE outright if the
-                    // read fails or the type is not REG_SZ/REG_EXPAND_SZ — no shell, and
-                    // `HandleLogon` unwinds into `UnloadUserProfile`. Served from the REAL SOFTWARE
-                    // hive, by exact value name.
-                    //
-                    // ★ EXACT-VALUE scoped, deliberately. The same key in the real hive also holds
-                    // **`AutoAdminLogon = "1"`**, `DefaultUserName`, `Shell` and `LogonType`;
-                    // letting those through would change the flow that produced the desktop paint
-                    // (msgina applies documented defaults on a missing value, and that is the path
-                    // this boot's SAS/credential sequence takes). Only `Userinit` is answered here;
-                    // every other value on this key still MISSES, exactly as before.
-                    let value = self
-                        .software_hive
-                        .as_ref()
-                        .and_then(|hive| {
-                            hive.open_key(r"Microsoft\Windows NT\CurrentVersion\Winlogon")
-                        })
-                        .and_then(|cell| {
-                            self.software_hive.as_ref()?.value(cell, "Userinit")
-                        });
-                    if let Some((ty, ref data)) = value {
-                        WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
-                        WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
-                        WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
-                        use_xas_write = true;
-                        if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
-                            print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
-                            for pair in data.chunks_exact(2) {
-                                let unit = u16::from_le_bytes([pair[0], pair[1]]);
-                                if unit == 0 {
-                                    break;
-                                }
-                                debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                    unit as u8
-                                } else {
-                                    b'?'
-                                });
-                            }
-                            print_str(b"\" (REG type ");
-                            print_u64(ty as u64);
-                            print_str(b", from the real SOFTWARE hive; AutoAdminLogon NOT served)\n");
-                        }
-                    }
-                    value
                 } else {
                     if pe_backed_registry_strings && !is_synth_key(key) {
                         // Hosted clients reading a value out of a REAL MOUNTED HIVE (not a synth
@@ -10176,12 +10108,43 @@ impl ExecNtHandler {
                         //     InitializeSAS FALSE → ExitProcess(2).
                         //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
                         //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
-                        // Scoped by `!is_synth_key`, so every paint-time msgina value read is
-                        // unchanged (those hit SYNTH_WINLOGON_KEY, excluded here).
+                        // Scoped by `!is_synth_key`, so synthetic CPU/predefined-root reads stay on
+                        // their narrow paths.
                         use_xas_write = true;
                     }
                     self.registry_value(key, &name_lc)
                 };
+                let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
+                if self.current_process_is_winlogon() && key_is_real_winlogon {
+                    if let Some((ty, ref data)) = val {
+                        WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
+                        if name_lc == "userinit" {
+                            WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
+                            WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
+                            WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
+                            use_xas_write = true;
+                            if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
+                                print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
+                                for pair in data.chunks_exact(2) {
+                                    let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                                    if unit == 0 {
+                                        break;
+                                    }
+                                    debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                        unit as u8
+                                    } else {
+                                        b'?'
+                                    });
+                                }
+                                print_str(b"\" (REG type ");
+                                print_u64(ty as u64);
+                                print_str(b", from the real SOFTWARE hive)\n");
+                            }
+                        } else if name_lc == "defaultpassword" {
+                            WINLOGON_DEFAULT_PASSWORD_READS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 // A `PolAcDm[NS]` account-domain attribute served back through
                 // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and msv1_0's
                 // `GetAccountDomainSid` on the real logon path (counted separately while an
@@ -10203,13 +10166,6 @@ impl ExecNtHandler {
                 // evidence of which step gave up, so name the KEY and the VALUE.
                 if self.current_process_is_winlogon() && val.is_none() && post_profile_phase() {
                     self.trace_post_profile_registry(b"query-value", key, &name_lc);
-                }
-                // Every value the synthesized Winlogon key ever ANSWERS. The gate asserts this
-                // equals `Userinit` + `DefaultPassword` and nothing else — i.e. `AutoAdminLogon`
-                // (which the real hive holds as "1", and which would change the logon flow that
-                // produced the desktop paint) never leaks through this key.
-                if key == SYNTH_WINLOGON_KEY && val.is_some() {
-                    WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
                 }
                 if val.is_some() && shell_com_inproc_bit != 0 {
                     if name_lc.is_empty() {

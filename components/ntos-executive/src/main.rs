@@ -3153,17 +3153,17 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
 /// The generic image lane accepts its open, creates SEC_IMAGE, answers SectionImageInformation, and
 /// publishes a real pi=5 process. The separate gate below proves every stage plus the live VSpace.
 ///
-/// The `AutoAdminLogon` clause is the trap this spec exists to hold shut: the real SOFTWARE hive's
-/// Winlogon key carries `AutoAdminLogon = "1"` next to `Userinit`, and serving it would change the
-/// logon flow that produces the desktop paint. The key answers EXACTLY two values — `Userinit`
-/// (from the real hive, by exact name) and the empty `DefaultPassword` — and this counts them.
+/// The Winlogon key is now read from the real SOFTWARE hive. This proof keeps the essential shell
+/// frontier facts: msgina read the real `Userinit` value, winlogon attempted `userinit.exe`, and the
+/// logon token carried a real logon SID. Other Winlogon-key values are counted as real hive traffic,
+/// not suppressed by executive policy.
 fn user_shell_activation_spec(passed: &mut u64) {
     let reads = WINLOGON_USERINIT_READS.load(Ordering::Relaxed);
     let ty = WINLOGON_USERINIT_TYPE.load(Ordering::Relaxed);
     let bytes = WINLOGON_USERINIT_BYTES.load(Ordering::Relaxed);
     let opens = WINLOGON_USERINIT_IMAGE_OPENS.load(Ordering::Relaxed);
     let served = WINLOGON_KEY_VALUES_SERVED.load(Ordering::Relaxed);
-    let defpwd = WINLOGON_DEFPWD_EMPTY.load(Ordering::Relaxed);
+    let defpwd = WINLOGON_DEFAULT_PASSWORD_READS.load(Ordering::Relaxed);
     let logon_sids = SE_CREATE_TOKEN_LOGON_SIDS.load(Ordering::Relaxed);
     print_str(b"[wl-shell] WlxActivateUserShell: Userinit reads=");
     print_u64(reads);
@@ -3175,7 +3175,9 @@ fn user_shell_activation_spec(passed: &mut u64) {
     print_u64(opens);
     print_str(b" | Winlogon-key values served=");
     print_u64(served);
-    print_str(b" (Userinit+DefaultPassword only; AutoAdminLogon NOT among them) | logon-SID groups in the token=");
+    print_str(b" (real SOFTWARE hive; DefaultPassword reads=");
+    print_u64(defpwd);
+    print_str(b") | logon-SID groups in the token=");
     print_u64(logon_sids);
     print_str(b" | user locale bytes=");
     print_u64(DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed));
@@ -3185,26 +3187,24 @@ fn user_shell_activation_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_winlogon_user_shell_activated",
-        !SERVE_WINLOGON_USERINIT
-            || (
-                // `WlxActivateUserShell` really read `Userinit`, and got the REAL hive value:
-                // `%SystemRoot%\system32\userinit.exe` is 35 chars ⇒ 70 bytes with its NUL, and
-                // the hive stores it as REG_EXPAND_SZ (2) — the type msgina insists on.
-                reads >= 1
-                && ty == 2
-                && bytes == 70
-                // …winlogon's OWN CreateProcessAsUserW then reached the shell binary…
-                && opens >= 1
-                // …the Winlogon key leaked NOTHING else (AutoAdminLogon above all)…
-                && served == reads + defpwd
-                // …`AllowAccessOnSession` could only have been passed with a real logon SID in
-                // TOKEN_GROUPS (it dereferences an uninitialised local otherwise)…
-                && logon_sids >= 1
-                // …and setup's locale step really seeded the value `SetDefaultLanguage` needs.
-                && (!PROVISION_DEFAULT_USER_LOCALE
-                    || (DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
-                        && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0))
-            ),
+        // `WlxActivateUserShell` really read `Userinit`, and got the REAL hive value:
+        // `%SystemRoot%\system32\userinit.exe` is 35 chars => 70 bytes with its NUL, and
+        // the hive stores it as REG_EXPAND_SZ (2) — the type msgina insists on.
+        reads >= 1
+            && ty == 2
+            && bytes == 70
+            // winlogon's OWN CreateProcessAsUserW then reached the shell binary.
+            && opens >= 1
+            // The key was not an executive-owned two-value surface; all served values are real hive
+            // values and at least include Userinit.
+            && served >= reads
+            // `AllowAccessOnSession` could only have been passed with a real logon SID in
+            // TOKEN_GROUPS (it dereferences an uninitialised local otherwise).
+            && logon_sids >= 1
+            // Setup's locale step really seeded the value `SetDefaultLanguage` needs.
+            && (!PROVISION_DEFAULT_USER_LOCALE
+                || (DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
+                    && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0)),
         passed,
     );
     userinit_image_pipeline_spec(passed);
@@ -9707,17 +9707,6 @@ const NTDLL_STUB: &[u8] = &[
 /// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
 /// cell offset, so it never collides with a hive key.
 const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
-/// Sentinel `KeyRef` for the synthesized `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`
-/// key. Our staged registry backs only the SYSTEM hive (`\Registry\Machine\System\…`, ::ROSSYS.HIV);
-/// the SOFTWARE hive is not on the image. msgina's `GetRegistrySettings` (WlxInitialize) opens this
-/// Winlogon key and, on failure, returns FALSE → WlxInitialize frees its GINA_CONTEXT and never
-/// writes `*pWlxContext` (stays NULL) → GinaInit FALSE → winlogon's WinMain calls
-/// `HandleShutdown → WlxShutdown(NULL)` → NULL-deref at msgina RVA 0x95f8. GetRegistrySettings only
-/// needs the key to OPEN (every value it reads via ReadRegDwordValue/RegQueryValueExW tolerates a
-/// missing value and applies a documented default), so we back the key's EXISTENCE with this sentinel
-/// and let NtQueryValueKey miss (→ defaults). Far above any real regf cell offset (like SYNTH_CPU_KEY),
-/// so it never collides with a hive key.
-const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
 /// Typed key target for the predefined machine root. This is stored inside process-local
 /// `HandleObject::RegistryKey` entries; it is not a handle value.
 const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
@@ -9732,9 +9721,8 @@ const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
 /// far above any real cell offset and below the synthetic key targets.
 const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
 const OVERLAY_KEY_MAX: u32 = 0x1000;
-/// True if a `KeyRef` is a synthetic/overlay handle (SYNTH_CPU_KEY, SYNTH_WINLOGON_KEY, or an overlay
-/// key) rather than a genuine ::ROSSYS.HIV cell offset. Real hive KeyRefs are small hbin-relative cell
-/// offsets (well under the ~204 KiB hive), so any KeyRef at/above OVERLAY_KEY_TAG (0x8000_0000) is synth.
+/// True if a `KeyRef` is a synthetic/overlay/predefined-root handle rather than a genuine mounted
+/// hive cell offset. Real hive KeyRefs keep their selector below `OVERLAY_KEY_TAG`.
 fn is_synth_key(kr: KeyRef) -> bool {
     kr >= OVERLAY_KEY_TAG
 }
@@ -10307,13 +10295,8 @@ pub(crate) static NT_LOAD_KEY_ROOT_SUBKEYS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_VALUE_READBACK: AtomicU64 = AtomicU64::new(0);
 /// Opens that resolved into the `\Registry\User` namespace: the predefined root, `.Default`, and
 /// keys inside a dynamically loaded per-user hive.
-/// ★ BYPASS SWITCH: serve `Userinit` on the synthesized Winlogon key from the real SOFTWARE hive.
-/// `false` restores the pre-batch state — every value on that key misses, so
-/// `msgina!WlxActivateUserShell` (`msgina.c:498`) returns FALSE, `StartUserShell` fails and
-/// `HandleLogon` unwinds into `UnloadUserProfile` with no user shell.
-pub(crate) const SERVE_WINLOGON_USERINIT: bool = true;
-/// How many times `Userinit` was served, and what it was (type + byte length), so the gate can
-/// assert the REAL hive value rather than a fabricated string.
+/// How many times `Userinit` was read from the real Winlogon key, and what it was (type + byte
+/// length), so the gate can assert the REAL hive value rather than a fabricated string.
 pub(crate) static WINLOGON_USERINIT_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_USERINIT_TYPE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_USERINIT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -10345,7 +10328,7 @@ pub(crate) static EXPLORER_SHELL_COM_THREADING_MODEL_MASK: AtomicU64 = AtomicU64
 pub(crate) static USERINIT_SHELL_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_EXPLORER_IMAGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_WALLPAPER_SPI_CAPTURES: AtomicU64 = AtomicU64::new(0);
-/// Every value the synthesized Winlogon key ANSWERED — the leak check for `AutoAdminLogon`.
+/// Every value answered from the real Winlogon key.
 pub(crate) static WINLOGON_KEY_VALUES_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Groups in the token `NtCreateToken` minted that carry `SE_GROUP_LOGON_ID` — the logon SID
 /// `winlogon!AllowAccessOnSession` scans `TOKEN_GROUPS` for.
@@ -10453,8 +10436,7 @@ pub(crate) fn is_nls_language_key(path: &str) -> bool {
 }
 /// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
 /// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
-/// so no other Software subkey is spuriously satisfied — see SYNTH_WINLOGON_KEY / the paint-safety
-/// note on the keyboard-layout fix (broadly succeeding HKLM opens regressed the desktop paint).
+/// so no other Software subkey is spuriously satisfied.
 pub(crate) fn is_winlogon_key_comps(comps: &[&str]) -> bool {
     comps.len() == 5
         && comps[0].eq_ignore_ascii_case("Software")
@@ -10527,9 +10509,8 @@ pub(crate) fn is_lsa_hive_path(path: &str) -> bool {
 /// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced (drives the `exec_kbd_layout_opened`
 /// spec — proves winlogon's InitKeyboardLayouts fallback reached its layout key).
 static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
-/// Count of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` opens satisfied via
-/// SYNTH_WINLOGON_KEY (BATCH 40 — msgina's GetRegistrySettings). Proves winlogon crossed the msgina
-/// GINA-init wall (WlxInitialize wrote a non-NULL context instead of GinaInit-fail → WlxShutdown(NULL)).
+/// Count of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` opens satisfied through the
+/// real SOFTWARE hive. Proves winlogon crossed the msgina GINA-init wall.
 pub(crate) static WINLOGON_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Count of `\Registry\Machine\{SECURITY,SAM}[\...]` opens RESOLVED against the REAL mounted regf
 /// hive (not the overlay). Proves lsass/samsrv reached genuine hive-backed keys.
@@ -10620,21 +10601,8 @@ pub(crate) static REG_FLUSH_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones whose key lives in the in-memory write overlay — `HvSyncHive`'s
 /// `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`) verbatim.
 pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
-/// BATCH 41 — count of winlogon `DefaultPassword` value reads satisfied with an empty REG_SZ (proves
-/// the LSA-RPC-avoidance crossing). During GinaInit, msgina's `GetRegistrySettings` (msgina.c:216)
-/// reads `HKLM\...\Winlogon\DefaultPassword`; ONLY when that read FAILS does it call
-/// `GetLsaDefaultPassword` (msgina.c:223), whose `LsaOpenPolicy` binds `ncacn_np:\pipe\lsarpc`
-/// (advapi32/sec/lsa.c:53) and blocks reading the bind_ack. lsass hosts NO per-connection LSA RPC
-/// worker (its listeners only re-arm+exit — unlike services' SCM \ntsvcs worker), so the bind read
-/// stalled forever inside GinaInit; when we completed it as broken-pipe, rpcrt4 raised an RPC
-/// exception (RPC_S_CALL_FAILED 0x6be) that our ntdll's stubbed RtlRaiseException cannot dispatch to
-/// rpcrt4's `RpcTryExcept` → winlogon parked on the int3. So AVOID the RPC entirely at its source:
-/// satisfy the `DefaultPassword` value read with an EMPTY REG_SZ (a legitimate value — a system with
-/// no stored auto-logon password) so `GetRegistrySettings`'s `if (rc) GetLsaDefaultPassword(...)`
-/// (msgina.c:223) is NOT taken. `GetRegistrySettings` returns TRUE, GinaInit completes without the
-/// lsarpc RPC, and winlogon advances into its post-GinaInit logon flow (InitializeSAS → the SAS
-/// window → the desktop-switch paint). Scoped to winlogon's SYNTH_WINLOGON_KEY / DefaultPassword ONLY.
-pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
+/// Count of winlogon `DefaultPassword` value reads answered by the real Winlogon key.
+pub(crate) static WINLOGON_DEFAULT_PASSWORD_READS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).

@@ -760,3 +760,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   --target x86_64-unknown-none` passed. Review adjustment: D1 still needs real service-control/load
   ordering for GDI driver requests rather than bring-up pre-registration, plus driver-object/device
   ownership beyond the current win32k image-registration table.
+- D3 continued. Removed the synthetic `SYNTH_WINLOGON_KEY` compatibility key and the selective
+  `DefaultPassword`/`Userinit` value branches. `resolve_key` now lets
+  `\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Winlogon` resolve through the real
+  SOFTWARE hive, winlogon's PE-backed exact-name recovery mints a handle to that real key, and
+  `NtQueryValueKey` observes `Userinit`/`DefaultPassword` reads after normal hive lookup instead of
+  fabricating or suppressing values. The shell-frontier gate now counts real Winlogon-key value
+  traffic rather than enforcing the old two-value surface. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs`, `git diff --check`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: this may expose the next real LSA/RPC/autologon
+  behavior in full boot; that should be implemented in the LPC/LSA workstream rather than hidden by
+  Winlogon-key filtering.
