@@ -38,7 +38,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### B. Win32k Process And Thread Context
 
-- `[ ]` B1: Replace placeholder `EPROCESS`, `ETHREAD`, `W32PROCESS`, and `W32THREAD` addresses
+- `[~]` B1: Replace placeholder `EPROCESS`, `ETHREAD`, `W32PROCESS`, and `W32THREAD` addresses
   with object-manager/process-manager backed pointers.
 - `[ ]` B2: Replace `WIN32K_CLIENT_*[pi]` tables with PID/TID keyed runtime state populated by
   `PsConvertToGuiThread`, process/thread callouts, and win32k allocations.
@@ -558,3 +558,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   per-process win32k `PROCESSINFO`/`W32PROCESS` ownership so shell and service clients can use
   ordinary provider-owned paths, followed by the remaining service WSS_NOIO branches and the F2/F3
   real paint path.
+- B1 cleanup. Removed the executive `PROCESSINFO`/`W32PROCESS` fallback allocator from win32k
+  attach. Bootstrap and per-client GUI attaches now require win32k's process-create callout to
+  publish a non-null `W32PROCESS`/`PROCESSINFO`; missing publication is a visible attach failure
+  instead of a synthetic process-info page. Validation:
+  `.tmp/full-boot-w32process-callout-required-20260803-102311.log` reached `RUN_RC=0`, `276/276`
+  checks passed, `PASS exec_win32k_desktop_painted`, `PASS
+  exec_msgina_logon_dialog_painted`, `PASS exec_explorer_process_spawned`, and real non-zero
+  process-callout publication for bootstrap plus `pi=2..6`. Review adjustment: B1 now moves to the
+  thread half: call win32k's thread-create callout with real thread/process fields and kernel event
+  services, then retire the `W32THREAD` placeholder path.

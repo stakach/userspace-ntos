@@ -70,7 +70,7 @@ pub const WIN32K_STACK_VADDR: u64 = 0x0000_0100_0D00_0000;
 pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// Data-export region: placeholder structs (page 0) + import cells (page 1) + KPCR (page 2) +
 /// HEAP handle (page 3) + per-process slots/callout table (page 4) + EPROCESS (page 5) +
-/// W32PROCESS (page 6) + W32THREAD (page 7) + ETHREAD (page 8). 9 frames.
+/// retired W32PROCESS placeholder page (page 6) + W32THREAD (page 7) + ETHREAD (page 8). 9 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
 pub const WIN32K_DATA_FRAMES: u64 = 9;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
@@ -95,8 +95,6 @@ const WIN32_CALLOUTS: u64 = WIN32K_DATA_VADDR + 0x4100; // recorded WIN32_CALLOU
 /// A fuller EPROCESS placeholder (page 5) — win32k's process-attach callout asserts fields like
 /// `EPROCESS+0x2b8 != 0`; ObReferenceObjectByHandle(process handle) returns this.
 const PH_EPROCESS_VA: u64 = WIN32K_DATA_VADDR + 0x5000;
-/// The per-process W32PROCESS/PROCESSINFO placeholder (page 6) win32k's callout initializes.
-const PH_W32PROCESS_VA: u64 = WIN32K_DATA_VADDR + 0x6000;
 /// The per-thread W32THREAD placeholder (page 7).
 const PH_W32THREAD_VA: u64 = WIN32K_DATA_VADDR + 0x7000;
 /// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
@@ -105,7 +103,6 @@ const WIN32K_BOOTSTRAP_PI: usize = 1;
 const WIN32K_EPROCESS_BYTES: u64 = 0x1000;
 const WIN32K_ETHREAD_BYTES: u64 = 0x400;
 const WIN32K_THREADINFO_BYTES: u64 = 0x400;
-const WIN32K_PROCESSINFO_FALLBACK_BYTES: u64 = 0x400;
 /// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers
 /// bump-allocate from (counter at +0, data at +0x1000). win32k creates its session heap + maps
 /// several ~1 MiB session views; give it 16 MiB. Its own 8 PT window (0x0740_0000..0x0840_0000).
@@ -2212,17 +2209,10 @@ unsafe fn ensure_win32k_process_attached(pi: u64) -> bool {
         }
     }
     if WIN32K_CLIENT_W32PROCESS[pi].load(Ordering::Relaxed) == 0 {
-        let ppi = if pi == WIN32K_BOOTSTRAP_PI {
-            PH_W32PROCESS_VA
-        } else {
-            let allocated = pool_alloc(WIN32K_PROCESSINFO_FALLBACK_BYTES);
-            if allocated == 0 {
-                return false;
-            }
-            zero_region(allocated, WIN32K_PROCESSINFO_FALLBACK_BYTES);
-            allocated
-        };
-        WIN32K_CLIENT_W32PROCESS[pi].store(ppi, Ordering::Relaxed);
+        print_str(b"[win32k-context] ERROR: process callout did not publish W32PROCESS for pi=");
+        print_u64(pi as u64);
+        print_str(b"\n");
+        return false;
     }
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
@@ -5420,12 +5410,9 @@ unsafe fn establish_client_and_dispatch() {
         print_hex(w32 as u32);
         print_str(b"\n");
     }
-    // If the callout did not populate the win32-slot, fall back to the placeholder so the connect
-    // path still has a non-null W32PROCESS to walk (surfaces the next requirement rather than a null
-    // deref).
     if read_volatile(SLOT_W32PROCESS as *const u64) == 0 {
-        write_volatile(SLOT_W32PROCESS as *mut u64, PH_W32PROCESS_VA);
-        WIN32K_CLIENT_W32PROCESS[WIN32K_BOOTSTRAP_PI].store(PH_W32PROCESS_VA, Ordering::Relaxed);
+        print_str(b"[win32k-host] ERROR: bootstrap process callout did not publish W32PROCESS\n");
+        return;
     }
     if read_volatile(SLOT_W32THREAD as *const u64) == 0 {
         write_volatile(SLOT_W32THREAD as *mut u64, PH_W32THREAD_VA);
