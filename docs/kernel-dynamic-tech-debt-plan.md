@@ -1245,3 +1245,26 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `exec_explorer_wndproc_installed_by_client`, and `exec_explorer_shell_com_classes_served`. The
   older post-quiesce proof gates `exec_user_callback_dead_client_unwind`,
   `exec_win32k_transport_call_nested`, and `exec_lsa_worker_route` also remain open.
+- C3 repair. `NtGdiCreateDIBitmapInternal(0x10a0)` now stages its caller-owned
+  `BITMAPINFO` and optional init-bits buffer in the provider bulk argument window before isolated
+  win32k dispatch, and forwards the ReactOS x64 stack-tail scalars in canonical 32-bit form. This
+  avoids treating undefined high 32 bits in `DWORD`/`UINT`/`FLONG` stack slots as part of
+  `cjMaxInitInfo`, `cjMaxBits`, `iUsage`, or `fl`, while still failing visibly with NULL on missing
+  stacks, unreadable client graphs, invalid layouts, or bounded-copy failures. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-createdibitmap-low32.log` passed through the microtest sentinel with
+  `271/275 executive->isolated-service checks passed`, `PASS exec_win32k_desktop_painted`,
+  `PASS exec_msgina_logon_dialog_painted`, `PASS exec_msgina_credential_keystrokes_delivered`,
+  `PASS exec_lsa_logon_user_reached`, `PASS exec_winlogon_user_shell_activated`,
+  `PASS exec_userinit_process_spawned`, `PASS exec_explorer_process_spawned`, `PASS
+  exec_explorer_user_callbacks_redirected`, `PASS exec_explorer_wndproc_installed_by_client`, and
+  `PASS exec_explorer_shell_com_classes_served`. F3/F4 remain closed by the natural modal,
+  credential, and desktop framebuffer proofs. Review adjustment: the older explorer
+  create-window/message/callback/WndProc/COM gates are now green. C3 remains open for the remaining
+  win32k/client marshalling audit; the current log still shows one
+  `NtGdiStretchDIBitsInternal(0x1082)` input-probe rejection with a high-32-bit-tainted
+  stack scalar. The persistent red gates are `exec_user_callback_real_api0_nested_roundtrip`,
+  `exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`, and
+  `exec_lsa_worker_route`.

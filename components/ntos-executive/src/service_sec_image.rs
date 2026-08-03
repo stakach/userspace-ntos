@@ -16,6 +16,7 @@ static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +64,14 @@ const STRETCH_DIBITS_FAIL_BITS_OVERFLOW: u64 = 4;
 const STRETCH_DIBITS_FAIL_BMI_OVERFLOW: u64 = 5;
 const STRETCH_DIBITS_FAIL_BITS_COPY: u64 = 6;
 const STRETCH_DIBITS_FAIL_BMI_COPY: u64 = 7;
+const CREATE_DIBITMAP_FAIL_MISSING_SP: u64 = 1;
+const CREATE_DIBITMAP_FAIL_STACK_TAIL: u64 = 2;
+const CREATE_DIBITMAP_FAIL_LAYOUT: u64 = 3;
+const CREATE_DIBITMAP_FAIL_BITS_OVERFLOW: u64 = 4;
+const CREATE_DIBITMAP_FAIL_BMI_OVERFLOW: u64 = 5;
+const CREATE_DIBITMAP_FAIL_BITS_COPY: u64 = 6;
+const CREATE_DIBITMAP_FAIL_BMI_COPY: u64 = 7;
+const CBM_INIT: u64 = 0x04;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     value.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -7111,6 +7120,13 @@ pub(crate) unsafe fn service_sec_image(
                 let mut create_bitmap_stack_args = [0u64; 1];
                 let mut create_bitmap_stack_arg_count = 0usize;
                 let mut create_bitmap_probe_failed = false;
+                let mut create_dibitmap_stack_args = [0u64; 7];
+                let mut create_dibitmap_stack_arg_count = 0usize;
+                let mut create_dibitmap_probe_failed = false;
+                let mut create_dibitmap_probe_failure = 0u64;
+                let mut create_dibitmap_probe_aux0 = 0u64;
+                let mut create_dibitmap_probe_aux1 = 0u64;
+                let mut create_dibitmap_probe_aux2 = 0u64;
                 let mut stretch_dibits_stack_args = [0u64; 12];
                 let mut stretch_dibits_stack_arg_count = 0usize;
                 let mut stretch_dibits_probe_failed = false;
@@ -7424,6 +7440,211 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         create_bitmap_probe_failed = true;
+                    }
+                } else if m0 == 0x10a0 && uses_client_gdi {
+                    // NtGdiCreateDIBitmapInternal receives a DIB bits pointer and BITMAPINFO in the
+                    // stack tail. ReactOS probes and copies them before GreCreateDIBitmapInternal;
+                    // isolated win32k must receive provider-owned pointers rather than explorer's
+                    // client heap addresses.
+                    if sp == 0 {
+                        create_dibitmap_probe_failed = true;
+                        create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_MISSING_SP;
+                    } else {
+                        let mut tail_ok = true;
+                        let mut i = 0usize;
+                        while i < create_dibitmap_stack_args.len() {
+                            match client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28 + i as u64 * 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                Some(value) => create_dibitmap_stack_args[i] = value,
+                                None => {
+                                    tail_ok = false;
+                                    create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_STACK_TAIL;
+                                    create_dibitmap_probe_aux0 = i as u64;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        if !tail_ok {
+                            create_dibitmap_probe_failed = true;
+                        } else {
+                            let pj_init = create_dibitmap_stack_args[0];
+                            let pbmi = create_dibitmap_stack_args[1];
+                            let i_usage = create_dibitmap_stack_args[2] as u32 as u64;
+                            let cj_max_info = create_dibitmap_stack_args[3] as u32 as u64;
+                            let cj_max_bits = create_dibitmap_stack_args[4] as u32 as u64;
+                            let fl = create_dibitmap_stack_args[5] as u32 as u64;
+                            let wants_init_bits =
+                                pj_init != 0 && ((a3 as u32) & (CBM_INIT as u32)) != 0;
+                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
+                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let mut offset = 0u64;
+                            let mut layout_ok = (pbmi == 0
+                                || (cj_max_info >= 12 && cj_max_info <= cap))
+                                && (!wants_init_bits || (cj_max_bits != 0 && cj_max_bits <= cap));
+                            if !layout_ok {
+                                create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_LAYOUT;
+                                create_dibitmap_probe_aux0 = pbmi;
+                                create_dibitmap_probe_aux1 = cj_max_info;
+                                create_dibitmap_probe_aux2 = cj_max_bits;
+                            }
+                            let staged_bits = if layout_ok && wants_init_bits {
+                                let out = base + offset;
+                                match offset
+                                    .checked_add(cj_max_bits)
+                                    .and_then(|next| align_up_u64(next, 8))
+                                {
+                                    Some(next) if next <= cap => offset = next,
+                                    _ => {
+                                        layout_ok = false;
+                                        create_dibitmap_probe_failure =
+                                            CREATE_DIBITMAP_FAIL_BITS_OVERFLOW;
+                                        create_dibitmap_probe_aux0 = offset;
+                                        create_dibitmap_probe_aux1 = cj_max_bits;
+                                        create_dibitmap_probe_aux2 = cap;
+                                    }
+                                }
+                                out
+                            } else {
+                                0
+                            };
+                            let staged_pbmi = if layout_ok && pbmi != 0 {
+                                let out = base + offset;
+                                match offset
+                                    .checked_add(cj_max_info)
+                                    .and_then(|next| align_up_u64(next, 8))
+                                {
+                                    Some(next) if next <= cap => offset = next,
+                                    _ => {
+                                        layout_ok = false;
+                                        create_dibitmap_probe_failure =
+                                            CREATE_DIBITMAP_FAIL_BMI_OVERFLOW;
+                                        create_dibitmap_probe_aux0 = offset;
+                                        create_dibitmap_probe_aux1 = cj_max_info;
+                                        create_dibitmap_probe_aux2 = cap;
+                                    }
+                                }
+                                out
+                            } else {
+                                0
+                            };
+                            if !layout_ok {
+                                create_dibitmap_probe_failed = true;
+                            } else {
+                                core::ptr::write_bytes(
+                                    base as *mut u8,
+                                    0,
+                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
+                                );
+                                let copied_bits = if !wants_init_bits {
+                                    true
+                                } else {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        pj_init,
+                                        cj_max_bits as usize,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let bits_out = core::slice::from_raw_parts_mut(
+                                        staged_bits as *mut u8,
+                                        cj_max_bits as usize,
+                                    );
+                                    img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        pj_init,
+                                        bits_out,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    )
+                                };
+                                if !copied_bits {
+                                    create_dibitmap_probe_failed = true;
+                                    create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_BITS_COPY;
+                                    create_dibitmap_probe_aux0 = pj_init;
+                                    create_dibitmap_probe_aux1 = cj_max_bits;
+                                } else {
+                                    let copied_bmi = if pbmi == 0 {
+                                        true
+                                    } else {
+                                        prefill_client_copyin_dll_range_pages(
+                                            pi as u64,
+                                            pbmi,
+                                            cj_max_info as usize,
+                                            scratch_base,
+                                            &reg,
+                                            &dll_pes,
+                                        );
+                                        let bmi_out = core::slice::from_raw_parts_mut(
+                                            staged_pbmi as *mut u8,
+                                            cj_max_info as usize,
+                                        );
+                                        img_spawn::client_copyin_mapped(
+                                            pi as u64,
+                                            pbmi,
+                                            bmi_out,
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        )
+                                    };
+                                    if copied_bmi {
+                                        create_dibitmap_stack_args[0] = staged_bits;
+                                        create_dibitmap_stack_args[1] = staged_pbmi;
+                                        create_dibitmap_stack_args[2] = i_usage;
+                                        create_dibitmap_stack_args[3] = cj_max_info;
+                                        create_dibitmap_stack_args[4] = cj_max_bits;
+                                        create_dibitmap_stack_args[5] = fl;
+                                        create_dibitmap_stack_arg_count =
+                                            create_dibitmap_stack_args.len();
+                                        let n = CREATE_DIBITMAP_MARSHAL_TRACE
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if n < 24 {
+                                            print_str(
+                                                b"[w32marshal] NtGdiCreateDIBitmapInternal pi=",
+                                            );
+                                            print_u64(pi as u64);
+                                            print_str(b" hdc=0x");
+                                            print_hex_u64(a0);
+                                            print_str(b" ");
+                                            print_u64(a1 as u32 as u64);
+                                            print_str(b"x");
+                                            print_u64(a2 as u32 as u64);
+                                            print_str(b" init=0x");
+                                            print_hex(a3 as u32);
+                                            print_str(b" bits=0x");
+                                            print_hex_u64(pj_init);
+                                            print_str(b" bmi=0x");
+                                            print_hex_u64(pbmi);
+                                            print_str(b" info=");
+                                            print_u64(cj_max_info);
+                                            print_str(b" bits-bytes=");
+                                            print_u64(cj_max_bits);
+                                            print_str(b" staged=0x");
+                                            print_hex_u64(staged_bits);
+                                            print_str(b"/0x");
+                                            print_hex_u64(staged_pbmi);
+                                            print_str(b" bytes=");
+                                            print_u64(offset);
+                                            print_str(b"\n");
+                                        }
+                                    } else {
+                                        create_dibitmap_probe_failed = true;
+                                        create_dibitmap_probe_failure =
+                                            CREATE_DIBITMAP_FAIL_BMI_COPY;
+                                        create_dibitmap_probe_aux0 = pbmi;
+                                        create_dibitmap_probe_aux1 = cj_max_info;
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if m0 == 0x1082 && uses_client_gdi {
                     // NtGdiStretchDIBitsInternal receives the converted BITMAPINFO and optional DIB
@@ -8675,6 +8896,36 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if create_dibitmap_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(
+                            b"[win32k-svc] NtGdiCreateDIBitmapInternal input probe failed pi=",
+                        );
+                        print_u64(pi as u64);
+                        print_str(b" hdc=0x");
+                        print_hex_u64(a0);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" reason=");
+                        print_u64(create_dibitmap_probe_failure);
+                        print_str(b" bits=0x");
+                        print_hex_u64(create_dibitmap_stack_args[0]);
+                        print_str(b" bmi=0x");
+                        print_hex_u64(create_dibitmap_stack_args[1]);
+                        print_str(b" info=");
+                        print_u64(create_dibitmap_stack_args[3]);
+                        print_str(b" bits-bytes=");
+                        print_u64(create_dibitmap_stack_args[4]);
+                        print_str(b" aux=");
+                        print_u64(create_dibitmap_probe_aux0);
+                        print_str(b"/");
+                        print_u64(create_dibitmap_probe_aux1);
+                        print_str(b"/");
+                        print_u64(create_dibitmap_probe_aux2);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if stretch_dibits_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -8825,6 +9076,8 @@ pub(crate) unsafe fn service_sec_image(
                         && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
                     let create_bitmap_staged_stack = m0 == 0x106c
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
+                    let create_dibitmap_staged_stack = m0 == 0x10a0
+                        && create_dibitmap_stack_arg_count == create_dibitmap_stack_args.len();
                     let stretch_dibits_staged_stack = m0 == 0x1082
                         && stretch_dibits_stack_arg_count == stretch_dibits_stack_args.len();
                     let text_extent_staged_stack =
@@ -8850,6 +9103,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &build_hwnd_list_stack_args)
                     } else if create_bitmap_staged_stack {
                         (sp, &create_bitmap_stack_args)
+                    } else if create_dibitmap_staged_stack {
+                        (sp, &create_dibitmap_stack_args)
                     } else if stretch_dibits_staged_stack {
                         (sp, &stretch_dibits_stack_args)
                     } else if text_extent_staged_stack {
