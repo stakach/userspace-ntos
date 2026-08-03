@@ -602,14 +602,6 @@ fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<us
     None
 }
 
-fn live_hosted_pid_for_leaf(
-    nt_handler: &ExecNtHandler,
-    leaf: &[u8],
-) -> Option<nt_process::ProcessId> {
-    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
-    nt_handler.pm_pid_for_pi(pi)
-}
-
 fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     nt_handler
         .hosted_thread_pi_for_badge(badge)
@@ -14352,20 +14344,21 @@ const LSA_API_MSG_MAX: usize = 0x200;
 /// switches on (`references/reactos/sdk/include/ndk/lpctypes.h`); `nt_lpc_abi::msg_type` mirrors them.
 const LSA_MSG_TYPE_CONNECTION_REQUEST: u16 = nt_lpc_abi::msg_type::LPC_CONNECTION_REQUEST;
 const LSA_MSG_TYPE_REQUEST: u16 = nt_lpc_abi::msg_type::LPC_REQUEST;
+const LSA_CONTEXT_UNSET: u64 = u64::MAX;
 
 /// lsass' REAL `AuthPortThreadRoutine` blocked in `NtReplyWaitReceivePort(AuthPortHandle, …)`.
 /// `reply_cap != 0` ⇒ parked; the thread is genuinely blocked in-kernel on the Call that delivered
 /// that syscall, exactly like every other executive wait-park.
 static LSA_SRV_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
-static LSA_SRV_BADGE: AtomicU64 = AtomicU64::new(0);
+static LSA_SRV_BADGE: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
 /// The multiplex badge of the LSA server thread, latched at its FIRST park and never cleared — used
 /// to recognise its syscalls while it is RUNNING (diagnostics + the wall-release below).
-static LSA_SRV_LIVE_BADGE: AtomicU64 = AtomicU64::new(u64::MAX);
+static LSA_SRV_LIVE_BADGE: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
 /// Bounded SSN trace for the real LSA server thread.
 static LSA_SRV_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
-/// The SSN the real LSA server walled on while a client was blocked (u64::MAX = never).
-pub(crate) static LSA_SERVER_WALL_SSN: AtomicU64 = AtomicU64::new(u64::MAX);
-static LSA_SRV_PI: AtomicU64 = AtomicU64::new(4);
+/// The SSN the real LSA server walled on while a client was blocked (`LSA_CONTEXT_UNSET` = never).
+pub(crate) static LSA_SERVER_WALL_SSN: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
+static LSA_SRV_PI: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
 /// `R9` — `&RequestMsg` (the server's stack-local `LSA_API_MSG` it receives into).
 static LSA_SRV_RECVMSG: AtomicU64 = AtomicU64::new(0);
 /// `RDX` — `PVOID *PortContext` (the server reads back the `LSAP_LOGON_CONTEXT` here).
@@ -14378,8 +14371,8 @@ static LSA_SRV_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// while the real server runs its half of the exchange.
 static LSA_CLI_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_KIND: AtomicU64 = AtomicU64::new(0);
-static LSA_CLI_BADGE: AtomicU64 = AtomicU64::new(0);
-static LSA_CLI_PI: AtomicU64 = AtomicU64::new(2);
+static LSA_CLI_BADGE: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
+static LSA_CLI_PI: AtomicU64 = AtomicU64::new(LSA_CONTEXT_UNSET);
 /// connect: `*PortHandle` (R10). request: the client's reply `PORT_MESSAGE` buffer (R8).
 static LSA_CLI_OUT: AtomicU64 = AtomicU64::new(0);
 /// connect only: the client's `ConnectionInformation` buffer + its length (copied back after accept).
@@ -14468,6 +14461,26 @@ fn lsa_server_parked() -> bool {
     LSA_SRV_REPLY_CAP.load(Ordering::Relaxed) != 0
 }
 
+fn lsa_recorded_pi(cell: &AtomicU64) -> Option<usize> {
+    let pi = cell.load(Ordering::Relaxed);
+    if pi == LSA_CONTEXT_UNSET || pi as usize >= MAX_PI {
+        None
+    } else {
+        Some(pi as usize)
+    }
+}
+
+fn lsa_clear_client_context() {
+    LSA_CLI_BADGE.store(LSA_CONTEXT_UNSET, Ordering::Relaxed);
+    LSA_CLI_PI.store(LSA_CONTEXT_UNSET, Ordering::Relaxed);
+    LSA_CLI_OUT.store(0, Ordering::Relaxed);
+    LSA_CLI_CONNINFO.store(0, Ordering::Relaxed);
+    LSA_CLI_CONNINFO_LEN.store(0, Ordering::Relaxed);
+    LSA_CLI_IP.store(0, Ordering::Relaxed);
+    LSA_CLI_SP.store(0, Ordering::Relaxed);
+    LSA_CLI_FLAGS.store(0, Ordering::Relaxed);
+}
+
 /// PARK the real LSA server thread on its `NtReplyWaitReceivePort` — the reply capability is RETAINED
 /// (not dropped like the generic listener park), so a later client connect/request can genuinely
 /// resume it. Returns false if the reply pool is exhausted (caller falls back to the generic park).
@@ -14518,6 +14531,7 @@ unsafe fn lsa_release_client_on_server_wall(ssn: u64) -> bool {
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    lsa_clear_client_context();
     true
 }
 
@@ -14538,7 +14552,9 @@ unsafe fn lsa_server_deliver(
         return false;
     }
     let badge = LSA_SRV_BADGE.load(Ordering::Relaxed);
-    let pi = LSA_SRV_PI.load(Ordering::Relaxed) as usize;
+    let Some(pi) = lsa_recorded_pi(&LSA_SRV_PI) else {
+        return false;
+    };
     let ctx_out = LSA_SRV_CTXOUT.load(Ordering::Relaxed);
     let mut header = [0u8; LSA_PORT_MESSAGE_HEADER as usize];
     let data_length = payload.len() as u16;
@@ -14612,7 +14628,9 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         return false;
     }
     let srv_badge = LSA_SRV_BADGE.load(Ordering::Relaxed);
-    let srv_pi = LSA_SRV_PI.load(Ordering::Relaxed) as usize;
+    let Some(srv_pi) = lsa_recorded_pi(&LSA_SRV_PI) else {
+        return false;
+    };
     let recvmsg = LSA_SRV_RECVMSG.load(Ordering::Relaxed);
     // Read the server's OWN ConnectInfo back out of its message buffer — these are the bytes
     // `LsapHandlePortConnection` wrote, not a fabrication.
@@ -14629,7 +14647,9 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
     let operational_mode = u32::from_le_bytes(connect_info[4..8].try_into().unwrap()) as u64;
     let client_handle = LSA_CLIENT_HANDLE.load(Ordering::Relaxed);
     let cli_badge = LSA_CLI_BADGE.load(Ordering::Relaxed);
-    let cli_pi = LSA_CLI_PI.load(Ordering::Relaxed) as usize;
+    let Some(cli_pi) = lsa_recorded_pi(&LSA_CLI_PI) else {
+        return false;
+    };
     let out = LSA_CLI_OUT.load(Ordering::Relaxed);
     let conninfo = LSA_CLI_CONNINFO.load(Ordering::Relaxed);
     let conninfo_len =
@@ -14674,6 +14694,7 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    lsa_clear_client_context();
     true
 }
 
@@ -14685,7 +14706,9 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         return false;
     }
     let srv_badge = LSA_SRV_BADGE.load(Ordering::Relaxed);
-    let srv_pi = LSA_SRV_PI.load(Ordering::Relaxed) as usize;
+    let Some(srv_pi) = lsa_recorded_pi(&LSA_SRV_PI) else {
+        return false;
+    };
     let mut buffer = [0u8; LSA_API_MSG_MAX];
     let mut length = 0usize;
     lsa_with_peer(nt_handler, srv_badge, srv_pi, |handler| {
@@ -14706,7 +14729,9 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         return false;
     }
     let cli_badge = LSA_CLI_BADGE.load(Ordering::Relaxed);
-    let cli_pi = LSA_CLI_PI.load(Ordering::Relaxed) as usize;
+    let Some(cli_pi) = lsa_recorded_pi(&LSA_CLI_PI) else {
+        return false;
+    };
     let out = LSA_CLI_OUT.load(Ordering::Relaxed);
     lsa_with_peer(nt_handler, cli_badge, cli_pi, |handler| {
         if out != 0 {
@@ -14755,6 +14780,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    lsa_clear_client_context();
     true
 }
 

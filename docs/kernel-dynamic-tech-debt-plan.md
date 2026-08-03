@@ -969,3 +969,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: F1/C3 remain open for service cursor/class/stock
   reuse and process-owned GDI allocation, but the init/DC leaves now depend on provider or
   provider-created object state instead of an unconditional service identity shortcut.
+- E3 cleanup. The LSA rendezvous runtime no longer initializes parked server/client process identity
+  to fixed LSASS/winlogon slots. Server and client `pi`/badge records now start explicitly unset,
+  every use of a parked `pi` goes through a checked load, and the client-side rendezvous context is
+  cleared after a connect, request/reply, or server-wall wake. The obsolete live-hosted-PID helper
+  left behind by the metadata migration was removed as dead code. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: E3 remains open because the LSA route still uses
+  executive-mediated rendezvous state instead of a complete LPC port-message server path, but it no
+  longer has fixed hosted-process identity defaults.
