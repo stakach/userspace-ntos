@@ -68,7 +68,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` E1: Remove modeled CSR reply paths and require real CSR server rendezvous for connect and
   request/reply traffic.
 - `[ ]` E2: Replace fixed LPC port-name creation order with object-manager named-port lookup.
-- `[ ]` E3: Replace modeled SRM/LSA accept replies with real port messages and server-side
+- `[x]` E3: Replace modeled SRM/LSA accept replies with real port messages and server-side
   processing.
 
 ### F. User32, GDI, And Paint Path Completion
@@ -1356,3 +1356,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   framebuffer readback after `NtUserSwitchDesktop`, and real IDD api0 callbacks for the logon UI.
   Review adjustment: E3 is the next LPC frontier because the same log still reports
   `NtConnectPort(\SeRmCommandPort) -> modeled SRM accept`; A2 and D1-D3 also remain open.
+- E3 complete. The SRM command port is now kernel-owned state registered in the LPC broker during
+  executive initialization, and LSASS' `NtConnectPort(\SeRmCommandPort)` drains the broker
+  connection request, accepts it on the executive SRM side, completes the client handle, and records
+  the established LPC connection. `\SeLsaInitEvent` is provisioned up front as an object-manager
+  event instead of being auto-created by the LSASS open path. Removed the generic LPC request/reply
+  modeled success path, the scoped LSASS unknown-port accept fallback, and the old modeled SRM
+  connect. Validation: `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-srm-rdv-20260804-082749.log` passed through the
+  microtest sentinel with `PASS exec_srm_command_port_registered`,
+  `[srm-rdv] kernel SRM accepted \SeRmCommandPort`, `PASS exec_lsass_lsa_init_running`, `PASS
+  exec_lsass_signals_lsa_rpc_active`, `PASS exec_msgina_logon_dialog_painted`, and `PASS
+  exec_win32k_desktop_painted`. Review adjustment: the remaining open plan work is A2, D1-D3, and
+  E2.

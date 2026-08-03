@@ -12588,9 +12588,12 @@ static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static USERINIT_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// Set once lsass's lsasrv `LsapRmInitializeServer` NtConnectPort(\SeRmCommandPort) is modeled-accepted
-/// — i.e. lsass's LSA init (LsapInitLsa) has resolved lsasrv+samsrv (SERVICE 10 step 2) and is running
-/// its real SRM/LSA-database bring-up. Read by the exec_lsass_lsa_init_running milestone spec.
+/// Kernel SRM listen-port handle for `\SeRmCommandPort`, registered in the LPC broker during
+/// executive initialization before LSASS starts.
+static SRM_COMMAND_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Set once lsass's lsasrv `LsapRmInitializeServer` connects to the kernel-owned
+/// `\SeRmCommandPort` through the LPC broker and the executive SRM side accepts/completes that
+/// connection. Read by the exec_lsass_lsa_init_running milestone spec.
 static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 // ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
 // The THIRD authentic LPC rendezvous in this system, after `sm_rendezvous` (smss' real `SmpApiLoop`
@@ -14052,6 +14055,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .map(|(ch, _)| ch != 0)
             .unwrap_or(false);
     check(b"exec_lpc_connect_rendezvous", lpc_rdv_ok, &mut passed);
+    // Kernel SRM objects are present before LSASS starts. ReactOS' ntoskrnl creates
+    // \SeRmCommandPort in SeRmInitPhase1; LSASS later connects to it during LsapRmInitializeServer.
+    let srm_command_port_name: Vec<u16> = "\\SeRmCommandPort".encode_utf16().collect();
+    let srm_command_port = lpc.create_port(&srm_command_port_name, 4, 0x148, 0x2400);
+    match srm_command_port {
+        Ok(handle) if handle != 0 => {
+            SRM_COMMAND_PORT_HANDLE.store(handle, Ordering::Relaxed);
+            check(b"exec_srm_command_port_registered", true, &mut passed);
+        }
+        _ => check(b"exec_srm_command_port_registered", false, &mut passed),
+    }
     // Live ALPC + LPC↔ALPC bridge self-test over the SAME ring/component/core (the
     // integration proof — no real ALPC binary exists yet). Drives ALPC + classic-LPC
     // message-plane opcodes raw on the shared channel, uses distinct \AlpcLive /
@@ -18461,9 +18475,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     // SERVICE 10 step 2 (checkpoint A): lsasrv.dll + samsrv.dll are registered, so
                     // lsass's loader resolves them, reaches its real LSA entry, and runs
-                    // LsapInitLsa → LsapRmInitializeServer, whose NtConnectPort(\SeRmCommandPort) we
-                    // model-accept. This proves lsass advanced PAST the lsasrv DLL_NOT_FOUND wall into
-                    // its genuine SRM/LSA-database bring-up.
+                    // LsapInitLsa → LsapRmInitializeServer, whose NtConnectPort(\SeRmCommandPort)
+                    // now completes through the kernel-owned SRM LPC port. This proves lsass advanced
+                    // PAST the lsasrv DLL_NOT_FOUND wall into its genuine SRM/LSA-database bring-up.
                     check(
                         b"exec_lsass_lsa_init_running",
                         LSASS_SRM_CONNECTED.load(Ordering::Relaxed) == 1,

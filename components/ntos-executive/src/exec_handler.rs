@@ -627,10 +627,44 @@ impl ExecNtHandler {
             }
         }
         handler.refresh_process_manager_gates();
+        handler.provision_kernel_srm_objects();
         handler.provision_volatile_hardware_registry();
         unsafe { handler.provision_default_user_locale() };
         handler.provision_reactos_explorer_shell_com_classes();
         handler
+    }
+
+    /// Seed the kernel-owned SRM synchronization object that ReactOS creates from ntoskrnl's
+    /// `SeRmInitPhase1`. LSASS later opens and signals this object while initializing its SRM
+    /// client side; the open path should therefore be an ordinary object-manager lookup.
+    fn provision_kernel_srm_objects(&mut self) {
+        const SELSA_INIT_EVENT: &[u8] = b"\\selsainitevent";
+
+        match self.obj_resolve(SELSA_INIT_EVENT, 0) {
+            Some(index) if self.obj_ns[index].kind == 2 => {
+                if !self.events.contains(index as u64) {
+                    self.events
+                        .initialize(index as u64, EventKind::Notification, false);
+                }
+                print_str(b"[srm-init] found existing \\SeLsaInitEvent obj=");
+                print_u64(index as u64);
+                print_str(b"\n");
+            }
+            Some(_) => {
+                print_str(b"[srm-init] \\SeLsaInitEvent name collision with non-event object\n");
+            }
+            None => {
+                if let Some(index) = self.obj_create(SELSA_INIT_EVENT, 0, 2, &[]) {
+                    self.events
+                        .initialize(index as u64, EventKind::Notification, false);
+                    print_str(b"[srm-init] provisioned \\SeLsaInitEvent obj=");
+                    print_u64(index as u64);
+                    print_str(b"\n");
+                } else {
+                    print_str(b"[srm-init] failed to provision \\SeLsaInitEvent\n");
+                }
+            }
+        }
     }
 
     /// Seed the kernel-owned volatile HARDWARE hive state that ReactOS expects during early SMSS.
@@ -8135,17 +8169,123 @@ impl ExecNtHandler {
         })
     }
 
-    pub(crate) unsafe fn model_lpc_request_reply(&mut self, reqmsg: u64) -> u32 {
-        // Generic LPC fallback for modeled non-CSR ports. CSR's \Windows\ApiPort message plane has
-        // no modeled success path; it must rendezvous with the real CsrApiRequestThread.
-        let _ = self.xas_try_write_buf(reqmsg + 0x34, &0u32.to_le_bytes());
-        let _ = self.xas_try_write_buf(
-            reqmsg + 0x04,
-            &nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes(),
-        );
-        print_str(
-            b"[lpc-msg] NtRequestWaitReplyPort -> modeled reply Status=SUCCESS (non-CSR port)\n",
-        );
+    fn lpc_name_equals_ascii(name16: &[u16], expected: &[u8]) -> bool {
+        name16.len() == expected.len()
+            && name16.iter().zip(expected.iter()).all(|(&wide, &ascii)| {
+                wide <= 0x7f && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
+            })
+    }
+
+    pub(crate) unsafe fn connect_srm_command_port(
+        &mut self,
+        name16: &[u16],
+        subsystem_type: u32,
+        conn_info: &[u8],
+        port_handle_out: u64,
+    ) -> u32 {
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+
+        let listen_handle = SRM_COMMAND_PORT_HANDLE.load(Ordering::Relaxed);
+        if listen_handle == 0 {
+            print_str(b"[srm-rdv] \\SeRmCommandPort is not registered in the LPC broker\n");
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
+        let Some(lpc) = lpc_client() else {
+            print_str(b"[srm-rdv] LPC broker unavailable for \\SeRmCommandPort connect\n");
+            return STATUS_UNSUCCESSFUL;
+        };
+        let connect = match lpc.connect_port(name16, subsystem_type, conn_info) {
+            Ok(connect) if connect.pending && connect.connection_id != 0 => connect,
+            Ok(connect) => {
+                print_str(b"[srm-rdv] expected a pending broker connection, got handle=0x");
+                print_hex((connect.handle >> 32) as u32);
+                print_hex(connect.handle as u32);
+                print_str(b" pending=");
+                print_u64(connect.pending as u64);
+                print_str(b"\n");
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                print_str(b"[srm-rdv] broker rejected \\SeRmCommandPort connect status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                return status.raw() as u32;
+            }
+        };
+
+        match lpc.reply_wait_receive(listen_handle) {
+            Ok(received)
+                if received.connection_id == connect.connection_id
+                    && received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST => {}
+            Ok(received) => {
+                print_str(b"[srm-rdv] broker receive returned unexpected conn=");
+                print_u64(received.connection_id);
+                print_str(b" type=");
+                print_u64(received.msg_type as u64);
+                print_str(b"\n");
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                print_str(b"[srm-rdv] broker receive failed status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                return status.raw() as u32;
+            }
+        }
+
+        let server_handle = match lpc.accept_connect(connect.connection_id, true, 0) {
+            Ok(handle) if handle != 0 => handle,
+            Ok(_) => {
+                print_str(
+                    b"[srm-rdv] broker accepted \\SeRmCommandPort with a null server handle\n",
+                );
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                print_str(b"[srm-rdv] broker accept failed status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                return status.raw() as u32;
+            }
+        };
+
+        let client_handle = match lpc.complete_connect(connect.connection_id) {
+            Ok((client_handle, completed_id))
+                if client_handle != 0 && completed_id == connect.connection_id =>
+            {
+                client_handle
+            }
+            Ok((client_handle, completed_id)) => {
+                print_str(b"[srm-rdv] broker complete returned client=0x");
+                print_hex((client_handle >> 32) as u32);
+                print_hex(client_handle as u32);
+                print_str(b" conn=");
+                print_u64(completed_id);
+                print_str(b"\n");
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                print_str(b"[srm-rdv] broker complete failed status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                return status.raw() as u32;
+            }
+        };
+
+        self.queue_write(port_handle_out, client_handle);
+        self.cache_lpc_connection(connect.connection_id, client_handle, name16);
+        LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
+        print_str(b"[srm-rdv] kernel SRM accepted \\SeRmCommandPort conn=");
+        print_u64(connect.connection_id);
+        print_str(b" server=0x");
+        print_hex((server_handle >> 32) as u32);
+        print_hex(server_handle as u32);
+        print_str(b" client=0x");
+        print_hex((client_handle >> 32) as u32);
+        print_hex(client_handle as u32);
+        print_str(b"\n");
         0
     }
 
@@ -8268,7 +8408,9 @@ impl ExecNtHandler {
                     print_str(b" -> failing, CSR accept must be real\n");
                 }
                 Err(_) => {
-                    print_str(b"[csr] broker failed NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n");
+                    print_str(
+                        b"[csr] broker failed NtSecureConnectPort(\\Windows\\ApiPort) -> failing\n",
+                    );
                 }
             }
         } else {
@@ -11554,7 +11696,8 @@ impl ExecNtHandler {
                 if self.lpc_connection_is(args[0], self.pi, b"\\sermcommandport") {
                     return self.service_srm_request_reply(args[1], args[2]);
                 }
-                self.model_lpc_request_reply(args[1])
+                print_str(b"[lpc-msg] NtRequestWaitReplyPort on an unregistered LPC connection -> failing\n");
+                0xC000_0008 // STATUS_INVALID_HANDLE
             },
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
@@ -11585,55 +11728,19 @@ impl ExecNtHandler {
                 } else {
                     0
                 };
-                // \SeRmCommandPort — the Security Reference Monitor's command port, created by the SRM
-                // in ntoskrnl (SeRmInitPhase1). lsass's lsasrv LsapRmInitializeServer (srm.c:216)
-                // NtConnectPort's it during LsapInitLsa. We don't host a real SRM, so MODEL the port:
-                // mint a comm-port handle + return SUCCESS so LsapRmInitializeServer proceeds (its
-                // LsapRmServerThread only NtRequestWaitReplyPort's the SRM for logon/token events, which
-                // don't occur on this boot path). Scoped to lsass.exe so it can't perturb the CSR/SM
-                // LPC broker path (csrss/winlogon pi 1/2).
+                // \SeRmCommandPort — ReactOS' kernel SRM creates this command port before LSASS.
+                // LSASS connects during LsapRmInitializeServer; the executive owns the SRM side, drains
+                // the broker's connection request, accepts it, and completes it through the same LPC
+                // state machine as the user-mode SM/CSR/LSA rendezvous paths.
+                if self.current_process_is_lsass()
+                    && Self::lpc_name_equals_ascii(&name16, b"\\sermcommandport")
                 {
-                    let mut nb = [0u8; 40];
-                    let nlen = Self::fold_name(&name16, &mut nb);
-                    if self.current_process_is_lsass()
-                        && nb[..nlen].windows(15).any(|w| w == b"sermcommandport")
-                    {
-                        let h = self.mint_handle();
-                        self.queue_write(args[0], h);
-                        self.cache_lpc_connection(0, h, &name16);
-                        LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
-                        print_str(b"[ntos-exec] lsass NtConnectPort(\\SeRmCommandPort) -> modeled SRM accept\n");
-                        return 0;
-                    }
-                }
-                // lsass.exe LSA-init port connects: after \SeRmCommandPort (modeled above), lsass's
-                // LSA/RPC init connects to further ports. If the broker doesn't own the name, connecting
-                // returns OBJECT_NAME_NOT_FOUND → lsass (a CRITICAL process via RtlSetProcessIsCritical)
-                // terminates the WHOLE process with 0xC0000034 (see LsapInitLsa/LsarStartRpcServer).
-                // MODEL any lsass port connect the broker doesn't know as an accepted comm port (mint a
-                // handle + SUCCESS) so LSA init proceeds past the connect toward LsarStartRpcServer /
-                // LSA_RPC_SERVER_ACTIVE. Scoped to lsass.exe (services/csrss/winlogon LPC unchanged).
-                // NOTE: this advances lsass PAST the connect into its LSA server-thread creation
-                // (NtCreateThread), which then WALLs at a bad thread-entry fetch (a bare RVA 0x3a288) —
-                // the flagged "N threads per process" lsass-listener multiplex frontier (same class as
-                // winlogon's RPC-listener thread). Kept because it advances lsass + is non-regressive
-                // (gate 165 held); the thread-entry wall is the NEXT batch's frontier.
-                if self.current_process_is_lsass() {
-                    let mut nb = [0u8; 48];
-                    let nlen = Self::fold_name(&name16, &mut nb);
-                    print_str(b"[lsass-connect] port=");
-                    print_str(&nb[..nlen.min(48)]);
-                    // Only model if the broker doesn't own the name (a real broker port still routes).
-                    let broker_owns = lpc_client()
-                        .map(|c| matches!(c.connect_port(&name16, 0, &[]), Ok(r) if r.pending || r.handle != 0))
-                        .unwrap_or(false);
-                    if !broker_owns {
-                        let h = self.mint_handle();
-                        self.queue_write(args[0], h);
-                        print_str(b" -> modeled lsass port accept\n");
-                        return 0;
-                    }
-                    print_str(b" (broker-owned)\n");
+                    return self.connect_srm_command_port(
+                        &name16,
+                        subsystem_type,
+                        &conn_info[..conn_info_len],
+                        args[0],
+                    );
                 }
                 match lpc_client().map(|c| {
                     c.connect_port(
@@ -12065,33 +12172,6 @@ impl ExecNtHandler {
                         return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                     }
                     return 0;
-                }
-                // lsass.exe: \SeLsaInitEvent is created by ntoskrnl's SeRmInitPhase1 (the SRM), which
-                // we don't host — lsass' LsapRmInitializeServer (srm.c:194) NtOpenEvent's it then
-                // NtSetEvent's it to signal the kernel it's ready, and treats an open failure as FATAL.
-                // Model it: auto-create the event so the open + set succeed (like \SeRmCommandPort). The
-                // name folds to "selsainitevent". Scoped to lsass.exe so services/paint reads are unchanged.
-                if self.current_process_is_lsass() && path == b"\\selsainitevent" {
-                    if let Some(i) = self.obj_create(path, root_idx, 2, &[]) {
-                        let created = !self.events.contains(i as u64);
-                        if !self.events.contains(i as u64) {
-                            self.events.initialize(i as u64, EventKind::Notification, false);
-                        }
-                        let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
-                            if created {
-                                self.rollback_new_event(i);
-                            }
-                            return 0xC000_009A;
-                        };
-                        if !self.xas_write_u64(out, event_handle) {
-                            self.close_current_handle(event_handle);
-                            if created {
-                                self.rollback_new_event(i);
-                            }
-                            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                        }
-                        return 0;
-                    }
                 }
                 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
             },
