@@ -30,10 +30,12 @@ mod kmdf_host;
 mod lpc_server;
 mod ntoskrnl_shared;
 mod server;
+mod service_gui_runtime;
 mod service_sec_image;
 mod storage_host;
 mod win32k_pe;
 mod win32k_subsystem;
+pub(crate) use service_gui_runtime::*;
 pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
@@ -2086,21 +2088,6 @@ pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_PROC: AtomicU64 = AtomicU64::new(
 /// session-global class identity with their own client-side ScrollBar proc without minting atoms.
 pub(crate) static GLOBAL_SCROLLBAR_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GLOBAL_SCROLLBAR_CLASS_CURSOR: AtomicU64 = AtomicU64::new(0);
-/// Non-interactive services initialize user32 enough to expose their real client-side built-in
-/// window procs. Capture those PFNs and reuse them for service `NtUserGetClassInfo`, rather than
-/// reporting the system class as absent.
-pub(crate) static SVC_CLIENT_PFNA_SCROLLBAR: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-pub(crate) static SVC_CLIENT_PFNW_SCROLLBAR: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-pub(crate) static SVC_CLIENT_PFN_ARRAYS_CAPTURED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SVC_CLIENT_HMOD_USER32: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-pub(crate) static SVC_SCROLLBAR_CLASS_ATOM: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-pub(crate) static SVC_SCROLLBAR_CLASSINFO_HITS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SVC_SCROLLBAR_CLASSINFO_MISSES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SVC_SCROLLBAR_CLASSINFO_COPYOUT_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.
@@ -11119,6 +11106,9 @@ struct ExecNtHandler {
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
     thread_runtime: HostedThreadRuntimes,
+    /// Runtime user32 state captured from non-interactive service GUI clients, keyed by their real
+    /// ProcessManager PID instead of hosted-process slot globals.
+    service_gui_clients: ServiceGuiClientRuntimes,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,
@@ -18556,24 +18546,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         W32_CONNECTED_MASK.load(Ordering::Relaxed) & (1 << 3) != 0,
                         &mut passed,
                     );
+                    let (
+                        svc_pfn_arrays,
+                        svc_scrollbar_hits,
+                        svc_scrollbar_misses,
+                        svc_scrollbar_copyout_errors,
+                    ) = service_gui_runtime_counters();
                     check(
                         b"exec_services_scrollbar_classinfo_mirrored",
-                        SVC_CLIENT_PFN_ARRAYS_CAPTURED.load(Ordering::Relaxed) >= 1
-                            && SVC_SCROLLBAR_CLASSINFO_HITS.load(Ordering::Relaxed) >= 1
-                            && SVC_SCROLLBAR_CLASSINFO_MISSES.load(Ordering::Relaxed) == 0
-                            && SVC_SCROLLBAR_CLASSINFO_COPYOUT_ERRORS.load(Ordering::Relaxed) == 0,
+                        svc_pfn_arrays >= 1
+                            && svc_scrollbar_hits >= 1
+                            && svc_scrollbar_misses == 0
+                            && svc_scrollbar_copyout_errors == 0,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] win32k per-process connect mask=0x");
                     print_hex(W32_CONNECTED_MASK.load(Ordering::Relaxed) as u32);
                     print_str(b" svc-pfn-arrays=");
-                    print_u64(SVC_CLIENT_PFN_ARRAYS_CAPTURED.load(Ordering::Relaxed));
+                    print_u64(svc_pfn_arrays);
                     print_str(b" svc-scrollbar-classinfo hits/misses/errors=");
-                    print_u64(SVC_SCROLLBAR_CLASSINFO_HITS.load(Ordering::Relaxed));
+                    print_u64(svc_scrollbar_hits);
                     print_str(b"/");
-                    print_u64(SVC_SCROLLBAR_CLASSINFO_MISSES.load(Ordering::Relaxed));
+                    print_u64(svc_scrollbar_misses);
                     print_str(b"/");
-                    print_u64(SVC_SCROLLBAR_CLASSINFO_COPYOUT_ERRORS.load(Ordering::Relaxed));
+                    print_u64(svc_scrollbar_copyout_errors);
                     print_str(b"\n");
                     // ★ SERVICE 8 — services' SCM creates REAL named events in \BaseNamedObjects
                     // (SCM_START_EVENT / SC_AutoStartComplete / LSA_RPC_SERVER_ACTIVE / …) via

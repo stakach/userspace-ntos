@@ -1822,6 +1822,7 @@ fn remember_global_scrollbar_cursor(handle: u32) {
 }
 
 unsafe fn capture_service_client_pfn_arrays(
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     pfn_client_a: u64,
     pfn_client_w: u64,
@@ -1832,11 +1833,8 @@ unsafe fn capture_service_client_pfn_arrays(
 ) -> bool {
     use nt_kernel_exec::user_class::{pfn_client_proc, FNID_SCROLLBAR, PFNCLIENT_SIZE};
 
-    if pi >= MAX_PI {
-        return false;
-    }
-
-    let mut captured = false;
+    let mut proc_a = 0;
+    let mut proc_w = 0;
     let mut raw = [0u8; PFNCLIENT_SIZE];
     if pfn_client_a != 0
         && img_spawn::client_copyin_mapped(
@@ -1849,8 +1847,7 @@ unsafe fn capture_service_client_pfn_arrays(
         )
     {
         if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
-            SVC_CLIENT_PFNA_SCROLLBAR[pi].store(proc, Ordering::Relaxed);
-            captured = true;
+            proc_a = proc;
         }
     }
 
@@ -1866,21 +1863,15 @@ unsafe fn capture_service_client_pfn_arrays(
         )
     {
         if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
-            SVC_CLIENT_PFNW_SCROLLBAR[pi].store(proc, Ordering::Relaxed);
-            captured = true;
+            proc_w = proc;
         }
     }
 
-    if hmod_user != 0 {
-        SVC_CLIENT_HMOD_USER32[pi].store(hmod_user, Ordering::Relaxed);
-    }
-    if captured {
-        SVC_CLIENT_PFN_ARRAYS_CAPTURED.fetch_add(1, Ordering::Relaxed);
-    }
-    captured
+    nt_handler.record_service_client_pfns(pi, proc_a, proc_w, hmod_user)
 }
 
 unsafe fn copy_service_scrollbar_class_info(
+    nt_handler: &mut ExecNtHandler,
     pi: usize,
     capture: CapturedGetClassInfo,
     filled_pages: &[u64],
@@ -1889,32 +1880,20 @@ unsafe fn copy_service_scrollbar_class_info(
 ) -> Option<u64> {
     use nt_kernel_exec::user_class::{scrollbar_class_info, WNDCLASSEXW_SIZE};
 
-    if pi >= MAX_PI || !capture.scrollbar {
+    if !capture.scrollbar {
         return None;
     }
-    let proc = if capture.ansi {
-        SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed)
-    } else {
-        SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed)
-    };
-    if proc == 0 {
-        return None;
-    }
-    let mut atom = SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u16;
+    let proc = nt_handler.service_scrollbar_proc(pi, capture.ansi)?;
+    let mut atom = nt_handler.service_scrollbar_atom(pi).unwrap_or(0);
     if atom == 0 {
         let observed = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
         if observed == 0 {
             return None;
         }
-        atom = match SVC_SCROLLBAR_CLASS_ATOM[pi].compare_exchange(
-            0,
-            observed as u64,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => observed,
-            Err(existing) => existing as u16,
-        };
+        if !nt_handler.record_service_scrollbar_atom(pi, observed) {
+            return None;
+        }
+        atom = observed;
     }
     let hcursor = GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed);
     if hcursor == 0 {
@@ -1943,7 +1922,7 @@ unsafe fn copy_service_scrollbar_class_info(
     ) {
         Some(payload.atom() as u64)
     } else {
-        SVC_SCROLLBAR_CLASSINFO_COPYOUT_ERRORS.fetch_add(1, Ordering::Relaxed);
+        nt_handler.record_service_scrollbar_classinfo_copyout_error();
         None
     }
 }
@@ -8626,8 +8605,7 @@ pub(crate) unsafe fn service_sec_image(
                     let hit = if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
                     {
                         let atom = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
-                        if atom != 0 && pi < MAX_PI {
-                            SVC_SCROLLBAR_CLASS_ATOM[pi].store(atom as u64, Ordering::Relaxed);
+                        if nt_handler.record_service_scrollbar_atom(pi, atom) {
                             Some(atom)
                         } else {
                             None
@@ -8663,6 +8641,7 @@ pub(crate) unsafe fn service_sec_image(
                     // interactive setup does that first; WSS_NOIO service processes only need their
                     // client PFNs captured for later service-owned classinfo mirrors.
                     let captured = capture_service_client_pfn_arrays(
+                        &mut *nt_handler,
                         pi,
                         a0,
                         a1,
@@ -8753,13 +8732,14 @@ pub(crate) unsafe fn service_sec_image(
                     // blit path for WSS_NOIO services.
                     if let Some(capture) = get_class_info_capture {
                         if let Some(atom) = copy_service_scrollbar_class_info(
+                            &mut *nt_handler,
                             pi,
                             capture,
                             filled_pages,
                             faults as usize,
                             scratch_base,
                         ) {
-                            SVC_SCROLLBAR_CLASSINFO_HITS.fetch_add(1, Ordering::Relaxed);
+                            nt_handler.record_service_scrollbar_classinfo_hit();
                             print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR ScrollBar atom=0x");
                             print_hex(atom as u32);
                             print_str(b" ansi=");
@@ -8767,28 +8747,25 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" -> TRUE\n");
                             (atom, true)
                         } else {
-                            SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
+                            nt_handler.record_service_scrollbar_classinfo_miss();
+                            let debug = nt_handler.service_scrollbar_debug(pi);
                             print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS scrollbar=");
                             print_u64(capture.scrollbar as u64);
                             print_str(b" atom=0x");
-                            print_hex(SVC_SCROLLBAR_CLASS_ATOM[pi].load(Ordering::Relaxed) as u32);
+                            print_hex(debug.scrollbar_atom as u32);
                             print_str(b" hcursor=0x");
                             print_hex_u64(GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed));
                             print_str(b" procA=");
-                            print_u64(
-                                (SVC_CLIENT_PFNA_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64,
-                            );
+                            print_u64(debug.has_pfn_a as u64);
                             print_str(b" procW=");
-                            print_u64(
-                                (SVC_CLIENT_PFNW_SCROLLBAR[pi].load(Ordering::Relaxed) != 0) as u64,
-                            );
+                            print_u64(debug.has_pfn_w as u64);
                             print_str(b" ansi=");
                             print_u64(capture.ansi as u64);
                             print_str(b" -> FALSE\n");
                             (0, true)
                         }
                     } else {
-                        SVC_SCROLLBAR_CLASSINFO_MISSES.fetch_add(1, Ordering::Relaxed);
+                        nt_handler.record_service_scrollbar_classinfo_miss();
                         print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) MIRROR MISS capture=0 -> FALSE\n");
                         (0, true)
                     }

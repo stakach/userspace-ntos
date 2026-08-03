@@ -886,3 +886,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   not reach the explorer `WM_PAINT` loop before the stop, so F2 remains open. Review adjustment:
   the next executable cleanup target is the remaining service/class/cursor/DC mirror surface under
   C3/F1, plus E3's modeled SRM/LSA accept path.
+- C3/F1 cleanup. Removed the static per-`pi` service GUI PFN/class-atom arrays
+  (`SVC_CLIENT_PFNA_SCROLLBAR`, `SVC_CLIENT_PFNW_SCROLLBAR`, `SVC_CLIENT_HMOD_USER32`, and
+  `SVC_SCROLLBAR_CLASS_ATOM`) plus their global boot-gate counters. Non-interactive service
+  user32 PFNs and the service ScrollBar atom now live in an `ExecNtHandler`-owned fixed runtime
+  table keyed by the real ProcessManager PID, and the post-loop proof reads a quiesced snapshot from
+  that runtime table instead of from slot globals. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs components/ntos-executive/src/service_sec_image.rs`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: F1 remains open for the session-global
+  cursor/class/stock-object mirrors and the remaining WSS_NOIO service GDI leaf branches; those
+  should move behind provider-owned per-process/session GUI state rather than returning to
+  executive-owned identity slots.
