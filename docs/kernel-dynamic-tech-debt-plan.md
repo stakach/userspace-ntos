@@ -1175,3 +1175,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   gone, but D3 remains open for replacing the host-published Video0 device-map route and
   `EngDeviceIoControl` framebuffer intercept with a real miniport-created device object/interface and
   Configuration Manager DeviceMap publication.
+- D3 cleanup. The remaining host-published `\Device\Video0` state moved out of
+  `win32k_subsystem` into the executive-owned `video_device` boundary. Win32k no longer owns the
+  device-map value, projected `DEVICE_OBJECT`/`FILE_OBJECT` bodies, or display IOCTL state; it only
+  opens/query-routes the runtime Video0 key and delegates `IoGetDeviceObjectPointer` plus
+  `EngDeviceIoControl` to that kernel boundary. The route still fails visibly when unpublished or
+  when the miniport handle is not the registered Video0 object. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `components/ntos-executive/build.sh`, and
+  `.tmp/full-boot-video-device-boundary.log` passed the desktop gate with
+  `PDEVOBJ_lChangeDisplaySettings status=0x0x00000000`,
+  `[video-device] IOCTL_VIDEO_MAP_VIDEO_MEMORY`, `PASS exec_win32k_desktop_painted`, and the
+  microtest sentinel. Review adjustment: D3 remains open until a real hosted
+  videoprt/display-miniport stack creates the device object/interface and Configuration Manager
+  publishes `HARDWARE\DEVICEMAP\VIDEO`.

@@ -4595,23 +4595,14 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 // keyboard-layout keys, plus the runtime Video0 device-map link published when the selected display
 // route is registered. There is no key/value mirror: ZwOpenKey only mints an opaque handle to a live
 // target, and ZwQueryValueKey reads the value from that target.
-
-// DEVICE_OBJECT / FILE_OBJECT bodies for the registered \Device\Video0 route. win32k passes the
-// DeviceObject as the miniport handle to the display driver + EngDeviceIoControl, which this host
-// intercepts. The bodies are allocated when the display device is registered, not fixed cells.
-const VIDEO_DEVICE_OBJECT_BYTES: u64 = 0x150;
-const VIDEO_FILE_OBJECT_BYTES: u64 = 0x100;
-static mut WIN32K_VIDEO_DEVICE_OBJECT: u64 = 0;
-static mut WIN32K_VIDEO_FILE_OBJECT: u64 = 0;
+// Video0's DeviceMap value, projected IO object identities, and framebuffer IOCTL state are owned by
+// `video_device`; win32k only carries opaque registry handles to that executive-owned route.
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
-const REG_SZ: u32 = 1;
-const REG_DWORD: u32 = 4;
 const WIN32K_REG_HANDLE_CAP: usize = 16;
 const WIN32K_REG_PATH_CAP: usize = 192;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
-const WIN32K_VIDEO_SERVICE_PATH_CAP: usize = 128;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4636,10 +4627,6 @@ impl Win32kRegHandle {
 
 static mut WIN32K_REG_HANDLES: [Win32kRegHandle; WIN32K_REG_HANDLE_CAP] =
     [Win32kRegHandle::EMPTY; WIN32K_REG_HANDLE_CAP];
-static mut WIN32K_VIDEO_SERVICE_PATH: [u8; WIN32K_VIDEO_SERVICE_PATH_CAP] =
-    [0; WIN32K_VIDEO_SERVICE_PATH_CAP];
-static mut WIN32K_VIDEO_SERVICE_PATH_LEN: u8 = 0;
-static mut WIN32K_DISPLAY_DEVICE_READY: bool = false;
 
 pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) service_key_pattern: &'a [u8],
@@ -4703,42 +4690,25 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
         || spec.installed_display_driver.is_empty()
         || spec.display_driver_leaf.is_empty()
         || spec.device_description.is_empty()
-        || spec.service_registry_path.len() > WIN32K_VIDEO_SERVICE_PATH_CAP
     {
         return false;
     }
     unsafe {
-        if !ensure_video_device_objects() {
-            return false;
-        }
-        let path = &mut *core::ptr::addr_of_mut!(WIN32K_VIDEO_SERVICE_PATH);
-        path.fill(0);
-        path[..spec.service_registry_path.len()].copy_from_slice(spec.service_registry_path);
-        WIN32K_VIDEO_SERVICE_PATH_LEN = spec.service_registry_path.len() as u8;
-        WIN32K_DISPLAY_DEVICE_READY = true;
+        crate::video_device::publish_boot_framebuffer_video_device(
+            &crate::video_device::VideoDeviceRegistration {
+                service_registry_path: spec.service_registry_path,
+                framebuffer_va: WIN32K_FB_VA,
+                framebuffer_size: WIN32K_FB_SIZE,
+                mode: crate::video_device::VideoModeSpec {
+                    width: 1024,
+                    height: 768,
+                    stride: 4096,
+                    bits_per_plane: 32,
+                },
+                allocate_projection: pool_alloc,
+            },
+        )
     }
-    true
-}
-
-unsafe fn ensure_video_device_objects() -> bool {
-    if WIN32K_VIDEO_DEVICE_OBJECT != 0 && WIN32K_VIDEO_FILE_OBJECT != 0 {
-        return true;
-    }
-    let device = pool_alloc(VIDEO_DEVICE_OBJECT_BYTES);
-    let file = pool_alloc(VIDEO_FILE_OBJECT_BYTES);
-    if device == 0 || file == 0 {
-        return false;
-    }
-    // Minimal x64 IO object headers. The current win32k route only needs stable object identities,
-    // but seeding Type/Size and FILE_OBJECT.DeviceObject keeps the objects structurally honest.
-    write_unaligned(device as *mut u16, 3); // IO_TYPE_DEVICE
-    write_unaligned((device + 2) as *mut u16, VIDEO_DEVICE_OBJECT_BYTES as u16);
-    write_unaligned(file as *mut u16, 5); // IO_TYPE_FILE
-    write_unaligned((file + 2) as *mut u16, VIDEO_FILE_OBJECT_BYTES as u16);
-    write_unaligned((file + 8) as *mut u64, device);
-    WIN32K_VIDEO_DEVICE_OBJECT = device;
-    WIN32K_VIDEO_FILE_OBJECT = file;
-    true
 }
 
 fn strip_ascii_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -4846,27 +4816,6 @@ unsafe fn object_attributes_name_ascii_lower(obj_attr: u64, out: &mut [u8]) -> O
     read_unicode_string_ascii_lower(ustr, out)
 }
 
-/// Case-insensitive exact compare of a wide value-name [buf, +len_bytes) against an ASCII pattern.
-unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
-    if buf == 0 || len_bytes / 2 != pat.len() {
-        return false;
-    }
-    let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        }
-    };
-    for k in 0..pat.len() {
-        let c = low(read_unaligned((buf + (k * 2) as u64) as *const u16));
-        if c != low(pat[k] as u16) {
-            return false;
-        }
-    }
-    true
-}
-
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
 /// ObjectName (PUNICODE_STRING) at +0x10. Resolve win32k's registry imports to live registry/device
 /// targets; optional keys not present in the mounted hives fail with NOT_FOUND.
@@ -4903,7 +4852,7 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
                 }
             }
         } else if is_video_device_map_key(path) {
-            if !WIN32K_DISPLAY_DEVICE_READY || WIN32K_VIDEO_SERVICE_PATH_LEN == 0 {
+            if !crate::video_device::video_device_map_ready() {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             Win32kRegHandleTarget::VideoDeviceMap
@@ -4917,53 +4866,6 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
         };
         write_unaligned(handle_out, hkey);
     }
-    0
-}
-
-/// Emit an ASCII string `s` as a wide (UTF-16) REG_SZ/REG_MULTI_SZ into a KEY_VALUE_PARTIAL_INFORMATION
-/// {TitleIndex@0, Type@4, DataLength@8, Data@0xC}. `extra_nul` adds a second terminator (MULTI_SZ).
-unsafe fn emit_kvpi_wsz(
-    kvi: u64,
-    length: u64,
-    result_len: *mut u32,
-    rtype: u32,
-    s: &[u8],
-    extra_nul: bool,
-) -> i32 {
-    let nchars = s.len() + 1 + if extra_nul { 1 } else { 0 };
-    let dbytes = (nchars * 2) as u64;
-    let need = 0xC + dbytes;
-    if !result_len.is_null() {
-        write_unaligned(result_len, need as u32);
-    }
-    if kvi == 0 || length < need {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-    write_unaligned(kvi as *mut u32, 0);
-    write_unaligned((kvi + 4) as *mut u32, rtype);
-    write_unaligned((kvi + 8) as *mut u32, dbytes as u32);
-    let d = kvi + 0xC;
-    for (i, &b) in s.iter().enumerate() {
-        write_unaligned((d + (i * 2) as u64) as *mut u16, b as u16);
-    }
-    write_unaligned((d + (s.len() * 2) as u64) as *mut u16, 0);
-    if extra_nul {
-        write_unaligned((d + ((s.len() + 1) * 2) as u64) as *mut u16, 0);
-    }
-    0
-}
-unsafe fn emit_kvpi_dword(kvi: u64, length: u64, result_len: *mut u32, val: u32) -> i32 {
-    let need = 0xC + 4;
-    if !result_len.is_null() {
-        write_unaligned(result_len, need as u32);
-    }
-    if kvi == 0 || length < need {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-    write_unaligned(kvi as *mut u32, 0);
-    write_unaligned((kvi + 4) as *mut u32, REG_DWORD);
-    write_unaligned((kvi + 8) as *mut u32, 4);
-    write_unaligned((kvi + 0xC) as *mut u32, val);
     0
 }
 
@@ -4989,33 +4891,6 @@ unsafe fn emit_kvpi_bytes(
         write_unaligned((dst + idx as u64) as *mut u8, byte);
     }
     0
-}
-
-unsafe fn query_video_device_map_value(
-    name: &[u8],
-    kvi: u64,
-    length: u64,
-    result_len: *mut u32,
-) -> i32 {
-    if reg_ascii_eq(name, b"maxobjectnumber") {
-        return emit_kvpi_dword(kvi, length, result_len, 0);
-    }
-    if reg_ascii_eq(name, b"\\device\\video0") {
-        let service_path = &*core::ptr::addr_of!(WIN32K_VIDEO_SERVICE_PATH);
-        let service_path_len = WIN32K_VIDEO_SERVICE_PATH_LEN as usize;
-        if service_path_len == 0 {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        return emit_kvpi_wsz(
-            kvi,
-            length,
-            result_len,
-            REG_SZ,
-            &service_path[..service_path_len],
-            false,
-        );
-    }
-    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 unsafe fn query_system_hive_value(
@@ -5061,7 +4936,7 @@ extern "win64" fn s_zw_query_value_key(
         match target {
             Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
             Win32kRegHandleTarget::VideoDeviceMap => {
-                query_video_device_map_value(name, kvi, length, result_len)
+                crate::video_device::query_video_device_map_value(name, kvi, length, result_len)
             }
             Win32kRegHandleTarget::SystemHive { key } => {
                 query_system_hive_value(key, name, kvi, length, result_len)
@@ -5077,122 +4952,27 @@ extern "win64" fn s_io_get_device_object_pointer(
     fileobj_out: *mut u64,
     devobj_out: *mut u64,
 ) -> i32 {
-    unsafe {
-        if !WIN32K_DISPLAY_DEVICE_READY || name == 0 {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let len = read_unaligned(name as *const u16) as usize;
-        let buf = read_unaligned((name + 8) as *const u64);
-        if !wstr_eq_ascii(buf, len, b"\\Device\\Video0") {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let file_object = WIN32K_VIDEO_FILE_OBJECT;
-        let device_object = WIN32K_VIDEO_DEVICE_OBJECT;
-        if file_object == 0 || device_object == 0 {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        if !fileobj_out.is_null() {
-            write_unaligned(fileobj_out, file_object);
-        }
-        if !devobj_out.is_null() {
-            write_unaligned(devobj_out, device_object);
-        }
-    }
-    0
+    unsafe { crate::video_device::video_get_device_object_pointer(name, fileobj_out, devobj_out) }
 }
 
-// Video-miniport IOCTLs (ntddvdeo.h: FILE_DEVICE_VIDEO=0x23, METHOD_BUFFERED, FILE_ANY_ACCESS →
-// value = 0x0023_0000 | (Function << 2)).
-const IOCTL_VIDEO_QUERY_AVAIL_MODES: u64 = 0x0023_0400;
-const IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES: u64 = 0x0023_0404;
-const IOCTL_VIDEO_QUERY_CURRENT_MODE: u64 = 0x0023_0408;
-const IOCTL_VIDEO_SET_CURRENT_MODE: u64 = 0x0023_040C;
-const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u64 = 0x0023_0458;
-
-/// Fill an 80-byte VIDEO_MODE_INFORMATION for 1024x768x32 (scanline 4096) at `out`.
-unsafe fn fill_video_mode(out: u64) {
-    let w = |off: u64, v: u32| write_unaligned((out + off) as *mut u32, v);
-    w(0, 80); // Length (== ModeInformationLength; nonzero = a valid mode)
-    w(4, 1); // ModeIndex
-    w(8, 1024); // VisScreenWidth
-    w(12, 768); // VisScreenHeight
-    w(16, 4096); // ScreenStride (bytes/scanline)
-    w(20, 1); // NumberOfPlanes (must be 1)
-    w(24, 32); // BitsPerPlane (8/16/24/32)
-    w(28, 60); // Frequency
-    w(32, 320); // XMillimeter
-    w(36, 240); // YMillimeter
-    w(40, 8); // NumberRedBits
-    w(44, 8); // NumberGreenBits
-    w(48, 8); // NumberBlueBits
-    w(52, 0x00FF_0000); // RedMask
-    w(56, 0x0000_FF00); // GreenMask
-    w(60, 0x0000_00FF); // BlueMask
-    w(64, 0x0000_0003); // AttributeFlags = VIDEO_MODE_COLOR | VIDEO_MODE_GRAPHICS
-    w(68, 1024); // VideoMemoryBitmapWidth
-    w(72, 768); // VideoMemoryBitmapHeight
-    w(76, 0); // DriverSpecificAttributeFlags
-}
-
-/// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in `load_into`,
-/// so BOTH the display DLL's imported calls AND win32k's own internal calls route here without a real
-/// miniport/DeviceObject). Services the video IOCTLs the display DLL issues, feeding it the BOOTBOOT
-/// framebuffer. Returns 0 (ERROR_SUCCESS) on handled, nonzero on unhandled (benign for the optional
-/// IOCTLs — the callers only check zero/non-zero). win64: rcx=hDev, rdx=ioctl, r8=inbuf, r9=inlen,
-/// stack: outbuf, outlen, bytesret.
+/// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in
+/// `load_into`, so both the display DLL's imported calls and win32k's own internal calls route into
+/// the executive-owned video-device boundary). Returns 0 (ERROR_SUCCESS) on handled, nonzero on
+/// unhandled. win64: rcx=hDev, rdx=ioctl, r8=inbuf, r9=inlen, stack: outbuf, outlen, bytesret.
 extern "win64" fn s_eng_device_io_control(
-    _hdev: u64,
+    hdev: u64,
     ioctl: u64,
-    _in_buf: u64,
-    _in_len: u64,
+    in_buf: u64,
+    in_len: u64,
     out_buf: u64,
     out_len: u64,
     bytes_ret: *mut u32,
 ) -> u32 {
     unsafe {
-        let set_ret = |n: u32| {
-            if !bytes_ret.is_null() {
-                write_unaligned(bytes_ret, n);
-            }
-        };
-        match ioctl {
-            IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES => {
-                if out_buf != 0 && out_len >= 8 {
-                    write_unaligned(out_buf as *mut u32, 1); // NumModes
-                    write_unaligned((out_buf + 4) as *mut u32, 80); // ModeInformationLength
-                    set_ret(8);
-                    return 0;
-                }
-            }
-            IOCTL_VIDEO_QUERY_AVAIL_MODES | IOCTL_VIDEO_QUERY_CURRENT_MODE => {
-                if out_buf != 0 && out_len >= 80 {
-                    fill_video_mode(out_buf);
-                    set_ret(80);
-                    return 0;
-                }
-            }
-            IOCTL_VIDEO_SET_CURRENT_MODE => {
-                set_ret(0);
-                return 0;
-            }
-            IOCTL_VIDEO_MAP_VIDEO_MEMORY => {
-                if out_buf != 0 && out_len >= 32 {
-                    write_unaligned(out_buf as *mut u64, WIN32K_FB_VA); // VideoRamBase
-                    write_unaligned((out_buf + 8) as *mut u32, WIN32K_FB_SIZE as u32); // VideoRamLength
-                    write_unaligned((out_buf + 16) as *mut u64, WIN32K_FB_VA); // FrameBufferBase
-                    write_unaligned((out_buf + 24) as *mut u32, WIN32K_FB_SIZE as u32); // FrameBufferLength
-                    set_ret(32);
-                    print_str(b"[win32k fb] IOCTL_VIDEO_MAP_VIDEO_MEMORY -> FrameBufferBase=0x");
-                    print_hex((WIN32K_FB_VA >> 32) as u32);
-                    print_hex(WIN32K_FB_VA as u32);
-                    print_str(b"\n");
-                    return 0;
-                }
-            }
-            _ => {}
-        }
+        crate::video_device::video_device_io_control(
+            hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret,
+        )
     }
-    1 // unhandled → failure (benign)
 }
 
 /// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
@@ -6218,8 +5998,7 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
         }
     }
 
-    // Patch win32k's EngDeviceIoControl export to our video-IOCTL intercept (so the display DLL's imported
-    // calls AND win32k's own internal miniport IOCTLs route to us — no real DeviceObject needed).
+    // Patch win32k's EngDeviceIoControl export to the executive-owned video-device boundary.
     patch_eng_device_io_control();
 
     // Patch win32k's inlined KeGetCurrentIrql helper (RVA 0x305c0 = `mov rax,cr8; ret`) to
@@ -7964,9 +7743,9 @@ pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 /// ZwSetSystemInformation, then resolves KbdLayerDescriptor from its export directory.
 pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
 pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
-/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. The display
-/// driver issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns this VA as
-/// FrameBufferBase, so the driver writes pixels straight to the real framebuffer.
+/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. The
+/// executive video-device boundary returns this VA for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`, so the
+/// display driver writes pixels straight to the real framebuffer.
 /// 1024x768x32 scanline 4096 = 0x300000 = 768 pages (2 PTs at 0x0900/0x0920).
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 pub const WIN32K_FB_SIZE: u64 = 0x30_0000;

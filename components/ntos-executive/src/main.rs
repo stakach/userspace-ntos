@@ -32,6 +32,7 @@ mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
 mod storage_host;
+mod video_device;
 mod win32k_pe;
 mod win32k_session_runtime;
 mod win32k_subsystem;
