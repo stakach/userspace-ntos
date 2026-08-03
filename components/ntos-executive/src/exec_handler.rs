@@ -2037,11 +2037,7 @@ impl ExecNtHandler {
         Some(self.token_store.statistics(token)?.authentication_id)
     }
 
-    pub(crate) fn primary_token_user_sid_for_pi(
-        &self,
-        pi: usize,
-        out: &mut [u8],
-    ) -> Option<usize> {
+    pub(crate) fn primary_token_user_sid_for_pi(&self, pi: usize, out: &mut [u8]) -> Option<usize> {
         let pid = self.pm_pid_for_pi(pi)?;
         let token = self.pm.process_primary_token(pid)?;
         self.token_store.get(token)?.user.write_native(out)
@@ -9269,15 +9265,35 @@ impl ExecNtHandler {
                     }
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_KEY). Match the layout key
-                // by NAME (its RootDirectory arrives as 0 — advapi32's MapDefaultKey HKLM handle
-                // doesn't round-trip into the subkey OA — so the sentinel-relative test isn't hit).
-                // This is the ONLY key resolved specially, so every other HKLM/HKCU subkey outcome is
-                // identical to pre-fix and win32k's paint-time client reads are unchanged (a broad
-                // DLL-.rdata read regressed the paint by letting ALL HKLM reads succeed).
-                if is_keyboard_layout_key(&path) {
-                    KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                    return self.mint_registry_key(SYNTH_KBD_KEY, args[1] as u32, args[0]);
+                // Early keyboard-layout open. advapi32's HKLM predefined-root handle does not always
+                // arrive as RootDirectory on this path, so accept either the sentinel-relative form
+                // or a machine-relative absolute name, but resolve only the exact real SYSTEM hive key.
+                let keyboard_layout_full =
+                    if root_target == Some(MACHINE_ROOT_KEY) && is_keyboard_layout_key(&path) {
+                        let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                        full.push_str(&path);
+                        Some(full)
+                    } else if root_target.is_none() && is_keyboard_layout_key(&path) {
+                        let comps = Self::key_components(&path);
+                        if comps.len() >= 2
+                            && comps[0].eq_ignore_ascii_case("Registry")
+                            && comps[1].eq_ignore_ascii_case("Machine")
+                        {
+                            Some(path.clone())
+                        } else {
+                            let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                            full.push_str(&path);
+                            Some(full)
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(full) = keyboard_layout_full {
+                    if let Some(cell) = self.resolve_key(&full) {
+                        KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                        return self.mint_registry_key(cell, args[1] as u32, args[0]);
+                    }
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // A subkey open relative to the predefined-root sentinel that is NOT the keyboard key:
                 // NOT_FOUND (preserves the pre-fix outcome for all non-keyboard predefined subkeys).
@@ -10161,7 +10177,7 @@ impl ExecNtHandler {
                         //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
                         //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
                         // Scoped by `!is_synth_key`, so every paint-time msgina value read is
-                        // unchanged (those hit SYNTH_WINLOGON_KEY / SYNTH_KBD_KEY, excluded here).
+                        // unchanged (those hit SYNTH_WINLOGON_KEY, excluded here).
                         use_xas_write = true;
                     }
                     self.registry_value(key, &name_lc)

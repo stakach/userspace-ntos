@@ -9729,10 +9729,9 @@ const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 /// and let NtQueryValueKey miss (→ defaults). Far above any real regf cell offset (like SYNTH_CPU_KEY),
 /// so it never collides with a hive key.
 const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
-/// Typed key targets for predefined-machine-root and the synthetic keyboard-layout key. These are
-/// stored inside process-local `HandleObject::RegistryKey` entries; they are not handle values.
+/// Typed key target for the predefined machine root. This is stored inside process-local
+/// `HandleObject::RegistryKey` entries; it is not a handle value.
 const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
-const SYNTH_KBD_KEY: KeyRef = 0xFFFF_FF03;
 /// Typed key target for the predefined `HKEY_USERS` root (`\Registry\User`) — the container the
 /// per-user hives mount INTO. advapi32's `MapDefaultKey(HKEY_USERS)` opens it by name and then
 /// opens `.Default` / `<SID>` relative to it; `NtLoadKey`/`NtUnloadKey` name their target the same
@@ -10413,28 +10412,31 @@ pub const SSN_NT_CREATE_KEY: u64 = 43;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 
-/// P5 — PAINT-SAFE keyboard-layout registry fix. advapi32's `MapDefaultKey` opens a predefined
-/// root (HKLM=`\Registry\Machine`, HKCU, HKCR) via `NtOpenKey(RootDirectory=0, ObjectName=<.rdata
-/// static>)`; that name lives in a mapped DLL's `.rdata`, which the executive's copyin mirror can't
-/// read, so `smss_read_objattr_name` returns EMPTY. Pre-fix we return NOT_FOUND, so `MapDefaultKey`
-/// fails and EVERY HKLM/HKCU subkey open fails — including winlogon's `InitKeyboardLayouts` fallback
-/// `LoadKeyboardLayoutW("00000409")` which opens `HKLM\SYSTEM\...\Keyboard Layouts\00000409` — so
-/// `InitKeyboardLayouts` returns FALSE → fatal `NtRaiseHardError`. Fix: hand back this sentinel for
-/// an absolute empty-name (predefined-root) open so `MapDefaultKey` succeeds, then resolve ONLY the
-/// keyboard-layout subkey (relative to this sentinel), returning NOT_FOUND for EVERY other subkey.
-/// That preserves the pre-fix outcome (not-found) for all non-keyboard opens, so win32k's paint-time
-/// client registry reads are byte-for-byte unchanged (a broad DLL-`.rdata`-name read was tried and
-/// regressed the desktop paint by letting ALL HKLM reads succeed → the interactive-winsta fork).
-/// Synthetic key target returned for the `HKLM\SYSTEM\...\Keyboard Layouts\<KLID>` open. Non-IME
-/// KLIDs (e.g. 00000409) need only the key to OPEN — the optional "Layout Id" value read is allowed
-/// to miss (a query on this handle returns not-found → `IntLoadKeyboardLayout` keeps the default).
-
-/// True if `path` is a `...\Keyboard Layouts\<klid>` subkey (the plural "Keyboard Layouts" under
-/// `Control`, distinct from the singular HKCU `Keyboard Layout\Preload`/`Substitutes`). Matched
-/// case-insensitively; this is the ONLY subkey the MACHINE_ROOT sentinel resolves (paint safety).
+/// True if `path` is exactly the SYSTEM hive `...\Control\Keyboard Layouts\<klid>` subkey (the
+/// plural "Keyboard Layouts" under `Control`, distinct from the singular HKCU
+/// `Keyboard Layout\Preload`/`Substitutes`). Matched case-insensitively; this is the only early
+/// machine-root sentinel subkey winlogon's keyboard init resolves before the broader hosted-machine
+/// registry route is active.
 fn is_keyboard_layout_key(path: &str) -> bool {
-    let lc = path.to_ascii_lowercase();
-    lc.contains("keyboard layouts\\")
+    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+    let tail: &[&str] = if comps.len() >= 2
+        && comps[0].eq_ignore_ascii_case("Registry")
+        && comps[1].eq_ignore_ascii_case("Machine")
+    {
+        &comps[2..]
+    } else {
+        &comps[..]
+    };
+    tail.len() == 5
+        && tail[0].eq_ignore_ascii_case("System")
+        && (tail[1].eq_ignore_ascii_case("CurrentControlSet")
+            || tail[1].eq_ignore_ascii_case("ControlSet001"))
+        && tail[2].eq_ignore_ascii_case("Control")
+        && tail[3].eq_ignore_ascii_case("Keyboard Layouts")
+        && tail[4].len() == 8
+        && tail[4]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b.to_ascii_lowercase()))
 }
 /// True if `path` names the NLS default-language key `System\CurrentControlSet\Control\Nls\Language`
 /// (HKLM-relative form, with or without a leading `\` or `\Registry\Machine\` prefix). winlogon's

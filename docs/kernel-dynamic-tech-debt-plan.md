@@ -735,3 +735,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   broader service-control launch ordering; D3 still has a bounded win32k registry mirror and a
   temporary video object body until the Configuration Manager and real display miniport device stack
   can serve these imports directly.
+- D3 continued. Removed the hosted-process `SYNTH_KBD_KEY` sentinel for
+  `HKLM\System\CurrentControlSet\Control\Keyboard Layouts\<KLID>`. Early keyboard-layout opens still
+  use the predefined-machine-root sentinel when advapi32 maps HKLM, but the layout subkey now has an
+  exact key-shape check and resolves into the real SYSTEM hive through `resolve_key`; missing keys
+  return `STATUS_OBJECT_NAME_NOT_FOUND`, and value reads on existing keys can flow through the normal
+  hive-backed `NtQueryValueKey` path. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs`, `git diff --check`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: D3 still has the bounded win32k import registry
+  mirror, synthetic CPU/HARDWARE and Winlogon-key compatibility keys, and the temporary video object
+  body.
