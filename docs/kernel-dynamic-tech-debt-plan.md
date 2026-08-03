@@ -75,11 +75,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[~]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
   object ownership.
-- `[~]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
+- `[x]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
-- `[ ]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
+- `[x]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
   queue state produced by real window invalidation and dispatch.
-- `[ ]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
+- `[x]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
 
 ## Review Log
 
@@ -1008,5 +1008,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   stopped for checkpointing. Review adjustment: this closes the stack regression introduced by the
   runtime-dynamic cleanup, but A2 remains open for replacing the bootstrap manifest/runtime-layout
   descriptors with a session-manager handoff, C3/F1 remain open for the remaining provider-owned
-  service GUI/GDI model, and F2/F3 remain open for final real WM_PAINT queue and dialog framebuffer
-  proof.
+  service GUI/GDI model, and the paint checklist status is reconciled in the next entry.
+- F2/F3/F4 closed. The checklist had not been reconciled with the already-landed Phase 4 user
+  callback work recorded in `docs/user-callback-dispatch.md`: the modal path now routes real
+  `PeekMessageW`/`GetMessageW`/`DispatchMessageW` win32k SSNs for the correlated IDD_LOGON dialog,
+  api0 WINDOWPROC callbacks run the real user32 dialog/control paint procedures, nested USER/GDI
+  calls re-enter win32k through the continuation stack, and the final gate is a framebuffer readback
+  over the credential dialog rectangle. The current source confirms the old synthetic modal prefix
+  has been replaced by real modal dispatch observation; the remaining `NtUserGetMessage` preflight is
+  the general NT `PeekMessage(PM_NOREMOVE)` empty-queue guard so a blocking wait cannot suspend the
+  single-threaded host, not a synthetic `WM_PAINT` source. Review adjustment: workstream F remains
+  open only for F1's provider-owned service GUI/GDI cleanup.
