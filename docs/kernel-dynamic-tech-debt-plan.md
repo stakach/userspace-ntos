@@ -50,7 +50,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` C1: Route win32k services through `KeAddSystemServiceTable` and provider metadata.
 - `[x]` C2: Reject provider service calls whose runtime arity does not match the registered
   metadata.
-- `[~]` C3: Audit remaining direct win32k/client service shims and convert them to provider-owned
+- `[x]` C3: Audit remaining direct win32k/client service shims and convert them to provider-owned
   dispatch or documented narrow kernel callbacks.
 
 ### D. Driver, Device, And Registry Discovery
@@ -1328,3 +1328,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the log shows five staged `NtUserGetIconInfo` provider dispatches and no `0x104e` wall. Review
   adjustment: the known explorer marshalling frontier is closed and the previous transport/LSA red
   gates are green; C3 remains open only for the final direct-shim audit.
+- C3 complete. The remaining direct win32k service branches were audited after the
+  `NtUserGetIconInfo` frontier closed. The executive-side branches are now one of three explicit
+  categories: cross-address-space argument marshalling/copyback before or after provider dispatch,
+  provider-result observation for gates/client TEB/GDI mappings, or a documented wait-park for
+  blocking GUI message waits whose queue was first tested with real `NtUserPeekMessage(PM_NOREMOVE)`.
+  The wait-park path no longer logs as a win32k provider `WALL`, so actual provider failures remain
+  distinguishable from cooperative single-host-thread waits. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none` passed with the existing
+  warning set. `.tmp/full-boot-c3-audit.log` also reached the microtest sentinel with
+  `275/275 executive->isolated-service checks passed`, `SUCCESS -- the ReactOS stack booted and
+  the win32k desktop painted (0x003a6ea5)`, `PASS exec_win32k_desktop_painted`,
+  `PASS exec_explorer_process_spawned`, `PASS exec_explorer_user_callbacks_redirected`, and
+  `PASS exec_lsa_worker_route`; the win32k transport proof reported `walled=0`. Review adjustment:
+  workstream C is closed; the remaining open plan work is A2, D1-D3, and E1-E3.

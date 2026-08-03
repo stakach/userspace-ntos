@@ -9357,8 +9357,10 @@ pub(crate) unsafe fn service_sec_image(
                     );
                 }
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
-                    // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
-                    // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
+                    // This caller is intentionally parked without a provider dispatch. For GUI
+                    // message waits this means the preflight PeekMessage proved the queue is empty,
+                    // so dispatching the blocking GetMessage would park the single-threaded host
+                    // inside win32k. The !handled block below owns the wait-park.
                     (0, false)
                 } else if find_cursor_icon_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -10317,9 +10319,9 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                // BATCH 43: throttle the status line for the same hot class-loop SSNs (WALL statuses ALWAYS
-                // print — a wall is never suppressed).
-                if !redirected_user_callback && (!ok || w32_log) {
+                // Throttle the status line for the same hot class-loop SSNs. Real provider walls
+                // still print, but an intentional wait-park is not a failed provider dispatch.
+                if !redirected_user_callback && !wl_milestone_park && (!ok || w32_log) {
                     print_str(b"[win32k-svc] ");
                     print_str(win32k_client_label(&nt_handler, pi));
                     print_str(b" SSN 0x");
