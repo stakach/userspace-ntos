@@ -2,6 +2,7 @@ struct Win32kSessionRuntimeState {
     stock_objects: nt_kernel_exec::user_gdi::StockObjectMirror,
     cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror<32, 16>,
     builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror<16>,
+    class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror<128>,
     stock_objects_observed: u64,
     service_stock_hits: u64,
     service_stock_misses: u64,
@@ -14,6 +15,18 @@ struct Win32kSessionRuntimeState {
     userinit_builtin_class_misses: u64,
     userinit_builtin_class_mask: u64,
     userinit_dialog_class_atom: u64,
+    class_atom_names_observed: u64,
+    class_atom_name_serves: u64,
+    class_atom_name_failures: u64,
+    scrollbar_class_atom: u16,
+    scrollbar_class_cursor: u64,
+    userinit_scrollbar_queries: u64,
+    userinit_scrollbar_copyouts: u64,
+    userinit_scrollbar_errors: u64,
+    userinit_scrollbar_atom: u64,
+    userinit_scrollbar_style: u64,
+    userinit_scrollbar_extra: u64,
+    userinit_scrollbar_proc: u64,
 }
 
 impl Win32kSessionRuntimeState {
@@ -22,6 +35,7 @@ impl Win32kSessionRuntimeState {
             stock_objects: nt_kernel_exec::user_gdi::StockObjectMirror::new(),
             cursor_mirror: nt_kernel_exec::user_cursor::GlobalCursorMirror::new(),
             builtin_class_mirror: nt_kernel_exec::user_class::BuiltinClassMirror::new(),
+            class_atom_name_mirror: nt_kernel_exec::user_class::ClassAtomNameMirror::new(),
             stock_objects_observed: 0,
             service_stock_hits: 0,
             service_stock_misses: 0,
@@ -34,6 +48,18 @@ impl Win32kSessionRuntimeState {
             userinit_builtin_class_misses: 0,
             userinit_builtin_class_mask: 0,
             userinit_dialog_class_atom: 0,
+            class_atom_names_observed: 0,
+            class_atom_name_serves: 0,
+            class_atom_name_failures: 0,
+            scrollbar_class_atom: 0,
+            scrollbar_class_cursor: 0,
+            userinit_scrollbar_queries: 0,
+            userinit_scrollbar_copyouts: 0,
+            userinit_scrollbar_errors: 0,
+            userinit_scrollbar_atom: 0,
+            userinit_scrollbar_style: 0,
+            userinit_scrollbar_extra: 0,
+            userinit_scrollbar_proc: 0,
         }
     }
 
@@ -119,6 +145,68 @@ impl Win32kSessionRuntimeState {
     fn record_userinit_builtin_class_miss(&mut self) {
         self.userinit_builtin_class_misses = self.userinit_builtin_class_misses.saturating_add(1);
     }
+
+    fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
+        let observed = self.class_atom_name_mirror.observe(atom, units);
+        if observed {
+            self.class_atom_names_observed = self.class_atom_names_observed.saturating_add(1);
+        }
+        observed
+    }
+
+    fn copy_class_atom_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
+        self.class_atom_name_mirror.copy_name(atom, out)
+    }
+
+    fn record_class_atom_name_serve(&mut self) {
+        self.class_atom_name_serves = self.class_atom_name_serves.saturating_add(1);
+    }
+
+    fn record_class_atom_name_failure(&mut self) {
+        self.class_atom_name_failures = self.class_atom_name_failures.saturating_add(1);
+    }
+
+    fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
+        if atom != 0 {
+            self.scrollbar_class_atom = atom;
+        }
+        if hcursor != 0 {
+            self.scrollbar_class_cursor = hcursor;
+        }
+    }
+
+    fn remember_scrollbar_cursor(&mut self, handle: u32) {
+        if self.scrollbar_class_cursor == 0 && handle != 0 {
+            self.scrollbar_class_cursor = handle as u64;
+        }
+    }
+
+    fn record_userinit_scrollbar_query(&mut self) {
+        self.userinit_scrollbar_queries = self.userinit_scrollbar_queries.saturating_add(1);
+    }
+
+    fn record_userinit_scrollbar_classinfo(
+        &mut self,
+        atom: u16,
+        style: u32,
+        cb_wnd_extra: u32,
+        has_proc: bool,
+        copyout_ok: bool,
+    ) {
+        self.userinit_scrollbar_atom = atom as u64;
+        self.userinit_scrollbar_style = style as u64;
+        self.userinit_scrollbar_extra = cb_wnd_extra as u64;
+        self.userinit_scrollbar_proc = has_proc as u64;
+        if copyout_ok {
+            self.userinit_scrollbar_copyouts = self.userinit_scrollbar_copyouts.saturating_add(1);
+        } else {
+            self.userinit_scrollbar_errors = self.userinit_scrollbar_errors.saturating_add(1);
+        }
+    }
+
+    fn record_userinit_scrollbar_error(&mut self) {
+        self.userinit_scrollbar_errors = self.userinit_scrollbar_errors.saturating_add(1);
+    }
 }
 
 static mut WIN32K_SESSION_RUNTIME_WORK: Win32kSessionRuntimeState =
@@ -138,6 +226,19 @@ pub(crate) struct Win32kSessionCursorClassCounters {
     pub(crate) userinit_builtin_class_misses: u64,
     pub(crate) userinit_builtin_class_mask: u64,
     pub(crate) userinit_dialog_class_atom: u64,
+}
+
+pub(crate) struct Win32kSessionAtomScrollbarCounters {
+    pub(crate) class_atom_names_observed: u64,
+    pub(crate) class_atom_name_serves: u64,
+    pub(crate) class_atom_name_failures: u64,
+    pub(crate) userinit_scrollbar_queries: u64,
+    pub(crate) userinit_scrollbar_copyouts: u64,
+    pub(crate) userinit_scrollbar_errors: u64,
+    pub(crate) userinit_scrollbar_atom: u64,
+    pub(crate) userinit_scrollbar_style: u64,
+    pub(crate) userinit_scrollbar_extra: u64,
+    pub(crate) userinit_scrollbar_proc: u64,
 }
 
 impl Win32kSessionRuntime {
@@ -221,6 +322,78 @@ impl Win32kSessionRuntime {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).record_userinit_builtin_class_miss() };
     }
+
+    pub(crate) fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).observe_class_atom_name(atom, units) }
+    }
+
+    pub(crate) fn copy_class_atom_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.state).copy_class_atom_name(atom, out) }
+    }
+
+    pub(crate) fn record_class_atom_name_serve(&mut self) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).record_class_atom_name_serve() };
+    }
+
+    pub(crate) fn record_class_atom_name_failure(&mut self) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).record_class_atom_name_failure() };
+    }
+
+    pub(crate) fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).observe_scrollbar_class_identity(atom, hcursor) };
+    }
+
+    pub(crate) fn remember_scrollbar_cursor(&mut self, handle: u32) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).remember_scrollbar_cursor(handle) };
+    }
+
+    pub(crate) fn scrollbar_class_atom(&self) -> Option<u16> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        let atom = unsafe { (&*self.state).scrollbar_class_atom };
+        (atom != 0).then_some(atom)
+    }
+
+    pub(crate) fn scrollbar_class_cursor(&self) -> Option<u64> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        let cursor = unsafe { (&*self.state).scrollbar_class_cursor };
+        (cursor != 0).then_some(cursor)
+    }
+
+    pub(crate) fn record_userinit_scrollbar_query(&mut self) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).record_userinit_scrollbar_query() };
+    }
+
+    pub(crate) fn record_userinit_scrollbar_classinfo(
+        &mut self,
+        atom: u16,
+        style: u32,
+        cb_wnd_extra: u32,
+        has_proc: bool,
+        copyout_ok: bool,
+    ) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe {
+            (&mut *self.state).record_userinit_scrollbar_classinfo(
+                atom,
+                style,
+                cb_wnd_extra,
+                has_proc,
+                copyout_ok,
+            )
+        };
+    }
+
+    pub(crate) fn record_userinit_scrollbar_error(&mut self) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).record_userinit_scrollbar_error() };
+    }
 }
 
 pub(crate) fn win32k_session_stock_counters() -> (u64, u64, u64) {
@@ -248,5 +421,23 @@ pub(crate) fn win32k_session_cursor_class_counters() -> Win32kSessionCursorClass
         userinit_builtin_class_misses: state.userinit_builtin_class_misses,
         userinit_builtin_class_mask: state.userinit_builtin_class_mask,
         userinit_dialog_class_atom: state.userinit_dialog_class_atom,
+    }
+}
+
+pub(crate) fn win32k_session_atom_scrollbar_counters() -> Win32kSessionAtomScrollbarCounters {
+    let state = core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK);
+    // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
+    let state = unsafe { &*state };
+    Win32kSessionAtomScrollbarCounters {
+        class_atom_names_observed: state.class_atom_names_observed,
+        class_atom_name_serves: state.class_atom_name_serves,
+        class_atom_name_failures: state.class_atom_name_failures,
+        userinit_scrollbar_queries: state.userinit_scrollbar_queries,
+        userinit_scrollbar_copyouts: state.userinit_scrollbar_copyouts,
+        userinit_scrollbar_errors: state.userinit_scrollbar_errors,
+        userinit_scrollbar_atom: state.userinit_scrollbar_atom,
+        userinit_scrollbar_style: state.userinit_scrollbar_style,
+        userinit_scrollbar_extra: state.userinit_scrollbar_extra,
+        userinit_scrollbar_proc: state.userinit_scrollbar_proc,
     }
 }

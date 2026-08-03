@@ -929,3 +929,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none` passed. Review adjustment: F1's remaining session-global state is class atom
   name resolution and ScrollBar class identity, followed by the semantic WSS_NOIO GDI leaves.
+- C3/F1 cleanup. Moved the class atom-name mirror and ScrollBar class identity/userinit
+  classinfo counters out of root-module globals (`GLOBAL_CLASS_ATOM_NAME_MIRROR`,
+  `GLOBAL_CLASS_ATOM_NAMES_OBSERVED`, `GLOBAL_CLASS_ATOM_NAME_MIRROR_*`,
+  `GLOBAL_SCROLLBAR_CLASS_*`, and `USERINIT_SCROLLBAR_CLASSINFO_*`) into
+  `Win32kSessionRuntime`. Shell `NtUserGetAtomName`, post-dispatch class-name observation, service
+  ScrollBar classinfo synthesis, and userinit ScrollBar proof counters now go through explicit
+  `ExecNtHandler` session methods, and the userinit/explorer post-loop summaries read quiesced
+  session snapshots. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs components/ntos-executive/src/service_sec_image.rs
+  components/ntos-executive/src/service_gui_runtime.rs
+  components/ntos-executive/src/win32k_session_runtime.rs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and an old-symbol source search passed. Review
+  adjustment: the root user32/GDI mirror state from F1 is now gone; F1 remains open for the
+  remaining semantic WSS_NOIO service GUI/GDI branches and the larger provider-owned per-process
+  GUI/GDI ownership model.

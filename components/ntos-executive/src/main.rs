@@ -2045,24 +2045,6 @@ pub(crate) const DEBUG_TRACE: bool = cfg!(feature = "debug-trace");
 /// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
 /// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
 pub(crate) static W32_HOT_LOG: AtomicU64 = AtomicU64::new(0);
-/// Exact dynamic class atom names learned from successful real NtUserRegisterClassExWOW calls.
-pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
-    nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
-    nt_kernel_exec::user_class::ClassAtomNameMirror::new();
-pub(crate) static GLOBAL_CLASS_ATOM_NAMES_OBSERVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_QUERIES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_ATOM: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_STYLE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_EXTRA: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_SCROLLBAR_CLASSINFO_PROC: AtomicU64 = AtomicU64::new(0);
-/// Real ScrollBar class metadata observed from win32k. Non-interactive services can pair this
-/// session-global class identity with their own client-side ScrollBar proc without minting atoms.
-pub(crate) static GLOBAL_SCROLLBAR_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_SCROLLBAR_CLASS_CURSOR: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.
@@ -3198,17 +3180,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
     let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
     let cursor_class = win32k_session_cursor_class_counters();
+    let atom_scrollbar = win32k_session_atom_scrollbar_counters();
     let (stock_observed, stock_hits, stock_misses) = win32k_session_stock_counters();
-    let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
-    let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
-    let class_atom_mirror_failures = GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
-    let scrollbar_queries = USERINIT_SCROLLBAR_CLASSINFO_QUERIES.load(Ordering::Relaxed);
-    let scrollbar_copyouts = USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.load(Ordering::Relaxed);
-    let scrollbar_errors = USERINIT_SCROLLBAR_CLASSINFO_ERRORS.load(Ordering::Relaxed);
-    let scrollbar_atom = USERINIT_SCROLLBAR_CLASSINFO_ATOM.load(Ordering::Relaxed);
-    let scrollbar_style = USERINIT_SCROLLBAR_CLASSINFO_STYLE.load(Ordering::Relaxed);
-    let scrollbar_extra = USERINIT_SCROLLBAR_CLASSINFO_EXTRA.load(Ordering::Relaxed);
-    let scrollbar_proc = USERINIT_SCROLLBAR_CLASSINFO_PROC.load(Ordering::Relaxed);
     let (font_seeds, font_successes, font_failures) = win32k_subsystem::client_system_font_proofs();
     print_str(b"[userinit-image] opens=");
     print_u64(opened);
@@ -3263,25 +3236,25 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_str(b" dialog-atom=0x");
     print_hex(cursor_class.userinit_dialog_class_atom as u32);
     print_str(b" class-atom-names=");
-    print_u64(class_atom_names);
+    print_u64(atom_scrollbar.class_atom_names_observed);
     print_str(b" atom-name-mirror-serves/failures=");
-    print_u64(class_atom_mirror_serves);
+    print_u64(atom_scrollbar.class_atom_name_serves);
     print_str(b"/");
-    print_u64(class_atom_mirror_failures);
+    print_u64(atom_scrollbar.class_atom_name_failures);
     print_str(b" scrollbar-classinfo=");
-    print_u64(scrollbar_queries);
+    print_u64(atom_scrollbar.userinit_scrollbar_queries);
     print_str(b"/");
-    print_u64(scrollbar_copyouts);
+    print_u64(atom_scrollbar.userinit_scrollbar_copyouts);
     print_str(b"/");
-    print_u64(scrollbar_errors);
+    print_u64(atom_scrollbar.userinit_scrollbar_errors);
     print_str(b" atom=0x");
-    print_hex(scrollbar_atom as u32);
+    print_hex(atom_scrollbar.userinit_scrollbar_atom as u32);
     print_str(b" style=0x");
-    print_hex(scrollbar_style as u32);
+    print_hex(atom_scrollbar.userinit_scrollbar_style as u32);
     print_str(b" extra=0x");
-    print_hex(scrollbar_extra as u32);
+    print_hex(atom_scrollbar.userinit_scrollbar_extra as u32);
     print_str(b" proc=");
-    print_u64(scrollbar_proc);
+    print_u64(atom_scrollbar.userinit_scrollbar_proc);
     print_str(b" system-font seeds/successes/failures=0x");
     print_hex(font_seeds as u32);
     print_str(b"/0x");
@@ -3344,11 +3317,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     );
     check(
         b"exec_userinit_scrollbar_classinfo",
-        scrollbar_queries >= 1
-            && scrollbar_copyouts >= 1
-            && scrollbar_errors == 0
-            && scrollbar_atom != 0
-            && scrollbar_proc != 0,
+        atom_scrollbar.userinit_scrollbar_queries >= 1
+            && atom_scrollbar.userinit_scrollbar_copyouts >= 1
+            && atom_scrollbar.userinit_scrollbar_errors == 0
+            && atom_scrollbar.userinit_scrollbar_atom != 0
+            && atom_scrollbar.userinit_scrollbar_proc != 0,
         passed,
     );
     explorer_image_pipeline_spec(passed);
@@ -3378,9 +3351,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let register_window_message_captures =
         EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
-    let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
-    let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
-    let class_atom_mirror_failures = GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
+    let atom_scrollbar = win32k_session_atom_scrollbar_counters();
     let shell_com_provisioned = EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
     let shell_com_opened = EXPLORER_SHELL_COM_CLASS_OPEN_MASK.load(Ordering::Relaxed);
     let shell_com_inproc_default = EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
@@ -3420,11 +3391,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_str(b" win32k-pool-exhaustions=");
     print_u64(win32k_pool_exhaustions);
     print_str(b" class-atom-names=");
-    print_u64(class_atom_names);
+    print_u64(atom_scrollbar.class_atom_names_observed);
     print_str(b" atom-name-mirror-serves/failures=");
-    print_u64(class_atom_mirror_serves);
+    print_u64(atom_scrollbar.class_atom_name_serves);
     print_str(b"/");
-    print_u64(class_atom_mirror_failures);
+    print_u64(atom_scrollbar.class_atom_name_failures);
     print_str(b" api0-redirects=");
     print_u64(api0_redirects);
     print_str(b" callback-failures=");

@@ -1743,7 +1743,8 @@ unsafe fn capture_get_class_info_graph(
 }
 
 unsafe fn copy_back_get_class_info(
-    pi: u64,
+    nt_handler: &mut ExecNtHandler,
+    pi: usize,
     capture: CapturedGetClassInfo,
     atom: u64,
     filled_pages: &[u64],
@@ -1754,7 +1755,7 @@ unsafe fn copy_back_get_class_info(
 
     let wnd_bytes = core::slice::from_raw_parts(capture.wnd_out as *const u8, WNDCLASSEXW_SIZE);
     let wnd_ok = img_spawn::client_write_mapped(
-        pi,
+        pi as u64,
         capture.wnd_client,
         wnd_bytes,
         filled_pages,
@@ -1764,7 +1765,7 @@ unsafe fn copy_back_get_class_info(
     let menu_value = core::ptr::read_unaligned(capture.menu_out as *const u64);
     let menu_ok = capture.menu_client == 0
         || img_spawn::client_write_mapped(
-            pi,
+            pi as u64,
             capture.menu_client,
             &menu_value.to_le_bytes(),
             filled_pages,
@@ -1774,26 +1775,24 @@ unsafe fn copy_back_get_class_info(
     let copyout_ok = wnd_ok && menu_ok;
     if capture.scrollbar && atom != 0 {
         let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
-        GLOBAL_SCROLLBAR_CLASS_ATOM.store(atom, Ordering::Relaxed);
-        if hcursor != 0 {
-            GLOBAL_SCROLLBAR_CLASS_CURSOR.store(hcursor, Ordering::Relaxed);
-        }
+        nt_handler.observe_scrollbar_class_identity(atom as u16, hcursor);
     }
-    if pi == 5 && capture.scrollbar {
+    if nt_handler.hosted_process_role(pi)
+        == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
+        && capture.scrollbar
+    {
         let style = core::ptr::read_unaligned((capture.wnd_out + 0x04) as *const u32);
         let proc = core::ptr::read_unaligned((capture.wnd_out + 0x08) as *const u64);
         let cb_wnd_extra = core::ptr::read_unaligned((capture.wnd_out + 0x14) as *const u32);
         let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
-        USERINIT_SCROLLBAR_CLASSINFO_ATOM.store(atom, Ordering::Relaxed);
-        USERINIT_SCROLLBAR_CLASSINFO_STYLE.store(style as u64, Ordering::Relaxed);
-        USERINIT_SCROLLBAR_CLASSINFO_EXTRA.store(cb_wnd_extra as u64, Ordering::Relaxed);
-        USERINIT_SCROLLBAR_CLASSINFO_PROC.store((proc != 0) as u64, Ordering::Relaxed);
-        if copyout_ok {
-            USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
-        }
-        print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x");
+        nt_handler.record_userinit_scrollbar_classinfo(
+            atom as u16,
+            style,
+            cb_wnd_extra,
+            proc != 0,
+            copyout_ok,
+        );
+        print_str(b"[win32k-class] userinit ScrollBar capture=1 atom=0x");
         print_hex(atom as u32);
         print_str(b" copyout=");
         print_u64(copyout_ok as u64);
@@ -1810,15 +1809,8 @@ unsafe fn copy_back_get_class_info(
     copyout_ok
 }
 
-fn remember_global_scrollbar_cursor(handle: u32) {
-    if handle != 0 {
-        let _ = GLOBAL_SCROLLBAR_CLASS_CURSOR.compare_exchange(
-            0,
-            handle as u64,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
+fn remember_scrollbar_cursor(nt_handler: &mut ExecNtHandler, handle: u32) {
+    nt_handler.remember_scrollbar_cursor(handle);
 }
 
 unsafe fn capture_service_client_pfn_arrays(
@@ -1886,7 +1878,7 @@ unsafe fn copy_service_scrollbar_class_info(
     let proc = nt_handler.service_scrollbar_proc(pi, capture.ansi)?;
     let mut atom = nt_handler.service_scrollbar_atom(pi).unwrap_or(0);
     if atom == 0 {
-        let observed = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
+        let observed = nt_handler.scrollbar_class_atom().unwrap_or(0);
         if observed == 0 {
             return None;
         }
@@ -1895,7 +1887,7 @@ unsafe fn copy_service_scrollbar_class_info(
         }
         atom = observed;
     }
-    let hcursor = GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed);
+    let hcursor = nt_handler.scrollbar_class_cursor().unwrap_or(0);
     if hcursor == 0 {
         return None;
     }
@@ -1913,7 +1905,8 @@ unsafe fn copy_service_scrollbar_class_info(
     );
     core::ptr::write_unaligned(capture.menu_out as *mut u64, payload.menu_name());
     if copy_back_get_class_info(
-        pi as u64,
+        nt_handler,
+        pi,
         capture,
         payload.atom() as u64,
         filled_pages,
@@ -2170,6 +2163,7 @@ unsafe fn capture_registered_class_atom_name(
 }
 
 unsafe fn copy_class_atom_name_from_mirror(
+    nt_handler: &mut ExecNtHandler,
     pi: u64,
     atom: u16,
     unicode_string: u64,
@@ -2178,11 +2172,11 @@ unsafe fn copy_class_atom_name_from_mirror(
     scratch_base: u64,
 ) -> Option<u64> {
     let mut name = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
-    let Some(name_len) = GLOBAL_CLASS_ATOM_NAME_MIRROR
-        .copy_name(atom, &mut name)
+    let Some(name_len) = nt_handler
+        .copy_class_atom_name(atom, &mut name)
         .or_else(|| nt_kernel_exec::user_class::integer_atom_name(atom, &mut name))
     else {
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
+        nt_handler.record_class_atom_name_failure();
         return None;
     };
     let mut raw = [0u8; 16];
@@ -2196,7 +2190,7 @@ unsafe fn copy_class_atom_name_from_mirror(
             scratch_base,
         )
     {
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
+        nt_handler.record_class_atom_name_failure();
         return None;
     }
     let maximum = u16::from_le_bytes([raw[2], raw[3]]) as usize;
@@ -2205,7 +2199,7 @@ unsafe fn copy_class_atom_name_from_mirror(
     }
     let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     if buffer == 0 {
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
+        nt_handler.record_class_atom_name_failure();
         return None;
     }
     let chars = name_len.min((maximum - 2) / 2);
@@ -2231,10 +2225,10 @@ unsafe fn copy_class_atom_name_from_mirror(
         scratch_base,
     );
     if !text_ok || !terminator_ok {
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.fetch_add(1, Ordering::Relaxed);
+        nt_handler.record_class_atom_name_failure();
         return None;
     }
-    GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.fetch_add(1, Ordering::Relaxed);
+    nt_handler.record_class_atom_name_serve();
     Some((chars * 2) as u64)
 }
 
@@ -8177,6 +8171,8 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
+                let userinit_gui_client = nt_handler.hosted_process_role(pi)
+                    == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
                 let get_class_info_ansi = if m0 == 0x10bd {
                     client_read_u64_mapped(
                         pi as u64,
@@ -8204,8 +8200,8 @@ pub(crate) unsafe fn service_sec_image(
                         d_a1 = capture.class_desc;
                         d_a2 = capture.wnd_out;
                         d_a3 = if a3 == 0 { 0 } else { capture.menu_out };
-                        if pi == 5 && capture.scrollbar {
-                            USERINIT_SCROLLBAR_CLASSINFO_QUERIES.fetch_add(1, Ordering::Relaxed);
+                        if userinit_gui_client && capture.scrollbar {
+                            nt_handler.record_userinit_scrollbar_query();
                         }
                         Some(capture)
                     } else {
@@ -8399,8 +8395,6 @@ pub(crate) unsafe fn service_sec_image(
                     hosted_process_is_noninteractive_service_gui_client(&nt_handler, pi);
                 let shell_gui_client =
                     hosted_process_is_interactive_shell_gui_client(&nt_handler, pi);
-                let userinit_gui_client = nt_handler.hosted_process_role(pi)
-                    == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
                 // Shell GUI clients ask win32k for class atom names from inside nested user
                 // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
                 // mirror-backed names are served before dispatch; misses stay visible.
@@ -8412,6 +8406,7 @@ pub(crate) unsafe fn service_sec_image(
                         .unwrap_or(SMSS_TEB_VA);
                     crate::ke_gdi_flush_user_batch(pi, client_teb);
                     let mirrored = copy_class_atom_name_from_mirror(
+                        &mut *nt_handler,
                         pi as u64,
                         a0 as u16,
                         a1,
@@ -8453,7 +8448,7 @@ pub(crate) unsafe fn service_sec_image(
                         .as_ref()
                         .and_then(|key| nt_handler.lookup_global_cursor(key));
                     if let Some(handle) = hit {
-                        remember_global_scrollbar_cursor(handle);
+                        remember_scrollbar_cursor(&mut *nt_handler, handle);
                         if userinit_gui_client {
                             nt_handler.record_userinit_global_cursor_hit(handle);
                         }
@@ -8579,7 +8574,7 @@ pub(crate) unsafe fn service_sec_image(
                         .as_ref()
                         .and_then(|key| nt_handler.lookup_global_cursor(key));
                     if let Some(handle) = hit {
-                        remember_global_scrollbar_cursor(handle);
+                        remember_scrollbar_cursor(&mut *nt_handler, handle);
                         print_str(
                             b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) MIRROR pi=",
                         );
@@ -8598,7 +8593,7 @@ pub(crate) unsafe fn service_sec_image(
                     // win32k registration/query paths. A miss stays visible instead of minting an atom.
                     let hit = if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
                     {
-                        let atom = GLOBAL_SCROLLBAR_CLASS_ATOM.load(Ordering::Relaxed) as u16;
+                        let atom = nt_handler.scrollbar_class_atom().unwrap_or(0);
                         if nt_handler.record_service_scrollbar_atom(pi, atom) {
                             Some(atom)
                         } else {
@@ -8746,7 +8741,7 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" atom=0x");
                             print_hex(debug.scrollbar_atom as u32);
                             print_str(b" hcursor=0x");
-                            print_hex_u64(GLOBAL_SCROLLBAR_CLASS_CURSOR.load(Ordering::Relaxed));
+                            print_hex_u64(nt_handler.scrollbar_class_cursor().unwrap_or(0));
                             print_str(b" procA=");
                             print_u64(debug.has_pfn_a as u64);
                             print_str(b" procW=");
@@ -9308,7 +9303,8 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(capture) = get_class_info_capture {
                         if st != 0 {
                             if !copy_back_get_class_info(
-                                pi as u64,
+                                &mut *nt_handler,
+                                pi,
                                 capture,
                                 st as u32 as u64,
                                 filled_pages,
@@ -9317,9 +9313,9 @@ pub(crate) unsafe fn service_sec_image(
                             ) {
                                 st = 0;
                             }
-                        } else if pi == 5 && capture.scrollbar {
-                            USERINIT_SCROLLBAR_CLASSINFO_ERRORS.fetch_add(1, Ordering::Relaxed);
-                            print_str(b"[win32k-class] pi=5 ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
+                        } else if userinit_gui_client && capture.scrollbar {
+                            nt_handler.record_userinit_scrollbar_error();
+                            print_str(b"[win32k-class] userinit ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
                         }
                     }
                     if let Some(capture) = get_class_name_capture {
@@ -9340,9 +9336,7 @@ pub(crate) unsafe fn service_sec_image(
                 if ok && !redirected_user_callback && m0 == 0x10b4 && st != 0 && !svc_noninteractive
                 {
                     if let Some(name) = registered_class_atom_name.as_ref() {
-                        if GLOBAL_CLASS_ATOM_NAME_MIRROR.observe(st as u16, name.as_slice()) {
-                            GLOBAL_CLASS_ATOM_NAMES_OBSERVED.fetch_add(1, Ordering::Relaxed);
-                        }
+                        nt_handler.observe_class_atom_name(st as u16, name.as_slice());
                     }
                 }
                 if ok

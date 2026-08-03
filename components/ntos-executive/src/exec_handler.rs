@@ -1874,6 +1874,64 @@ impl ExecNtHandler {
         self.win32k_session.record_userinit_builtin_class_miss();
     }
 
+    pub(crate) fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
+        self.win32k_session.observe_class_atom_name(atom, units)
+    }
+
+    pub(crate) fn copy_class_atom_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
+        self.win32k_session.copy_class_atom_name(atom, out)
+    }
+
+    pub(crate) fn record_class_atom_name_serve(&mut self) {
+        self.win32k_session.record_class_atom_name_serve();
+    }
+
+    pub(crate) fn record_class_atom_name_failure(&mut self) {
+        self.win32k_session.record_class_atom_name_failure();
+    }
+
+    pub(crate) fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
+        self.win32k_session
+            .observe_scrollbar_class_identity(atom, hcursor);
+    }
+
+    pub(crate) fn remember_scrollbar_cursor(&mut self, handle: u32) {
+        self.win32k_session.remember_scrollbar_cursor(handle);
+    }
+
+    pub(crate) fn scrollbar_class_atom(&self) -> Option<u16> {
+        self.win32k_session.scrollbar_class_atom()
+    }
+
+    pub(crate) fn scrollbar_class_cursor(&self) -> Option<u64> {
+        self.win32k_session.scrollbar_class_cursor()
+    }
+
+    pub(crate) fn record_userinit_scrollbar_query(&mut self) {
+        self.win32k_session.record_userinit_scrollbar_query();
+    }
+
+    pub(crate) fn record_userinit_scrollbar_classinfo(
+        &mut self,
+        atom: u16,
+        style: u32,
+        cb_wnd_extra: u32,
+        has_proc: bool,
+        copyout_ok: bool,
+    ) {
+        self.win32k_session.record_userinit_scrollbar_classinfo(
+            atom,
+            style,
+            cb_wnd_extra,
+            has_proc,
+            copyout_ok,
+        );
+    }
+
+    pub(crate) fn record_userinit_scrollbar_error(&mut self) {
+        self.win32k_session.record_userinit_scrollbar_error();
+    }
+
     pub(crate) fn publish_hosted_process_vspace(
         &mut self,
         pi: usize,
