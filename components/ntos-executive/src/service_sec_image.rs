@@ -19,6 +19,7 @@ static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -27,6 +28,9 @@ const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFF
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
+const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
+const FNID_DEFWINDOWPROC: u64 = 0x029e;
+const FNID_SENDMESSAGE: u64 = 0x02b1;
 const WM_QUIT: u32 = 0x0012;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
@@ -7154,6 +7158,10 @@ pub(crate) unsafe fn service_sec_image(
                 let mut load_keyboard_layout_stack_args = [0u64; 3];
                 let mut load_keyboard_layout_stack_arg_count = 0usize;
                 let mut load_keyboard_layout_probe_failed = false;
+                let mut message_call_stack_args = [0u64; 3];
+                let mut message_call_stack_arg_count = 0usize;
+                let mut message_call_copyout = (0u64, 0u64, 0usize);
+                let mut message_call_probe_failed = false;
                 if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
@@ -7466,6 +7474,92 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == 0x125c {
                     load_keyboard_layout_probe_failed = true;
+                } else if m0 == NTUSER_MESSAGE_CALL_SSN && sp != 0 {
+                    // NtUserMessageCall carries its final three arguments on the client stack:
+                    // ResultInfo, dwType/FNID, and Ansi. During a real api0 WM_PAINT callback this is
+                    // usually DefWindowProcW, whose kernel-side IntBeginPaint/IntEndPaint path must
+                    // clear WNDS_PAINTNOTPROCESSED. Do the NT probe/capture step at the
+                    // cross-VSpace boundary so isolated win32k sees stable provider-owned tail args.
+                    let result_info = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x28,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let dw_type = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x30,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let ansi = client_read_u64_mapped(
+                        pi as u64,
+                        sp + 0x38,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    if let (Some(result_info), Some(dw_type), Some(ansi)) =
+                        (result_info, dw_type, ansi)
+                    {
+                        if matches!(dw_type, FNID_DEFWINDOWPROC | FNID_SENDMESSAGE) {
+                            let staged_result = if result_info == 0 {
+                                0
+                            } else {
+                                let base = win32k_subsystem::WIN32K_ARG_VADDR;
+                                let mut seed = [0u8; 8];
+                                if !img_spawn::client_copyin_mapped(
+                                    pi as u64,
+                                    result_info,
+                                    &mut seed,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    message_call_probe_failed = true;
+                                    0
+                                } else {
+                                    core::ptr::copy_nonoverlapping(
+                                        seed.as_ptr(),
+                                        base as *mut u8,
+                                        seed.len(),
+                                    );
+                                    base
+                                }
+                            };
+                            if !message_call_probe_failed {
+                                message_call_stack_args = [staged_result, dw_type, ansi];
+                                message_call_stack_arg_count = message_call_stack_args.len();
+                                message_call_copyout = (
+                                    result_info,
+                                    staged_result,
+                                    if result_info == 0 { 0 } else { 8 },
+                                );
+                                let n = MESSAGE_CALL_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                                if n < 32 {
+                                    print_str(b"[w32marshal] NtUserMessageCall pi=");
+                                    print_u64(pi as u64);
+                                    print_str(b" hwnd=0x");
+                                    print_hex_u64(a0);
+                                    print_str(b" msg=0x");
+                                    print_hex(a1 as u32);
+                                    print_str(b" result=0x");
+                                    print_hex_u64(result_info);
+                                    print_str(b" fnid=0x");
+                                    print_hex(dw_type as u32);
+                                    print_str(b" ansi=");
+                                    print_u64(ansi as u32 as u64);
+                                    print_str(b"\n");
+                                }
+                            }
+                        }
+                    } else {
+                        message_call_probe_failed = true;
+                    }
+                } else if m0 == NTUSER_MESSAGE_CALL_SSN {
+                    message_call_probe_failed = true;
                 } else if m0 == 0x10cb && hosted_process_uses_client_gdi(&nt_handler, pi) {
                     // NtGdiGetCharWidthW copies an optional caller WCHAR/glyph array and then writes
                     // Count INT/FLOAT-sized widths back to the caller. Stage both sides explicitly so
@@ -8482,6 +8576,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if message_call_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserMessageCall stack probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a0);
+                        print_str(b" msg=0x");
+                        print_hex(a1 as u32);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if create_window_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -8731,6 +8839,8 @@ pub(crate) unsafe fn service_sec_image(
                     let load_keyboard_layout_staged_stack = m0 == 0x125c
                         && load_keyboard_layout_stack_arg_count
                             == load_keyboard_layout_stack_args.len();
+                    let message_call_staged_stack = m0 == NTUSER_MESSAGE_CALL_SSN
+                        && message_call_stack_arg_count == message_call_stack_args.len();
                     // Keep the original SP in the dispatch context for callback/completion
                     // observers. win32k_dispatch_wide still sends SH_REQ_CALLER_SP=0 when
                     // stack_args is non-empty, so the component consumes only the staged tail.
@@ -8751,6 +8861,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &create_window_stack_args)
                     } else if load_keyboard_layout_staged_stack {
                         (sp, &load_keyboard_layout_stack_args)
+                    } else if message_call_staged_stack {
+                        (sp, &message_call_stack_args)
                     } else {
                         (sp, &[])
                     };
@@ -8956,6 +9068,34 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(client_buffer);
                                 print_str(b" bytes=");
                                 print_u64(output_bytes as u64);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if message_call_staged_stack && r.1 {
+                        let (client_result, staged_result, output_bytes) = message_call_copyout;
+                        let result_ok = output_bytes == 0
+                            || img_spawn::client_copyout_mapped(
+                                pi as u64,
+                                client_result,
+                                core::slice::from_raw_parts(
+                                    staged_result as *const u8,
+                                    output_bytes,
+                                ),
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                        if !result_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtUserMessageCall result copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" result=0x");
+                                print_hex_u64(client_result);
                                 print_str(b"\n");
                             }
                             r = (0, true);

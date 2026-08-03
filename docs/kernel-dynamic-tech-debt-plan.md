@@ -1,6 +1,6 @@
 # Kernel Dynamic Tech Debt Plan
 
-Last updated: 2026-08-03
+Last updated: 2026-08-04
 
 ## Objective
 
@@ -75,7 +75,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[~]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
   object ownership.
-- `[ ]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
+- `[~]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
 - `[ ]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
   queue state produced by real window invalidation and dispatch.
@@ -868,3 +868,21 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   real api0 explorer `WM_PAINT` callbacks before being manually stopped; review adjustment: the CPU
   HARDWARE compatibility key is closed, while the live frontier for the next plan slice is F2/F3
   paint invalidation/queue completion plus D3's remaining win32k registry/device mirrors.
+
+### 2026-08-04
+
+- C3/F2 repair. `NtUserMessageCall` now has explicit cross-address-space stack-tail marshalling for
+  the simple `FNID_DEFWINDOWPROC` and `FNID_SENDMESSAGE` shapes used by client-side user32 during
+  nested api0 paint/message callbacks. The executive probes `ResultInfo`, `dwType`, and `Ansi` from
+  the hosted caller stack, stages an optional provider-owned result slot in the win32k argument
+  frame, forwards the tail through `win32k_dispatch_wide`, and copies the result slot back only after
+  a successful provider return. Unsupported message-call shapes still take the existing raw path so
+  they remain visible as future boundary work instead of gaining a silent success path. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. The broader boot attempt
+  `.tmp/full-boot-message-call-marshal-20260804-000837.log` was manually stopped after reaching
+  real winlogon/services/LSASS GUI-provider initialization, msgina loading, and LSA/RPC setup; it did
+  not reach the explorer `WM_PAINT` loop before the stop, so F2 remains open. Review adjustment:
+  the next executable cleanup target is the remaining service/class/cursor/DC mirror surface under
+  C3/F1, plus E3's modeled SRM/LSA accept path.
