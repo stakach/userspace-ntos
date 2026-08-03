@@ -38,11 +38,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### B. Win32k Process And Thread Context
 
-- `[~]` B1: Replace placeholder `EPROCESS`, `ETHREAD`, `W32PROCESS`, and `W32THREAD` addresses
+- `[x]` B1: Replace placeholder `EPROCESS`, `ETHREAD`, `W32PROCESS`, and `W32THREAD` addresses
   with object-manager/process-manager backed pointers.
-- `[ ]` B2: Replace `WIN32K_CLIENT_*[pi]` tables with PID/TID keyed runtime state populated by
+- `[x]` B2: Replace `WIN32K_CLIENT_*[pi]` tables with PID/TID keyed runtime state populated by
   `PsConvertToGuiThread`, process/thread callouts, and win32k allocations.
-- `[ ]` B3: Remove bootstrap placeholder aliases once win32k can resolve current process/thread
+- `[x]` B3: Remove bootstrap placeholder aliases once win32k can resolve current process/thread
   objects dynamically for every GUI caller.
 
 ### C. System Service Provider Boundary
@@ -584,3 +584,43 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   win32k-hosted scratch objects selected through `WIN32K_CLIENT_*[pi]`; the next B1/B2 step is to
   derive those from process-manager/thread-manager objects and remove the per-PI client context
   arrays.
+- B1/B2/B3 cleanup. `nt-process` now has explicit kernel object pointer slots for process and
+  thread records, including PID/TID reverse lookups for `EPROCESS`/`ETHREAD` bodies. The win32k
+  shared dispatch ABI now carries the caller's real TID, and the win32k host removed the old
+  `WIN32K_CLIENT_*[pi]` context arrays plus the fixed bootstrap `PH_EPROCESS`/`PH_ETHREAD`
+  selection path. GUI process/thread context is now keyed by runtime PID/TID records and populated
+  through the same process/thread callout path used for routed clients; the bootstrap DriverEntry
+  context is allocated through that runtime path as well. Validation:
+  `cargo test --manifest-path crates/nt-process/Cargo.toml` passed, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`
+  passed with the existing warning set. Review adjustment: B2 and B3 are complete. B1 remains open
+  until the allocated `EPROCESS`/`ETHREAD` addresses are published back into `ProcessManager`, or
+  allocated by the executive and handed to win32k, so process-manager object identity is
+  authoritative end to end rather than mirrored by component-local GUI runtime records.
+- B1 complete. The win32k shared dispatch ABI now carries ProcessManager-published `EPROCESS` and
+  `ETHREAD` pointers when known, and win32k publishes the selected PID/TID plus `EPROCESS`,
+  `ETHREAD`, `W32PROCESS`, and `W32THREAD` back through shared context slots before/after attach
+  callouts. Service-loop win32k dispatches synchronize those publications into `ProcessManager`, so
+  later GUI calls resolve object identity through the process/thread records instead of component-
+  local scratch ownership. `ObReferenceObjectByHandle` no longer aliases arbitrary process-typed
+  unknown handles to the current process; `NtUserProcessConnect` rewrites only
+  `NtCurrentProcess()` or real process handles that ProcessManager resolves to the routed client.
+  Validation: `cargo test --manifest-path crates/nt-process/Cargo.toml` passed, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`
+  passed with the existing 267-warning baseline. Review adjustment: workstream B is closed for the
+  placeholder-object cleanup; the next dynamic-boundary work should move to C3/F1 or the D/E
+  discovery and LPC routes unless full boot exposes a regression.
+- B1 repair. Full boot exposed that `InitThreadCallback` cannot safely use the live hosted TEB VA
+  inside win32k's component address space: winlogon's `NtUserProcessConnect` previously faulted at
+  `win32k` RVA `0x39538` reading `TEB->PEB->ProcessParameters` from an image-window collision. The
+  thread callout now gets a per-thread win32k-owned TEB/PEB/process-parameters mirror allocated from
+  the win32k pool and seeded from PID/TID runtime context, while the live user TEB remains client
+  state that the executive seeds after win32k publishes desktop/thread facts. The old shared
+  kernel-TEB scratch fallback was removed from this path. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed with the existing warning baseline, and
+  `.tmp/full-boot-dynamic-callout-teb-20260803.log` reached winlogon `NtUserProcessConnect`, real
+  api7 callback redirection/return, and `thread callout tid=6 pi=2 status=0`. Review adjustment: the
+  next full-boot frontier is user32 client setup after attach: `user32!UserClientDllInitialize+0x740`
+  dereferences `gHandleTable->handles` with `gSharedInfo.aheList == NULL`, so the next C3/F1 target is
+  real `USERCONNECT.siClient`/USER handle-table publication for non-CSRSS GUI clients.

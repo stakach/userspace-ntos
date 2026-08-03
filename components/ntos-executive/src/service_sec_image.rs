@@ -221,12 +221,18 @@ fn win32k_client_context_for_thread(
     peb_mirror: u64,
     scratch_base: u64,
 ) -> win32k_glue::Win32kClientContext {
+    let pid = nt_handler.pm_pid_for_pi(pi).unwrap_or(0);
     win32k_glue::Win32kClientContext {
         pi: pi as u32,
-        pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+        pid: pid as u64,
         badge,
         tid,
         tcb,
+        eprocess: nt_handler.pm.process_kernel_object(pid).unwrap_or(0),
+        ethread: nt_handler
+            .pm
+            .thread_kernel_object(tid as nt_process::ThreadId)
+            .unwrap_or(0),
         role,
         process_role: nt_handler.hosted_process_role(pi),
         top_badge: nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
@@ -234,6 +240,74 @@ fn win32k_client_context_for_thread(
         peb_mirror,
         scratch_base,
     }
+}
+
+unsafe fn sync_win32k_context_to_process_manager(
+    nt_handler: &mut ExecNtHandler,
+    expected: win32k_glue::Win32kClientContext,
+) {
+    let published = win32k_glue::published_win32k_context();
+    let pid = if published.pid != 0 {
+        published.pid
+    } else {
+        expected.pid
+    };
+    let tid = if published.tid != 0 {
+        published.tid
+    } else {
+        expected.tid
+    };
+    if expected.pid != 0 && pid != expected.pid {
+        print_str(b"[win32k-context] ERROR: published PID mismatch expected=");
+        print_u64(expected.pid);
+        print_str(b" actual=");
+        print_u64(pid);
+        print_str(b"\n");
+        return;
+    }
+    if expected.tid != 0 && tid != expected.tid {
+        print_str(b"[win32k-context] ERROR: published TID mismatch expected=");
+        print_u64(expected.tid);
+        print_str(b" actual=");
+        print_u64(tid);
+        print_str(b"\n");
+        return;
+    }
+    if pid != 0 && pid <= nt_process::ProcessId::MAX as u64 {
+        let pid = pid as nt_process::ProcessId;
+        if published.eprocess != 0 {
+            let _ = nt_handler.pm.set_process_kernel_object(pid, published.eprocess);
+        }
+        if published.w32process != 0 {
+            let _ = nt_handler.pm.set_process_win32(pid, published.w32process);
+        }
+    }
+    if tid != 0 && tid <= nt_process::ThreadId::MAX as u64 {
+        let tid = tid as nt_process::ThreadId;
+        if published.ethread != 0 {
+            let _ = nt_handler.pm.set_thread_kernel_object(tid, published.ethread);
+        }
+        if published.w32thread != 0 {
+            let _ = nt_handler.pm.set_thread_win32(tid, published.w32thread);
+        }
+    }
+}
+
+unsafe fn dispatch_win32k_for_client(
+    nt_handler: &mut ExecNtHandler,
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    client: win32k_glue::Win32kClientContext,
+) -> (u64, bool) {
+    let result =
+        win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
+    sync_win32k_context_to_process_manager(nt_handler, client);
+    result
 }
 
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
@@ -323,6 +397,8 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
             badge,
             tid: current_tid,
             tcb: current_tcb,
+            eprocess: 0,
+            ethread: 0,
             role: current_role,
             process_role,
             top_badge,
@@ -6426,7 +6502,19 @@ pub(crate) unsafe fn service_sec_image(
                     // The caller's own NtUserGetMessage(MSG* [R10], HWND [RDX], min [R8], max [R9]);
                     // NtUserPeekMessage takes the same four plus wRemoveMsg on the stack.
                     W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-                    let peek = win32k_glue::win32k_dispatch_wide(
+                    let client = win32k_client_context_for_thread(
+                        &nt_handler,
+                        pi,
+                        badge,
+                        nt_handler.current_tid,
+                        hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                        nt_handler.hosted_thread_role(nt_handler.current_tid),
+                        client_teb,
+                        peb_mirror,
+                        scratch_base,
+                    );
+                    let peek = dispatch_win32k_for_client(
+                        &mut nt_handler,
                         nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
                         get_recv_mr(9),
                         m3,
@@ -6434,17 +6522,7 @@ pub(crate) unsafe fn service_sec_image(
                         get_recv_mr(8),
                         sp,
                         &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
-                        win32k_client_context_for_thread(
-                            &nt_handler,
-                            pi,
-                            badge,
-                            nt_handler.current_tid,
-                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            client_teb,
-                            peb_mirror,
-                            scratch_base,
-                        ),
+                        client,
                     );
                     GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
                     if peek.0 == 0 {
@@ -6631,13 +6709,6 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(a2 as u32);
                     print_str(b"\n");
                 }
-                // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
-                // hosted client's process via the synthetic handle the DriverEntry attach used.
-                let mut d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF {
-                    win32k_subsystem::FAKE_PROCESS_HANDLE
-                } else {
-                    a0
-                };
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
                 // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -6645,6 +6716,19 @@ pub(crate) unsafe fn service_sec_image(
                 // dispatch with the ARG-frame pointer, then copy win32k's out-params back to the same
                 // caller process.
                 let has_buf = m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
+                let current_pid = nt_handler.pm_pid_for_pi(pi);
+                let mut d_a0 = if has_buf
+                    && (a0 == 0xFFFF_FFFF_FFFF_FFFF
+                        || (current_pid.is_some()
+                            && nt_handler.resolve_process_handle(a0) == current_pid))
+                {
+                    // The component's Ob layer accepts only this narrow connect handle for the
+                    // current process. Real handles must be resolved by ProcessManager before they are
+                    // translated, so arbitrary process-typed values cannot alias to the current EPROCESS.
+                    win32k_subsystem::FAKE_PROCESS_HANDLE
+                } else {
+                    a0
+                };
                 let (mut d_a1, blen) = if has_buf {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     let n = a2.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
@@ -8143,7 +8227,19 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         (sp, &[])
                     };
-                    let mut r = win32k_glue::win32k_dispatch_wide(
+                    let client = win32k_client_context_for_thread(
+                        &nt_handler,
+                        pi,
+                        badge,
+                        nt_handler.current_tid,
+                        hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
+                        nt_handler.hosted_thread_role(nt_handler.current_tid),
+                        client_teb,
+                        peb_mirror,
+                        scratch_base,
+                    );
+                    let mut r = dispatch_win32k_for_client(
+                        &mut nt_handler,
                         m0,
                         d_a0,
                         d_a1,
@@ -8151,17 +8247,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a3,
                         dispatch_sp,
                         dispatch_stack_args,
-                        win32k_client_context_for_thread(
-                            &nt_handler,
-                            pi,
-                            badge,
-                            nt_handler.current_tid,
-                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            nt_handler.hosted_thread_role(nt_handler.current_tid),
-                            client_teb,
-                            peb_mirror,
-                            scratch_base,
-                        ),
+                        client,
                     );
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail

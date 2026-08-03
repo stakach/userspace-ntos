@@ -327,6 +327,10 @@ pub struct NtProcess {
     /// Opaque `W32PROCESS` pointer parked by win32k via `PsSetProcessWin32Process`
     /// (read back with `PsGetProcessWin32Process`). `None` until win32k attaches.
     pub win32_process: Option<u64>,
+    /// Opaque executive-owned `EPROCESS` body pointer used by kernel-mode providers that need a
+    /// stable process object address. The object bytes live outside this crate; ProcessManager owns
+    /// the NT identity and stores the pointer verbatim.
+    pub kernel_process_object: Option<u64>,
     /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
     /// `PsGetProcessWin32WindowStation`).
     pub win32_window_station: Option<u64>,
@@ -471,6 +475,10 @@ pub struct NtThread {
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
     pub win32_thread: Option<u64>,
+    /// Opaque executive-owned `ETHREAD` body pointer used by kernel-mode providers that need a
+    /// stable thread object address. The object bytes live outside this crate; ProcessManager owns
+    /// the NT identity and stores the pointer verbatim.
+    pub kernel_thread_object: Option<u64>,
     /// The thread's TEB base VA (its `NtCurrentTeb()` / `KTHREAD.Teb`). Set when the host actually
     /// spawns the backing thread (its TEB is a per-thread page); read back by
     /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`. `0` until the TEB is mapped.
@@ -648,6 +656,7 @@ impl ProcessManager {
                 exit_status: None,
                 primary_token: None,
                 win32_process: None,
+                kernel_process_object: None,
                 win32_window_station: None,
                 process_cookie: 0,
                 default_hard_error_processing,
@@ -913,6 +922,7 @@ impl ProcessManager {
                 impersonation: None,
                 suspend_count: 0,
                 win32_thread: None,
+                kernel_thread_object: None,
                 teb_base: 0,
                 break_on_termination: false,
                 disable_boost: false,
@@ -959,12 +969,41 @@ impl ProcessManager {
         Ok(tid)
     }
 
-    // --- win32k per-process/thread context slots (spec §7.4) -----------------
+    // --- kernel/win32k per-process/thread context slots (spec §7.4) ----------
     //
-    // win32k parks an opaque `W32PROCESS`/`W32THREAD` pointer on each hosted
-    // process/thread and reads it back on every NtUser/NtGdi call. These are
-    // pure pointer slots — the executive stores what win32k hands it and returns
-    // it verbatim; it never dereferences the value.
+    // Kernel-mode providers need stable process/thread object bodies
+    // (`EPROCESS`/`ETHREAD`) while win32k parks opaque `W32PROCESS`/`W32THREAD`
+    // pointers on those objects. These are pointer slots — the executive stores
+    // what the owning boundary hands it and returns it verbatim.
+
+    /// Park the executive-owned `EPROCESS` body pointer on `pid`.
+    /// Returns `false` for an unknown process.
+    pub fn set_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.kernel_process_object = (eprocess != 0).then_some(eprocess);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read back the parked `EPROCESS` body pointer.
+    pub fn process_kernel_object(&self, pid: ProcessId) -> Option<u64> {
+        self.processes
+            .get(&pid)
+            .and_then(|p| p.kernel_process_object)
+    }
+
+    /// Reverse-map an `EPROCESS` body pointer to the owning PID.
+    pub fn pid_for_kernel_process_object(&self, eprocess: u64) -> Option<ProcessId> {
+        if eprocess == 0 {
+            return None;
+        }
+        self.processes.iter().find_map(|(&pid, process)| {
+            (process.kernel_process_object == Some(eprocess)).then_some(pid)
+        })
+    }
 
     /// `PsSetProcessWin32Process`: park win32k's `W32PROCESS` pointer on `pid`.
     /// Returns `false` for an unknown process.
@@ -998,6 +1037,35 @@ impl ProcessManager {
     /// `PsGetThreadWin32Thread`: read back the parked `W32THREAD` pointer.
     pub fn thread_win32(&self, tid: ThreadId) -> Option<u64> {
         self.threads.get(&tid).and_then(|t| t.win32_thread)
+    }
+
+    /// Park the executive-owned `ETHREAD` body pointer on `tid`.
+    /// Returns `false` for an unknown thread.
+    pub fn set_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
+        match self.threads.get_mut(&tid) {
+            Some(t) => {
+                t.kernel_thread_object = (ethread != 0).then_some(ethread);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read back the parked `ETHREAD` body pointer.
+    pub fn thread_kernel_object(&self, tid: ThreadId) -> Option<u64> {
+        self.threads
+            .get(&tid)
+            .and_then(|t| t.kernel_thread_object)
+    }
+
+    /// Reverse-map an `ETHREAD` body pointer to the owning TID.
+    pub fn tid_for_kernel_thread_object(&self, ethread: u64) -> Option<ThreadId> {
+        if ethread == 0 {
+            return None;
+        }
+        self.threads.iter().find_map(|(&tid, thread)| {
+            (thread.kernel_thread_object == Some(ethread)).then_some(tid)
+        })
     }
 
     /// `PsSetProcessWindowStation`: bind a `WINDOWSTATION` to `pid`.

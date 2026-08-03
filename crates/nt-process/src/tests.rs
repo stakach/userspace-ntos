@@ -1162,23 +1162,51 @@ fn win32_process_thread_context_slots() {
     // Slots start empty — win32k has not attached yet.
     assert_eq!(pm.process_win32(pid), None);
     assert_eq!(pm.thread_win32(tid), None);
+    assert_eq!(pm.process_kernel_object(pid), None);
+    assert_eq!(pm.thread_kernel_object(tid), None);
     assert_eq!(pm.process_window_station(pid), None);
 
-    // win32k parks its opaque W32PROCESS / W32THREAD pointers.
+    // The executive owns EPROCESS / ETHREAD body addresses; win32k parks its
+    // opaque W32PROCESS / W32THREAD pointers on those objects.
+    assert!(pm.set_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
+    assert!(pm.set_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
     assert!(pm.set_process_win32(pid, 0xFFFF_9E00_1234_0000));
     assert!(pm.set_thread_win32(tid, 0xFFFF_9E00_5678_0000));
     assert!(pm.set_process_window_station(pid, 0xFFFF_9E00_9ABC_0000));
+    assert_eq!(
+        pm.process_kernel_object(pid),
+        Some(0xFFFF_8000_1000_0000)
+    );
+    assert_eq!(pm.thread_kernel_object(tid), Some(0xFFFF_8000_2000_0000));
+    assert_eq!(
+        pm.pid_for_kernel_process_object(0xFFFF_8000_1000_0000),
+        Some(pid)
+    );
+    assert_eq!(
+        pm.tid_for_kernel_thread_object(0xFFFF_8000_2000_0000),
+        Some(tid)
+    );
     assert_eq!(pm.process_win32(pid), Some(0xFFFF_9E00_1234_0000));
     assert_eq!(pm.thread_win32(tid), Some(0xFFFF_9E00_5678_0000));
     assert_eq!(pm.process_window_station(pid), Some(0xFFFF_9E00_9ABC_0000));
 
     // Setting NULL clears the slot (win32k detaches on process/thread teardown).
+    assert!(pm.set_process_kernel_object(pid, 0));
+    assert!(pm.set_thread_kernel_object(tid, 0));
     assert!(pm.set_process_win32(pid, 0));
+    assert_eq!(pm.process_kernel_object(pid), None);
+    assert_eq!(pm.thread_kernel_object(tid), None);
+    assert_eq!(pm.pid_for_kernel_process_object(0xFFFF_8000_1000_0000), None);
+    assert_eq!(pm.tid_for_kernel_thread_object(0xFFFF_8000_2000_0000), None);
     assert_eq!(pm.process_win32(pid), None);
 
     // Unknown pid/tid is rejected, not a panic.
+    assert!(!pm.set_process_kernel_object(9999, 1));
+    assert!(!pm.set_thread_kernel_object(9999, 1));
     assert!(!pm.set_process_win32(9999, 1));
     assert!(!pm.set_thread_win32(9999, 1));
+    assert_eq!(pm.process_kernel_object(9999), None);
+    assert_eq!(pm.thread_kernel_object(9999), None);
     assert_eq!(pm.process_win32(9999), None);
     assert_eq!(pm.thread_win32(9999), None);
 }

@@ -109,12 +109,40 @@ pub(crate) struct Win32kClientContext {
     pub badge: u64,
     pub tid: u64,
     pub tcb: u64,
+    pub eprocess: u64,
+    pub ethread: u64,
     pub role: Option<HostedThreadRole>,
     pub process_role: Option<nt_exe_image::HostedProcessRole>,
     pub top_badge: u64,
     pub teb: u64,
     pub peb_mirror: u64,
     pub scratch_base: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Win32kPublishedContext {
+    pub pid: u64,
+    pub tid: u64,
+    pub eprocess: u64,
+    pub ethread: u64,
+    pub w32process: u64,
+    pub w32thread: u64,
+}
+
+pub(crate) unsafe fn published_win32k_context() -> Win32kPublishedContext {
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    Win32kPublishedContext {
+        pid: core::ptr::read_volatile((sh + win32k_subsystem::SH_CTX_PROCESS_ID) as *const u64),
+        tid: core::ptr::read_volatile((sh + win32k_subsystem::SH_CTX_THREAD_ID) as *const u64),
+        eprocess: core::ptr::read_volatile((sh + win32k_subsystem::SH_CTX_EPROCESS) as *const u64),
+        ethread: core::ptr::read_volatile((sh + win32k_subsystem::SH_CTX_ETHREAD) as *const u64),
+        w32process: core::ptr::read_volatile(
+            (sh + win32k_subsystem::SH_CTX_W32PROCESS) as *const u64,
+        ),
+        w32thread: core::ptr::read_volatile(
+            (sh + win32k_subsystem::SH_CTX_W32THREAD) as *const u64,
+        ),
+    }
 }
 
 const CALLBACK_ROLE_NONE: u32 = 0;
@@ -185,56 +213,48 @@ fn callback_runtime_role_from_code(code: u32) -> Option<HostedThreadRole> {
     }
 }
 
-const CALLBACK_PROCESS_ROLE_NONE: u32 = 0;
-const CALLBACK_PROCESS_ROLE_NATIVE_SESSION: u32 = 1;
-const CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM: u32 = 2;
-const CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON: u32 = 3;
-const CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE: u32 = 4;
-const CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP: u32 = 5;
-const CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL: u32 = 6;
-
 fn callback_process_role_code(role: Option<nt_exe_image::HostedProcessRole>) -> u32 {
     match role {
         Some(nt_exe_image::HostedProcessRole::NativeSession) => {
-            CALLBACK_PROCESS_ROLE_NATIVE_SESSION
+            win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_SESSION as u32
         }
         Some(nt_exe_image::HostedProcessRole::Win32Subsystem) => {
-            CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM
+            win32k_subsystem::HOSTED_PROCESS_ROLE_WIN32_SUBSYSTEM as u32
         }
         Some(nt_exe_image::HostedProcessRole::InteractiveLogon) => {
-            CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON
+            win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_LOGON as u32
         }
         Some(nt_exe_image::HostedProcessRole::NonInteractiveService) => {
-            CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+            win32k_subsystem::HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE as u32
         }
         Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap) => {
-            CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP
+            win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP as u32
         }
         Some(nt_exe_image::HostedProcessRole::InteractiveShell) => {
-            CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL
+            win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL as u32
         }
-        None => CALLBACK_PROCESS_ROLE_NONE,
+        None => win32k_subsystem::HOSTED_PROCESS_ROLE_NONE as u32,
     }
 }
 
 fn callback_process_role_from_code(code: u32) -> Option<nt_exe_image::HostedProcessRole> {
-    match code {
-        CALLBACK_PROCESS_ROLE_NATIVE_SESSION => {
+    match code as u64 {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_NATIVE_SESSION => {
             Some(nt_exe_image::HostedProcessRole::NativeSession)
         }
-        CALLBACK_PROCESS_ROLE_WIN32_SUBSYSTEM => {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_WIN32_SUBSYSTEM => {
             Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
         }
-        CALLBACK_PROCESS_ROLE_INTERACTIVE_LOGON => {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_LOGON => {
             Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
         }
-        CALLBACK_PROCESS_ROLE_NONINTERACTIVE_SERVICE => {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE => {
             Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
         }
-        CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP => {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP => {
             Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
         }
-        CALLBACK_PROCESS_ROLE_INTERACTIVE_SHELL => {
+        win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL => {
             Some(nt_exe_image::HostedProcessRole::InteractiveShell)
         }
         _ => None,
@@ -1839,6 +1859,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
         badge,
         tid,
         tcb,
+        eprocess: 0,
+        ethread: 0,
         role: Some(role),
         process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
         top_badge: WINLOGON_BADGE,
@@ -2053,6 +2075,8 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         badge,
         tid,
         tcb,
+        eprocess: 0,
+        ethread: 0,
         role: Some(role),
         process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
         top_badge: WINLOGON_BADGE,
@@ -2415,6 +2439,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             badge: request.client_badge,
             tid: request.client_tid,
             tcb: completed_frame.client_tcb(),
+            eprocess: 0,
+            ethread: 0,
             role: completed_role,
             process_role: callback_process_role_from_code(completed_frame.client_process_role()),
             top_badge: completed_frame.client_top_badge(),
@@ -3213,10 +3239,15 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             badge: 0,
             tid: 0,
             tcb: 0,
+            eprocess: 0,
+            ethread: 0,
             role: None,
             process_role: None,
             top_badge: 0,
-            teb: crate::SMSS_TEB_VA,
+            // Executive-originated probes do not have a hosted caller TEB. Leaving this empty makes
+            // win32k keep the component's already-selected GUI process/thread identity instead of
+            // deriving a new client from SMSS' TEB.
+            teb: 0,
             peb_mirror: 0,
             scratch_base: crate::SM_FILL_SCRATCH_BASE,
         },
@@ -3260,6 +3291,16 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         return (0xC000_0001u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    for offset in [
+        win32k_subsystem::SH_CTX_PROCESS_ID,
+        win32k_subsystem::SH_CTX_THREAD_ID,
+        win32k_subsystem::SH_CTX_EPROCESS,
+        win32k_subsystem::SH_CTX_ETHREAD,
+        win32k_subsystem::SH_CTX_W32PROCESS,
+        win32k_subsystem::SH_CTX_W32THREAD,
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, 0);
+    }
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
         Ok(nested) => nested,
@@ -3318,6 +3359,22 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_CLIENT_TEB) as *mut u64,
         client.teb,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_THREAD_ID) as *mut u64,
+        client.tid,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_EPROCESS) as *mut u64,
+        client.eprocess,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_ETHREAD) as *mut u64,
+        client.ethread,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_PROCESS_ROLE) as *mut u64,
+        callback_process_role_code(client.process_role) as u64,
     );
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_DEBUG_FLAGS) as *mut u64,

@@ -141,6 +141,10 @@ impl UserCallbackContract {
     pub const fn for_api(api_index: u32) -> Option<Self> {
         match api_index {
             USER32_CALLBACK_WINDOWPROC => Some(Self::WindowProc),
+            USER32_CALLBACK_CLIENTTHREADSTARTUP => Some(Self::Fixed {
+                input_length: 0,
+                result_length: 0,
+            }),
             USER32_CALLBACK_LOADDEFAULTCURSORS => Some(Self::Fixed {
                 input_length: 4,
                 result_length: 8,
@@ -2477,6 +2481,12 @@ mod tests {
         assert!(api0.accepts_request(0x90, 0x90, 0x40));
         assert!(!api0.accepts_request(0x38, 0x40, NO_PAYLOAD_REFERENCE));
         assert!(api0.accepts_result(0x90, 0x90, 0));
+
+        let api7 = UserCallbackContract::for_api(USER32_CALLBACK_CLIENTTHREADSTARTUP).unwrap();
+        assert!(api7.accepts_request(0, 16, NO_PAYLOAD_REFERENCE));
+        assert_eq!(api7.minimum_result_capacity(0), Some(0));
+        assert!(api7.accepts_result(0, 0, 0));
+        assert!(!api7.requires_window_binding());
 
         let api3 = UserCallbackContract::for_api(USER32_CALLBACK_LOADDEFAULTCURSORS).unwrap();
         assert!(api3.accepts_request(4, 16, NO_PAYLOAD_REFERENCE));
