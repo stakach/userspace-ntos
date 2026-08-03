@@ -154,7 +154,7 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
     t
 }
 
-unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
+pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
     let interrupt_time = monotonic_time_100ns();
     let processor = exec_handler::native_processor_information();
     let page = unsafe { &mut *(scratch_va as *mut [u8; nt_ntdll_layout::kuser::PAGE_SIZE]) };

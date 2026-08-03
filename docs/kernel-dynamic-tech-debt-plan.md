@@ -568,3 +568,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   process-callout publication for bootstrap plus `pi=2..6`. Review adjustment: B1 now moves to the
   thread half: call win32k's thread-create callout with real thread/process fields and kernel event
   services, then retire the `W32THREAD` placeholder path.
+- B1 cleanup. Removed the `W32THREAD` placeholder allocator path and now require win32k's
+  thread-create callout to publish a real `THREADINFO` through `PsSetThreadWin32Thread`. The
+  executive seeds the routed `ETHREAD` with the compiled ReactOS x64 `Teb`, `Process`, `Cid`, and
+  `ThreadsProcess` offsets, maps canonical high `KUSER_SHARED_DATA` for win32k, backs the event APIs
+  used by `InitThreadCallback`, and stores `Win32Process` in the actual `EPROCESS.Win32Process`
+  field rather than only in a side slot. Validation: `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none` passes with the existing warning
+  set; `.tmp/full-boot-w32thread-offsets-20260803-125016.log` shows `thread callout pi=1
+  status=0x00000000 pti=0x000001000a016b70` and `NtUserProcessConnect(0x10FA)` returning
+  `STATUS_SUCCESS`, with `PASS win32k_dispatch_loop_roundtrip` and `PASS
+  win32k_dispatch_fault_via_reply_cap`. A previous run,
+  `.tmp/full-boot-w32process-field-20260803-124536.log`, reached the broader desktop-painted pass.
+  Review adjustment: B1 remains open because the routed `EPROCESS`/`ETHREAD` bodies are still
+  win32k-hosted scratch objects selected through `WIN32K_CLIENT_*[pi]`; the next B1/B2 step is to
+  derive those from process-manager/thread-manager objects and remove the per-PI client context
+  arrays.

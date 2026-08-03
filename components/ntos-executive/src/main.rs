@@ -15884,6 +15884,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
                 let _ = alloc_frame();
             }
+            // KUSER_SHARED_DATA for win32k's kernel-mode high canonical mapping. It is initialized
+            // through an executive scratch alias below, then mapped into the component after its
+            // high-VA paging chain exists.
+            let kuser_frame = alloc_frame();
             // The win32k session-heap arena. Retain the frame-cap base so the connect marshaling can
             // RO-map it into GUI clients. Phase 2A also maps the same frames RW into the executive at
             // their server VAs: callback policy must resolve HWND through gSharedInfo's handle table
@@ -15943,6 +15947,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
+            let _ = page_map(
+                kuser_frame,
+                win32k_subsystem::WIN32K_KUSER_SCRATCH_VA,
+                RW_NX,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            img_spawn::initialize_kuser_snapshot(win32k_subsystem::WIN32K_KUSER_SCRATCH_VA);
             // Parse + copy sections + relocate + patch IAT. Fully HEAP-FREE + STACK-light: the
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
@@ -16122,6 +16133,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     caps: HostCaps::default(),
                 };
                 let sc = spawn_component(&d);
+                win32k_glue::ensure_w32_client_paging(
+                    win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
+                    sc.pml4,
+                );
+                let _ = page_map(
+                    copy_cap(kuser_frame),
+                    win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
+                    2 | PAGE_EXECUTE_NEVER,
+                    sc.pml4,
+                );
                 // Stash the globals the demand-map fault loop + per-client attach need. The stack frame
                 // base is the first FreshZeroed frame of the dedicated stack.
                 WIN32K_STACK_SLOT.store(sc.stack_frame_base, Ordering::Relaxed);
