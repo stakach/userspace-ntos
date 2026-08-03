@@ -1155,3 +1155,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the previous combo/load-bitmap wall into real desktop paint work plus services/LSASS win32k calls;
   it was then manually stopped after continued post-desktop progress, so F3/F4 remain open until a
   natural modal/credential framebuffer proof is restored.
+- D3 continued. Removed the bounded win32k registry key/value mirror for display and keyboard
+  imports. win32k's `ZwOpenKey` import now decodes the requested NT key name and mints a distinct
+  handle to either a mounted SYSTEM-hive key or the runtime `\Device\Video0` device-map route;
+  root-relative opens against those handles are supported, `ZwClose` releases them, and
+  `ZwQueryValueKey` reads service and keyboard-layout values from the real SYSTEM hive at query time.
+  The win32k component now receives the staged SYSTEM hive buffer read-only, so these imports parse
+  the same mounted regf bytes as the executive instead of a synthetic key/value mirror. Keyboard
+  layout driver registration no longer seeds registry values; the Video0 device-map value is still
+  derived from the display route published when the registry-selected display driver is hosted.
+  Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/main.rs components/ntos-executive/src/win32k_subsystem.rs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `components/ntos-executive/build.sh`, `git diff --check`, and
+  `.tmp/full-boot-win32k-registry-imports-clean.log` passed with `234/275
+  executive->isolated-service checks passed`, `PASS exec_win32k_desktop_painted`,
+  `PDEVOBJ_lChangeDisplaySettings status=0x0x00000000`, and natural framebuffer readback
+  `changed 768/768, desktop-bg 768/768`. Review adjustment: the old win32k registry mirrors are
+  gone, but D3 remains open for replacing the host-published Video0 device-map route and
+  `EngDeviceIoControl` framebuffer intercept with a real miniport-created device object/interface and
+  Configuration Manager DeviceMap publication.

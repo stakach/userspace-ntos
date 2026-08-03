@@ -1926,6 +1926,9 @@ extern "win64" fn s_zw_create_event(
 }
 
 extern "win64" fn s_zw_close(handle: u64) -> i32 {
+    if close_win32k_reg_handle(handle) {
+        return 0;
+    }
     s_ob_close_handle(handle, 0)
 }
 
@@ -4584,15 +4587,14 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
     0
 }
 
-// --- video-device registry mirror + display miniport IOCTL intercept -------------------------
+// --- video-device registry import + display miniport IOCTL intercept --------------------------
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
-// win32ss/user/ntuser/display.c) read the video device map from the registry (RegOpenKey→ZwOpenKey,
-// RegQueryValue/RegReadDWORD→ZwQueryValueKey). Until those imports can call the executive
-// Configuration Manager directly, the executive publishes the small display/keyboard key set into a
-// bounded mirror when the backing driver image is actually loaded. The trampolines below only serve
-// registered mirror keys/values, and the display miniport IOCTL intercept feeds the BOOTBOOT
-// framebuffer.
+// win32ss/user/ntuser/display.c) open registry keys through ntoskrnl imports. These trampolines now
+// resolve those imports against real executive-owned state: the mounted SYSTEM hive for service and
+// keyboard-layout keys, plus the runtime Video0 device-map link published when the selected display
+// route is registered. There is no key/value mirror: ZwOpenKey only mints an opaque handle to a live
+// target, and ZwQueryValueKey reads the value from that target.
 
 // DEVICE_OBJECT / FILE_OBJECT bodies for the registered \Device\Video0 route. win32k passes the
 // DeviceObject as the miniport handle to the display driver + EngDeviceIoControl, which this host
@@ -4606,73 +4608,38 @@ const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
-const REG_MULTI_SZ: u32 = 7;
-const WIN32K_REG_KEY_CAP: usize = 8;
-const WIN32K_REG_VALUE_CAP: usize = 16;
-const WIN32K_REG_PATTERN_CAP: usize = 96;
+const WIN32K_REG_HANDLE_CAP: usize = 16;
+const WIN32K_REG_PATH_CAP: usize = 192;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
-const WIN32K_REG_VALUE_ASCII_CAP: usize = 96;
+const WIN32K_VIDEO_SERVICE_PATH_CAP: usize = 128;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
 
-#[derive(Clone, Copy)]
-struct Win32kRegKeyMirror {
-    handle: u64,
-    pattern: [u8; WIN32K_REG_PATTERN_CAP],
-    pattern_len: u8,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Win32kRegHandleTarget {
+    Empty,
+    VideoDeviceMap,
+    SystemHive { key: u32 },
 }
 
-impl Win32kRegKeyMirror {
+#[derive(Clone, Copy)]
+struct Win32kRegHandle {
+    handle: u64,
+    target: Win32kRegHandleTarget,
+}
+
+impl Win32kRegHandle {
     const EMPTY: Self = Self {
         handle: 0,
-        pattern: [0; WIN32K_REG_PATTERN_CAP],
-        pattern_len: 0,
+        target: Win32kRegHandleTarget::Empty,
     };
-
-    fn pattern_bytes(&self) -> &[u8] {
-        &self.pattern[..self.pattern_len as usize]
-    }
 }
 
-#[derive(Clone, Copy)]
-enum Win32kRegValueData {
-    Empty,
-    Dword(u32),
-    WideAscii {
-        value_type: u32,
-        ascii: [u8; WIN32K_REG_VALUE_ASCII_CAP],
-        ascii_len: u8,
-        extra_nul: bool,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct Win32kRegValueMirror {
-    key_handle: u64,
-    name: [u8; WIN32K_REG_VALUE_NAME_CAP],
-    name_len: u8,
-    data: Win32kRegValueData,
-}
-
-impl Win32kRegValueMirror {
-    const EMPTY: Self = Self {
-        key_handle: 0,
-        name: [0; WIN32K_REG_VALUE_NAME_CAP],
-        name_len: 0,
-        data: Win32kRegValueData::Empty,
-    };
-
-    fn name_bytes(&self) -> &[u8] {
-        &self.name[..self.name_len as usize]
-    }
-}
-
-static mut WIN32K_REG_KEYS: [Win32kRegKeyMirror; WIN32K_REG_KEY_CAP] =
-    [Win32kRegKeyMirror::EMPTY; WIN32K_REG_KEY_CAP];
-static mut WIN32K_REG_VALUES: [Win32kRegValueMirror; WIN32K_REG_VALUE_CAP] =
-    [Win32kRegValueMirror::EMPTY; WIN32K_REG_VALUE_CAP];
-static mut WIN32K_DISPLAY_REGISTRY_READY: bool = false;
+static mut WIN32K_REG_HANDLES: [Win32kRegHandle; WIN32K_REG_HANDLE_CAP] =
+    [Win32kRegHandle::EMPTY; WIN32K_REG_HANDLE_CAP];
+static mut WIN32K_VIDEO_SERVICE_PATH: [u8; WIN32K_VIDEO_SERVICE_PATH_CAP] =
+    [0; WIN32K_VIDEO_SERVICE_PATH_CAP];
+static mut WIN32K_VIDEO_SERVICE_PATH_LEN: u8 = 0;
 static mut WIN32K_DISPLAY_DEVICE_READY: bool = false;
-static mut WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY: bool = false;
 
 pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) service_key_pattern: &'a [u8],
@@ -4687,157 +4654,70 @@ fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
     ascii_eq_ignore_case(a, b)
 }
 
-fn register_win32k_reg_key(pattern: &[u8]) -> Option<u64> {
-    if pattern.is_empty() || pattern.len() > WIN32K_REG_PATTERN_CAP {
+fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Option<u64> {
+    if matches!(target, Win32kRegHandleTarget::Empty) {
         return None;
     }
     unsafe {
-        let keys = &mut *core::ptr::addr_of_mut!(WIN32K_REG_KEYS);
-        let mut empty = None;
-        for (idx, key) in keys.iter().enumerate() {
-            if key.pattern_len == 0 {
-                empty.get_or_insert(idx);
-                continue;
-            }
-            if reg_ascii_eq(key.pattern_bytes(), pattern) {
-                return Some(key.handle);
+        let handles = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
+        for (idx, entry) in handles.iter().enumerate() {
+            if matches!(entry.target, Win32kRegHandleTarget::Empty) {
+                let handle = WIN32K_REG_HANDLE_BASE + idx as u64;
+                handles[idx] = Win32kRegHandle { handle, target };
+                return Some(handle);
             }
         }
-        let idx = empty?;
-        let mut key = Win32kRegKeyMirror::EMPTY;
-        key.handle = WIN32K_REG_HANDLE_BASE + idx as u64;
-        key.pattern_len = pattern.len() as u8;
-        for (i, &b) in pattern.iter().enumerate() {
-            key.pattern[i] = b.to_ascii_lowercase();
-        }
-        keys[idx] = key;
-        Some(key.handle)
+        None
     }
 }
 
-fn register_win32k_reg_dword(key_handle: u64, name: &[u8], value: u32) -> bool {
-    register_win32k_reg_value(key_handle, name, Win32kRegValueData::Dword(value))
-}
-
-fn register_win32k_reg_wide_ascii(
-    key_handle: u64,
-    name: &[u8],
-    value_type: u32,
-    ascii: &[u8],
-    extra_nul: bool,
-) -> bool {
-    if ascii.len() > WIN32K_REG_VALUE_ASCII_CAP {
-        return false;
-    }
-    let mut data = [0u8; WIN32K_REG_VALUE_ASCII_CAP];
-    for (idx, &b) in ascii.iter().enumerate() {
-        data[idx] = b;
-    }
-    register_win32k_reg_value(
-        key_handle,
-        name,
-        Win32kRegValueData::WideAscii {
-            value_type,
-            ascii: data,
-            ascii_len: ascii.len() as u8,
-            extra_nul,
-        },
-    )
-}
-
-fn register_win32k_reg_value(key_handle: u64, name: &[u8], data: Win32kRegValueData) -> bool {
-    if key_handle == 0 || name.is_empty() || name.len() > WIN32K_REG_VALUE_NAME_CAP {
-        return false;
-    }
+fn lookup_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
     unsafe {
-        let values = &mut *core::ptr::addr_of_mut!(WIN32K_REG_VALUES);
-        let mut empty = None;
-        for (idx, value) in values.iter().enumerate() {
-            if value.key_handle == 0 {
-                empty.get_or_insert(idx);
-                continue;
-            }
-            if value.key_handle == key_handle && reg_ascii_eq(value.name_bytes(), name) {
-                values[idx] = registered_win32k_reg_value(key_handle, name, data);
-                return true;
-            }
+        (&*core::ptr::addr_of!(WIN32K_REG_HANDLES))
+            .iter()
+            .find(|entry| {
+                entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
+            })
+            .map(|entry| entry.target)
+    }
+}
+
+fn close_win32k_reg_handle(handle: u64) -> bool {
+    unsafe {
+        let handles = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
+        if let Some(entry) = handles.iter_mut().find(|entry| {
+            entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
+        }) {
+            *entry = Win32kRegHandle::EMPTY;
+            true
+        } else {
+            false
         }
-        let Some(idx) = empty else {
-            return false;
-        };
-        values[idx] = registered_win32k_reg_value(key_handle, name, data);
-        true
     }
 }
 
-fn registered_win32k_reg_value(
-    key_handle: u64,
-    name: &[u8],
-    data: Win32kRegValueData,
-) -> Win32kRegValueMirror {
-    let mut value = Win32kRegValueMirror::EMPTY;
-    value.key_handle = key_handle;
-    value.name_len = name.len() as u8;
-    for (idx, &b) in name.iter().enumerate() {
-        value.name[idx] = b.to_ascii_lowercase();
-    }
-    value.data = data;
-    value
-}
-
-fn register_display_registry_mirror(spec: &DisplayRegistrySpec<'_>) -> bool {
+fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
+    let _ = spec.vga_compatible;
     if spec.service_key_pattern.is_empty()
         || spec.service_registry_path.is_empty()
         || spec.installed_display_driver.is_empty()
         || spec.display_driver_leaf.is_empty()
         || spec.device_description.is_empty()
+        || spec.service_registry_path.len() > WIN32K_VIDEO_SERVICE_PATH_CAP
     {
         return false;
     }
     unsafe {
-        if WIN32K_DISPLAY_REGISTRY_READY {
-            return ensure_video_device_objects();
+        if !ensure_video_device_objects() {
+            return false;
         }
+        let path = &mut *core::ptr::addr_of_mut!(WIN32K_VIDEO_SERVICE_PATH);
+        path.fill(0);
+        path[..spec.service_registry_path.len()].copy_from_slice(spec.service_registry_path);
+        WIN32K_VIDEO_SERVICE_PATH_LEN = spec.service_registry_path.len() as u8;
+        WIN32K_DISPLAY_DEVICE_READY = true;
     }
-    let Some(video_map) = register_win32k_reg_key(b"HARDWARE\\DEVICEMAP\\VIDEO") else {
-        return false;
-    };
-    let Some(display_service) = register_win32k_reg_key(spec.service_key_pattern) else {
-        return false;
-    };
-    let ok = register_win32k_reg_dword(video_map, b"MaxObjectNumber", 0)
-        && register_win32k_reg_wide_ascii(
-            video_map,
-            b"\\Device\\Video0",
-            REG_SZ,
-            spec.service_registry_path,
-            false,
-        )
-        && register_win32k_reg_wide_ascii(
-            display_service,
-            b"InstalledDisplayDrivers",
-            REG_MULTI_SZ,
-            spec.installed_display_driver,
-            true,
-        )
-        && register_win32k_reg_wide_ascii(
-            display_service,
-            b"Device Description",
-            REG_SZ,
-            spec.device_description,
-            false,
-        )
-        && register_win32k_reg_dword(display_service, b"VgaCompatible", spec.vga_compatible);
-    if ok {
-        unsafe {
-            if !ensure_video_device_objects() {
-                return false;
-            }
-            WIN32K_DISPLAY_REGISTRY_READY = true;
-            WIN32K_DISPLAY_DEVICE_READY = true;
-        }
-    }
-    ok
+    true
 }
 
 unsafe fn ensure_video_device_objects() -> bool {
@@ -4861,71 +4741,111 @@ unsafe fn ensure_video_device_objects() -> bool {
     true
 }
 
-fn register_keyboard_layout_registry_mirror(layout_id: &[u8], layout_file: &[u8]) -> bool {
-    if layout_id.len() != 8
-        || !layout_id
-            .iter()
-            .copied()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || layout_file.is_empty()
-        || layout_file.len() > WIN32K_REG_VALUE_ASCII_CAP
-    {
-        return false;
+fn strip_ascii_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if bytes.len() >= prefix.len() && reg_ascii_eq(&bytes[..prefix.len()], prefix) {
+        Some(&bytes[prefix.len()..])
+    } else {
+        None
     }
-    unsafe {
-        if WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY {
-            return true;
-        }
-    }
-    let mut key_pattern = [0u8; 32];
-    let prefix = b"KEYBOARD LAYOUTS\\";
-    key_pattern[..prefix.len()].copy_from_slice(prefix);
-    key_pattern[prefix.len()..prefix.len() + layout_id.len()].copy_from_slice(layout_id);
-    let Some(kbd) = register_win32k_reg_key(&key_pattern[..prefix.len() + layout_id.len()]) else {
-        return false;
-    };
-    let ok = register_win32k_reg_wide_ascii(kbd, b"Layout File", REG_SZ, layout_file, false);
-    if ok {
-        unsafe {
-            WIN32K_KEYBOARD_LAYOUT_REGISTRY_READY = true;
-        }
-    }
-    ok
 }
 
-/// Case-insensitive: does the wide string [buf, +len_bytes) contain the ASCII pattern?
-unsafe fn wstr_contains_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
-    if buf == 0 || pat.is_empty() {
-        return false;
+fn registry_path_tail(mut path: &[u8]) -> &[u8] {
+    while path.first() == Some(&b'\\') {
+        path = &path[1..];
     }
-    let n = len_bytes / 2;
-    if n < pat.len() {
-        return false;
-    }
-    let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        }
-    };
-    for start in 0..=(n - pat.len()) {
-        let mut ok = true;
-        for (k, &pb) in pat.iter().enumerate() {
-            let c = low(read_unaligned(
-                (buf + ((start + k) * 2) as u64) as *const u16,
-            ));
-            if c != low(pb as u16) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            return true;
-        }
-    }
-    false
+    strip_ascii_prefix(path, b"registry\\machine\\").unwrap_or(path)
 }
+
+fn is_video_device_map_key(path: &[u8]) -> bool {
+    reg_ascii_eq(registry_path_tail(path), b"hardware\\devicemap\\video")
+}
+
+fn system_hive_relative_path(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut tail = registry_path_tail(path);
+    tail = strip_ascii_prefix(tail, b"system\\")?;
+    if reg_ascii_eq(tail, b"currentcontrolset") {
+        let alias = b"controlset001";
+        if alias.len() > out.len() {
+            return None;
+        }
+        out[..alias.len()].copy_from_slice(alias);
+        Some(alias.len())
+    } else if let Some(rest) = strip_ascii_prefix(tail, b"currentcontrolset\\") {
+        let alias = b"controlset001";
+        if alias.len() + 1 + rest.len() > out.len() {
+            return None;
+        }
+        out[..alias.len()].copy_from_slice(alias);
+        out[alias.len()] = b'\\';
+        out[alias.len() + 1..alias.len() + 1 + rest.len()].copy_from_slice(rest);
+        Some(alias.len() + 1 + rest.len())
+    } else {
+        if tail.len() > out.len() {
+            return None;
+        }
+        out[..tail.len()].copy_from_slice(tail);
+        Some(tail.len())
+    }
+}
+
+fn system_hive_key_from_path(path: &[u8]) -> Option<u32> {
+    let hive = system_hive_regf()?;
+    let mut rel = [0u8; WIN32K_REG_PATH_CAP];
+    let rel_len = system_hive_relative_path(path, &mut rel)?;
+    let rel_str = unsafe { core::str::from_utf8_unchecked(&rel[..rel_len]) };
+    hive.open_key(rel_str)
+}
+
+fn system_hive_key_from_root_path(root: u32, path: &[u8]) -> Option<u32> {
+    let hive = system_hive_regf()?;
+    if path.is_empty() {
+        return Some(root);
+    }
+    let rel_str = unsafe { core::str::from_utf8_unchecked(path) };
+    hive.open_key_from(root, rel_str)
+}
+
+fn win32k_reg_path_is_absolute(path: &[u8]) -> bool {
+    path.first() == Some(&b'\\')
+        || strip_ascii_prefix(path, b"registry\\machine\\").is_some()
+        || strip_ascii_prefix(path, b"system\\").is_some()
+        || strip_ascii_prefix(path, b"hardware\\").is_some()
+}
+
+unsafe fn read_unicode_string_ascii_lower(ustr: u64, out: &mut [u8]) -> Option<usize> {
+    if ustr == 0 {
+        return None;
+    }
+    let len = read_unaligned(ustr as *const u16) as usize;
+    if len % 2 != 0 {
+        return None;
+    }
+    let chars = len / 2;
+    if chars > out.len() {
+        return None;
+    }
+    let buf = read_unaligned((ustr + 8) as *const u64);
+    if chars != 0 && buf == 0 {
+        return None;
+    }
+    for i in 0..chars {
+        let unit = read_unaligned((buf + (i * 2) as u64) as *const u16);
+        if unit > 0x7f {
+            return None;
+        }
+        out[i] = (unit as u8).to_ascii_lowercase();
+    }
+    Some(chars)
+}
+
+unsafe fn object_attributes_name_ascii_lower(obj_attr: u64, out: &mut [u8]) -> Option<usize> {
+    if obj_attr == 0 {
+        return None;
+    }
+    let ustr = read_unaligned((obj_attr + 0x10) as *const u64);
+    read_unicode_string_ascii_lower(ustr, out)
+}
+
 /// Case-insensitive exact compare of a wide value-name [buf, +len_bytes) against an ASCII pattern.
 unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
     if buf == 0 || len_bytes / 2 != pat.len() {
@@ -4948,30 +4868,54 @@ unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
 }
 
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
-/// ObjectName (PUNICODE_STRING) at +0x10. Match the key path to a synthetic HKEY (else NOT_FOUND, so
-/// win32k's optional keys — e.g. GraphicsDrivers\BaseVideo — fail cleanly and gbBaseVideo stays 0).
+/// ObjectName (PUNICODE_STRING) at +0x10. Resolve win32k's registry imports to live registry/device
+/// targets; optional keys not present in the mounted hives fail with NOT_FOUND.
 extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u64) -> i32 {
+    if handle_out.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
     if obj_attr == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
-        let ustr = read_unaligned((obj_attr + 0x10) as *const u64); // PUNICODE_STRING
-        if ustr == 0 {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let len = read_unaligned(ustr as *const u16) as usize; // Length (bytes)
-        let buf = read_unaligned((ustr + 8) as *const u64); // Buffer
-        let keys = &*core::ptr::addr_of!(WIN32K_REG_KEYS);
-        let Some(hkey) = keys
-            .iter()
-            .find(|key| key.pattern_len != 0 && wstr_contains_ascii(buf, len, key.pattern_bytes()))
-            .map(|key| key.handle)
-        else {
+        let mut path = [0u8; WIN32K_REG_PATH_CAP];
+        let Some(path_len) = object_attributes_name_ascii_lower(obj_attr, &mut path) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        if !handle_out.is_null() {
-            write_unaligned(handle_out, hkey);
-        }
+        let path = &path[..path_len];
+        let root_dir = read_unaligned((obj_attr + 0x8) as *const u64);
+        let root_target = if root_dir == 0 {
+            None
+        } else {
+            lookup_win32k_reg_handle(root_dir)
+        };
+        let target = if !win32k_reg_path_is_absolute(path) {
+            match root_target {
+                Some(Win32kRegHandleTarget::SystemHive { key }) => {
+                    if let Some(key) = system_hive_key_from_root_path(key, path) {
+                        Win32kRegHandleTarget::SystemHive { key }
+                    } else {
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                }
+                _ => {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+            }
+        } else if is_video_device_map_key(path) {
+            if !WIN32K_DISPLAY_DEVICE_READY || WIN32K_VIDEO_SERVICE_PATH_LEN == 0 {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            Win32kRegHandleTarget::VideoDeviceMap
+        } else if let Some(key) = system_hive_key_from_path(path) {
+            Win32kRegHandleTarget::SystemHive { key }
+        } else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let Some(hkey) = register_win32k_reg_handle(target) else {
+            return STATUS_NO_MEMORY;
+        };
+        write_unaligned(handle_out, hkey);
     }
     0
 }
@@ -5023,8 +4967,76 @@ unsafe fn emit_kvpi_dword(kvi: u64, length: u64, result_len: *mut u32, val: u32)
     0
 }
 
+unsafe fn emit_kvpi_bytes(
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+    value_type: u32,
+    data: &[u8],
+) -> i32 {
+    let need = 0xC + data.len() as u64;
+    if !result_len.is_null() {
+        write_unaligned(result_len, need as u32);
+    }
+    if kvi == 0 || length < need {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    write_unaligned(kvi as *mut u32, 0);
+    write_unaligned((kvi + 4) as *mut u32, value_type);
+    write_unaligned((kvi + 8) as *mut u32, data.len() as u32);
+    let dst = kvi + 0xC;
+    for (idx, &byte) in data.iter().enumerate() {
+        write_unaligned((dst + idx as u64) as *mut u8, byte);
+    }
+    0
+}
+
+unsafe fn query_video_device_map_value(
+    name: &[u8],
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+) -> i32 {
+    if reg_ascii_eq(name, b"maxobjectnumber") {
+        return emit_kvpi_dword(kvi, length, result_len, 0);
+    }
+    if reg_ascii_eq(name, b"\\device\\video0") {
+        let service_path = &*core::ptr::addr_of!(WIN32K_VIDEO_SERVICE_PATH);
+        let service_path_len = WIN32K_VIDEO_SERVICE_PATH_LEN as usize;
+        if service_path_len == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        return emit_kvpi_wsz(
+            kvi,
+            length,
+            result_len,
+            REG_SZ,
+            &service_path[..service_path_len],
+            false,
+        );
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+unsafe fn query_system_hive_value(
+    key: u32,
+    name: &[u8],
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+) -> i32 {
+    let Some(hive) = system_hive_regf() else {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+    let name = core::str::from_utf8_unchecked(name);
+    let Some((value_type, data)) = hive.value(key, name) else {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+    emit_kvpi_bytes(kvi, length, result_len, value_type, &data)
+}
+
 /// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
-/// KeyValueInformation, ULONG Length, PULONG ResultLength)` — serve the synthetic device-map values.
+/// KeyValueInformation, ULONG Length, PULONG ResultLength)`.
 extern "win64" fn s_zw_query_value_key(
     hkey: u64,
     value_name: u64,
@@ -5038,36 +5050,24 @@ extern "win64" fn s_zw_query_value_key(
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
-        let vlen = read_unaligned(value_name as *const u16) as usize;
-        let vbuf = read_unaligned((value_name + 8) as *const u64);
-        let values = &*core::ptr::addr_of!(WIN32K_REG_VALUES);
-        for value in values.iter() {
-            if value.key_handle != hkey || value.name_len == 0 {
-                continue;
+        let Some(target) = lookup_win32k_reg_handle(hkey) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let mut name = [0u8; WIN32K_REG_VALUE_NAME_CAP];
+        let Some(name_len) = read_unicode_string_ascii_lower(value_name, &mut name) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let name = &name[..name_len];
+        match target {
+            Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
+            Win32kRegHandleTarget::VideoDeviceMap => {
+                query_video_device_map_value(name, kvi, length, result_len)
             }
-            if !wstr_eq_ascii(vbuf, vlen, value.name_bytes()) {
-                continue;
+            Win32kRegHandleTarget::SystemHive { key } => {
+                query_system_hive_value(key, name, kvi, length, result_len)
             }
-            return match value.data {
-                Win32kRegValueData::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
-                Win32kRegValueData::Dword(v) => emit_kvpi_dword(kvi, length, result_len, v),
-                Win32kRegValueData::WideAscii {
-                    value_type,
-                    ascii,
-                    ascii_len,
-                    extra_nul,
-                } => emit_kvpi_wsz(
-                    kvi,
-                    length,
-                    result_len,
-                    value_type,
-                    &ascii[..ascii_len as usize],
-                    extra_nul,
-                ),
-            };
         }
     }
-    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 /// `NTSTATUS IoGetDeviceObjectPointer(PUNICODE_STRING, ACCESS_MASK, PFILE_OBJECT*, PDEVICE_OBJECT*)`.
@@ -7991,13 +7991,13 @@ pub fn record_display_driver(
         FRAMEBUF_VA + entry_rva as u64,
         expd,
         image_len,
-    ) && register_display_registry_mirror(spec)
+    ) && register_display_device_route(spec)
 }
 
 /// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find
 /// KbdLayerDescriptor; the PE entry may be zero.
 pub fn record_keyboard_layout_driver(
-    layout_id: &[u8],
+    _layout_id: &[u8],
     layout_file: &[u8],
     entry_rva: u32,
     export_dir_rva: u32,
@@ -8014,7 +8014,7 @@ pub fn record_keyboard_layout_driver(
         KEYBOARD_LAYOUT_VA + entry_rva as u64,
         expd,
         image_len,
-    ) && register_keyboard_layout_registry_mirror(layout_id, layout_file)
+    )
 }
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export

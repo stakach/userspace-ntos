@@ -16331,6 +16331,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     };
                     n += 1;
                 }
+                // SYSTEM hive buffer: win32k's ntoskrnl registry imports now resolve real keys
+                // directly against the mounted regf bytes. Map the same staged hive read-only into
+                // the component rather than publishing a key/value mirror.
+                let system_hive_base = HIVEBUF_START.load(Ordering::Relaxed);
+                if system_hive_base != 0 {
+                    regions[n] = Region {
+                        source: FrameSource::Alias(0),
+                        base_va: NLS_ANSI_VADDR,
+                        count: 0,
+                        rights: Rights::Uniform(2),
+                        pts: 1,
+                    };
+                    n += 1;
+                    regions[n] = Region {
+                        source: FrameSource::Alias(system_hive_base),
+                        base_va: HIVEBUF_VADDR,
+                        count: HIVEBUF_FRAMES,
+                        rights: Rights::Uniform(2),
+                        pts: 0,
+                    };
+                    n += 1;
+                }
                 // DATA export region (aux PT window — no dedicated PT).
                 regions[n] = Region {
                     source: FrameSource::Alias(data_base),
