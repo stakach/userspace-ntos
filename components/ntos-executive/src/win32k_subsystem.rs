@@ -4580,21 +4580,19 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
     0
 }
 
-// --- video-device registry synthesis + framebuf miniport IOCTL intercept ---------------------
+// --- video-device registry mirror + framebuf miniport IOCTL intercept ------------------------
 //
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
 // win32ss/user/ntuser/display.c) read the video device map from the registry (RegOpenKey→ZwOpenKey,
-// RegQueryValue/RegReadDWORD→ZwQueryValueKey). There is no real registry in win32k's context, so
-// these trampolines synthesise the MINIMAL device map that makes win32k find + load a "framebuf"
-// display device, and intercept framebuf's video-miniport IOCTLs to feed it the BOOTBOOT framebuffer.
+// RegQueryValue/RegReadDWORD→ZwQueryValueKey). Until those imports can call the executive
+// Configuration Manager directly, the executive publishes the small display/keyboard key set into a
+// bounded mirror when the backing driver image is actually loaded. The trampolines below only serve
+// registered mirror keys/values, and the framebuf miniport IOCTL intercept feeds the BOOTBOOT
+// framebuffer.
 
-// Synthetic HKEYs (opaque handles win32k passes back to ZwQueryValueKey / ZwClose).
-const HKEY_VIDEO_MAP: u64 = 0x5A5A_0F10; // \Registry\Machine\HARDWARE\DEVICEMAP\VIDEO
-const HKEY_FB_SETTINGS: u64 = 0x5A5A_0F11; // ..\Services\framebuf\Device0 (the display settings key)
-const HKEY_KBD_LAYOUT_0409: u64 = 0x5A5A_0F12; // ..\Keyboard Layouts\00000409
-                                               // A fake DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
-                                               // handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
-                                               // stable). Zeroed sub-regions of DATA page 0.
+// A DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
+// handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
+// stable). Zeroed sub-regions of DATA page 0.
 const FAKE_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
 const FAKE_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
 
@@ -4603,6 +4601,240 @@ const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
 const REG_MULTI_SZ: u32 = 7;
+const WIN32K_REG_KEY_CAP: usize = 8;
+const WIN32K_REG_VALUE_CAP: usize = 16;
+const WIN32K_REG_PATTERN_CAP: usize = 64;
+const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
+const WIN32K_REG_VALUE_ASCII_CAP: usize = 96;
+const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
+
+#[derive(Clone, Copy)]
+struct Win32kRegKeyMirror {
+    handle: u64,
+    pattern: [u8; WIN32K_REG_PATTERN_CAP],
+    pattern_len: u8,
+}
+
+impl Win32kRegKeyMirror {
+    const EMPTY: Self = Self {
+        handle: 0,
+        pattern: [0; WIN32K_REG_PATTERN_CAP],
+        pattern_len: 0,
+    };
+
+    fn pattern_bytes(&self) -> &[u8] {
+        &self.pattern[..self.pattern_len as usize]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Win32kRegValueData {
+    Empty,
+    Dword(u32),
+    WideAscii {
+        value_type: u32,
+        ascii: [u8; WIN32K_REG_VALUE_ASCII_CAP],
+        ascii_len: u8,
+        extra_nul: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Win32kRegValueMirror {
+    key_handle: u64,
+    name: [u8; WIN32K_REG_VALUE_NAME_CAP],
+    name_len: u8,
+    data: Win32kRegValueData,
+}
+
+impl Win32kRegValueMirror {
+    const EMPTY: Self = Self {
+        key_handle: 0,
+        name: [0; WIN32K_REG_VALUE_NAME_CAP],
+        name_len: 0,
+        data: Win32kRegValueData::Empty,
+    };
+
+    fn name_bytes(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+static mut WIN32K_REG_KEYS: [Win32kRegKeyMirror; WIN32K_REG_KEY_CAP] =
+    [Win32kRegKeyMirror::EMPTY; WIN32K_REG_KEY_CAP];
+static mut WIN32K_REG_VALUES: [Win32kRegValueMirror; WIN32K_REG_VALUE_CAP] =
+    [Win32kRegValueMirror::EMPTY; WIN32K_REG_VALUE_CAP];
+static mut WIN32K_FRAMEBUF_REGISTRY_READY: bool = false;
+static mut WIN32K_KBDUS_REGISTRY_READY: bool = false;
+
+fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
+    ascii_eq_ignore_case(a, b)
+}
+
+fn register_win32k_reg_key(pattern: &[u8]) -> Option<u64> {
+    if pattern.is_empty() || pattern.len() > WIN32K_REG_PATTERN_CAP {
+        return None;
+    }
+    unsafe {
+        let keys = &mut *core::ptr::addr_of_mut!(WIN32K_REG_KEYS);
+        let mut empty = None;
+        for (idx, key) in keys.iter().enumerate() {
+            if key.pattern_len == 0 {
+                empty.get_or_insert(idx);
+                continue;
+            }
+            if reg_ascii_eq(key.pattern_bytes(), pattern) {
+                return Some(key.handle);
+            }
+        }
+        let idx = empty?;
+        let mut key = Win32kRegKeyMirror::EMPTY;
+        key.handle = WIN32K_REG_HANDLE_BASE + idx as u64;
+        key.pattern_len = pattern.len() as u8;
+        for (i, &b) in pattern.iter().enumerate() {
+            key.pattern[i] = b.to_ascii_lowercase();
+        }
+        keys[idx] = key;
+        Some(key.handle)
+    }
+}
+
+fn register_win32k_reg_dword(key_handle: u64, name: &[u8], value: u32) -> bool {
+    register_win32k_reg_value(key_handle, name, Win32kRegValueData::Dword(value))
+}
+
+fn register_win32k_reg_wide_ascii(
+    key_handle: u64,
+    name: &[u8],
+    value_type: u32,
+    ascii: &[u8],
+    extra_nul: bool,
+) -> bool {
+    if ascii.len() > WIN32K_REG_VALUE_ASCII_CAP {
+        return false;
+    }
+    let mut data = [0u8; WIN32K_REG_VALUE_ASCII_CAP];
+    for (idx, &b) in ascii.iter().enumerate() {
+        data[idx] = b;
+    }
+    register_win32k_reg_value(
+        key_handle,
+        name,
+        Win32kRegValueData::WideAscii {
+            value_type,
+            ascii: data,
+            ascii_len: ascii.len() as u8,
+            extra_nul,
+        },
+    )
+}
+
+fn register_win32k_reg_value(
+    key_handle: u64,
+    name: &[u8],
+    data: Win32kRegValueData,
+) -> bool {
+    if key_handle == 0 || name.is_empty() || name.len() > WIN32K_REG_VALUE_NAME_CAP {
+        return false;
+    }
+    unsafe {
+        let values = &mut *core::ptr::addr_of_mut!(WIN32K_REG_VALUES);
+        let mut empty = None;
+        for (idx, value) in values.iter().enumerate() {
+            if value.key_handle == 0 {
+                empty.get_or_insert(idx);
+                continue;
+            }
+            if value.key_handle == key_handle && reg_ascii_eq(value.name_bytes(), name) {
+                values[idx] = registered_win32k_reg_value(key_handle, name, data);
+                return true;
+            }
+        }
+        let Some(idx) = empty else {
+            return false;
+        };
+        values[idx] = registered_win32k_reg_value(key_handle, name, data);
+        true
+    }
+}
+
+fn registered_win32k_reg_value(
+    key_handle: u64,
+    name: &[u8],
+    data: Win32kRegValueData,
+) -> Win32kRegValueMirror {
+    let mut value = Win32kRegValueMirror::EMPTY;
+    value.key_handle = key_handle;
+    value.name_len = name.len() as u8;
+    for (idx, &b) in name.iter().enumerate() {
+        value.name[idx] = b.to_ascii_lowercase();
+    }
+    value.data = data;
+    value
+}
+
+fn register_framebuf_registry_mirror() -> bool {
+    unsafe {
+        if WIN32K_FRAMEBUF_REGISTRY_READY {
+            return true;
+        }
+    }
+    let Some(video_map) = register_win32k_reg_key(b"HARDWARE\\DEVICEMAP\\VIDEO") else {
+        return false;
+    };
+    let Some(framebuf) =
+        register_win32k_reg_key(b"SYSTEM\\CURRENTCONTROLSET\\SERVICES\\FRAMEBUF\\DEVICE0")
+    else {
+        return false;
+    };
+    let ok = register_win32k_reg_dword(video_map, b"MaxObjectNumber", 0)
+        && register_win32k_reg_wide_ascii(
+            video_map,
+            b"\\Device\\Video0",
+            REG_SZ,
+            b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf\\Device0",
+            false,
+        )
+        && register_win32k_reg_wide_ascii(
+            framebuf,
+            b"InstalledDisplayDrivers",
+            REG_MULTI_SZ,
+            b"framebuf",
+            true,
+        )
+        && register_win32k_reg_wide_ascii(
+            framebuf,
+            b"Device Description",
+            REG_SZ,
+            b"BOOTBOOT Framebuffer",
+            false,
+        )
+        && register_win32k_reg_dword(framebuf, b"VgaCompatible", 0);
+    if ok {
+        unsafe {
+            WIN32K_FRAMEBUF_REGISTRY_READY = true;
+        }
+    }
+    ok
+}
+
+fn register_kbdus_registry_mirror() -> bool {
+    unsafe {
+        if WIN32K_KBDUS_REGISTRY_READY {
+            return true;
+        }
+    }
+    let Some(kbd) = register_win32k_reg_key(b"KEYBOARD LAYOUTS\\00000409") else {
+        return false;
+    };
+    let ok = register_win32k_reg_wide_ascii(kbd, b"Layout File", REG_SZ, b"kbdus.dll", false);
+    if ok {
+        unsafe {
+            WIN32K_KBDUS_REGISTRY_READY = true;
+        }
+    }
+    ok
+}
 
 /// Case-insensitive: does the wide string [buf, +len_bytes) contain the ASCII pattern?
 unsafe fn wstr_contains_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
@@ -4672,13 +4904,14 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
         }
         let len = read_unaligned(ustr as *const u16) as usize; // Length (bytes)
         let buf = read_unaligned((ustr + 8) as *const u64); // Buffer
-        let hkey = if wstr_contains_ascii(buf, len, b"DEVICEMAP\\VIDEO") {
-            HKEY_VIDEO_MAP
-        } else if wstr_contains_ascii(buf, len, b"framebuf") {
-            HKEY_FB_SETTINGS
-        } else if wstr_contains_ascii(buf, len, b"KEYBOARD LAYOUTS\\00000409") {
-            HKEY_KBD_LAYOUT_0409
-        } else {
+        let keys = &*core::ptr::addr_of!(WIN32K_REG_KEYS);
+        let Some(hkey) = keys
+            .iter()
+            .find(|key| {
+                key.pattern_len != 0 && wstr_contains_ascii(buf, len, key.pattern_bytes())
+            })
+            .map(|key| key.handle)
+        else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         if !handle_out.is_null() {
@@ -4752,43 +4985,31 @@ extern "win64" fn s_zw_query_value_key(
     unsafe {
         let vlen = read_unaligned(value_name as *const u16) as usize;
         let vbuf = read_unaligned((value_name + 8) as *const u64);
-        match hkey {
-            HKEY_VIDEO_MAP => {
-                if wstr_eq_ascii(vbuf, vlen, b"MaxObjectNumber") {
-                    return emit_kvpi_dword(kvi, length, result_len, 0);
-                }
-                if wstr_eq_ascii(vbuf, vlen, b"\\Device\\Video0") {
-                    return emit_kvpi_wsz(
-                        kvi, length, result_len, REG_SZ,
-                        b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf\\Device0",
-                        false,
-                    );
-                }
+        let values = &*core::ptr::addr_of!(WIN32K_REG_VALUES);
+        for value in values.iter() {
+            if value.key_handle != hkey || value.name_len == 0 {
+                continue;
             }
-            HKEY_FB_SETTINGS => {
-                if wstr_eq_ascii(vbuf, vlen, b"InstalledDisplayDrivers") {
-                    return emit_kvpi_wsz(kvi, length, result_len, REG_MULTI_SZ, b"framebuf", true);
-                }
-                if wstr_eq_ascii(vbuf, vlen, b"Device Description") {
-                    return emit_kvpi_wsz(
-                        kvi,
-                        length,
-                        result_len,
-                        REG_SZ,
-                        b"BOOTBOOT Framebuffer",
-                        false,
-                    );
-                }
-                if wstr_eq_ascii(vbuf, vlen, b"VgaCompatible") {
-                    return emit_kvpi_dword(kvi, length, result_len, 0);
-                }
+            if !wstr_eq_ascii(vbuf, vlen, value.name_bytes()) {
+                continue;
             }
-            HKEY_KBD_LAYOUT_0409 => {
-                if wstr_eq_ascii(vbuf, vlen, b"Layout File") {
-                    return emit_kvpi_wsz(kvi, length, result_len, REG_SZ, b"kbdus.dll", false);
-                }
-            }
-            _ => {}
+            return match value.data {
+                Win32kRegValueData::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
+                Win32kRegValueData::Dword(v) => emit_kvpi_dword(kvi, length, result_len, v),
+                Win32kRegValueData::WideAscii {
+                    value_type,
+                    ascii,
+                    ascii_len,
+                    extra_nul,
+                } => emit_kvpi_wsz(
+                    kvi,
+                    length,
+                    result_len,
+                    value_type,
+                    &ascii[..ascii_len as usize],
+                    extra_nul,
+                ),
+            };
         }
     }
     STATUS_OBJECT_NAME_NOT_FOUND
@@ -7706,6 +7927,7 @@ pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
         expd,
         image_len,
     );
+    let _ = register_framebuf_registry_mirror();
 }
 
 /// Record the loaded kbdus.dll info (called by the executive after `load_driver_into(kbdus)`).
@@ -7723,6 +7945,7 @@ pub fn record_kbdus(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
         expd,
         image_len,
     );
+    let _ = register_kbdus_registry_mirror();
 }
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export

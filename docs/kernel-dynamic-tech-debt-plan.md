@@ -59,7 +59,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   driven driver objects.
 - `[~]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
-- `[ ]` D3: Replace synthetic video, keyboard, CPU, and Winlogon registry overlays with real hive
+- `[~]` D3: Replace synthetic video, keyboard, CPU, and Winlogon registry overlays with real hive
   data and driver-created device interfaces.
 
 ### E. LPC, CSR, SRM, And LSA
@@ -691,3 +691,12 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none` passed. Review adjustment:
   D2 remains open for the registry/device side of display discovery and `NtQuerySystemInformation`
   module/device answers, but the GDI-driver system-information path is no longer name-switch owned.
+- D3 started. The win32k `ZwOpenKey`/`ZwQueryValueKey` import shims no longer own unconditional
+  synthetic `HKEY_*` handles or per-value `match hkey` branches for display and keyboard setup.
+  `record_framebuf` and `record_kbdus` now publish a bounded registry mirror only after the
+  corresponding hosted driver image is loaded, and the trampolines serve only registered mirror
+  keys/values. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none` passed. Review adjustment:
+  this is still a mirror, not the final Configuration Manager/device-interface path; D3 remains open
+  to feed these keys from the real SYSTEM hive and replace the video `DEVICE_OBJECT` placeholder with
+  a driver-created device object.
