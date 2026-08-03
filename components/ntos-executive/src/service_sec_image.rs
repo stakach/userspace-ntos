@@ -2542,7 +2542,7 @@ pub(crate) unsafe fn service_sec_image(
     register_loaded_hosted_image(
         &mut exe_image_catalog,
         smss_bootstrap_image(),
-        smss_process_runtime(),
+        SMSS_PROCESS_RUNTIME,
         !pe.bytes().is_empty(),
     )
     .expect("SMSS hosted image metadata must register once");

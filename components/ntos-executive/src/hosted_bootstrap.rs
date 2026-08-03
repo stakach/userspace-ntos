@@ -6,9 +6,9 @@
 #![allow(clippy::all)]
 
 use crate::{
-    csrss_process_runtime, explorer_process_runtime, lsass_process_runtime,
-    register_hosted_process_runtime, services_process_runtime, userinit_process_runtime,
-    winlogon_process_runtime, HostedProcessRuntime,
+    register_hosted_process_runtime, HostedProcessRuntime, CSRSS_PROCESS_RUNTIME,
+    EXPLORER_PROCESS_RUNTIME, LSASS_PROCESS_RUNTIME, SERVICES_PROCESS_RUNTIME,
+    SMSS_PROCESS_RUNTIME, USERINIT_PROCESS_RUNTIME, WINLOGON_PROCESS_RUNTIME,
 };
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,6 @@ pub(crate) struct HostedBootstrapLoadSpec {
 struct HostedBootstrapManifestEntry {
     disk_path: &'static [u8],
     stem: &'static [u8],
-    pi: usize,
     top_badge: u64,
     leaf: &'static [u8],
     role: nt_exe_image::HostedProcessRole,
@@ -31,13 +30,13 @@ struct HostedBootstrapManifestEntry {
     command_line: &'static [u8],
     image_root: nt_exe_image::HostedImageRoot,
     probe_fragment: &'static [u8],
-    runtime: fn() -> HostedProcessRuntime,
+    runtime: HostedProcessRuntime,
 }
 
 impl HostedBootstrapManifestEntry {
     fn image(self) -> nt_exe_image::OwnedHostedProcessImage {
         nt_exe_image::OwnedHostedProcessImage::new(
-            self.pi,
+            self.runtime.pi,
             self.top_badge,
             self.leaf,
             self.leaf,
@@ -55,7 +54,7 @@ impl HostedBootstrapManifestEntry {
             disk_path: self.disk_path,
             stem: self.stem,
             image: self.image(),
-            runtime: (self.runtime)(),
+            runtime: self.runtime,
         }
     }
 }
@@ -63,7 +62,6 @@ impl HostedBootstrapManifestEntry {
 const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapManifestEntry {
     disk_path: b"reactos\\system32\\smss.exe",
     stem: b"smss.exe",
-    pi: 0,
     top_badge: nt_exe_image::SMSS_TOP_BADGE,
     leaf: b"smss.exe",
     role: nt_exe_image::HostedProcessRole::NativeSession,
@@ -71,14 +69,13 @@ const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapMan
     command_line: b"smss.exe",
     image_root: nt_exe_image::HostedImageRoot::System32,
     probe_fragment: b"",
-    runtime: crate::smss_process_runtime,
+    runtime: SMSS_PROCESS_RUNTIME,
 };
 
 const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\csrss.exe",
         stem: b"csrss.exe",
-        pi: 1,
         top_badge: nt_exe_image::CSRSS_TOP_BADGE,
         leaf: b"csrss.exe",
         role: nt_exe_image::HostedProcessRole::Win32Subsystem,
@@ -86,12 +83,11 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"csrss",
-        runtime: csrss_process_runtime,
+        runtime: CSRSS_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\winlogon.exe",
         stem: b"winlogon.exe",
-        pi: 2,
         top_badge: nt_exe_image::WINLOGON_TOP_BADGE,
         leaf: b"winlogon.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveLogon,
@@ -99,12 +95,11 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"winlogon.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"winlogon",
-        runtime: winlogon_process_runtime,
+        runtime: WINLOGON_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\services.exe",
         stem: b"services.exe",
-        pi: 3,
         top_badge: nt_exe_image::SERVICES_TOP_BADGE,
         leaf: b"services.exe",
         role: nt_exe_image::HostedProcessRole::NonInteractiveService,
@@ -112,12 +107,11 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"services.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"services",
-        runtime: services_process_runtime,
+        runtime: SERVICES_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\lsass.exe",
         stem: b"lsass.exe",
-        pi: 4,
         top_badge: nt_exe_image::LSASS_TOP_BADGE,
         leaf: b"lsass.exe",
         role: nt_exe_image::HostedProcessRole::NonInteractiveService,
@@ -125,12 +119,11 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"lsass.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"lsass",
-        runtime: lsass_process_runtime,
+        runtime: LSASS_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: br"reactos\system32\userinit.exe",
         stem: b"userinit.exe",
-        pi: 5,
         top_badge: nt_exe_image::USERINIT_TOP_BADGE,
         leaf: b"userinit.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
@@ -138,12 +131,11 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"userinit.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"userinit",
-        runtime: userinit_process_runtime,
+        runtime: USERINIT_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: br"reactos\explorer.exe",
         stem: b"explorer.exe",
-        pi: 6,
         top_badge: nt_exe_image::EXPLORER_TOP_BADGE,
         leaf: b"explorer.exe",
         role: nt_exe_image::HostedProcessRole::InteractiveShell,
@@ -151,7 +143,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"explorer.exe",
         image_root: nt_exe_image::HostedImageRoot::SystemRoot,
         probe_fragment: b"explorer",
-        runtime: explorer_process_runtime,
+        runtime: EXPLORER_PROCESS_RUNTIME,
     },
 ];
 

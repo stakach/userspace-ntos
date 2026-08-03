@@ -75,103 +75,89 @@ pub(crate) fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRu
     unsafe { (&*core::ptr::addr_of!(HOSTED_PROCESS_RUNTIMES)).get_by_pi(pi) }
 }
 
-pub(crate) fn smss_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 0,
-        priority: 100,
-        env_scratch_va: 0x0000_0100_1074_0000,
-        stack_mirror_va: SMSS_STACK_MIRROR_VA,
-        heap_mirror_va: SMSS_HEAP_MIRROR_VA,
-        active_image_mirror_va: IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: 0,
-        scratch_base: SMSS_SCRATCH_BASE,
-        spawned: None,
-    }
-}
+pub(crate) const SMSS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 0,
+    priority: 100,
+    env_scratch_va: 0x0000_0100_1074_0000,
+    stack_mirror_va: SMSS_STACK_MIRROR_VA,
+    heap_mirror_va: SMSS_HEAP_MIRROR_VA,
+    active_image_mirror_va: IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: 0,
+    scratch_base: SMSS_SCRATCH_BASE,
+    spawned: None,
+};
 
-pub(crate) fn csrss_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 1,
-        priority: 101,
-        env_scratch_va: 0x0000_0100_1078_0000,
-        stack_mirror_va: CSRSS_STACK_MIRROR_VA,
-        heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
-        active_image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: 0,
-        scratch_base: CSRSS_SCRATCH_BASE,
-        spawned: Some(&CSRSS_SPAWNED),
-    }
-}
+pub(crate) const CSRSS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 1,
+    priority: 101,
+    env_scratch_va: 0x0000_0100_1078_0000,
+    stack_mirror_va: CSRSS_STACK_MIRROR_VA,
+    heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
+    active_image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: 0,
+    scratch_base: CSRSS_SCRATCH_BASE,
+    spawned: Some(&CSRSS_SPAWNED),
+};
 
-pub(crate) fn winlogon_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 2,
-        priority: 102,
-        env_scratch_va: WINLOGON_MAIN_TEB_MIRROR_VA,
-        stack_mirror_va: WINLOGON_STACK_MIRROR_VA,
-        heap_mirror_va: WINLOGON_HEAP_MIRROR_VA,
-        active_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
-        scratch_base: WINLOGON_SCRATCH_BASE,
-        spawned: Some(&WINLOGON_SPAWNED),
-    }
-}
+pub(crate) const WINLOGON_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 2,
+    priority: 102,
+    env_scratch_va: WINLOGON_MAIN_TEB_MIRROR_VA,
+    stack_mirror_va: WINLOGON_STACK_MIRROR_VA,
+    heap_mirror_va: WINLOGON_HEAP_MIRROR_VA,
+    active_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
+    scratch_base: WINLOGON_SCRATCH_BASE,
+    spawned: Some(&WINLOGON_SPAWNED),
+};
 
-pub(crate) fn services_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 3,
-        priority: 103,
-        env_scratch_va: SERVICES_ENV_SCRATCH_VA,
-        stack_mirror_va: SERVICES_STACK_MIRROR_VA,
-        heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
-        active_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
-        scratch_base: SERVICES_SCRATCH_BASE,
-        spawned: Some(&SERVICES_SPAWNED),
-    }
-}
+pub(crate) const SERVICES_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 3,
+    priority: 103,
+    env_scratch_va: SERVICES_ENV_SCRATCH_VA,
+    stack_mirror_va: SERVICES_STACK_MIRROR_VA,
+    heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
+    active_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
+    scratch_base: SERVICES_SCRATCH_BASE,
+    spawned: Some(&SERVICES_SPAWNED),
+};
 
-pub(crate) fn lsass_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 4,
-        priority: 104,
-        env_scratch_va: LSASS_ENV_SCRATCH_VA,
-        stack_mirror_va: LSASS_STACK_MIRROR_VA,
-        heap_mirror_va: LSASS_HEAP_MIRROR_VA,
-        active_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
-        scratch_base: LSASS_SCRATCH_BASE,
-        spawned: Some(&LSASS_SPAWNED),
-    }
-}
+pub(crate) const LSASS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 4,
+    priority: 104,
+    env_scratch_va: LSASS_ENV_SCRATCH_VA,
+    stack_mirror_va: LSASS_STACK_MIRROR_VA,
+    heap_mirror_va: LSASS_HEAP_MIRROR_VA,
+    active_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
+    scratch_base: LSASS_SCRATCH_BASE,
+    spawned: Some(&LSASS_SPAWNED),
+};
 
-pub(crate) fn userinit_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 5,
-        priority: 105,
-        env_scratch_va: USERINIT_ENV_SCRATCH_VA,
-        stack_mirror_va: USERINIT_STACK_MIRROR_VA,
-        heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
-        active_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
-        scratch_base: USERINIT_SCRATCH_BASE,
-        spawned: Some(&USERINIT_SPAWNED),
-    }
-}
+pub(crate) const USERINIT_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 5,
+    priority: 105,
+    env_scratch_va: USERINIT_ENV_SCRATCH_VA,
+    stack_mirror_va: USERINIT_STACK_MIRROR_VA,
+    heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
+    active_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
+    scratch_base: USERINIT_SCRATCH_BASE,
+    spawned: Some(&USERINIT_SPAWNED),
+};
 
-pub(crate) fn explorer_process_runtime() -> HostedProcessRuntime {
-    HostedProcessRuntime {
-        pi: 6,
-        priority: 106,
-        env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
-        stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
-        heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
-        active_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
-        spawn_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
-        scratch_base: EXPLORER_SCRATCH_BASE,
-        spawned: Some(&EXPLORER_SPAWNED),
-    }
-}
+pub(crate) const EXPLORER_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
+    pi: 6,
+    priority: 106,
+    env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
+    stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
+    heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
+    active_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
+    spawn_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
+    scratch_base: EXPLORER_SCRATCH_BASE,
+    spawned: Some(&EXPLORER_SPAWNED),
+};
 
 fn expect_hosted_process_runtime(pi: usize) -> HostedProcessRuntime {
     hosted_process_runtime_for_pi(pi).expect("hosted process runtime layout must be registered")

@@ -841,3 +841,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: A2 remains open until SMSS/session-manager process creation can supply this
   topology dynamically and `hosted_process_runtime.rs` no longer bakes fixed runtime layouts in
   named per-image constructors.
+- A2 cleanup. The fixed hosted-process runtime layouts are now immutable
+  `HostedProcessRuntime` descriptors instead of named per-image factory functions. The bootstrap
+  manifest carries the descriptor directly, derives image `pi` from it, and SMSS demo/live
+  registrations use the same descriptor as the normal SEC_IMAGE loop. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/hosted_process_runtime.rs components/ntos-executive/src/hosted_bootstrap.rs components/ntos-executive/src/main.rs components/ntos-executive/src/service_sec_image.rs`,
+  `git diff --check`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-runtime-descriptors-rerun-20260803-233453.log` reached
+  `276/276 executive->isolated-service checks passed`, including IDD_LOGON framebuffer evidence,
+  userinit/explorer spawn, real callback transport, and explorer WndProc/COM gates. Review
+  adjustment: A2 still needs the real dynamic endpoint: SMSS/session-manager process creation must
+  provide these records, and the fixed VA/cap placement should move behind an allocator rather than
+  staying as static descriptor data.
