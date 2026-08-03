@@ -569,6 +569,7 @@ impl ExecNtHandler {
                 pool_suspended: [0; MAX_PI],
                 thread_runtime: HostedThreadRuntimes::reset(),
                 service_gui_clients: ServiceGuiClientRuntimes::reset(),
+                win32k_session: Win32kSessionRuntime::reset(),
                 token_store: nt_security::TokenStore::with_capacity(64),
                 token_dirty: false,
                 process_dirty: false,
@@ -1802,6 +1803,28 @@ impl ExecNtHandler {
 
     pub(crate) fn record_service_scrollbar_classinfo_copyout_error(&mut self) {
         self.service_gui_clients.record_classinfo_copyout_error();
+    }
+
+    pub(crate) fn observe_win32k_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
+        self.win32k_session.observe_stock_object(object_id, handle)
+    }
+
+    pub(crate) fn lookup_win32k_stock_object(&self, object_id: u32) -> Option<u32> {
+        self.win32k_session.lookup_stock_object(object_id)
+    }
+
+    pub(crate) fn lookup_service_win32k_stock_object(&mut self, object_id: u32) -> Option<u32> {
+        let hit = self.win32k_session.lookup_stock_object(object_id);
+        if hit.is_some() {
+            self.win32k_session.record_service_stock_hit();
+        } else {
+            self.win32k_session.record_service_stock_miss();
+        }
+        hit
+    }
+
+    pub(crate) fn record_service_win32k_stock_hit(&mut self) {
+        self.win32k_session.record_service_stock_hit();
     }
 
     pub(crate) fn publish_hosted_process_vspace(

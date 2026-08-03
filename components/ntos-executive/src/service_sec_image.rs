@@ -8669,16 +8669,14 @@ pub(crate) unsafe fn service_sec_image(
                     // learned from real win32k calls, so service-side gdi32 validates them through
                     // the live shared GDI table instead of receiving an invented handle index.
                     let object_id = a0 as u32;
-                    let hit = GLOBAL_GDI_STOCK_OBJECT_MIRROR.lookup(object_id);
+                    let hit = nt_handler.lookup_service_win32k_stock_object(object_id);
                     if let Some(handle) = hit {
-                        SVC_GDI_STOCK_OBJECT_HITS.fetch_add(1, Ordering::Relaxed);
                         print_str(b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR object=");
                         print_u64(object_id as u64);
                         print_str(b" -> real handle 0x");
                         print_hex(handle);
                         print_str(b"\n");
                     } else {
-                        SVC_GDI_STOCK_OBJECT_MISSES.fetch_add(1, Ordering::Relaxed);
                         print_str(
                             b"[win32k-svc] svc NtGdiGetStockObject(0x10d4) MIRROR MISS object=",
                         );
@@ -8693,13 +8691,13 @@ pub(crate) unsafe fn service_sec_image(
                     // bitmap allocation requests fail visibly until service GDI object ownership is
                     // wired through the provider.
                     let zero_size_default_bitmap = if a0 == 0 || a1 == 0 {
-                        GLOBAL_GDI_STOCK_OBJECT_MIRROR
-                            .lookup(nt_kernel_exec::user_gdi::DEFAULT_BITMAP)
+                        nt_handler
+                            .lookup_win32k_stock_object(nt_kernel_exec::user_gdi::DEFAULT_BITMAP)
                     } else {
                         None
                     };
                     if let Some(handle) = zero_size_default_bitmap {
-                        SVC_GDI_STOCK_OBJECT_HITS.fetch_add(1, Ordering::Relaxed);
+                        nt_handler.record_service_win32k_stock_hit();
                         print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) MIRROR zero-size -> DEFAULT_BITMAP 0x");
                         print_hex(handle);
                         print_str(b"\n");
@@ -9358,9 +9356,8 @@ pub(crate) unsafe fn service_sec_image(
                     && m0 == 0x10d4
                     && st != 0
                     && !svc_noninteractive
-                    && GLOBAL_GDI_STOCK_OBJECT_MIRROR.observe(a0 as u32, st as u32)
+                    && nt_handler.observe_win32k_stock_object(a0 as u32, st as u32)
                 {
-                    GLOBAL_GDI_STOCK_OBJECTS_OBSERVED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] NtGdiGetStockObject(0x10d4) OBSERVED object=");
                     print_u64(a0 as u32 as u64);
                     print_str(b" -> real handle 0x");

@@ -899,3 +899,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   cursor/class/stock-object mirrors and the remaining WSS_NOIO service GDI leaf branches; those
   should move behind provider-owned per-process/session GUI state rather than returning to
   executive-owned identity slots.
+- C3/F1 cleanup. Moved the session GDI stock-object cache and service stock hit/miss counters out
+  of root-module globals (`GLOBAL_GDI_STOCK_OBJECT_MIRROR`,
+  `GLOBAL_GDI_STOCK_OBJECTS_OBSERVED`, `SVC_GDI_STOCK_OBJECT_HITS`, and
+  `SVC_GDI_STOCK_OBJECT_MISSES`) into `Win32kSessionRuntime`, reset and accessed through
+  `ExecNtHandler`. Service `NtGdiGetStockObject`, zero-sized service `NtGdiCreateBitmap`, and the
+  post-dispatch real stock observation path now use explicit handler methods, and the post-loop
+  proof reads a quiesced session-runtime snapshot. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs components/ntos-executive/src/service_sec_image.rs
+  components/ntos-executive/src/service_gui_runtime.rs
+  components/ntos-executive/src/win32k_session_runtime.rs` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: the remaining F1 globals are cursor,
+  built-in-class, class-atom-name, and ScrollBar class identity state; the next slice should keep
+  moving those into provider/session runtime state before tackling the semantic WSS_NOIO GDI
+  leaves.

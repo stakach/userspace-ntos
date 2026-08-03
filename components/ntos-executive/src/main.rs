@@ -34,6 +34,7 @@ mod service_gui_runtime;
 mod service_sec_image;
 mod storage_host;
 mod win32k_pe;
+mod win32k_session_runtime;
 mod win32k_subsystem;
 pub(crate) use service_gui_runtime::*;
 pub(crate) use service_sec_image::*;
@@ -65,6 +66,7 @@ mod img_spawn;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
 pub(crate) use win32k_glue::*;
+pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
 pub(crate) use driver_launch::*;
 
@@ -2062,14 +2064,6 @@ pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
-/// Exact GDI stock-object handles learned from real win32k `NtGdiGetStockObject` calls. Stock
-/// objects are session-global (`ProcessId == 0` in the shared GDI table), so these handles can be
-/// reused by non-interactive service clients after the real interactive path has created them.
-pub(crate) static mut GLOBAL_GDI_STOCK_OBJECT_MIRROR: nt_kernel_exec::user_gdi::StockObjectMirror =
-    nt_kernel_exec::user_gdi::StockObjectMirror::new();
-pub(crate) static GLOBAL_GDI_STOCK_OBJECTS_OBSERVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SVC_GDI_STOCK_OBJECT_HITS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SVC_GDI_STOCK_OBJECT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Exact dynamic class atom names learned from successful real NtUserRegisterClassExWOW calls.
 pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
     nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
@@ -3227,9 +3221,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
     let cursor_handle = USERINIT_GLOBAL_CURSOR_HANDLE.load(Ordering::Relaxed);
     let classes_observed = GLOBAL_BUILTIN_CLASSES_OBSERVED.load(Ordering::Relaxed);
-    let stock_observed = GLOBAL_GDI_STOCK_OBJECTS_OBSERVED.load(Ordering::Relaxed);
-    let stock_hits = SVC_GDI_STOCK_OBJECT_HITS.load(Ordering::Relaxed);
-    let stock_misses = SVC_GDI_STOCK_OBJECT_MISSES.load(Ordering::Relaxed);
+    let (stock_observed, stock_hits, stock_misses) = win32k_session_stock_counters();
     let class_hits = USERINIT_BUILTIN_CLASS_HITS.load(Ordering::Relaxed);
     let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
     let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
@@ -11109,6 +11101,9 @@ struct ExecNtHandler {
     /// Runtime user32 state captured from non-interactive service GUI clients, keyed by their real
     /// ProcessManager PID instead of hosted-process slot globals.
     service_gui_clients: ServiceGuiClientRuntimes,
+    /// Session-scoped win32k state observed from provider-owned objects and reused only through
+    /// explicit session/runtime lookup.
+    win32k_session: Win32kSessionRuntime,
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,
