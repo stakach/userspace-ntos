@@ -64,6 +64,14 @@ const PRIVATE_HEAP_CAPACITY: usize = 15;
 #[cfg(target_arch = "x86_64")]
 type ProcessHeapRegistry = HeapRegistry<on_target::HeapBacking, PRIVATE_HEAP_CAPACITY>;
 
+/// Extra VM-backed segments owned by the distinguished process heap. These are not separate native
+/// heap handles: `Peb->ProcessHeap` remains the handle callers pass to `RtlAllocateHeap`/`Free`.
+#[cfg(target_arch = "x86_64")]
+const PROCESS_HEAP_SEGMENT_CAPACITY: usize = 8;
+
+#[cfg(target_arch = "x86_64")]
+const PROCESS_HEAP_SEGMENT_MIN: usize = 0x10_0000;
+
 /// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). `None` until
 /// initialization; all later access is covered by [`PROCESS_HEAP_LOCK`] so hosted worker threads
 /// cannot alias its mutable state. A global-alloc call before installation returns null.
@@ -76,6 +84,10 @@ static mut PROCESS_HEAPS: MaybeUninit<ProcessHeapRegistry> = MaybeUninit::uninit
 
 #[cfg(target_arch = "x86_64")]
 static mut PROCESS_HEAPS_INITIALIZED: bool = false;
+
+#[cfg(target_arch = "x86_64")]
+static mut PROCESS_HEAP_SEGMENTS: [Option<ProcessHeap>; PROCESS_HEAP_SEGMENT_CAPACITY] =
+    [const { None }; PROCESS_HEAP_SEGMENT_CAPACITY];
 
 #[cfg(target_arch = "x86_64")]
 static PROCESS_HEAP_LOCK: AtomicBool = AtomicBool::new(false);
@@ -131,9 +143,7 @@ unsafe fn critical_section_is_idle(lock: *mut c_void) -> bool {
     let lock_count = unsafe { &*(lock.byte_add(0x08) as *const AtomicI32) };
     let recursion = unsafe { core::ptr::read_volatile(lock.byte_add(0x0c) as *const i32) };
     let owner = unsafe { &*(lock.byte_add(0x10) as *const AtomicU64) };
-    lock_count.load(Ordering::Acquire) == -1
-        && recursion == 0
-        && owner.load(Ordering::Acquire) == 0
+    lock_count.load(Ordering::Acquire) == -1 && recursion == 0 && owner.load(Ordering::Acquire) == 0
 }
 
 const HEAP_LOCK_FREE: u8 = 0;
@@ -228,11 +238,7 @@ unsafe fn heap_lock_record_locked(
     None
 }
 
-unsafe fn register_heap_lock_locked(
-    handle: *mut u8,
-    serialized: bool,
-    custom_lock: u64,
-) -> bool {
+unsafe fn register_heap_lock_locked(handle: *mut u8, serialized: bool, custom_lock: u64) -> bool {
     let records = core::ptr::addr_of_mut!(HEAP_LOCKS).cast::<HeapLockRecord>();
     for index in 0..HEAP_LOCK_CAPACITY {
         let record = unsafe { &*records.add(index) };
@@ -443,11 +449,31 @@ impl ProcessHeapDebugSnapshot<'_> {
         self.registry.copy_handles(output)
     }
 
-    pub(crate) fn summary(
-        &self,
-        handle: *mut u8,
-    ) -> Option<nt_ntdll::heap::HeapDebugSummary> {
-        self.registry.find(handle)?.debug_summary()
+    pub(crate) fn summary(&self, handle: *mut u8) -> Option<nt_ntdll::heap::HeapDebugSummary> {
+        let heap = self.registry.find(handle)?;
+        let mut summary = heap.debug_summary()?;
+        if self
+            .registry
+            .process_handle()
+            .is_some_and(|process| process == handle)
+        {
+            for heap in unsafe { process_heap_segments_locked() }
+                .iter()
+                .filter_map(Option::as_ref)
+            {
+                let segment = heap.debug_summary()?;
+                summary.bytes_committed = summary
+                    .bytes_committed
+                    .checked_add(segment.bytes_committed)?;
+                summary.bytes_allocated = summary
+                    .bytes_allocated
+                    .checked_add(segment.bytes_allocated)?;
+                summary.number_of_entries = summary
+                    .number_of_entries
+                    .checked_add(segment.number_of_entries)?;
+            }
+        }
+        Some(summary)
     }
 
     pub(crate) fn flags(&self, handle: *mut u8) -> Option<u32> {
@@ -465,10 +491,7 @@ impl ProcessHeapDebugSnapshot<'_> {
         handle: *mut u8,
         entry: &mut RtlHeapWalkEntry,
     ) -> Result<HeapWalkOutcome, HeapWalkError> {
-        self.registry
-            .find(handle)
-            .ok_or(HeapWalkError::InvalidParameter)?
-            .walk_next(entry)
+        heap_walk_locked(self.registry, handle, entry)
     }
 }
 
@@ -487,13 +510,139 @@ pub(crate) fn with_process_heap_debug_snapshot<R>(
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn validate_process_heaps() -> bool {
     let _guard = lock_process_heap();
-    unsafe { process_heaps_locked().validate_all() }
+    unsafe {
+        process_heaps_locked().validate_all()
+            && process_heap_segments_locked()
+                .iter()
+                .filter_map(Option::as_ref)
+                .all(|heap| heap.validate(None))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn process_heap_handle() -> Option<*mut u8> {
     let _guard = lock_process_heap();
     unsafe { process_heaps_locked().process_handle() }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn process_heap_segments_locked(
+) -> &'static mut [Option<ProcessHeap>; PROCESS_HEAP_SEGMENT_CAPACITY] {
+    unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_HEAP_SEGMENTS) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn process_heap_segment_size(requested_payload: usize) -> Option<usize> {
+    requested_payload
+        .checked_add(0x1_ffff)
+        .map(|size| size & !0xffff)
+        .map(|size| size.max(PROCESS_HEAP_SEGMENT_MIN))
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn create_process_heap_segment(size: usize) -> Option<ProcessHeap> {
+    let base = unsafe { on_target::nt_allocate_virtual_memory(size) };
+    if base == 0 {
+        return None;
+    }
+    let backing = on_target::HeapBacking {
+        base: base as *mut u8,
+        len: size,
+        owned: true,
+    };
+    let Some(heap) = Heap::create(backing) else {
+        unsafe { on_target::nt_release_virtual_memory(base) };
+        return None;
+    };
+    Some(heap)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn release_owned_heap(heap: ProcessHeap) {
+    let backing = heap.destroy();
+    if backing.owned {
+        unsafe { on_target::nt_release_virtual_memory(backing.base as u64) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn heap_walk_one(
+    heap: &ProcessHeap,
+    segment_index: u8,
+    entry: &mut RtlHeapWalkEntry,
+) -> Result<HeapWalkOutcome, HeapWalkError> {
+    let mut local = *entry;
+    local.segment_index = 0;
+    match heap.walk_next(&mut local)? {
+        HeapWalkOutcome::Entry => {
+            local.segment_index = segment_index;
+            *entry = local;
+            Ok(HeapWalkOutcome::Entry)
+        }
+        HeapWalkOutcome::NoMoreEntries => Ok(HeapWalkOutcome::NoMoreEntries),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn heap_walk_next_segment(
+    segments: &[Option<ProcessHeap>; PROCESS_HEAP_SEGMENT_CAPACITY],
+    start_index: usize,
+    entry: &mut RtlHeapWalkEntry,
+) -> Result<HeapWalkOutcome, HeapWalkError> {
+    for segment_index in start_index..=PROCESS_HEAP_SEGMENT_CAPACITY {
+        let Some(heap) = segments.get(segment_index - 1).and_then(Option::as_ref) else {
+            continue;
+        };
+        let mut restart = RtlHeapWalkEntry::restart();
+        let index = u8::try_from(segment_index).map_err(|_| HeapWalkError::InvalidParameter)?;
+        if let HeapWalkOutcome::Entry = heap_walk_one(heap, index, &mut restart)? {
+            *entry = restart;
+            return Ok(HeapWalkOutcome::Entry);
+        }
+    }
+    Ok(HeapWalkOutcome::NoMoreEntries)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn heap_walk_locked(
+    registry: &ProcessHeapRegistry,
+    handle: *mut u8,
+    entry: &mut RtlHeapWalkEntry,
+) -> Result<HeapWalkOutcome, HeapWalkError> {
+    let heap = registry
+        .find(handle)
+        .ok_or(HeapWalkError::InvalidParameter)?;
+    if !registry
+        .process_handle()
+        .is_some_and(|process| process == handle)
+    {
+        return heap.walk_next(entry);
+    }
+    if entry.data_address.is_null() {
+        return heap_walk_one(heap, 0, entry);
+    }
+
+    let segment_index = entry.segment_index as usize;
+    if segment_index == 0 {
+        return match heap_walk_one(heap, 0, entry)? {
+            HeapWalkOutcome::Entry => Ok(HeapWalkOutcome::Entry),
+            HeapWalkOutcome::NoMoreEntries => {
+                heap_walk_next_segment(unsafe { process_heap_segments_locked() }, 1, entry)
+            }
+        };
+    }
+
+    let segments = unsafe { process_heap_segments_locked() };
+    let segment = segments
+        .get(segment_index - 1)
+        .and_then(Option::as_ref)
+        .ok_or(HeapWalkError::InvalidAddress)?;
+    match heap_walk_one(segment, entry.segment_index, entry)? {
+        HeapWalkOutcome::Entry => Ok(HeapWalkOutcome::Entry),
+        HeapWalkOutcome::NoMoreEntries => {
+            heap_walk_next_segment(segments, segment_index + 1, entry)
+        }
+    }
 }
 
 /// Acquire the heap's recursive exclusion and retain it across subsequent heap API calls.
@@ -565,33 +714,72 @@ pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
 /// Allocate from the heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_alloc_with_flags(handle: *mut u8, size: usize, flags: u32) -> *mut u8 {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return core::ptr::null_mut();
     };
     let _guard = lock_process_heap();
+    let registry = unsafe { process_heaps_locked() };
+    let process_handle = registry.process_handle();
+    let is_process_heap = process_handle.is_some_and(|process| process == handle);
+    if let Some(ptr) = registry
+        .find_mut(handle)
+        .and_then(|heap| heap.allocate_with_flags(size, flags))
+    {
+        return ptr;
+    }
+    if !is_process_heap {
+        return core::ptr::null_mut();
+    }
     unsafe {
-        process_heaps_locked()
-            .find_mut(handle)
-            .and_then(|heap| heap.allocate_with_flags(size, flags))
-            .unwrap_or(core::ptr::null_mut())
+        let segments = process_heap_segments_locked();
+        for heap in segments.iter_mut().filter_map(Option::as_mut) {
+            if let Some(ptr) = heap.allocate_with_flags(size, flags) {
+                return ptr;
+            }
+        }
+        let Some(segment_size) = process_heap_segment_size(size) else {
+            return core::ptr::null_mut();
+        };
+        let Some(mut heap) = create_process_heap_segment(segment_size) else {
+            return core::ptr::null_mut();
+        };
+        let Some(ptr) = heap.allocate_with_flags(size, flags) else {
+            release_owned_heap(heap);
+            return core::ptr::null_mut();
+        };
+        let Some(slot) = segments.iter_mut().find(|entry| entry.is_none()) else {
+            release_owned_heap(heap);
+            return core::ptr::null_mut();
+        };
+        *slot = Some(heap);
+        ptr
     }
 }
 
 /// Free from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8, flags: u32) -> bool {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return false;
     };
     let _guard = lock_process_heap();
+    let registry = unsafe { process_heaps_locked() };
+    let is_process_heap = registry
+        .process_handle()
+        .is_some_and(|process| process == handle);
+    if unsafe { registry.find_mut(handle).is_some_and(|heap| heap.free(ptr)) } {
+        return true;
+    }
+    if !is_process_heap {
+        return false;
+    }
     unsafe {
-        process_heaps_locked()
-            .find_mut(handle)
-            .is_some_and(|heap| heap.free(ptr))
+        process_heap_segments_locked()
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .any(|heap| heap.free(ptr))
     }
 }
 
@@ -604,46 +792,136 @@ pub(crate) unsafe fn heap_realloc_with_flags(
     flags: u32,
     in_place_only: bool,
 ) -> *mut u8 {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return core::ptr::null_mut();
     };
     let _guard = lock_process_heap();
-    unsafe {
-        process_heaps_locked()
+    let registry = unsafe { process_heaps_locked() };
+    let is_process_heap = registry
+        .process_handle()
+        .is_some_and(|process| process == handle);
+    if let Some(result) = unsafe {
+        registry
             .find_mut(handle)
             .and_then(|heap| heap.reallocate_with_flags(ptr, new_size, flags, in_place_only))
-            .unwrap_or(core::ptr::null_mut())
+    } {
+        return result;
+    }
+    if !is_process_heap {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let segments = process_heap_segments_locked();
+        for heap in segments.iter_mut().filter_map(Option::as_mut) {
+            if let Some(result) = heap.reallocate_with_flags(ptr, new_size, flags, in_place_only) {
+                return result;
+            }
+        }
+        if in_place_only {
+            return core::ptr::null_mut();
+        }
+        let old_size = registry
+            .find(handle)
+            .and_then(|heap| heap.size_of(ptr))
+            .or_else(|| {
+                segments
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .find_map(|heap| heap.size_of(ptr))
+            });
+        let Some(old_size) = old_size else {
+            return core::ptr::null_mut();
+        };
+        let Some(segment_size) = process_heap_segment_size(new_size) else {
+            return core::ptr::null_mut();
+        };
+        let Some(slot_index) = segments.iter().position(Option::is_none) else {
+            return core::ptr::null_mut();
+        };
+        let Some(mut heap) = create_process_heap_segment(segment_size) else {
+            return core::ptr::null_mut();
+        };
+        let Some(result) = heap.allocate_with_flags(new_size, flags) else {
+            release_owned_heap(heap);
+            return core::ptr::null_mut();
+        };
+        core::ptr::copy_nonoverlapping(ptr, result, old_size.min(new_size));
+        if let Some(base_heap) = registry.find_mut(handle) {
+            let _ = base_heap.free(ptr);
+        }
+        for existing in segments.iter_mut().filter_map(Option::as_mut) {
+            if existing.free(ptr) {
+                break;
+            }
+        }
+        segments[slot_index] = Some(heap);
+        result
     }
 }
 
 /// Size a live allocation from the exact heap named by `handle`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8, flags: u32) -> Option<usize> {
-    let _heap_guard =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
+    let _heap_guard = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
     let _guard = lock_process_heap();
+    let registry = unsafe { process_heaps_locked() };
+    let is_process_heap = registry
+        .process_handle()
+        .is_some_and(|process| process == handle);
+    if let Some(size) = unsafe { registry.find(handle).and_then(|heap| heap.size_of(ptr)) } {
+        return Some(size);
+    }
+    if !is_process_heap {
+        return None;
+    }
     unsafe {
-        process_heaps_locked()
-            .find(handle)
-            .and_then(|heap| heap.size_of(ptr))
+        process_heap_segments_locked()
+            .iter()
+            .filter_map(Option::as_ref)
+            .find_map(|heap| heap.size_of(ptr))
     }
 }
 
 /// Validate the complete physical chain or one exact live block on the named heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_validate(handle: *mut u8, ptr: Option<*const u8>, flags: u32) -> bool {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return false;
     };
     let _guard = lock_process_heap();
     unsafe {
-        process_heaps_locked()
-            .find(handle)
-            .is_some_and(|heap| heap.validate(ptr))
+        let registry = process_heaps_locked();
+        let is_process_heap = registry
+            .process_handle()
+            .is_some_and(|process| process == handle);
+        if let Some(heap) = registry.find(handle) {
+            if ptr.is_some() {
+                if heap.validate(ptr) {
+                    return true;
+                }
+            } else if !heap.validate(None) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if !is_process_heap {
+            return ptr.is_none();
+        }
+        let segments = process_heap_segments_locked();
+        if let Some(ptr) = ptr {
+            segments
+                .iter()
+                .filter_map(Option::as_ref)
+                .any(|heap| heap.validate(Some(ptr)))
+        } else {
+            segments
+                .iter()
+                .filter_map(Option::as_ref)
+                .all(|heap| heap.validate(None))
+        }
     }
 }
 
@@ -652,20 +930,60 @@ pub(crate) fn heap_validate(handle: *mut u8, ptr: Option<*const u8>, flags: u32)
 pub(crate) fn heap_compact(handle: *mut u8, flags: u32) -> Option<usize> {
     let _heap_guard = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
     let _guard = lock_process_heap();
-    unsafe { process_heaps_locked().find(handle).and_then(Heap::compact) }
+    unsafe {
+        let registry = process_heaps_locked();
+        let mut largest = registry.find(handle)?.compact()?;
+        if registry
+            .process_handle()
+            .is_some_and(|process| process == handle)
+        {
+            for heap in process_heap_segments_locked()
+                .iter()
+                .filter_map(Option::as_ref)
+            {
+                largest = largest.max(heap.compact()?);
+            }
+        }
+        Some(largest)
+    }
 }
 
 /// Zero free payload bytes in a registered heap.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn heap_zero_free_blocks(handle: *mut u8, flags: u32) -> bool {
-    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0) else {
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    else {
         return false;
     };
     let _guard = lock_process_heap();
     unsafe {
-        process_heaps_locked()
+        let registry = process_heaps_locked();
+        let is_process_heap = registry
+            .process_handle()
+            .is_some_and(|process| process == handle);
+        let Some(heap) = registry.find(handle) else {
+            return false;
+        };
+        if !heap.validate(None) {
+            return false;
+        }
+        let segments = process_heap_segments_locked();
+        if is_process_heap
+            && !segments
+                .iter()
+                .filter_map(Option::as_ref)
+                .all(|heap| heap.validate(None))
+        {
+            return false;
+        }
+        let ok = registry
             .find_mut(handle)
-            .is_some_and(|heap| heap.zero_free_blocks())
+            .is_some_and(|heap| heap.zero_free_blocks());
+        ok && (!is_process_heap
+            || segments
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .all(|heap| heap.zero_free_blocks()))
     }
 }
 
@@ -694,13 +1012,23 @@ pub(crate) unsafe fn heap_user_info(
     ptr: *mut u8,
     flags: u32,
 ) -> Option<HeapUserInfo> {
-    let _heap_guard =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
+    let _heap_guard = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)?;
     let _guard = lock_process_heap();
     unsafe {
-        process_heaps_locked()
-            .find(handle)
-            .and_then(|heap| heap.user_info(ptr))
+        let registry = process_heaps_locked();
+        let is_process_heap = registry
+            .process_handle()
+            .is_some_and(|process| process == handle);
+        if let Some(info) = registry.find(handle).and_then(|heap| heap.user_info(ptr)) {
+            return Some(info);
+        }
+        if !is_process_heap {
+            return None;
+        }
+        process_heap_segments_locked()
+            .iter()
+            .filter_map(Option::as_ref)
+            .find_map(|heap| heap.user_info(ptr))
     }
 }
 
@@ -712,16 +1040,27 @@ pub(crate) unsafe fn heap_set_user_value(
     value: usize,
     flags: u32,
 ) -> bool {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return false;
     };
     let _guard = lock_process_heap();
     unsafe {
-        process_heaps_locked()
+        let registry = process_heaps_locked();
+        let is_process_heap = registry
+            .process_handle()
+            .is_some_and(|process| process == handle);
+        if registry
             .find_mut(handle)
             .is_some_and(|heap| heap.set_user_value(ptr, value))
+        {
+            return true;
+        }
+        is_process_heap
+            && process_heap_segments_locked()
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .any(|heap| heap.set_user_value(ptr, value))
     }
 }
 
@@ -734,23 +1073,33 @@ pub(crate) unsafe fn heap_set_user_flags(
     set: u32,
     flags: u32,
 ) -> bool {
-    let Some(_heap_guard) =
-        lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
+    let Some(_heap_guard) = lock_heap_operation(handle, false, flags & HEAP_NO_SERIALIZE != 0)
     else {
         return false;
     };
     let _guard = lock_process_heap();
     unsafe {
-        process_heaps_locked()
+        let registry = process_heaps_locked();
+        let is_process_heap = registry
+            .process_handle()
+            .is_some_and(|process| process == handle);
+        if registry
             .find_mut(handle)
             .is_some_and(|heap| heap.set_user_flags(ptr, reset, set))
+        {
+            return true;
+        }
+        is_process_heap
+            && process_heap_segments_locked()
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .any(|heap| heap.set_user_flags(ptr, reset, set))
     }
 }
 
-/// `RtlAllocateHeap` core — allocate `size` payload bytes from the installed process heap. The
-/// `HeapHandle` the caller passes (`Peb->ProcessHeap`) is ignored: during the smss bring-up the
-/// process has exactly one heap (ours), so routing every `RtlAllocateHeap` to it is correct. Returns
-/// null on OOM / before the heap is installed (an honest allocation failure — never a bogus pointer).
+/// `RtlAllocateHeap` core — allocate `size` payload bytes from the installed process heap handle.
+/// The primary heap is installed from `Peb->ProcessHeap`; once it is exhausted, the same handle grows
+/// with additional VM-backed segments. Returns null on OOM / before the heap is installed.
 ///
 /// # Safety
 /// Serialized by the process-heap guard.

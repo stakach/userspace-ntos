@@ -1135,3 +1135,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   creates and correlates IDD_LOGON (`modal-ready=1`) but then observes the correlated dialog being
   destroyed before the modal paint proof, so the current source no longer satisfies the older green
   modal/framebuffer checklist recorded before the service USER/GDI fallback cleanup sequence.
+
+### 2026-08-04
+
+- C3 continued. `NtGdiStretchDIBitsInternal(0x1082)` now has a provider-owned
+  cross-address-space input boundary for interactive GUI clients. The executive reads the complete
+  ReactOS x64 stack tail, stages the optional DIB bits and required `BITMAPINFO` in the win32k arg
+  frame, forwards the original scalar shape with only `pjInit`/`pbmi` rebased, and fails visibly
+  with a zero return if the client graph is unreadable or oversized. This removes the raw client
+  heap pointers that made ReactOS `user32!BITMAP_LoadImageW` log `StretchDIBits failed!` while
+  loading the combo-box bitmap during the winlogon dialog/control path. The same checkpoint grows
+  the ntdll process heap behind the real `Peb->ProcessHeap` handle with bounded VM-backed segments,
+  so process-heap exhaustion no longer requires private synthetic handles or caller-visible heap
+  substitution. Validation: `cargo test -p nt-ntdll` passed 699 tests,
+  `components/ntos-executive/build.sh` passed, `git diff --check` passed, and
+  `.tmp/full-boot-stretchdibits-marshalled.log` shows staged `NtGdiStretchDIBitsInternal` returns
+  and no `StretchDIBits failed`, combo `NCCREATE message failed`,
+  `co_UserCreateWindowEx failed`, or StretchDIBits input-probe rejection. The run advanced beyond
+  the previous combo/load-bitmap wall into real desktop paint work plus services/LSASS win32k calls;
+  it was then manually stopped after continued post-desktop progress, so F3/F4 remain open until a
+  natural modal/credential framebuffer proof is restored.

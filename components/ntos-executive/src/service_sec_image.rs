@@ -22,6 +22,7 @@ static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -46,6 +47,7 @@ const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
+const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize = 0x4000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
@@ -7124,6 +7126,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut create_bitmap_stack_args = [0u64; 1];
                 let mut create_bitmap_stack_arg_count = 0usize;
                 let mut create_bitmap_probe_failed = false;
+                let mut stretch_dibits_stack_args = [0u64; 12];
+                let mut stretch_dibits_stack_arg_count = 0usize;
+                let mut stretch_dibits_probe_failed = false;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -7388,6 +7393,164 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     } else {
                         create_bitmap_probe_failed = true;
+                    }
+                } else if m0 == 0x1082 && uses_client_gdi {
+                    // NtGdiStretchDIBitsInternal receives the converted BITMAPINFO and optional DIB
+                    // bits from gdi32's client heap. Stage those buffers in win32k-owned memory before
+                    // isolated win32k validates pbmi/pjInit, preserving the original scalar argument tail.
+                    if sp == 0 {
+                        stretch_dibits_probe_failed = true;
+                    } else {
+                        let mut tail_ok = true;
+                        let mut i = 0usize;
+                        while i < stretch_dibits_stack_args.len() {
+                            match client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28 + i as u64 * 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                Some(value) => stretch_dibits_stack_args[i] = value,
+                                None => {
+                                    tail_ok = false;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        if !tail_ok {
+                            stretch_dibits_probe_failed = true;
+                        } else {
+                            let pj_init = stretch_dibits_stack_args[5];
+                            let pbmi = stretch_dibits_stack_args[6];
+                            let cj_max_info = stretch_dibits_stack_args[9];
+                            let cj_max_bits = stretch_dibits_stack_args[10];
+                            let base = win32k_subsystem::WIN32K_ARG_VADDR;
+                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let mut offset = 0u64;
+                            let mut layout_ok = pbmi != 0
+                                && cj_max_info >= 12
+                                && cj_max_info <= cap
+                                && cj_max_bits <= cap;
+                            let staged_bits = if layout_ok && pj_init != 0 {
+                                let out = base + offset;
+                                let bits_reserved = if cj_max_bits == 0 { 8 } else { cj_max_bits };
+                                match offset
+                                    .checked_add(bits_reserved)
+                                    .and_then(|next| align_up_u64(next, 8))
+                                {
+                                    Some(next) if next <= cap => offset = next,
+                                    _ => layout_ok = false,
+                                }
+                                out
+                            } else {
+                                0
+                            };
+                            let staged_pbmi = if layout_ok {
+                                let out = base + offset;
+                                match offset
+                                    .checked_add(cj_max_info)
+                                    .and_then(|next| align_up_u64(next, 8))
+                                {
+                                    Some(next) if next <= cap => offset = next,
+                                    _ => layout_ok = false,
+                                }
+                                out
+                            } else {
+                                0
+                            };
+                            if !layout_ok {
+                                stretch_dibits_probe_failed = true;
+                            } else {
+                                core::ptr::write_bytes(
+                                    base as *mut u8,
+                                    0,
+                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
+                                );
+                                let copied_bits = if pj_init == 0 || cj_max_bits == 0 {
+                                    true
+                                } else {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        pj_init,
+                                        cj_max_bits as usize,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let bits_out = core::slice::from_raw_parts_mut(
+                                        staged_bits as *mut u8,
+                                        cj_max_bits as usize,
+                                    );
+                                    img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        pj_init,
+                                        bits_out,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    )
+                                };
+                                let copied_bmi = if copied_bits {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        pbmi,
+                                        cj_max_info as usize,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let bmi_out = core::slice::from_raw_parts_mut(
+                                        staged_pbmi as *mut u8,
+                                        cj_max_info as usize,
+                                    );
+                                    img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        pbmi,
+                                        bmi_out,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    )
+                                } else {
+                                    false
+                                };
+                                if copied_bmi {
+                                    stretch_dibits_stack_args[5] = staged_bits;
+                                    stretch_dibits_stack_args[6] = staged_pbmi;
+                                    stretch_dibits_stack_arg_count =
+                                        stretch_dibits_stack_args.len();
+                                    let n = STRETCH_DIBITS_MARSHAL_TRACE
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if n < 24 {
+                                        print_str(b"[w32marshal] NtGdiStretchDIBitsInternal pi=");
+                                        print_u64(pi as u64);
+                                        print_str(b" hdc=0x");
+                                        print_hex_u64(a0);
+                                        print_str(b" bits=0x");
+                                        print_hex_u64(pj_init);
+                                        print_str(b" bmi=0x");
+                                        print_hex_u64(pbmi);
+                                        print_str(b" info=");
+                                        print_u64(cj_max_info);
+                                        print_str(b" bits-bytes=");
+                                        print_u64(cj_max_bits);
+                                        print_str(b" rop=0x");
+                                        print_hex(stretch_dibits_stack_args[8] as u32);
+                                        print_str(b" staged=0x");
+                                        print_hex_u64(staged_bits);
+                                        print_str(b"/0x");
+                                        print_hex_u64(staged_pbmi);
+                                        print_str(b" bytes=");
+                                        print_u64(offset);
+                                        print_str(b"\n");
+                                    }
+                                } else {
+                                    stretch_dibits_probe_failed = true;
+                                }
+                            }
+                        }
                     }
                 } else if m0 == 0x125c && sp != 0 {
                     // NtUserLoadKeyboardLayoutEx has a client PUNICODE_STRING KLID in its stack
@@ -8458,6 +8621,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if stretch_dibits_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(
+                            b"[win32k-svc] NtGdiStretchDIBitsInternal input probe failed pi=",
+                        );
+                        print_u64(pi as u64);
+                        print_str(b" hdc=0x");
+                        print_hex_u64(a0);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> 0\n");
+                    }
+                    (0, true)
                 } else if text_extent_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -8578,6 +8755,8 @@ pub(crate) unsafe fn service_sec_image(
                         && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
                     let create_bitmap_staged_stack = m0 == 0x106c
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
+                    let stretch_dibits_staged_stack = m0 == 0x1082
+                        && stretch_dibits_stack_arg_count == stretch_dibits_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
                     let char_width_staged_stack =
@@ -8601,6 +8780,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &build_hwnd_list_stack_args)
                     } else if create_bitmap_staged_stack {
                         (sp, &create_bitmap_stack_args)
+                    } else if stretch_dibits_staged_stack {
+                        (sp, &stretch_dibits_stack_args)
                     } else if text_extent_staged_stack {
                         (sp, &text_extent_stack_args)
                     } else if char_width_staged_stack {
