@@ -1072,17 +1072,6 @@ pub const MPR_WIN32BUF_OFFSET: u64 = 0x6C0000; // mpr ~107 KiB (ends ~0x6DAC00)
 /// off disk into here; the executive parses+loads it into the win32k-service component.
 pub const WIN32KBUF_VADDR: u64 = 0x0000_0100_0600_0000;
 pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_image
-/// Raw dxg.sys / dxgthk.sys staging buffers (DirectX kernel driver + thunk table). Own 2 MiB PTs
-/// past WIN32KBUF (0x0600..0x0622) and clear of WIN32K_CODE_VA (0x0680, mapped in the executive too).
-/// dxg.sys=33,728 B (16 frames), dxgthk.sys=11,200 B (8 frames); one PT each.
-pub const DXGBUF_VADDR: u64 = 0x0000_0100_0630_0000;
-pub const DXGBUF_FRAMES: u64 = 16;
-pub const DXGTHKBUF_VADDR: u64 = 0x0000_0100_0650_0000;
-pub const DXGTHKBUF_FRAMES: u64 = 8;
-/// Raw ftfd.dll staging buffer (FreeType font driver, ~977 KiB). Own 2 MiB PT window [0x0660..0x0680)
-/// (245 frames span 0x0670_0000..0x067f_5000, clear of WIN32K_CODE_VA at 0x0680). ftfd size=1,000,960 B.
-pub const FTFDBUF_VADDR: u64 = 0x0000_0100_0670_0000;
-pub const FTFDBUF_FRAMES: u64 = 245;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -13195,11 +13184,6 @@ impl ProcExec {
 static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set when the handler accepted a nonzero seL4 VSpace cap for hosted process pi.
 static PM_VSPACE_PUBLISHED_OK: AtomicU64 = AtomicU64::new(0);
-/// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
-static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
-static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
-/// Frame-cap base of the raw ftfd.dll staged into FTFDBUF (FreeType font driver).
-static FTFDBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the staged system font (arial.ttf) in FONTBUF (fed to IntGdiAddFontMemResource).
 static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
@@ -15503,18 +15487,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             }
             WINLOGONBUF_START.store(winlogonbuf_start, Ordering::Relaxed);
-            // The raw dxg.sys / dxgthk.sys buffers (one PT each), mapped in the executive too so it
-            // can parse+load them into win32k's VSpace (DirectX driver hosting).
-            for (st_static, vaddr, frames) in [
-                (&DXGBUF_START, DXGBUF_VADDR, DXGBUF_FRAMES),
-                (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
-                (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
-                (
-                    &FONTBUF_START,
-                    win32k_subsystem::FONTBUF_VADDR,
-                    win32k_subsystem::FONTBUF_FRAMES,
-                ),
-            ] {
+            for (st_static, vaddr, frames) in [(
+                &FONTBUF_START,
+                win32k_subsystem::FONTBUF_VADDR,
+                win32k_subsystem::FONTBUF_FRAMES,
+            )] {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
                 let _ =
@@ -16588,7 +16565,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if finished {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
-                // Pre-load the DirectX graphics driver (dxg.sys + dxgthk.sys) into win32k's VSpace so
+                // Host the DirectX graphics driver (dxg.sys + dxgthk.sys) into win32k's VSpace so
                 // NtUserInitialize → InitializeGreCSRSS → DxDdStartupDxGraphics (ZwSetSystemInformation
                 // SystemLoadGdiDriverInformation) finds a real hosted dxg image.
                 load_directx_drivers(host_pml4);

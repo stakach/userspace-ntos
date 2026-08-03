@@ -932,7 +932,10 @@ unsafe fn primary_token_authentication_id(token: u64) -> Option<u64> {
     })
 }
 
-unsafe fn primary_token_user_sid(token: u64, out: &mut [u8; WIN32K_TOKEN_USER_SID_MAX]) -> Option<usize> {
+unsafe fn primary_token_user_sid(
+    token: u64,
+    out: &mut [u8; WIN32K_TOKEN_USER_SID_MAX],
+) -> Option<usize> {
     token_context_index(token)?;
     let len = read_volatile((token + TOKEN_USER_SID_LEN_OFF) as *const u64) as usize;
     if len == 0 || len > WIN32K_TOKEN_USER_SID_MAX {
@@ -2183,8 +2186,7 @@ extern "win64" fn s_ob_open_object_by_name(
                 0
             }
             Some(ObKind::WindowStation) => {
-                let service =
-                    object_attributes_name_contains_ascii(object_attributes, b"service-");
+                let service = object_attributes_name_contains_ascii(object_attributes, b"service-");
                 if service {
                     let handle_for_service = service_window_station_handle_for_current_token();
                     if handle_for_service != 0 {
@@ -3627,7 +3629,10 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
         && BOUND_DESK_PDESKINFO != 0
         && BOUND_DESK_BODY != 0
     {
-        write_volatile((w32thread + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
+        write_volatile(
+            (w32thread + THREADINFO_RPDESK_OFF) as *mut u64,
+            BOUND_DESK_BODY,
+        );
         write_volatile(
             (w32thread + THREADINFO_PDESKINFO_OFF) as *mut u64,
             BOUND_DESK_PDESKINFO,
@@ -4536,7 +4541,10 @@ fn registered_gdi_driver_record(
     rec
 }
 
-unsafe fn registered_gdi_driver_for_name(name_buf: u64, name_len: usize) -> Option<GdiDriverRecord> {
+unsafe fn registered_gdi_driver_for_name(
+    name_buf: u64,
+    name_len: usize,
+) -> Option<GdiDriverRecord> {
     let records = &*core::ptr::addr_of!(GDI_DRIVER_RECORDS);
     for rec in records.iter() {
         if rec.leaf_len == 0 {
@@ -4740,11 +4748,7 @@ fn register_win32k_reg_wide_ascii(
     )
 }
 
-fn register_win32k_reg_value(
-    key_handle: u64,
-    name: &[u8],
-    data: Win32kRegValueData,
-) -> bool {
+fn register_win32k_reg_value(key_handle: u64, name: &[u8], data: Win32kRegValueData) -> bool {
     if key_handle == 0 || name.is_empty() || name.len() > WIN32K_REG_VALUE_NAME_CAP {
         return false;
     }
@@ -4939,9 +4943,7 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
         let keys = &*core::ptr::addr_of!(WIN32K_REG_KEYS);
         let Some(hkey) = keys
             .iter()
-            .find(|key| {
-                key.pattern_len != 0 && wstr_contains_ascii(buf, len, key.pattern_bytes())
-            })
+            .find(|key| key.pattern_len != 0 && wstr_contains_ascii(buf, len, key.pattern_bytes()))
             .map(|key| key.handle)
         else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -5754,14 +5756,8 @@ fn register_trampolines() {
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
-    reg.bind(
-        "ZwOpenThreadToken",
-        s_zw_open_thread_token as usize as u64,
-    );
-    reg.bind(
-        "NtOpenThreadToken",
-        s_zw_open_thread_token as usize as u64,
-    );
+    reg.bind("ZwOpenThreadToken", s_zw_open_thread_token as usize as u64);
+    reg.bind("NtOpenThreadToken", s_zw_open_thread_token as usize as u64);
     reg.bind(
         "ZwOpenProcessToken",
         s_zw_open_process_token as usize as u64,
@@ -7776,9 +7772,7 @@ unsafe fn create_winsta_and_desktop() {
         let pti_link = pti + THREADINFO_PTI_LINK_OFF;
         let link_flink = read_volatile(pti_link as *const u64);
         let link_blink = read_volatile((pti_link + 8) as *const u64);
-        if (link_flink != 0 || link_blink != 0)
-            && !unlink_thread_from_desktop(pti as *mut u8)
-        {
+        if (link_flink != 0 || link_blink != 0) && !unlink_thread_from_desktop(pti as *mut u8) {
             print_str(b"[win32k-host] WARN: failed to unlink old desktop membership before Default bind\n");
         }
         if !link_thread_to_desktop(desk_body as *mut u8, pti as *mut u8) {
@@ -7920,9 +7914,9 @@ unsafe fn establish_client_and_dispatch() {
 //
 // win32k's InitializeGreCSRSS -> DxDdStartupDxGraphics loads dxg.sys via EngLoadImage ->
 // LDEVOBJ_bLoadImage -> ZwSetSystemInformation(SystemLoadGdiDriverInformation). The executive
-// (privileged) PRE-LOADS dxg.sys + its dxgthk.sys dependency into win32k's VSpace at bring-up
-// (parse, map W^X, relocs, resolve imports), then the ZwSetSystemInformation trampoline reports
-// the pre-loaded image to win32k. This is the reusable driver-loader used by display DLL hosting.
+// (privileged) reads dxg.sys + its dxgthk.sys dependency by path into pool memory at bring-up,
+// maps them into win32k's VSpace, then the ZwSetSystemInformation trampoline reports the registered
+// image to win32k. This is the reusable driver-loader used by display DLL hosting.
 
 /// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
 pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;

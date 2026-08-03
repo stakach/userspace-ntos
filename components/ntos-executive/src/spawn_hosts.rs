@@ -469,29 +469,12 @@ pub(crate) unsafe fn spawn_storage_host(
         pts: 1,
     };
     n += 1;
-    // dxg/dxgthk/ftfd/font staging buffers (one PT each).
-    for (start, vaddr, frames) in [
-        (
-            DXGBUF_START.load(Ordering::Relaxed),
-            DXGBUF_VADDR,
-            DXGBUF_FRAMES,
-        ),
-        (
-            DXGTHKBUF_START.load(Ordering::Relaxed),
-            DXGTHKBUF_VADDR,
-            DXGTHKBUF_FRAMES,
-        ),
-        (
-            FTFDBUF_START.load(Ordering::Relaxed),
-            FTFDBUF_VADDR,
-            FTFDBUF_FRAMES,
-        ),
-        (
-            FONTBUF_START.load(Ordering::Relaxed),
-            win32k_subsystem::FONTBUF_VADDR,
-            win32k_subsystem::FONTBUF_FRAMES,
-        ),
-    ] {
+    // Font staging buffer (one PT).
+    for (start, vaddr, frames) in [(
+        FONTBUF_START.load(Ordering::Relaxed),
+        win32k_subsystem::FONTBUF_VADDR,
+        win32k_subsystem::FONTBUF_FRAMES,
+    )] {
         regions[n] = Region {
             source: FrameSource::Alias(start),
             base_va: vaddr,

@@ -56,8 +56,9 @@ static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WINDOWPROC_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
-const _: () =
-    assert!(nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX);
+const _: () = assert!(
+    nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
+);
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -2132,10 +2133,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     let depth_after = crate::spawn_hosts::dispatch_depth();
     let suspended_after =
         crate::spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
-    let stacks_drained = active_after == 0
-        && continuation_after == 0
-        && depth_after == 0
-        && suspended_after == 0;
+    let stacks_drained =
+        active_after == 0 && continuation_after == 0 && depth_after == 0 && suspended_after == 0;
     let (probe_status, probe_ok) = if stacks_drained {
         win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0)
     } else {
@@ -2669,10 +2668,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     );
     let completed_client = callback_client_from_frame(request, completed_frame);
     let completed_role = completed_client.role;
-    let component = resume_suspended_user_callback_component(
-        request,
-        completed_client,
-    );
+    let component = resume_suspended_user_callback_component(request, completed_client);
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
@@ -3297,14 +3293,18 @@ pub(crate) unsafe fn load_one_driver(
 /// DxDdStartupDxGraphics) can report the hosted dxg image. dxgthk (leaf) first, then dxg (imports
 /// dxgthk's Eng* + ntoskrnl). Called once at win32k bring-up.
 pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
-    let dxg_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x80) as *const u32);
-    let dxgthk_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x84) as *const u32);
-    if dxg_size == 0 || dxgthk_size == 0 {
-        print_str(b"[win32k-svc] dxg/dxgthk not staged - DirectX gate will fail\n");
+    let Some(fs) = exec_fs() else {
+        print_str(b"[win32k-svc] DirectX drivers unavailable - executive FS not mounted\n");
         return;
-    }
+    };
+    let Some((dxgthk_src, dxgthk_size)) =
+        load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxgthk.sys")
+    else {
+        print_str(b"[win32k-svc] dxgthk.sys not found in ReactOS driver directory\n");
+        return;
+    };
     if load_one_driver(
-        DXGTHKBUF_VADDR,
+        dxgthk_src,
         win32k_subsystem::DXGTHK_VA,
         win32k_subsystem::DXGTHK_LOAD_FRAMES,
         host_pml4,
@@ -3315,8 +3315,13 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
         print_str(b"[win32k-svc] dxgthk load failed\n");
         return;
     }
+    let Some((dxg_src, dxg_size)) = load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxg.sys")
+    else {
+        print_str(b"[win32k-svc] dxg.sys not found in ReactOS driver directory\n");
+        return;
+    };
     match load_one_driver(
-        DXGBUF_VADDR,
+        dxg_src,
         win32k_subsystem::DXG_VA,
         win32k_subsystem::DXG_LOAD_FRAMES,
         host_pml4,
@@ -3324,7 +3329,11 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
     ) {
         Some((entry, expdir, len)) => {
             win32k_subsystem::record_dxg(entry, expdir, len);
-            print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: entry_rva=0x");
+            print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: file_sizes=");
+            print_u64(dxg_size as u64);
+            print_str(b"/");
+            print_u64(dxgthk_size as u64);
+            print_str(b" entry_rva=0x");
             print_hex(entry);
             print_str(b" export_dir_rva=0x");
             print_hex(expdir);
@@ -3343,13 +3352,16 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
 /// Called once at win32k bring-up, AFTER win32k is loaded (its exports must be present for ftfd's IAT)
 /// and BEFORE any FT_* call (which happens far later, during a routed NtUserInitialize dispatch).
 pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
-    let ftfd_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x88) as *const u32);
-    if ftfd_size == 0 {
-        print_str(b"[win32k-svc] ftfd.dll not staged - font gate will fail\n");
+    let Some(fs) = exec_fs() else {
+        print_str(b"[win32k-svc] ftfd.dll unavailable - executive FS not mounted\n");
         return;
-    }
+    };
+    let Some((ftfd_src, ftfd_size)) = load_file_to_pool(&fs, b"reactos\\system32\\ftfd.dll") else {
+        print_str(b"[win32k-svc] ftfd.dll not found in ReactOS System32\n");
+        return;
+    };
     match load_one_driver(
-        FTFDBUF_VADDR,
+        ftfd_src,
         win32k_subsystem::FTFD_VA,
         win32k_subsystem::FTFD_LOAD_FRAMES,
         host_pml4,
@@ -3357,7 +3369,9 @@ pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
     ) {
         Some((entry, _expdir, len)) => {
             let patched = win32k_subsystem::patch_win32k_ftfd_imports(win32k_subsystem::FTFD_VA);
-            print_str(b"[win32k-svc] hosted ftfd.dll: entry_rva=0x");
+            print_str(b"[win32k-svc] hosted ftfd.dll: file_size=");
+            print_u64(ftfd_size as u64);
+            print_str(b" entry_rva=0x");
             print_hex(entry);
             print_str(b" len=0x");
             print_hex(len);

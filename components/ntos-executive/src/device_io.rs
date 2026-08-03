@@ -488,38 +488,13 @@ pub(crate) unsafe fn storage_probe(
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x7c) as *mut u32, sz);
             }
         }
-        // dxg.sys + dxgthk.sys (DirectX kernel driver + thunk table) into their own buffers; sizes
-        // reported at STORAGE_SHARED+0x80 / +0x84 so the executive can host them into win32k.
-        for (path, short, dest, cap_frames, off) in [
-            (
-                b"reactos\\system32\\drivers\\dxg.sys".as_slice(),
-                b"DXG     SYS",
-                DXGBUF_VADDR,
-                DXGBUF_FRAMES,
-                0x80u64,
-            ),
-            (
-                b"reactos\\system32\\drivers\\dxgthk.sys".as_slice(),
-                b"DXGTHK  SYS",
-                DXGTHKBUF_VADDR,
-                DXGTHKBUF_FRAMES,
-                0x84u64,
-            ),
-            (
-                b"reactos\\system32\\ftfd.dll".as_slice(),
-                b"FTFD    DLL",
-                FTFDBUF_VADDR,
-                FTFDBUF_FRAMES,
-                0x88u64,
-            ),
-            (
-                b"reactos\\Fonts\\arial.ttf".as_slice(),
-                b"ARIAL   TTF",
-                win32k_subsystem::FONTBUF_VADDR,
-                win32k_subsystem::FONTBUF_FRAMES,
-                0x90u64,
-            ),
-        ] {
+        for (path, short, dest, cap_frames, off) in [(
+            b"reactos\\Fonts\\arial.ttf".as_slice(),
+            b"ARIAL   TTF",
+            win32k_subsystem::FONTBUF_VADDR,
+            win32k_subsystem::FONTBUF_FRAMES,
+            0x90u64,
+        )] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;
                 let want = if sz < cap { sz } else { cap };

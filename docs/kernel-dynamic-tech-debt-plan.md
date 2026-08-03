@@ -747,3 +747,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: D3 still has the bounded win32k import registry
   mirror, synthetic CPU/HARDWARE and Winlogon-key compatibility keys, and the temporary video object
   body.
+- D1 cleanup. Removed the storage-host staging buffers for `dxg.sys`, `dxgthk.sys`, and `ftfd.dll`.
+  Win32k bring-up now reads those images from the mounted ReactOS filesystem into pool memory by
+  path, then maps them into win32k exactly like the display/keyboard DLL path. The old `DXGBUF`,
+  `DXGTHKBUF`, and `FTFDBUF` frame windows, atomics, storage-host file reads, and host-region
+  mappings are gone; failures now report missing files or missing executive FS rather than a staged
+  buffer miss. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/win32k_glue.rs components/ntos-executive/src/win32k_subsystem.rs
+  components/ntos-executive/src/spawn_hosts.rs components/ntos-executive/src/device_io.rs`,
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. Review adjustment: D1 still needs real service-control/load
+  ordering for GDI driver requests rather than bring-up pre-registration, plus driver-object/device
+  ownership beyond the current win32k image-registration table.
