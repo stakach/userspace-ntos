@@ -958,3 +958,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: A2/C3/F1 remain open for the remaining measured
   winlogon frontier probes, semantic WSS_NOIO service branches, and the final provider-owned
   per-process GUI/GDI ownership model.
+- C3/F1 cleanup. Removed the noninteractive-service executive leaf result for `NtGdiInit`; services
+  now call ReactOS win32k's real `NtGdiInit` provider entry like other clients. The remaining service
+  `NtGdiOpenDCW` NULL path is no longer keyed by role alone: win32k now exposes a narrow query over
+  the real `Service-*` window-station body recorded for the caller token, and the executive returns
+  the NULL display-DC result only when that object exists and its `WINSTATION_OBJECT.Flags` includes
+  `WSS_NOIO`. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs components/ntos-executive/src/win32k_subsystem.rs`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: F1/C3 remain open for service cursor/class/stock
+  reuse and process-owned GDI allocation, but the init/DC leaves now depend on provider or
+  provider-created object state instead of an unconditional service identity shortcut.

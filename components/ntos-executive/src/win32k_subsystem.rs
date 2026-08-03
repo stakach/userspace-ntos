@@ -475,6 +475,10 @@ pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
 /// `mov rax,[rax+0x20]` = pdesk->rpwinstaParent, then [+0x20]=WINSTATION.Flags for the WSS_LOCKED
 /// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
+/// WINSTATION_OBJECT.Flags on this x64 ReactOS build. The 32-bit layout asserts Flags at 0x10;
+/// x64 pointer alignment moves it after DWORD + LIST_ENTRY + atom-table pointer.
+const WINSTATION_FLAGS_OFF: u64 = 0x20;
+const WSS_NOIO: u32 = 0x0000_0004;
 
 /// DESKTOP.pheapDesktop offset (`desktop.h` `struct _DESKTOP`: dwSessionId@0, pDeskInfo@8,
 /// ListEntry@0x10, rpwinstaParent@0x20, ..., hsectionDesktop@0x78, **pheapDesktop@0x80**). The
@@ -2149,6 +2153,18 @@ unsafe fn service_window_station_handle_for_current_token() -> u64 {
     service_winsta_index_for_auth(token_authentication_id)
         .map(|index| WIN32K_SERVICE_WINSTA_HANDLES[index].load(Ordering::Relaxed))
         .unwrap_or(0)
+}
+
+pub(crate) unsafe fn service_window_station_is_noio_for_token(
+    token_authentication_id: u64,
+) -> Option<bool> {
+    let index = service_winsta_index_for_auth(token_authentication_id)?;
+    let body = WIN32K_SERVICE_WINSTA_BODIES[index].load(Ordering::Relaxed);
+    if body == 0 {
+        return None;
+    }
+    let flags = read_volatile((body + WINSTATION_FLAGS_OFF) as *const u32);
+    Some((flags & WSS_NOIO) != 0)
 }
 
 /// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,

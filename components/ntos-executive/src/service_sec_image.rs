@@ -8390,6 +8390,22 @@ pub(crate) unsafe fn service_sec_image(
                 // services.exe and lsass.exe are non-interactive service hosts on a WSS_NOIO window
                 // station, and neither should enter win32k's interactive cursor/class/stock-object
                 // EngCopyBits path while initializing service DLLs.
+                let svc_wss_noio_window_station = if svc_noninteractive {
+                    nt_handler
+                        .primary_token_authentication_id_for_pi(pi)
+                        .and_then(|luid| {
+                            let authentication_id =
+                                luid.low as u64 | ((luid.high as u32 as u64) << 32);
+                            unsafe {
+                                win32k_subsystem::service_window_station_is_noio_for_token(
+                                    authentication_id,
+                                )
+                            }
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 // Shell GUI clients ask win32k for class atom names from inside nested user
                 // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
                 // mirror-backed names are served before dispatch; misses stay visible.
@@ -8638,15 +8654,10 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(captured as u64);
                     print_str(b" -> STATUS_SUCCESS\n");
                     (0, true)
-                } else if m0 == 0x11e0 && svc_noninteractive {
-                    // ReactOS NtGdiInit is a BOOL leaf that returns TRUE. Keep WSS_NOIO services on
-                    // that leaf result until win32k has separate per-service GDI process ownership.
-                    print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) SERVICE-LEAF -> TRUE\n");
-                    (1, true)
-                } else if m0 == 0x10de && svc_noninteractive {
-                    // WSS_NOIO services have no display DC. Return the real failure value for a DC
-                    // open instead of constructing an HDC backed by the interactive process state.
-                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) NO DISPLAY DC -> NULL\n");
+                } else if m0 == 0x10de && svc_wss_noio_window_station {
+                    // The service owns a real ReactOS Service-* window station and win32k marked it
+                    // WSS_NOIO. A display DC open has the real NULL outcome for that station state.
+                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) WSS_NOIO DC -> NULL\n");
                     (0, true)
                 } else if m0 == 0x10d4 && svc_noninteractive {
                     // NtGdiGetStockObject returns session-global stock handles. Reuse only handles
