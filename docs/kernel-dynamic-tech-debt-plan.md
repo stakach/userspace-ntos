@@ -1061,3 +1061,25 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Validation: `rustfmt`, `cargo test -p nt-kernel-exec`, `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
   `components/ntos-executive/build.sh`, stale-reference `rg`, and `git diff --check`.
+- C3/F1 cleanup. Removed the remaining noninteractive-service USER/GDI leaf fabrications for
+  `NtUserFindExistingCursorIcon`, `NtUserRegisterClassExWOW`, `NtUserGetClassInfo`,
+  `NtGdiCreateBitmap`, `NtGdiCreatePatternBrushInternal`, and the WSS_NOIO `NtGdiOpenDCW` shortcut.
+  Those service calls now enter the registered win32k provider through the same arity-checked
+  dispatch path as interactive clients, with the existing cross-address-space argument staging and
+  copyback code doing the boundary work. The service window-station runtime was also narrowed to the
+  token-to-handle association still used by win32k object lookup; the executive no longer mirrors
+  provider `WINSTATION_OBJECT` bodies or reads WSS_NOIO flags to synthesize DC results. Review
+  adjustment: C3/F1 now has no known executive-side service USER/GDI result fallback for the
+  service attach path. Full boot validation reached the win32k desktop proof, real services/LSASS
+  win32k connects, real provider returns for service/LSASS `NtGdiCreateBitmap` and
+  `NtGdiCreatePatternBrushInternal`, and provider-owned `NtGdiOpenDCW` NULL results with win32k's
+  `Didn't find a suitable PDEV` diagnostic instead of an executive WSS_NOIO shortcut. The new
+  frontier is higher-level LSA/profile/userinit/explorer work plus auditing the remaining shell
+  `SESSION` catalog queries and moving any required sharing behind proper win32k session/process
+  ownership.
+  Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs components/ntos-executive/src/win32k_subsystem.rs`,
+  stale-reference `rg`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `components/ntos-executive/build.sh`, `git diff --check`, and
+  `.tmp/full-boot-service-user-gdi-provider.log` passed the harness desktop gate with
+  `230/275 executive->isolated-service checks passed`.

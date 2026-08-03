@@ -8084,7 +8084,6 @@ pub(crate) unsafe fn service_sec_image(
                         .contains(&fn_id)
                         && flags == 0
                 });
-                let register_class_fn_id = builtin_class_args.map(|(fn_id, _)| fn_id).unwrap_or(0);
                 let builtin_class_key = builtin_class_args.and_then(|(fn_id, flags)| {
                     capture_builtin_class_key(
                         pi as u64,
@@ -8319,33 +8318,6 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                // Non-interactive services run user32 RegisterSystemClasses during GUI-DLL
-                // process attach, but they do not own the interactive window station path that loads
-                // and registers system cursors. Route only the real interactive win32k state that is
-                // safe to share across the session: exact promoted cursor identities, exact built-in
-                // class registrations, and captured per-process client PFNs. A miss remains a visible
-                // NULL/FALSE result instead of minting an atom or handle.
-                //
-                // The gate is driven by the live EPROCESS image role, not the launch slot:
-                // services.exe and lsass.exe are non-interactive service hosts on a WSS_NOIO window
-                // station, and neither should enter win32k's interactive cursor/class EngCopyBits
-                // path while initializing service DLLs.
-                let svc_wss_noio_window_station = if svc_noninteractive {
-                    nt_handler
-                        .primary_token_authentication_id_for_pi(pi)
-                        .and_then(|luid| {
-                            let authentication_id =
-                                luid.low as u64 | ((luid.high as u32 as u64) << 32);
-                            unsafe {
-                                win32k_subsystem::service_window_station_is_noio_for_token(
-                                    authentication_id,
-                                )
-                            }
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
                 // Shell GUI clients ask win32k for class atom names from inside nested user
                 // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
                 // session atom names observed from real registrations are served before dispatch;
@@ -8517,67 +8489,6 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" sp=0x");
                         print_hex_u64(sp);
                         print_str(b" -> NULL\n");
-                    }
-                    (0, true)
-                } else if m0 == 0x103d && svc_noninteractive {
-                    // Service cursor handles are process-owned USER objects. The current WSS_NOIO
-                    // service attach path does not yet own a service PROCESSINFO/global cursor path,
-                    // so fail visibly instead of sharing an interactive client's USER handle.
-                    print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SERVICE-USER owner missing pi=");
-                    print_u64(pi as u64);
-                    print_str(b" -> NULL\n");
-                    (0, true)
-                } else if m0 == 0x10b4 && svc_noninteractive {
-                    // Service class atoms must come from service-owned class registration in
-                    // win32k. The temporary session reuse path has been removed; fail visibly until
-                    // service PROCESSINFO/class ownership exists.
-                    print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SERVICE-USER owner missing pi=");
-                    print_u64(pi as u64);
-                    print_str(b" fnid=0x");
-                    print_hex(register_class_fn_id);
-                    print_str(b" -> atom 0\n");
-                    (0, true)
-                } else if m0 == 0x10de && svc_wss_noio_window_station {
-                    // The service owns a real ReactOS Service-* window station and win32k marked it
-                    // WSS_NOIO. A display DC open has the real NULL outcome for that station state.
-                    print_str(b"[win32k-svc] svc NtGdiOpenDCW(0x10de) WSS_NOIO DC -> NULL\n");
-                    (0, true)
-                } else if m0 == 0x106c && svc_noninteractive {
-                    // Bitmap handles are process-owned GDI objects. Noninteractive service clients
-                    // do not yet have provider-owned service GDI object allocation, so every service
-                    // bitmap request fails visibly instead of borrowing a session stock-object handle.
-                    print_str(
-                        b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) SERVICE-GDI owner missing ",
-                    );
-                    print_u64(a0 as u32 as u64);
-                    print_str(b"x");
-                    print_u64(a1 as u32 as u64);
-                    print_str(b" planes=");
-                    print_u64(a2 as u32 as u64);
-                    print_str(b" bpp=");
-                    print_u64(a3 as u32 as u64);
-                    print_str(b" -> NULL\n");
-                    (0, true)
-                } else if m0 == 0x10b5 && svc_noninteractive {
-                    // Pattern brushes are process-owned GDI objects, not stock handles. A
-                    // non-interactive service cannot receive an invented brush handle; fail visibly
-                    // until real provider-owned service GDI object allocation is available.
-                    print_str(b"[win32k-svc] svc NtGdiCreatePatternBrushInternal(0x10b5) SERVICE-GDI owner missing hbm=0x");
-                    print_hex(a0 as u32);
-                    print_str(b" -> NULL\n");
-                    (0, true)
-                } else if m0 == 0x10bd && svc_noninteractive {
-                    // Classinfo must be read from the caller's real win32k class table. The
-                    // executive no longer synthesizes ScrollBar WNDCLASSEXW payloads from session
-                    // atom/cursor observations.
-                    if let Some(capture) = get_class_info_capture {
-                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SERVICE-USER owner missing scrollbar=");
-                        print_u64(capture.scrollbar as u64);
-                        print_str(b" ansi=");
-                        print_u64(capture.ansi as u64);
-                        print_str(b" -> FALSE\n");
-                    } else {
-                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SERVICE-USER owner missing capture=0 -> FALSE\n");
                     }
                     (0, true)
                 } else {

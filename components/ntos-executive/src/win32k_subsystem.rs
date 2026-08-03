@@ -475,10 +475,6 @@ pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
 /// `mov rax,[rax+0x20]` = pdesk->rpwinstaParent, then [+0x20]=WINSTATION.Flags for the WSS_LOCKED
 /// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
-/// WINSTATION_OBJECT.Flags on this x64 ReactOS build. The 32-bit layout asserts Flags at 0x10;
-/// x64 pointer alignment moves it after DWORD + LIST_ENTRY + atom-table pointer.
-const WINSTATION_FLAGS_OFF: u64 = 0x20;
-const WSS_NOIO: u32 = 0x0000_0004;
 
 /// DESKTOP.pheapDesktop offset (`desktop.h` `struct _DESKTOP`: dwSessionId@0, pDeskInfo@8,
 /// ListEntry@0x10, rpwinstaParent@0x20, ..., hsectionDesktop@0x78, **pheapDesktop@0x80**). The
@@ -2128,21 +2124,19 @@ unsafe fn service_winsta_index_for_auth(token_authentication_id: u64) -> Option<
     None
 }
 
-unsafe fn record_service_window_station(handle: u64, body: u64) {
+unsafe fn record_service_window_station(handle: u64) {
     let token_authentication_id = current_token_authentication_id();
-    if token_authentication_id == 0 || handle == 0 || body == 0 {
+    if token_authentication_id == 0 || handle == 0 {
         return;
     }
     if let Some(index) = service_winsta_index_for_auth(token_authentication_id) {
         WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
-        WIN32K_SERVICE_WINSTA_BODIES[index].store(body, Ordering::Relaxed);
         return;
     }
     for index in 0..WIN32K_SERVICE_WINSTA_CAP {
         if WIN32K_SERVICE_WINSTA_AUTHS[index].load(Ordering::Relaxed) == 0 {
             WIN32K_SERVICE_WINSTA_AUTHS[index].store(token_authentication_id, Ordering::Relaxed);
             WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
-            WIN32K_SERVICE_WINSTA_BODIES[index].store(body, Ordering::Relaxed);
             return;
         }
     }
@@ -2153,18 +2147,6 @@ unsafe fn service_window_station_handle_for_current_token() -> u64 {
     service_winsta_index_for_auth(token_authentication_id)
         .map(|index| WIN32K_SERVICE_WINSTA_HANDLES[index].load(Ordering::Relaxed))
         .unwrap_or(0)
-}
-
-pub(crate) unsafe fn service_window_station_is_noio_for_token(
-    token_authentication_id: u64,
-) -> Option<bool> {
-    let index = service_winsta_index_for_auth(token_authentication_id)?;
-    let body = WIN32K_SERVICE_WINSTA_BODIES[index].load(Ordering::Relaxed);
-    if body == 0 {
-        return None;
-    }
-    let flags = read_volatile((body + WINSTATION_FLAGS_OFF) as *const u32);
-    Some((flags & WSS_NOIO) != 0)
 }
 
 /// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,
@@ -2373,7 +2355,7 @@ extern "win64" fn s_ob_insert_object(
             table.insert_pending(object)
         };
         if uncached_winsta {
-            record_service_window_station(h, object);
+            record_service_window_station(h);
         }
         if !handle.is_null() {
             write_unaligned(handle, h);
@@ -3241,8 +3223,6 @@ const WIN32K_SERVICE_WINSTA_CAP: usize = 8;
 static WIN32K_SERVICE_WINSTA_AUTHS: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
 static WIN32K_SERVICE_WINSTA_HANDLES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
-static WIN32K_SERVICE_WINSTA_BODIES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
