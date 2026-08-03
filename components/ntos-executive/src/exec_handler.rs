@@ -593,7 +593,6 @@ impl ExecNtHandler {
         write_field!(pool_used, [0; MAX_PI]);
         write_field!(pool_suspended, [0; MAX_PI]);
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
-        write_field!(service_gui_clients, ServiceGuiClientRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, nt_security::TokenStore::with_capacity(64));
         write_field!(token_dirty, false);
@@ -1761,68 +1760,6 @@ impl ExecNtHandler {
             .pool_slot_for_tid(tid as nt_process::ThreadId)
     }
 
-    pub(crate) fn record_service_client_pfns(
-        &mut self,
-        pi: usize,
-        pfn_client_a_scrollbar: u64,
-        pfn_client_w_scrollbar: u64,
-        hmod_user32: u64,
-    ) -> bool {
-        let Some(pid) = self.pm_pid_for_pi(pi) else {
-            return false;
-        };
-        self.service_gui_clients
-            .record_client_pfns(
-                pid,
-                pi,
-                pfn_client_a_scrollbar,
-                pfn_client_w_scrollbar,
-                hmod_user32,
-            )
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn record_service_scrollbar_atom(&mut self, pi: usize, atom: u16) -> bool {
-        let Some(pid) = self.pm_pid_for_pi(pi) else {
-            return false;
-        };
-        self.service_gui_clients
-            .record_scrollbar_atom(pid, pi, atom)
-    }
-
-    pub(crate) fn service_scrollbar_proc(&self, pi: usize, ansi: bool) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(pi)?;
-        self.service_gui_clients.scrollbar_proc(pid, ansi)
-    }
-
-    pub(crate) fn service_scrollbar_atom(&self, pi: usize) -> Option<u16> {
-        let pid = self.pm_pid_for_pi(pi)?;
-        self.service_gui_clients.scrollbar_atom(pid)
-    }
-
-    pub(crate) fn service_scrollbar_debug(&self, pi: usize) -> ServiceGuiClientDebug {
-        let Some(pid) = self.pm_pid_for_pi(pi) else {
-            return ServiceGuiClientDebug {
-                scrollbar_atom: 0,
-                has_pfn_a: false,
-                has_pfn_w: false,
-            };
-        };
-        self.service_gui_clients.debug(pid)
-    }
-
-    pub(crate) fn record_service_scrollbar_classinfo_hit(&mut self) {
-        self.service_gui_clients.record_classinfo_hit();
-    }
-
-    pub(crate) fn record_service_scrollbar_classinfo_miss(&mut self) {
-        self.service_gui_clients.record_classinfo_miss();
-    }
-
-    pub(crate) fn record_service_scrollbar_classinfo_copyout_error(&mut self) {
-        self.service_gui_clients.record_classinfo_copyout_error();
-    }
-
     pub(crate) fn observe_win32k_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
         self.win32k_session.observe_stock_object(object_id, handle)
     }
@@ -1888,23 +1825,6 @@ impl ExecNtHandler {
 
     pub(crate) fn record_class_atom_name_failure(&mut self) {
         self.win32k_session.record_class_atom_name_failure();
-    }
-
-    pub(crate) fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
-        self.win32k_session
-            .observe_scrollbar_class_identity(atom, hcursor);
-    }
-
-    pub(crate) fn remember_scrollbar_cursor(&mut self, handle: u32) {
-        self.win32k_session.remember_scrollbar_cursor(handle);
-    }
-
-    pub(crate) fn scrollbar_class_atom(&self) -> Option<u16> {
-        self.win32k_session.scrollbar_class_atom()
-    }
-
-    pub(crate) fn scrollbar_class_cursor(&self) -> Option<u64> {
-        self.win32k_session.scrollbar_class_cursor()
     }
 
     pub(crate) fn record_userinit_scrollbar_query(&mut self) {

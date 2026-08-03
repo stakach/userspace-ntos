@@ -1771,10 +1771,6 @@ unsafe fn copy_back_get_class_info(
             scratch_base,
         );
     let copyout_ok = wnd_ok && menu_ok;
-    if capture.scrollbar && atom != 0 {
-        let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
-        nt_handler.observe_scrollbar_class_identity(atom as u16, hcursor);
-    }
     if nt_handler.hosted_process_role(pi)
         == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
         && capture.scrollbar
@@ -1805,117 +1801,6 @@ unsafe fn copy_back_get_class_info(
         print_str(b"\n");
     }
     copyout_ok
-}
-
-fn remember_scrollbar_cursor(nt_handler: &mut ExecNtHandler, handle: u32) {
-    nt_handler.remember_scrollbar_cursor(handle);
-}
-
-unsafe fn capture_service_client_pfn_arrays(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    pfn_client_a: u64,
-    pfn_client_w: u64,
-    hmod_user: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> bool {
-    use nt_kernel_exec::user_class::{pfn_client_proc, FNID_SCROLLBAR, PFNCLIENT_SIZE};
-
-    let mut proc_a = 0;
-    let mut proc_w = 0;
-    let mut raw = [0u8; PFNCLIENT_SIZE];
-    if pfn_client_a != 0
-        && img_spawn::client_copyin_mapped(
-            pi as u64,
-            pfn_client_a,
-            &mut raw,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
-            proc_a = proc;
-        }
-    }
-
-    raw.fill(0);
-    if pfn_client_w != 0
-        && img_spawn::client_copyin_mapped(
-            pi as u64,
-            pfn_client_w,
-            &mut raw,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        if let Some(proc) = pfn_client_proc(&raw, FNID_SCROLLBAR).filter(|proc| *proc != 0) {
-            proc_w = proc;
-        }
-    }
-
-    nt_handler.record_service_client_pfns(pi, proc_a, proc_w, hmod_user)
-}
-
-unsafe fn copy_service_scrollbar_class_info(
-    nt_handler: &mut ExecNtHandler,
-    pi: usize,
-    capture: CapturedGetClassInfo,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<u64> {
-    use nt_kernel_exec::user_class::{scrollbar_class_info, WNDCLASSEXW_SIZE};
-
-    if !capture.scrollbar {
-        return None;
-    }
-    let proc = nt_handler.service_scrollbar_proc(pi, capture.ansi)?;
-    let mut atom = nt_handler.service_scrollbar_atom(pi).unwrap_or(0);
-    if atom == 0 {
-        let observed = nt_handler.scrollbar_class_atom().unwrap_or(0);
-        if observed == 0 {
-            return None;
-        }
-        if !nt_handler.record_service_scrollbar_atom(pi, observed) {
-            return None;
-        }
-        atom = observed;
-    }
-    let hcursor = nt_handler.scrollbar_class_cursor().unwrap_or(0);
-    if hcursor == 0 {
-        return None;
-    }
-    let mut initial = [0u8; WNDCLASSEXW_SIZE];
-    core::ptr::copy_nonoverlapping(
-        capture.wnd_out as *const u8,
-        initial.as_mut_ptr(),
-        initial.len(),
-    );
-    let payload = scrollbar_class_info(&initial, atom, proc, hcursor)?;
-    core::ptr::copy_nonoverlapping(
-        payload.wnd_class().as_ptr(),
-        capture.wnd_out as *mut u8,
-        WNDCLASSEXW_SIZE,
-    );
-    core::ptr::write_unaligned(capture.menu_out as *mut u64, payload.menu_name());
-    if copy_back_get_class_info(
-        nt_handler,
-        pi,
-        capture,
-        payload.atom() as u64,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    ) {
-        Some(payload.atom() as u64)
-    } else {
-        nt_handler.record_service_scrollbar_classinfo_copyout_error();
-        None
-    }
 }
 
 unsafe fn capture_get_class_name_out(
@@ -8515,7 +8400,6 @@ pub(crate) unsafe fn service_sec_image(
                         .as_ref()
                         .and_then(|key| nt_handler.lookup_global_cursor(key));
                     if let Some(handle) = hit {
-                        remember_scrollbar_cursor(&mut *nt_handler, handle);
                         if userinit_gui_client {
                             nt_handler.record_userinit_global_cursor_hit(handle);
                         }
@@ -8636,79 +8520,22 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     (0, true)
                 } else if m0 == 0x103d && svc_noninteractive {
-                    // Reuse only an exact cursor handle learned from the real interactive win32k path.
-                    let hit = cursor_identity_key
-                        .as_ref()
-                        .and_then(|key| nt_handler.lookup_global_cursor(key));
-                    if let Some(handle) = hit {
-                        remember_scrollbar_cursor(&mut *nt_handler, handle);
-                        print_str(
-                            b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SESSION pi=",
-                        );
-                        print_u64(pi as u64);
-                        print_str(b" -> real HCURSOR 0x");
-                        print_hex(handle);
-                        print_str(b"\n");
-                    } else {
-                        print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SESSION MISS pi=");
-                        print_u64(pi as u64);
-                        print_str(b" -> NULL\n");
-                    }
-                    (hit.unwrap_or(0) as u64, true)
+                    // Service cursor handles are process-owned USER objects. The current WSS_NOIO
+                    // service attach path does not yet own a service PROCESSINFO/global cursor path,
+                    // so fail visibly instead of sharing an interactive client's USER handle.
+                    print_str(b"[win32k-svc] svc NtUserFindExistingCursorIcon(0x103d) SERVICE-USER owner missing pi=");
+                    print_u64(pi as u64);
+                    print_str(b" -> NULL\n");
+                    (0, true)
                 } else if m0 == 0x10b4 && svc_noninteractive {
-                    // Non-interactive services reuse only class atoms already observed from real
-                    // win32k registration/query paths. A miss stays visible instead of minting an atom.
-                    let hit = if register_class_fn_id == nt_kernel_exec::user_class::FNID_SCROLLBAR
-                    {
-                        let atom = nt_handler.scrollbar_class_atom().unwrap_or(0);
-                        if nt_handler.record_service_scrollbar_atom(pi, atom) {
-                            Some(atom)
-                        } else {
-                            None
-                        }
-                    } else if builtin_class_attempt {
-                        builtin_class_key
-                            .as_ref()
-                            .and_then(|key| nt_handler.lookup_builtin_class_atom(key))
-                    } else {
-                        None
-                    };
-                    if let Some(atom) = hit {
-                        print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SESSION pi=");
-                        print_u64(pi as u64);
-                        print_str(b" fnid=0x");
-                        print_hex(register_class_fn_id);
-                        print_str(b" -> real atom 0x");
-                        print_hex(atom as u32);
-                        print_str(b"\n");
-                    } else {
-                        print_str(
-                            b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SESSION MISS pi=",
-                        );
-                        print_u64(pi as u64);
-                        print_str(b" fnid=0x");
-                        print_hex(register_class_fn_id);
-                        print_str(b" -> atom 0\n");
-                    }
-                    (hit.unwrap_or(0) as u64, true)
-                } else if m0 == 0x125b && svc_noninteractive {
-                    // ReactOS NtUserInitializeClientPfnArrays returns STATUS_SUCCESS once the
-                    // session-global client PFN arrays have already been initialized. Winlogon's
-                    // interactive setup does that first; WSS_NOIO service processes only need their
-                    // client PFNs captured for later service-owned classinfo queries.
-                    let captured = capture_service_client_pfn_arrays(
-                        &mut *nt_handler,
-                        pi,
-                        a0,
-                        a1,
-                        a3,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) SERVICE-PFN captured-pfns=");
-                    print_u64(captured as u64);
-                    print_str(b" -> STATUS_SUCCESS\n");
+                    // Service class atoms must come from service-owned class registration in
+                    // win32k. The temporary session reuse path has been removed; fail visibly until
+                    // service PROCESSINFO/class ownership exists.
+                    print_str(b"[win32k-svc] svc NtUserRegisterClassExWOW(0x10b4) SERVICE-USER owner missing pi=");
+                    print_u64(pi as u64);
+                    print_str(b" fnid=0x");
+                    print_hex(register_class_fn_id);
+                    print_str(b" -> atom 0\n");
                     (0, true)
                 } else if m0 == 0x10de && svc_wss_noio_window_station {
                     // The service owns a real ReactOS Service-* window station and win32k marked it
@@ -8740,50 +8567,19 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" -> NULL\n");
                     (0, true)
                 } else if m0 == 0x10bd && svc_noninteractive {
-                    // Non-interactive services have already supplied their real user32 client PFN
-                    // arrays and registered the system classes through the bounded service path above.
-                    // Return ScrollBar class info from that per-process state instead of reporting the
-                    // class absent, while still avoiding win32k's interactive UserRegisterSystemClasses
-                    // blit path for WSS_NOIO services.
+                    // Classinfo must be read from the caller's real win32k class table. The
+                    // executive no longer synthesizes ScrollBar WNDCLASSEXW payloads from session
+                    // atom/cursor observations.
                     if let Some(capture) = get_class_info_capture {
-                        if let Some(atom) = copy_service_scrollbar_class_info(
-                            &mut *nt_handler,
-                            pi,
-                            capture,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                        ) {
-                            nt_handler.record_service_scrollbar_classinfo_hit();
-                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION ScrollBar atom=0x");
-                            print_hex(atom as u32);
-                            print_str(b" ansi=");
-                            print_u64(capture.ansi as u64);
-                            print_str(b" -> TRUE\n");
-                            (atom, true)
-                        } else {
-                            nt_handler.record_service_scrollbar_classinfo_miss();
-                            let debug = nt_handler.service_scrollbar_debug(pi);
-                            print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION MISS scrollbar=");
-                            print_u64(capture.scrollbar as u64);
-                            print_str(b" atom=0x");
-                            print_hex(debug.scrollbar_atom as u32);
-                            print_str(b" hcursor=0x");
-                            print_hex_u64(nt_handler.scrollbar_class_cursor().unwrap_or(0));
-                            print_str(b" procA=");
-                            print_u64(debug.has_pfn_a as u64);
-                            print_str(b" procW=");
-                            print_u64(debug.has_pfn_w as u64);
-                            print_str(b" ansi=");
-                            print_u64(capture.ansi as u64);
-                            print_str(b" -> FALSE\n");
-                            (0, true)
-                        }
+                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SERVICE-USER owner missing scrollbar=");
+                        print_u64(capture.scrollbar as u64);
+                        print_str(b" ansi=");
+                        print_u64(capture.ansi as u64);
+                        print_str(b" -> FALSE\n");
                     } else {
-                        nt_handler.record_service_scrollbar_classinfo_miss();
-                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SESSION MISS capture=0 -> FALSE\n");
-                        (0, true)
+                        print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) SERVICE-USER owner missing capture=0 -> FALSE\n");
                     }
+                    (0, true)
                 } else {
                     // Forward the real syscall-entry stack pointer to win32k. The component derives
                     // exact arity from win32k's SSPT and reads only the required tail args through

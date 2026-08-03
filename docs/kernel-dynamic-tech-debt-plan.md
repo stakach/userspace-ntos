@@ -1050,3 +1050,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `rustfmt`, `cargo test -p nt-kernel-exec`, `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `components/ntos-executive/build.sh`,
   stale-reference `rg`, and `git diff --check`.
+- C3/F1 cleanup. Removed the service GUI runtime table and the synthetic
+  `exec_services_scrollbar_classinfo_mirrored` gate. Noninteractive service
+  `NtUserFindExistingCursorIcon`, `NtUserRegisterClassExWOW`, and `NtUserGetClassInfo` now fail
+  visibly with `SERVICE-USER owner missing` instead of sharing session cursor/class atoms or building
+  an executive-owned `WNDCLASSEXW`. The `nt-kernel-exec` ScrollBar classinfo/PFN helpers were deleted
+  with the runtime they supported. Review adjustment: F1/C3 now has no service-side USER/GDI success
+  fallback for cursor/class/classinfo; the remaining work is implementing real service
+  PROCESSINFO/class/cursor ownership in win32k so those calls can dispatch to provider-owned state.
+  Validation: `rustfmt`, `cargo test -p nt-kernel-exec`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, stale-reference `rg`, and `git diff --check`.

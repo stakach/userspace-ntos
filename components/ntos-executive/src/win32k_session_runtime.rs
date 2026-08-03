@@ -232,8 +232,6 @@ struct Win32kSessionRuntimeState {
     class_atom_names_observed: u64,
     class_atom_name_serves: u64,
     class_atom_name_failures: u64,
-    scrollbar_class_atom: u16,
-    scrollbar_class_cursor: u64,
     userinit_scrollbar_queries: u64,
     userinit_scrollbar_copyouts: u64,
     userinit_scrollbar_errors: u64,
@@ -263,8 +261,6 @@ impl Win32kSessionRuntimeState {
             class_atom_names_observed: 0,
             class_atom_name_serves: 0,
             class_atom_name_failures: 0,
-            scrollbar_class_atom: 0,
-            scrollbar_class_cursor: 0,
             userinit_scrollbar_queries: 0,
             userinit_scrollbar_copyouts: 0,
             userinit_scrollbar_errors: 0,
@@ -294,8 +290,6 @@ impl Win32kSessionRuntimeState {
         self.class_atom_names_observed = 0;
         self.class_atom_name_serves = 0;
         self.class_atom_name_failures = 0;
-        self.scrollbar_class_atom = 0;
-        self.scrollbar_class_cursor = 0;
         self.userinit_scrollbar_queries = 0;
         self.userinit_scrollbar_copyouts = 0;
         self.userinit_scrollbar_errors = 0;
@@ -395,21 +389,6 @@ impl Win32kSessionRuntimeState {
 
     fn record_class_atom_name_failure(&mut self) {
         self.class_atom_name_failures = self.class_atom_name_failures.saturating_add(1);
-    }
-
-    fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
-        if atom != 0 {
-            self.scrollbar_class_atom = atom;
-        }
-        if hcursor != 0 {
-            self.scrollbar_class_cursor = hcursor;
-        }
-    }
-
-    fn remember_scrollbar_cursor(&mut self, handle: u32) {
-        if self.scrollbar_class_cursor == 0 && handle != 0 {
-            self.scrollbar_class_cursor = handle as u64;
-        }
     }
 
     fn record_userinit_scrollbar_query(&mut self) {
@@ -558,28 +537,6 @@ impl Win32kSessionRuntime {
     pub(crate) fn record_class_atom_name_failure(&mut self) {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).record_class_atom_name_failure() };
-    }
-
-    pub(crate) fn observe_scrollbar_class_identity(&mut self, atom: u16, hcursor: u64) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).observe_scrollbar_class_identity(atom, hcursor) };
-    }
-
-    pub(crate) fn remember_scrollbar_cursor(&mut self, handle: u32) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).remember_scrollbar_cursor(handle) };
-    }
-
-    pub(crate) fn scrollbar_class_atom(&self) -> Option<u16> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        let atom = unsafe { (&*self.state).scrollbar_class_atom };
-        (atom != 0).then_some(atom)
-    }
-
-    pub(crate) fn scrollbar_class_cursor(&self) -> Option<u64> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        let cursor = unsafe { (&*self.state).scrollbar_class_cursor };
-        (cursor != 0).then_some(cursor)
     }
 
     pub(crate) fn record_userinit_scrollbar_query(&mut self) {

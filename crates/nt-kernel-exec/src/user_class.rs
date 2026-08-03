@@ -4,19 +4,9 @@ use crate::user_cursor::CursorResource;
 
 pub const WNDCLASSEXW_SIZE: usize = 0x50;
 pub const CS_GLOBALCLASS: u32 = 0x4000;
-pub const CS_DBLCLKS: u32 = 0x0008;
-pub const CS_HREDRAW: u32 = 0x0002;
-pub const CS_PARENTDC: u32 = 0x0080;
-pub const CS_VREDRAW: u32 = 0x0001;
-pub const FNID_FIRST: u32 = 0x029a;
-pub const FNID_SCROLLBAR: u32 = 0x029a;
 pub const FNID_BUILTIN_FIRST: u32 = 0x02a1;
 pub const FNID_BUILTIN_LAST: u32 = 0x02aa;
 pub const CLASS_ATOM_NAME_CAP: usize = 255;
-pub const PFNCLIENT_ENTRY_COUNT: usize = 23;
-pub const PFNCLIENT_SIZE: usize = PFNCLIENT_ENTRY_COUNT * 8;
-pub const SCROLLBAR_CLASS_STYLE: u32 = CS_DBLCLKS | CS_VREDRAW | CS_HREDRAW | CS_PARENTDC;
-pub const SCROLLBAR_CB_WND_EXTRA: u32 = 0x48;
 pub const SCROLLBAR_CLASS_NAME: [u16; 9] = [
     b'S' as u16,
     b'c' as u16,
@@ -126,68 +116,8 @@ impl BuiltinClassKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClassInfoPayload {
-    atom: u16,
-    wnd_class: [u8; WNDCLASSEXW_SIZE],
-    menu_name: u64,
-}
-
-impl ClassInfoPayload {
-    pub const fn atom(&self) -> u16 {
-        self.atom
-    }
-
-    pub const fn wnd_class(&self) -> &[u8; WNDCLASSEXW_SIZE] {
-        &self.wnd_class
-    }
-
-    pub const fn menu_name(&self) -> u64 {
-        self.menu_name
-    }
-}
-
-pub fn pfn_client_proc(raw: &[u8], fn_id: u32) -> Option<u64> {
-    let index = fn_id.checked_sub(FNID_FIRST)? as usize;
-    if index >= PFNCLIENT_ENTRY_COUNT {
-        return None;
-    }
-    let offset = index * 8;
-    let bytes: [u8; 8] = raw.get(offset..offset + 8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
-}
-
 pub fn is_scrollbar_class_name(units: &[u16]) -> bool {
     units == SCROLLBAR_CLASS_NAME
-}
-
-pub fn scrollbar_class_info(
-    initial_wnd_class: &[u8; WNDCLASSEXW_SIZE],
-    atom: u16,
-    wnd_proc: u64,
-    hcursor: u64,
-) -> Option<ClassInfoPayload> {
-    if atom == 0 || wnd_proc == 0 {
-        return None;
-    }
-
-    let mut wnd = *initial_wnd_class;
-    wnd[0x04..0x08].copy_from_slice(&SCROLLBAR_CLASS_STYLE.to_le_bytes());
-    wnd[0x08..0x10].copy_from_slice(&wnd_proc.to_le_bytes());
-    wnd[0x10..0x14].copy_from_slice(&0u32.to_le_bytes());
-    wnd[0x14..0x18].copy_from_slice(&SCROLLBAR_CB_WND_EXTRA.to_le_bytes());
-    wnd[0x18..0x20].copy_from_slice(&0u64.to_le_bytes());
-    wnd[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
-    wnd[0x28..0x30].copy_from_slice(&hcursor.to_le_bytes());
-    wnd[0x30..0x38].copy_from_slice(&0u64.to_le_bytes());
-    wnd[0x38..0x40].copy_from_slice(&0u64.to_le_bytes());
-    wnd[0x48..0x50].copy_from_slice(&0u64.to_le_bytes());
-
-    Some(ClassInfoPayload {
-        atom,
-        wnd_class: wnd,
-        menu_name: 0,
-    })
 }
 
 pub fn integer_atom_name(atom: u16, out: &mut [u16]) -> Option<usize> {
@@ -335,22 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn pfn_client_proc_decodes_fnid_indexed_entries() {
-        let mut raw = [0u8; PFNCLIENT_SIZE];
-        raw[0..8].copy_from_slice(&0x8012_3456u64.to_le_bytes());
-        raw[6 * 8..7 * 8].copy_from_slice(&0x8077_1122u64.to_le_bytes());
-
-        assert_eq!(pfn_client_proc(&raw, FNID_SCROLLBAR), Some(0x8012_3456));
-        assert_eq!(pfn_client_proc(&raw, FNID_FIRST + 6), Some(0x8077_1122));
-        assert_eq!(pfn_client_proc(&raw[..7], FNID_SCROLLBAR), None);
-        assert_eq!(pfn_client_proc(&raw, FNID_FIRST - 1), None);
-        assert_eq!(
-            pfn_client_proc(&raw, FNID_FIRST + PFNCLIENT_ENTRY_COUNT as u32),
-            None
-        );
-    }
-
-    #[test]
     fn scrollbar_class_name_matches_reactos_system_class() {
         assert!(is_scrollbar_class_name(&SCROLLBAR_CLASS_NAME));
         assert!(!is_scrollbar_class_name(&[
@@ -365,41 +279,5 @@ mod tests {
             b'r' as u16,
         ]));
         assert!(!is_scrollbar_class_name(&SCROLLBAR_CLASS_NAME[..8]));
-    }
-
-    #[test]
-    fn scrollbar_class_info_uses_real_client_proc_and_system_shape() {
-        let mut initial = [0xccu8; WNDCLASSEXW_SIZE];
-        initial[0..4].copy_from_slice(&(WNDCLASSEXW_SIZE as u32).to_le_bytes());
-        initial[0x40..0x48].copy_from_slice(&0x1234_5678u64.to_le_bytes());
-
-        let payload = scrollbar_class_info(&initial, 0xc004, 0x8020_1000, 0x0002_0044).unwrap();
-        let wnd = payload.wnd_class();
-
-        assert_eq!(payload.atom(), 0xc004);
-        assert_eq!(payload.menu_name(), 0);
-        assert_eq!(
-            u32::from_le_bytes(wnd[0x04..0x08].try_into().unwrap()),
-            SCROLLBAR_CLASS_STYLE
-        );
-        assert_eq!(
-            u64::from_le_bytes(wnd[0x08..0x10].try_into().unwrap()),
-            0x8020_1000
-        );
-        assert_eq!(
-            u32::from_le_bytes(wnd[0x14..0x18].try_into().unwrap()),
-            SCROLLBAR_CB_WND_EXTRA
-        );
-        assert_eq!(
-            u64::from_le_bytes(wnd[0x28..0x30].try_into().unwrap()),
-            0x0002_0044
-        );
-        assert_eq!(u64::from_le_bytes(wnd[0x38..0x40].try_into().unwrap()), 0);
-        assert_eq!(
-            u64::from_le_bytes(wnd[0x40..0x48].try_into().unwrap()),
-            0x1234_5678
-        );
-        assert_eq!(scrollbar_class_info(&initial, 0, 0x8020_1000, 0), None);
-        assert_eq!(scrollbar_class_info(&initial, 0xc004, 0, 0), None);
     }
 }
