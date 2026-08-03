@@ -1019,3 +1019,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the general NT `PeekMessage(PM_NOREMOVE)` empty-queue guard so a blocking wait cannot suspend the
   single-threaded host, not a synthetic `WM_PAINT` source. Review adjustment: workstream F remains
   open only for F1's provider-owned service GUI/GDI cleanup.
+- F1 cleanup. Removed the noninteractive-service `NtGdiCreateBitmap` zero-size `DEFAULT_BITMAP`
+  success shortcut. Service bitmap handles are process-owned GDI objects, so the executive no longer
+  borrows a session stock-object handle for `0x0` or `0xN` service bitmap requests. Until
+  provider-owned service GDI allocation exists, every noninteractive service bitmap allocation fails
+  visibly with NULL. Review adjustment: F1 remains open for `NtGdiGetStockObject` stock-handle reuse,
+  service cursor/class/ScrollBar classinfo mirrors, and the final provider-owned per-process service
+  GUI/GDI object model. Validation: `rustfmt`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, `git diff --check`, and
+  `.tmp/full-boot-service-bitmap-no-default-20260804-015323.log` passed through natural framebuffer
+  readback, dynamic `services.exe`, the new service bitmap NULL path, and dynamic `lsass.exe` spawn.

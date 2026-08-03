@@ -8735,35 +8735,21 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     (hit.unwrap_or(0) as u64, true)
                 } else if m0 == 0x106c && svc_noninteractive {
-                    // Non-interactive services may ask gdi32 for cached process-attach bitmaps even
-                    // though they never own an interactive display target. Reuse the real session
-                    // DEFAULT_BITMAP only for the zero-sized stock-object case; all other service
-                    // bitmap allocation requests fail visibly until service GDI object ownership is
-                    // wired through the provider.
-                    let zero_size_default_bitmap = if a0 == 0 || a1 == 0 {
-                        nt_handler
-                            .lookup_win32k_stock_object(nt_kernel_exec::user_gdi::DEFAULT_BITMAP)
-                    } else {
-                        None
-                    };
-                    if let Some(handle) = zero_size_default_bitmap {
-                        nt_handler.record_service_win32k_stock_hit();
-                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) MIRROR zero-size -> DEFAULT_BITMAP 0x");
-                        print_hex(handle);
-                        print_str(b"\n");
-                        (handle as u64, true)
-                    } else {
-                        print_str(b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) MIRROR MISS ");
-                        print_u64(a0 as u32 as u64);
-                        print_str(b"x");
-                        print_u64(a1 as u32 as u64);
-                        print_str(b" planes=");
-                        print_u64(a2 as u32 as u64);
-                        print_str(b" bpp=");
-                        print_u64(a3 as u32 as u64);
-                        print_str(b" -> NULL\n");
-                        (0, true)
-                    }
+                    // Bitmap handles are process-owned GDI objects. Noninteractive service clients
+                    // do not yet have provider-owned service GDI object allocation, so every service
+                    // bitmap request fails visibly instead of borrowing a session stock-object handle.
+                    print_str(
+                        b"[win32k-svc] svc NtGdiCreateBitmap(0x106c) SERVICE-GDI owner missing ",
+                    );
+                    print_u64(a0 as u32 as u64);
+                    print_str(b"x");
+                    print_u64(a1 as u32 as u64);
+                    print_str(b" planes=");
+                    print_u64(a2 as u32 as u64);
+                    print_str(b" bpp=");
+                    print_u64(a3 as u32 as u64);
+                    print_str(b" -> NULL\n");
+                    (0, true)
                 } else if m0 == 0x10b5 && svc_noninteractive {
                     // Pattern brushes are process-owned GDI objects, not stock handles. A
                     // non-interactive service cannot receive an invented brush handle; fail visibly
