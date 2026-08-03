@@ -98,8 +98,7 @@ pub(crate) fn native_processor_information(
     use core::arch::x86_64::__cpuid;
     use nt_syscall::system_information::{amd64_processor_information_from_cpuid, X86Vendor};
 
-    // SAFETY: CPUID is available in the x86_64 execution environment.
-    let vendor_leaf = unsafe { __cpuid(0) };
+    let vendor_leaf = __cpuid(0);
     let mut vendor_bytes = [0u8; 12];
     vendor_bytes[0..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
     vendor_bytes[4..8].copy_from_slice(&vendor_leaf.edx.to_le_bytes());
@@ -109,13 +108,10 @@ pub(crate) fn native_processor_information(
         b"AuthenticAMD" => X86Vendor::Amd,
         _ => X86Vendor::Other,
     };
-    // SAFETY: leaf 1 exists on every x86_64 processor.
-    let version = unsafe { __cpuid(1) };
-    // SAFETY: extended leaf zero reports whether leaf 0x80000001 is available.
-    let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
+    let version = __cpuid(1);
+    let max_extended = __cpuid(0x8000_0000).eax;
     let extended_edx = if max_extended >= 0x8000_0001 {
-        // SAFETY: availability was checked above.
-        unsafe { __cpuid(0x8000_0001) }.edx
+        __cpuid(0x8000_0001).edx
     } else {
         0
     };
@@ -127,6 +123,46 @@ pub(crate) fn native_processor_information(
         extended_edx,
         false, // rust-micro currently saves FXSAVE state, not XSAVE state.
     )
+}
+
+fn native_processor_vendor_identifier() -> alloc::string::String {
+    use core::arch::x86_64::__cpuid;
+
+    let vendor_leaf = __cpuid(0);
+    let mut vendor_bytes = [0u8; 12];
+    vendor_bytes[0..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
+    vendor_bytes[4..8].copy_from_slice(&vendor_leaf.edx.to_le_bytes());
+    vendor_bytes[8..12].copy_from_slice(&vendor_leaf.ecx.to_le_bytes());
+    let vendor = core::str::from_utf8(&vendor_bytes).unwrap_or("UnknownCPU");
+    alloc::string::String::from(vendor)
+}
+
+fn native_processor_registry_identifier() -> alloc::string::String {
+    let info = native_processor_information();
+    let vendor = native_processor_vendor_identifier();
+    let arch = if vendor == "AuthenticAMD" {
+        "AMD64"
+    } else if vendor == "GenuineIntel" {
+        "Intel64"
+    } else {
+        "x64"
+    };
+    alloc::format!(
+        "{} Family {} Model {} Stepping {}",
+        arch,
+        info.processor_level,
+        info.processor_revision >> 8,
+        info.processor_revision & 0xff
+    )
+}
+
+fn registry_sz_bytes(value: &str) -> alloc::vec::Vec<u8> {
+    let mut data = alloc::vec::Vec::new();
+    for unit in value.encode_utf16() {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data
 }
 
 fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
@@ -572,9 +608,71 @@ impl ExecNtHandler {
             }
         }
         handler.refresh_process_manager_gates();
+        handler.provision_volatile_hardware_registry();
         unsafe { handler.provision_default_user_locale() };
         handler.provision_reactos_explorer_shell_com_classes();
         handler
+    }
+
+    /// Seed the kernel-owned volatile HARDWARE hive state that ReactOS expects during early SMSS.
+    /// These keys are not backed by the disk hives; on NT they are runtime registry state published
+    /// from detected platform/CPU data. Keep it in the normal overlay so callers use ordinary
+    /// registry handles, enumeration, and query paths.
+    fn provision_volatile_hardware_registry(&mut self) {
+        const REG_SZ: u32 = 1;
+        const REG_DWORD: u32 = 4;
+        const HARDWARE_PATHS: [&str; 5] = [
+            r"\Registry\Machine\Hardware",
+            r"\Registry\Machine\Hardware\Description",
+            r"\Registry\Machine\Hardware\Description\System",
+            r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
+            r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0",
+        ];
+        let mut created = 0u32;
+        for path in HARDWARE_PATHS {
+            let canon = self.overlay_canon(path);
+            let (_, was_created) = self.overlay.create(&canon);
+            if was_created {
+                created += 1;
+            }
+        }
+
+        let cpu_key =
+            self.overlay_canon(r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0");
+        let Some(cpu_index) = self.overlay.find(&cpu_key) else {
+            print_str(b"[hardware-reg] CPU key provisioning failed\n");
+            return;
+        };
+        let identifier = native_processor_registry_identifier();
+        let vendor = native_processor_vendor_identifier();
+        let processor = native_processor_information();
+        self.overlay.set_value(
+            cpu_index,
+            "Identifier",
+            REG_SZ,
+            &registry_sz_bytes(&identifier),
+        );
+        self.overlay.set_value(
+            cpu_index,
+            "VendorIdentifier",
+            REG_SZ,
+            &registry_sz_bytes(&vendor),
+        );
+        self.overlay.set_value(
+            cpu_index,
+            "FeatureSet",
+            REG_DWORD,
+            &processor.processor_feature_bits.to_le_bytes(),
+        );
+        print_str(b"[hardware-reg] provisioned volatile CPU registry keys=");
+        print_u64(created as u64);
+        print_str(b" Identifier=\"");
+        print_ascii_str(&identifier);
+        print_str(b"\" VendorIdentifier=\"");
+        print_ascii_str(&vendor);
+        print_str(b"\" FeatureSet=0x");
+        print_hex(processor.processor_feature_bits);
+        print_str(b"\n");
     }
 
     /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback
@@ -776,12 +874,12 @@ impl ExecNtHandler {
         nt_hive_core::canon_path(&apply_ccs_alias(full))
     }
 
-    /// The mounted base hive a non-synth `KeyRef` belongs to, plus its in-hive cell offset. The
+    /// The mounted base hive a non-virtual `KeyRef` belongs to, plus its in-hive cell offset. The
     /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`]
     /// — or one of the `\Registry\User` mounts in [`ExecNtHandler::hive_mounts`] (`.Default` plus
     /// whatever `NtLoadKey` has mounted). Uniform: a dynamic mount resolves exactly like a boot one.
     pub(crate) fn base_hive(&self, target: KeyRef) -> Option<(&RegfHive<'static>, KeyRef)> {
-        if is_synth_key(target) {
+        if is_virtual_registry_key(target) {
             return None;
         }
         let sel = hive_sel(target);
@@ -1180,7 +1278,7 @@ impl ExecNtHandler {
         match self.registry_target_path(key) {
             Some(path) => print_ascii_str(&path),
             None => {
-                print_str(b"<synth 0x");
+                print_str(b"<non-hive 0x");
                 print_hex(key);
                 print_str(b">");
             }
@@ -1545,7 +1643,7 @@ impl ExecNtHandler {
             self.overlay
                 .path(index)
                 .and_then(|path| self.resolve_key(path))
-        } else if !is_synth_key(target) {
+        } else if !is_virtual_registry_key(target) {
             Some(target)
         } else {
             None
@@ -1595,7 +1693,7 @@ impl ExecNtHandler {
             self.overlay
                 .path(index)
                 .and_then(|overlay_path| self.resolve_key(overlay_path))
-        } else if !is_synth_key(target) {
+        } else if !is_virtual_registry_key(target) {
             Some(target)
         } else {
             None
@@ -8473,18 +8571,6 @@ impl ExecNtHandler {
             let cell = self.sam_hive.as_ref()?.open_key(&comps[3..].join("\\"))?;
             return Some(HIVE_SEL_SAM | cell);
         }
-        // The kernel's volatile HARDWARE hive isn't on disk. Synthesize the one key smss's SmpInit
-        // reads: \Registry\Machine\Hardware\Description\System\CentralProcessor\0 (CPU identifier).
-        let ci = |i: usize, s: &str| comps.get(i).map_or(false, |c| c.eq_ignore_ascii_case(s));
-        if comps.len() == 7
-            && ci(2, "Hardware")
-            && ci(3, "Description")
-            && ci(4, "System")
-            && ci(5, "CentralProcessor")
-            && ci(6, "0")
-        {
-            return Some(SYNTH_CPU_KEY);
-        }
         // The 4th mount — the REAL 471040 B SOFTWARE hive at `\Registry\Machine\SOFTWARE`. Placed
         // last so no pre-existing resolution changes: before it, every non-Winlogon Software key
         // fell out of this function as `None`.
@@ -9574,20 +9660,7 @@ impl ExecNtHandler {
                 };
                 let use_xas_write = self.pi >= 2;
                 let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
-                    if key == SYNTH_CPU_KEY {
-                        // The synthetic CPU key has 2 values (Identifier, VendorIdentifier).
-                        let entry = match args[1] {
-                            0 => Some(("Identifier", "identifier")),
-                            1 => Some(("VendorIdentifier", "vendoridentifier")),
-                            _ => None,
-                        };
-                        entry.and_then(|(nm, lc)| {
-                            synth_cpu_value(lc)
-                                .map(|(ty, d16)| (alloc::string::String::from(nm), ty, utf16_bytes(&d16)))
-                        })
-                    } else {
-                        self.registry_values(key).into_iter().nth(args[1] as usize)
-                    };
+                    self.registry_values(key).into_iter().nth(args[1] as usize);
                 match byname {
                     None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
                     Some((name, ty, data)) => {
@@ -10044,8 +10117,9 @@ impl ExecNtHandler {
                 status as u32
             },
             // NtQueryValueKey(KeyHandle[0], *ValueName[1], InfoClass[2], KeyValueInfo[3], Length[4],
-            // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the synthetic CPU
-            // key to build PROCESSOR_IDENTIFIER. Real-hive values by name → not-found (smss defaults).
+            // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the kernel-owned
+            // volatile HARDWARE overlay to build PROCESSOR_IDENTIFIER. Real-hive values by name
+            // continue to fall through to the mounted hives.
             NativeService::NtQueryValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x1) {
                     Ok(key) => key,
@@ -10091,29 +10165,26 @@ impl ExecNtHandler {
                     }
                 }
                 // Set for hosted processes reading real-hive values: their out-params are often
-                // advapi/userenv heap or stack buffers the plain mirror can't reach. Synth-key reads
-                // can stay mirror-only unless a call site below proves it needs cross-AS copyout.
+                // advapi/userenv heap or stack buffers the plain mirror can't reach. Predefined-root
+                // and overlay reads stay on their narrow paths unless a call site below proves it
+                // needs cross-AS copyout.
                 let mut use_xas_write =
                     shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
-                let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
-                    synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
-                } else {
-                    if pe_backed_registry_strings && !is_synth_key(key) {
-                        // Hosted clients reading a value out of a REAL MOUNTED HIVE (not a synth
-                        // handle): their out-params are advapi/userenv heap or stack the plain mirror
-                        // can't reach, so the copyout below must go cross-AS. Early live cases:
-                        //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
-                        //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was:
-                        //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
-                        //     InitializeSAS FALSE → ExitProcess(2).
-                        //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
-                        //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
-                        // Scoped by `!is_synth_key`, so synthetic CPU/predefined-root reads stay on
-                        // their narrow paths.
-                        use_xas_write = true;
-                    }
-                    self.registry_value(key, &name_lc)
-                };
+                if pe_backed_registry_strings && !is_virtual_registry_key(key) {
+                    // Hosted clients reading a value out of a REAL MOUNTED HIVE (not an overlay or
+                    // predefined-root handle): their out-params are advapi/userenv heap or stack the
+                    // plain mirror can't reach, so the copyout below must go cross-AS. Early live cases:
+                    //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
+                    //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was:
+                    //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
+                    //     InitializeSAS FALSE → ExitProcess(2).
+                    //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
+                    //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
+                    // Scoped by `!is_virtual_registry_key`, so overlay/predefined-root reads stay
+                    // on their narrow paths.
+                    use_xas_write = true;
+                }
+                let val: Option<(u32, alloc::vec::Vec<u8>)> = self.registry_value(key, &name_lc);
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
                 if self.current_process_is_winlogon() && key_is_real_winlogon {
                     if let Some((ty, ref data)) = val {
@@ -10226,7 +10297,7 @@ impl ExecNtHandler {
                             // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
                             // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
                             // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
-                            if !is_synth_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE {
+                            if !is_virtual_registry_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE {
                                 SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
                                 if self.current_process_is_winlogon()
                                     && name_lc == "profilesdirectory"

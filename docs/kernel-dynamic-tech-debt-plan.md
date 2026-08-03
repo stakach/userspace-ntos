@@ -59,8 +59,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   driven driver objects.
 - `[~]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
-- `[~]` D3: Replace synthetic video, keyboard, CPU, and Winlogon registry overlays with real hive
-  data and driver-created device interfaces.
+- `[~]` D3: Replace remaining win32k video/keyboard registry mirrors and temporary video object
+  scaffolding with real hive data, Configuration Manager state, and driver-created device
+  interfaces.
 
 ### E. LPC, CSR, SRM, And LSA
 
@@ -853,3 +854,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: A2 still needs the real dynamic endpoint: SMSS/session-manager process creation must
   provide these records, and the fixed VA/cap placement should move behind an allocator rather than
   staying as static descriptor data.
+- D3 continued. Removed the `SYNTH_CPU_KEY` sentinel and the per-value
+  `Identifier`/`VendorIdentifier` branches from registry open, enumeration, and query handling.
+  The executive now seeds the kernel-owned volatile HARDWARE registry hierarchy in the normal
+  overlay from live CPUID-derived processor facts, so SMSS reads ordinary registry handles and the
+  generic `NtEnumerateValueKey`/`NtQueryValueKey` paths serve the CPU values. The stale
+  `is_synth_key` naming was also replaced with `is_virtual_registry_key` for overlay/predefined-root
+  targets. Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/exec_handler.rs components/ntos-executive/src/main.rs`,
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. Full boot attempt
+  `.tmp/full-boot-volatile-hardware-reg-20260803-235006.log` reached userinit/explorer and repeated
+  real api0 explorer `WM_PAINT` callbacks before being manually stopped; review adjustment: the CPU
+  HARDWARE compatibility key is closed, while the live frontier for the next plan slice is F2/F3
+  paint invalidation/queue completion plus D3's remaining win32k registry/device mirrors.

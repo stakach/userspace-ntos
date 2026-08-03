@@ -9707,10 +9707,6 @@ const NTDLL_STUB: &[u8] = &[
 /// so syscalls migrate from fake to real one family at a time while the tree stays green. v0.1
 /// covers only the trivial object calls; the registry family (real OBJECT_ATTRIBUTES copyin +
 /// a real hive) lands next, then process/section/token/port against the smss trace.
-/// Sentinel `KeyRef` for the synthesized `\Registry\Machine\Hardware\…\CentralProcessor\0` key
-/// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
-/// cell offset, so it never collides with a hive key.
-const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 /// Typed key target for the predefined machine root. This is stored inside process-local
 /// `HandleObject::RegistryKey` entries; it is not a handle value.
 const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
@@ -9722,12 +9718,12 @@ const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
 const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
 /// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
 /// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
-/// far above any real cell offset and below the synthetic key targets.
+/// far above any real cell offset and below the predefined-root sentinel targets.
 const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
 const OVERLAY_KEY_MAX: u32 = 0x1000;
-/// True if a `KeyRef` is a synthetic/overlay/predefined-root handle rather than a genuine mounted
+/// True if a `KeyRef` is an overlay/predefined-root target rather than a genuine mounted
 /// hive cell offset. Real hive KeyRefs keep their selector below `OVERLAY_KEY_TAG`.
-fn is_synth_key(kr: KeyRef) -> bool {
+fn is_virtual_registry_key(kr: KeyRef) -> bool {
     kr >= OVERLAY_KEY_TAG
 }
 /// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
@@ -9735,7 +9731,7 @@ fn is_synth_key(kr: KeyRef) -> bool {
 /// ~204 KiB), SOFTWARE (460 KiB), SECURITY and SAM (8 KiB each) — all read BY PATH off
 /// `\reactos\system32\config`. A `KeyRef` is a cell offset inside ONE of them, so the top nibble
 /// SELECTS the hive. Real cell offsets are far below 0x2000_0000 (the largest hive is 460 KiB), and
-/// the tags stay below `OVERLAY_KEY_TAG` so `is_synth_key` is unchanged.
+/// the tags stay below `OVERLAY_KEY_TAG` so `is_virtual_registry_key` is unchanged.
 /// **BYPASS SWITCH** for the SECURITY/SAM hive mount. Set to `false` to leave both hives unmounted
 /// (the pre-batch state): `\Registry\Machine\SECURITY` then fails to open, lsasrv's
 /// `LsapOpenServiceKey` returns STATUS_OBJECT_NAME_NOT_FOUND, no LSA policy database is installed
@@ -9750,7 +9746,8 @@ pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
 pub(crate) const SOFTWARE_HIVE_MOUNTED: bool = true;
 /// ★ WIDENED `0xE000_0000` -> `0xF000_0000` (batch 62). The mask must leave room for the hives
 /// mounted at RUN time by `NtLoadKey` as well as the four mounted at boot, and every selector has
-/// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_synth_key` is unchanged. Four
+/// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_virtual_registry_key` is
+/// unchanged. Four
 /// tags of 3 bits gave exactly four mounts; four bits gives EIGHT (`0x0`-`0x7`), of which the four
 /// boot mounts keep their existing values byte-for-byte and the odd ones are free for the
 /// `\Registry\User` namespace. A widened mask is safe because a real cell offset is bounded by the
@@ -9776,7 +9773,7 @@ pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
 pub(crate) const HIVE_SEL_DYNAMIC: [u32; 2] = [0x3000_0000, 0x5000_0000];
 const _: () =
     assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
-/// The hive selector bits of a `KeyRef` (meaningful only for a non-synth key).
+/// The hive selector bits of a `KeyRef` (meaningful only for a mounted-hive key).
 pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
     kr & HIVE_SEL_MASK
 }
@@ -10671,27 +10668,6 @@ static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
 static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
-/// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
-/// for SmpInit's PROCESSOR_IDENTIFIER build (Identifier + VendorIdentifier, both REG_SZ).
-fn synth_cpu_value(name_lc: &str) -> Option<(u32, alloc::vec::Vec<u16>)> {
-    const REG_SZ: u32 = 1;
-    let s: &str = match name_lc {
-        "identifier" => "Intel64 Family 6 Model 60 Stepping 3",
-        "vendoridentifier" => "GenuineIntel",
-        _ => return None,
-    };
-    let mut d: alloc::vec::Vec<u16> = s.encode_utf16().collect();
-    d.push(0); // REG_SZ is NUL-terminated
-    Some((REG_SZ, d))
-}
-/// UTF-16 code units → little-endian bytes (registry value data is stored/copied as bytes).
-fn utf16_bytes(d16: &[u16]) -> alloc::vec::Vec<u8> {
-    let mut b = alloc::vec::Vec::with_capacity(d16.len() * 2);
-    for &w in d16 {
-        b.extend_from_slice(&w.to_le_bytes());
-    }
-    b
-}
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
 const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
 /// Opaque-tag payload used by the real per-process handle table for anonymous events. The low
