@@ -773,3 +773,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: this may expose the next real LSA/RPC/autologon
   behavior in full boot; that should be implemented in the LPC/LSA workstream rather than hidden by
   Winlogon-key filtering.
+- A2/C3 cleanup. Message-buffer marshalling for `NtUserGetMessage`/`NtUserPeekMessage` now follows
+  registered hosted-process GUI metadata instead of a fixed explorer `pi` check. The diagnostics and
+  copy-in/copy-out path use the staged provider argument frame when the isolated win32k dispatch
+  writes back into the executive-owned buffer, so correlated winlogon and shell clients are observed
+  through the same role-backed transport. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
+  `git diff --check`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-gui-msg-marshalling-20260803-214257.log` completed
+  without regressing the current SAS frontier. Review adjustment: this is a cleanup of a fixed
+  shell identity check, not a F2/F3 paint completion; the next target remains restoring the real SAS
+  WndProc/dialog route after the dynamic registry and callback cleanup exposed it again.

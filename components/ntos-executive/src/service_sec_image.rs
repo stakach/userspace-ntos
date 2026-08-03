@@ -8,7 +8,7 @@ const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
-static EXPLORER_GETMESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +43,10 @@ fn hosted_process_uses_client_gdi(nt_handler: &ExecNtHandler, pi: usize) -> bool
         ) => true,
         _ => false,
     }
+}
+
+fn hosted_process_uses_user_message_marshalling(nt_handler: &ExecNtHandler, pi: usize) -> bool {
+    hosted_process_uses_client_gdi(nt_handler, pi)
 }
 
 fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_va: u64) {
@@ -500,7 +504,8 @@ fn hosted_pi_for_role(
     role: nt_exe_image::HostedProcessRole,
 ) -> Option<usize> {
     (0..MAX_PI).find(|&pi| {
-        hosted_process_runtime_for_pi(pi).is_some() && nt_handler.hosted_process_role(pi) == Some(role)
+        hosted_process_runtime_for_pi(pi).is_some()
+            && nt_handler.hosted_process_role(pi) == Some(role)
     })
 }
 
@@ -6959,7 +6964,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                let msg_syscall = pi == 6
+                let msg_syscall = hosted_process_uses_user_message_marshalling(&nt_handler, pi)
                     && a0 != 0
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
@@ -6988,7 +6993,7 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                             if failures < 8 {
-                                print_str(b"[win32k-svc] explorer MSG copy-in failed ssn=0x");
+                                print_str(b"[win32k-svc] GUI MSG copy-in failed ssn=0x");
                                 print_hex(m0 as u32);
                                 print_str(b" buffer=0x");
                                 print_hex_u64(a0);
@@ -8605,9 +8610,26 @@ pub(crate) unsafe fn service_sec_image(
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
                     // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.
                     if pi == 2 && (m0 == 0x1006 || m0 == 0x1001) && a0 != 0 {
-                        let hwnd = smss_stack_read(a0);
-                        let message = smss_stack_read(a0 + 8);
-                        let wparam = smss_stack_read(a0 + 0x10);
+                        let msg_ptr = if msg_returns_to_client {
+                            win32k_subsystem::WIN32K_ARG_VADDR
+                        } else {
+                            a0
+                        };
+                        let hwnd = if msg_returns_to_client {
+                            core::ptr::read_unaligned(msg_ptr as *const u64)
+                        } else {
+                            smss_stack_read(msg_ptr)
+                        };
+                        let message = if msg_returns_to_client {
+                            core::ptr::read_unaligned((msg_ptr + 8) as *const u64)
+                        } else {
+                            smss_stack_read(msg_ptr + 8)
+                        };
+                        let wparam = if msg_returns_to_client {
+                            core::ptr::read_unaligned((msg_ptr + 0x10) as *const u64)
+                        } else {
+                            smss_stack_read(msg_ptr + 0x10)
+                        };
                         print_str(b"[wl-diag] GetMessage retrieved MSG hwnd=0x");
                         print_hex(hwnd as u32);
                         print_str(b" message=0x");
@@ -8737,7 +8759,7 @@ pub(crate) unsafe fn service_sec_image(
                         ) {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                             if failures < 8 {
-                                print_str(b"[win32k-svc] explorer MSG copy-out failed ssn=0x");
+                                print_str(b"[win32k-svc] GUI MSG copy-out failed ssn=0x");
                                 print_hex(m0 as u32);
                                 print_str(b" buffer=0x");
                                 print_hex_u64(a0);
@@ -8748,18 +8770,26 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if msg_syscall && ok && !redirected_user_callback {
-                    let n = EXPLORER_GETMESSAGE_DIAG_N.fetch_add(1, Ordering::Relaxed);
+                    let n = GUI_MESSAGE_DIAG_N.fetch_add(1, Ordering::Relaxed);
                     if n < 128 || n.is_power_of_two() {
                         let mut msg = [0u8; WIN32K_MSG_BYTES];
-                        let copy_ok = img_spawn::client_copyin_process_mapped(
-                            pi as u64,
-                            a0,
-                            &mut msg,
-                            filled_pages,
-                            faults as usize,
-                            scratch_base,
-                            false,
-                        );
+                        let copy_ok = if msg_returns_to_client {
+                            msg.copy_from_slice(core::slice::from_raw_parts(
+                                win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+                                WIN32K_MSG_BYTES,
+                            ));
+                            true
+                        } else {
+                            img_spawn::client_copyin_process_mapped(
+                                pi as u64,
+                                a0,
+                                &mut msg,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                                false,
+                            )
+                        };
                         let hwnd = u64::from_le_bytes(msg[0..8].try_into().unwrap_or([0; 8]));
                         let message = u32::from_le_bytes(msg[8..12].try_into().unwrap_or([0; 4]));
                         let wparam =
@@ -8767,7 +8797,7 @@ pub(crate) unsafe fn service_sec_image(
                         let lparam =
                             u64::from_le_bytes(msg[0x18..0x20].try_into().unwrap_or([0; 8]));
                         let time = u32::from_le_bytes(msg[0x20..0x24].try_into().unwrap_or([0; 4]));
-                        print_str(b"[explorer-msg] ssn=0x");
+                        print_str(b"[gui-msg] ssn=0x");
                         print_hex(m0 as u32);
                         print_str(b" ret=0x");
                         print_hex(st as u32);
@@ -9728,9 +9758,10 @@ pub(crate) unsafe fn service_sec_image(
     // === PRIVATE-VM COMMIT/DECOMMIT/RE-COMMIT SELF-TEST (POST-QUIESCE). Runs on the real
     // `vm_map_private_page` path in a real hosted VSpace, at a VA above every placement the boot
     // makes, so it perturbs nothing. See `private_vm_unmap_selftest`. ===
-    if let Some(logon_pi) =
-        hosted_pi_for_role(&nt_handler, nt_exe_image::HostedProcessRole::InteractiveLogon)
-    {
+    if let Some(logon_pi) = hosted_pi_for_role(
+        &nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveLogon,
+    ) {
         crate::private_vm_unmap_selftest(
             logon_pi,
             procs[logon_pi].pml4,
