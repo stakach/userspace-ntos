@@ -23,6 +23,7 @@ static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -2187,6 +2188,55 @@ unsafe fn capture_cursor_lookup_key(
         nfilled,
         scratch_base,
     )
+}
+
+unsafe fn stage_cursor_lookup_args(
+    pi: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    parameter: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<(u64, u64, u64)> {
+    let module = try_capture_client_string_arg(
+        pi,
+        module_descriptor,
+        false,
+        false,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    let resource = try_capture_client_string_arg(
+        pi,
+        resource_descriptor,
+        false,
+        false,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    if parameter == 0 {
+        return None;
+    }
+    let mut params = [0u8; 12];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        parameter,
+        &mut params,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let param_out = rc_arg_slot_base(slot);
+    core::ptr::write_bytes(param_out as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    core::ptr::copy_nonoverlapping(params.as_ptr(), param_out as *mut u8, params.len());
+    Some((module.desc, resource.desc, param_out))
 }
 
 /// Capture the identity assigned by a real `NtUserSetCursorIconData`. `CURSORDATA.rt` is RT_CURSOR
@@ -7085,7 +7135,49 @@ pub(crate) unsafe fn service_sec_image(
                 let mut message_call_probe_failed = false;
                 let mut get_atom_name_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
-                if m0 == 0x10b4 {
+                let mut find_cursor_icon_probe_failed = false;
+                if m0 == 0x103d {
+                    // NtUserFindExistingCursorIcon probes two client UNICODE_STRING descriptors and
+                    // a FINDEXISTINGCURICONPARAM. The resource string can be MAKEINTRESOURCE, in
+                    // which case Length is zero and Buffer is the integer identity; preserve that
+                    // descriptor shape while rebasing only real counted-string buffers.
+                    match stage_cursor_lookup_args(
+                        pi as u64,
+                        d_a0,
+                        d_a1,
+                        d_a2,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        Some((module, resource, params)) => {
+                            d_a0 = module;
+                            d_a1 = resource;
+                            d_a2 = params;
+                            let n = FIND_CURSOR_ICON_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 24 {
+                                print_str(b"[w32marshal] NtUserFindExistingCursorIcon pi=");
+                                print_u64(pi as u64);
+                                print_str(b" module=0x");
+                                print_hex_u64(a0);
+                                print_str(b" resource=0x");
+                                print_hex_u64(a1);
+                                print_str(b" params=0x");
+                                print_hex_u64(a2);
+                                print_str(b" staged=0x");
+                                print_hex_u64(module);
+                                print_str(b"/0x");
+                                print_hex_u64(resource);
+                                print_str(b"/0x");
+                                print_hex_u64(params);
+                                print_str(b"\n");
+                            }
+                        }
+                        None => {
+                            find_cursor_icon_probe_failed = true;
+                        }
+                    }
+                } else if m0 == 0x10b4 {
                     d_a1 = capture_client_string_arg(
                         pi as u64,
                         d_a1,
@@ -8551,6 +8643,22 @@ pub(crate) unsafe fn service_sec_image(
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0, false)
+                } else if find_cursor_icon_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(
+                            b"[win32k-svc] NtUserFindExistingCursorIcon input probe failed pi=",
+                        );
+                        print_u64(pi as u64);
+                        print_str(b" module=0x");
+                        print_hex_u64(a0);
+                        print_str(b" resource=0x");
+                        print_hex_u64(a1);
+                        print_str(b" params=0x");
+                        print_hex_u64(a2);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if create_bitmap_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {

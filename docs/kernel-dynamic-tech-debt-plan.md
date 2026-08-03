@@ -77,9 +77,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   object ownership.
 - `[x]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
-- `[~]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
+- `[x]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
   queue state produced by real window invalidation and dispatch.
-- `[~]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
+- `[x]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
 
 ## Review Log
 
@@ -1223,3 +1223,25 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `NtGdiStretchDIBitsInternal input probe failed` or `StretchDIBits failed` signatures. Review
   adjustment: C3 remains open for the final win32k/client marshalling audit, while F3/F4 remain open
   until the modal paint queue and credential framebuffer proof have a terminating, natural gate.
+- C3 repair. `NtUserFindExistingCursorIcon(0x103d)` now stages both caller-owned
+  `UNICODE_STRING` descriptors and the `FINDEXISTINGCURICONPARAM` block before isolated win32k
+  dispatch. Counted module/resource strings are copied into the provider-owned argument frame, while
+  zero-length `MAKEINTRESOURCE` descriptors preserve their integer `Buffer` identity so ReactOS'
+  atom/resource probe path still sees the expected shape. Invalid probes return a visible NULL
+  result instead of forwarding foreign pointers or fabricating a cursor/icon handle. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-cursor-lookup-marshalled.log` passed through the microtest sentinel with
+  `PASS exec_win32k_desktop_painted`, `PASS exec_desktop_shell_frontier`, `PASS
+  exec_msgina_modal_paint_prefix`, `PASS exec_msgina_logon_dialog_painted`, `PASS
+  exec_userinit_shell_image_attempted`, `PASS exec_userinit_global_cursor_reused`, `PASS
+  exec_userinit_builtin_classes_reused`, `PASS exec_userinit_scrollbar_classinfo`, and `PASS
+  exec_explorer_process_spawned`. F3/F4 are closed again by this terminating natural modal paint and
+  credential framebuffer proof. Review adjustment: C3 remains open for the remaining explorer
+  provider-boundary/client-callback route; the current red gates are
+  `exec_explorer_create_window_strings_captured`,
+  `exec_explorer_register_window_messages_captured`, `exec_explorer_user_callbacks_redirected`,
+  `exec_explorer_wndproc_installed_by_client`, and `exec_explorer_shell_com_classes_served`. The
+  older post-quiesce proof gates `exec_user_callback_dead_client_unwind`,
+  `exec_win32k_transport_call_nested`, and `exec_lsa_worker_route` also remain open.
