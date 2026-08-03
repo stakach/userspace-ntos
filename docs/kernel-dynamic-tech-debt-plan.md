@@ -673,3 +673,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the SAS/dialog/profile/userinit/explorer regression is closed again. Remaining open items are the
   hosted-image manifest handoff, provider-owned service GUI/GDI state, the driver/registry and LPC
   discovery workstreams, and the real WM_PAINT queue/framebuffer path.
+- A2/C3 cleanup. The post-quiesce private-VM and win32k callback injection proofs no longer select
+  their winlogon client through `pi == 2`, `WINLOGON_BADGE`, or a hardcoded PEB mirror. The service
+  loop now resolves the interactive-logon process from registered hosted-process metadata, and the
+  callback victim carries its runtime `pi`, process role, top badge, PEB mirror, and scratch layout
+  into the proof client context. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. A full boot attempt
+  `.tmp/full-boot-dynamic-callback-victim-20260803.log` was stopped after serial output stalled
+  before post-quiesce proof emission, so the next full-boot check should confirm the proof markers
+  and the hosted-boot liveness frontier together.

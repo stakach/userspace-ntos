@@ -1819,11 +1819,16 @@ pub(crate) struct DeadClientVictimTermination {
 
 #[derive(Clone, Copy)]
 pub(crate) struct WinlogonCallbackThread {
+    pub pi: usize,
     pub badge: u64,
     pub tid: u64,
     pub tcb: u64,
     pub role: HostedThreadRole,
+    pub process_role: nt_exe_image::HostedProcessRole,
+    pub top_badge: u64,
     pub teb: u64,
+    pub peb_mirror: u64,
+    pub scratch_base: u64,
     pub stack_top: u64,
 }
 
@@ -1922,23 +1927,26 @@ pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 /// Returns the `NESTED_SLIP_*` proof mask.
 pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     client_pid: u64,
-    scratch_base: u64,
     victim: WinlogonCallbackThread,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
     const WM_NULL: u64 = 0x0000;
-    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
     const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
 
     let mut proof = 0u64;
     let (system_sid, system_sid_len) = local_system_sid_native();
     let WinlogonCallbackThread {
+        pi,
         badge,
         tid,
         tcb,
         role,
+        process_role,
+        top_badge,
         teb,
+        peb_mirror,
+        scratch_base,
         stack_top,
     } = victim;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
@@ -1964,7 +1972,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     print_str(b"\n");
 
     let client = Win32kClientContext {
-        pi: 2,
+        pi: pi as u32,
         pid: client_pid,
         badge,
         tid,
@@ -1972,10 +1980,10 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
         eprocess: 0,
         ethread: 0,
         role: Some(role),
-        process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
-        top_badge: WINLOGON_BADGE,
+        process_role: Some(process_role),
+        top_badge,
         teb,
-        peb_mirror: WINLOGON_PEB_MIRROR,
+        peb_mirror,
         scratch_base,
         token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
         token_user_sid: system_sid,
@@ -2161,7 +2169,6 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
 
 pub(crate) unsafe fn inject_dead_client_callback_unwind(
     client_pid: u64,
-    scratch_base: u64,
     victim: WinlogonCallbackThread,
     terminate_victim: &mut dyn FnMut(u64) -> DeadClientVictimTermination,
 ) -> u64 {
@@ -2170,7 +2177,6 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
     const WM_NULL: u64 = 0x0000;
     const WM_WINDOWPOSCHANGING: u64 = 0x0046;
-    const WINLOGON_PEB_MIRROR: u64 = 0x0000_0100_107C_1000;
     const WINDOWPOS_BYTES: usize = 40;
     const WINDOWPOS_STACK_OFFSET: u64 = 0x80;
     const SWP_NOSIZE: u64 = 0x0001;
@@ -2184,14 +2190,19 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
 
     let mut proof = 0u64;
     let (system_sid, system_sid_len) = local_system_sid_native();
-    // (0) VICTIM SELECTION — caller supplies an expendable winlogon (pi 2) worker thread resolved
-    // from the registered hosted-thread runtime table.
+    // (0) VICTIM SELECTION — caller supplies an expendable winlogon worker thread resolved from
+    // the registered hosted-thread runtime table.
     let WinlogonCallbackThread {
+        pi,
         badge,
         tid,
         tcb,
         role,
+        process_role,
+        top_badge,
         teb,
+        peb_mirror,
+        scratch_base,
         stack_top,
     } = victim;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
@@ -2218,7 +2229,7 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     print_str(b"\n");
 
     let client = Win32kClientContext {
-        pi: 2,
+        pi: pi as u32,
         pid: client_pid,
         badge,
         tid,
@@ -2226,10 +2237,10 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         eprocess: 0,
         ethread: 0,
         role: Some(role),
-        process_role: Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
-        top_badge: WINLOGON_BADGE,
+        process_role: Some(process_role),
+        top_badge,
         teb,
-        peb_mirror: WINLOGON_PEB_MIRROR,
+        peb_mirror,
         scratch_base,
         token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
         token_user_sid: system_sid,

@@ -495,6 +495,15 @@ fn hosted_top_badge_for_role(
     })
 }
 
+fn hosted_pi_for_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<usize> {
+    (0..MAX_PI).find(|&pi| {
+        hosted_process_runtime_for_pi(pi).is_some() && nt_handler.hosted_process_role(pi) == Some(role)
+    })
+}
+
 fn hosted_pi_for_top_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     (0..MAX_PI).find(|&pi| {
         hosted_process_runtime_for_pi(pi).is_some()
@@ -9719,40 +9728,50 @@ pub(crate) unsafe fn service_sec_image(
     // === PRIVATE-VM COMMIT/DECOMMIT/RE-COMMIT SELF-TEST (POST-QUIESCE). Runs on the real
     // `vm_map_private_page` path in a real hosted VSpace, at a VA above every placement the boot
     // makes, so it perturbs nothing. See `private_vm_unmap_selftest`. ===
-    crate::private_vm_unmap_selftest(2, procs[2].pml4, procs[2].scratch_base);
+    if let Some(logon_pi) =
+        hosted_pi_for_role(&nt_handler, nt_exe_image::HostedProcessRole::InteractiveLogon)
+    {
+        crate::private_vm_unmap_selftest(
+            logon_pi,
+            procs[logon_pi].pml4,
+            procs[logon_pi].scratch_base,
+        );
+    } else {
+        print_str(b"[private-vm] no runtime-registered interactive logon process -> skipped\n");
+    }
     if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
-        let client_pid = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
-        let scratch_base = procs[2].scratch_base;
         if let Some(callback_thread) = winlogon_callback_thread_candidate(&nt_handler) {
-            // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
-            // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
-            // dead-client injection below still finds a live, redirectable thread. Order matters: the
-            // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
-            // park and this injection could not arm.
-            let nested_proof = win32k_glue::inject_win32k_nested_dispatch_slip(
-                client_pid,
-                scratch_base,
-                callback_thread,
-            );
-            WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
-            let mut terminate_victim = |victim_tid: u64| {
-                let terminated = terminate_hosted_thread_mechanism(
-                    victim_tid,
-                    &mut delay_queue,
-                    &mut nt_handler,
+            if let Some(client_pid) = nt_handler.pm_pid_for_pi(callback_thread.pi) {
+                // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
+                // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
+                // dead-client injection below still finds a live, redirectable thread. Order matters: the
+                // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
+                // park and this injection could not arm.
+                let nested_proof = win32k_glue::inject_win32k_nested_dispatch_slip(
+                    client_pid as u64,
+                    callback_thread,
                 );
-                win32k_glue::DeadClientVictimTermination {
-                    terminated,
-                    tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
-                }
-            };
-            let proof = win32k_glue::inject_dead_client_callback_unwind(
-                client_pid,
-                scratch_base,
-                callback_thread,
-                &mut terminate_victim,
-            );
-            DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
+                WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
+                let mut terminate_victim = |victim_tid: u64| {
+                    let terminated = terminate_hosted_thread_mechanism(
+                        victim_tid,
+                        &mut delay_queue,
+                        &mut nt_handler,
+                    );
+                    win32k_glue::DeadClientVictimTermination {
+                        terminated,
+                        tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
+                    }
+                };
+                let proof = win32k_glue::inject_dead_client_callback_unwind(
+                    client_pid as u64,
+                    callback_thread,
+                    &mut terminate_victim,
+                );
+                DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
+            } else {
+                print_str(b"[cb-inject] runtime-registered winlogon callback worker has no pid\n");
+            }
         } else {
             print_str(b"[cb-inject] no runtime-registered winlogon callback worker -> skipped\n");
         }
@@ -13220,6 +13239,9 @@ fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
 fn winlogon_callback_thread_candidate(
     nt_handler: &ExecNtHandler,
 ) -> Option<win32k_glue::WinlogonCallbackThread> {
+    let process_role = nt_exe_image::HostedProcessRole::InteractiveLogon;
+    let pi = hosted_pi_for_role(nt_handler, process_role)?;
+    let top_badge = nt_handler.hosted_process_top_badge(pi)?;
     let candidates = [
         (
             HostedThreadRole::WinlogonWorker { slot: 1 },
@@ -13233,13 +13255,18 @@ fn winlogon_callback_thread_candidate(
         ),
     ];
     for (role, teb, stack_top) in candidates {
-        if let Some((tid, tcb, badge)) = nt_handler.hosted_thread_identity_for_role(2, role) {
+        if let Some((tid, tcb, badge)) = nt_handler.hosted_thread_identity_for_role(pi, role) {
             return Some(win32k_glue::WinlogonCallbackThread {
+                pi,
                 badge,
                 tid,
                 tcb,
                 role,
+                process_role,
+                top_badge,
                 teb,
+                peb_mirror: hosted_peb_mirror_for_pi(pi),
+                scratch_base: hosted_scratch_base_for_pi(pi),
                 stack_top,
             });
         }
