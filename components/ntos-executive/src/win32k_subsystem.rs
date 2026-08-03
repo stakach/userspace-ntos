@@ -2368,11 +2368,11 @@ unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
     write_volatile((teb + TEB_SELF_OFF) as *mut u64, teb);
     write_volatile((teb + TEB_CLIENT_ID_PROCESS_OFF) as *mut u64, pid);
     write_volatile((teb + TEB_CLIENT_ID_THREAD_OFF) as *mut u64, tid);
+    write_volatile((teb + TEB_PROCESS_ENVIRONMENT_BLOCK_OFF) as *mut u64, peb);
     write_volatile(
-        (teb + TEB_PROCESS_ENVIRONMENT_BLOCK_OFF) as *mut u64,
-        peb,
+        (peb + PEB_PROCESS_PARAMETERS_OFF) as *mut u64,
+        process_params,
     );
-    write_volatile((peb + PEB_PROCESS_PARAMETERS_OFF) as *mut u64, process_params);
     Some(teb)
 }
 
@@ -2395,9 +2395,15 @@ unsafe fn prepare_ethread_for_win32k_callout(thread_index: usize, teb: u64) {
 
     write_volatile((ethread + KTHREAD_TEB_OFF) as *mut u64, teb);
     write_volatile((ethread + KTHREAD_PROCESS_OFF) as *mut u64, eprocess);
-    write_volatile((ethread + ETHREAD_CID_UNIQUE_PROCESS_OFF) as *mut u64, process_id);
+    write_volatile(
+        (ethread + ETHREAD_CID_UNIQUE_PROCESS_OFF) as *mut u64,
+        process_id,
+    );
     write_volatile((ethread + ETHREAD_CID_UNIQUE_THREAD_OFF) as *mut u64, tid);
-    write_volatile((ethread + ETHREAD_THREADS_PROCESS_OFF) as *mut u64, eprocess);
+    write_volatile(
+        (ethread + ETHREAD_THREADS_PROCESS_OFF) as *mut u64,
+        eprocess,
+    );
 }
 
 unsafe fn context_object_matches_or_empty(slot: &AtomicU64, supplied: u64) -> bool {
@@ -2435,10 +2441,19 @@ unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {
     let w32thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
     write_volatile((WIN32K_SHARED_VADDR + SH_CTX_PROCESS_ID) as *mut u64, pid);
     write_volatile((WIN32K_SHARED_VADDR + SH_CTX_THREAD_ID) as *mut u64, tid);
-    write_volatile((WIN32K_SHARED_VADDR + SH_CTX_EPROCESS) as *mut u64, eprocess);
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_CTX_EPROCESS) as *mut u64,
+        eprocess,
+    );
     write_volatile((WIN32K_SHARED_VADDR + SH_CTX_ETHREAD) as *mut u64, ethread);
-    write_volatile((WIN32K_SHARED_VADDR + SH_CTX_W32PROCESS) as *mut u64, w32process);
-    write_volatile((WIN32K_SHARED_VADDR + SH_CTX_W32THREAD) as *mut u64, w32thread);
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_CTX_W32PROCESS) as *mut u64,
+        w32process,
+    );
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_CTX_W32THREAD) as *mut u64,
+        w32thread,
+    );
 }
 
 unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) -> Option<usize> {
@@ -2447,10 +2462,8 @@ unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) ->
     }
     if let Some(index) = process_context_index_for_pid(pid) {
         WIN32K_PROCESS_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
-        if !context_object_matches_or_empty(
-            &WIN32K_PROCESS_CTX_EPROCESS[index],
-            supplied_eprocess,
-        ) {
+        if !context_object_matches_or_empty(&WIN32K_PROCESS_CTX_EPROCESS[index], supplied_eprocess)
+        {
             print_str(b"[win32k-context] ERROR: supplied EPROCESS mismatch for pid=");
             print_u64(pid);
             print_str(b"\n");
@@ -4530,7 +4543,9 @@ pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
     // PsGetCurrentProcess/Thread or inline KPCR.Prcb.CurrentThread while registering its callouts; those
     // reads now resolve through the same PID/TID-keyed context table used by routed client dispatches.
     if ensure_bootstrap_win32k_context().is_none() {
-        print_str(b"[win32k-host] ERROR: bootstrap GUI context allocation failed before DriverEntry\n");
+        print_str(
+            b"[win32k-host] ERROR: bootstrap GUI context allocation failed before DriverEntry\n",
+        );
     }
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
     // Mark "entered" BEFORE component_main calls DriverEntry so a fault mid-init is still attributable.
@@ -4611,17 +4626,15 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let process_role = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
     let top_level =
         read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0;
-    let Some((process_index, thread_index)) =
-        select_win32k_client_context(
-            client_pi,
-            process_id,
-            thread_id,
-            client_teb,
-            supplied_eprocess,
-            supplied_ethread,
-            process_role,
-        )
-    else {
+    let Some((process_index, thread_index)) = select_win32k_client_context(
+        client_pi,
+        process_id,
+        thread_id,
+        client_teb,
+        supplied_eprocess,
+        supplied_ethread,
+        process_role,
+    ) else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
     if !ensure_win32k_process_attached(process_index)
@@ -5711,7 +5724,10 @@ unsafe fn seed_process_startup_desktop_for_process(
         );
     }
     if read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-        write_volatile((desk_body + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
+        write_volatile(
+            (desk_body + DESKTOP_PHEAP_OFF) as *mut u64,
+            WIN32K_HEAP_HANDLE,
+        );
     }
     write_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *mut u64, hdesk);
     write_volatile(

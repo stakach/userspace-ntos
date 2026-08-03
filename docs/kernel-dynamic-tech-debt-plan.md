@@ -624,3 +624,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   next full-boot frontier is user32 client setup after attach: `user32!UserClientDllInitialize+0x740`
   dereferences `gHandleTable->handles` with `gSharedInfo.aheList == NULL`, so the next C3/F1 target is
   real `USERCONNECT.siClient`/USER handle-table publication for non-CSRSS GUI clients.
+- C3/F1 repair. `NtUserProcessConnect` `USERCONNECT` fix-up is now shared by the direct win32k
+  dispatch path and the real `KeUserModeCallback`/`NtCallbackReturn` completion path. The win32k
+  dispatch transport now carries original syscall arguments separately from the staged cross-address
+  arguments, so callback-completed observers copy the filled `USERCONNECT` back to the caller's real
+  user buffer while win32k still consumes the provider-owned shared frame. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed with the existing warning baseline, and
+  `.tmp/full-boot-userconnect-original-args-20260803.log` got winlogon past the old
+  `gHandleTable` null dereference into about 900 further real win32k/user32 initialization calls.
+  Review adjustment: the next frontier is noninteractive hosted clients (`services.exe` and
+  `lsass.exe`) reaching `NtUserProcessConnect`; they must either acquire real provider-owned GUI
+  process state through the same dynamic identity route or fail before entering win32k, with no
+  executive-owned fake success path.

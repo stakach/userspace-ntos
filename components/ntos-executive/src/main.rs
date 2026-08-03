@@ -3260,8 +3260,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
     let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
-    let class_atom_mirror_failures =
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
+    let class_atom_mirror_failures = GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
     let scrollbar_queries = USERINIT_SCROLLBAR_CLASSINFO_QUERIES.load(Ordering::Relaxed);
     let scrollbar_copyouts = USERINIT_SCROLLBAR_CLASSINFO_COPYOUTS.load(Ordering::Relaxed);
     let scrollbar_errors = USERINIT_SCROLLBAR_CLASSINFO_ERRORS.load(Ordering::Relaxed);
@@ -3437,8 +3436,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
     let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
-    let class_atom_mirror_failures =
-        GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
+    let class_atom_mirror_failures = GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
     let shell_com_provisioned = EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
     let shell_com_opened = EXPLORER_SHELL_COM_CLASS_OPEN_MASK.load(Ordering::Relaxed);
     let shell_com_inproc_default = EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);

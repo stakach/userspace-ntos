@@ -276,7 +276,9 @@ unsafe fn sync_win32k_context_to_process_manager(
     if pid != 0 && pid <= nt_process::ProcessId::MAX as u64 {
         let pid = pid as nt_process::ProcessId;
         if published.eprocess != 0 {
-            let _ = nt_handler.pm.set_process_kernel_object(pid, published.eprocess);
+            let _ = nt_handler
+                .pm
+                .set_process_kernel_object(pid, published.eprocess);
         }
         if published.w32process != 0 {
             let _ = nt_handler.pm.set_process_win32(pid, published.w32process);
@@ -285,7 +287,9 @@ unsafe fn sync_win32k_context_to_process_manager(
     if tid != 0 && tid <= nt_process::ThreadId::MAX as u64 {
         let tid = tid as nt_process::ThreadId;
         if published.ethread != 0 {
-            let _ = nt_handler.pm.set_thread_kernel_object(tid, published.ethread);
+            let _ = nt_handler
+                .pm
+                .set_thread_kernel_object(tid, published.ethread);
         }
         if published.w32thread != 0 {
             let _ = nt_handler.pm.set_thread_win32(tid, published.w32thread);
@@ -306,6 +310,33 @@ unsafe fn dispatch_win32k_for_client(
 ) -> (u64, bool) {
     let result =
         win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
+    sync_win32k_context_to_process_manager(nt_handler, client);
+    result
+}
+
+unsafe fn dispatch_win32k_for_client_with_completion_args(
+    nt_handler: &mut ExecNtHandler,
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    client: win32k_glue::Win32kClientContext,
+) -> (u64, bool) {
+    let result = win32k_glue::win32k_dispatch_wide_with_completion_args(
+        ssn,
+        a0,
+        a1,
+        a2,
+        a3,
+        caller_sp,
+        stack_args,
+        completion_args,
+        client,
+    );
     sync_win32k_context_to_process_manager(nt_handler, client);
     result
 }
@@ -860,6 +891,107 @@ fn hosted_gui_thread_teb_alias_for(
     }
     let teb_alias = hosted_env_scratch_base_for_pi(pi);
     (teb_alias != 0).then_some(teb_alias)
+}
+
+unsafe fn complete_ntuser_process_connect_copyout(
+    pi: usize,
+    pml4: u64,
+    client_buffer: u64,
+    buffer_len: u64,
+    filled_pages: &[u64],
+    faults: usize,
+    scratch_base: u64,
+) -> bool {
+    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+    let blen = buffer_len.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+    if client_buffer == 0 || blen == 0 {
+        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-out invalid target pi=");
+            print_u64(pi as u64);
+            print_str(b" buffer=0x");
+            print_hex_u64(client_buffer);
+            print_str(b" bytes=");
+            print_u64(blen);
+            print_str(b"\n");
+        }
+        return false;
+    }
+
+    // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the USERCONNECT's
+    // siClient with pointers into its OWN session-space USER heap (gpsi / gHandleTable / the
+    // handle-entry array). Map that USER heap into the GUI client and rewrite siClient to the
+    // client-relative view before user32 resumes.
+    let delta = map_win32k_heap_into_csrss(pml4, pi);
+    let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
+    let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
+    let handler_delta =
+        core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *const u64);
+    let psi_client = core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_PSI) as *const u64);
+    let ahe_client =
+        core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_AHELIST) as *const u64);
+    let psi_server = psi_client.wrapping_add(handler_delta);
+    let ahe_server = ahe_client.wrapping_add(handler_delta);
+    if psi_client == 0
+        || ahe_client == 0
+        || psi_server < heap_lo
+        || psi_server >= heap_hi
+        || ahe_server < heap_lo
+        || ahe_server >= heap_hi
+    {
+        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[win32k-svc] NtUserProcessConnect incomplete SHAREDINFO pi=");
+            print_u64(pi as u64);
+            print_str(b" psi=0x");
+            print_hex_u64(psi_client);
+            print_str(b" ahe=0x");
+            print_hex_u64(ahe_client);
+            print_str(b" handler-delta=0x");
+            print_hex_u64(handler_delta);
+            print_str(b"\n");
+        }
+        return false;
+    }
+
+    core::ptr::write_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_AHELIST) as *mut u64,
+        ahe_server,
+    );
+    core::ptr::write_volatile(
+        (arg + win32k_subsystem::UC_SI_PSI) as *mut u64,
+        psi_server.wrapping_sub(delta),
+    );
+    core::ptr::write_volatile(
+        (arg + win32k_subsystem::UC_SI_AHELIST) as *mut u64,
+        ahe_server.wrapping_sub(delta),
+    );
+    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *mut u64, delta);
+    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_PDISPINFO) as *mut u64, 0);
+
+    let output = core::slice::from_raw_parts(arg as *const u8, blen as usize);
+    if !img_spawn::client_write_mapped(
+        pi as u64,
+        client_buffer,
+        output,
+        filled_pages,
+        faults,
+        scratch_base,
+    ) {
+        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-out failed pi=");
+            print_u64(pi as u64);
+            print_str(b" buffer=0x");
+            print_hex_u64(client_buffer);
+            print_str(b" bytes=");
+            print_u64(blen);
+            print_str(b"\n");
+        }
+        return false;
+    }
+
+    true
 }
 
 unsafe fn observe_winlogon_completed_dispatch(
@@ -4882,8 +5014,30 @@ pub(crate) unsafe fn service_sec_image(
                     m3,
                     get_recv_mr(7),
                 ) {
-                    if pi == 2 {
-                        if let Some(dispatch) = completion.outer_dispatch {
+                    if let Some(dispatch) = completion.outer_dispatch {
+                        if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
+                            && dispatch.status == 0
+                        {
+                            if complete_ntuser_process_connect_copyout(
+                                pi,
+                                pml4,
+                                dispatch.args[1],
+                                dispatch.args[2],
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
+                            } else {
+                                park_and_log!(
+                                    pi,
+                                    b"userconnect-copyout",
+                                    dispatch.ssn,
+                                    dispatch.args[1]
+                                );
+                            }
+                        }
+                        if pi == 2 {
                             observe_winlogon_completed_dispatch(
                                 dispatch,
                                 filled_pages,
@@ -8238,7 +8392,7 @@ pub(crate) unsafe fn service_sec_image(
                         peb_mirror,
                         scratch_base,
                     );
-                    let mut r = dispatch_win32k_for_client(
+                    let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
                         m0,
                         d_a0,
@@ -8247,6 +8401,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a3,
                         dispatch_sp,
                         dispatch_stack_args,
+                        [a0, a1, a2, a3],
                         client,
                     );
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
@@ -8673,89 +8828,19 @@ pub(crate) unsafe fn service_sec_image(
                     observe_winlogon_natural_switch_desktop(st);
                 }
                 if has_buf && ok && st == 0 && !redirected_user_callback {
-                    // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client —
-                    // record the per-pi "win32k client connected" bit (csrss=1, winlogon=2, services=3).
-                    W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
-                }
-                if has_buf && ok && !redirected_user_callback {
-                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-                    // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the
-                    // USERCONNECT's siClient with pointers into its OWN session-space USER heap
-                    // (gpsi / gHandleTable / the handle-entry array — all `UserHeapAlloc`ed), which
-                    // is NOT mapped in csrss → user32's DllMain `Init` faults dereferencing
-                    // gSharedInfo.aheList->handles. RO-map that heap arena into csrss and rewrite the
-                    // siClient pointers (+ ulSharedDelta) to the csrss-relative client addresses so
-                    // the client reads valid memory. delta = server(win32k) − client(csrss).
-                    let delta = map_win32k_heap_into_csrss(pml4, pi);
-                    let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
-                    let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
-                    // The handler's own shift (0 in this single-AS host; be robust anyway): recover
-                    // the raw server VA before applying our delta.
-                    let hd = core::ptr::read_volatile(
-                        (arg + win32k_subsystem::UC_SI_DELTA) as *const u64,
-                    );
-                    // Publish the RAW server-VA aheList (USER handle table) so win32k's WM_CREATE callback
-                    // bridge can resolve a HWND → its PWND to persist WND.dwUserData (the Session), for the
-                    // client-side SASWindowProc. Capture it before the delta rewrite below.
-                    {
-                        let ahe_client = core::ptr::read_volatile(
-                            (arg + win32k_subsystem::UC_SI_AHELIST) as *const u64,
-                        );
-                        if ahe_client != 0 {
-                            let ahe_server = ahe_client.wrapping_add(hd);
-                            if ahe_server >= heap_lo && ahe_server < heap_hi {
-                                core::ptr::write_volatile(
-                                    (win32k_subsystem::WIN32K_SHARED_VADDR
-                                        + win32k_subsystem::SH_SAS_AHELIST)
-                                        as *mut u64,
-                                    ahe_server,
-                                );
-                            }
-                        }
-                    }
-                    for off in [win32k_subsystem::UC_SI_PSI, win32k_subsystem::UC_SI_AHELIST] {
-                        let client = core::ptr::read_volatile((arg + off) as *const u64);
-                        if client != 0 {
-                            let server = client.wrapping_add(hd);
-                            if server >= heap_lo && server < heap_hi {
-                                core::ptr::write_volatile(
-                                    (arg + off) as *mut u64,
-                                    server.wrapping_sub(delta),
-                                );
-                            }
-                        }
-                    }
-                    core::ptr::write_volatile(
-                        (arg + win32k_subsystem::UC_SI_DELTA) as *mut u64,
-                        delta,
-                    );
-                    core::ptr::write_volatile(
-                        (arg + win32k_subsystem::UC_SI_PDISPINFO) as *mut u64,
-                        0,
-                    );
-                    // Copy the fixed-up USERCONNECT back to the original caller, not a fixed bootstrap
-                    // mirror. Explorer and userinit use the same VA ranges as earlier clients in their
-                    // own VSpaces, so this must stay pi-keyed.
-                    let output = core::slice::from_raw_parts(arg as *const u8, blen as usize);
-                    if !img_spawn::client_write_mapped(
-                        pi as u64,
+                    if complete_ntuser_process_connect_copyout(
+                        pi,
+                        pml4,
                         a1,
-                        output,
+                        blen,
                         filled_pages,
                         faults as usize,
                         scratch_base,
                     ) {
-                        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        if failures < 8 {
-                            print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-out failed pi=");
-                            print_u64(pi as u64);
-                            print_str(b" buffer=0x");
-                            print_hex((a1 >> 32) as u32);
-                            print_hex(a1 as u32);
-                            print_str(b" bytes=");
-                            print_u64(blen);
-                            print_str(b"\n");
-                        }
+                        // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client
+                        // and its USERCONNECT was copied back to the caller.
+                        W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
+                    } else {
                         ok = false;
                         st = 0xC000_0001;
                     }

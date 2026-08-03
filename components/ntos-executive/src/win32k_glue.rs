@@ -3268,6 +3268,30 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     stack_args: &[u64],
     client: Win32kClientContext,
 ) -> (u64, bool) {
+    win32k_dispatch_wide_with_completion_args(
+        ssn,
+        a0,
+        a1,
+        a2,
+        a3,
+        caller_sp,
+        stack_args,
+        [a0, a1, a2, a3],
+        client,
+    )
+}
+
+pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    client: Win32kClientContext,
+) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);
@@ -3331,7 +3355,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         UserCallbackDispatchContext {
             dispatch_id,
             ssn,
-            args: [a0, a1, a2, a3],
+            args: completion_args,
             caller_sp,
         },
     );
