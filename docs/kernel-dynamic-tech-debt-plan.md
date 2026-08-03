@@ -829,3 +829,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   boot/session image manifest handoff, service-control driver/device/registry ownership, real
   CSR/SRM/LSA LPC processing, provider-owned service GUI/GDI state, and the full real WM_PAINT
   queue/framebuffer path.
+- A2 cleanup. Hosted bootstrap image metadata is now centralized in typed
+  `HostedBootstrapManifestEntry` records instead of duplicated per-image constructor functions.
+  The load loop derives `HostedBootstrapLoadSpec` values from that manifest, so path, role, NT image
+  path, command line, top badge, and runtime constructor data stay in one checked shape while the
+  old constructor scaffolding is removed. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/hosted_bootstrap.rs`,
+  `git diff --check`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-bootstrap-manifest-20260803-231203.log` reached
+  `276/276 executive->isolated-service checks passed`, including the userinit/explorer shell gates.
+  Review adjustment: A2 remains open until SMSS/session-manager process creation can supply this
+  topology dynamically and `hosted_process_runtime.rs` no longer bakes fixed runtime layouts in
+  named per-image constructors.
