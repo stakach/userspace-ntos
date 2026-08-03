@@ -774,13 +774,31 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   behavior in full boot; that should be implemented in the LPC/LSA workstream rather than hidden by
   Winlogon-key filtering.
 - A2/C3 cleanup. Message-buffer marshalling for `NtUserGetMessage`/`NtUserPeekMessage` now follows
-  registered hosted-process GUI metadata instead of a fixed explorer `pi` check. The diagnostics and
-  copy-in/copy-out path use the staged provider argument frame when the isolated win32k dispatch
-  writes back into the executive-owned buffer, so correlated winlogon and shell clients are observed
-  through the same role-backed transport. Validation:
+  registered hosted-process role metadata instead of a fixed explorer `pi` check. The staged
+  provider-owned MSG buffer path is limited to shell roles that require it; Winlogon keeps its real
+  caller-owned MSG buffer path so the SAS/modal pump can observe queue state written by the provider
+  directly. Validation:
   `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs`,
-  `git diff --check`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`, and `.tmp/full-boot-gui-msg-marshalling-20260803-214257.log` completed
-  without regressing the current SAS frontier. Review adjustment: this is a cleanup of a fixed
-  shell identity check, not a F2/F3 paint completion; the next target remains restoring the real SAS
-  WndProc/dialog route after the dynamic registry and callback cleanup exposed it again.
+  `git diff --check`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none` passed. Review adjustment: the broader
+  `.tmp/full-boot-gui-msg-marshalling-20260803-214257.log` attempt was red after the real Winlogon
+  key exposed `AutoAdminLogon`, so the validation proof moved to the follow-up autologon SAS route
+  below rather than treating that red run as frontier-preserving.
+- D3/F2/F3 repair. The real SOFTWARE Winlogon key enables ReactOS msgina's `AutoAdminLogon` branch:
+  after SAS#1, msgina calls the real `WlxSasNotify`, which posts the second `WLX_WM_SAS` to
+  Winlogon's SAS window instead of waiting for the executive's headless CAD injection after welcome
+  notice paint. The executive now observes `Session->LogonState` immediately after SAS#1, accepts
+  either the headless injected SAS or the real queue-retrieved SAS#2 as proof, latches
+  `WINLOGON_SAS2_RETRIEVED`, and removed the old blind "subsequent SAS-window GetMessage" park so
+  the real queue can deliver msgina's autologon post. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/service_sec_image.rs`, `git diff --check`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-autologon-sas-route-20260803-223108.log` reached
+  `RUN_RC=0` with 264/276 checks passed. The run passed `exec_winlogon_logged_out_sas`
+  (`2nd-SAS injected=0 retrieved=1`), `exec_msgina_logon_dialog_painted`, credential input,
+  LSA logon/SAM validation, `NtCreateToken`, `NtLoadKey`, profile copy/load, `WlxActivateUserShell`,
+  and `exec_userinit_process_spawned`. Review adjustment: the current red frontier is no longer the
+  Winlogon SAS/dialog path; it is `exec_desktop_shell_frontier`, the callback dead-client/nested
+  transport selftests, `exec_lsa_worker_route`, `exec_userinit_shell_image_attempted`, and the
+  downstream explorer gates.

@@ -45,8 +45,17 @@ fn hosted_process_uses_client_gdi(nt_handler: &ExecNtHandler, pi: usize) -> bool
     }
 }
 
-fn hosted_process_uses_user_message_marshalling(nt_handler: &ExecNtHandler, pi: usize) -> bool {
-    hosted_process_uses_client_gdi(nt_handler, pi)
+fn hosted_process_requires_staged_user_message_buffer(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+) -> bool {
+    matches!(
+        nt_handler.hosted_process_role(pi),
+        Some(
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                | nt_exe_image::HostedProcessRole::InteractiveShell
+        )
+    )
 }
 
 fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_va: u64) {
@@ -482,6 +491,47 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     } else {
         false
     }
+}
+
+fn winlogon_second_sas_route_proven() -> bool {
+    WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0
+        || WINLOGON_SAS2_RETRIEVED.load(Ordering::Relaxed) != 0
+}
+
+unsafe fn read_winlogon_session_logon_state() -> Option<(u64, u32)> {
+    let session = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+    );
+    if session == 0 {
+        return None;
+    }
+
+    const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
+    let mut bytes = [0u8; 4];
+    img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut bytes)
+        .then(|| (session, u32::from_le_bytes(bytes)))
+}
+
+unsafe fn observe_winlogon_sas_logon_state() {
+    if WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) == 0
+        || WINLOGON_SAS_LOGONSTATE.load(Ordering::Relaxed) != 0
+    {
+        return;
+    }
+    let Some((session, logon_state)) = read_winlogon_session_logon_state() else {
+        return;
+    };
+    if logon_state == 0 {
+        return;
+    }
+
+    WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
+    if logon_state == nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
+        let _ = winlogon_dialog_observe_logged_off(session, logon_state);
+    }
+    print_str(b"[wl-main] observed post-SAS Session->LogonState=0x");
+    print_hex(logon_state);
+    print_str(b"\n");
 }
 
 fn hosted_top_badge_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
@@ -1076,7 +1126,7 @@ unsafe fn observe_winlogon_completed_dispatch(
         return;
     }
     WINLOGON_DIALOG_WINDOWS.fetch_add(1, Ordering::Relaxed);
-    if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
+    if !winlogon_second_sas_route_proven()
         || WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
             <= WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed)
         || name == 0
@@ -6588,6 +6638,9 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     0
                 };
+                if pi == 2 {
+                    observe_winlogon_sas_logon_state();
+                }
                 if pi == 2
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
@@ -6650,21 +6703,10 @@ pub(crate) unsafe fn service_sec_image(
                     && sas_hwnd != 0
                     && m3 == sas_hwnd
                     && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+                    && WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed) == 0
                 {
-                    let n = WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
-                    if n == 0 {
-                        print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
-                    } else {
-                        wl_park_defer_quiesce =
-                            userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
-                        print_str(if wl_park_defer_quiesce {
-                            b"[wl-main] SAS queue empty at main-loop GetMessage -> parking while userinit advances to shell frontier\n"
-                        } else {
-                            b"[wl-main] SAS queue empty at main-loop GetMessage -> parking\n"
-                        });
-                        handled = false;
-                        wl_milestone_park = true;
-                    }
+                    WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
                 } else if m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && GET_MESSAGE_EMPTY_QUEUE_GUARD
                 {
@@ -6964,11 +7006,12 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                let msg_syscall = hosted_process_uses_user_message_marshalling(&nt_handler, pi)
-                    && a0 != 0
-                    && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
-                        || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
-                        || m0 == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN);
+                let msg_syscall =
+                    hosted_process_requires_staged_user_message_buffer(&nt_handler, pi)
+                        && a0 != 0
+                        && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                            || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+                            || m0 == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN);
                 let msg_returns_to_client = msg_syscall
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN);
@@ -8648,6 +8691,11 @@ pub(crate) unsafe fn service_sec_image(
                             && message as u32 == nt_user_callback::WLX_WM_SAS
                             && wparam == nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL
                         {
+                            let sas_hwnd = core::ptr::read_volatile(
+                                (win32k_subsystem::WIN32K_SHARED_VADDR
+                                    + win32k_subsystem::SH_SAS_HWND)
+                                    as *const u64,
+                            );
                             if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
                                 && WINLOGON_SAS1_RETRIEVED.swap(1, Ordering::Relaxed) == 0
                             {
@@ -8655,8 +8703,19 @@ pub(crate) unsafe fn service_sec_image(
                                     win32k_glue::real_wm_paint_callback_returns(),
                                     Ordering::Relaxed,
                                 );
-                            } else if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0 {
-                                WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
+                            } else if hwnd == sas_hwnd
+                                && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
+                            {
+                                if WINLOGON_SAS2_RETRIEVED.swap(1, Ordering::Relaxed) == 0 {
+                                    WINLOGON_KEY_OPENED_AT_INJECT.store(
+                                        WINLOGON_KEY_OPENED.load(Ordering::Relaxed),
+                                        Ordering::Relaxed,
+                                    );
+                                    WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
+                                    print_str(
+                                        b"[wl-main] winlogon retrieved second WLX_WM_SAS from real queue\n",
+                                    );
+                                }
                             }
                             let session = core::ptr::read_volatile(
                                 (win32k_subsystem::WIN32K_SHARED_VADDR
