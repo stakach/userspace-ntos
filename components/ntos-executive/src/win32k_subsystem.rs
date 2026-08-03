@@ -4614,12 +4614,13 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 // registered mirror keys/values, and the display miniport IOCTL intercept feeds the BOOTBOOT
 // framebuffer.
 
-// A DEVICE_OBJECT / FILE_OBJECT for the registered \Device\Video0 route. win32k passes the
+// DEVICE_OBJECT / FILE_OBJECT bodies for the registered \Device\Video0 route. win32k passes the
 // DeviceObject as the miniport handle to the display driver + EngDeviceIoControl, which this host
-// intercepts. The object bodies are stable zeroed sub-regions of DATA page 0 until the real video
-// miniport device object exists.
-const VIDEO_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
-const VIDEO_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
+// intercepts. The bodies are allocated when the display device is registered, not fixed cells.
+const VIDEO_DEVICE_OBJECT_BYTES: u64 = 0x150;
+const VIDEO_FILE_OBJECT_BYTES: u64 = 0x100;
+static mut WIN32K_VIDEO_DEVICE_OBJECT: u64 = 0;
+static mut WIN32K_VIDEO_FILE_OBJECT: u64 = 0;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
@@ -4815,7 +4816,7 @@ fn register_display_registry_mirror(spec: &DisplayRegistrySpec<'_>) -> bool {
     }
     unsafe {
         if WIN32K_DISPLAY_REGISTRY_READY {
-            return true;
+            return ensure_video_device_objects();
         }
     }
     let Some(video_map) = register_win32k_reg_key(b"HARDWARE\\DEVICEMAP\\VIDEO") else {
@@ -4849,11 +4850,35 @@ fn register_display_registry_mirror(spec: &DisplayRegistrySpec<'_>) -> bool {
         && register_win32k_reg_dword(display_service, b"VgaCompatible", spec.vga_compatible);
     if ok {
         unsafe {
+            if !ensure_video_device_objects() {
+                return false;
+            }
             WIN32K_DISPLAY_REGISTRY_READY = true;
             WIN32K_DISPLAY_DEVICE_READY = true;
         }
     }
     ok
+}
+
+unsafe fn ensure_video_device_objects() -> bool {
+    if WIN32K_VIDEO_DEVICE_OBJECT != 0 && WIN32K_VIDEO_FILE_OBJECT != 0 {
+        return true;
+    }
+    let device = pool_alloc(VIDEO_DEVICE_OBJECT_BYTES);
+    let file = pool_alloc(VIDEO_FILE_OBJECT_BYTES);
+    if device == 0 || file == 0 {
+        return false;
+    }
+    // Minimal x64 IO object headers. The current win32k route only needs stable object identities,
+    // but seeding Type/Size and FILE_OBJECT.DeviceObject keeps the objects structurally honest.
+    write_unaligned(device as *mut u16, 3); // IO_TYPE_DEVICE
+    write_unaligned((device + 2) as *mut u16, VIDEO_DEVICE_OBJECT_BYTES as u16);
+    write_unaligned(file as *mut u16, 5); // IO_TYPE_FILE
+    write_unaligned((file + 2) as *mut u16, VIDEO_FILE_OBJECT_BYTES as u16);
+    write_unaligned((file + 8) as *mut u64, device);
+    WIN32K_VIDEO_DEVICE_OBJECT = device;
+    WIN32K_VIDEO_FILE_OBJECT = file;
+    true
 }
 
 fn register_keyboard_layout_registry_mirror(layout_id: &[u8], layout_file: &[u8]) -> bool {
@@ -5081,11 +5106,16 @@ extern "win64" fn s_io_get_device_object_pointer(
         if !wstr_eq_ascii(buf, len, b"\\Device\\Video0") {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
+        let file_object = WIN32K_VIDEO_FILE_OBJECT;
+        let device_object = WIN32K_VIDEO_DEVICE_OBJECT;
+        if file_object == 0 || device_object == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
         if !fileobj_out.is_null() {
-            write_unaligned(fileobj_out, VIDEO_FILE_OBJECT);
+            write_unaligned(fileobj_out, file_object);
         }
         if !devobj_out.is_null() {
-            write_unaligned(devobj_out, VIDEO_DEVICE_OBJECT);
+            write_unaligned(devobj_out, device_object);
         }
     }
     0

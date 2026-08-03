@@ -979,3 +979,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none` passed. Review adjustment: E3 remains open because the LSA route still uses
   executive-mediated rendezvous state instead of a complete LPC port-message server path, but it no
   longer has fixed hosted-process identity defaults.
+- D3 cleanup. `\Device\Video0` no longer resolves to fixed data-page `DEVICE_OBJECT`/`FILE_OBJECT`
+  placeholders. When the registry-selected display driver route is registered, win32k now allocates
+  stable Video0 device/file object bodies from the win32k pool, seeds minimal x64 IO object headers,
+  links `FILE_OBJECT.DeviceObject`, and only lets `IoGetDeviceObjectPointer` succeed if those runtime
+  objects exist. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/win32k_subsystem.rs`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: D3 remains open for replacing the bounded win32k
+  registry mirror with direct Configuration Manager/device-interface service, but the Video0 object
+  body is no longer a compile-time placeholder cell.
