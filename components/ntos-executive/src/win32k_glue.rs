@@ -3319,18 +3319,21 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
         print_str(b"[win32k-svc] dxgthk.sys not found in ReactOS driver directory\n");
         return;
     };
-    if load_one_driver(
+    let Some((_dxgthk_entry, _dxgthk_expdir, dxgthk_len)) = load_one_driver(
         dxgthk_src,
         win32k_subsystem::DXGTHK_VA,
         win32k_subsystem::DXGTHK_LOAD_FRAMES,
         host_pml4,
         0,
-    )
-    .is_none()
-    {
+    ) else {
         print_str(b"[win32k-svc] dxgthk load failed\n");
         return;
-    }
+    };
+    let _ = register_system_module(
+        b"reactos\\system32\\drivers\\dxgthk.sys",
+        win32k_subsystem::DXGTHK_VA,
+        dxgthk_len,
+    );
     let Some((dxg_src, dxg_size)) = load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxg.sys")
     else {
         print_str(b"[win32k-svc] dxg.sys not found in ReactOS driver directory\n");
@@ -3344,6 +3347,11 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
         win32k_subsystem::DXGTHK_VA,
     ) {
         Some((entry, expdir, len)) => {
+            let _ = register_system_module(
+                b"reactos\\system32\\drivers\\dxg.sys",
+                win32k_subsystem::DXG_VA,
+                len,
+            );
             win32k_subsystem::record_dxg(entry, expdir, len);
             print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: file_sizes=");
             print_u64(dxg_size as u64);
@@ -3384,6 +3392,11 @@ pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
         0,
     ) {
         Some((entry, _expdir, len)) => {
+            let _ = register_system_module(
+                b"reactos\\system32\\ftfd.dll",
+                win32k_subsystem::FTFD_VA,
+                len,
+            );
             let patched = win32k_subsystem::patch_win32k_ftfd_imports(win32k_subsystem::FTFD_VA);
             print_str(b"[win32k-svc] hosted ftfd.dll: file_size=");
             print_u64(ftfd_size as u64);
@@ -3481,6 +3494,7 @@ pub(crate) unsafe fn load_display_driver(
         0,
     ) {
         Some((entry, expdir, len)) => {
+            let _ = register_system_module(&path[..path_len], win32k_subsystem::FRAMEBUF_VA, len);
             let recorded = win32k_subsystem::record_display_driver(spec, entry, expdir, len);
             print_str(b"[win32k-svc] hosted display driver ");
             print_str(spec.display_driver_leaf);
@@ -3531,6 +3545,11 @@ pub(crate) unsafe fn load_keyboard_layout_driver(
         0,
     ) {
         Some((entry, expdir, len)) => {
+            let _ = register_system_module(
+                &path[..path_len],
+                win32k_subsystem::KEYBOARD_LAYOUT_VA,
+                len,
+            );
             let recorded = win32k_subsystem::record_keyboard_layout_driver(
                 layout_id,
                 layout_file,

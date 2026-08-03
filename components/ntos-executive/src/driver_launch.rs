@@ -2036,7 +2036,7 @@ unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
 /// Parse a driver PE at `src_va` (raw file bytes), copy its sections into `dst_va` (frames pre-mapped
 /// RW in BOTH the executive and the component), apply DIR64 relocations for the load at `dst_va`, and
 /// patch the IAT resolving each import name through `resolve`. Records per-frame W^X rights into
-/// `rights_out`. Returns the DriverEntry RVA, or None. Fully HEAP-FREE.
+/// `rights_out`. Returns `(DriverEntryRva, SizeOfImage)`, or None. Fully HEAP-FREE.
 ///
 /// This is the generic PE-load mechanism (the win32k `load_driver_into` shape, but with an injected
 /// name resolver so it's driver-agnostic — the general dynamic path).
@@ -2047,7 +2047,7 @@ unsafe fn load_pe_into(
     max_frames: u64,
     rights_out: &mut [u64],
     resolve: fn(&str) -> u64,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va + e;
     if read_unaligned(nt as *const u32) != 0x0000_4550 {
@@ -2059,6 +2059,7 @@ unsafe fn load_pe_into(
     let opt = file_hdr + 20;
     let entry_rva = read_unaligned((opt + 16) as *const u32);
     let image_base = read_unaligned((opt + 24) as *const u64);
+    let size_of_image = read_unaligned((opt + 56) as *const u32);
     let size_of_headers = read_unaligned((opt + 60) as *const u32) as u64;
     let sec_table = opt + size_opt_hdr;
     let cap = max_frames * 0x1000;
@@ -2130,8 +2131,7 @@ unsafe fn load_pe_into(
     // %rax) into `xor %eax,%eax; nop` (`31 c0 90 90`, 4 bytes, result 0 = PASSIVE_LEVEL) and each
     // `mov %reg,%cr8` (`0f 22`, KeLowerIrql, 3 bytes) into `nop`s. Scan the whole loaded image.
     {
-        let size_of_image = read_unaligned((opt + 56) as *const u32) as u64;
-        let scan = size_of_image.min(cap);
+        let scan = (size_of_image as u64).min(cap);
         let mut p = 0u64;
         while p + 4 <= scan {
             let b0 = read_unaligned((dst_va + p) as *const u8);
@@ -2204,7 +2204,7 @@ unsafe fn load_pe_into(
         }
     }
 
-    Some(entry_rva)
+    Some((entry_rva, size_of_image))
 }
 
 /// The FSD image loaded/mapped rights (W^X), filled by [`load_pe_into`]. ONE array per instance
@@ -2331,7 +2331,9 @@ pub(crate) unsafe fn load_driver(
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
     let rights = &mut (*core::ptr::addr_of_mut!(FSD_RIGHTS))[instance];
-    let entry_rva = load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
+    let (entry_rva, image_len) =
+        load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
+    let _ = register_system_module(path, code_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
     print_str(b"\n");

@@ -5,11 +5,15 @@ use crate::{STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
+pub const SYSTEM_MODULE_INFORMATION_CLASS: u32 = 11;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS: u32 = 44;
 
 pub const SYSTEM_BASIC_INFORMATION_SIZE: usize = 0x40;
 pub const SYSTEM_PROCESSOR_INFORMATION_SIZE: usize = 0x0c;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 0x30;
+pub const RTL_PROCESS_MODULES_HEADER_SIZE: usize = 0x08;
+pub const RTL_PROCESS_MODULE_INFORMATION_SIZE: usize = 0x128;
+pub const RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE: usize = 256;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE: usize = 0xac;
 
 pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
@@ -206,6 +210,146 @@ impl SystemTimeOfDayInformation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemModuleEntry {
+    pub section: u32,
+    pub mapped_base: u64,
+    pub image_base: u64,
+    pub image_size: u32,
+    pub flags: u32,
+    pub load_order_index: u16,
+    pub init_order_index: u16,
+    pub load_count: u16,
+    pub offset_to_file_name: u16,
+    pub full_path_name_len: u16,
+    pub full_path_name: [u8; RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE],
+}
+
+impl SystemModuleEntry {
+    pub const EMPTY: Self = Self {
+        section: 0,
+        mapped_base: 0,
+        image_base: 0,
+        image_size: 0,
+        flags: 0,
+        load_order_index: 0,
+        init_order_index: 0,
+        load_count: 0,
+        offset_to_file_name: 0,
+        full_path_name_len: 0,
+        full_path_name: [0; RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE],
+    };
+
+    pub fn new(
+        full_path_name: &[u8],
+        mapped_base: u64,
+        image_base: u64,
+        image_size: u32,
+        flags: u32,
+        load_order_index: u16,
+        init_order_index: u16,
+        load_count: u16,
+    ) -> Option<Self> {
+        if full_path_name.is_empty()
+            || full_path_name.len() > RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE
+            || image_base == 0
+            || image_size == 0
+        {
+            return None;
+        }
+
+        let mut entry = Self {
+            section: 0,
+            mapped_base,
+            image_base,
+            image_size,
+            flags,
+            load_order_index,
+            init_order_index,
+            load_count,
+            offset_to_file_name: module_file_name_offset(full_path_name),
+            full_path_name_len: full_path_name.len() as u16,
+            full_path_name: [0; RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE],
+        };
+        entry.full_path_name[..full_path_name.len()].copy_from_slice(full_path_name);
+        Some(entry)
+    }
+
+    pub fn path(&self) -> &[u8] {
+        &self.full_path_name[..self.full_path_name_len as usize]
+    }
+}
+
+pub fn system_module_information_required_length(module_count: usize) -> Option<usize> {
+    module_count
+        .checked_mul(RTL_PROCESS_MODULE_INFORMATION_SIZE)
+        .and_then(|modules| RTL_PROCESS_MODULES_HEADER_SIZE.checked_add(modules))
+}
+
+pub fn encode_system_module_information(
+    output: &mut [u8],
+    modules: &[SystemModuleEntry],
+) -> Result<u32, QueryError> {
+    let required_length =
+        system_module_information_required_length(modules.len()).ok_or(QueryError {
+            status: STATUS_INFO_LENGTH_MISMATCH,
+            return_length: u32::MAX,
+        })?;
+    let return_length = required_length.min(u32::MAX as usize) as u32;
+
+    output.fill(0);
+    if output.len() >= RTL_PROCESS_MODULES_HEADER_SIZE {
+        put_u32(output, 0, modules.len() as u32);
+    }
+
+    for (index, module) in modules.iter().enumerate() {
+        let Some(entry_span) = index.checked_mul(RTL_PROCESS_MODULE_INFORMATION_SIZE) else {
+            break;
+        };
+        let Some(offset) = RTL_PROCESS_MODULES_HEADER_SIZE.checked_add(entry_span) else {
+            break;
+        };
+        if output.len() < offset + RTL_PROCESS_MODULE_INFORMATION_SIZE {
+            break;
+        }
+        encode_module_entry(output, offset, module);
+    }
+
+    if output.len() < required_length {
+        Err(QueryError {
+            status: STATUS_INFO_LENGTH_MISMATCH,
+            return_length,
+        })
+    } else {
+        Ok(return_length)
+    }
+}
+
+fn encode_module_entry(output: &mut [u8], offset: usize, module: &SystemModuleEntry) {
+    put_u32(output, offset, module.section);
+    put_u64(output, offset + 0x08, module.mapped_base);
+    put_u64(output, offset + 0x10, module.image_base);
+    put_u32(output, offset + 0x18, module.image_size);
+    put_u32(output, offset + 0x1c, module.flags);
+    put_u16(output, offset + 0x20, module.load_order_index);
+    put_u16(output, offset + 0x22, module.init_order_index);
+    put_u16(output, offset + 0x24, module.load_count);
+    put_u16(output, offset + 0x26, module.offset_to_file_name);
+    let path_len = (module.full_path_name_len as usize).min(RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE);
+    output[offset + 0x28..offset + 0x28 + path_len]
+        .copy_from_slice(&module.full_path_name[..path_len]);
+}
+
+fn module_file_name_offset(path: &[u8]) -> u16 {
+    let mut offset = 0usize;
+    for (index, &byte) in path.iter().enumerate() {
+        if byte == b'\\' || byte == b'/' {
+            offset = index + 1;
+        }
+    }
+    offset.min(u16::MAX as usize) as u16
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemInformationKind {
     Basic,
     Processor,
@@ -312,6 +456,7 @@ fn put_u64(output: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn basic_information_has_the_nt5_x64_layout() {
@@ -504,5 +649,121 @@ mod tests {
         assert_eq!(i64::from_le_bytes(output[16..24].try_into().unwrap()), -30);
         assert_eq!(u32::from_le_bytes(output[24..28].try_into().unwrap()), 2);
         assert_eq!(&output[28..], &[0; 20]);
+    }
+
+    #[test]
+    fn system_module_information_has_the_nt5_x64_layout() {
+        let modules = [
+            SystemModuleEntry::new(
+                b"\\SystemRoot\\system32\\drivers\\npfs.sys",
+                0x1000,
+                0x2000,
+                0x14000,
+                0x20,
+                0,
+                0,
+                1,
+            )
+            .unwrap(),
+            SystemModuleEntry::new(
+                b"\\SystemRoot\\system32\\win32k.sys",
+                0x3000,
+                0x3000,
+                0x220000,
+                0,
+                1,
+                0,
+                1,
+            )
+            .unwrap(),
+        ];
+        let required = system_module_information_required_length(modules.len()).unwrap();
+        assert_eq!(required, 0x08 + 2 * 0x128);
+
+        let mut output = vec![0xcc; required];
+        assert_eq!(
+            encode_system_module_information(&mut output, &modules),
+            Ok(required as u32)
+        );
+
+        assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 2);
+        assert_eq!(&output[4..8], &[0; 4]);
+        let first = RTL_PROCESS_MODULES_HEADER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(output[first..first + 4].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(output[first + 0x08..first + 0x10].try_into().unwrap()),
+            0x1000
+        );
+        assert_eq!(
+            u64::from_le_bytes(output[first + 0x10..first + 0x18].try_into().unwrap()),
+            0x2000
+        );
+        assert_eq!(
+            u32::from_le_bytes(output[first + 0x18..first + 0x1c].try_into().unwrap()),
+            0x14000
+        );
+        assert_eq!(
+            u32::from_le_bytes(output[first + 0x1c..first + 0x20].try_into().unwrap()),
+            0x20
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[first + 0x20..first + 0x22].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[first + 0x24..first + 0x26].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[first + 0x26..first + 0x28].try_into().unwrap()),
+            29
+        );
+        assert_eq!(
+            &output[first + 0x28..first + 0x28 + modules[0].path().len()],
+            modules[0].path()
+        );
+
+        let second = RTL_PROCESS_MODULES_HEADER_SIZE + RTL_PROCESS_MODULE_INFORMATION_SIZE;
+        assert_eq!(
+            u16::from_le_bytes(output[second + 0x20..second + 0x22].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            &output[second + 0x28..second + 0x28 + modules[1].path().len()],
+            modules[1].path()
+        );
+    }
+
+    #[test]
+    fn system_module_information_reports_required_length_and_prefix() {
+        let modules = [SystemModuleEntry::new(
+            b"\\SystemRoot\\system32\\win32k.sys",
+            0x3000,
+            0x3000,
+            0x220000,
+            0,
+            0,
+            0,
+            1,
+        )
+        .unwrap()];
+        let required = system_module_information_required_length(modules.len()).unwrap();
+
+        let mut header = vec![0xcc; RTL_PROCESS_MODULES_HEADER_SIZE];
+        let error = encode_system_module_information(&mut header, &modules).unwrap_err();
+        assert_eq!(error.status, STATUS_INFO_LENGTH_MISMATCH);
+        assert_eq!(error.return_length, required as u32);
+        assert_eq!(u32::from_le_bytes(header[0..4].try_into().unwrap()), 1);
+        assert_eq!(&header[4..], &[0; 4]);
+
+        let mut too_small_for_header = vec![0xcc; 4];
+        let error =
+            encode_system_module_information(&mut too_small_for_header, &modules).unwrap_err();
+        assert_eq!(error.status, STATUS_INFO_LENGTH_MISMATCH);
+        assert_eq!(error.return_length, required as u32);
+        assert_eq!(too_small_for_header, [0; 4]);
     }
 }

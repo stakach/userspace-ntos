@@ -57,7 +57,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[~]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
   driven driver objects.
-- `[~]` D2: Replace driver-name matches in system information calls with registered module/device
+- `[x]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
 - `[~]` D3: Replace remaining win32k video/keyboard registry mirrors and temporary video object
   scaffolding with real hive data, Configuration Manager state, and driver-created device
@@ -1383,3 +1383,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `PASS exec_lsass_lsa_init_running`, `PASS exec_lsa_auth_port_connected`, and
   `PASS exec_win32k_desktop_painted`. The remaining red frontier matches
   `.tmp/full-boot-srm-rdv-20260804-082749.log`, so this cleanup preserved the current boot state.
+- D2 complete. `NtQuerySystemInformation(SystemModuleInformation)` now reports the live
+  kernel-module registry instead of rejecting class 11 or answering from name-specific branches.
+  The registry is populated only by actual PE load paths: generic `load_driver` instances,
+  `win32k.sys`, and the win32k-hosted GDI/font/display/keyboard images after they are mapped.
+  The NT5 x64 `RTL_PROCESS_MODULES` layout and short-buffer policy live in `nt-syscall` with
+  host tests; the executive syscall body only snapshots registered module state and copies the
+  encoded result to the caller. Validation: `cargo test --manifest-path
+  crates/nt-syscall/Cargo.toml system_information`, `cargo fmt --manifest-path
+  crates/nt-syscall/Cargo.toml`, `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D2 is closed; the
+  remaining open plan work is A2, D1, and D3.

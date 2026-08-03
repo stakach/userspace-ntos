@@ -10600,7 +10600,10 @@ impl ExecNtHandler {
             // layer supplies the live machine/time facts and performs user-buffer probing/copyout.
             NativeService::NtQuerySystemInformation => unsafe {
                 use nt_syscall::system_information::{
-                    query_plan, SystemInformationKind, SystemTimeOfDayInformation,
+                    encode_system_module_information, query_plan,
+                    system_module_information_required_length, SystemInformationKind,
+                    SystemModuleEntry, SystemTimeOfDayInformation,
+                    RTL_PROCESS_MODULES_HEADER_SIZE, SYSTEM_MODULE_INFORMATION_CLASS,
                     SYSTEM_BASIC_INFORMATION_CLASS,
                     SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
                     SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
@@ -10620,6 +10623,7 @@ impl ExecNtHandler {
                     SYSTEM_BASIC_INFORMATION_CLASS
                         | SYSTEM_PROCESSOR_INFORMATION_CLASS
                         | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS
+                        | SYSTEM_MODULE_INFORMATION_CLASS
                         | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS
                 ) {
                     return STATUS_INVALID_INFO_CLASS;
@@ -10640,6 +10644,34 @@ impl ExecNtHandler {
                     if !self.xas_write_u32(retlen_ptr, 0) {
                         return STATUS_ACCESS_VIOLATION;
                     }
+                }
+
+                if class == SYSTEM_MODULE_INFORMATION_CLASS {
+                    let mut snapshot = [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
+                    let module_count = snapshot_system_modules(&mut snapshot);
+                    let required_length =
+                        system_module_information_required_length(module_count).unwrap_or(usize::MAX);
+                    let return_length = required_length.min(u32::MAX as usize) as u32;
+                    if retlen_ptr != 0 {
+                        self.xas_write_u32(retlen_ptr, return_length);
+                    }
+
+                    if len < RTL_PROCESS_MODULES_HEADER_SIZE {
+                        return nt_syscall::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+
+                    let copy_length = len.min(required_length);
+                    let mut output = alloc::vec![0u8; copy_length];
+                    let status =
+                        match encode_system_module_information(&mut output, &snapshot[..module_count])
+                        {
+                            Ok(_) => 0,
+                            Err(error) => error.status,
+                        };
+                    if !self.xas_try_write_buf(buf, &output) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return status;
                 }
 
                 let plan = match query_plan(class, len) {

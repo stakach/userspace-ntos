@@ -32,6 +32,7 @@ mod ntoskrnl_shared;
 mod server;
 mod service_sec_image;
 mod storage_host;
+mod system_modules;
 mod video_device;
 mod win32k_pe;
 mod win32k_session_runtime;
@@ -55,6 +56,7 @@ mod writable_fs;
 pub(crate) use rendezvous::*;
 mod spawn_hosts;
 pub(crate) use spawn_hosts::*;
+pub(crate) use system_modules::*;
 mod device_io;
 pub(crate) use device_io::*;
 mod pnp;
@@ -16254,7 +16256,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
             // frame rights into its own `static`.
-            let entry_rva = win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size).unwrap_or(0);
+            let entry_rva = match win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size) {
+                Some(entry_rva) => {
+                    let _ = register_system_module(
+                        b"reactos\\system32\\win32k.sys",
+                        win32k_subsystem::WIN32K_CODE_VA,
+                        win32k_pe::WIN32K_PE.size_of_image,
+                    );
+                    entry_rva
+                }
+                None => 0,
+            };
             print_str(b"[win32k-svc] loaded win32k.sys; DriverEntry rva=0x");
             print_hex(entry_rva);
             print_str(b"\n");
