@@ -16540,9 +16540,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
                 register_win32k_gdi_loader(host_pml4);
-                // Host ftfd.dll (FreeType font driver) + patch win32k's IAT for its 34 FT_* imports so
-                // InitFontSupport → FT_Init_FreeType initialises the font subsystem for real.
-                load_ftfd_driver(host_pml4);
+                // Host win32k's non-native static import DLLs and patch their IAT descriptors before
+                // any routed NtUser/NtGdi dispatch can call them.
+                load_win32k_static_import_drivers(host_pml4);
                 // Publish the display route selected from the real SYSTEM hive before win32k probes
                 // HARDWARE\DEVICEMAP\VIDEO. The display DLL image itself is demand-loaded only when
                 // win32k requests it through SystemLoadGdiDriverInformation.
@@ -18855,6 +18855,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" Blocked=");
         print_u64(c.blocked as u64);
         print_str(b"\n");
+        let (static_deps, static_loaded, static_patches, static_failures) =
+            win32k_glue::win32k_static_import_loader_proofs();
+        print_str(b"[win32k] static imports: deps=");
+        print_u64(static_deps);
+        print_str(b" loaded=");
+        print_u64(static_loaded);
+        print_str(b" iat-patches=");
+        print_u64(static_patches);
+        print_str(b" failures=");
+        print_u64(static_failures);
+        print_str(b"\n");
         let ssdt_ok = win32k_pe::ssdt_seam_selftest();
         print_str(if ssdt_ok {
             b"[win32k] KeAddSystemServiceTable -> SSDT resolve(0x1000..) seam: OK\n"
@@ -18866,6 +18877,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // asserted by nt-compat-exports' host test; CLASSIFICATION is that verified breakdown.)
         let contract_ok = c.blocked == 0
             && (c.implemented + c.partial + c.stub + c.trap) == (c.ntoskrnl + c.hal)
+            && static_deps != 0
+            && static_loaded == static_deps
+            && static_patches >= c.ftfd as u64
+            && static_failures == 0
             && ssdt_ok;
         check(b"exec_win32k_load_contract", contract_ok, &mut passed);
     }

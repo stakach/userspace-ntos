@@ -1,6 +1,6 @@
 //! `win32k_glue` — the executive-side win32k client plumbing: RO-map win32k's
-//! USER heap into csrss, per-client cross-AS page attach (w32_*), the DirectX/
-//! ftfd/display driver loaders, and the win32k syscall dispatch + backtrace.
+//! USER heap into csrss, per-client cross-AS page attach (w32_*), the GDI/display
+//! driver loaders, and the win32k syscall dispatch + backtrace.
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
@@ -69,6 +69,10 @@ static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_LOADER_PML4: AtomicU64 = AtomicU64::new(0);
 static DXGTHK_DRIVER_LOADED: AtomicU64 = AtomicU64::new(0);
+static WIN32K_STATIC_IMPORT_DEPENDENCIES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_STATIC_IMPORTS_LOADED: AtomicU64 = AtomicU64::new(0);
+static WIN32K_STATIC_IMPORT_IAT_PATCHES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_STATIC_IMPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub(crate) struct CompletedWin32kDispatch {
@@ -3264,6 +3268,9 @@ pub(crate) unsafe fn load_one_driver(
     host_pml4: u64,
     dxgthk_base: u64,
 ) -> Option<(u32, u32, u32)> {
+    if frames == 0 || frames as usize > 256 {
+        return None;
+    }
     // Executive-side PT + frames (RW), to load into.
     let ept = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ept);
@@ -3479,46 +3486,111 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
     }
 }
 
-/// Host ftfd.dll (the FreeType font driver) into win32k's VSpace + patch win32k's OWN IAT for its 34
-/// FT_* imports against ftfd's export table. Unlike dxg (dynamic, via ZwSetSystemInformation), ftfd
-/// is a STATIC win32k import: win32k's InitFontSupport → FT_Init_FreeType calls it directly. ftfd
-/// imports only 8 Eng*/Rtl thunks back from win32k.sys (resolved by load_driver_into's is_win32k arm).
-/// Called once at win32k bring-up, AFTER win32k is loaded (its exports must be present for ftfd's IAT)
-/// and BEFORE any FT_* call (which happens far later, during a routed NtUserInitialize dispatch).
-pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
+const WIN32K_STATIC_IMPORT_SLOTS: &[(u64, u64)] = &[(
+    win32k_subsystem::WIN32K_STATIC_IMPORT0_VA,
+    win32k_subsystem::WIN32K_STATIC_IMPORT0_LOAD_FRAMES,
+)];
+
+pub(crate) fn win32k_static_import_loader_proofs() -> (u64, u64, u64, u64) {
+    (
+        WIN32K_STATIC_IMPORT_DEPENDENCIES.load(Ordering::Relaxed),
+        WIN32K_STATIC_IMPORTS_LOADED.load(Ordering::Relaxed),
+        WIN32K_STATIC_IMPORT_IAT_PATCHES.load(Ordering::Relaxed),
+        WIN32K_STATIC_IMPORT_FAILURES.load(Ordering::Relaxed),
+    )
+}
+
+/// Host win32k's non-native static import DLLs into win32k's VSpace and patch win32k's IAT against
+/// their real export tables. The dependency names come from win32k's own PE import descriptors;
+/// native imports stay bound to the ntoskrnl/hal trampoline registry.
+pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
+    WIN32K_STATIC_IMPORT_DEPENDENCIES.store(0, Ordering::Relaxed);
+    WIN32K_STATIC_IMPORTS_LOADED.store(0, Ordering::Relaxed);
+    WIN32K_STATIC_IMPORT_IAT_PATCHES.store(0, Ordering::Relaxed);
+    WIN32K_STATIC_IMPORT_FAILURES.store(0, Ordering::Relaxed);
+
     let Some(fs) = exec_fs() else {
-        print_str(b"[win32k-svc] ftfd.dll unavailable - executive FS not mounted\n");
+        print_str(b"[win32k-svc] static win32k imports unavailable - executive FS not mounted\n");
+        WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let Some((ftfd_src, ftfd_size)) = load_file_to_pool(&fs, b"reactos\\system32\\ftfd.dll") else {
-        print_str(b"[win32k-svc] ftfd.dll not found in ReactOS System32\n");
-        return;
-    };
-    match load_one_driver(
-        ftfd_src,
-        win32k_subsystem::FTFD_VA,
-        win32k_subsystem::FTFD_LOAD_FRAMES,
-        host_pml4,
-        0,
-    ) {
-        Some((entry, _expdir, len)) => {
-            let _ = register_system_module(
-                b"reactos\\system32\\ftfd.dll",
-                win32k_subsystem::FTFD_VA,
-                len,
-            );
-            let patched = win32k_subsystem::patch_win32k_ftfd_imports(win32k_subsystem::FTFD_VA);
-            print_str(b"[win32k-svc] hosted ftfd.dll: file_size=");
-            print_u64(ftfd_size as u64);
-            print_str(b" entry_rva=0x");
-            print_hex(entry);
-            print_str(b" len=0x");
-            print_hex(len);
-            print_str(b" win32k FT_* IAT patched=");
-            print_u64(patched as u64);
+
+    let mut dep_index = 0usize;
+    let mut slot_index = 0usize;
+    loop {
+        let mut dll_leaf = [0u8; 32];
+        let Some(dll_len) =
+            win32k_subsystem::win32k_static_import_dependency(dep_index, &mut dll_leaf)
+        else {
+            break;
+        };
+        let dll = &dll_leaf[..dll_len];
+        WIN32K_STATIC_IMPORT_DEPENDENCIES.fetch_add(1, Ordering::Relaxed);
+        if slot_index >= WIN32K_STATIC_IMPORT_SLOTS.len() {
+            print_str(b"[win32k-svc] no static-import slot for win32k dependency ");
+            print_str(dll);
             print_str(b"\n");
+            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            dep_index += 1;
+            continue;
         }
-        None => print_str(b"[win32k-svc] ftfd load failed\n"),
+
+        let (image_va, image_frames) = WIN32K_STATIC_IMPORT_SLOTS[slot_index];
+        let mut path = [0u8; 64];
+        let Some(path_len) = system32_driver_path(dll, &mut path) else {
+            print_str(b"[win32k-svc] static win32k import leaf rejected: ");
+            print_str(dll);
+            print_str(b"\n");
+            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            dep_index += 1;
+            slot_index += 1;
+            continue;
+        };
+        print_str(b"[win32k-svc] loading static win32k import ");
+        print_str(dll);
+        print_str(b" from ");
+        print_str(&path[..path_len]);
+        print_str(b"\n");
+        let Some((src, file_size)) = load_file_to_pool(&fs, &path[..path_len]) else {
+            print_str(b"[win32k-svc] static win32k import not found: ");
+            print_str(&path[..path_len]);
+            print_str(b"\n");
+            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            dep_index += 1;
+            slot_index += 1;
+            continue;
+        };
+        match load_one_driver(src, image_va, image_frames, host_pml4, 0) {
+            Some((entry, _expdir, len)) => {
+                let _ = register_system_module(&path[..path_len], image_va, len);
+                let patched = win32k_subsystem::patch_win32k_static_import(dll, image_va);
+                print_str(b"[win32k-svc] hosted static win32k import ");
+                print_str(dll);
+                print_str(b": file_size=");
+                print_u64(file_size as u64);
+                print_str(b" entry_rva=0x");
+                print_hex(entry);
+                print_str(b" len=0x");
+                print_hex(len);
+                print_str(b" iat-patched=");
+                print_u64(patched as u64);
+                print_str(b"\n");
+                if patched == 0 {
+                    WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    WIN32K_STATIC_IMPORTS_LOADED.fetch_add(1, Ordering::Relaxed);
+                    WIN32K_STATIC_IMPORT_IAT_PATCHES.fetch_add(patched as u64, Ordering::Relaxed);
+                }
+            }
+            None => {
+                print_str(b"[win32k-svc] static win32k import load failed: ");
+                print_str(dll);
+                print_str(b"\n");
+                WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        dep_index += 1;
+        slot_index += 1;
     }
 }
 

@@ -50,6 +50,7 @@ use crate::*;
 pub const WIN32K_CODE_VA: u64 = 0x0000_0100_0680_0000;
 /// win32k image frame count (size_of_image 0x220000 / 0x1000).
 pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
+const WIN32K_IMAGE_BYTES: u64 = WIN32K_IMAGE_FRAMES * 0x1000;
 /// Pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter at +0, data at +0x1000).
 /// PRE-MAPPED pure bump (the committed-baseline mechanism), relocated to its own window + grown from
 /// 1 MiB → 8 MiB: win32k's GUI init (DirectX + fonts + PDEV/surface/brush) needs more than 1 MiB, and
@@ -5956,6 +5957,24 @@ unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
     }
 }
 
+fn image_rva_span_ok(rva: u64, len: u64, image_bytes: u64) -> bool {
+    len != 0 && rva < image_bytes && len <= image_bytes - rva
+}
+
+unsafe fn image_c_string_len(base: u64, rva: u64, image_bytes: u64, limit: usize) -> Option<usize> {
+    if rva >= image_bytes {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < limit && (n as u64) < image_bytes - rva {
+        if read_volatile((base + rva + n as u64) as *const u8) == 0 {
+            return Some(n);
+        }
+        n += 1;
+    }
+    None
+}
+
 /// Runs in the EXECUTIVE. `src_va`/`src_size` name the raw win32k.sys staged in WIN32KBUF; the
 /// image frames are mapped RW at [`WIN32K_CODE_VA`] and the DATA region at [`WIN32K_DATA_VADDR`].
 /// Copy the sections into their virtual offsets, apply DIR64 relocs, initialise the data-export
@@ -7815,13 +7834,14 @@ unsafe fn establish_client_and_dispatch() {
     print_str(b"\n");
 }
 
-// --- DirectX driver hosting (dxg.sys + dxgthk.sys) -------------------------------------------
+// --- win32k-adjacent driver hosting -----------------------------------------------------------
 //
 // win32k's InitializeGreCSRSS -> DxDdStartupDxGraphics loads dxg.sys via EngLoadImage ->
 // LDEVOBJ_bLoadImage -> ZwSetSystemInformation(SystemLoadGdiDriverInformation). The executive
-// (privileged) reads dxg.sys + its dxgthk.sys dependency by path into pool memory at bring-up,
-// maps them into win32k's VSpace, then the ZwSetSystemInformation trampoline reports the registered
-// image to win32k. This is the reusable driver-loader used by display DLL hosting.
+// (privileged) reads requested GDI/display/keyboard images by path into pool memory, maps them into
+// win32k's VSpace, then the ZwSetSystemInformation trampoline reports the registered image to
+// win32k. The same loader also resolves static win32k import DLLs discovered from win32k's own PE
+// import table.
 
 /// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
 pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;
@@ -7829,10 +7849,11 @@ pub const DXGTHK_LOAD_FRAMES: u64 = 8;
 /// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
 pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
 pub const DXG_LOAD_FRAMES: u64 = 16;
-/// ftfd.dll (FreeType font driver) loaded-image base in win32k's VSpace. size_of_image=0xf8000 ->
-/// 248 frames (one 2 MiB PT, 2 MiB-aligned at 0x0870). win32k statically imports 34 FT_* from it.
-pub const FTFD_VA: u64 = 0x0000_0100_0870_0000;
-pub const FTFD_LOAD_FRAMES: u64 = 248;
+/// Static win32k import dependency slot. ReactOS 0.4.17 currently imports one System32 DLL here
+/// (`ftfd.dll`, size_of_image=0xf8000 -> 248 frames), but the dependency name is discovered from
+/// win32k's import descriptor instead of selected by an executive-side branch.
+pub const WIN32K_STATIC_IMPORT0_VA: u64 = 0x0000_0100_0870_0000;
+pub const WIN32K_STATIC_IMPORT0_LOAD_FRAMES: u64 = 248;
 /// Display driver loaded-image base in win32k's VSpace. ReactOS' current registry selects the
 /// linear-framebuffer driver, whose size_of_image is 0x8000, so this reserves one 8-frame PT window.
 /// win32k loads the selected display DLL dynamically via ZwSetSystemInformation.
@@ -8006,6 +8027,9 @@ pub unsafe fn load_driver_into(
     let export_dir_rva = read_unaligned((opt + 112) as *const u32);
     let sec_table = opt + size_opt_hdr;
     let cap = max_frames * 0x1000;
+    if cap == 0 || size_of_image == 0 || size_of_image as u64 > cap || size_of_headers > cap {
+        return None;
+    }
 
     copy_bytes(dst_va, src_va, size_of_headers.min(cap));
     for s in 0..num_sections {
@@ -8025,7 +8049,7 @@ pub unsafe fn load_driver_into(
         } else {
             RW_NX
         };
-        let span = va + vsize.max(raw_size);
+        let span = va.saturating_add(vsize.max(raw_size)).min(cap);
         let mut p = va & !0xFFF;
         while p < span {
             let idx = (p / 0x1000) as usize;
@@ -8041,19 +8065,23 @@ pub unsafe fn load_driver_into(
     if delta != 0 {
         let reloc_rva = read_unaligned((opt + 112 + 5 * 8) as *const u32) as u64;
         let reloc_size = read_unaligned((opt + 112 + 5 * 8 + 4) as *const u32) as u64;
+        if reloc_rva != 0 && !image_rva_span_ok(reloc_rva, reloc_size, cap) {
+            return None;
+        }
         let mut off = 0u64;
         while reloc_rva != 0 && off + 8 <= reloc_size {
-            let page_rva = read_unaligned((dst_va + reloc_rva + off) as *const u32) as u64;
-            let block = read_unaligned((dst_va + reloc_rva + off + 4) as *const u32) as u64;
-            if block < 8 {
-                break;
+            let block_rva = reloc_rva + off;
+            let page_rva = read_unaligned((dst_va + block_rva) as *const u32) as u64;
+            let block = read_unaligned((dst_va + block_rva + 4) as *const u32) as u64;
+            if block < 8 || block > reloc_size - off {
+                return None;
             }
             let cnt = (block - 8) / 2;
             for i in 0..cnt {
-                let ent = read_unaligned((dst_va + reloc_rva + off + 8 + i * 2) as *const u16);
+                let ent = read_unaligned((dst_va + block_rva + 8 + i * 2) as *const u16);
                 if (ent >> 12) == 10 {
                     let t = page_rva + (ent & 0xFFF) as u64;
-                    if t < cap {
+                    if image_rva_span_ok(t, 8, cap) {
                         let v = read_unaligned((dst_va + t) as *const u64);
                         write_unaligned((dst_va + t) as *mut u64, v.wrapping_add(delta));
                     }
@@ -8066,8 +8094,14 @@ pub unsafe fn load_driver_into(
     // Patch the IAT: resolve per import descriptor by DLL name.
     let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
     if imp_rva != 0 {
-        let mut desc = dst_va + imp_rva;
-        loop {
+        let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
+        if !image_rva_span_ok(imp_rva, imp_size, cap) {
+            return None;
+        }
+        let imp_end = imp_rva + imp_size;
+        let mut desc_rva = imp_rva;
+        while desc_rva + 20 <= imp_end {
+            let desc = dst_va + desc_rva;
             let ilt = read_unaligned(desc as *const u32) as u64;
             let iat = read_unaligned((desc + 16) as *const u32) as u64;
             let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
@@ -8078,11 +8112,9 @@ pub unsafe fn load_driver_into(
             let mut dllbuf = [0u8; 32];
             let mut dn = 0usize;
             if dll_name_rva != 0 {
-                while dn < 31 {
+                let cstr_len = image_c_string_len(dst_va, dll_name_rva, cap, 31)?;
+                while dn < cstr_len {
                     let c = read_volatile((dst_va + dll_name_rva + dn as u64) as *const u8);
-                    if c == 0 {
-                        break;
-                    }
                     dllbuf[dn] = c.to_ascii_lowercase();
                     dn += 1;
                 }
@@ -8091,23 +8123,32 @@ pub unsafe fn load_driver_into(
             // ftfd.dll imports its 8 Eng*/Rtl thunks from win32k.sys — resolve against win32k's
             // own export table (real Eng* code + forwarders to ntoskrnl handled by pe_export_lookup).
             let is_win32k = dn >= 6 && &dllbuf[..6] == b"win32k";
-            let names = dst_va + if ilt != 0 { ilt } else { iat };
+            let thunk_rva = if ilt != 0 { ilt } else { iat };
+            if !image_rva_span_ok(thunk_rva, 8, cap) || !image_rva_span_ok(iat, 8, cap) {
+                return None;
+            }
+            let names = dst_va + thunk_rva;
             let slots = dst_va + iat;
             let mut k = 0u64;
-            loop {
+            let thunk_cap = ((cap - thunk_rva) / 8).min((cap - iat) / 8);
+            let mut terminated = false;
+            while k < thunk_cap {
                 let thunk = read_unaligned((names + k * 8) as *const u64);
                 if thunk == 0 {
+                    terminated = true;
                     break;
                 }
                 if thunk & 0x8000_0000_0000_0000 == 0 {
-                    let name_ptr = dst_va + (thunk & 0x7FFF_FFFF) + 2;
+                    let name_rva = thunk & 0x7FFF_FFFF;
+                    if !image_rva_span_ok(name_rva, 2, cap) {
+                        return None;
+                    }
+                    let name_ptr = dst_va + name_rva + 2;
                     let mut buf = [0u8; 64];
                     let mut n = 0usize;
-                    while n < 63 {
+                    let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
+                    while n < cstr_len {
                         let c = read_volatile((name_ptr + n as u64) as *const u8);
-                        if c == 0 {
-                            break;
-                        }
                         buf[n] = c;
                         n += 1;
                     }
@@ -8127,7 +8168,10 @@ pub unsafe fn load_driver_into(
                 }
                 k += 1;
             }
-            desc += 20;
+            if !terminated {
+                return None;
+            }
+            desc_rva += 20;
         }
     }
 
@@ -8151,13 +8195,101 @@ pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     );
 }
 
-/// Re-patch win32k's OWN IAT for the `ftfd.dll` import descriptor (34 FT_* entries) against the
-/// now-loaded ftfd image's export table at `ftfd_base`. Runs in the EXECUTIVE (win32k's frames are
-/// still mapped RW at [`WIN32K_CODE_VA`] from `load_into`). load_into initially resolved these to
-/// benign zero stubs (ftfd wasn't loaded yet); this points them at the real FreeType functions so
-/// win32k's InitFontSupport → FT_Init_FreeType actually initialises the font subsystem. Returns the
-/// number of FT_* slots patched (0 if no ftfd descriptor / not found). HEAP-FREE.
-pub unsafe fn patch_win32k_ftfd_imports(ftfd_base: u64) -> u32 {
+fn import_dll_name_is_native(dll: &[u8]) -> bool {
+    (dll.len() >= 9 && &dll[..9] == b"ntoskrnl.") || (dll.len() >= 4 && &dll[..4] == b"hal.")
+}
+
+fn import_dll_name_is_safe(dll: &[u8]) -> bool {
+    !dll.is_empty()
+        && dll.len() <= 31
+        && dll.iter().copied().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+        && !dll.windows(2).any(|w| w == b"..")
+}
+
+fn import_dll_name_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn read_import_dll_name(desc: u64, out: &mut [u8]) -> Option<usize> {
+    let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
+    if dll_name_rva == 0 || out.is_empty() {
+        return None;
+    }
+    let cstr_len = image_c_string_len(WIN32K_CODE_VA, dll_name_rva, WIN32K_IMAGE_BYTES, out.len())?;
+    let mut n = 0usize;
+    while n < cstr_len {
+        let c = read_volatile((WIN32K_CODE_VA + dll_name_rva + n as u64) as *const u8);
+        out[n] = c.to_ascii_lowercase();
+        n += 1;
+    }
+    if !import_dll_name_is_safe(&out[..n]) {
+        return None;
+    }
+    Some(n)
+}
+
+/// Return the Nth non-native static dependency imported by win32k. Native imports (`ntoskrnl.*` and
+/// `hal.*`) are bound by the normal trampoline registry during `load_into`; every other DLL must be
+/// backed by a real System32 image before win32k can call it.
+pub unsafe fn win32k_static_import_dependency(index: usize, out: &mut [u8]) -> Option<usize> {
+    let code_va = WIN32K_CODE_VA;
+    let e = read_unaligned((code_va + 0x3c) as *const u32) as u64;
+    let opt = code_va + e + 4 + 20;
+    let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
+    if imp_rva == 0 {
+        return None;
+    }
+    let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
+    if !image_rva_span_ok(imp_rva, imp_size, WIN32K_IMAGE_BYTES) {
+        return None;
+    }
+    let imp_end = imp_rva + imp_size;
+    let mut seen = 0usize;
+    let mut desc_rva = imp_rva;
+    while desc_rva + 20 <= imp_end {
+        let desc = code_va + desc_rva;
+        let ilt = read_unaligned(desc as *const u32) as u64;
+        let iat = read_unaligned((desc + 16) as *const u32) as u64;
+        if ilt == 0 && iat == 0 {
+            break;
+        }
+        let mut dllbuf = [0u8; 32];
+        if let Some(dn) = read_import_dll_name(desc, &mut dllbuf) {
+            let dll = &dllbuf[..dn];
+            if !import_dll_name_is_native(dll) {
+                if seen == index {
+                    if dn > out.len() {
+                        return None;
+                    }
+                    out[..dn].copy_from_slice(dll);
+                    return Some(dn);
+                }
+                seen += 1;
+            }
+        }
+        desc_rva += 20;
+    }
+    None
+}
+
+/// Re-patch win32k's OWN IAT for a loaded static import DLL. Runs in the EXECUTIVE while win32k's
+/// frames are still mapped writable at [`WIN32K_CODE_VA`]. `load_into` initially resolved non-native
+/// imports to visible benign stubs because the dependency image was not loaded yet; this points the
+/// import slots at real exports from the loaded dependency. Returns the number of slots patched.
+pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 {
+    if !import_dll_name_is_safe(dll_name) || dll_base == 0 {
+        return 0;
+    }
     let code_va = WIN32K_CODE_VA;
     let e = read_unaligned((code_va + 0x3c) as *const u32) as u64;
     let opt = code_va + e + 4 + 20;
@@ -8165,50 +8297,63 @@ pub unsafe fn patch_win32k_ftfd_imports(ftfd_base: u64) -> u32 {
     if imp_rva == 0 {
         return 0;
     }
+    let imp_size = read_unaligned((opt + 112 + 8 + 4) as *const u32) as u64;
+    if !image_rva_span_ok(imp_rva, imp_size, WIN32K_IMAGE_BYTES) {
+        return 0;
+    }
+    let imp_end = imp_rva + imp_size;
     let mut patched = 0u32;
-    let mut desc = code_va + imp_rva;
-    loop {
+    let mut desc_rva = imp_rva;
+    while desc_rva + 20 <= imp_end {
+        let desc = code_va + desc_rva;
         let ilt = read_unaligned(desc as *const u32) as u64;
         let iat = read_unaligned((desc + 16) as *const u32) as u64;
         let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
         if ilt == 0 && iat == 0 {
             break;
         }
-        // Is this the ftfd.dll descriptor?
-        let mut dllbuf = [0u8; 16];
-        let mut dn = 0usize;
-        if dll_name_rva != 0 {
-            while dn < 15 {
-                let c = read_volatile((code_va + dll_name_rva + dn as u64) as *const u8);
-                if c == 0 {
-                    break;
-                }
-                dllbuf[dn] = c.to_ascii_lowercase();
-                dn += 1;
+        let mut dllbuf = [0u8; 32];
+        let dn = if dll_name_rva != 0 {
+            read_import_dll_name(desc, &mut dllbuf).unwrap_or(0)
+        } else {
+            0
+        };
+        if dn != 0 && import_dll_name_eq(&dllbuf[..dn], dll_name) {
+            let thunk_rva = if ilt != 0 { ilt } else { iat };
+            if !image_rva_span_ok(thunk_rva, 8, WIN32K_IMAGE_BYTES)
+                || !image_rva_span_ok(iat, 8, WIN32K_IMAGE_BYTES)
+            {
+                return patched;
             }
-        }
-        if dn >= 4 && &dllbuf[..4] == b"ftfd" {
-            let names = code_va + if ilt != 0 { ilt } else { iat };
+            let names = code_va + thunk_rva;
             let slots = code_va + iat;
             let mut k = 0u64;
-            loop {
+            let thunk_cap =
+                ((WIN32K_IMAGE_BYTES - thunk_rva) / 8).min((WIN32K_IMAGE_BYTES - iat) / 8);
+            while k < thunk_cap {
                 let thunk = read_unaligned((names + k * 8) as *const u64);
                 if thunk == 0 {
                     break;
                 }
                 if thunk & 0x8000_0000_0000_0000 == 0 {
-                    let name_ptr = code_va + (thunk & 0x7FFF_FFFF) + 2;
+                    let name_rva = thunk & 0x7FFF_FFFF;
+                    if !image_rva_span_ok(name_rva, 2, WIN32K_IMAGE_BYTES) {
+                        return patched;
+                    }
+                    let name_ptr = code_va + name_rva + 2;
                     let mut buf = [0u8; 65];
                     let mut n = 0usize;
-                    while n < 63 {
+                    let Some(cstr_len) =
+                        image_c_string_len(code_va, name_rva + 2, WIN32K_IMAGE_BYTES, 63)
+                    else {
+                        return patched;
+                    };
+                    while n < cstr_len {
                         let c = read_volatile((name_ptr + n as u64) as *const u8);
-                        if c == 0 {
-                            break;
-                        }
                         buf[n] = c;
                         n += 1;
                     }
-                    let addr = pe_export_lookup(ftfd_base, &buf[..n + 1]);
+                    let addr = pe_export_lookup(dll_base, &buf[..n + 1]);
                     if addr != 0 {
                         write_unaligned((slots + k * 8) as *mut u64, addr);
                         patched += 1;
@@ -8218,7 +8363,7 @@ pub unsafe fn patch_win32k_ftfd_imports(ftfd_base: u64) -> u32 {
             }
             break;
         }
-        desc += 20;
+        desc_rva += 20;
     }
     patched
 }

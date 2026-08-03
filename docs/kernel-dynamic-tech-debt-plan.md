@@ -1410,3 +1410,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
   remains open for `ftfd.dll`'s static win32k import load contract and for full service-control
   driver object/device ownership beyond the current GDI-driver image registration table.
+- D1 continued. The named `ftfd.dll` preload is gone. Win32k non-native static imports are now
+  discovered from win32k's own PE import descriptors, loaded from System32 into bounded static-import
+  image slots, registered as system modules, and IAT-patched against the loaded dependency's real
+  exports. The loader records discovered/loaded/patched/failure counters, and
+  `exec_win32k_load_contract` now requires `deps=1 loaded=1 iat-patches=34 failures=0`, so unresolved
+  static imports fail visibly instead of silently continuing with unresolved dependency thunks. The
+  shared PE driver loader's relocation and import-table walking is also bounded to the destination
+  image span. Validation: `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`, `cargo
+  check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-win32k-static-imports-gated-20260804.log` reached the microtest sentinel with
+  `PASS exec_win32k_load_contract`, `PASS exec_win32k_desktop_painted`, `PASS
+  exec_msgina_modal_paint_prefix`, `PASS exec_msgina_logon_dialog_painted`, and `243/276`
+  executive-to-isolated-service checks passing. Review adjustment: D1 remains open for
+  service-control-created driver objects/device ownership and for replacing the fixed static-import
+  image slot with dynamic driver-image address allocation.
