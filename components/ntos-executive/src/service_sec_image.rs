@@ -8451,12 +8451,11 @@ pub(crate) unsafe fn service_sec_image(
                     // NtUserSetSystemCursor promotion; an exact miss remains NULL.
                     let hit = cursor_identity_key
                         .as_ref()
-                        .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
+                        .and_then(|key| nt_handler.lookup_global_cursor(key));
                     if let Some(handle) = hit {
                         remember_global_scrollbar_cursor(handle);
                         if userinit_gui_client {
-                            USERINIT_GLOBAL_CURSOR_HITS.fetch_add(1, Ordering::Relaxed);
-                            USERINIT_GLOBAL_CURSOR_HANDLE.store(handle as u64, Ordering::Relaxed);
+                            nt_handler.record_userinit_global_cursor_hit(handle);
                         }
                         print_str(b"[win32k-svc] shell global cursor mirror HIT pi=");
                         print_u64(pi as u64);
@@ -8477,15 +8476,10 @@ pub(crate) unsafe fn service_sec_image(
                     // of the same complete class.
                     let hit = builtin_class_key
                         .as_ref()
-                        .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key));
+                        .and_then(|key| nt_handler.lookup_builtin_class_atom(key));
                     if let (Some(key), Some(atom)) = (builtin_class_key.as_ref(), hit) {
                         if userinit_gui_client {
-                            let bit = 1u64 << (key.fn_id() - 0x02a1);
-                            USERINIT_BUILTIN_CLASS_HITS.fetch_add(1, Ordering::Relaxed);
-                            USERINIT_BUILTIN_CLASS_MASK.fetch_or(bit, Ordering::Relaxed);
-                            if key.fn_id() == 0x02a4 {
-                                USERINIT_DIALOG_CLASS_ATOM.store(atom as u64, Ordering::Relaxed);
-                            }
+                            nt_handler.record_userinit_builtin_class_hit(key.fn_id(), atom);
                         }
                         print_str(b"[win32k-svc] shell builtin class mirror HIT pi=");
                         print_u64(pi as u64);
@@ -8496,7 +8490,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     } else {
                         if userinit_gui_client {
-                            USERINIT_BUILTIN_CLASS_MISSES.fetch_add(1, Ordering::Relaxed);
+                            nt_handler.record_userinit_builtin_class_miss();
                         }
                         print_str(b"[win32k-svc] shell builtin class mirror MISS pi=");
                         print_u64(pi as u64);
@@ -8583,7 +8577,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Reuse only an exact cursor handle learned from the real interactive win32k path.
                     let hit = cursor_identity_key
                         .as_ref()
-                        .and_then(|key| GLOBAL_CURSOR_MIRROR.lookup_global(key));
+                        .and_then(|key| nt_handler.lookup_global_cursor(key));
                     if let Some(handle) = hit {
                         remember_global_scrollbar_cursor(handle);
                         print_str(
@@ -8613,7 +8607,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else if builtin_class_attempt {
                         builtin_class_key
                             .as_ref()
-                            .and_then(|key| GLOBAL_BUILTIN_CLASS_MIRROR.lookup(key))
+                            .and_then(|key| nt_handler.lookup_builtin_class_atom(key))
                     } else {
                         None
                     };
@@ -9367,17 +9361,14 @@ pub(crate) unsafe fn service_sec_image(
                 if pi == 2 && ok && !redirected_user_callback {
                     if m0 == 0x10a8 && st != 0 {
                         if let Some(key) = cursor_identity_key.as_ref() {
-                            GLOBAL_CURSOR_MIRROR.observe_identity(key, a0 as u32);
-                            GLOBAL_CURSOR_IDENTITIES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+                            nt_handler.observe_global_cursor_identity(key, a0 as u32);
                         }
                     } else if m0 == 0x1283 && st != 0 {
-                        GLOBAL_CURSOR_MIRROR.promote(a0 as u32);
-                        GLOBAL_CURSOR_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+                        nt_handler.promote_global_cursor(a0 as u32);
                     }
                     if m0 == 0x10b4 && st != 0 {
                         if let Some(key) = builtin_class_key.as_ref() {
-                            GLOBAL_BUILTIN_CLASS_MIRROR.observe(key, st as u16);
-                            GLOBAL_BUILTIN_CLASSES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+                            nt_handler.observe_builtin_class_atom(key, st as u16);
                         }
                     }
                 }

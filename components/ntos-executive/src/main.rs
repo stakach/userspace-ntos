@@ -2045,25 +2045,6 @@ pub(crate) const DEBUG_TRACE: bool = cfg!(feature = "debug-trace");
 /// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
 /// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
 pub(crate) static W32_HOT_LOG: AtomicU64 = AtomicU64::new(0);
-/// Exact USER cursor identities and handles learned from winlogon's real win32k calls. The executive
-/// event loop is single-threaded, so accesses in `service_sec_image` are serialized.
-pub(crate) static mut GLOBAL_CURSOR_MIRROR: nt_kernel_exec::user_cursor::GlobalCursorMirror<
-    32,
-    16,
-> = nt_kernel_exec::user_cursor::GlobalCursorMirror::new();
-pub(crate) static GLOBAL_CURSOR_IDENTITIES_OBSERVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_CURSOR_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_GLOBAL_CURSOR_HITS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_GLOBAL_CURSOR_HANDLE: AtomicU64 = AtomicU64::new(0);
-/// Exact built-in class identities and real atoms learned from winlogon's successful registrations.
-pub(crate) static mut GLOBAL_BUILTIN_CLASS_MIRROR: nt_kernel_exec::user_class::BuiltinClassMirror<
-    16,
-> = nt_kernel_exec::user_class::BuiltinClassMirror::new();
-pub(crate) static GLOBAL_BUILTIN_CLASSES_OBSERVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_BUILTIN_CLASS_HITS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_BUILTIN_CLASS_MISSES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_BUILTIN_CLASS_MASK: AtomicU64 = AtomicU64::new(0);
-pub(crate) static USERINIT_DIALOG_CLASS_ATOM: AtomicU64 = AtomicU64::new(0);
 /// Exact dynamic class atom names learned from successful real NtUserRegisterClassExWOW calls.
 pub(crate) static mut GLOBAL_CLASS_ATOM_NAME_MIRROR:
     nt_kernel_exec::user_class::ClassAtomNameMirror<128> =
@@ -3216,16 +3197,8 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let explorer_attempts = USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed);
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
     let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
-    let cursor_identities = GLOBAL_CURSOR_IDENTITIES_OBSERVED.load(Ordering::Relaxed);
-    let cursor_promotions = GLOBAL_CURSOR_PROMOTIONS.load(Ordering::Relaxed);
-    let cursor_hits = USERINIT_GLOBAL_CURSOR_HITS.load(Ordering::Relaxed);
-    let cursor_handle = USERINIT_GLOBAL_CURSOR_HANDLE.load(Ordering::Relaxed);
-    let classes_observed = GLOBAL_BUILTIN_CLASSES_OBSERVED.load(Ordering::Relaxed);
+    let cursor_class = win32k_session_cursor_class_counters();
     let (stock_observed, stock_hits, stock_misses) = win32k_session_stock_counters();
-    let class_hits = USERINIT_BUILTIN_CLASS_HITS.load(Ordering::Relaxed);
-    let class_misses = USERINIT_BUILTIN_CLASS_MISSES.load(Ordering::Relaxed);
-    let class_mask = USERINIT_BUILTIN_CLASS_MASK.load(Ordering::Relaxed);
-    let dialog_atom = USERINIT_DIALOG_CLASS_ATOM.load(Ordering::Relaxed);
     let class_atom_names = GLOBAL_CLASS_ATOM_NAMES_OBSERVED.load(Ordering::Relaxed);
     let class_atom_mirror_serves = GLOBAL_CLASS_ATOM_NAME_MIRROR_SERVES.load(Ordering::Relaxed);
     let class_atom_mirror_failures = GLOBAL_CLASS_ATOM_NAME_MIRROR_FAILURES.load(Ordering::Relaxed);
@@ -3266,15 +3239,15 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_str(b" gdi-mapped=");
     print_u64(gdi_mapped);
     print_str(b" cursor-identities=");
-    print_u64(cursor_identities);
+    print_u64(cursor_class.cursor_identities_observed);
     print_str(b" promotions=");
-    print_u64(cursor_promotions);
+    print_u64(cursor_class.cursor_promotions);
     print_str(b" cache-hits=");
-    print_u64(cursor_hits);
+    print_u64(cursor_class.userinit_cursor_hits);
     print_str(b" cursor=0x");
-    print_hex(cursor_handle as u32);
+    print_hex(cursor_class.userinit_cursor_handle as u32);
     print_str(b" classes-observed=");
-    print_u64(classes_observed);
+    print_u64(cursor_class.builtin_classes_observed);
     print_str(b" gdi-stock-observed=");
     print_u64(stock_observed);
     print_str(b" svc-stock-hits/misses=");
@@ -3282,13 +3255,13 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_str(b"/");
     print_u64(stock_misses);
     print_str(b" class-hits/misses=");
-    print_u64(class_hits);
+    print_u64(cursor_class.userinit_builtin_class_hits);
     print_str(b"/");
-    print_u64(class_misses);
+    print_u64(cursor_class.userinit_builtin_class_misses);
     print_str(b" class-mask=0x");
-    print_hex(class_mask as u32);
+    print_hex(cursor_class.userinit_builtin_class_mask as u32);
     print_str(b" dialog-atom=0x");
-    print_hex(dialog_atom as u32);
+    print_hex(cursor_class.userinit_dialog_class_atom as u32);
     print_str(b" class-atom-names=");
     print_u64(class_atom_names);
     print_str(b" atom-name-mirror-serves/failures=");
@@ -3349,7 +3322,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     );
     check(
         b"exec_userinit_global_cursor_reused",
-        cursor_identities >= 1 && cursor_promotions >= 1 && cursor_hits >= 1 && cursor_handle != 0,
+        cursor_class.cursor_identities_observed >= 1
+            && cursor_class.cursor_promotions >= 1
+            && cursor_class.userinit_cursor_hits >= 1
+            && cursor_class.userinit_cursor_handle != 0,
         passed,
     );
     check(
@@ -3359,11 +3335,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     );
     check(
         b"exec_userinit_builtin_classes_reused",
-        classes_observed >= 9
-            && class_hits >= 9
-            && class_misses == 0
-            && class_mask & 0x02ff == 0x02ff
-            && dialog_atom == 0x8002,
+        cursor_class.builtin_classes_observed >= 9
+            && cursor_class.userinit_builtin_class_hits >= 9
+            && cursor_class.userinit_builtin_class_misses == 0
+            && cursor_class.userinit_builtin_class_mask & 0x02ff == 0x02ff
+            && cursor_class.userinit_dialog_class_atom == 0x8002,
         passed,
     );
     check(

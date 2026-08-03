@@ -1827,6 +1827,53 @@ impl ExecNtHandler {
         self.win32k_session.record_service_stock_hit();
     }
 
+    pub(crate) fn lookup_global_cursor(
+        &self,
+        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
+    ) -> Option<u32> {
+        self.win32k_session.lookup_cursor(key)
+    }
+
+    pub(crate) fn observe_global_cursor_identity(
+        &mut self,
+        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
+        handle: u32,
+    ) {
+        self.win32k_session.observe_cursor_identity(key, handle);
+    }
+
+    pub(crate) fn promote_global_cursor(&mut self, handle: u32) {
+        self.win32k_session.promote_cursor(handle);
+    }
+
+    pub(crate) fn record_userinit_global_cursor_hit(&mut self, handle: u32) {
+        self.win32k_session.record_userinit_cursor_hit(handle);
+    }
+
+    pub(crate) fn lookup_builtin_class_atom(
+        &self,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
+    ) -> Option<u16> {
+        self.win32k_session.lookup_builtin_class(key)
+    }
+
+    pub(crate) fn observe_builtin_class_atom(
+        &mut self,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
+        atom: u16,
+    ) {
+        self.win32k_session.observe_builtin_class(key, atom);
+    }
+
+    pub(crate) fn record_userinit_builtin_class_hit(&mut self, fn_id: u32, atom: u16) {
+        self.win32k_session
+            .record_userinit_builtin_class_hit(fn_id, atom);
+    }
+
+    pub(crate) fn record_userinit_builtin_class_miss(&mut self) {
+        self.win32k_session.record_userinit_builtin_class_miss();
+    }
+
     pub(crate) fn publish_hosted_process_vspace(
         &mut self,
         pi: usize,

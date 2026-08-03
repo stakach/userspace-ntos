@@ -915,3 +915,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   built-in-class, class-atom-name, and ScrollBar class identity state; the next slice should keep
   moving those into provider/session runtime state before tackling the semantic WSS_NOIO GDI
   leaves.
+- C3/F1 cleanup. Moved the session cursor identity mirror and built-in class atom mirror out of
+  root-module globals (`GLOBAL_CURSOR_MIRROR`, `GLOBAL_CURSOR_IDENTITIES_OBSERVED`,
+  `GLOBAL_CURSOR_PROMOTIONS`, `USERINIT_GLOBAL_CURSOR_*`, `GLOBAL_BUILTIN_CLASS_MIRROR`,
+  `GLOBAL_BUILTIN_CLASSES_OBSERVED`, `USERINIT_BUILTIN_CLASS_*`, and
+  `USERINIT_DIALOG_CLASS_ATOM`) into `Win32kSessionRuntime`. Shell/service cursor lookups, shell and
+  service built-in class lookups, Winlogon cursor/class observations, and the userinit proof counters
+  now all go through explicit handler methods and post-loop session snapshots. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/main.rs
+  components/ntos-executive/src/exec_handler.rs components/ntos-executive/src/service_sec_image.rs
+  components/ntos-executive/src/service_gui_runtime.rs
+  components/ntos-executive/src/win32k_session_runtime.rs` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: F1's remaining session-global state is class atom
+  name resolution and ScrollBar class identity, followed by the semantic WSS_NOIO GDI leaves.
