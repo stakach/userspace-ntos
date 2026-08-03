@@ -1309,3 +1309,22 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   red gates remain `exec_user_callback_real_api0_nested_roundtrip`,
   `exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`, and
   `exec_lsa_worker_route`.
+- C3 repair. `NtUserGetIconInfo(0x104e)` now stages all caller-owned output graphs before isolated
+  win32k dispatch: optional `ICONINFO`, optional `DWORD *pbpp`, and the module/resource
+  `UNICODE_STRING` descriptors plus caller buffers. The first ReactOS explorer icon path uses
+  output-only descriptors with `MaximumLength == 0`, so the marshaller now treats that probe as a
+  size query instead of reading uninitialized `Length`/`Buffer` fields. Successful provider returns
+  copy staged descriptor updates, low integer resource IDs, and returned string bytes back to the
+  original client address space; probe/copy failures return visible `FALSE` results instead of
+  forwarding raw explorer heap/stack pointers. Validation: `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none` and
+  `.tmp/full-boot-geticoninfo.log` passed through the microtest sentinel with
+  `275/275 executive->isolated-service checks passed`, `PASS exec_win32k_desktop_painted`,
+  `PASS exec_msgina_logon_dialog_painted`, `PASS exec_msgina_credential_keystrokes_delivered`,
+  `PASS exec_lsa_logon_user_reached`, `PASS exec_winlogon_user_shell_activated`,
+  `PASS exec_userinit_process_spawned`, `PASS exec_explorer_process_spawned`, `PASS
+  exec_explorer_user_callbacks_redirected`, `PASS exec_explorer_wndproc_installed_by_client`, and
+  `PASS exec_explorer_shell_com_classes_served`. The old explorer `0x104e -> WALL` route is gone:
+  the log shows five staged `NtUserGetIconInfo` provider dispatches and no `0x104e` wall. Review
+  adjustment: the known explorer marshalling frontier is closed and the previous transport/LSA red
+  gates are green; C3 remains open only for the final direct-shim audit.

@@ -15,6 +15,7 @@ static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static GET_ICON_INFO_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIB_SECTION_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -76,6 +77,9 @@ const CREATE_DIB_SECTION_FAIL_MISSING_SP: u64 = 1;
 const CREATE_DIB_SECTION_FAIL_STACK_TAIL: u64 = 2;
 const CREATE_DIB_SECTION_FAIL_LAYOUT: u64 = 3;
 const CREATE_DIB_SECTION_FAIL_BMI_COPY: u64 = 4;
+const GET_ICON_INFO_FAIL_MISSING_SP: u64 = 1;
+const GET_ICON_INFO_FAIL_STACK_TAIL: u64 = 2;
+const GET_ICON_INFO_FAIL_DESC_COPY: u64 = 3;
 const CBM_INIT: u64 = 0x04;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
@@ -1349,6 +1353,10 @@ const RC_ARG_CAPTURE_SLOT: u64 = 0x0220;
 const RC_ARG_CAPTURE_SLOTS: u64 = 0x0010;
 const RC_CLASS_MENU_DESC_OFF: u64 = 0x0080;
 const RC_CLASS_MENU_BUF_OFF: u64 = 0x00A0;
+const GET_ICON_INFO_ICONINFO_BYTES: usize = 32;
+const GET_ICON_INFO_BPP_OFF: u64 = 0x20;
+const GET_ICON_INFO_STRING_BUF_OFF: u64 = 0x20;
+const GET_ICON_INFO_STRING_STAGE_CAP: u64 = RC_ARG_CAPTURE_SLOT - GET_ICON_INFO_STRING_BUF_OFF;
 const DEVMODEW_DMSIZE_OFF: usize = 0x44;
 const DEVMODEW_DMDRIVEREXTRA_OFF: usize = 0x46;
 const DEVMODEW_MIN_BYTES: usize = 0x48;
@@ -1674,8 +1682,46 @@ struct CapturedGetAtomName {
     maximum: u16,
 }
 
+#[derive(Clone, Copy)]
+struct CapturedUnicodeStringOut {
+    desc_client: u64,
+    buffer_client: u64,
+    maximum_client: u16,
+    desc_out: u64,
+    buffer_out: u64,
+    buffer_cap: u16,
+    original_desc: [u8; 16],
+}
+
+#[derive(Clone, Copy)]
+struct CapturedGetIconInfo {
+    iconinfo_client: u64,
+    iconinfo_out: u64,
+    bpp_client: u64,
+    bpp_out: u64,
+    module: Option<CapturedUnicodeStringOut>,
+    resource: Option<CapturedUnicodeStringOut>,
+}
+
+impl CapturedGetIconInfo {
+    const fn empty() -> Self {
+        Self {
+            iconinfo_client: 0,
+            iconinfo_out: 0,
+            bpp_client: 0,
+            bpp_out: 0,
+            module: None,
+            resource: None,
+        }
+    }
+}
+
 fn rc_arg_slot_base(slot: u64) -> u64 {
     win32k_subsystem::WIN32K_ARG_VADDR + RC_ARG_CAPTURE_BASE + slot * RC_ARG_CAPTURE_SLOT
+}
+
+fn is_int_resource_value(value: u64) -> bool {
+    value != 0 && value <= 0xffff
 }
 
 unsafe fn staged_unicode_string_is_scrollbar(desc: u64) -> bool {
@@ -1967,6 +2013,162 @@ unsafe fn copy_back_get_atom_name(
         nfilled,
         scratch_base,
     )
+}
+
+unsafe fn stage_unicode_string_output_for_win32k(
+    pi: u64,
+    descriptor: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<CapturedUnicodeStringOut> {
+    if descriptor == 0 {
+        return None;
+    }
+
+    let mut raw = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        descriptor,
+        &mut raw,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+
+    let maximum_client = u16::from_le_bytes([raw[2], raw[3]]);
+    let buffer_client = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let buffer_cap = (maximum_client as u64).min(GET_ICON_INFO_STRING_STAGE_CAP) as u16;
+    if maximum_client != 0 && (buffer_client == 0 || buffer_cap < 2) {
+        return None;
+    }
+
+    let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed) % RC_ARG_CAPTURE_SLOTS;
+    let desc_out = rc_arg_slot_base(slot);
+    let buffer_out = desc_out + GET_ICON_INFO_STRING_BUF_OFF;
+    core::ptr::write_bytes(desc_out as *mut u8, 0, RC_ARG_CAPTURE_SLOT as usize);
+    core::ptr::write_unaligned(desc_out as *mut u16, 0);
+    core::ptr::write_unaligned((desc_out + 2) as *mut u16, buffer_cap);
+    core::ptr::write_unaligned((desc_out + 4) as *mut u32, 0);
+    core::ptr::write_unaligned(
+        (desc_out + 8) as *mut u64,
+        if buffer_cap != 0 { buffer_out } else { 0 },
+    );
+
+    Some(CapturedUnicodeStringOut {
+        desc_client: descriptor,
+        buffer_client,
+        maximum_client,
+        desc_out,
+        buffer_out,
+        buffer_cap,
+        original_desc: raw,
+    })
+}
+
+unsafe fn copy_back_unicode_string_output(
+    pi: u64,
+    capture: CapturedUnicodeStringOut,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    let mut staged = [0u8; 16];
+    core::ptr::copy_nonoverlapping(
+        capture.desc_out as *const u8,
+        staged.as_mut_ptr(),
+        staged.len(),
+    );
+    let length = u16::from_le_bytes([staged[0], staged[1]]);
+    let maximum = u16::from_le_bytes([staged[2], staged[3]]);
+    let staged_buffer = u64::from_le_bytes(staged[8..16].try_into().unwrap());
+
+    let mut out_desc = capture.original_desc;
+    out_desc[0..2].copy_from_slice(&length.to_le_bytes());
+    let client_maximum =
+        if staged_buffer == capture.buffer_out && length != 0 && maximum == capture.buffer_cap {
+            capture.maximum_client
+        } else {
+            maximum
+        };
+    out_desc[2..4].copy_from_slice(&client_maximum.to_le_bytes());
+
+    let (client_buffer, buffer_ok) = if staged_buffer == capture.buffer_out {
+        if length == 0 {
+            (capture.buffer_client, true)
+        } else if capture.buffer_client == 0
+            || length > capture.maximum_client
+            || length > capture.buffer_cap
+        {
+            (capture.buffer_client, false)
+        } else {
+            (
+                capture.buffer_client,
+                img_spawn::client_copyout_mapped(
+                    pi,
+                    capture.buffer_client,
+                    core::slice::from_raw_parts(capture.buffer_out as *const u8, length as usize),
+                    filled_pages,
+                    nfilled,
+                    scratch_base,
+                ),
+            )
+        }
+    } else if is_int_resource_value(staged_buffer) || staged_buffer == 0 {
+        (staged_buffer, true)
+    } else {
+        (capture.buffer_client, false)
+    };
+    out_desc[8..16].copy_from_slice(&client_buffer.to_le_bytes());
+
+    buffer_ok
+        && img_spawn::client_write_mapped(
+            pi,
+            capture.desc_client,
+            &out_desc,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+}
+
+unsafe fn copy_back_get_icon_info(
+    pi: u64,
+    capture: CapturedGetIconInfo,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    let iconinfo_ok = capture.iconinfo_client == 0
+        || img_spawn::client_copyout_mapped(
+            pi,
+            capture.iconinfo_client,
+            core::slice::from_raw_parts(
+                capture.iconinfo_out as *const u8,
+                GET_ICON_INFO_ICONINFO_BYTES,
+            ),
+            filled_pages,
+            nfilled,
+            scratch_base,
+        );
+    let bpp_ok = capture.bpp_client == 0
+        || img_spawn::client_copyout_mapped(
+            pi,
+            capture.bpp_client,
+            core::slice::from_raw_parts(capture.bpp_out as *const u8, 4),
+            filled_pages,
+            nfilled,
+            scratch_base,
+        );
+    let module_ok = capture.module.is_none_or(|module| {
+        copy_back_unicode_string_output(pi, module, filled_pages, nfilled, scratch_base)
+    });
+    let resource_ok = capture.resource.is_none_or(|resource| {
+        copy_back_unicode_string_output(pi, resource, filled_pages, nfilled, scratch_base)
+    });
+    iconinfo_ok && bpp_ok && module_ok && resource_ok
 }
 
 unsafe fn capture_register_class_graph(
@@ -7122,6 +7324,13 @@ pub(crate) unsafe fn service_sec_image(
                 let mut build_hwnd_list_stack_args = [0u64; 3];
                 let mut build_hwnd_list_stack_arg_count = 0usize;
                 let mut build_hwnd_list_copyout = (0u64, 0u64, 0u64, 0u64);
+                let mut get_icon_info_stack_args = [0u64; 2];
+                let mut get_icon_info_stack_arg_count = 0usize;
+                let mut get_icon_info_probe_failed = false;
+                let mut get_icon_info_probe_failure = 0u64;
+                let mut get_icon_info_probe_aux0 = 0u64;
+                let mut get_icon_info_probe_aux1 = 0u64;
+                let mut get_icon_info_copyout = CapturedGetIconInfo::empty();
                 let mut create_bitmap_stack_args = [0u64; 1];
                 let mut create_bitmap_stack_arg_count = 0usize;
                 let mut create_bitmap_probe_failed = false;
@@ -7363,6 +7572,129 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(client_needed);
                                 print_str(b"\n");
                             }
+                        }
+                    }
+                } else if m0 == 0x104e {
+                    // NtUserGetIconInfo has three optional caller-owned outputs: ICONINFO, two
+                    // UNICODE_STRING descriptors/buffers, and a DWORD bpp pointer in the stack tail.
+                    // The ReactOS user32 LR_COPYFROMRESOURCE path first asks only for string sizes
+                    // with partially initialized descriptors, then calls again with heap buffers.
+                    // Stage those output graphs before isolated win32k probes them.
+                    if sp == 0 {
+                        get_icon_info_probe_failed = true;
+                        get_icon_info_probe_failure = GET_ICON_INFO_FAIL_MISSING_SP;
+                    } else {
+                        let pbpp = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        let b_internal = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if let (Some(pbpp), Some(b_internal)) = (pbpp, b_internal) {
+                            let fixed_slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed)
+                                % RC_ARG_CAPTURE_SLOTS;
+                            let fixed_base = rc_arg_slot_base(fixed_slot);
+                            core::ptr::write_bytes(
+                                fixed_base as *mut u8,
+                                0,
+                                RC_ARG_CAPTURE_SLOT as usize,
+                            );
+
+                            if d_a1 != 0 {
+                                d_a1 = fixed_base;
+                                get_icon_info_copyout.iconinfo_client = a1;
+                                get_icon_info_copyout.iconinfo_out = fixed_base;
+                                if pbpp != 0 {
+                                    get_icon_info_copyout.bpp_client = pbpp;
+                                    get_icon_info_copyout.bpp_out =
+                                        fixed_base + GET_ICON_INFO_BPP_OFF;
+                                }
+                            }
+                            if d_a2 != 0 {
+                                match stage_unicode_string_output_for_win32k(
+                                    pi as u64,
+                                    d_a2,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    Some(capture) => {
+                                        d_a2 = capture.desc_out;
+                                        get_icon_info_copyout.module = Some(capture);
+                                    }
+                                    None => {
+                                        get_icon_info_probe_failed = true;
+                                        get_icon_info_probe_failure = GET_ICON_INFO_FAIL_DESC_COPY;
+                                        get_icon_info_probe_aux0 = a2;
+                                        get_icon_info_probe_aux1 = 1;
+                                    }
+                                }
+                            }
+                            if !get_icon_info_probe_failed && d_a3 != 0 {
+                                match stage_unicode_string_output_for_win32k(
+                                    pi as u64,
+                                    d_a3,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    Some(capture) => {
+                                        d_a3 = capture.desc_out;
+                                        get_icon_info_copyout.resource = Some(capture);
+                                    }
+                                    None => {
+                                        get_icon_info_probe_failed = true;
+                                        get_icon_info_probe_failure = GET_ICON_INFO_FAIL_DESC_COPY;
+                                        get_icon_info_probe_aux0 = a3;
+                                        get_icon_info_probe_aux1 = 2;
+                                    }
+                                }
+                            }
+
+                            if !get_icon_info_probe_failed {
+                                get_icon_info_stack_args = [
+                                    if d_a1 != 0 && pbpp != 0 {
+                                        fixed_base + GET_ICON_INFO_BPP_OFF
+                                    } else {
+                                        0
+                                    },
+                                    b_internal as u32 as u64,
+                                ];
+                                get_icon_info_stack_arg_count = get_icon_info_stack_args.len();
+                                let n = GET_ICON_INFO_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                                if n < 24 {
+                                    print_str(b"[w32marshal] NtUserGetIconInfo pi=");
+                                    print_u64(pi as u64);
+                                    print_str(b" icon=0x");
+                                    print_hex_u64(a0);
+                                    print_str(b" info=0x");
+                                    print_hex_u64(a1);
+                                    print_str(b" module=0x");
+                                    print_hex_u64(a2);
+                                    print_str(b" resource=0x");
+                                    print_hex_u64(a3);
+                                    print_str(b" bpp=0x");
+                                    print_hex_u64(pbpp);
+                                    print_str(b" staged=0x");
+                                    print_hex_u64(d_a1);
+                                    print_str(b"/0x");
+                                    print_hex_u64(d_a2);
+                                    print_str(b"/0x");
+                                    print_hex_u64(d_a3);
+                                    print_str(b"\n");
+                                }
+                            }
+                        } else {
+                            get_icon_info_probe_failed = true;
+                            get_icon_info_probe_failure = GET_ICON_INFO_FAIL_STACK_TAIL;
                         }
                     }
                 } else if m0 == 0x106c && sp != 0 && uses_client_gdi {
@@ -9044,6 +9376,30 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if get_icon_info_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserGetIconInfo output probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" icon=0x");
+                        print_hex_u64(a0);
+                        print_str(b" info=0x");
+                        print_hex_u64(a1);
+                        print_str(b" module=0x");
+                        print_hex_u64(a2);
+                        print_str(b" resource=0x");
+                        print_hex_u64(a3);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" reason=");
+                        print_u64(get_icon_info_probe_failure);
+                        print_str(b" aux=");
+                        print_u64(get_icon_info_probe_aux0);
+                        print_str(b"/");
+                        print_u64(get_icon_info_probe_aux1);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if create_bitmap_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9266,6 +9622,8 @@ pub(crate) unsafe fn service_sec_image(
                         m0 == 0x10de && open_dcw_stack_arg_count == open_dcw_stack_args.len();
                     let build_hwnd_list_staged_stack = m0 == 0x101b
                         && build_hwnd_list_stack_arg_count == build_hwnd_list_stack_args.len();
+                    let get_icon_info_staged_stack = m0 == 0x104e
+                        && get_icon_info_stack_arg_count == get_icon_info_stack_args.len();
                     let create_bitmap_staged_stack = m0 == 0x106c
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
                     let create_dib_section_staged_stack = m0 == 0x109b
@@ -9296,6 +9654,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &open_dcw_stack_args)
                     } else if build_hwnd_list_staged_stack {
                         (sp, &build_hwnd_list_stack_args)
+                    } else if get_icon_info_staged_stack {
+                        (sp, &get_icon_info_stack_args)
                     } else if create_bitmap_staged_stack {
                         (sp, &create_bitmap_stack_args)
                     } else if create_dib_section_staged_stack {
@@ -9442,6 +9802,31 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b"\n");
                             }
                             r = (0xC000_0005, false);
+                        }
+                    }
+                    if get_icon_info_staged_stack && r.1 && r.0 != 0 {
+                        if !copy_back_get_icon_info(
+                            pi as u64,
+                            get_icon_info_copyout,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] NtUserGetIconInfo copy-out failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" info=0x");
+                                print_hex_u64(get_icon_info_copyout.iconinfo_client);
+                                print_str(b" module=");
+                                print_u64(get_icon_info_copyout.module.is_some() as u64);
+                                print_str(b" resource=");
+                                print_u64(get_icon_info_copyout.resource.is_some() as u64);
+                                print_str(b" bpp=0x");
+                                print_hex_u64(get_icon_info_copyout.bpp_client);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
                         }
                     }
                     if text_extent_staged_stack && r.1 && r.0 != 0 {
