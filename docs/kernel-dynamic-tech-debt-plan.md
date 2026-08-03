@@ -1268,3 +1268,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   stack scalar. The persistent red gates are `exec_user_callback_real_api0_nested_roundtrip`,
   `exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`, and
   `exec_lsa_worker_route`.
+- C3 repair. `NtGdiStretchDIBitsInternal(0x1082)` now also canonicalizes its ReactOS x64
+  stack-tail scalar slots before isolated win32k dispatch. The executive preserves signed `INT`
+  coordinate/extent shape and truncates `DWORD`/`UINT` slots (`dwUsage`, `dwRop4`, `cjMaxInfo`,
+  and `cjMaxBits`) to their declared 32-bit widths before rebasing `pjInit`/`pbmi` into the
+  provider bulk argument window. This closes the remaining high-32-bit-tainted `cjMaxBits`
+  rejection seen in the explorer path without adding a fallback success result. Validation:
+  `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `.tmp/full-boot-stretchdibits-low32.log` passed through the microtest sentinel with
+  `271/275 executive->isolated-service checks passed`, `PASS exec_win32k_desktop_painted`,
+  `PASS exec_msgina_logon_dialog_painted`, `PASS exec_msgina_credential_keystrokes_delivered`,
+  `PASS exec_lsa_logon_user_reached`, `PASS exec_winlogon_user_shell_activated`, `PASS
+  exec_userinit_process_spawned`, `PASS exec_explorer_process_spawned`, and `PASS
+  exec_explorer_shell_com_classes_served`. The log contains staged `NtGdiStretchDIBitsInternal`
+  payloads for winlogon and explorer and no `NtGdiStretchDIBitsInternal input probe failed`
+  signature. Review adjustment: the known `0x1082` marshalling rejection is closed, but C3 remains
+  open for the final win32k/client marshalling audit. The persistent red gates remain
+  `exec_user_callback_real_api0_nested_roundtrip`, `exec_user_callback_dead_client_unwind`,
+  `exec_win32k_transport_call_nested`, and `exec_lsa_worker_route`.

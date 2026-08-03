@@ -7649,7 +7649,8 @@ pub(crate) unsafe fn service_sec_image(
                 } else if m0 == 0x1082 && uses_client_gdi {
                     // NtGdiStretchDIBitsInternal receives the converted BITMAPINFO and optional DIB
                     // bits from gdi32's client heap. Stage those buffers in win32k-owned memory before
-                    // isolated win32k validates pbmi/pjInit, preserving the original scalar argument tail.
+                    // isolated win32k validates pbmi/pjInit, preserving the Windows x64 32-bit scalar
+                    // argument shape in the stack tail.
                     if sp == 0 {
                         stretch_dibits_probe_failed = true;
                         stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_MISSING_SP;
@@ -7677,10 +7678,17 @@ pub(crate) unsafe fn service_sec_image(
                         if !tail_ok {
                             stretch_dibits_probe_failed = true;
                         } else {
+                            let cy_dst = stretch_dibits_stack_args[0] as i32 as i64 as u64;
+                            let x_src = stretch_dibits_stack_args[1] as i32 as i64 as u64;
+                            let y_src = stretch_dibits_stack_args[2] as i32 as i64 as u64;
+                            let cx_src = stretch_dibits_stack_args[3] as i32 as i64 as u64;
+                            let cy_src = stretch_dibits_stack_args[4] as i32 as i64 as u64;
                             let pj_init = stretch_dibits_stack_args[5];
                             let pbmi = stretch_dibits_stack_args[6];
-                            let cj_max_info = stretch_dibits_stack_args[9];
-                            let cj_max_bits = stretch_dibits_stack_args[10];
+                            let dw_usage = stretch_dibits_stack_args[7] as u32 as u64;
+                            let dw_rop = stretch_dibits_stack_args[8] as u32 as u64;
+                            let cj_max_info = stretch_dibits_stack_args[9] as u32 as u64;
+                            let cj_max_bits = stretch_dibits_stack_args[10] as u32 as u64;
                             let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
                             let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
                             let mut offset = 0u64;
@@ -7793,8 +7801,17 @@ pub(crate) unsafe fn service_sec_image(
                                         faults as usize,
                                         scratch_base,
                                     ) {
+                                        stretch_dibits_stack_args[0] = cy_dst;
+                                        stretch_dibits_stack_args[1] = x_src;
+                                        stretch_dibits_stack_args[2] = y_src;
+                                        stretch_dibits_stack_args[3] = cx_src;
+                                        stretch_dibits_stack_args[4] = cy_src;
                                         stretch_dibits_stack_args[5] = staged_bits;
                                         stretch_dibits_stack_args[6] = staged_pbmi;
+                                        stretch_dibits_stack_args[7] = dw_usage;
+                                        stretch_dibits_stack_args[8] = dw_rop;
+                                        stretch_dibits_stack_args[9] = cj_max_info;
+                                        stretch_dibits_stack_args[10] = cj_max_bits;
                                         stretch_dibits_stack_arg_count =
                                             stretch_dibits_stack_args.len();
                                         let n = STRETCH_DIBITS_MARSHAL_TRACE
@@ -7815,7 +7832,7 @@ pub(crate) unsafe fn service_sec_image(
                                             print_str(b" bits-bytes=");
                                             print_u64(cj_max_bits);
                                             print_str(b" rop=0x");
-                                            print_hex(stretch_dibits_stack_args[8] as u32);
+                                            print_hex(dw_rop as u32);
                                             print_str(b" staged=0x");
                                             print_hex_u64(staged_bits);
                                             print_str(b"/0x");
