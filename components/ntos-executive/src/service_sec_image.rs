@@ -5427,11 +5427,14 @@ pub(crate) unsafe fn service_sec_image(
             // request genuinely resumes this thread inside its own receive loop. If the syscall also
             // carried a `ReplyMessage` (the server answering the request it just handled), that reply
             // is copied straight out of the server's buffer into the waiting client's.
+            let lsa_auth_port_handle = nt_handler
+                .lpc_port_handle_by_ascii(b"\\lsaauthenticationport")
+                .unwrap_or(0);
             if LSA_RENDEZVOUS_ENABLED
                 && m0 == SSN_NT_REPLY_WAIT_RECEIVE_PORT
                 && (is_lsass_listener || is_lsass_listener2 || is_lsass_listener3)
-                && LSA_AUTH_PORT_HANDLE.load(Ordering::Relaxed) != 0
-                && get_recv_mr(9) == LSA_AUTH_PORT_HANDLE.load(Ordering::Relaxed)
+                && lsa_auth_port_handle != 0
+                && get_recv_mr(9) == lsa_auth_port_handle
             {
                 nt_handler.pi = pi;
                 nt_handler.current_badge = badge;

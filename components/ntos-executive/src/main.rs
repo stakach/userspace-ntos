@@ -1964,9 +1964,6 @@ static CSR_SB_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 static CSR_FILL_NEXT: AtomicU64 = AtomicU64::new(0);
-/// Count of csrss's NtCreatePort calls (its port names are unreadable csrsrv .data globals, so they
-/// are assigned canonical names by creation order: 0 = \Windows\ApiPort, 1 = \Windows\SbApiPort).
-static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
 /// The self-connect ClientId uses the real csrss EPROCESS/ETHREAD identity written to
 /// CsrApiRequestThread's *ClientId out-param (so csrss's CsrAddStaticServerThread registers a
 /// CSR_THREAD with this CID) AND marshaled into the connection-request PORT_MESSAGE, so csrss's real
@@ -2877,7 +2874,7 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
 /// and its OWN `NtAcceptConnectPort(Accept)` decision, the broker's real comm-port handles, and the
 /// `LSA_API_MSG`s winlogon's `LsaLookupAuthenticationPackage`/`LsaLogonUser` marshalled.
 fn lsa_authentication_port_specs(passed: &mut u64) {
-    let server_port = LSA_AUTH_PORT_HANDLE.load(Ordering::Relaxed);
+    let server_port = LSA_AUTH_PORT_OBJECT_HANDLE.load(Ordering::Relaxed);
     let client_port = WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed);
     print_str(b"[lsa] \\LsaAuthenticationPort: server-port=0x");
     print_hex(server_port as u32);
@@ -10607,18 +10604,27 @@ const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
 const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
+const OBJ_KIND_DIRECTORY: u8 = 0;
+const OBJ_KIND_SYMBOLIC_LINK: u8 = 1;
+const OBJ_KIND_EVENT: u8 = 2;
+const OBJ_KIND_SEMAPHORE: u8 = 3;
+const OBJ_KIND_MUTANT: u8 = 4;
+const OBJ_KIND_LPC_PORT: u8 = 5;
+
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
 /// allocation, so the backing `Vec` (pre-reserved below the per-syscall heap mark) never
-/// reallocates and survives the bump-heap reset. Enough for SmpInit's DosDevices bring-up:
-/// directories (`\`, `\??`, …) and the drive-letter symbolic links it creates in `\??`.
+/// reallocates and survives the bump-heap reset. `target` is link-only data; `payload` carries
+/// backing object identity for kinds whose state lives outside the namespace, such as LPC listen
+/// port handles.
 #[derive(Clone, Copy)]
 struct ObjEntry {
     name: [u8; 40], // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
-    parent: u8,       // index of the parent directory; 0xFF = the root itself
-    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event, 3 = semaphore, 4 = mutant
+    parent: u8, // index of the parent directory; 0xFF = the root itself
+    kind: u8,
     target: [u8; 40], // symbolic-link target (kind == 1)
     target_len: u8,
+    payload: u64,
 }
 impl ObjEntry {
     fn dir(name: &[u8], parent: u8) -> Self {
@@ -10626,9 +10632,10 @@ impl ObjEntry {
             name: [0; 40],
             name_len: 0,
             parent,
-            kind: 0,
+            kind: OBJ_KIND_DIRECTORY,
             target: [0; 40],
             target_len: 0,
+            payload: 0,
         };
         let n = name.len().min(40);
         e.name[..n].copy_from_slice(&name[..n]);
@@ -12588,13 +12595,13 @@ static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static USERINIT_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// Kernel SRM listen-port handle for `\SeRmCommandPort`, registered in the LPC broker during
-/// executive initialization before LSASS starts.
-static SRM_COMMAND_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass's lsasrv `LsapRmInitializeServer` connects to the kernel-owned
 /// `\SeRmCommandPort` through the LPC broker and the executive SRM side accepts/completes that
 /// connection. Read by the exec_lsass_lsa_init_running milestone spec.
 static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic proof only: set after `\SeRmCommandPort` is registered as an object-manager LPC port.
+/// Runtime routing resolves the handle from `ExecNtHandler::obj_ns`, not from this cell.
+static SRM_COMMAND_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
 // ═══ `\LsaAuthenticationPort` RENDEZVOUS ══════════════════════════════════════════════════════
 // The THIRD authentic LPC rendezvous in this system, after `sm_rendezvous` (smss' real `SmpApiLoop`
 // accepting `\SmApiPort`) and `csr_rendezvous` (csrss' real `CsrApiRequestThread` accepting
@@ -12605,8 +12612,9 @@ static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 // `NtReplyWaitReceivePort` with its reply capability retained, the connecting/ requesting client
 // genuinely BLOCKS in `NtConnectPort`/`NtRequestWaitReplyPort`, and each side is woken by the other's
 // real progress. Nothing about the accept decision, the port handles or the reply payload is modelled.
-/// lsass' `AuthPortHandle` — the broker handle its `NtCreatePort(\LsaAuthenticationPort)` returned.
-pub(crate) static LSA_AUTH_PORT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic proof only: set after LSASS' `NtCreatePort(\LsaAuthenticationPort)` registers the
+/// broker listen handle as an object-manager LPC port. Runtime routing resolves `obj_ns`.
+pub(crate) static LSA_AUTH_PORT_OBJECT_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// The broker connection id currently being accepted by the real server (0 = none in flight).
 pub(crate) static LSA_PENDING_CONN: AtomicU64 = AtomicU64::new(0);
 /// `PortContext` the real `NtAcceptConnectPort` passed (its `LSAP_LOGON_CONTEXT`), replayed to the
@@ -14055,17 +14063,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .map(|(ch, _)| ch != 0)
             .unwrap_or(false);
     check(b"exec_lpc_connect_rendezvous", lpc_rdv_ok, &mut passed);
-    // Kernel SRM objects are present before LSASS starts. ReactOS' ntoskrnl creates
-    // \SeRmCommandPort in SeRmInitPhase1; LSASS later connects to it during LsapRmInitializeServer.
-    let srm_command_port_name: Vec<u16> = "\\SeRmCommandPort".encode_utf16().collect();
-    let srm_command_port = lpc.create_port(&srm_command_port_name, 4, 0x148, 0x2400);
-    match srm_command_port {
-        Ok(handle) if handle != 0 => {
-            SRM_COMMAND_PORT_HANDLE.store(handle, Ordering::Relaxed);
-            check(b"exec_srm_command_port_registered", true, &mut passed);
-        }
-        _ => check(b"exec_srm_command_port_registered", false, &mut passed),
-    }
     // Live ALPC + LPC↔ALPC bridge self-test over the SAME ring/component/core (the
     // integration proof — no real ALPC binary exists yet). Drives ALPC + classic-LPC
     // message-plane opcodes raw on the shared channel, uses distinct \AlpcLive /
@@ -18478,6 +18475,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // LsapInitLsa → LsapRmInitializeServer, whose NtConnectPort(\SeRmCommandPort)
                     // now completes through the kernel-owned SRM LPC port. This proves lsass advanced
                     // PAST the lsasrv DLL_NOT_FOUND wall into its genuine SRM/LSA-database bring-up.
+                    check(
+                        b"exec_srm_command_port_registered",
+                        SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Relaxed) != 0,
+                        &mut passed,
+                    );
                     check(
                         b"exec_lsass_lsa_init_running",
                         LSASS_SRM_CONNECTED.load(Ordering::Relaxed) == 1,

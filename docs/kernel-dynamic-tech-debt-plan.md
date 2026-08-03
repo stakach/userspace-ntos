@@ -67,7 +67,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[x]` E1: Remove modeled CSR reply paths and require real CSR server rendezvous for connect and
   request/reply traffic.
-- `[ ]` E2: Replace fixed LPC port-name creation order with object-manager named-port lookup.
+- `[x]` E2: Replace fixed LPC port-name creation order with object-manager named-port lookup.
 - `[x]` E3: Replace modeled SRM/LSA accept replies with real port messages and server-side
   processing.
 
@@ -1370,3 +1370,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_lsass_signals_lsa_rpc_active`, `PASS exec_msgina_logon_dialog_painted`, and `PASS
   exec_win32k_desktop_painted`. Review adjustment: the remaining open plan work is A2, D1-D3, and
   E2.
+- E2 complete. LPC listen ports are now registered as object-manager `Port` objects carrying their
+  broker listen handles. `NtCreatePort` requires a real object name, broker port creation, and
+  namespace registration; the old CSRSS `\Windows\ApiPort`/`\Windows\SbApiPort` creation-order
+  naming and opaque-handle broker fallback are gone. CSR secure connects, generic `NtConnectPort`,
+  SRM, and LSA server receive routing now resolve the named port object dynamically instead of
+  reading fixed global listen handles. Validation: `cargo fmt --manifest-path
+  components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-lpc-port-objects-20260804-084449.log` reached the microtest sentinel with
+  `PASS exec_srm_command_port_registered`, `[srm-rdv] kernel SRM accepted \SeRmCommandPort`,
+  `PASS exec_lsass_lsa_init_running`, `PASS exec_lsa_auth_port_connected`, and
+  `PASS exec_win32k_desktop_painted`. The remaining red frontier matches
+  `.tmp/full-boot-srm-rdv-20260804-082749.log`, so this cleanup preserved the current boot state.

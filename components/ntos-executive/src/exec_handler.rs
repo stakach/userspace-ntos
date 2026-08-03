@@ -635,13 +635,14 @@ impl ExecNtHandler {
     }
 
     /// Seed the kernel-owned SRM synchronization object that ReactOS creates from ntoskrnl's
-    /// `SeRmInitPhase1`. LSASS later opens and signals this object while initializing its SRM
-    /// client side; the open path should therefore be an ordinary object-manager lookup.
+    /// `SeRmInitPhase1`, plus the kernel SRM listen port. LSASS later opens/signals the event and
+    /// connects to `\SeRmCommandPort`; both lookups should be ordinary object-manager queries.
     fn provision_kernel_srm_objects(&mut self) {
         const SELSA_INIT_EVENT: &[u8] = b"\\selsainitevent";
+        const STATUS_SUCCESS: u32 = 0;
 
         match self.obj_resolve(SELSA_INIT_EVENT, 0) {
-            Some(index) if self.obj_ns[index].kind == 2 => {
+            Some(index) if self.obj_ns[index].kind == OBJ_KIND_EVENT => {
                 if !self.events.contains(index as u64) {
                     self.events
                         .initialize(index as u64, EventKind::Notification, false);
@@ -654,7 +655,7 @@ impl ExecNtHandler {
                 print_str(b"[srm-init] \\SeLsaInitEvent name collision with non-event object\n");
             }
             None => {
-                if let Some(index) = self.obj_create(SELSA_INIT_EVENT, 0, 2, &[]) {
+                if let Some(index) = self.obj_create(SELSA_INIT_EVENT, 0, OBJ_KIND_EVENT, &[]) {
                     self.events
                         .initialize(index as u64, EventKind::Notification, false);
                     print_str(b"[srm-init] provisioned \\SeLsaInitEvent obj=");
@@ -664,6 +665,35 @@ impl ExecNtHandler {
                     print_str(b"[srm-init] failed to provision \\SeLsaInitEvent\n");
                 }
             }
+        }
+
+        let name16: alloc::vec::Vec<u16> = "\\SeRmCommandPort".encode_utf16().collect();
+        let status = match unsafe { lpc_client() } {
+            Some(client) => match client.create_port(&name16, 4, 0x148, 0x2400) {
+                Ok(handle) if handle != 0 => {
+                    match self.register_lpc_port_object(&name16, 0, handle) {
+                        Ok(index) => {
+                            SRM_COMMAND_PORT_OBJECT_HANDLE.store(handle, Ordering::Relaxed);
+                            print_str(b"[srm-init] registered \\SeRmCommandPort obj=");
+                            print_u64(index as u64);
+                            print_str(b" handle=0x");
+                            print_hex((handle >> 32) as u32);
+                            print_hex(handle as u32);
+                            print_str(b"\n");
+                            STATUS_SUCCESS
+                        }
+                        Err(status) => status,
+                    }
+                }
+                Ok(_) => 0xC000_0001,
+                Err(status) => status.raw() as u32,
+            },
+            None => 0xC000_0001,
+        };
+        if status != STATUS_SUCCESS {
+            print_str(b"[srm-init] failed to register \\SeRmCommandPort status=0x");
+            print_hex(status);
+            print_str(b"\n");
         }
     }
 
@@ -7319,7 +7349,7 @@ impl ExecNtHandler {
     /// broker couldn't match winlogon's connect. Use this so the port registers under its real name.
     pub(crate) unsafe fn read_objattr_name(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
         let mut p = [0u8; 8];
-        if !smss_copyin(oa_va + 0x10, &mut p) {
+        if !self.xas_read(oa_va + 0x10, &mut p) {
             return alloc::vec::Vec::new();
         }
         let objname = u64::from_le_bytes(p);
@@ -7334,7 +7364,7 @@ impl ExecNtHandler {
         }
         let mut lm = [0u8; 2];
         let mut bp = [0u8; 8];
-        if !smss_copyin(ustr_va, &mut lm) || !smss_copyin(ustr_va + 8, &mut bp) {
+        if !self.xas_read(ustr_va, &mut lm) || !self.xas_read(ustr_va + 8, &mut bp) {
             return alloc::vec::Vec::new();
         }
         let buffer_va = u64::from_le_bytes(bp);
@@ -7343,7 +7373,7 @@ impl ExecNtHandler {
         for i in 0..n {
             let va = buffer_va + (i as u64) * 2;
             let mut w = [0u8; 2];
-            if smss_copyin(va, &mut w) {
+            if self.xas_read(va, &mut w) {
                 out.push(u16::from_le_bytes(w));
                 continue;
             }
@@ -8186,11 +8216,10 @@ impl ExecNtHandler {
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
-        let listen_handle = SRM_COMMAND_PORT_HANDLE.load(Ordering::Relaxed);
-        if listen_handle == 0 {
+        let Some(listen_handle) = self.lpc_port_handle_for_name16(name16) else {
             print_str(b"[srm-rdv] \\SeRmCommandPort is not registered in the LPC broker\n");
             return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
+        };
 
         let Some(lpc) = lpc_client() else {
             print_str(b"[srm-rdv] LPC broker unavailable for \\SeRmCommandPort connect\n");
@@ -8390,6 +8419,11 @@ impl ExecNtHandler {
             print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) from non-CSR client role -> failing\n");
             CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
             return 0xC000_0001;
+        }
+        if self.lpc_port_handle_for_name16(name16).is_none() {
+            print_str(b"[csr] NtSecureConnectPort(\\Windows\\ApiPort) has no named port object -> failing\n");
+            CSR_RENDEZVOUS_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return 0xC000_0034;
         }
         let mut pending = false;
         if let Some(c) = lpc_client() {
@@ -8603,7 +8637,7 @@ impl ExecNtHandler {
         }
         let mut e = ObjEntry::dir(leaf, parent as u8);
         e.kind = kind;
-        if kind == 1 {
+        if kind == OBJ_KIND_SYMBOLIC_LINK {
             let t = target.len().min(40);
             e.target[..t].copy_from_slice(&target[..t]);
             e.target_len = t as u8;
@@ -8611,6 +8645,59 @@ impl ExecNtHandler {
         self.obj_ns.push(e);
         Some(self.obj_ns.len() - 1)
     }
+
+    pub(crate) fn lpc_port_handle_by_ascii(&self, path: &[u8]) -> Option<u64> {
+        let index = self.obj_resolve(path, 0)?;
+        let entry = self.obj_ns.get(index)?;
+        if entry.kind == OBJ_KIND_LPC_PORT && entry.payload != 0 {
+            Some(entry.payload)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn lpc_port_handle_for_name16(&self, name16: &[u16]) -> Option<u64> {
+        let mut nbuf = [0u8; 40];
+        let nlen = Self::fold_name(name16, &mut nbuf);
+        if nlen == 0 {
+            return None;
+        }
+        self.lpc_port_handle_by_ascii(&nbuf[..nlen])
+    }
+
+    pub(crate) fn register_lpc_port_object(
+        &mut self,
+        name16: &[u16],
+        root_idx: usize,
+        handle: u64,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+        const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+
+        if handle == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let mut nbuf = [0u8; 40];
+        let nlen = Self::fold_name(name16, &mut nbuf);
+        if nlen == 0 {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        if let Some(index) = self.obj_resolve(&nbuf[..nlen], root_idx) {
+            if self.obj_ns[index].kind != OBJ_KIND_LPC_PORT {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
+            self.obj_ns[index].payload = handle;
+            return Ok(index);
+        }
+        let Some(index) = self.obj_create(&nbuf[..nlen], root_idx, OBJ_KIND_LPC_PORT, &[]) else {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        };
+        self.obj_ns[index].payload = handle;
+        Ok(index)
+    }
+
     /// Create a fresh ANONYMOUS (unnamed) event object (kind==2). Each call makes a DISTINCT obj_ns
     /// entry — no dedup — carrying a unique synthetic name under a private parent (250) so it is never
     /// found by name-resolution but is still a real, waitable/signalable event. `auto_reset` marks it
@@ -8635,7 +8722,7 @@ impl ExecNtHandler {
             ((n >> 16) & 0xff) as u8,
         ];
         let mut e = ObjEntry::dir(&name, 250);
-        e.kind = 2;
+        e.kind = OBJ_KIND_EVENT;
         self.obj_ns.push(e);
         let index = self.obj_ns.len() - 1;
         self.events.initialize(
@@ -8666,7 +8753,7 @@ impl ExecNtHandler {
             ((n >> 16) & 0xff) as u8,
         ];
         let mut entry = ObjEntry::dir(&name, 250);
-        entry.kind = 3;
+        entry.kind = OBJ_KIND_SEMAPHORE;
         self.obj_ns.push(entry);
         let index = self.obj_ns.len() - 1;
         if self
@@ -8693,7 +8780,7 @@ impl ExecNtHandler {
             ((n >> 16) & 0xff) as u8,
         ];
         let mut entry = ObjEntry::dir(&name, 250);
-        entry.kind = 4;
+        entry.kind = OBJ_KIND_MUTANT;
         self.obj_ns.push(entry);
         let index = self.obj_ns.len() - 1;
         self.mutants.initialize(index as u64, initial_owner);
@@ -10746,6 +10833,8 @@ impl ExecNtHandler {
             // NtConnectPort. Writing to R10 via the out-writer queue (csrss: a .data global; smss: a
             // stack local) lands the handle where the caller reads it → SmConnectToSm reaches connect.
             NativeService::NtCreatePort => unsafe {
+                const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+                const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
                 // Robust .rdata-capable name read (csrss's \Windows\ApiPort name is in csrsrv .rdata,
                 // unreachable by the mirror-only smss_read_objattr_name) so the port registers under
                 // its real name → winlogon's NtSecureConnectPort matches it → the authentic CSR accept.
@@ -10753,31 +10842,39 @@ impl ExecNtHandler {
                 if name16.is_empty() {
                     name16 = smss_read_objattr_name(args[1]);
                 }
-                // csrss's OA + ObjectName UNICODE_STRING are csrsrv .data globals unreachable by the
-                // mirror/scratch readers → the name reads EMPTY, so the port would register unnamed and
-                // winlogon's NtSecureConnectPort(\Windows\ApiPort) could not match it. csrss creates
-                // exactly two ports, in a fixed order: CsrApiPortInitialize(\Windows\ApiPort) then
-                // CsrSbApiPortInitialize(\Windows\SbApiPort). Assign the canonical name by order so the
-                // ports register correctly → the authentic CSR accept can find the pending connection.
-                if self.current_process_is_csrss() && name16.is_empty() {
-                    let n = CSR_CREATEPORT_N.fetch_add(1, Ordering::Relaxed);
-                    let canon: &str = if n == 0 { "\\Windows\\ApiPort" } else { "\\Windows\\SbApiPort" };
-                    name16 = canon.encode_utf16().collect();
+                if name16.is_empty() {
+                    print_str(b"[lpc-port] NtCreatePort missing ObjectName -> failing\n");
+                    return STATUS_OBJECT_NAME_INVALID;
                 }
-                let handle = lpc_client()
-                    .and_then(|c| {
-                        c.create_port(&name16, args[2] as u32, args[3] as u32, 0).ok()
-                    })
-                    .unwrap_or_else(|| {
-                        self.mint_handle()
-                    });
+
+                let mut root_bytes = [0u8; 8];
+                let _ = self.xas_read(args[1] + 8, &mut root_bytes);
+                let root_dir = u64::from_le_bytes(root_bytes);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+
+                let Some(client) = lpc_client() else {
+                    print_str(b"[lpc-port] broker unavailable for NtCreatePort -> failing\n");
+                    return STATUS_UNSUCCESSFUL;
+                };
+                let handle = match client.create_port(&name16, args[2] as u32, args[3] as u32, 0) {
+                    Ok(handle) if handle != 0 => handle,
+                    Ok(_) => return STATUS_UNSUCCESSFUL,
+                    Err(status) => return status.raw() as u32,
+                };
+                match self.register_lpc_port_object(&name16, root_idx, handle) {
+                    Ok(_) => {}
+                    Err(status) => return status,
+                }
                 self.queue_write(args[0], handle);
                 // ★ LSA RENDEZVOUS (identify the server port). lsass' lsasrv `StartAuthenticationPort`
                 // (`references/reactos/dll/win32/lsasrv/authport.c:364`) creates `\LsaAuthenticationPort`
                 // and hands the handle to its `AuthPortThreadRoutine`, which then blocks in
-                // `NtReplyWaitReceivePort(AuthPortHandle, …)`. Record the broker handle here so the loop
-                // can recognise THAT receive as the LSA server's, park it with its reply capability
-                // retained, and later wake it with winlogon's connection request (`lsa_rendezvous`).
+                // `NtReplyWaitReceivePort(AuthPortHandle, …)`. The loop recognizes that handle by
+                // resolving the named port object, not by a creation-order or global-handle side table.
                 {
                     let mut nb = [0u8; 48];
                     let nlen = Self::fold_name(&name16, &mut nb);
@@ -10786,7 +10883,7 @@ impl ExecNtHandler {
                             .windows(b"lsaauthenticationport".len())
                             .any(|w| w == b"lsaauthenticationport")
                     {
-                        LSA_AUTH_PORT_HANDLE.store(handle, Ordering::Relaxed);
+                        LSA_AUTH_PORT_OBJECT_HANDLE.store(handle, Ordering::Relaxed);
                         print_str(b"[lsa-rdv] lsass NtCreatePort(\\LsaAuthenticationPort) -> broker port handle=0x");
                         print_hex((handle >> 32) as u32);
                         print_hex(handle as u32);
@@ -11741,6 +11838,19 @@ impl ExecNtHandler {
                         &conn_info[..conn_info_len],
                         args[0],
                     );
+                }
+                if self.lpc_port_handle_for_name16(&name16).is_none() {
+                    print_str(b"[lpc-connect] no named LPC port object for ");
+                    for &unit in name16.iter().take(64) {
+                        let byte = if (0x20..=0x7e).contains(&unit) {
+                            unit as u8
+                        } else {
+                            b'?'
+                        };
+                        print_str(core::slice::from_ref(&byte));
+                    }
+                    print_str(b" -> failing\n");
+                    return 0xC000_0034;
                 }
                 match lpc_client().map(|c| {
                     c.connect_port(
@@ -13238,8 +13348,11 @@ impl ExecNtHandler {
                         let name16: alloc::vec::Vec<u16> =
                             e.name().iter().map(|&b| b as u16).collect();
                         let type_name = match e.kind {
-                            2 => "Event",
-                            1 => "SymbolicLink",
+                            OBJ_KIND_EVENT => "Event",
+                            OBJ_KIND_SYMBOLIC_LINK => "SymbolicLink",
+                            OBJ_KIND_SEMAPHORE => "Semaphore",
+                            OBJ_KIND_MUTANT => "Mutant",
+                            OBJ_KIND_LPC_PORT => "Port",
                             _ => "Directory",
                         };
                         records.push((name16, type_name));
