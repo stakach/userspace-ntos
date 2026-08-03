@@ -41,30 +41,6 @@ fn win32k_client_label<'a>(nt_handler: &'a ExecNtHandler, pi: usize) -> &'a [u8]
     nt_handler.hosted_process_leaf(pi).unwrap_or(b"client")
 }
 
-fn hosted_process_uses_client_gdi(nt_handler: &ExecNtHandler, pi: usize) -> bool {
-    match nt_handler.hosted_process_role(pi) {
-        Some(
-            nt_exe_image::HostedProcessRole::InteractiveLogon
-            | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-            | nt_exe_image::HostedProcessRole::InteractiveShell,
-        ) => true,
-        _ => false,
-    }
-}
-
-fn hosted_process_requires_staged_user_message_buffer(
-    nt_handler: &ExecNtHandler,
-    pi: usize,
-) -> bool {
-    matches!(
-        nt_handler.hosted_process_role(pi),
-        Some(
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-                | nt_exe_image::HostedProcessRole::InteractiveShell
-        )
-    )
-}
-
 fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_va: u64) {
     let Some(image) = nt_handler.hosted_process_image(pi) else {
         return;
@@ -89,24 +65,6 @@ fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_v
         print_hex(gdi_va as u32);
         print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
     }
-}
-
-fn hosted_process_is_noninteractive_service_gui_client(
-    nt_handler: &ExecNtHandler,
-    pi: usize,
-) -> bool {
-    nt_handler.hosted_process_role(pi)
-        == Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
-}
-
-fn hosted_process_is_interactive_shell_gui_client(nt_handler: &ExecNtHandler, pi: usize) -> bool {
-    matches!(
-        nt_handler.hosted_process_role(pi),
-        Some(
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-                | nt_exe_image::HostedProcessRole::InteractiveShell
-        )
-    )
 }
 
 fn ntgdi_bitmap_format_rgb(bits: u32) -> u32 {
@@ -4987,7 +4945,9 @@ pub(crate) unsafe fn service_sec_image(
             // lsass' generic ntdll thread-pool worker is where rpcrt4 runs `RPCRT4_worker_thread`
             // (`QueueUserWorkItem`, rpc_server.c:591) — i.e. the actual `LsarOpenPolicy` server-stub
             // dispatch. Trace it so the RPC dispatch is visible, not a black box.
-            if is_tp_worker && pi == 4 {
+            let trace_process_role = nt_handler.hosted_process_role(pi);
+            let trace_is_lsass = hosted_pi_has_leaf(&nt_handler, pi, b"lsass.exe");
+            if is_tp_worker && trace_is_lsass {
                 let dn = LSA_TP_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
                 if dn < 64 {
                     print_str(b"[lsa-tp-ssn] #");
@@ -5006,13 +4966,29 @@ pub(crate) unsafe fn service_sec_image(
             // FORWARD-PROGRESS CENSUS: per-SSN histogram for the two processes that matter to the
             // starvation question — lsass (whose self-RPC is suspected of churning) and winlogon
             // (whose SAS window the paint depends on). A poll/retry livelock is unmistakable here.
-            if pi == 4 || pi == 2 || pi == 1 || pi == 6 {
+            if trace_is_lsass
+                || matches!(
+                    trace_process_role,
+                    Some(
+                        nt_exe_image::HostedProcessRole::Win32Subsystem
+                            | nt_exe_image::HostedProcessRole::InteractiveLogon
+                            | nt_exe_image::HostedProcessRole::InteractiveShell
+                    )
+                )
+            {
                 let bucket = ssn_bucket(ssn);
-                match pi {
-                    4 => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                    2 => WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                    1 => CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
-                    _ => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                match trace_process_role {
+                    _ if trace_is_lsass => LSASS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
+                    Some(nt_exe_image::HostedProcessRole::InteractiveLogon) => {
+                        WINLOGON_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed)
+                    }
+                    Some(nt_exe_image::HostedProcessRole::Win32Subsystem) => {
+                        CSRSS_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed)
+                    }
+                    Some(nt_exe_image::HostedProcessRole::InteractiveShell) => {
+                        EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed)
+                    }
+                    _ => 0,
                 };
             }
             if is_lsa_worker {
@@ -5076,7 +5052,10 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
-            if pi == 6 {
+            let syscall_process_role = nt_handler.hosted_process_role(pi);
+            let syscall_is_explorer =
+                syscall_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
+            if syscall_is_explorer {
                 let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
                 if active_depth != 0 {
                     let n = EXPLORER_CALLBACK_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
@@ -5109,7 +5088,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             }
-            if pi == 6 && m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE {
+            if syscall_is_explorer && m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE {
                 let n = EXPLORER_FLUSH_ICACHE_TRACE.fetch_add(1, Ordering::Relaxed);
                 if n < 32 {
                     let (active_depth, continuation_depth) =
@@ -6642,7 +6621,31 @@ pub(crate) unsafe fn service_sec_image(
                     || is_wl_worker
                     || (is_tp_worker && pi != 0))
             {
-                let dialog_modal_expected_ssn = if pi == 2 {
+                let process_role = nt_handler.hosted_process_role(pi);
+                let winlogon_gui_client =
+                    process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
+                let userinit_gui_client = process_role
+                    == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap);
+                let explorer_gui_client =
+                    process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
+                let shell_gui_client = matches!(
+                    process_role,
+                    Some(
+                        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                            | nt_exe_image::HostedProcessRole::InteractiveShell
+                    )
+                );
+                let uses_client_gdi = matches!(
+                    process_role,
+                    Some(
+                        nt_exe_image::HostedProcessRole::InteractiveLogon
+                            | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+                            | nt_exe_image::HostedProcessRole::InteractiveShell
+                    )
+                );
+                let svc_noninteractive =
+                    process_role == Some(nt_exe_image::HostedProcessRole::NonInteractiveService);
+                let dialog_modal_expected_ssn = if winlogon_gui_client {
                     winlogon_dialog_modal_expected_ssn()
                 } else {
                     0
@@ -6665,7 +6668,7 @@ pub(crate) unsafe fn service_sec_image(
                         WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
                     }
                 }
-                let sas_hwnd = if pi == 2 {
+                let sas_hwnd = if winlogon_gui_client {
                     core::ptr::read_volatile(
                         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND)
                             as *const u64,
@@ -6673,10 +6676,10 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     0
                 };
-                if pi == 2 {
+                if winlogon_gui_client {
                     observe_winlogon_sas_logon_state();
                 }
-                if pi == 2
+                if winlogon_gui_client
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
                     && !winlogon_dialog_modal_target_alive()
@@ -6695,7 +6698,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[dialog-pump] correlated IDD_LOGON was destroyed; parking modal GetMessage\n");
                     handled = false;
                     wl_milestone_park = true;
-                } else if pi == 2
+                } else if winlogon_gui_client
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
                     && winlogon_dialog_modal_thread_matches(
@@ -6710,7 +6713,7 @@ pub(crate) unsafe fn service_sec_image(
                     // that stands in for Ctrl-Alt-Del), then let this GetMessage run — the queue is
                     // non-empty, so it returns instead of blocking win32k. When there is nothing
                     // left to type the blocking GetMessage is parked as before.
-                    let peb_mirror = hosted_peb_mirror_for_pi(2);
+                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
@@ -6733,7 +6736,7 @@ pub(crate) unsafe fn service_sec_image(
                         handled = false;
                         wl_milestone_park = true;
                     }
-                } else if pi == 2
+                } else if winlogon_gui_client
                     && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && sas_hwnd != 0
                     && m3 == sas_hwnd
@@ -6910,18 +6913,20 @@ pub(crate) unsafe fn service_sec_image(
                     // character runs the real edit control's caret/invalidate/repaint cycle on top
                     // of the dialog's own pump. Grant the headroom only once keystrokes are in.
                     const W32_CREDENTIAL_LIMIT: u64 = 12288;
-                    let limit = if pi == 2 && winlogon_credential_started() {
+                    let limit = if winlogon_gui_client && winlogon_credential_started() {
                         W32_CREDENTIAL_LIMIT
-                    } else if pi == 2 && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0 {
+                    } else if winlogon_gui_client
+                        && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+                    {
                         W32_IDD_LOGON_LIMIT
-                    } else if pi == 2
+                    } else if winlogon_gui_client
                         && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
                         && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) != 0
                     {
                         W32_POST_SAS_DIALOG_LIMIT
-                    } else if pi == 2 && win32k_glue::real_resource_callback_started() {
+                    } else if winlogon_gui_client && win32k_glue::real_resource_callback_started() {
                         W32_RESOURCE_CALLBACK_LIMIT
-                    } else if pi == 6 && EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0 {
+                    } else if explorer_gui_client && EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0 {
                         W32_EXPLORER_STARTUP_LIMIT
                     } else {
                         W32_TOTAL_LIMIT
@@ -7041,12 +7046,11 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                let msg_syscall =
-                    hosted_process_requires_staged_user_message_buffer(&nt_handler, pi)
-                        && a0 != 0
-                        && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
-                            || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
-                            || m0 == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN);
+                let msg_syscall = shell_gui_client
+                    && a0 != 0
+                    && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                        || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+                        || m0 == nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN);
                 let msg_returns_to_client = msg_syscall
                     && (m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                         || m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN);
@@ -7196,7 +7200,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if captured != d_a0 {
                         d_a0 = captured;
-                        if pi == 6 {
+                        if explorer_gui_client {
                             EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
                                 .fetch_add(1, Ordering::Relaxed);
                         }
@@ -7294,8 +7298,7 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
-                } else if m0 == 0x106c && sp != 0 && hosted_process_uses_client_gdi(&nt_handler, pi)
-                {
+                } else if m0 == 0x106c && sp != 0 && uses_client_gdi {
                     // NtGdiCreateBitmap's fifth argument is an optional client pointer to
                     // initialized bitmap bits. ReactOS probes and copies that range before
                     // UnsafeSetBitmapBits; isolated win32k must receive a pointer in its own address
@@ -7533,7 +7536,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == NTUSER_MESSAGE_CALL_SSN {
                     message_call_probe_failed = true;
-                } else if m0 == 0x10cb && hosted_process_uses_client_gdi(&nt_handler, pi) {
+                } else if m0 == 0x10cb && uses_client_gdi {
                     // NtGdiGetCharWidthW copies an optional caller WCHAR/glyph array and then writes
                     // Count INT/FLOAT-sized widths back to the caller. Stage both sides explicitly so
                     // nested win32k dispatches do not discover fl/Buffer through a foreign stack.
@@ -7656,7 +7659,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         char_width_probe_failed = true;
                     }
-                } else if m0 == 0x11d9 && hosted_process_uses_client_gdi(&nt_handler, pi) {
+                } else if m0 == 0x11d9 && uses_client_gdi {
                     // NtGdiGetTextExtentExW has one client input buffer and three possible output
                     // buffers in its stack tail. Isolated win32k must see only win32k-owned VAs; the
                     // executive copies results back to the hosted client after a TRUE service return.
@@ -7834,7 +7837,7 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         text_extent_probe_failed = true;
                     }
-                } else if m0 == 0x10de && pi != 3 && pi != 4 {
+                } else if m0 == 0x10de && uses_client_gdi {
                     // NtGdiOpenDCW probes/copies the caller's optional device name before opening
                     // the DC. Capture interactive clients' counted strings at the executive boundary
                     // so nested GDI calls from user callbacks do not hand isolated win32k a foreign
@@ -7931,7 +7934,7 @@ pub(crate) unsafe fn service_sec_image(
                             create_window_probe_failed = true;
                         }
                     }
-                    if pi == 6 {
+                    if explorer_gui_client {
                         // Explorer reaches this path with create-window strings outside the main image
                         // window. Capture them generically so isolated win32k never sees foreign VAs.
                         prefill_client_large_string_pages(
@@ -8017,15 +8020,11 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         );
                     }
-                } else if m0 == 0x1080
-                    && hosted_process_is_interactive_shell_gui_client(&nt_handler, pi)
-                {
+                } else if m0 == 0x1080 && shell_gui_client {
                     // NtUserDefSetText takes HWND plus a client PLARGE_STRING. It often runs from
                     // DefWindowProc while win32k is parked in a user callback; capture the counted
                     // string before isolated win32k probes the client's raw pointer graph.
-                    if nt_handler.hosted_process_role(pi)
-                        == Some(nt_exe_image::HostedProcessRole::InteractiveShell)
-                    {
+                    if explorer_gui_client {
                         prefill_client_large_string_pages(
                             pi as u64,
                             d_a1,
@@ -8058,7 +8057,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if captured != d_a2 {
                         d_a2 = captured;
-                        if pi == 5 {
+                        if userinit_gui_client {
                             let n = USERINIT_WALLPAPER_SPI_CAPTURES.fetch_add(1, Ordering::Relaxed);
                             if n < 4 {
                                 print_str(b"[w32marshal] userinit captured SPI_SETDESKWALLPAPER UNICODE_STRING arg=0x");
@@ -8391,10 +8390,6 @@ pub(crate) unsafe fn service_sec_image(
                 // services.exe and lsass.exe are non-interactive service hosts on a WSS_NOIO window
                 // station, and neither should enter win32k's interactive cursor/class/stock-object
                 // EngCopyBits path while initializing service DLLs.
-                let svc_noninteractive =
-                    hosted_process_is_noninteractive_service_gui_client(&nt_handler, pi);
-                let shell_gui_client =
-                    hosted_process_is_interactive_shell_gui_client(&nt_handler, pi);
                 // Shell GUI clients ask win32k for class atom names from inside nested user
                 // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
                 // mirror-backed names are served before dispatch; misses stay visible.
@@ -8863,7 +8858,10 @@ pub(crate) unsafe fn service_sec_image(
                     // es->text + col, count, …)` (args 5..9 ride the win64 stack tail). The string
                     // it hands GDI IS the control's live text buffer, so matching our injected user
                     // name there proves the real edit control holds what was typed into it.
-                    if pi == 2 && m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN && sp != 0 {
+                    if winlogon_gui_client
+                        && m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
+                        && sp != 0
+                    {
                         let string = client_read_u64_mapped(
                             pi as u64,
                             sp + 0x30,
@@ -9068,7 +9066,7 @@ pub(crate) unsafe fn service_sec_image(
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
                     // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.
-                    if pi == 2 && (m0 == 0x1006 || m0 == 0x1001) && a0 != 0 {
+                    if winlogon_gui_client && (m0 == 0x1006 || m0 == 0x1001) && a0 != 0 {
                         let msg_ptr = if msg_returns_to_client {
                             win32k_subsystem::WIN32K_ARG_VADDR
                         } else {
@@ -9352,7 +9350,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                if pi == 2 && ok && !redirected_user_callback {
+                if winlogon_gui_client && ok && !redirected_user_callback {
                     if m0 == 0x10a8 && st != 0 {
                         if let Some(key) = cursor_identity_key.as_ref() {
                             nt_handler.observe_global_cursor_identity(key, a0 as u32);
@@ -9425,7 +9423,7 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some((client_deskinfo, pti, delta)) =
                         seed_gui_thread_client_info(pi, teb_alias, pml4)
                     {
-                        if pi == 2 {
+                        if winlogon_gui_client {
                             if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
                                 print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
                                 print_hex((client_deskinfo >> 32) as u32);
@@ -9464,7 +9462,7 @@ pub(crate) unsafe fn service_sec_image(
                 // their VSpace before client-side GdiValidateHandle runs. Winlogon needs this for the
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
-                if hosted_process_uses_client_gdi(&nt_handler, pi) {
+                if uses_client_gdi {
                     let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
                     let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
                     if gdi_va != 0 && gdi_attributes {
@@ -9485,7 +9483,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = nt_user_callback::STATUS_PENDING as u32 as u64;
                 } else if ok {
                     result = st; // pointer-width NtUser/NtGdi return value back to the caller
-                    if pi == 2 && m0 == 0x1077 && st != 0 {
+                    if winlogon_gui_client && m0 == 0x1077 && st != 0 {
                         observe_winlogon_completed_dispatch(
                             win32k_glue::CompletedWin32kDispatch {
                                 ssn: m0,
@@ -9507,7 +9505,7 @@ pub(crate) unsafe fn service_sec_image(
                     // parks below: winlogon's TCB stays blocked at this proven-advanced steady state, the boot
                     // quiesces, and the gate runs cleanly. Gated on the SAS HWND milestone so we only park
                     // once winlogon actually created its window (never on the old NULL-HWND failure path).
-                    if pi == 2
+                    if winlogon_gui_client
                         && m0 == 0x127c
                         && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
                     {
@@ -10059,7 +10057,11 @@ pub(crate) unsafe fn service_sec_image(
                         // do NOT treat a spawned-but-faulted worker as keeping the server live (that would
                         // hang the loop's recv with no signaler → boot timeout). Once the listener exits
                         // there is no signaler for winlogon's SCM read, so parking is terminal → quiesce.
-                        let scm_server_live = pi == 2
+                        let scm_server_live = hosted_pi_has_role(
+                            &nt_handler,
+                            pi,
+                            nt_exe_image::HostedProcessRole::InteractiveLogon,
+                        )
                             && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                             && PIPE_LISTEN_SIGNALLED_COUNT.load(Ordering::Relaxed) != 0
                             && SVC_LISTENER_TERMINATED.load(Ordering::Relaxed) == 0
@@ -10072,8 +10074,11 @@ pub(crate) unsafe fn service_sec_image(
                             // Terminal backstop: winlogon's SCM read parking with NO live server signaler
                             // (no listen ever signalled, or the listener has exited) after LSA is signalled
                             // is its steady state — run the gate rather than block recv forever.
-                            if pi == 2
-                                && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                            if hosted_pi_has_role(
+                                &nt_handler,
+                                pi,
+                                nt_exe_image::HostedProcessRole::InteractiveLogon,
+                            ) && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                             {
                                 print_str(b"[wl-main] winlogon SCM-RPC read parked (no live server signaler) + LSA signalled -> QUIESCE; run gate\n");
                                 stop = resume_ip;
@@ -14629,7 +14634,11 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
     if outcome == 1 {
         LSA_CONNECT_COMPLETED.fetch_add(1, Ordering::Relaxed);
         LSA_OPERATIONAL_MODE.store(operational_mode, Ordering::Relaxed);
-        if cli_pi == 2 {
+        if hosted_pi_has_role(
+            nt_handler,
+            cli_pi,
+            nt_exe_image::HostedProcessRole::InteractiveLogon,
+        ) {
             WINLOGON_LSA_PORT_HANDLE.store(client_handle, Ordering::Relaxed);
             WINLOGON_LSA_CONNECTED.store(1, Ordering::Relaxed);
         }

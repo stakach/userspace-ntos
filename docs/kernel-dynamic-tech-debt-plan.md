@@ -946,3 +946,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: the root user32/GDI mirror state from F1 is now gone; F1 remains open for the
   remaining semantic WSS_NOIO service GUI/GDI branches and the larger provider-owned per-process
   GUI/GDI ownership model.
+- A2/C3/F1 cleanup. Win32k dispatch and user-callback completion diagnostics no longer key their
+  winlogon/userinit/explorer/service decisions off fixed hosted-process slots. The service-loop
+  dispatcher now snapshots the registered hosted-process role once per win32k dispatch, uses that
+  metadata for modal-pump budgeting, GDI/client-buffer marshalling, USERCONNECT/GDI shared-table
+  publication, shell message staging, and winlogon/userinit/explorer proof counters, and removes the
+  old helper predicates that wrapped static `pi` checks. Callback completion and NCCREATE tracing now
+  classify clients through the process role carried by the active callback frame. Validation:
+  `rustfmt --edition 2021 --config skip_children=true components/ntos-executive/src/service_sec_image.rs components/ntos-executive/src/win32k_glue.rs`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: A2/C3/F1 remain open for the remaining measured
+  winlogon frontier probes, semantic WSS_NOIO service branches, and the final provider-owned
+  per-process GUI/GDI ownership model.

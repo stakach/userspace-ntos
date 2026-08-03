@@ -728,6 +728,17 @@ unsafe fn bind_client_callback_window(
     let _ = (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
         .record_bridged_window(correlation, [hwnd, client_pwnd, activation_context]);
     if message == 0x0081 {
+        let identity = nt_user_callback::ClientThreadIdentity::new(
+            request.client_pi,
+            request.client_tid,
+            request.client_badge,
+        );
+        let client_is_explorer = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
+            .top_for(&identity)
+            .is_some_and(|frame| {
+                callback_process_role_from_code(frame.client_process_role())
+                    == Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+            });
         print_str(b"[callback-wnd] WM_NCCREATE hwnd=0x");
         print_hex(hwnd as u32);
         print_str(b" server-pwnd=0x");
@@ -742,7 +753,7 @@ unsafe fn bind_client_callback_window(
             print_str(b" fnid=0x");
             print_hex(core::ptr::read_volatile((server_pwnd + 0x40) as *const u32));
         }
-        if request.client_pi == 6 {
+        if client_is_explorer {
             let n = USER_CALLBACK_EXPLORER_NCCREATE_TRACES.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 let frame = (win32k_subsystem::WIN32K_SHARED_VADDR
@@ -2455,6 +2466,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     let Some(active_frame) = active.top_for(&identity).copied() else {
         return None;
     };
+    let client_process_role = callback_process_role_from_code(active_frame.client_process_role());
+    let client_is_winlogon =
+        client_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon);
+    let client_is_explorer =
+        client_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
     let request = *active_frame.request();
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
@@ -2495,7 +2511,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
             result_length as usize,
         );
-        if (client_pi == 2 || client_pi == 6) && request_window_message == 0x0081 {
+        if (client_is_winlogon || client_is_explorer) && request_window_message == 0x0081 {
             let expected = nt_user_callback::UserCallbackStackLayout::below(
                 active_frame.saved_user_context()[nt_user_callback::USER_CONTEXT_RSP],
                 request.input_length as usize,
@@ -2570,7 +2586,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_hex(result0 as u32);
             print_str(b"\n");
         }
-        if client_pi == 6
+        if client_is_explorer
             && request_window_message == 0x0081
             && result_length >= 0x40
             && callback_payload_u64(frame, 0x38) == 0
@@ -2588,7 +2604,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             }
         }
     }
-    if client_pi == 2
+    if client_is_winlogon
         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
         && request_window_message != u32::MAX
     {
