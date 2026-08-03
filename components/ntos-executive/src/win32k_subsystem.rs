@@ -270,12 +270,17 @@ pub const SH_REQ_TOKEN_AUTH: u64 = 0x1B8; // in: packed primary-token Authentica
 pub const SH_REQ_TOKEN_USER_SID_LEN: u64 = 0x1C0; // in: native user SID byte length
 pub const SH_REQ_TOKEN_USER_SID_PTR: u64 = 0x1C8; // in: component VA of native user SID bytes
 pub const WIN32K_TOKEN_USER_SID_MAX: usize = 68; // SID header + 15 sub-authorities
+pub const SH_GDI_LOAD_LEAF_LEN: u64 = 0x1D0; // in: ASCII driver leaf byte length
+pub const SH_GDI_LOAD_STATUS: u64 = 0x1D8; // out: executive load NTSTATUS
+pub const SH_GDI_LOAD_LEAF: u64 = 0x1E0; // in: lower-case ASCII driver leaf bytes
+pub const SH_GDI_LOAD_LEAF_CAP: usize = 24;
 pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
+const _: () = assert!(SH_GDI_LOAD_LEAF + SH_GDI_LOAD_LEAF_CAP as u64 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 pub const HOSTED_PROCESS_ROLE_NONE: u64 = 0;
@@ -517,6 +522,10 @@ pub const W32_USER_CALLBACK_LABEL: u64 = 0x772;
 /// synchronous callback Call reply, this leaves the sole win32k TCB runnable as a nested-dispatch
 /// receiver while the user callback executes.
 pub const W32_USER_CALLBACK_RESUME_LABEL: u64 = 0x773;
+/// A component-side `ZwSetSystemInformation(SystemLoadGdiDriverInformation)` request. The trampoline
+/// cannot do executive-owned filesystem/capability work in win32k's VSpace, so it sends the bounded
+/// driver leaf through the shared page and waits while the executive performs the real load.
+pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
@@ -4561,6 +4570,77 @@ unsafe fn registered_gdi_driver_for_name(
     None
 }
 
+fn registered_gdi_driver_for_leaf(leaf: &[u8]) -> Option<GdiDriverRecord> {
+    let records = unsafe { &*core::ptr::addr_of!(GDI_DRIVER_RECORDS) };
+    for rec in records.iter() {
+        if rec.leaf_len != 0 && ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
+            return Some(*rec);
+        }
+    }
+    None
+}
+
+pub(crate) fn gdi_driver_registered(leaf: &[u8]) -> bool {
+    registered_gdi_driver_for_leaf(leaf).is_some()
+}
+
+unsafe fn gdi_driver_leaf_from_wname(
+    name_buf: u64,
+    name_len: usize,
+    out: &mut [u8],
+) -> Option<usize> {
+    if name_len == 0 || name_len % 2 != 0 || name_buf == 0 {
+        return None;
+    }
+    let chars = name_len / 2;
+    let mut start = 0usize;
+    for i in 0..chars {
+        let unit = read_unaligned((name_buf + (i * 2) as u64) as *const u16);
+        if unit == b'\\' as u16 || unit == b'/' as u16 {
+            start = i + 1;
+        }
+    }
+    let leaf_chars = chars.checked_sub(start)?;
+    if leaf_chars == 0 || leaf_chars > out.len() {
+        return None;
+    }
+    for i in 0..leaf_chars {
+        let unit = read_unaligned((name_buf + ((start + i) * 2) as u64) as *const u16);
+        if unit > 0x7f {
+            return None;
+        }
+        out[i] = (unit as u8).to_ascii_lowercase();
+    }
+    Some(leaf_chars)
+}
+
+unsafe fn request_gdi_driver_load(leaf: &[u8]) -> i32 {
+    if leaf.is_empty() || leaf.len() > SH_GDI_LOAD_LEAF_CAP {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF_LEN) as *mut u64,
+        leaf.len() as u64,
+    );
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *mut i32,
+        0x0000_0103, // STATUS_PENDING, overwritten by the executive before reply.
+    );
+    for i in 0..SH_GDI_LOAD_LEAF_CAP {
+        let b = if i < leaf.len() {
+            leaf[i].to_ascii_lowercase()
+        } else {
+            0
+        };
+        write_volatile(
+            (WIN32K_SHARED_VADDR + SH_GDI_LOAD_LEAF + i as u64) as *mut u8,
+            b,
+        );
+    }
+    let (_label, _tag, _, _, _) = crate::driver_launch::call_on(W32_GDI_LOAD_LABEL << 12);
+    read_volatile((WIN32K_SHARED_VADDR + SH_GDI_LOAD_STATUS) as *const i32)
+}
+
 extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
     const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
     if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
@@ -4570,6 +4650,17 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
         let name_len = read_unaligned(buf as *const u16) as usize;
         let name_buf = read_unaligned((buf + 8) as *const u64);
+        let mut requested_leaf = [0u8; GDI_DRIVER_LEAF_CAP];
+        if let Some(leaf_len) = gdi_driver_leaf_from_wname(name_buf, name_len, &mut requested_leaf)
+        {
+            let leaf = &requested_leaf[..leaf_len];
+            if !gdi_driver_registered(leaf) {
+                let status = request_gdi_driver_load(leaf);
+                if status != 0 {
+                    return status;
+                }
+            }
+        }
         let Some(driver) = registered_gdi_driver_for_name(name_buf, name_len) else {
             print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
             return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
@@ -4714,6 +4805,10 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
             },
         )
     }
+}
+
+pub(crate) fn publish_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
+    register_display_device_route(spec)
 }
 
 fn strip_ascii_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {

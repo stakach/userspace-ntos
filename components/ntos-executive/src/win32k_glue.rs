@@ -67,6 +67,8 @@ static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequen
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
+static WIN32K_GDI_LOADER_PML4: AtomicU64 = AtomicU64::new(0);
+static DXGTHK_DRIVER_LOADED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub(crate) struct CompletedWin32kDispatch {
@@ -3304,36 +3306,144 @@ pub(crate) unsafe fn load_one_driver(
     Some(res)
 }
 
-/// Pre-load dxg.sys + its dxgthk.sys dependency into win32k's VSpace so win32k's
-/// `ZwSetSystemInformation(SystemLoadGdiDriverInformation)` (from InitializeGreCSRSS →
-/// DxDdStartupDxGraphics) can report the hosted dxg image. dxgthk (leaf) first, then dxg (imports
-/// dxgthk's Eng* + ntoskrnl). Called once at win32k bring-up.
+pub(crate) fn register_win32k_gdi_loader(host_pml4: u64) {
+    WIN32K_GDI_LOADER_PML4.store(host_pml4, Ordering::Relaxed);
+}
+
+fn gdi_leaf_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) unsafe fn ensure_win32k_gdi_driver_loaded(leaf: &[u8]) -> bool {
+    if leaf.is_empty() || win32k_subsystem::gdi_driver_registered(leaf) {
+        return true;
+    }
+    let host_pml4 = WIN32K_GDI_LOADER_PML4.load(Ordering::Relaxed);
+    if host_pml4 == 0 {
+        print_str(b"[win32k-svc] GDI demand-load requested before loader registration\n");
+        return false;
+    }
+
+    if gdi_leaf_eq(leaf, b"dxg.sys") {
+        load_directx_drivers(host_pml4);
+        return win32k_subsystem::gdi_driver_registered(leaf);
+    }
+
+    if let Some(display_spec) = system_hive_display_driver_spec() {
+        let display_spec = display_spec.win32k_spec();
+        if gdi_leaf_eq(leaf, display_spec.display_driver_leaf) {
+            load_display_driver(host_pml4, &display_spec);
+            return win32k_subsystem::gdi_driver_registered(leaf);
+        }
+    }
+
+    let mut layout_id = [0u8; 8];
+    if let Some((layout_id_len, _source)) = registry_keyboard_layout_id(&mut layout_id) {
+        let mut layout_file = [0u8; 32];
+        if let Some(layout_file_len) =
+            system_hive_keyboard_layout_file(&layout_id[..layout_id_len], &mut layout_file)
+        {
+            if gdi_leaf_eq(leaf, &layout_file[..layout_file_len]) {
+                load_keyboard_layout_driver(
+                    host_pml4,
+                    &layout_id[..layout_id_len],
+                    &layout_file[..layout_file_len],
+                );
+                return win32k_subsystem::gdi_driver_registered(leaf);
+            }
+        }
+    }
+
+    false
+}
+
+pub(crate) fn service_gdi_driver_load() -> i32 {
+    unsafe {
+        let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+        let leaf_len =
+            core::ptr::read_volatile((sh + win32k_subsystem::SH_GDI_LOAD_LEAF_LEN) as *const u64)
+                as usize;
+        let status = if leaf_len == 0 || leaf_len > win32k_subsystem::SH_GDI_LOAD_LEAF_CAP {
+            0xC000_000Du32 as i32 // STATUS_INVALID_PARAMETER
+        } else {
+            let mut leaf = [0u8; win32k_subsystem::SH_GDI_LOAD_LEAF_CAP];
+            let mut valid = true;
+            for i in 0..leaf_len {
+                let b = core::ptr::read_volatile(
+                    (sh + win32k_subsystem::SH_GDI_LOAD_LEAF + i as u64) as *const u8,
+                )
+                .to_ascii_lowercase();
+                if !(b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'_'
+                    || b == b'-'
+                    || b == b'.')
+                {
+                    valid = false;
+                }
+                leaf[i] = b;
+            }
+            if !valid || leaf[..leaf_len].windows(2).any(|w| w == b"..") {
+                0xC000_000Du32 as i32
+            } else if ensure_win32k_gdi_driver_loaded(&leaf[..leaf_len]) {
+                0
+            } else {
+                0xC000_0135u32 as i32 // STATUS_DLL_NOT_FOUND
+            }
+        };
+        core::ptr::write_volatile(
+            (sh + win32k_subsystem::SH_GDI_LOAD_STATUS) as *mut i32,
+            status,
+        );
+        status
+    }
+}
+
+/// Demand-load dxg.sys + its dxgthk.sys dependency into win32k's VSpace when win32k asks for dxg
+/// through `ZwSetSystemInformation(SystemLoadGdiDriverInformation)`. dxgthk (leaf) loads first,
+/// then dxg imports dxgthk's Eng* exports plus ntoskrnl.
 pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
+    if win32k_subsystem::gdi_driver_registered(b"dxg.sys") {
+        return;
+    }
     let Some(fs) = exec_fs() else {
         print_str(b"[win32k-svc] DirectX drivers unavailable - executive FS not mounted\n");
         return;
     };
-    let Some((dxgthk_src, dxgthk_size)) =
-        load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxgthk.sys")
-    else {
-        print_str(b"[win32k-svc] dxgthk.sys not found in ReactOS driver directory\n");
-        return;
-    };
-    let Some((_dxgthk_entry, _dxgthk_expdir, dxgthk_len)) = load_one_driver(
-        dxgthk_src,
-        win32k_subsystem::DXGTHK_VA,
-        win32k_subsystem::DXGTHK_LOAD_FRAMES,
-        host_pml4,
-        0,
-    ) else {
-        print_str(b"[win32k-svc] dxgthk load failed\n");
-        return;
-    };
-    let _ = register_system_module(
-        b"reactos\\system32\\drivers\\dxgthk.sys",
-        win32k_subsystem::DXGTHK_VA,
-        dxgthk_len,
-    );
+    let mut dxgthk_size = 0u32;
+    if DXGTHK_DRIVER_LOADED.load(Ordering::Relaxed) == 0 {
+        let Some((dxgthk_src, loaded_dxgthk_size)) =
+            load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxgthk.sys")
+        else {
+            print_str(b"[win32k-svc] dxgthk.sys not found in ReactOS driver directory\n");
+            return;
+        };
+        let Some((_dxgthk_entry, _dxgthk_expdir, dxgthk_len)) = load_one_driver(
+            dxgthk_src,
+            win32k_subsystem::DXGTHK_VA,
+            win32k_subsystem::DXGTHK_LOAD_FRAMES,
+            host_pml4,
+            0,
+        ) else {
+            print_str(b"[win32k-svc] dxgthk load failed\n");
+            return;
+        };
+        let _ = register_system_module(
+            b"reactos\\system32\\drivers\\dxgthk.sys",
+            win32k_subsystem::DXGTHK_VA,
+            dxgthk_len,
+        );
+        DXGTHK_DRIVER_LOADED.store(1, Ordering::Relaxed);
+        dxgthk_size = loaded_dxgthk_size;
+    }
     let Some((dxg_src, dxg_size)) = load_file_to_pool(&fs, b"reactos\\system32\\drivers\\dxg.sys")
     else {
         print_str(b"[win32k-svc] dxg.sys not found in ReactOS driver directory\n");

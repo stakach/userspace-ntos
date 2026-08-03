@@ -16539,16 +16539,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if finished {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
-                // Host the DirectX graphics driver (dxg.sys + dxgthk.sys) into win32k's VSpace so
-                // NtUserInitialize → InitializeGreCSRSS → DxDdStartupDxGraphics (ZwSetSystemInformation
-                // SystemLoadGdiDriverInformation) finds a real hosted dxg image.
-                load_directx_drivers(host_pml4);
+                register_win32k_gdi_loader(host_pml4);
                 // Host ftfd.dll (FreeType font driver) + patch win32k's IAT for its 34 FT_* imports so
                 // InitFontSupport → FT_Init_FreeType initialises the font subsystem for real.
                 load_ftfd_driver(host_pml4);
-                // Host the display driver selected from the real SYSTEM hive and map the BOOTBOOT
-                // framebuffer into win32k, so desktop-graphics init can enable a primary surface on
-                // the real framebuffer.
+                // Publish the display route selected from the real SYSTEM hive before win32k probes
+                // HARDWARE\DEVICEMAP\VIDEO. The display DLL image itself is demand-loaded only when
+                // win32k requests it through SystemLoadGdiDriverInformation.
                 if let Some(display_spec) = system_hive_display_driver_spec() {
                     let display_spec_view = display_spec.win32k_spec();
                     print_str(b"[win32k-svc] display service=");
@@ -16558,43 +16555,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" description=");
                     print_str(display_spec_view.device_description);
                     print_str(b"\n");
-                    load_display_driver(host_pml4, &display_spec_view);
+                    let route_published =
+                        win32k_subsystem::publish_display_device_route(&display_spec_view);
+                    print_str(b"[win32k-svc] display route published=");
+                    print_u64(route_published as u64);
+                    print_str(b"\n");
                 } else {
                     print_str(
                         b"[win32k-svc] no loadable display Device0 in SYSTEM hive and ReactOS FS\n",
                     );
-                }
-                // Host the keyboard-layout DLL selected by the real registry layout key so win32k's
-                // NtUserLoadKeyboardLayoutEx path can resolve KbdLayerDescriptor without a synthetic
-                // HKL result.
-                let mut layout_id = [0u8; 8];
-                let mut layout_file = [0u8; 24];
-                if let Some((layout_id_len, layout_source)) =
-                    registry_keyboard_layout_id(&mut layout_id)
-                {
-                    if let Some(layout_file_len) = system_hive_keyboard_layout_file(
-                        &layout_id[..layout_id_len],
-                        &mut layout_file,
-                    ) {
-                        print_str(b"[win32k-svc] keyboard layout id=");
-                        print_str(&layout_id[..layout_id_len]);
-                        print_str(b" source=");
-                        print_str(layout_source);
-                        print_str(b" file=");
-                        print_str(&layout_file[..layout_file_len]);
-                        print_str(b"\n");
-                        load_keyboard_layout_driver(
-                            host_pml4,
-                            &layout_id[..layout_id_len],
-                            &layout_file[..layout_file_len],
-                        );
-                    } else {
-                        print_str(
-                            b"[win32k-svc] keyboard layout key missing Layout File in SYSTEM hive\n",
-                        );
-                    }
-                } else {
-                    print_str(b"[win32k-svc] no keyboard layout id in DEFAULT/SYSTEM hives\n");
                 }
             }
 

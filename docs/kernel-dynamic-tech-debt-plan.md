@@ -1395,3 +1395,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D2 is closed; the
   remaining open plan work is A2, D1, and D3.
+- D1 continued. `SystemLoadGdiDriverInformation` now uses a real component-to-executive
+  rendezvous instead of relying on win32k bring-up preloads. The win32k import extracts the requested
+  GDI driver leaf, checks the registered driver table, and sends a bounded `W32_GDI_LOAD_LABEL`
+  request through the shared component pump when the driver is not loaded. The executive side
+  validates the leaf and performs the filesystem/capability work in root context, demand-loading
+  `dxg.sys`, the registry-selected display driver, or the registry-selected keyboard layout only
+  when win32k asks for that leaf. Display registry/device-route publication is still available before
+  win32k probes `HARDWARE\DEVICEMAP\VIDEO`, but the display image and keyboard layout image are no
+  longer eagerly hosted during win32k initialization. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed, and `.tmp/full-boot-gdi-load-rendezvous-20260804.log` reached the
+  microtest sentinel with demand-loaded `dxg.sys`, `framebuf.dll`, and `kbdus.dll`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for `ftfd.dll`'s static win32k import load contract and for full service-control
+  driver object/device ownership beyond the current GDI-driver image registration table.

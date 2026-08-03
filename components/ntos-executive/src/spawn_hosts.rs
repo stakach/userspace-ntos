@@ -1008,6 +1008,18 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             _m2 = nm2;
             m3 = nm3;
             continue;
+        } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = crate::win32k_glue::service_gdi_driver_load();
+            let (nmi, nm0, nm1, nm2, nm3) =
+                pump_resume_recv(ch, REQUEST_TAG_LEN, status as u32 as u64);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            _m2 = nm2;
+            m3 = nm3;
+            continue;
         } else if label == 6 {
             let ip = m0;
             let addr = m1;
