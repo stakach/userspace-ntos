@@ -2045,76 +2045,6 @@ unsafe fn capture_registered_class_atom_name(
     Some(CapturedClassAtomName { len, units })
 }
 
-unsafe fn copy_class_atom_name_from_session(
-    nt_handler: &mut ExecNtHandler,
-    pi: u64,
-    atom: u16,
-    unicode_string: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<u64> {
-    let mut name = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
-    let Some(name_len) = nt_handler
-        .copy_class_atom_name(atom, &mut name)
-        .or_else(|| nt_kernel_exec::user_class::integer_atom_name(atom, &mut name))
-    else {
-        nt_handler.record_class_atom_name_failure();
-        return None;
-    };
-    let mut raw = [0u8; 16];
-    if unicode_string == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            unicode_string,
-            &mut raw,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        nt_handler.record_class_atom_name_failure();
-        return None;
-    }
-    let maximum = u16::from_le_bytes([raw[2], raw[3]]) as usize;
-    if maximum < 2 {
-        return Some(0);
-    }
-    let buffer = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-    if buffer == 0 {
-        nt_handler.record_class_atom_name_failure();
-        return None;
-    }
-    let chars = name_len.min((maximum - 2) / 2);
-    let mut bytes = [0u8; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP * 2];
-    for (index, unit) in name[..chars].iter().copied().enumerate() {
-        bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
-    }
-    let text_ok = chars == 0
-        || img_spawn::client_write_mapped(
-            pi,
-            buffer,
-            &bytes[..chars * 2],
-            filled_pages,
-            nfilled,
-            scratch_base,
-        );
-    let terminator_ok = img_spawn::client_write_mapped(
-        pi,
-        buffer + chars as u64 * 2,
-        &0u16.to_le_bytes(),
-        filled_pages,
-        nfilled,
-        scratch_base,
-    );
-    if !text_ok || !terminator_ok {
-        nt_handler.record_class_atom_name_failure();
-        return None;
-    }
-    nt_handler.record_class_atom_name_serve();
-    Some((chars * 2) as u64)
-}
-
 unsafe fn capture_cursor_identity_key(
     pi: u64,
     module_descriptor: u64,
@@ -8318,103 +8248,10 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                // Shell GUI clients ask win32k for class atom names from inside nested user
-                // callbacks. The hosted win32k still has one shared PROCESSINFO, so exact
-                // session atom names observed from real registrations are served before dispatch;
-                // misses stay visible.
-                let class_atom_name_session_result = if m0 == 0x10ad && shell_gui_client {
-                    let client_teb = nt_handler
-                        .pm
-                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
-                        .filter(|teb| *teb != 0)
-                        .unwrap_or(SMSS_TEB_VA);
-                    crate::ke_gdi_flush_user_batch(pi, client_teb);
-                    let session_bytes = copy_class_atom_name_from_session(
-                        &mut *nt_handler,
-                        pi as u64,
-                        a0 as u16,
-                        a1,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                    if session_bytes.is_none() {
-                        print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) SESSION MISS pi=");
-                        print_u64(pi as u64);
-                        print_str(b" atom=0x");
-                        print_hex(a0 as u32);
-                        print_str(b" -> bytes=0\n");
-                    }
-                    Some(session_bytes.unwrap_or(0))
-                } else {
-                    None
-                };
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0, false)
-                } else if let Some(mirror_bytes) = class_atom_name_session_result {
-                    print_str(b"[win32k-svc] shell NtUserGetAtomName(0x10ad) SESSION pi=");
-                    print_u64(pi as u64);
-                    print_str(b" atom=0x");
-                    print_hex(a0 as u32);
-                    print_str(b" -> bytes=");
-                    print_u64(mirror_bytes);
-                    print_str(b"\n");
-                    (mirror_bytes, true)
-                } else if m0 == 0x103d && shell_gui_client {
-                    // userinit/explorer are distinct interactive child processes, but the current
-                    // win32k host still has one shared PROCESSINFO. Entering the real handler with
-                    // that mismatched state reaches an unbounded EngCopyBits path. Reuse only a
-                    // handle learned from a real winlogon lookup and a successful real
-                    // NtUserSetSystemCursor promotion; an exact miss remains NULL.
-                    let hit = cursor_identity_key
-                        .as_ref()
-                        .and_then(|key| nt_handler.lookup_global_cursor(key));
-                    if let Some(handle) = hit {
-                        if userinit_gui_client {
-                            nt_handler.record_userinit_global_cursor_hit(handle);
-                        }
-                        print_str(b"[win32k-svc] shell global cursor SESSION HIT pi=");
-                        print_u64(pi as u64);
-                        print_str(b" -> real HCURSOR 0x");
-                        print_hex(handle);
-                        print_str(b"\n");
-                    } else {
-                        print_str(b"[win32k-svc] shell global cursor SESSION MISS pi=");
-                        print_u64(pi as u64);
-                        print_str(b" -> NULL\n");
-                    }
-                    (hit.unwrap_or(0) as u64, true)
-                } else if m0 == 0x10b4 && shell_gui_client && builtin_class_attempt {
-                    // The hosted win32k currently has one shared PROCESSINFO, whose built-in class
-                    // list was populated by winlogon. A second real registration from userinit or
-                    // explorer would mutate that same list and report duplicate-class semantics.
-                    // Reuse only an exact real atom learned from winlogon's successful registration
-                    // of the same complete class.
-                    let hit = builtin_class_key
-                        .as_ref()
-                        .and_then(|key| nt_handler.lookup_builtin_class_atom(key));
-                    if let (Some(key), Some(atom)) = (builtin_class_key.as_ref(), hit) {
-                        if userinit_gui_client {
-                            nt_handler.record_userinit_builtin_class_hit(key.fn_id(), atom);
-                        }
-                        print_str(b"[win32k-svc] shell builtin class SESSION HIT pi=");
-                        print_u64(pi as u64);
-                        print_str(b" fnid=0x");
-                        print_hex(key.fn_id());
-                        print_str(b" -> real atom 0x");
-                        print_hex(atom as u32);
-                        print_str(b"\n");
-                    } else {
-                        if userinit_gui_client {
-                            nt_handler.record_userinit_builtin_class_miss();
-                        }
-                        print_str(b"[win32k-svc] shell builtin class SESSION MISS pi=");
-                        print_u64(pi as u64);
-                        print_str(b" -> atom 0\n");
-                    }
-                    (hit.unwrap_or(0) as u64, true)
                 } else if create_bitmap_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9068,6 +8905,20 @@ pub(crate) unsafe fn service_sec_image(
                             )
                         {
                             st = 0;
+                        }
+                    }
+                }
+                if ok && !redirected_user_callback && userinit_gui_client {
+                    if m0 == 0x103d && st != 0 {
+                        nt_handler.record_userinit_global_cursor_hit(st as u32);
+                    }
+                    if m0 == 0x10b4 && builtin_class_attempt {
+                        if st != 0 {
+                            if let Some((fn_id, _)) = builtin_class_args {
+                                nt_handler.record_userinit_builtin_class_hit(fn_id, st as u16);
+                            }
+                        } else {
+                            nt_handler.record_userinit_builtin_class_miss();
                         }
                     }
                 }

@@ -1764,13 +1764,6 @@ impl ExecNtHandler {
         self.win32k_session.observe_stock_object(object_id, handle)
     }
 
-    pub(crate) fn lookup_global_cursor(
-        &self,
-        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
-    ) -> Option<u32> {
-        self.win32k_session.lookup_cursor(key)
-    }
-
     pub(crate) fn observe_global_cursor_identity(
         &mut self,
         key: &nt_kernel_exec::user_cursor::CursorLookupKey,
@@ -1785,13 +1778,6 @@ impl ExecNtHandler {
 
     pub(crate) fn record_userinit_global_cursor_hit(&mut self, handle: u32) {
         self.win32k_session.record_userinit_cursor_hit(handle);
-    }
-
-    pub(crate) fn lookup_builtin_class_atom(
-        &self,
-        key: &nt_kernel_exec::user_class::BuiltinClassKey,
-    ) -> Option<u16> {
-        self.win32k_session.lookup_builtin_class(key)
     }
 
     pub(crate) fn observe_builtin_class_atom(
@@ -1813,18 +1799,6 @@ impl ExecNtHandler {
 
     pub(crate) fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
         self.win32k_session.observe_class_atom_name(atom, units)
-    }
-
-    pub(crate) fn copy_class_atom_name(&self, atom: u16, out: &mut [u16]) -> Option<usize> {
-        self.win32k_session.copy_class_atom_name(atom, out)
-    }
-
-    pub(crate) fn record_class_atom_name_serve(&mut self) {
-        self.win32k_session.record_class_atom_name_serve();
-    }
-
-    pub(crate) fn record_class_atom_name_failure(&mut self) {
-        self.win32k_session.record_class_atom_name_failure();
     }
 
     pub(crate) fn record_userinit_scrollbar_query(&mut self) {

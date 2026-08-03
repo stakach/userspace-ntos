@@ -73,7 +73,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### F. User32, GDI, And Paint Path Completion
 
-- `[~]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
+- `[x]` F1: Remove user32/GDI fake handle mirrors and global cursor/class state that bypasses real
   object ownership.
 - `[x]` F2: Complete api0 `WINDOWPROC` execution so `WM_PAINT` runs dialog/control paint procs
   instead of synthetic `LRESULT` completion.
@@ -1083,3 +1083,22 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none`, `components/ntos-executive/build.sh`, `git diff --check`, and
   `.tmp/full-boot-service-user-gdi-provider.log` passed the harness desktop gate with
   `230/275 executive->isolated-service checks passed`.
+- C3/F1 cleanup. Removed the shell-side `SESSION` catalog result paths for `NtUserGetAtomName`,
+  `NtUserFindExistingCursorIcon`, and built-in `NtUserRegisterClassExWOW`. The cursor,
+  built-in-class, and class-atom-name catalogs were deleted from `Win32kSessionRuntime`; that runtime
+  now keeps only observation/proof counters for provider-returned facts. Userinit proof counters are
+  recorded only after real provider dispatch returns, so a shell cursor/class miss is no longer
+  hidden by an executive-owned session reuse result. Review adjustment: F1 has no known
+  executive-owned USER/GDI handle, cursor, class, atom-name, stock-object, classinfo, service bitmap,
+  brush, or display-DC result path left, so F1 is closed. C3 remains open: the full boot now reaches
+  a real provider-owned winlogon `NtUserGetAtomName(0x10ad)` path during the post-SAS Winlogon-key
+  route and walls inside isolated win32k instead of falling back to a session catalog. The next C3
+  step is to implement that syscall's proper cross-address-space input/output boundary for all GUI
+  clients. Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs components/ntos-executive/src/exec_handler.rs
+  components/ntos-executive/src/win32k_session_runtime.rs`, stale-reference `rg`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, `components/ntos-executive/build.sh`, and
+  `.tmp/full-boot-shell-session-catalog-removed.log` passed the harness desktop gate with
+  `230/275 executive->isolated-service checks passed`; the boot log contains no old shell `SESSION`
+  catalog hit/miss lines.
