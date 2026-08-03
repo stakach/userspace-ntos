@@ -17,6 +17,7 @@ static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
 static BUILD_HWND_LIST_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const WIN32K_MSG_BYTES: usize = 48;
@@ -25,6 +26,7 @@ const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
+const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WM_QUIT: u32 = 0x0012;
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
@@ -7145,6 +7147,10 @@ pub(crate) unsafe fn service_sec_image(
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
                 let mut text_extent_probe_failed = false;
+                let mut char_width_stack_args = [0u64; 2];
+                let mut char_width_stack_arg_count = 0usize;
+                let mut char_width_copyout = (0u64, 0u64, 0usize);
+                let mut char_width_probe_failed = false;
                 let mut load_keyboard_layout_stack_args = [0u64; 3];
                 let mut load_keyboard_layout_stack_arg_count = 0usize;
                 let mut load_keyboard_layout_probe_failed = false;
@@ -7460,6 +7466,129 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == 0x125c {
                     load_keyboard_layout_probe_failed = true;
+                } else if m0 == 0x10cb && hosted_process_uses_client_gdi(&nt_handler, pi) {
+                    // NtGdiGetCharWidthW copies an optional caller WCHAR/glyph array and then writes
+                    // Count INT/FLOAT-sized widths back to the caller. Stage both sides explicitly so
+                    // nested win32k dispatches do not discover fl/Buffer through a foreign stack.
+                    let fl = if sp != 0 {
+                        client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                    } else {
+                        None
+                    };
+                    let client_buffer = if sp != 0 {
+                        client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                    } else {
+                        None
+                    };
+                    if let (Some(fl), Some(client_buffer)) = (fl, client_buffer) {
+                        let count = a2 as u32;
+                        let input_bytes = if d_a3 != 0 {
+                            (count as usize).checked_mul(2)
+                        } else {
+                            Some(0)
+                        };
+                        let output_bytes = (count as usize).checked_mul(4);
+                        if count == 0 || client_buffer == 0 {
+                            char_width_probe_failed = true;
+                        } else if let (Some(input_bytes), Some(output_bytes)) =
+                            (input_bytes, output_bytes)
+                        {
+                            let base = win32k_subsystem::WIN32K_ARG_VADDR;
+                            let cap = WIN32K_CHAR_WIDTH_STAGE_BYTES as u64;
+                            let staged_pwc = if d_a3 != 0 { base } else { 0 };
+                            let mut offset = input_bytes as u64;
+                            let mut layout_ok = true;
+                            if let Some(next) = align_up_u64(offset, 8) {
+                                offset = next;
+                            } else {
+                                layout_ok = false;
+                            }
+                            let staged_buffer = if layout_ok {
+                                let out = base + offset;
+                                offset += output_bytes as u64;
+                                out
+                            } else {
+                                0
+                            };
+                            if !layout_ok || offset > cap {
+                                char_width_probe_failed = true;
+                            } else {
+                                core::ptr::write_bytes(
+                                    base as *mut u8,
+                                    0,
+                                    WIN32K_CHAR_WIDTH_STAGE_BYTES,
+                                );
+                                let copied_input = if d_a3 == 0 {
+                                    true
+                                } else {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        d_a3,
+                                        input_bytes,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let input = core::slice::from_raw_parts_mut(
+                                        staged_pwc as *mut u8,
+                                        input_bytes,
+                                    );
+                                    img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        d_a3,
+                                        input,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    )
+                                };
+                                if copied_input {
+                                    d_a3 = staged_pwc;
+                                    char_width_stack_args = [fl, staged_buffer];
+                                    char_width_stack_arg_count = char_width_stack_args.len();
+                                    char_width_copyout =
+                                        (client_buffer, staged_buffer, output_bytes);
+                                    let n =
+                                        CHAR_WIDTH_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                                    if n < 24 {
+                                        print_str(b"[w32marshal] NtGdiGetCharWidthW pi=");
+                                        print_u64(pi as u64);
+                                        print_str(b" first=");
+                                        print_u64(a1 as u32 as u64);
+                                        print_str(b" count=");
+                                        print_u64(count as u64);
+                                        print_str(b" pwc=0x");
+                                        print_hex_u64(a3);
+                                        print_str(b" fl=0x");
+                                        print_hex(fl as u32);
+                                        print_str(b" out=0x");
+                                        print_hex_u64(client_buffer);
+                                        print_str(b" bytes=");
+                                        print_u64(offset);
+                                        print_str(b"\n");
+                                    }
+                                } else {
+                                    char_width_probe_failed = true;
+                                }
+                            }
+                        } else {
+                            char_width_probe_failed = true;
+                        }
+                    } else {
+                        char_width_probe_failed = true;
+                    }
                 } else if m0 == 0x11d9 && hosted_process_uses_client_gdi(&nt_handler, pi) {
                     // NtGdiGetTextExtentExW has one client input buffer and three possible output
                     // buffers in its stack tail. Isolated win32k must see only win32k-owned VAs; the
@@ -8339,6 +8468,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if char_width_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiGetCharWidthW input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" count=");
+                        print_u64(a2 as u32 as u64);
+                        print_str(b" pwc=0x");
+                        print_hex_u64(a3);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if create_window_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -8579,6 +8722,8 @@ pub(crate) unsafe fn service_sec_image(
                         && create_bitmap_stack_arg_count == create_bitmap_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
+                    let char_width_staged_stack =
+                        m0 == 0x10cb && char_width_stack_arg_count == char_width_stack_args.len();
                     let register_class_staged_stack = m0 == 0x10b4
                         && register_class_stack_arg_count == register_class_stack_args.len();
                     let create_window_staged_stack = m0 == 0x1077
@@ -8598,6 +8743,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &create_bitmap_stack_args)
                     } else if text_extent_staged_stack {
                         (sp, &text_extent_stack_args)
+                    } else if char_width_staged_stack {
+                        (sp, &char_width_stack_args)
                     } else if register_class_staged_stack {
                         (sp, &register_class_stack_args)
                     } else if create_window_staged_stack {
@@ -8781,6 +8928,34 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(client_size);
                                 print_str(b" dx-bytes=");
                                 print_u64(dx_bytes as u64);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if char_width_staged_stack && r.1 && r.0 != 0 {
+                        let (client_buffer, staged_buffer, output_bytes) = char_width_copyout;
+                        let out_ok = output_bytes == 0
+                            || img_spawn::client_copyout_mapped(
+                                pi as u64,
+                                client_buffer,
+                                core::slice::from_raw_parts(
+                                    staged_buffer as *const u8,
+                                    output_bytes,
+                                ),
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                        if !out_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] NtGdiGetCharWidthW copy-out failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" out=0x");
+                                print_hex_u64(client_buffer);
+                                print_str(b" bytes=");
+                                print_u64(output_bytes as u64);
                                 print_str(b"\n");
                             }
                             r = (0, true);

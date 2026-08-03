@@ -815,3 +815,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   gates. Review adjustment: the live red frontier is now explorer `NtGdiGetCharWidthW` (`0x10cb`),
   which faults inside isolated win32k on caller output/input pointer handling, plus the callback
   nested/dead-client proof counters and `exec_lsa_worker_route`.
+- C3 repair. `NtGdiGetCharWidthW` now stages its optional caller WCHAR/glyph input buffer, the
+  `fl`/output-buffer stack tail, and the returned INT/FLOAT-sized width array through the win32k
+  shared argument frame. Bad input/output probes return visible FALSE rather than forwarding foreign
+  pointers into isolated win32k. Validation: `git diff --check`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `.tmp/full-boot-char-width-marshal-20260803-225954.log` reached
+  `276/276 executive->isolated-service checks passed`, with staged explorer `0x10cb` calls,
+  `PASS exec_user_callback_real_api0_nested_roundtrip`, `PASS
+  exec_user_callback_dead_client_unwind`, `PASS exec_win32k_transport_call_nested`, `PASS
+  exec_lsa_worker_route`, and all userinit/explorer shell gates green. Review adjustment: the
+  immediate boot frontier is green again; remaining plan work is the larger dynamic-debt backlog:
+  boot/session image manifest handoff, service-control driver/device/registry ownership, real
+  CSR/SRM/LSA LPC processing, provider-owned service GUI/GDI state, and the full real WM_PAINT
+  queue/framebuffer path.
