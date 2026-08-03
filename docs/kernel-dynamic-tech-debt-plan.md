@@ -57,7 +57,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[ ]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
   driven driver objects.
-- `[ ]` D2: Replace driver-name matches in system information calls with registered module/device
+- `[~]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
 - `[ ]` D3: Replace synthetic video, keyboard, CPU, and Winlogon registry overlays with real hive
   data and driver-created device interfaces.
@@ -683,3 +683,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `.tmp/full-boot-dynamic-callback-victim-20260803.log` was stopped after serial output stalled
   before post-quiesce proof emission, so the next full-boot check should confirm the proof markers
   and the hosted-boot liveness frontier together.
+- D2 started. `ZwSetSystemInformation(SystemLoadGdiDriverInformation)` no longer matches
+  `dxg.sys`, `framebuf.dll`, or `kbdus.dll` through a local hardcoded branch or per-driver global
+  image slots. The existing driver load hooks now register loaded GDI driver metadata into a bounded
+  table, and the win32k import resolves the requested driver name only through that registered
+  state. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none` passed. Review adjustment:
+  D2 remains open for the registry/device side of display discovery and `NtQuerySystemInformation`
+  module/device answers, but the GDI-driver system-information path is no longer name-switch owned.

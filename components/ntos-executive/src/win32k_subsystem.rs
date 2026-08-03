@@ -4419,9 +4419,10 @@ extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
 /// `LDEVOBJ_bLoadImage` loads a GDI driver by calling this with class
 /// `SystemLoadGdiDriverInformation` (26) + a `SYSTEM_GDI_DRIVER_INFORMATION` whose DriverName it
 /// filled; the "kernel" loads the driver + fills ImageAddress/EntryPoint/ExportSectionPointer/etc.
-/// We pre-loaded dxg.sys into win32k's VSpace at bring-up; match the name + fill the struct from the
-/// recorded info (offsets: DriverName@0, ImageAddress@0x10, SectionPointer@0x18, EntryPoint@0x20,
-/// ExportSectionPointer@0x28, ImageLength@0x30). Other classes → benign success.
+/// The executive registers each hosted GDI driver image as it is loaded, and this import resolves
+/// only against that registered state (offsets: DriverName@0, ImageAddress@0x10,
+/// SectionPointer@0x18, EntryPoint@0x20, ExportSectionPointer@0x28, ImageLength@0x30). Other
+/// classes → benign success.
 /// Case-insensitive: does the wide DriverName [name_buf, +name_len bytes) end with the ASCII tail?
 unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
     if name_buf == 0 || name_len < tail.len() * 2 {
@@ -4442,6 +4443,112 @@ unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
     true
 }
 
+const GDI_DRIVER_RECORD_CAP: usize = 8;
+const GDI_DRIVER_LEAF_CAP: usize = 24;
+
+#[derive(Clone, Copy)]
+struct GdiDriverRecord {
+    leaf: [u8; GDI_DRIVER_LEAF_CAP],
+    leaf_len: u8,
+    image: u64,
+    entry: u64,
+    expdir: u64,
+    image_len: u32,
+}
+
+impl GdiDriverRecord {
+    const EMPTY: Self = Self {
+        leaf: [0; GDI_DRIVER_LEAF_CAP],
+        leaf_len: 0,
+        image: 0,
+        entry: 0,
+        expdir: 0,
+        image_len: 0,
+    };
+
+    fn leaf_bytes(&self) -> &[u8] {
+        &self.leaf[..self.leaf_len as usize]
+    }
+}
+
+static mut GDI_DRIVER_RECORDS: [GdiDriverRecord; GDI_DRIVER_RECORD_CAP] =
+    [GdiDriverRecord::EMPTY; GDI_DRIVER_RECORD_CAP];
+
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
+fn register_gdi_driver_image(
+    leaf: &[u8],
+    image: u64,
+    entry: u64,
+    expdir: u64,
+    image_len: u32,
+) -> bool {
+    if leaf.is_empty() || leaf.len() > GDI_DRIVER_LEAF_CAP || image == 0 || image_len == 0 {
+        return false;
+    }
+    unsafe {
+        let records = &mut *core::ptr::addr_of_mut!(GDI_DRIVER_RECORDS);
+        let mut empty = None;
+        for (idx, rec) in records.iter().enumerate() {
+            if rec.leaf_len == 0 {
+                empty.get_or_insert(idx);
+                continue;
+            }
+            if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
+                records[idx] = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
+                return true;
+            }
+        }
+        let Some(idx) = empty else {
+            return false;
+        };
+        records[idx] = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
+        true
+    }
+}
+
+fn registered_gdi_driver_record(
+    leaf: &[u8],
+    image: u64,
+    entry: u64,
+    expdir: u64,
+    image_len: u32,
+) -> GdiDriverRecord {
+    let mut rec = GdiDriverRecord::EMPTY;
+    rec.leaf_len = leaf.len() as u8;
+    for (idx, &b) in leaf.iter().enumerate() {
+        rec.leaf[idx] = b.to_ascii_lowercase();
+    }
+    rec.image = image;
+    rec.entry = entry;
+    rec.expdir = expdir;
+    rec.image_len = image_len;
+    rec
+}
+
+unsafe fn registered_gdi_driver_for_name(name_buf: u64, name_len: usize) -> Option<GdiDriverRecord> {
+    let records = &*core::ptr::addr_of!(GDI_DRIVER_RECORDS);
+    for rec in records.iter() {
+        if rec.leaf_len == 0 {
+            continue;
+        }
+        if wname_ends_with(name_buf, name_len, rec.leaf_bytes()) {
+            return Some(*rec);
+        }
+    }
+    None
+}
+
 extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
     const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
     if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
@@ -4451,50 +4558,23 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
         let name_len = read_unaligned(buf as *const u16) as usize;
         let name_buf = read_unaligned((buf + 8) as *const u64);
-        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll / kbdus.dll)
-        // and pick its recorded info.
-        let (image, entry, expdir, len, tag): (u64, u64, u64, u32, &[u8]) =
-            if wname_ends_with(name_buf, name_len, b"dxg.sys") {
-                (
-                    read_volatile(core::ptr::addr_of!(DXG_IMAGE)),
-                    read_volatile(core::ptr::addr_of!(DXG_ENTRY)),
-                    read_volatile(core::ptr::addr_of!(DXG_EXPORT_DIR)),
-                    read_volatile(core::ptr::addr_of!(DXG_IMAGE_LEN)),
-                    b"dxg.sys",
-                )
-            } else if wname_ends_with(name_buf, name_len, b"framebuf.dll") {
-                (
-                    read_volatile(core::ptr::addr_of!(FRAMEBUF_IMAGE)),
-                    read_volatile(core::ptr::addr_of!(FRAMEBUF_ENTRY)),
-                    read_volatile(core::ptr::addr_of!(FRAMEBUF_EXPORT_DIR)),
-                    read_volatile(core::ptr::addr_of!(FRAMEBUF_IMAGE_LEN)),
-                    b"framebuf.dll",
-                )
-            } else if wname_ends_with(name_buf, name_len, b"kbdus.dll") {
-                (
-                    read_volatile(core::ptr::addr_of!(KBDUS_IMAGE)),
-                    read_volatile(core::ptr::addr_of!(KBDUS_ENTRY)),
-                    read_volatile(core::ptr::addr_of!(KBDUS_EXPORT_DIR)),
-                    read_volatile(core::ptr::addr_of!(KBDUS_IMAGE_LEN)),
-                    b"kbdus.dll",
-                )
-            } else {
-                print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
-                return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
-            };
-        if image == 0 {
+        let Some(driver) = registered_gdi_driver_for_name(name_buf, name_len) else {
+            print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
+            return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
+        };
+        if driver.image == 0 {
             return 0xC000_0135u32 as i32;
         }
-        write_unaligned((buf + 0x10) as *mut u64, image); // ImageAddress
-        write_unaligned((buf + 0x18) as *mut u64, image); // SectionPointer (non-null placeholder)
-        write_unaligned((buf + 0x20) as *mut u64, entry); // EntryPoint (= DrvEnableDriver for framebuf)
-        write_unaligned((buf + 0x28) as *mut u64, expdir); // ExportSectionPointer
-        write_unaligned((buf + 0x30) as *mut u32, len); // ImageLength
+        write_unaligned((buf + 0x10) as *mut u64, driver.image); // ImageAddress
+        write_unaligned((buf + 0x18) as *mut u64, driver.image); // SectionPointer (non-null placeholder)
+        write_unaligned((buf + 0x20) as *mut u64, driver.entry); // EntryPoint (= DrvEnableDriver for framebuf)
+        write_unaligned((buf + 0x28) as *mut u64, driver.expdir); // ExportSectionPointer
+        write_unaligned((buf + 0x30) as *mut u32, driver.image_len); // ImageLength
         print_str(b"[win32k gdidrv] hosted ");
-        print_str(tag);
+        print_str(driver.leaf_bytes());
         print_str(b" -> image=0x");
-        print_hex((image >> 32) as u32);
-        print_hex(image as u32);
+        print_hex((driver.image >> 32) as u32);
+        print_hex(driver.image as u32);
         print_str(b"\n");
     }
     0
@@ -7610,62 +7690,39 @@ pub const KBDUS_LOAD_FRAMES: u64 = 8;
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 pub const WIN32K_FB_SIZE: u64 = 0x30_0000;
 
-// The pre-loaded dxg.sys image info the ZwSetSystemInformation trampoline reports to win32k. Written
-// by the executive (load_dxg_drivers) at bring-up; read by s_zw_set_system_information.
-static mut DXG_IMAGE: u64 = 0; // ImageAddress = DXG_VA
-static mut DXG_ENTRY: u64 = 0; // EntryPoint = DXG_VA + entry_rva
-static mut DXG_EXPORT_DIR: u64 = 0; // ExportSectionPointer = DXG_VA + export_dir_rva
-static mut DXG_IMAGE_LEN: u32 = 0; // size_of_image
-                                   // Pre-loaded framebuf.dll image info (parallel to DXG_*), reported to win32k when it dynamically
-                                   // loads "framebuf.dll" via ZwSetSystemInformation(SystemLoadGdiDriverInformation).
-static mut FRAMEBUF_IMAGE: u64 = 0;
-static mut FRAMEBUF_ENTRY: u64 = 0;
-static mut FRAMEBUF_EXPORT_DIR: u64 = 0;
-static mut FRAMEBUF_IMAGE_LEN: u32 = 0;
-// Pre-loaded kbdus.dll image info (parallel to FRAMEBUF_*), reported to win32k when it dynamically
-// loads the keyboard layout through UserLoadKbdDll.
-static mut KBDUS_IMAGE: u64 = 0;
-static mut KBDUS_ENTRY: u64 = 0;
-static mut KBDUS_EXPORT_DIR: u64 = 0;
-static mut KBDUS_IMAGE_LEN: u32 = 0;
-
 /// Record the loaded framebuf.dll info (called by the executive after `load_driver_into(framebuf)`).
 /// framebuf has NO export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` special-
 /// cases to `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
 pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
-    unsafe {
-        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE), FRAMEBUF_VA);
-        write_volatile(
-            core::ptr::addr_of_mut!(FRAMEBUF_ENTRY),
-            FRAMEBUF_VA + entry_rva as u64,
-        );
-        let expd = if export_dir_rva != 0 {
-            FRAMEBUF_VA + export_dir_rva as u64
-        } else {
-            0
-        };
-        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_EXPORT_DIR), expd);
-        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE_LEN), image_len);
-    }
+    let expd = if export_dir_rva != 0 {
+        FRAMEBUF_VA + export_dir_rva as u64
+    } else {
+        0
+    };
+    let _ = register_gdi_driver_image(
+        b"framebuf.dll",
+        FRAMEBUF_VA,
+        FRAMEBUF_VA + entry_rva as u64,
+        expd,
+        image_len,
+    );
 }
 
 /// Record the loaded kbdus.dll info (called by the executive after `load_driver_into(kbdus)`).
 /// win32k uses the export directory to find KbdLayerDescriptor; the PE entry may be zero.
 pub fn record_kbdus(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
-    unsafe {
-        write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE), KBDUS_VA);
-        write_volatile(
-            core::ptr::addr_of_mut!(KBDUS_ENTRY),
-            KBDUS_VA + entry_rva as u64,
-        );
-        let expd = if export_dir_rva != 0 {
-            KBDUS_VA + export_dir_rva as u64
-        } else {
-            0
-        };
-        write_volatile(core::ptr::addr_of_mut!(KBDUS_EXPORT_DIR), expd);
-        write_volatile(core::ptr::addr_of_mut!(KBDUS_IMAGE_LEN), image_len);
-    }
+    let expd = if export_dir_rva != 0 {
+        KBDUS_VA + export_dir_rva as u64
+    } else {
+        0
+    };
+    let _ = register_gdi_driver_image(
+        b"kbdus.dll",
+        KBDUS_VA,
+        KBDUS_VA + entry_rva as u64,
+        expd,
+        image_len,
+    );
 }
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export
@@ -7909,18 +7966,18 @@ pub unsafe fn load_driver_into(
 /// Record the loaded dxg.sys info for the ZwSetSystemInformation trampoline. Called by the executive
 /// after `load_driver_into(dxg)`.
 pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
-    unsafe {
-        write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE), DXG_VA);
-        write_volatile(
-            core::ptr::addr_of_mut!(DXG_ENTRY),
-            DXG_VA + entry_rva as u64,
-        );
-        write_volatile(
-            core::ptr::addr_of_mut!(DXG_EXPORT_DIR),
-            DXG_VA + export_dir_rva as u64,
-        );
-        write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE_LEN), image_len);
-    }
+    let expd = if export_dir_rva != 0 {
+        DXG_VA + export_dir_rva as u64
+    } else {
+        0
+    };
+    let _ = register_gdi_driver_image(
+        b"dxg.sys",
+        DXG_VA,
+        DXG_VA + entry_rva as u64,
+        expd,
+        image_len,
+    );
 }
 
 /// Re-patch win32k's OWN IAT for the `ftfd.dll` import descriptor (34 FT_* entries) against the
