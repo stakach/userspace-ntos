@@ -1439,3 +1439,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_msgina_logon_dialog_painted`, and `244/277` executive-to-isolated-service checks passing.
   Review adjustment: D3 remains open for a real videoprt/miniport-created device stack and any
   remaining keyboard/device route scaffolding.
+- D1 continued. Win32k static-import dependencies still come from win32k's PE import descriptors,
+  but their placement no longer uses a fixed `WIN32K_STATIC_IMPORT0` slot. The executive reads each
+  dependency PE, derives the required frame count from `SizeOfImage`, reserves a bounded VA span from
+  the win32k static-import arena, and maps/loads/patches that image at the allocated base. The old
+  `WIN32K_STATIC_IMPORT_SLOTS` and exported slot constants are gone; PE parse/allocation failures
+  increment the loader failure counter and fail the visible load-contract gate. Validation:
+  `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-static-import-allocator-20260804.log` reached the microtest sentinel with
+  `hosted static win32k import ftfd.dll ... base=0x0000010008700000 frames=248 iat-patched=34`,
+  `PASS exec_win32k_load_contract`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_modal_paint_prefix`, `PASS
+  exec_msgina_logon_dialog_painted`, and `244/277` executive-to-isolated-service checks passing.
+  Review adjustment: D1 remains open for service-control-created driver objects and real device
+  ownership beyond the current GDI/display driver request path.

@@ -74,6 +74,10 @@ static WIN32K_STATIC_IMPORTS_LOADED: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_IAT_PATCHES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STATIC_IMPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+const WIN32K_STATIC_IMPORT_BASE_VA: u64 = 0x0000_0100_0870_0000;
+const WIN32K_STATIC_IMPORT_LIMIT_VA: u64 = win32k_subsystem::FRAMEBUF_VA;
+const WIN32K_STATIC_IMPORT_ALIGN: u64 = 0x0010_0000;
+
 #[derive(Clone, Copy)]
 pub(crate) struct CompletedWin32kDispatch {
     pub ssn: u64,
@@ -3313,6 +3317,38 @@ pub(crate) unsafe fn load_one_driver(
     Some(res)
 }
 
+unsafe fn driver_image_frame_count(src_va: u64) -> Option<u64> {
+    let e = core::ptr::read_unaligned((src_va + 0x3c) as *const u32) as u64;
+    let nt = src_va.checked_add(e)?;
+    if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
+        return None;
+    }
+    let file_hdr = nt + 4;
+    let opt = file_hdr + 20;
+    let size_of_image = core::ptr::read_unaligned((opt + 56) as *const u32) as u64;
+    if size_of_image == 0 {
+        return None;
+    }
+    let frames = size_of_image.checked_add(0x0fff)? / 0x1000;
+    if frames == 0 || frames > 256 {
+        return None;
+    }
+    Some(frames)
+}
+
+fn reserve_win32k_static_import_va(next_va: &mut u64, frames: u64) -> Option<u64> {
+    let bytes = frames.checked_mul(0x1000)?;
+    let aligned = next_va
+        .checked_add(WIN32K_STATIC_IMPORT_ALIGN - 1)
+        .map(|v| v & !(WIN32K_STATIC_IMPORT_ALIGN - 1))?;
+    let end = aligned.checked_add(bytes)?;
+    if end > WIN32K_STATIC_IMPORT_LIMIT_VA {
+        return None;
+    }
+    *next_va = end;
+    Some(aligned)
+}
+
 pub(crate) fn register_win32k_gdi_loader(host_pml4: u64) {
     WIN32K_GDI_LOADER_PML4.store(host_pml4, Ordering::Relaxed);
 }
@@ -3486,11 +3522,6 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
     }
 }
 
-const WIN32K_STATIC_IMPORT_SLOTS: &[(u64, u64)] = &[(
-    win32k_subsystem::WIN32K_STATIC_IMPORT0_VA,
-    win32k_subsystem::WIN32K_STATIC_IMPORT0_LOAD_FRAMES,
-)];
-
 pub(crate) fn win32k_static_import_loader_proofs() -> (u64, u64, u64, u64) {
     (
         WIN32K_STATIC_IMPORT_DEPENDENCIES.load(Ordering::Relaxed),
@@ -3516,7 +3547,7 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
     };
 
     let mut dep_index = 0usize;
-    let mut slot_index = 0usize;
+    let mut next_static_import_va = WIN32K_STATIC_IMPORT_BASE_VA;
     loop {
         let mut dll_leaf = [0u8; 32];
         let Some(dll_len) =
@@ -3526,16 +3557,7 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
         };
         let dll = &dll_leaf[..dll_len];
         WIN32K_STATIC_IMPORT_DEPENDENCIES.fetch_add(1, Ordering::Relaxed);
-        if slot_index >= WIN32K_STATIC_IMPORT_SLOTS.len() {
-            print_str(b"[win32k-svc] no static-import slot for win32k dependency ");
-            print_str(dll);
-            print_str(b"\n");
-            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
-            dep_index += 1;
-            continue;
-        }
 
-        let (image_va, image_frames) = WIN32K_STATIC_IMPORT_SLOTS[slot_index];
         let mut path = [0u8; 64];
         let Some(path_len) = system32_driver_path(dll, &mut path) else {
             print_str(b"[win32k-svc] static win32k import leaf rejected: ");
@@ -3543,7 +3565,6 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
             print_str(b"\n");
             WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
             dep_index += 1;
-            slot_index += 1;
             continue;
         };
         print_str(b"[win32k-svc] loading static win32k import ");
@@ -3557,7 +3578,26 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
             print_str(b"\n");
             WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
             dep_index += 1;
-            slot_index += 1;
+            continue;
+        };
+        let Some(image_frames) = driver_image_frame_count(src) else {
+            print_str(b"[win32k-svc] static win32k import PE rejected: ");
+            print_str(&path[..path_len]);
+            print_str(b"\n");
+            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            dep_index += 1;
+            continue;
+        };
+        let Some(image_va) =
+            reserve_win32k_static_import_va(&mut next_static_import_va, image_frames)
+        else {
+            print_str(b"[win32k-svc] static win32k import allocation failed: ");
+            print_str(dll);
+            print_str(b" frames=");
+            print_u64(image_frames);
+            print_str(b"\n");
+            WIN32K_STATIC_IMPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            dep_index += 1;
             continue;
         };
         match load_one_driver(src, image_va, image_frames, host_pml4, 0) {
@@ -3572,6 +3612,11 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
                 print_hex(entry);
                 print_str(b" len=0x");
                 print_hex(len);
+                print_str(b" base=0x");
+                print_hex((image_va >> 32) as u32);
+                print_hex(image_va as u32);
+                print_str(b" frames=");
+                print_u64(image_frames);
                 print_str(b" iat-patched=");
                 print_u64(patched as u64);
                 print_str(b"\n");
@@ -3590,7 +3635,6 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
             }
         }
         dep_index += 1;
-        slot_index += 1;
     }
 }
 

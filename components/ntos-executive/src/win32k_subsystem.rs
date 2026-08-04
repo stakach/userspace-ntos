@@ -7852,11 +7852,6 @@ pub const DXGTHK_LOAD_FRAMES: u64 = 8;
 /// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
 pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
 pub const DXG_LOAD_FRAMES: u64 = 16;
-/// Static win32k import dependency slot. ReactOS 0.4.17 currently imports one System32 DLL here
-/// (`ftfd.dll`, size_of_image=0xf8000 -> 248 frames), but the dependency name is discovered from
-/// win32k's import descriptor instead of selected by an executive-side branch.
-pub const WIN32K_STATIC_IMPORT0_VA: u64 = 0x0000_0100_0870_0000;
-pub const WIN32K_STATIC_IMPORT0_LOAD_FRAMES: u64 = 248;
 /// Display driver loaded-image base in win32k's VSpace. ReactOS' current registry selects the
 /// linear-framebuffer driver, whose size_of_image is 0x8000, so this reserves one 8-frame PT window.
 /// win32k loads the selected display DLL dynamically via ZwSetSystemInformation.
