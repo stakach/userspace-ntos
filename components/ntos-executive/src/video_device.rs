@@ -4,8 +4,9 @@
 //! `HARDWARE\DEVICEMAP\VIDEO`, and service the display driver's video IOCTLs through the I/O
 //! manager. Until the real videoprt/miniport stack is hosted, this module owns the boot framebuffer
 //! route as a canonical I/O Manager driver/device/open plus projected NT driver/device/file object
-//! bodies that win32k can dereference. The DeviceMap values are published through Configuration
-//! Manager, not through a private video registry table.
+//! bodies that win32k can dereference. DeviceMap values are published through Configuration
+//! Manager and retained in this route state so hosted win32k import shims can answer the same
+//! values without crossing into executive-only service-ring clients.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -34,9 +35,13 @@ const VIDEO_DEVICE_PATH_STR: &str = "\\Device\\Video0";
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
 const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
 const VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE: &str = "MaxObjectNumber";
+const IOCTL_VIDEO_INIT_WIN32K_CALLBACKS: u32 = 0x0023_001C;
+const IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: u32 = 0x0023_045C;
+const VIDEO_WIN32K_CALLBACKS_SIZE_X64: u64 = 40;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const REG_SZ: u32 = 1;
+const REG_DWORD: u32 = 4;
 
 pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) driver_name: &'a [u8],
@@ -121,6 +126,36 @@ pub(crate) fn video_device_map_ready() -> bool {
             && core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)).is_some()
             && video_io_route_ready()
     }
+}
+
+pub(crate) fn video_device_map_published() -> bool {
+    unsafe { VIDEO_DEVICE_READY && VIDEO_SERVICE_PATH_LEN != 0 }
+}
+
+pub(crate) unsafe fn query_video_device_map_value(
+    name: &[u8],
+    out: &mut [u8],
+) -> Result<(u32, usize), i32> {
+    if !video_device_map_published() {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    if ascii_eq_ignore_case(name, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE.as_bytes()) {
+        let data = 0u32.to_le_bytes();
+        if data.len() > out.len() {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        out[..data.len()].copy_from_slice(&data);
+        return Ok((REG_DWORD, data.len()));
+    }
+    if ascii_eq_ignore_case(name, VIDEO_DEVICE_PATH) {
+        let path_len = VIDEO_SERVICE_PATH_LEN as usize;
+        let path = &(&*core::ptr::addr_of!(VIDEO_SERVICE_PATH))[..path_len];
+        let Some(data_len) = utf16le_nul_from_ascii_into(path, out) else {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        return Ok((REG_SZ, data_len));
+    }
+    Err(STATUS_OBJECT_NAME_NOT_FOUND)
 }
 
 pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
@@ -306,6 +341,22 @@ unsafe fn video_io_route_ready() -> bool {
         && crate::driver_launch::device_object_id(VIDEO_DEVICE_ID) == VIDEO_DEVICE_OBJECT_ID
 }
 
+unsafe fn projected_video_route_ready() -> bool {
+    VIDEO_DEVICE_READY
+        && VIDEO_DRIVER_NAME_LEN != 0
+        && VIDEO_SERVICE_PATH_LEN != 0
+        && VIDEO_DRIVER_OBJECT != 0
+        && VIDEO_DEVICE_OBJECT != 0
+        && VIDEO_FILE_OBJECT != 0
+        && VIDEO_DRIVER_ID != 0
+        && VIDEO_DEVICE_ID != 0
+        && VIDEO_DEVICE_OBJECT_ID != 0
+        && VIDEO_FILE_HANDLE != 0
+        && VIDEO_FILE_ID != 0
+        && VIDEO_FILE_OBJECT_ID != 0
+        && core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)).is_some()
+}
+
 unsafe fn teardown_video_io_route() {
     if VIDEO_FILE_HANDLE != 0 {
         let _ = crate::driver_launch::close_io_handle(VIDEO_FILE_HANDLE);
@@ -436,6 +487,36 @@ fn utf16le_nul_from_ascii(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(data)
 }
 
+fn utf16le_nul_from_ascii_into(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    let need = bytes.len().checked_mul(2)?.checked_add(2)?;
+    if need > out.len() {
+        return None;
+    }
+    for (idx, &b) in bytes.iter().enumerate() {
+        if !b.is_ascii() {
+            return None;
+        }
+        let unit = (b as u16).to_le_bytes();
+        out[idx * 2] = unit[0];
+        out[idx * 2 + 1] = unit[1];
+    }
+    out[need - 2] = 0;
+    out[need - 1] = 0;
+    Some(need)
+}
+
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
 unsafe fn publish_video_device_map(service_registry_path: &[u8]) -> bool {
     let Some(service_path_data) = utf16le_nul_from_ascii(service_registry_path) else {
         return false;
@@ -461,7 +542,7 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     fileobj_out: *mut u64,
     devobj_out: *mut u64,
 ) -> i32 {
-    if !video_device_map_ready() || name == 0 {
+    if !projected_video_route_ready() || name == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     let len = read_unaligned(name as *const u16) as usize;
@@ -470,9 +551,6 @@ pub(crate) unsafe fn video_get_device_object_pointer(
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     if VIDEO_DRIVER_OBJECT == 0 || VIDEO_FILE_OBJECT == 0 || VIDEO_DEVICE_OBJECT == 0 {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    if !video_io_route_ready() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     if !fileobj_out.is_null() {
@@ -493,16 +571,39 @@ pub(crate) unsafe fn video_device_io_control(
     out_len: u64,
     bytes_ret: *mut u32,
 ) -> u32 {
-    if !video_device_map_ready() || hdev != VIDEO_DEVICE_OBJECT {
-        return 1;
-    }
-    if !video_io_route_ready() {
+    if !projected_video_route_ready() || hdev != VIDEO_DEVICE_OBJECT {
         return 1;
     }
     if ioctl > u32::MAX as u64 {
         return 1;
     }
-    let file_handle = VIDEO_FILE_HANDLE;
+    let set_ret = |n: u32| {
+        if !bytes_ret.is_null() {
+            write_unaligned(bytes_ret, n);
+        }
+    };
+    if ioctl as u32 == IOCTL_VIDEO_INIT_WIN32K_CALLBACKS {
+        if in_buf == 0
+            || out_buf == 0
+            || in_len < 16
+            || out_len < VIDEO_WIN32K_CALLBACKS_SIZE_X64
+        {
+            return 1;
+        }
+        let phys_disp = read_unaligned(in_buf as *const u64);
+        let callout = read_unaligned((in_buf + 8) as *const u64);
+        write_unaligned(out_buf as *mut u64, phys_disp);
+        write_unaligned((out_buf + 8) as *mut u64, callout);
+        write_unaligned((out_buf + 16) as *mut u32, 0);
+        write_unaligned((out_buf + 24) as *mut u64, VIDEO_DEVICE_OBJECT);
+        write_unaligned((out_buf + 32) as *mut u32, 0);
+        set_ret(VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u32);
+        return 0;
+    }
+    if ioctl as u32 == IOCTL_VIDEO_UNMAP_VIDEO_MEMORY {
+        set_ret(0);
+        return 0;
+    }
     let input = if in_len == 0 {
         &[]
     } else if in_buf != 0 {
@@ -517,25 +618,13 @@ pub(crate) unsafe fn video_device_io_control(
     } else {
         return 1;
     };
-    let set_ret = |n: u32| {
-        if !bytes_ret.is_null() {
-            write_unaligned(bytes_ret, n);
-        }
+    let Some(miniport) = core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)) else {
+        return 1;
     };
-    match crate::driver_launch::device_control_on_io_handle(
-        file_handle,
-        ioctl as u32,
-        input,
-        output,
-    ) {
-        Ok(information) if information <= u32::MAX as u64 => {
+    match miniport.dispatch_io_control(ioctl as u32, input, output) {
+        Ok(information) if information <= u32::MAX as usize => {
             set_ret(information as u32);
             if ioctl as u32 == IOCTL_VIDEO_MAP_VIDEO_MEMORY {
-                let Some(miniport) =
-                    core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT))
-                else {
-                    return 1;
-                };
                 let mapping = miniport.mapping();
                 crate::print_str(
                     b"[video-device] IOCTL_VIDEO_MAP_VIDEO_MEMORY -> FrameBufferBase=0x",

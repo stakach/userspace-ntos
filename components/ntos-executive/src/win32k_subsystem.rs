@@ -4702,7 +4702,6 @@ const WIN32K_REG_PATH_CAP: usize = 192;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
 const WIN32K_REG_VALUE_DATA_CAP: usize = 512;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
-const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Win32kRegHandleTarget {
@@ -4973,9 +4972,7 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
                 }
             }
         } else if is_video_device_map_key(path) {
-            if !crate::video_device::video_device_map_ready()
-                || !crate::config_manager_open_key(VIDEO_DEVICE_MAP_KEY_STR)
-            {
+            if !crate::video_device::video_device_map_published() {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             Win32kRegHandleTarget::VideoDeviceMap
@@ -5033,18 +5030,14 @@ unsafe fn query_system_hive_value(
     emit_kvpi_bytes(kvi, length, result_len, value_type, &data)
 }
 
-unsafe fn query_config_manager_value(
-    key_path: &str,
+unsafe fn query_video_device_map_value(
     name: &[u8],
     kvi: u64,
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    let Ok(name) = core::str::from_utf8(name) else {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    };
     let mut data = [0u8; WIN32K_REG_VALUE_DATA_CAP];
-    match crate::config_manager_query_value(key_path, name, &mut data) {
+    match crate::video_device::query_video_device_map_value(name, &mut data) {
         Ok((value_type, data_len)) => {
             emit_kvpi_bytes(kvi, length, result_len, value_type, &data[..data_len])
         }
@@ -5078,7 +5071,7 @@ extern "win64" fn s_zw_query_value_key(
         match target {
             Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
             Win32kRegHandleTarget::VideoDeviceMap => {
-                query_config_manager_value(VIDEO_DEVICE_MAP_KEY_STR, name, kvi, length, result_len)
+                query_video_device_map_value(name, kvi, length, result_len)
             }
             Win32kRegHandleTarget::SystemHive { key } => {
                 query_system_hive_value(key, name, kvi, length, result_len)
