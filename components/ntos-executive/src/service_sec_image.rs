@@ -23,6 +23,7 @@ static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static DEFER_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +57,7 @@ const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
+const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
 const WM_QUIT: u32 = 0x0012;
@@ -7382,6 +7384,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut message_call_stack_arg_count = 0usize;
                 let mut message_call_copyout = (0u64, 0u64, 0usize);
                 let mut message_call_probe_failed = false;
+                let mut defer_window_pos_stack_args = [0u64; 4];
+                let mut defer_window_pos_stack_arg_count = 0usize;
+                let mut defer_window_pos_probe_failed = false;
                 let mut get_atom_name_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
                 let mut find_cursor_icon_probe_failed = false;
@@ -8490,6 +8495,66 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == NTUSER_MESSAGE_CALL_SSN {
                     message_call_probe_failed = true;
+                } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN && sp != 0 {
+                    // NtUserDeferWindowPos' final four scalar arguments are part of the syscall
+                    // trap frame on NT. Isolated win32k cannot rely on a hosted caller stack being
+                    // mapped in its VSpace, so capture the tail at the executive boundary and pass a
+                    // normal staged stack tail through the registered win32k service table arity.
+                    let mut tail = [0u64; 4];
+                    let mut tail_ok = true;
+                    let mut i = 0usize;
+                    while i < tail.len() {
+                        match client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28 + i as u64 * 8,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            Some(value) => tail[i] = value,
+                            None => {
+                                tail_ok = false;
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    if tail_ok {
+                        d_a3 = a3 as i32 as i64 as u64;
+                        defer_window_pos_stack_args = [
+                            tail[0] as i32 as i64 as u64,
+                            tail[1] as i32 as i64 as u64,
+                            tail[2] as i32 as i64 as u64,
+                            tail[3] as u32 as u64,
+                        ];
+                        defer_window_pos_stack_arg_count = defer_window_pos_stack_args.len();
+                        let n = DEFER_WINDOW_POS_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 {
+                            print_str(b"[w32marshal] NtUserDeferWindowPos pi=");
+                            print_u64(pi as u64);
+                            print_str(b" hdwp=0x");
+                            print_hex_u64(a0);
+                            print_str(b" hwnd=0x");
+                            print_hex_u64(a1);
+                            print_str(b" after=0x");
+                            print_hex_u64(a2);
+                            print_str(b" pos=");
+                            print_u64(d_a3 as i32 as i64 as u64);
+                            print_str(b",");
+                            print_u64(defer_window_pos_stack_args[0] as i32 as i64 as u64);
+                            print_str(b" size=");
+                            print_u64(defer_window_pos_stack_args[1] as i32 as i64 as u64);
+                            print_str(b"x");
+                            print_u64(defer_window_pos_stack_args[2] as i32 as i64 as u64);
+                            print_str(b" flags=0x");
+                            print_hex(defer_window_pos_stack_args[3] as u32);
+                            print_str(b"\n");
+                        }
+                    } else {
+                        defer_window_pos_probe_failed = true;
+                    }
+                } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN {
+                    defer_window_pos_probe_failed = true;
                 } else if m0 == 0x10cb && uses_client_gdi {
                     // NtGdiGetCharWidthW copies an optional caller WCHAR/glyph array and then writes
                     // Count INT/FLOAT-sized widths back to the caller. Stage both sides explicitly so
@@ -9567,6 +9632,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if defer_window_pos_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserDeferWindowPos stack probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hdwp=0x");
+                        print_hex_u64(a0);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a1);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> NULL\n");
+                    }
+                    (0, true)
                 } else if get_atom_name_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9659,6 +9738,9 @@ pub(crate) unsafe fn service_sec_image(
                             == load_keyboard_layout_stack_args.len();
                     let message_call_staged_stack = m0 == NTUSER_MESSAGE_CALL_SSN
                         && message_call_stack_arg_count == message_call_stack_args.len();
+                    let defer_window_pos_staged_stack = m0 == NTUSER_DEFER_WINDOW_POS_SSN
+                        && defer_window_pos_stack_arg_count
+                            == defer_window_pos_stack_args.len();
                     // Keep the original SP in the dispatch context for callback/completion
                     // observers. win32k_dispatch_wide still sends SH_REQ_CALLER_SP=0 when
                     // stack_args is non-empty, so the component consumes only the staged tail.
@@ -9689,6 +9771,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &load_keyboard_layout_stack_args)
                     } else if message_call_staged_stack {
                         (sp, &message_call_stack_args)
+                    } else if defer_window_pos_staged_stack {
+                        (sp, &defer_window_pos_stack_args)
                     } else {
                         (sp, &[])
                     };
