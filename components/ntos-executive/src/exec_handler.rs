@@ -165,6 +165,29 @@ fn registry_sz_bytes(value: &str) -> alloc::vec::Vec<u8> {
     data
 }
 
+fn utf16_units_to_string(units: &[u16]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for &unit in units {
+        if let Some(c) = char::from_u32(unit as u32) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_profile_list_sid_key_canon(path: &str) -> bool {
+    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+    comps.len() == 8
+        && comps[0].eq_ignore_ascii_case("Registry")
+        && comps[1].eq_ignore_ascii_case("Machine")
+        && comps[2].eq_ignore_ascii_case("Software")
+        && comps[3].eq_ignore_ascii_case("Microsoft")
+        && comps[4].eq_ignore_ascii_case("Windows NT")
+        && comps[5].eq_ignore_ascii_case("CurrentVersion")
+        && comps[6].eq_ignore_ascii_case("ProfileList")
+        && comps[7].starts_with("s-")
+}
+
 fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
     let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
     let affinity = if processors >= 64 {
@@ -1044,13 +1067,51 @@ impl ExecNtHandler {
         if !path.is_empty() {
             return alloc::string::String::from(path);
         }
-        let mut name = alloc::string::String::new();
-        for &unit in &self.read_objattr_name_pe(oa) {
-            if let Some(c) = char::from_u32(unit as u32) {
-                name.push(c);
+        self.read_registry_objattr_name(oa)
+    }
+
+    /// Decode a registry UNICODE_STRING from the calling process. Prefer the ordinary live-memory
+    /// mirror (stack/heap/resident image), then fall back to the PE-backed reader for untouched DLL
+    /// `.rdata` literals. This is the CM equivalent of ProbeForRead: dynamic names created by
+    /// userenv must not be lost just because other registry callers need static-literal recovery.
+    unsafe fn read_registry_ustr_units(&self, ustr_va: u64) -> alloc::vec::Vec<u16> {
+        if ustr_va == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let mut expected_units = None;
+        let mut len = [0u8; 2];
+        if self.xas_read(ustr_va, &mut len) {
+            let byte_len = u16::from_le_bytes(len) as usize;
+            if byte_len & 1 == 0 {
+                expected_units = Some((byte_len / 2).min(1024));
             }
         }
-        name
+        let live = smss_read_ustr(ustr_va);
+        if expected_units.is_some_and(|n| live.len() >= n) || expected_units.is_none() && !live.is_empty()
+        {
+            return live;
+        }
+        let backed = self.read_ustr_pe(ustr_va);
+        if backed.len() > live.len() {
+            backed
+        } else {
+            live
+        }
+    }
+
+    unsafe fn read_registry_ustr_name(&self, ustr_va: u64) -> alloc::string::String {
+        utf16_units_to_string(&self.read_registry_ustr_units(ustr_va))
+    }
+
+    unsafe fn read_registry_objattr_name(&self, oa_va: u64) -> alloc::string::String {
+        if oa_va == 0 {
+            return alloc::string::String::new();
+        }
+        let mut p = [0u8; 8];
+        if !self.xas_read(oa_va + 0x10, &mut p) {
+            return alloc::string::String::new();
+        }
+        self.read_registry_ustr_name(u64::from_le_bytes(p))
     }
 
     /// Split an NT registry path into its non-empty components.
@@ -9862,13 +9923,7 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
-                let name16 = self.read_objattr_name_pe(oa);
-                let mut name = alloc::string::String::new();
-                for &w in &name16 {
-                    if let Some(c) = char::from_u32(w as u32) {
-                        name.push(c);
-                    }
-                }
+                let name = self.read_registry_objattr_name(oa);
                 // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
                 let full: Option<alloc::string::String> = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut f = alloc::string::String::from(r"\Registry\Machine\");
@@ -9940,6 +9995,17 @@ impl ExecNtHandler {
                     // `rpcrt4_ncacn_np_handoff`. Its tail is `NtFlushKey`, so this key existing
                     // proves that whole sequence ran instead of walling on the unserviced SSN 83.
                     ACTIVE_COMPUTER_NAME_KEY_CREATED.fetch_add(1, Ordering::Relaxed);
+                } else if self.current_process_is_winlogon() && is_profile_list_sid_key_canon(&canon) {
+                    PROFILE_LIST_SID_KEYS_CREATED.fetch_add((!existed) as u64, Ordering::Relaxed);
+                    if PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+                        print_str(b"[profile-list] NtCreateKey ");
+                        print_ascii_str(&canon);
+                        if existed {
+                            print_str(b" opened\n");
+                        } else {
+                            print_str(b" created\n");
+                        }
+                    }
                 }
                 let status = self.mint_registry_key(
                     OVERLAY_KEY_TAG | (oidx as u32),
@@ -9970,13 +10036,7 @@ impl ExecNtHandler {
                     Ok(index) => index,
                     Err(status) => return status,
                 };
-                let name16 = self.read_ustr_pe(args[1]);
-                let mut name = alloc::string::String::new();
-                for &w in &name16 {
-                    if let Some(c) = char::from_u32(w as u32) {
-                        name.push(c);
-                    }
-                }
+                let name = self.read_registry_ustr_name(args[1]);
                 let ty = args[3] as u32; // R9 = Type
                 let sp = get_recv_mr(16);
                 let data_ptr = smss_stack_read(sp + 0x28); // [sp+0x28] = Data
@@ -10006,6 +10066,30 @@ impl ExecNtHandler {
                     LSA_ACCT_DOMAIN_SID_HEAD.store(u64::from_le_bytes(head), Ordering::Relaxed);
                 }
                 self.overlay.set_value(oidx, &name, ty, &data);
+                if self.current_process_is_winlogon() {
+                    if let Some(path) = self.overlay.path(oidx) {
+                        if is_profile_list_sid_key_canon(path) {
+                            PROFILE_LIST_SID_VALUE_SETS.fetch_add(1, Ordering::Relaxed);
+                            let name_lc = name.to_ascii_lowercase();
+                            if name_lc == "profileimagepath" {
+                                PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.fetch_add(1, Ordering::Relaxed);
+                            } else if name_lc == "refcount" {
+                                PROFILE_LIST_REFCOUNT_SETS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+                                print_str(b"[profile-list] NtSetValueKey ");
+                                print_ascii_str(path);
+                                print_str(b" value=\"");
+                                print_ascii_str(&name);
+                                print_str(b"\" type=");
+                                print_u64(ty as u64);
+                                print_str(b" bytes=");
+                                print_u64(data.len() as u64);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
+                }
                 self.overlay_dirty = true;
                 0 // STATUS_SUCCESS
             },
@@ -10059,13 +10143,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let name16 = self.read_ustr_pe(args[1]);
-                let mut name = alloc::string::String::new();
-                for &w in &name16 {
-                    if let Some(c) = char::from_u32(w as u32) {
-                        name.push(c);
-                    }
-                }
+                let name = self.read_registry_ustr_name(args[1]);
                 if self.registry_value(key, &name).is_none() {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }

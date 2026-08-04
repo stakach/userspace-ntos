@@ -4257,6 +4257,14 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(hits);
     print_str(b" ProfilesDirectory value-reads=");
     print_u64(reads);
+    print_str(b" ProfileSID keys-created=");
+    print_u64(PROFILE_LIST_SID_KEYS_CREATED.load(Ordering::Relaxed));
+    print_str(b" value-sets=");
+    print_u64(PROFILE_LIST_SID_VALUE_SETS.load(Ordering::Relaxed));
+    print_str(b" ProfileImagePath=");
+    print_u64(PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.load(Ordering::Relaxed));
+    print_str(b" RefCount=");
+    print_u64(PROFILE_LIST_REFCOUNT_SETS.load(Ordering::Relaxed));
     print_str(b" SOFTWARE value-reads=");
     print_u64(SOFTWARE_HIVE_VALUE_READS.load(Ordering::Relaxed));
     print_str(b" readonly-fat-create-opens=");
@@ -10645,6 +10653,13 @@ pub(crate) static SOFTWARE_HIVE_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SOFTWARE_HIVE_VALUE_READS: AtomicU64 = AtomicU64::new(0);
 /// …of which: winlogon reading `ProfileList\ProfilesDirectory` — `userenv!GetProfilesDirectoryW`.
 pub(crate) static WINLOGON_PROFILES_DIR_READS: AtomicU64 = AtomicU64::new(0);
+/// Runtime-created `ProfileList\<SID>` keys/values. `CreateUserProfileW` creates the SID key and
+/// writes `ProfileImagePath`/`Sid`; `LoadUserProfileW` later bumps `RefCount` and stamps state.
+pub(crate) static PROFILE_LIST_SID_KEYS_CREATED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_LIST_SID_VALUE_SETS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_LIST_PROFILE_IMAGE_PATH_SETS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_LIST_REFCOUNT_SETS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROFILE_LIST_VALUE_TRACE: AtomicU64 = AtomicU64::new(0);
 /// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or
 /// `\Registry\Machine\SAM[...]`) — lsass' LsapOpenServiceKey / samsrv's SampInitDatabase open these,
 /// which our staged SYSTEM hive doesn't contain (real ReactOS creates them at setup). The executive
