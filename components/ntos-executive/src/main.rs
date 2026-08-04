@@ -16933,7 +16933,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[driver-launch] launching Npfs from SYSTEM hive path=");
             print_str(&npfs_path[..npfs_path_len]);
             print_str(b"\n");
-            if let Some(dc) = load_driver(&fs, &npfs_path[..npfs_path_len], npfs_class) {
+            if let Some(dc) = load_driver(
+                &fs,
+                &npfs_path[..npfs_path_len],
+                npfs_class,
+                "\\Driver\\Npfs",
+            ) {
                 publish_npfs_io_objects(&mut c, &dc, &mut passed);
                 // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
                 check(
@@ -17537,6 +17542,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &fs,
                 &proof_driver_path[..proof_driver_path_len],
                 proof_driver_class,
+                "\\Driver\\IrpFsdTest",
             ) {
                 // This minimal FSD fills its MajorFunction[] table but creates NO control
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.

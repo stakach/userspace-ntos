@@ -20,10 +20,16 @@
 //! The existing bespoke spawners are follow-on migrations onto this path (their descriptor-builders
 //! already exist post effort-1); this increment builds the general path + proves it with npfs.
 
+use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
+use nt_io_manager::{
+    DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType, DispatchTarget, DriverBackendId,
+    DriverId, DriverPeerId, DriverRecord, IoManager, MajorFunctionTable,
+};
+use nt_types::{NtPath, ObjectId};
 
 // Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory};
@@ -2327,10 +2333,17 @@ pub(crate) unsafe fn load_driver(
     fs: &Fat32,
     path: &[u8],
     class: DriverClass,
+    driver_object_path: &str,
 ) -> Option<DriverComponent> {
     let (caps, _wants_device_caps) = caps_and_layout_for(class);
     if !caps.dispatch_server {
         // The GUI syscall server (win32k) is NOT routed through the general IRP path.
+        return None;
+    }
+    if parse_nt_path(driver_object_path).is_none() {
+        print_str(b"[driver-launch] invalid driver object path ");
+        print_str(driver_object_path.as_bytes());
+        print_str(b"\n");
         return None;
     }
 
@@ -2520,12 +2533,7 @@ pub(crate) unsafe fn load_driver(
     print_hex(devobj as u32);
     print_str(b"\n");
 
-    let driver_id = DRIVER_NEXT_BINDING_ID.fetch_add(1, Ordering::Relaxed);
-    let device_id = if devobj != 0 {
-        DEVICE_NEXT_ROUTE_ID.fetch_add(1, Ordering::Relaxed)
-    } else {
-        0
-    };
+    let driver_id = register_io_driver(driver_object_path, instance)?;
     let dc = DriverComponent {
         pml4,
         fault_ep,
@@ -2543,10 +2551,12 @@ pub(crate) unsafe fn load_driver(
         exec_arg_va: win.arg_va,
         instance,
         driver_id,
-        device_id,
+        device_id: 0,
         tcb,
         reply_cap,
     };
+    let device_id = register_io_device(driver_id, &dc);
+    let dc = DriverComponent { device_id, ..dc };
     // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
     Some(dc)
@@ -2656,8 +2666,72 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 // ---------------------------------------------------------------------------------------------
 
 pub(crate) const IO_MANAGER_COMPONENT_ID: u64 = 0x494F_0000;
-static DRIVER_NEXT_BINDING_ID: AtomicU64 = AtomicU64::new(1);
-static DEVICE_NEXT_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
+type ExecutiveIoManager = IoManager<()>;
+static mut DRIVER_IO_MANAGER: MaybeUninit<ExecutiveIoManager> = MaybeUninit::uninit();
+static mut DRIVER_IO_MANAGER_INIT: bool = false;
+
+fn io_manager_mut() -> &'static mut ExecutiveIoManager {
+    unsafe {
+        let init = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER_INIT);
+        let slot = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER);
+        if !read_volatile(init) {
+            (*slot).write(IoManager::new(()));
+            write_volatile(init, true);
+        }
+        (*slot).assume_init_mut()
+    }
+}
+
+fn parse_nt_path(path: &str) -> Option<NtPath> {
+    NtPath::parse_str(path).ok()
+}
+
+fn captured_nt_path(bytes: &[u8; SH_CAPTURED_PATH_BYTES], len: u16) -> Option<NtPath> {
+    let len = len as usize;
+    if len == 0 || len > bytes.len() || (len & 1) != 0 {
+        return None;
+    }
+    let mut units = [0u16; SH_CAPTURED_PATH_BYTES / 2];
+    let mut i = 0usize;
+    while i < len / 2 {
+        let off = i * 2;
+        units[i] = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+        i += 1;
+    }
+    NtPath::parse(&units[..len / 2]).ok()
+}
+
+fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {
+    let name = parse_nt_path(driver_object_path)?;
+    let mut dispatch = MajorFunctionTable::new();
+    dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(instance as u64)));
+    let record = DriverRecord::new(
+        ObjectId::NULL,
+        name,
+        DriverBackendId(instance as u64),
+        dispatch,
+    );
+    Some(io_manager_mut().register_driver(record).raw())
+}
+
+fn register_io_device(driver_id: u64, dc: &DriverComponent) -> u64 {
+    if dc.devobj == 0 || dc.device_name_len == 0 {
+        return 0;
+    }
+    let Some(name) = captured_nt_path(&dc.device_name_utf16, dc.device_name_len) else {
+        return 0;
+    };
+    let record = DeviceRecord::new(
+        ObjectId::NULL,
+        DriverId(driver_id),
+        Some(name),
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::BUFFERED_IO,
+        0,
+    );
+    io_manager_mut().add_device(record).raw()
+}
 
 /// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
 #[derive(Clone, Copy)]
@@ -2806,6 +2880,9 @@ pub(crate) fn bind_driver_object_id(driver_id: u64, object_id: u64) -> bool {
     for entry in t.iter_mut() {
         if entry.used && entry.id == driver_id {
             entry.object_id = object_id;
+            if let Some(driver) = io_manager_mut().driver_mut(DriverId(driver_id)) {
+                driver.object_id = ObjectId(object_id);
+            }
             return true;
         }
     }
@@ -2823,6 +2900,9 @@ pub(crate) fn bind_device_object_id(device_id: u64, object_id: u64) -> bool {
     for entry in t.iter_mut() {
         if entry.used && entry.id == device_id {
             entry.object_id = object_id;
+            if let Some(device) = io_manager_mut().device_mut(nt_io_manager::DeviceId(device_id)) {
+                device.object_id = ObjectId(object_id);
+            }
             return true;
         }
     }

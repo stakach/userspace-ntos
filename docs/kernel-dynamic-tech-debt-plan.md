@@ -1522,3 +1522,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   and `git diff --check` passed. Review adjustment: D1 remains open until these executive route
   tables are folded into the canonical `nt-io-manager` driver/device stores and driver-created
   projections are owned from that boundary rather than `driver_launch`.
+- D1 continued. The route ids published through Object Manager are now actual generation-protected
+  `nt-io-manager` `DriverId`/`DeviceId` values. `load_driver` receives the NT driver-object path from
+  service policy, registers a `DriverRecord` in the canonical I/O manager catalog, creates a
+  `DeviceRecord` from the driver-declared `IoCreateDevice` name, and backfills the Object Manager
+  object ids into those records after namespace publication. The private transport table now maps
+  canonical I/O ids to the isolated component instance; it no longer allocates its own driver/device
+  identities. Validation: `cargo fmt --manifest-path components/ntos-executive/Cargo.toml` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`
+  passed. Review adjustment: D1 remains open for replacing the private seL4 transport map with an
+  `nt-io-manager` dispatch backend/IRP lifecycle path and moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT`
+  projection construction out of `driver_launch`.
