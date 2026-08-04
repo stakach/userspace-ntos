@@ -23,12 +23,17 @@
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
 use nt_io_manager::{
-    DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType, DispatchTarget, DriverBackendId,
-    DriverId, DriverPeerId, DriverRecord, IoManager, MajorFunctionTable,
+    DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceRecord, DeviceType,
+    DispatchContext, DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend,
+    DriverId, DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters,
+    IrpId, IrpProjection, MajorFunctionTable, ReadWriteParameters,
 };
+use nt_types::ClientId;
 use nt_types::{NtPath, ObjectId};
 
 // Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
@@ -2701,17 +2706,228 @@ fn captured_nt_path(bytes: &[u8; SH_CAPTURED_PATH_BYTES], len: u16) -> Option<Nt
     NtPath::parse(&units[..len / 2]).ok()
 }
 
+struct HostedDriverBackend {
+    instance: usize,
+}
+
+fn projection_fsctl(irp: &IrpProjection) -> u64 {
+    match &irp.parameters {
+        IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
+            p.ioctl_code as u64
+        }
+        IoParameters::QueryInformation(p) | IoParameters::SetInformation(p) => p.info_class as u64,
+        _ => 0,
+    }
+}
+
+fn projection_buffer_extents(irp: &IrpProjection, cap: usize) -> (usize, usize) {
+    if let Some(buffer) = irp.buffer {
+        (
+            (buffer.input_len as usize).min(cap),
+            (buffer.output_len as usize).min(cap),
+        )
+    } else {
+        let (input_len, output_len) = irp.parameters.buffered_lengths(cap);
+        (
+            (input_len as usize).min(cap),
+            (output_len as usize).min(cap),
+        )
+    }
+}
+
+impl DriverDispatchBackend for HostedDriverBackend {
+    fn dispatch_irp(
+        &mut self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, nt_status::NtStatus> {
+        let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
+        let input = Vec::from(&ctx.system_buffer[..input_len]);
+        let fsctl = projection_fsctl(irp);
+        let result = unsafe {
+            dispatch_irp_for_instance(
+                self.instance,
+                irp.major as u64,
+                fsctl,
+                irp.user_data,
+                &input,
+                &mut ctx.system_buffer[..output_len],
+            )
+        };
+        match result {
+            Some((status, information)) => Ok(DispatchOutcome::Completed {
+                status: nt_status::NtStatus(status),
+                information,
+            }),
+            None => Ok(DispatchOutcome::Failed {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            }),
+        }
+    }
+
+    fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+        Err(nt_status::NtStatus::NOT_SUPPORTED)
+    }
+}
+
+fn external_major(major: u64) -> Option<u8> {
+    if major <= u8::MAX as u64 {
+        Some(major as u8)
+    } else {
+        None
+    }
+}
+
+fn external_len(len: usize) -> u32 {
+    len.min(u32::MAX as usize) as u32
+}
+
+fn external_code(fsctl: u64) -> Option<u32> {
+    if fsctl <= u32::MAX as u64 {
+        Some(fsctl as u32)
+    } else {
+        None
+    }
+}
+
+fn external_irp_parameters(
+    major: u8,
+    fsctl: u64,
+    input_len: u32,
+    output_len: u32,
+) -> Option<IoParameters> {
+    match major {
+        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE => {
+            Some(IoParameters::Create(Default::default()))
+        }
+        major::IRP_MJ_CLEANUP => Some(IoParameters::Cleanup),
+        major::IRP_MJ_CLOSE => Some(IoParameters::Close),
+        major::IRP_MJ_READ => Some(IoParameters::Read(ReadWriteParameters {
+            length: output_len,
+            key: 0,
+            offset: 0,
+        })),
+        major::IRP_MJ_WRITE => Some(IoParameters::Write(ReadWriteParameters {
+            length: input_len,
+            key: 0,
+            offset: 0,
+        })),
+        major::IRP_MJ_QUERY_INFORMATION => {
+            Some(IoParameters::QueryInformation(InformationParameters {
+                info_class: external_code(fsctl)?,
+                length: output_len,
+            }))
+        }
+        major::IRP_MJ_SET_INFORMATION => {
+            Some(IoParameters::SetInformation(InformationParameters {
+                info_class: external_code(fsctl)?,
+                length: input_len,
+            }))
+        }
+        major::IRP_MJ_FLUSH_BUFFERS => Some(IoParameters::FlushBuffers),
+        major::IRP_MJ_FILE_SYSTEM_CONTROL | major::IRP_MJ_DEVICE_CONTROL => {
+            Some(IoParameters::DeviceControl(DeviceControlParameters {
+                ioctl_code: external_code(fsctl)?,
+                input_len,
+                output_len,
+            }))
+        }
+        major::IRP_MJ_INTERNAL_DEVICE_CONTROL => Some(IoParameters::InternalDeviceControl(
+            DeviceControlParameters {
+                ioctl_code: external_code(fsctl)?,
+                input_len,
+                output_len,
+            },
+        )),
+        major::IRP_MJ_POWER => Some(IoParameters::Power),
+        major::IRP_MJ_PNP => Some(IoParameters::Pnp),
+        _ => Some(IoParameters::Unsupported),
+    }
+}
+
+fn dispatch_external_irp_to_driver_record(
+    driver_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let major = external_major(major)?;
+    let input_len = external_len(in_data.len());
+    let output_len = external_len(out.len());
+    let params = external_irp_parameters(major, fsctl, input_len, output_len)?;
+    let mut system_buffer = Vec::new();
+    system_buffer.resize(in_data.len().max(out.len()), 0);
+    system_buffer[..in_data.len()].copy_from_slice(in_data);
+    let (status, information) = io_manager_mut()
+        .build_and_dispatch_external_to_driver(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            DriverId(driver_id),
+            None::<FileId>,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            &mut system_buffer,
+        )
+        .ok()?;
+    let copy_len = (information as usize)
+        .min(out.len())
+        .min(system_buffer.len());
+    out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
+    Some((status.raw(), information))
+}
+
+fn dispatch_external_irp_to_device_record(
+    device_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let major = external_major(major)?;
+    let input_len = external_len(in_data.len());
+    let output_len = external_len(out.len());
+    let params = external_irp_parameters(major, fsctl, input_len, output_len)?;
+    let mut system_buffer = Vec::new();
+    system_buffer.resize(in_data.len().max(out.len()), 0);
+    system_buffer[..in_data.len()].copy_from_slice(in_data);
+    let (status, information) = io_manager_mut()
+        .build_and_dispatch_external_to_device(
+            ClientId(IO_MANAGER_COMPONENT_ID),
+            nt_io_manager::DeviceId(device_id),
+            None::<FileId>,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            &mut system_buffer,
+        )
+        .ok()?;
+    let copy_len = (information as usize)
+        .min(out.len())
+        .min(system_buffer.len());
+    out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
+    Some((status.raw(), information))
+}
+
 fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {
     let name = parse_nt_path(driver_object_path)?;
+    let io = io_manager_mut();
+    let backend = io.register_backend(Box::new(HostedDriverBackend { instance }));
     let mut dispatch = MajorFunctionTable::new();
-    dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(instance as u64)));
+    dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(backend as u64)));
     let record = DriverRecord::new(
         ObjectId::NULL,
         name,
-        DriverBackendId(instance as u64),
+        DriverBackendId(backend as u64),
         dispatch,
     );
-    Some(io_manager_mut().register_driver(record).raw())
+    Some(io.register_driver(record).raw())
 }
 
 fn register_io_device(driver_id: u64, dc: &DriverComponent) -> u64 {
@@ -3164,7 +3380,7 @@ pub(crate) unsafe fn dispatch_irp_to_driver(
     if !binding.ready || binding.driver_object == 0 {
         return None;
     }
-    dispatch_irp_for_instance(binding.instance, major, fsctl, file_id, in_data, out)
+    dispatch_external_irp_to_driver_record(driver_id, major, fsctl, file_id, in_data, out)
 }
 
 /// Route one IRP to a launched device by its canonical device route id.
@@ -3180,7 +3396,7 @@ pub(crate) unsafe fn dispatch_irp_to_device(
     if !route.ready || route.driver_id == 0 || route.device_object == 0 {
         return None;
     }
-    dispatch_irp_for_instance(route.instance, major, fsctl, file_id, in_data, out)
+    dispatch_external_irp_to_device_record(device_id, major, fsctl, file_id, in_data, out)
 }
 
 /// Route one IRP to a launched device by the Object Manager Device object id.
@@ -3196,7 +3412,7 @@ pub(crate) unsafe fn dispatch_irp_to_device_object(
     if !route.ready || route.driver_id == 0 || route.device_object == 0 {
         return None;
     }
-    dispatch_irp_for_instance(route.instance, major, fsctl, file_id, in_data, out)
+    dispatch_external_irp_to_device_record(route.id, major, fsctl, file_id, in_data, out)
 }
 
 unsafe fn dispatch_irp_to_named_device(

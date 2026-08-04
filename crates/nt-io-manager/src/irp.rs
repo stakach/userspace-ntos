@@ -24,6 +24,8 @@ pub struct IoBufferRef {
     pub buffer_id: u64,
     pub offset: u64,
     pub len: u32,
+    pub input_len: u32,
+    pub output_len: u32,
     pub access: BufferAccess,
 }
 
@@ -86,6 +88,24 @@ pub enum IoParameters {
     Power,
     #[default]
     Unsupported,
+}
+
+impl IoParameters {
+    /// The input/output extents represented inside a buffered SystemBuffer for
+    /// normal I/O Manager request builders.
+    pub fn buffered_lengths(&self, system_buffer_len: usize) -> (u32, u32) {
+        let cap = system_buffer_len.min(u32::MAX as usize) as u32;
+        match self {
+            IoParameters::Read(p) => (0, p.length.min(cap)),
+            IoParameters::Write(p) => (p.length.min(cap), 0),
+            IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
+                (p.input_len.min(cap), p.output_len.min(cap))
+            }
+            IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
+            IoParameters::SetInformation(p) => (p.length.min(cap), 0),
+            _ => (0, 0),
+        }
+    }
 }
 
 bitflags::bitflags! {

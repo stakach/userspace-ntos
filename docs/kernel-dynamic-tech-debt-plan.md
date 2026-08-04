@@ -1537,3 +1537,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   adjustment: D1 remains open for replacing the private seL4 transport map with an `nt-io-manager`
   dispatch backend/IRP lifecycle path and moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT` projection
   construction out of `driver_launch`.
+- D1 continued. Hosted FSD dispatch now runs through an `nt-io-manager` backend and synchronous IRP
+  lifecycle instead of public helpers jumping directly to the component instance pump. The I/O
+  Manager now has a host-testable external dispatch adapter that builds a canonical IRP, projects
+  buffered input/output extents, routes by registered driver/device dispatch target, preserves raw
+  NTSTATUS completions, and frees the IRP. The executive registers each isolated hosted driver as an
+  I/O Manager backend; public driver/device/Object Manager/NamedPipe routes build an I/O Manager IRP
+  and leave the seL4 pump as private backend transport only. Validation: `cargo test --manifest-path
+  crates/nt-io-manager/Cargo.toml`, `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `git diff --check`, and `.tmp/full-boot-driver-dispatch-iomanager-20260804.log` reached `RUN_RC=0`,
+  `247/280 executive->isolated-service checks passed`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_irp_transport_call_bound`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT` projection construction and any
+  driver-created device-stack ownership still embedded in `driver_launch` into the I/O Manager/driver
+  host boundary.

@@ -12,7 +12,7 @@ use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
 
 use crate::device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
-use crate::dispatch::{DispatchContext, DispatchOutcome, DriverDispatchBackend, IrpProjection};
+use crate::dispatch::{DispatchOutcome, DriverDispatchBackend};
 use crate::driver::{
     DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, MajorFunctionTable, MockDispatchId,
 };
@@ -256,37 +256,15 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         system_buffer: &mut [u8],
     ) -> Result<DispatchOutcome, NtStatus> {
-        let (device_id, major_fn, client) = {
+        let device_id = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
-            (irp.device_id, irp.major, irp.client_id)
+            irp.device_id
         };
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
             .driver_id;
-        let target = self
-            .driver(driver_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?
-            .dispatch
-            .get(major_fn);
-        let idx = match target {
-            DispatchTarget::Mock(id) => id.0 as usize,
-            DispatchTarget::DriverPeer(id) => id.0 as usize,
-            DispatchTarget::Unsupported => {
-                return Ok(DispatchOutcome::Failed {
-                    status: NtStatus::INVALID_DEVICE_REQUEST,
-                })
-            }
-        };
-        let proj = IrpProjection::from_record(self.irp(irp_id).expect("checked above"));
-        let backend = self
-            .backends
-            .get_mut(idx)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        backend.dispatch_irp(
-            DispatchContext::new(driver_id, client, system_buffer),
-            &proj,
-        )
+        self.dispatch_to_driver(driver_id, irp_id, system_buffer)
     }
 
     fn cleanup_failed_open(

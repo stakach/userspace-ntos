@@ -23,6 +23,7 @@ mod dispatch;
 mod driver;
 mod driver_host;
 mod driver_peer;
+mod external_dispatch;
 mod fault;
 mod file;
 mod irp;
@@ -888,6 +889,181 @@ mod tests {
             om.device_control(client, handle, code, b"x", &mut out),
             Err(NtStatus::INVALID_DEVICE_REQUEST)
         );
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedDispatch {
+        driver_id: DriverId,
+        client_id: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        major: u8,
+        user_data: u64,
+        parameters: IoParameters,
+        input_len: u32,
+        output_len: u32,
+        buffer: std::vec::Vec<u8>,
+    }
+
+    struct RecordingBackend {
+        seen: std::rc::Rc<std::cell::RefCell<std::vec::Vec<RecordedDispatch>>>,
+        status: NtStatus,
+        information: u64,
+        output: std::vec::Vec<u8>,
+    }
+
+    impl DriverDispatchBackend for RecordingBackend {
+        fn dispatch_irp(
+            &mut self,
+            ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            self.seen.borrow_mut().push(RecordedDispatch {
+                driver_id: ctx.driver_id,
+                client_id: ctx.client_id,
+                device_id: irp.device_id,
+                file_id: irp.file_id,
+                major: irp.major,
+                user_data: irp.user_data,
+                parameters: irp.parameters.clone(),
+                input_len: irp.buffer.map(|b| b.input_len).unwrap_or(0),
+                output_len: irp.buffer.map(|b| b.output_len).unwrap_or(0),
+                buffer: ctx.system_buffer.to_vec(),
+            });
+            let n = self.output.len().min(ctx.system_buffer.len());
+            ctx.system_buffer[..n].copy_from_slice(&self.output[..n]);
+            Ok(DispatchOutcome::Completed {
+                status: self.status,
+                information: self.information,
+            })
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::INVALID_PARAMETER)
+        }
+    }
+
+    fn external_recording_driver(
+        om: &mut IoManager<MockObjectPort>,
+        driver_path: &str,
+        status: NtStatus,
+        information: u64,
+        output: &[u8],
+    ) -> (
+        DriverId,
+        std::rc::Rc<std::cell::RefCell<std::vec::Vec<RecordedDispatch>>>,
+    ) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let idx = om.register_backend(Box::new(RecordingBackend {
+            seen: seen.clone(),
+            status,
+            information,
+            output: output.to_vec(),
+        }));
+        let target = DispatchTarget::DriverPeer(DriverPeerId(idx as u64));
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set_all(target);
+        let driver = om.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            path(driver_path),
+            DriverBackendId(idx as u64),
+            dispatch,
+        ));
+        (driver, seen)
+    }
+
+    #[test]
+    fn external_device_dispatch_preserves_raw_status_and_cookie() {
+        let mut om = io();
+        let warning = NtStatus(0x8000_0005u32 as i32); // STATUS_BUFFER_OVERFLOW.
+        let (driver, seen) =
+            external_recording_driver(&mut om, "\\Driver\\External", warning, 3, b"out");
+        let device = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            Some(path("\\Device\\External0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        let mut buf = *b"input";
+        let params = IoParameters::SetInformation(InformationParameters {
+            info_class: 23,
+            length: buf.len() as u32,
+        });
+
+        let (status, info) = om
+            .build_and_dispatch_external_to_device(
+                ClientId(44),
+                device,
+                None,
+                0xABCD,
+                major::IRP_MJ_SET_INFORMATION,
+                params.clone(),
+                buf.len() as u32,
+                0,
+                &mut buf,
+            )
+            .unwrap();
+
+        assert_eq!((status, info), (warning, 3));
+        assert_eq!(&buf[..3], b"out");
+        assert_eq!(om.irp_count(), 0);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            RecordedDispatch {
+                driver_id: driver,
+                client_id: ClientId(44),
+                device_id: device,
+                file_id: None,
+                major: major::IRP_MJ_SET_INFORMATION,
+                user_data: 0xABCD,
+                parameters: params,
+                input_len: 5,
+                output_len: 0,
+                buffer: b"input".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn external_driver_dispatch_supports_driver_without_device() {
+        let mut om = io();
+        let (driver, seen) =
+            external_recording_driver(&mut om, "\\Driver\\NoDevice", NtStatus::SUCCESS, 4, b"pong");
+        let params = IoParameters::DeviceControl(DeviceControlParameters {
+            ioctl_code: 0x222000,
+            input_len: 4,
+            output_len: 4,
+        });
+        let mut buf = *b"ping";
+
+        let (status, info) = om
+            .build_and_dispatch_external_to_driver(
+                ClientId(55),
+                driver,
+                None,
+                0x1234,
+                major::IRP_MJ_DEVICE_CONTROL,
+                params,
+                4,
+                4,
+                &mut buf,
+            )
+            .unwrap();
+
+        assert_eq!((status, info), (NtStatus::SUCCESS, 4));
+        assert_eq!(&buf, b"pong");
+        assert_eq!(om.irp_count(), 0);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].device_id, DeviceId::NULL);
+        assert_eq!(seen[0].driver_id, driver);
+        assert_eq!(seen[0].user_data, 0x1234);
+        assert_eq!((seen[0].input_len, seen[0].output_len), (4, 4));
     }
 
     #[test]

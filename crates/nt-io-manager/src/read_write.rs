@@ -155,10 +155,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut sl = IoStackLocation::new(major, device_id, file_id);
         sl.parameters = params;
         irp.stack.push(sl);
+        let (input_len, output_len) = irp
+            .current_stack()
+            .map(|s| s.parameters.buffered_lengths(system_buffer.len()))
+            .unwrap_or((0, 0));
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,
             len: system_buffer.len() as u32,
+            input_len,
+            output_len,
             access: BufferAccess::ReadWrite,
         });
         let irp_id = self.allocate_irp(irp);
