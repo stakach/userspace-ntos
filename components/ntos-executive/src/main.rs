@@ -1584,27 +1584,93 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
 /// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
 /// by a parked waiter). Managed by wait_park / wait_wake_event.
 static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
+/// Compact identity for an NT object that can satisfy a native wait.
+///
+/// Dispatcher namespace objects keep their historical raw encoding (the obj_ns index), so existing
+/// wait counters and debug-object proofs stay readable. Process/thread objects and win32k's
+/// client-visible event handles are tagged in the high bits.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) struct WaitObject(u64);
+
+impl WaitObject {
+    const KIND_SHIFT: u64 = 60;
+    const ID_MASK: u64 = (1u64 << Self::KIND_SHIFT) - 1;
+    pub(crate) const KIND_DISPATCHER: u64 = 0;
+    pub(crate) const KIND_PROCESS: u64 = 1;
+    pub(crate) const KIND_THREAD: u64 = 2;
+    pub(crate) const KIND_WIN32K_EVENT: u64 = 3;
+
+    pub(crate) const FREE: Self = Self(u64::MAX);
+
+    pub(crate) const fn dispatcher(index: usize) -> Self {
+        Self(index as u64)
+    }
+
+    pub(crate) const fn process(pid: nt_process::ProcessId) -> Self {
+        Self((Self::KIND_PROCESS << Self::KIND_SHIFT) | pid as u64)
+    }
+
+    pub(crate) const fn thread(tid: nt_process::ThreadId) -> Self {
+        Self((Self::KIND_THREAD << Self::KIND_SHIFT) | tid as u64)
+    }
+
+    pub(crate) const fn win32k_event_body(body: u64) -> Self {
+        Self((Self::KIND_WIN32K_EVENT << Self::KIND_SHIFT) | (body & Self::ID_MASK))
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Option<Self> {
+        if raw == Self::FREE.0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    pub(crate) const fn kind(self) -> u64 {
+        self.0 >> Self::KIND_SHIFT
+    }
+
+    pub(crate) const fn id(self) -> u64 {
+        self.0 & Self::ID_MASK
+    }
+
+    pub(crate) fn describe(self) -> &'static [u8] {
+        match self.kind() {
+            Self::KIND_DISPATCHER => b"dispatcher",
+            Self::KIND_PROCESS => b"process",
+            Self::KIND_THREAD => b"thread",
+            Self::KIND_WIN32K_EVENT => b"win32k-event",
+            _ => b"unknown",
+        }
+    }
+}
+
 /// The waiter queue: each slot parks one blocked caller.
 ///
-/// A single-object wait (NtWaitForSingleObject) records ONE event in slot 0 of its event set
+/// A single-object wait (NtWaitForSingleObject) records ONE wait object in slot 0 of its set
 /// (count 1); a multi-object wait (NtWaitForMultipleObjects) records up to `WAITER_MAX_EVENTS`
-/// obj_ns event indices + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == u32::MAX means the slot is free
-/// (it doubles as event[0]). Fixed-capacity; parking past capacity falls back to the immediate-return
-/// path (documented, never a hang).
+/// typed wait objects + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == `WaitObject::FREE.raw()` means
+/// the slot is free (it doubles as event[0]). Fixed-capacity; parking past capacity fails visibly
+/// with STATUS_INSUFFICIENT_RESOURCES.
 const WAITER_N: usize = 16;
 /// NT's architectural maximum for one multi-object wait.
 const WAITER_MAX_EVENTS: usize = 64;
-/// event[0] of each waiter's set (u32::MAX = free slot). Kept as the slot-free sentinel for backward
+/// object[0] of each waiter's set (u64::MAX = free slot). Kept as the slot-free sentinel for backward
 /// compat with the single-object callers/spec.
 static WAITER_EVENT_IDX: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
-/// The FULL event set for a multi-object waiter (event[1..count]; event[0] is WAITER_EVENT_IDX).
+/// The FULL object set for a multi-object waiter (object[1..count]; object[0] is WAITER_EVENT_IDX).
 static WAITER_EVENTS: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
     [const { [const { AtomicU64::new(u64::MAX) }; WAITER_MAX_EVENTS] }; WAITER_N];
-/// Original caller-array index for each compacted real event.
+/// Original caller-array index for each compacted real wait object.
 static WAITER_RESULT_INDEX: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
     [const { [const { AtomicU64::new(0) }; WAITER_MAX_EVENTS] }; WAITER_N];
 /// Serialized service-loop work buffers, kept off the bounded rootserver stack.
-static mut PARK_WAIT_SET_WORK: [usize; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS];
+static mut PARK_WAIT_SET_WORK: [WaitObject; WAITER_MAX_EVENTS] =
+    [WaitObject::FREE; WAITER_MAX_EVENTS];
 static mut PARK_WAIT_INDEX_WORK: [u8; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS];
 /// Number of events in this waiter's set (1 for a single-object wait).
 static WAITER_EVENT_COUNT: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
@@ -8753,31 +8819,22 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
 }
 
 /// ═══ Checkpoint B park/wake helpers (real reply-cap parking) ═══
-/// PARK the current caller on `event_idx`: the reply object CURRENTLY installed in REPLY_MAIN_SLOT is
+/// PARK the current caller on `object`: the reply object CURRENTLY installed in REPLY_MAIN_SLOT is
 /// bound (by the last recv-with-r12) to THIS caller's blocked Call, so we STEAL it into a free waiter
 /// slot and rotate a fresh POOL reply object into REPLY_MAIN_SLOT so the loop's next recv binds a
-/// NEW object (never rebinding/orphaning the parked one). The caller stays blocked in-kernel until
-/// `wait_wake_event` sends on the stolen cap. Returns true on success; false if the pool/waiter queue
-/// is exhausted (caller must then fall back to an immediate reply → never a hang).
+/// NEW object (never rebinding/orphaning the parked one). The caller stays blocked in-kernel until a
+/// matching state transition sends on the stolen cap. Returns true on success; false if the
+/// pool/waiter queue is exhausted.
 unsafe fn wait_park(
-    event_idx: usize,
+    object: WaitObject,
     resume_ip: u64,
     sp: u64,
     flags: u64,
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
-    // Single-object wait = a 1-event WaitAny set.
-    wait_park_multi(
-        &[event_idx],
-        &[0],
-        false,
-        resume_ip,
-        sp,
-        flags,
-        tid,
-        deadline,
-    )
+    // Single-object wait = a 1-object WaitAny set.
+    wait_park_multi(&[object], &[0], false, resume_ip, sp, flags, tid, deadline)
 }
 
 unsafe fn wait_cancel_thread(tid: u64) {
@@ -9234,14 +9291,14 @@ unsafe fn terminate_hosted_process_mechanisms(
     reclaimed
 }
 
-/// GENERAL park: block the current caller on a SET of obj_ns events (`events`), with `wait_all`
+/// GENERAL park: block the current caller on a SET of wait objects (`objects`), with `wait_all`
 /// selecting WaitAll (wake when all signalled → WAIT_0) vs WaitAny (wake on the first signalled →
 /// WAIT_0+index). Steals this caller's bound reply object (REPLY_MAIN) into a free waiter slot and
 /// rotates a fresh pool object into REPLY_MAIN so subsequent recvs bind a new object. Returns true on
-/// success; false if the pool/queue is exhausted OR the set is too large (`events.len() >
-/// WAITER_MAX_EVENTS`) → the caller must then fall back to an immediate reply (never a hang).
+/// success; false if the pool/queue is exhausted OR the set is too large (`objects.len() >
+/// WAITER_MAX_EVENTS`).
 unsafe fn wait_park_multi(
-    events: &[usize],
+    objects: &[WaitObject],
     result_indices: &[u8],
     wait_all: bool,
     resume_ip: u64,
@@ -9250,7 +9307,9 @@ unsafe fn wait_park_multi(
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
-    if events.is_empty() || events.len() > WAITER_MAX_EVENTS || result_indices.len() != events.len()
+    if objects.is_empty()
+        || objects.len() > WAITER_MAX_EVENTS
+        || result_indices.len() != objects.len()
     {
         return false;
     }
@@ -9288,16 +9347,16 @@ unsafe fn wait_park_multi(
     if fresh == 0 {
         return false; // pool exhausted → caller reports STATUS_INSUFFICIENT_RESOURCES
     }
-    // Commit: record the waiter's event set + its syscall resume context, install the fresh object as
+    // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
-    for (k, &ev) in events.iter().enumerate() {
-        WAITER_EVENTS[wslot][k].store(ev as u64, Ordering::Relaxed);
+    for (k, &object) in objects.iter().enumerate() {
+        WAITER_EVENTS[wslot][k].store(object.raw(), Ordering::Relaxed);
         WAITER_RESULT_INDEX[wslot][k].store(result_indices[k] as u64, Ordering::Relaxed);
     }
-    for k in events.len()..WAITER_MAX_EVENTS {
-        WAITER_EVENTS[wslot][k].store(u64::MAX, Ordering::Relaxed);
+    for k in objects.len()..WAITER_MAX_EVENTS {
+        WAITER_EVENTS[wslot][k].store(WaitObject::FREE.raw(), Ordering::Relaxed);
     }
-    WAITER_EVENT_COUNT[wslot].store(events.len() as u64, Ordering::Relaxed);
+    WAITER_EVENT_COUNT[wslot].store(objects.len() as u64, Ordering::Relaxed);
     WAITER_WAIT_ALL[wslot].store(wait_all as u64, Ordering::Relaxed);
     WAITER_REPLY_CAP[wslot].store(stolen, Ordering::Relaxed);
     WAITER_TID[wslot].store(tid, Ordering::Relaxed);
@@ -9307,15 +9366,15 @@ unsafe fn wait_park_multi(
     WAITER_RESUME_FLAGS[wslot].store(flags, Ordering::Relaxed);
     // WAITER_EVENT_IDX doubles as the slot-free sentinel: set it LAST (after the set) so a slot never
     // looks "used but empty".
-    WAITER_EVENT_IDX[wslot].store(events[0] as u64, Ordering::Relaxed);
+    WAITER_EVENT_IDX[wslot].store(objects[0].raw(), Ordering::Relaxed);
     WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
 
-/// Wake every waiter whose dispatcher condition is satisfied. Synchronization events and semaphore
-/// tokens are consumed in waiter-slot order; notification events remain signaled.
+/// Wake every waiter whose NT wait-object condition is satisfied. Synchronization events and
+/// semaphore tokens are consumed in waiter-slot order; process/thread objects are level-signalled.
 unsafe fn wait_wake_dispatcher_set(handler: &mut ExecNtHandler) -> u64 {
     wait_wake_dispatcher(handler, None)
 }
@@ -9347,8 +9406,13 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             let mut all = true;
             let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if !handler.dispatcher_ready_for(ev, waiter_tid) {
+                let Some(object) =
+                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
+                else {
+                    all = false;
+                    break;
+                };
+                if !handler.wait_object_ready_for(object, waiter_tid) {
                     all = false;
                     break;
                 }
@@ -9359,8 +9423,12 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             // WaitAny: the first (lowest-index) signalled event determines the return value.
             let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if handler.dispatcher_ready_for(ev, waiter_tid) {
+                let Some(object) =
+                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
+                else {
+                    continue;
+                };
+                if handler.wait_object_ready_for(object, waiter_tid) {
                     wake = true;
                     selected_slot = k;
                     wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
@@ -9375,13 +9443,19 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         if wait_all {
             let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                handler.dispatcher_consume_for(ev, waiter_tid);
+                if let Some(object) =
+                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
+                {
+                    handler.wait_object_consume_for(object, waiter_tid);
+                }
             }
         } else {
-            let ev = WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed) as usize;
             let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
-            handler.dispatcher_consume_for(ev, waiter_tid);
+            if let Some(object) =
+                WaitObject::from_raw(WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed))
+            {
+                handler.wait_object_consume_for(object, waiter_tid);
+            }
         }
         wake_indices[i] = wake_index;
     }
@@ -11229,11 +11303,10 @@ struct ExecNtHandler {
     /// MECHANISM — the seL4 thread in the TARGET's VSpace — because only the loop holds the main
     /// fault endpoint the new thread must be badged onto. `None` = no request (every boot today).
     pub(crate) remote_thread_request: Option<RemoteThreadRequest>,
-    /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
-    /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
-    /// event index) instead of replying, and wake it on the matching NtSetEvent. -1 = no park (either
-    /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
-    /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
+    /// Checkpoint B: set by NtWaitForSingleObject when the target is a real waitable object whose
+    /// signal state is clear → the loop must PARK this caller (reply-cap park keyed by encoded
+    /// WaitObject) instead of replying, and wake it on the matching state transition. -1 = no park.
+    /// Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
     /// Monotonic 100ns deadline for the pending single-event park (`u64::MAX` = infinite).
     wait_deadline_100ns: u64,

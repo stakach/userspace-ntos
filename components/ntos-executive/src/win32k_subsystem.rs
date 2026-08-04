@@ -1902,6 +1902,38 @@ unsafe fn register_event_object(handle: u64) {
     table.register_event(handle, body);
 }
 
+pub(crate) fn event_body_for_client_handle(handle: u64) -> Option<u64> {
+    use nt_object_manager::win32k_ob::ObKind;
+    let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
+    match table.lookup(handle) {
+        Some((ObKind::Event, body)) => Some(body),
+        _ => None,
+    }
+}
+
+pub(crate) fn event_body_ready(body: u64) -> bool {
+    body != 0
+        && unsafe { nt_kernel_exec::kevent::kevent_read_state(body as *const u8) }
+}
+
+pub(crate) fn event_body_consume(body: u64) -> bool {
+    if body == 0 {
+        return false;
+    }
+    unsafe {
+        if !nt_kernel_exec::kevent::kevent_read_state(body as *const u8) {
+            return false;
+        }
+        if matches!(
+            nt_kernel_exec::kevent::kevent_kind(body as *const u8),
+            nt_kernel_exec::kevent::EventKind::Synchronization
+        ) {
+            nt_kernel_exec::kevent::kevent_reset(body as *mut u8);
+        }
+    }
+    true
+}
+
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
     object
 }
@@ -1965,7 +1997,9 @@ extern "win64" fn s_ke_set_event(event: u64, _increment: u64, _wait: u64) -> i32
     if event == 0 {
         return 0;
     }
-    unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) as i32 }
+    let previous = unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) };
+    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+    previous as i32
 }
 
 extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
@@ -1985,7 +2019,9 @@ extern "win64" fn s_ke_pulse_event(event: u64, _increment: u64, _wait: u64) -> i
     if event == 0 {
         return 0;
     }
-    unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) as i32 }
+    let previous = unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) };
+    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+    previous as i32
 }
 
 extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
@@ -3254,7 +3290,12 @@ static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x0000_0000_6E00_0000);
+static WIN32K_LOCAL_EVENT_SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn take_local_event_signal_pending() -> bool {
+    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.swap(0, Ordering::Relaxed) != 0
+}
 
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` for the routed client. The
 /// bootstrap identity remains in place until the first client request reaches the component.

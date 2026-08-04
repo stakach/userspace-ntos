@@ -3811,25 +3811,92 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn waitable_index_for_handle(
+    pub(crate) fn wait_object_for_handle(
         &self,
         handle: u64,
         required_access: u32,
-    ) -> Result<usize, u32> {
+    ) -> Result<WaitObject, u32> {
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
         match self.event_index_for_handle(handle, required_access) {
-            Ok(index) => Ok(index),
+            Ok(index) => Ok(WaitObject::dispatcher(index)),
             Err(STATUS_OBJECT_TYPE_MISMATCH) => {
                 match self.semaphore_index_for_handle(handle, required_access) {
-                    Ok(index) => Ok(index),
+                    Ok(index) => Ok(WaitObject::dispatcher(index)),
                     // Mutants are named/openable real objects now, but the executive wait path still
                     // treats them as compatibility-immediate sync handles. Parking a mutant before
                     // the scheduler models owner handoff regresses winlogon's profile/shell startup.
-                    Err(STATUS_OBJECT_TYPE_MISMATCH) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                    Err(STATUS_OBJECT_TYPE_MISMATCH) => {
+                        self.process_thread_or_win32k_event_wait_object(handle, required_access)
+                    }
                     Err(status) => Err(status),
                 }
             }
             Err(status) => Err(status),
+        }
+    }
+
+    fn process_thread_or_win32k_event_wait_object(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<WaitObject, u32> {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+
+        let caller = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+
+        if handle == u64::MAX {
+            return self
+                .pm
+                .resolve_process_handle(caller, handle, required_access)
+                .map(WaitObject::process);
+        }
+        if handle == u64::MAX - 1 {
+            return self
+                .pm
+                .resolve_thread_handle(
+                    caller,
+                    self.current_tid as nt_process::ThreadId,
+                    handle,
+                    required_access,
+                )
+                .map(WaitObject::thread);
+        }
+
+        match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Process(pid)) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                if self.pm.process(pid).is_none() {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(WaitObject::process(pid))
+            }
+            Some(nt_process::HandleObject::Thread(tid)) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                if self.pm.thread(tid).is_none() {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(WaitObject::thread(tid))
+            }
+            Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => crate::win32k_subsystem::event_body_for_client_handle(handle)
+                .map(WaitObject::win32k_event_body)
+                .ok_or(STATUS_INVALID_HANDLE),
         }
     }
 
@@ -3879,6 +3946,35 @@ impl ExecNtHandler {
             &mut self.mutants,
             object,
         )
+    }
+
+    pub(crate) fn wait_object_ready(&self, object: WaitObject) -> bool {
+        self.wait_object_ready_for(object, self.current_tid)
+    }
+
+    pub(crate) fn wait_object_ready_for(&self, object: WaitObject, thread: u64) -> bool {
+        match object.kind() {
+            WaitObject::KIND_DISPATCHER => self.dispatcher_ready_for(object.id() as usize, thread),
+            WaitObject::KIND_PROCESS => self.pm.is_process_signaled(object.id() as u32),
+            WaitObject::KIND_THREAD => self.pm.is_thread_signaled(object.id() as u32),
+            WaitObject::KIND_WIN32K_EVENT => {
+                crate::win32k_subsystem::event_body_ready(object.id())
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn wait_object_consume(&mut self, object: WaitObject) -> bool {
+        self.wait_object_consume_for(object, self.current_tid)
+    }
+
+    pub(crate) fn wait_object_consume_for(&mut self, object: WaitObject, thread: u64) -> bool {
+        match object.kind() {
+            WaitObject::KIND_DISPATCHER => self.dispatcher_consume_for(object.id() as usize, thread),
+            WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => true,
+            WaitObject::KIND_WIN32K_EVENT => crate::win32k_subsystem::event_body_consume(object.id()),
+            _ => false,
+        }
     }
 
     pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
@@ -13454,35 +13550,31 @@ impl ExecNtHandler {
             },
             // NtWaitForSingleObject(Handle=R10=args[0], Alertable=RDX, *Timeout=R8).
             //
-            // ★ Checkpoint B — REAL event-state wait with reply-cap parking (the load-bearing case):
-            // if the target is a REAL executive event (obj_ns kind==2, e.g. LSA_RPC_SERVER_ACTIVE
-            // that lsass creates+signals in LsarStartRpcServer), consult its `signalled` flag:
+            // ★ Checkpoint B — REAL wait-object wait with reply-cap parking (the load-bearing case):
+            // if the target is a REAL executive dispatcher/process/thread/win32k event object,
+            // consult its signal state:
             //   • signalled  → STATUS_WAIT_0 immediately (correct for a manual-reset event that has
             //                  already been set — e.g. winlogon's WaitForLsass when lsass signaled first).
-            //   • unsignaled → request a PARK (wait_park_event = the event's obj_ns index); the service
-            //                  loop stashes this caller's reply cap keyed by the event and continues
-            //                  receiving. The matching NtSetEvent wakes it. This is the genuine
-            //                  block-then-wake (no deadlock: the loop keeps receiving while parked, and
-            //                  we only park on an event a live signaler can set).
+            //   • unsignaled → request a PARK (wait_park_event = encoded WaitObject); the service
+            //                  loop stashes this caller's reply cap keyed by that object and continues
+            //                  receiving. The matching state transition wakes it.
             // Any OTHER handle (fake sync handles from rpcrt4 mutants/csrsrv worker events, smss's
             // subsystem event, etc.) has no live signaler → immediate STATUS_WAIT_0 (KEPT — documented:
             // parking one of those would hang since nothing sets it). csrss (pi==1) stays immediate.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
-                match self.waitable_index_for_handle(handle, SYNCHRONIZE_ACCESS) {
-                    Ok(idx) => {
-                        if self.dispatcher_ready(idx) {
-                                unsafe {
-                                    print_str(b"[wait] pi=");
-                                    print_u64(self.pi as u64);
-                                    print_str(b" NtWaitForSingleObject(dispatcher #");
-                                    print_u64(idx as u64);
-                                    print_str(b" '");
-                                    for &c in self.obj_ns[idx].name() { debug_put_char(c); }
-                                    print_str(b"') already SIGNALLED -> immediate WAIT_0\n");
-                                }
-                                self.dispatcher_consume(idx);
-                                return 0;
+                match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
+                    Ok(object) => {
+                        if self.wait_object_ready(object) {
+                            print_str(b"[wait] pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" NtWaitForSingleObject(");
+                            print_str(object.describe());
+                            print_str(b" ");
+                            print_u64(object.id());
+                            print_str(b") already SIGNALLED -> immediate WAIT_0\n");
+                            self.wait_object_consume(object);
+                            return 0;
                         }
                         let timeout_ptr = args[2];
                         if timeout_ptr != 0 {
@@ -13498,17 +13590,15 @@ impl ExecNtHandler {
                                 }
                             }
                         }
-                            // Unsignaled dispatcher object → ask the loop to park this caller on it.
-                            self.wait_park_event = idx as i64;
-                            unsafe {
-                                print_str(b"[wait] pi=");
-                                print_u64(self.pi as u64);
-                                print_str(b" NtWaitForSingleObject(dispatcher #");
-                                print_u64(idx as u64);
-                                print_str(b" '");
-                                for &c in self.obj_ns[idx].name() { debug_put_char(c); }
-                                print_str(b"') UNSIGNALLED -> PARK caller (reply-cap park)\n");
-                            }
+                        // Unsignaled wait object → ask the loop to park this caller on it.
+                        self.wait_park_event = object.raw() as i64;
+                        print_str(b"[wait] pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" NtWaitForSingleObject(");
+                        print_str(object.describe());
+                        print_str(b" ");
+                        print_u64(object.id());
+                        print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
                         0x102 // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
                     }
                     Err(_status) if self.is_legacy_opaque_handle(handle) => 0,
@@ -16613,6 +16703,7 @@ impl ExecNtHandler {
                         };
                     }
                 }
+                unsafe { wait_wake_dispatcher_set(self) };
                 0 // STATUS_SUCCESS
             }
             NativeService::NtTerminateThread => {
@@ -16687,6 +16778,7 @@ impl ExecNtHandler {
                 if self.pm.is_process_signaled(target_pid) {
                     self.release_process_handles(target_pid);
                 }
+                unsafe { wait_wake_dispatcher_set(self) };
                 self.post_action = if is_current {
                     ExecPostAction::TerminateCurrentThread { tid: target as u64 }
                 } else {

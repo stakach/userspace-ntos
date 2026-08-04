@@ -5591,7 +5591,7 @@ pub(crate) unsafe fn service_sec_image(
             // action deletes the bound Reply cap and caller TCB before receiving again.
             let mut park_caller = false;
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
-            // the given obj_ns event index (set from nt_handler.wait_park_event after dispatch).
+            // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
             let mut park_wait_event: i64 = -1;
             // Array-wait park (NtWaitForMultipleObjects): the resolved obj_ns event set + WaitAll flag.
             // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
@@ -6632,11 +6632,11 @@ pub(crate) unsafe fn service_sec_image(
                 let wait_all = wait_type == 0;
                 let mut nev = 0usize;
                 let mut any_signalled_idx: i64 = -1; // handle-array index (k) of the first signalled
-                let mut any_signalled_obj: usize = 0; // obj_ns idx of that event (for auto-reset)
+                let mut any_signalled_obj = WaitObject::FREE;
                 let mut any_signalled_real = false;
                 let mut all_signalled = true;
-                let mut has_real_event = false;
-                let mut wait_identities = [u64::MAX; WAITER_MAX_EVENTS];
+                let mut has_wait_object = false;
+                let mut wait_identities = [WaitObject::FREE.raw(); WAITER_MAX_EVENTS];
                 let mut wait_error: Option<u32> =
                     if harr == 0 || count == 0 || count > WAITER_MAX_EVENTS || wait_type > 1 {
                         Some(0xC000_000D) // STATUS_INVALID_PARAMETER
@@ -6654,26 +6654,28 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         )
                         .unwrap_or(0);
-                        match nt_handler.waitable_index_for_handle(h, SYNCHRONIZE_ACCESS) {
-                            Ok(idx) => {
+                        match nt_handler.wait_object_for_handle(h, SYNCHRONIZE_ACCESS) {
+                            Ok(object) => {
                                 if trace < 32 {
                                     print_str(b"[event] wait-item k=");
                                     print_u64(k as u64);
                                     print_str(b" h=0x");
                                     print_hex_u64(h);
-                                    print_str(b" -> obj=");
-                                    print_u64(idx as u64);
+                                    print_str(b" -> ");
+                                    print_str(object.describe());
+                                    print_str(b"=");
+                                    print_u64(object.id());
                                     print_str(b"\n");
                                 }
-                                has_real_event = true;
-                                park_wait_set[nev] = idx;
+                                has_wait_object = true;
+                                park_wait_set[nev] = object;
                                 park_wait_indices[nev] = k as u8;
-                                wait_identities[k] = idx as u64;
+                                wait_identities[k] = object.raw();
                                 nev += 1;
-                                if nt_handler.dispatcher_ready(idx) {
+                                if nt_handler.wait_object_ready(object) {
                                     if any_signalled_idx < 0 {
                                         any_signalled_idx = k as i64;
-                                        any_signalled_obj = idx;
+                                        any_signalled_obj = object;
                                         any_signalled_real = true;
                                     }
                                 } else {
@@ -6760,7 +6762,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" count=");
                     print_u64(count as u64);
                     print_str(if wait_all { b" all" } else { b" any" });
-                    print_str(b" real=");
+                    print_str(b" waitable=");
                     print_u64(nev as u64);
                     print_str(if zero_timeout {
                         b" timeout=zero\n"
@@ -6773,37 +6775,37 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(status) = wait_error {
                     result = status as u64;
                 } else if wait_all {
-                    if has_real_event && all_signalled {
+                    if has_wait_object && all_signalled {
                         for k in 0..nev {
-                            nt_handler.dispatcher_consume(park_wait_set[k]);
+                            nt_handler.wait_object_consume(park_wait_set[k]);
                         }
                         result = 0; // WAIT_0 (all satisfied)
                     } else if zero_timeout {
                         result = 0x102;
-                    } else if has_real_event {
+                    } else if has_wait_object {
                         park_wait_set_n = nev;
                         park_wait_set_all = true;
                         park_wait_deadline = finite_deadline;
                         result = 0;
                     } else {
-                        result = 0; // no real event → immediate WAIT_0 (no live signaler; documented)
+                        result = 0; // no wait object → immediate WAIT_0 for legacy compatibility handles
                     }
                 } else {
                     // WaitAny
                     if any_signalled_idx >= 0 {
                         if any_signalled_real {
-                            nt_handler.dispatcher_consume(any_signalled_obj);
+                            nt_handler.wait_object_consume(any_signalled_obj);
                         }
                         result = any_signalled_idx as u64; // WAIT_OBJECT_0 + index
                     } else if zero_timeout {
                         result = 0x102;
-                    } else if has_real_event {
+                    } else if has_wait_object {
                         park_wait_set_n = nev;
                         park_wait_set_all = false;
                         park_wait_deadline = finite_deadline;
                         result = 0;
                     } else {
-                        result = 0; // no real event to park on → immediate WAIT_0 (documented)
+                        result = 0; // no wait object to park on; legacy compatibility handles only
                     }
                 }
             } else if m0 == 19 {
@@ -10414,6 +10416,9 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
+                if win32k_subsystem::take_local_event_signal_pending() {
+                    wait_wake_dispatcher_set(&mut nt_handler);
+                }
                 // Throttle the status line for the same hot class-loop SSNs. Real provider walls
                 // still print, but an intentional wait-park is not a failed provider dispatch.
                 if !redirected_user_callback && !wl_milestone_park && (!ok || w32_log) {
@@ -10939,10 +10944,19 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             if park_wait_event >= 0 && reply_main != 0 {
-                if park_wait_deadline.is_some() && !delay_timer_init() {
+                let park_object = match WaitObject::from_raw(park_wait_event as u64) {
+                    Some(object) => object,
+                    None => {
+                        result = 0xC000_0008;
+                        WaitObject::FREE
+                    }
+                };
+                if park_object == WaitObject::FREE {
+                    // Invalid handoff; return STATUS_INVALID_HANDLE through the normal reply path.
+                } else if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
                 } else if wait_park(
-                    park_wait_event as usize,
+                    park_object,
                     resume_ip,
                     sp,
                     flags,
@@ -13753,7 +13767,14 @@ pub(crate) unsafe fn service_sec_image(
                         && w_m0 == 0xD1
                         && wait_status == 0x102
                         && park_index >= 0
-                        && wait_park(park_index as usize, w_ip, w_sp, w_flags, 0xD1D1_0001, None)
+                        && wait_park(
+                            WaitObject::dispatcher(park_index as usize),
+                            w_ip,
+                            w_sp,
+                            w_flags,
+                            0xD1D1_0001,
+                            None,
+                        )
                         && marker_d() == 0;
                     // A queue-side post through the very entry the fault path uses SETS the
                     // object's EventsPresent dispatcher event and wakes the parked client.
