@@ -7160,8 +7160,8 @@ pub unsafe extern "system" fn rtl_is_current_thread_attach_exempt() -> u8 {
     }
 }
 
-/// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Live driver (opens the default user key via
-/// NtOpenKey; `references/reactos/sdk/lib/rtl/registry.c:702`).
+/// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Live driver over the effective token SID
+/// with the NT5 `.Default` fallback (`references/reactos/sdk/lib/rtl/registry.c:702`).
 ///
 /// # Safety
 /// `key_handle` writable.
@@ -7184,8 +7184,7 @@ pub unsafe extern "system" fn rtl_open_current_user(
 
 /// `RtlFormatCurrentUserKeyPath(PUNICODE_STRING KeyPath) -> NTSTATUS`.
 ///
-/// Current-user registry opens are currently backed by `\Registry\User\.Default`; return the same
-/// heap-allocated path here so apphelp and the registry helpers agree on the active user hive.
+/// Format `\Registry\User\<effective-token-SID>` into a process-heap allocated `UNICODE_STRING`.
 ///
 /// # Safety
 /// `key_path` writable for a `UNICODE_STRING`.
@@ -7197,31 +7196,10 @@ pub unsafe extern "system" fn rtl_format_current_user_key_path(
         return STATUS_INVALID_PARAMETER;
     }
 
-    const PATH: &[u8] = b"\\Registry\\User\\.Default";
-    let bytes = PATH.len() * 2;
-    let total = bytes + 2;
-    if total > u16::MAX as usize {
-        return STATUS_NAME_TOO_LONG;
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: process heap is available on target after loader initialization.
-        let buffer = unsafe { crate::process_heap_alloc(total) } as *mut u16;
-        if buffer.is_null() {
-            return STATUS_NO_MEMORY;
-        }
-        // SAFETY: `buffer` is writable for `total` bytes and `key_path` is caller-writable.
-        unsafe {
-            for (i, &byte) in PATH.iter().enumerate() {
-                core::ptr::write_unaligned(buffer.add(i), byte as u16);
-            }
-            core::ptr::write_unaligned(buffer.add(PATH.len()), 0);
-            (*key_path).length = bytes as u16;
-            (*key_path).maximum_length = total as u16;
-            (*key_path).buffer = buffer as u64;
-        }
-        STATUS_SUCCESS
+        // SAFETY: on-target; `key_path` is writable per the contract.
+        unsafe { crate::on_target::rtl_format_current_user_key_path(key_path) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

@@ -1,5 +1,6 @@
 //! Pure path policy shared by the `Rtl*Registry*` exports.
 
+use alloc::format;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -59,6 +60,7 @@ const CONTROL: &str = r"\Registry\Machine\System\CurrentControlSet\Control";
 const WINDOWS_NT: &str = r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion";
 const DEVICEMAP: &str = r"\Registry\Machine\Hardware\DeviceMap";
 const USER_DEFAULT: &str = r"\Registry\User\.Default";
+const USER_PREFIX: &str = r"\Registry\User";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectDestination {
@@ -257,6 +259,14 @@ pub fn resolve_path(
     Ok(resolved)
 }
 
+/// Build the `RtlFormatCurrentUserKeyPath` result from the caller's token-user SID.
+pub fn current_user_key_path_from_native_sid(sid: &[u8]) -> Result<Vec<u16>, u32> {
+    let sid = nt_security::Sid::from_native_bytes(sid)?;
+    Ok(format!("{USER_PREFIX}\\{}", sid.to_sddl())
+        .encode_utf16()
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +327,19 @@ mod tests {
         let user = wide(r"\Registry\User\S-1-5-21");
         let resolved = resolve_path(RTL_REGISTRY_USER, None, Some(&user)).unwrap();
         assert_eq!(text(&resolved), r"\Registry\User\S-1-5-21\");
+    }
+
+    #[test]
+    fn current_user_path_formats_native_token_sid() {
+        let mut sid = vec![1, 5, 0, 0, 0, 0, 0, 5];
+        for sub in [21u32, 1325974280, 164944053, 1780406144, 500] {
+            sid.extend_from_slice(&sub.to_le_bytes());
+        }
+        let path = current_user_key_path_from_native_sid(&sid).unwrap();
+        assert_eq!(
+            text(&path),
+            r"\Registry\User\S-1-5-21-1325974280-164944053-1780406144-500"
+        );
     }
 
     #[test]

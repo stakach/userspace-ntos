@@ -31,7 +31,7 @@ use core::{
 };
 
 use nt_ntdll::heap::{Backing, Heap};
-use nt_ntdll_layout::Teb;
+use nt_ntdll_layout::{Teb, UnicodeString};
 
 // ---------------------------------------------------------------------------------------------
 // In-process Nt* syscall callers (the trap backend — `mov r10,rcx; mov eax,ssn; syscall`).
@@ -3699,11 +3699,14 @@ pub unsafe fn ldr_get_procedure_address(
 
 const SSN_NT_OPEN_PROCESS_TOKEN: u32 = 129;
 const SSN_NT_OPEN_THREAD_TOKEN: u32 = 135;
+const SSN_NT_QUERY_INFORMATION_TOKEN: u32 = 163;
 const SSN_NT_DUPLICATE_TOKEN: u32 = 72;
 const SSN_NT_SET_INFORMATION_THREAD: u32 = 238;
 const SSN_NT_ADJUST_PRIVILEGES_TOKEN: u32 = 12;
 const SSN_NT_CLOSE: u32 = 27;
 
+/// `TOKEN_QUERY`.
+const TOKEN_QUERY: u32 = 0x08;
 /// `TOKEN_ADJUST_PRIVILEGES (0x20) | TOKEN_QUERY (0x08)`.
 const TOKEN_ADJUST_PRIVILEGES_QUERY: u32 = 0x28;
 /// `SE_PRIVILEGE_ENABLED`.
@@ -10248,57 +10251,185 @@ pub unsafe fn rtl_expand_environment_strings_u(
 }
 
 /// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Ported from
-/// `references/reactos/sdk/lib/rtl/registry.c:702` — open the current-user registry key. We open the
-/// default user key `\Registry\User\.Default` via our own `NtOpenKey(125)` trap (the executive's
-/// registry plane services it), writing the handle to `*key_handle`. (The real body first tries
-/// `\Registry\User\<SID>` from the thread token, then falls back to `.Default`; our single-user boot
-/// uses the fallback directly — behavior-equivalent for basesrv's init read.)
+/// `references/reactos/sdk/lib/rtl/registry.c:702` — open `\Registry\User\<effective-token-SID>`,
+/// then fall back to `\Registry\User\.Default` if the dynamic hive is not available.
 ///
 /// # Safety
 /// On-target; `key_handle` writable.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn rtl_open_current_user(desired_access: u32, key_handle: *mut u64) -> u32 {
-    // Build the UNICODE_STRING "\Registry\User\.Default" (UTF-16, NUL-terminated).
-    const PATH: &[u8] = b"\\Registry\\User\\.Default";
-    let mut wpath = [0u16; 32];
-    for (i, &b) in PATH.iter().enumerate() {
-        wpath[i] = b as u16;
+    if key_handle.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        maximum_length: u16,
-        _pad: u32,
-        buffer: u64,
+
+    if let Ok(path) = unsafe { current_user_key_path_units() } {
+        let mut handle = 0u64;
+        let status = unsafe { open_registry_path_units(&path, desired_access, &mut handle) };
+        if nt_success_u32(status) {
+            unsafe { core::ptr::write_unaligned(key_handle, handle) };
+            return 0;
+        }
+        unsafe { close_if_nonzero(handle) };
     }
-    let us = UnicodeString {
-        length: (PATH.len() * 2) as u16,
-        maximum_length: (PATH.len() * 2) as u16,
-        _pad: 0,
-        buffer: wpath.as_ptr() as u64,
+
+    let mut fallback = [0u16; 32];
+    let fallback_len = copy_ascii_path_units(b"\\Registry\\User\\.Default", &mut fallback);
+    unsafe { open_registry_path_units(&fallback[..fallback_len], desired_access, key_handle) }
+}
+
+/// `RtlFormatCurrentUserKeyPath(PUNICODE_STRING)` live body. Formats the effective token SID path
+/// and allocates the returned buffer from the process heap.
+///
+/// # Safety
+/// On-target; `key_path` writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_format_current_user_key_path(key_path: *mut UnicodeString) -> u32 {
+    if key_path.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let path = match unsafe { current_user_key_path_units() } {
+        Ok(path) => path,
+        Err(status) => return status,
     };
-    let oa = ObjectAttributes {
-        length: core::mem::size_of::<ObjectAttributes>() as u32,
-        _p0: 0,
-        root_directory: 0,
-        object_name: core::ptr::addr_of!(us) as u64,
-        attributes: 0x40, // OBJ_CASE_INSENSITIVE
-        _p1: 0,
-        security_descriptor: 0,
-        security_qos: 0,
-    };
-    // NtOpenKey(&KeyHandle, DesiredAccess, &OA).
-    // SAFETY: on-target; all pointers valid stack locals; key_handle writable.
-    let st = unsafe {
+    unsafe { allocate_unicode_string(key_path, &path) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn nt_success_u32(status: u32) -> bool {
+    (status as i32) >= 0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn copy_ascii_path_units(path: &[u8], out: &mut [u16]) -> usize {
+    let len = path.len().min(out.len());
+    for (dst, src) in out.iter_mut().zip(path.iter()).take(len) {
+        *dst = *src as u16;
+    }
+    len
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_registry_path_units(path: &[u16], desired_access: u32, key_handle: *mut u64) -> u32 {
+    if key_handle.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    if path.len() > u16::MAX as usize / 2 {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    }
+    let mut oa = [0u8; 0x30];
+    let mut us = [0u8; 0x10];
+    unsafe { build_oa(oa.as_mut_ptr(), us.as_mut_ptr(), 0, path.as_ptr(), path.len()) };
+    unsafe {
         syscall4(
             SSN_NT_OPEN_KEY,
             key_handle as u64,
             desired_access as u64,
-            core::ptr::addr_of!(oa) as u64,
+            oa.as_ptr() as u64,
+            0,
+        ) as u32
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn allocate_unicode_string(key_path: *mut UnicodeString, path: &[u16]) -> u32 {
+    let Some(bytes) = path.len().checked_mul(2) else {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    };
+    let Some(total) = bytes.checked_add(2) else {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    };
+    if total > u16::MAX as usize {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    }
+    let buffer = unsafe { crate::process_heap_alloc(total) } as *mut u16;
+    if buffer.is_null() {
+        return STATUS_NO_MEMORY as u32;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buffer, path.len());
+        core::ptr::write_unaligned(buffer.add(path.len()), 0);
+        (*key_path).length = bytes as u16;
+        (*key_path).maximum_length = total as u16;
+        (*key_path).buffer = buffer as u64;
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_user_key_path_units() -> Result<alloc::vec::Vec<u16>, u32> {
+    const STATUS_NO_TOKEN: u32 = 0xC000_007C;
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+    const STATUS_INVALID_SID: u32 = 0xC000_0078;
+    const TOKEN_USER: u64 = 1;
+    const TOKEN_USER_BUFFER_SIZE: usize = 256;
+
+    let mut token = 0u64;
+    let mut status = unsafe { open_current_thread_token(TOKEN_QUERY, &mut token as *mut u64) };
+    if !nt_success_u32(status as u32) {
+        if status as u32 != STATUS_NO_TOKEN {
+            return Err(status as u32);
+        }
+        status = unsafe {
+            syscall4(
+                SSN_NT_OPEN_PROCESS_TOKEN,
+                NT_CURRENT_PROCESS,
+                TOKEN_QUERY as u64,
+                &mut token as *mut u64 as u64,
+                0,
+            )
+        };
+        if !nt_success_u32(status as u32) {
+            return Err(status as u32);
+        }
+    }
+
+    let mut buffer = [0u8; TOKEN_USER_BUFFER_SIZE];
+    let mut return_length = 0u32;
+    status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_INFORMATION_TOKEN,
+            token,
+            TOKEN_USER,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+            &mut return_length as *mut u32 as u64,
             0,
         )
-    } as u32;
-    st
+    };
+    unsafe { close_if_nonzero(token) };
+    if !nt_success_u32(status as u32) {
+        return Err(status as u32);
+    }
+
+    let valid_len = (return_length as usize).min(buffer.len());
+    if valid_len < 24 {
+        return Err(STATUS_INVALID_SID);
+    }
+    let sid_ptr = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const u64) } as *const u8;
+    if sid_ptr.is_null() {
+        return Err(STATUS_INVALID_SID);
+    }
+
+    let base = buffer.as_ptr() as usize;
+    let end = base.checked_add(valid_len).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let sid_addr = sid_ptr as usize;
+    if sid_addr < base || sid_addr.checked_add(8).is_none_or(|addr| addr > end) {
+        return Err(STATUS_INVALID_SID);
+    }
+    let count = unsafe { *sid_ptr.add(1) } as usize;
+    let sid_len = 8usize
+        .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
+        .ok_or(STATUS_INVALID_SID)?;
+    if sid_addr
+        .checked_add(sid_len)
+        .is_none_or(|addr| addr > end)
+    {
+        return Err(STATUS_INVALID_SID);
+    }
+
+    let sid = unsafe { core::slice::from_raw_parts(sid_ptr, sid_len) };
+    nt_ntdll::rtl::registry::current_user_key_path_from_native_sid(sid)
 }
 
 /// `RtlDosSearchPath_U(Path, FileName, Extension, BufferLength, Buffer, PartName)` — search each

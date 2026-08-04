@@ -9,7 +9,6 @@ use alloc::vec::Vec;
 use crate::access::{Ace, AceType, Acl, SecurityDescriptor};
 use crate::create_token::{
     capture_acl, capture_sid, ClientMemory, STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES,
-    STATUS_INVALID_SID,
 };
 use crate::native_acl::{NativeAcl, STATUS_INVALID_ACL};
 use crate::sid::Sid;
@@ -28,8 +27,6 @@ const SE_SELF_RELATIVE: u16 = 0x8000;
 const ACL_HEADER_SIZE: usize = 8;
 const ACE_HEADER_SIZE: usize = 4;
 const SID_HEADER_SIZE: usize = 8;
-const SID_REVISION: u8 = 1;
-const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
@@ -153,7 +150,7 @@ pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
             aces.push(Ace {
                 ace_type: semantic_type,
                 mask,
-                sid: sid_from_native_bytes(&bytes[sid_offset..ace_end])?,
+                sid: Sid::from_native_bytes(&bytes[sid_offset..ace_end])?,
                 inherit_only: ace_flags & INHERIT_ONLY_ACE != 0,
             });
         }
@@ -202,37 +199,6 @@ fn semantic_ace(
         }
         _ => Ok(None),
     }
-}
-
-fn sid_from_native_bytes(bytes: &[u8]) -> Result<Sid, u32> {
-    if bytes.len() < SID_HEADER_SIZE
-        || bytes[0] != SID_REVISION
-        || bytes[1] > SID_MAX_SUB_AUTHORITIES
-    {
-        return Err(STATUS_INVALID_SID);
-    }
-    let count = bytes[1] as usize;
-    let sid_len = SID_HEADER_SIZE
-        .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
-        .ok_or(STATUS_INVALID_SID)?;
-    if sid_len > bytes.len() {
-        return Err(STATUS_INVALID_SID);
-    }
-    let mut sub_authorities = Vec::new();
-    if sub_authorities.try_reserve_exact(count).is_err() {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    for index in 0..count {
-        let offset = SID_HEADER_SIZE + index * 4;
-        sub_authorities.push(read_u32(bytes, offset));
-    }
-    Ok(Sid {
-        revision: bytes[0],
-        identifier_authority: bytes[2..8]
-            .try_into()
-            .expect("identifier authority slice is 6 bytes"),
-        sub_authorities,
-    })
 }
 
 fn relative_target(base: u64, offset: u32) -> Result<Option<u64>, u32> {

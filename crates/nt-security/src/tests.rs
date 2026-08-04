@@ -42,6 +42,52 @@ fn sid_wellknown_and_sddl() {
 }
 
 #[test]
+fn sid_decodes_native_bytes() {
+    let mut bytes = vec![1, 5, 0, 0, 0, 0, 0, 5];
+    for sub in [21u32, 1325974280, 164944053, 1780406144, 500] {
+        bytes.extend_from_slice(&sub.to_le_bytes());
+    }
+
+    let sid = Sid::from_native_bytes(&bytes).expect("native SID");
+    assert_eq!(
+        sid.to_sddl(),
+        "S-1-5-21-1325974280-164944053-1780406144-500"
+    );
+    assert_eq!(sid.native_len(), Some(bytes.len()));
+    assert_eq!(
+        Sid::from_native_bytes(&bytes[..bytes.len() - 1]),
+        Err(0xC000_0078)
+    );
+}
+
+#[test]
+fn sid_rejects_malformed_native_bytes() {
+    assert_eq!(Sid::from_native_bytes(&[]), Err(0xC000_0078));
+    assert_eq!(
+        Sid::from_native_bytes(&[2, 0, 0, 0, 0, 0, 0, 5]),
+        Err(0xC000_0078)
+    );
+    assert_eq!(
+        Sid::from_native_bytes(&[1, 16, 0, 0, 0, 0, 0, 5]),
+        Err(0xC000_0078)
+    );
+    assert_eq!(
+        Sid::from_native_bytes(&[1, 1, 0, 0, 0, 0, 0, 5, 18]),
+        Err(0xC000_0078)
+    );
+}
+
+#[test]
+fn sid_sddl_preserves_large_identifier_authority() {
+    let sid = Sid {
+        revision: 1,
+        identifier_authority: [1, 2, 3, 4, 5, 6],
+        sub_authorities: Vec::new(),
+    };
+    assert_eq!(sid.to_sddl(), "S-1-0x010203040506");
+}
+
+#[test]
 fn default_tokens() {
     let sys = AccessToken::system();
     assert_eq!(sys.user, Sid::local_system());

@@ -4,6 +4,12 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+const SID_REVISION: u8 = 1;
+const SID_HEADER_SIZE: usize = 8;
+const SID_MAX_SUB_AUTHORITIES: u8 = 15;
+const STATUS_INVALID_SID: u32 = 0xC000_0078;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
 /// A security identifier (spec §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sid {
@@ -59,12 +65,59 @@ impl Sid {
         Sid::new(5, &[21, machine, rid])
     }
 
+    /// Decode a native in-memory SID (`SID` header followed by little-endian sub-authorities).
+    pub fn from_native_bytes(bytes: &[u8]) -> Result<Self, u32> {
+        if bytes.len() < SID_HEADER_SIZE
+            || bytes[0] != SID_REVISION
+            || bytes[1] > SID_MAX_SUB_AUTHORITIES
+        {
+            return Err(STATUS_INVALID_SID);
+        }
+        let count = bytes[1] as usize;
+        let sid_len = SID_HEADER_SIZE
+            .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
+            .ok_or(STATUS_INVALID_SID)?;
+        if sid_len > bytes.len() {
+            return Err(STATUS_INVALID_SID);
+        }
+        let mut sub_authorities = Vec::new();
+        if sub_authorities.try_reserve_exact(count).is_err() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        for index in 0..count {
+            let offset = SID_HEADER_SIZE + index * 4;
+            sub_authorities.push(u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]));
+        }
+        Ok(Sid {
+            revision: bytes[0],
+            identifier_authority: bytes[2..8]
+                .try_into()
+                .expect("identifier authority slice is 6 bytes"),
+            sub_authorities,
+        })
+    }
+
     /// SDDL string form (`S-1-5-32-544`, spec §18.4).
     pub fn to_sddl(&self) -> String {
-        let authority = self.identifier_authority[5] as u64
-            | (self.identifier_authority[4] as u64) << 8
-            | (self.identifier_authority[3] as u64) << 16;
-        let mut s = format!("S-{}-{}", self.revision, authority);
+        let authority = if self.identifier_authority[0] == 0 && self.identifier_authority[1] == 0 {
+            let value = (self.identifier_authority[2] as u32) << 24
+                | (self.identifier_authority[3] as u32) << 16
+                | (self.identifier_authority[4] as u32) << 8
+                | self.identifier_authority[5] as u32;
+            format!("{value}")
+        } else {
+            let mut out = String::from("0x");
+            for byte in self.identifier_authority {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out
+        };
+        let mut s = format!("S-{}-{authority}", self.revision);
         for sub in &self.sub_authorities {
             s.push_str(&format!("-{sub}"));
         }
