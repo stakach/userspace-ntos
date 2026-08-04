@@ -1553,3 +1553,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   remains open for moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT` projection construction and any
   driver-created device-stack ownership still embedded in `driver_launch` into the I/O Manager/driver
   host boundary.
+- D1 continued. WDM x64 compatibility layout writing for hosted drivers moved into
+  `nt-io-manager`. `driver_launch` still owns the transport pool allocation and completion lifetime,
+  but it now delegates `DEVICE_OBJECT`, `FILE_OBJECT`, IRP, and `IO_STACK_LOCATION` byte images plus
+  `DRIVER_OBJECT` layout constants to shared, host-testable writers instead of open-coding NT5 x64
+  offsets in the executive. Validation: `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`,
+  `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `git diff --check`, and `.tmp/full-boot-wdm-projection-writers-20260804.log` reached `RUN_RC=0`,
+  `247/280 executive->isolated-service checks passed`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_irp_transport_call_bound`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for moving driver-created device-stack ownership/lifetime and remaining hosted-driver
+  projection state out of `driver_launch`; D3 remains the real videoprt/miniport-created video stack.

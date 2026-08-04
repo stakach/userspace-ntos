@@ -28,10 +28,15 @@ use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
 use nt_io_manager::{
+    write_wdm_device_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceRecord, DeviceType,
     DispatchContext, DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend,
     DriverId, DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters,
-    IrpId, IrpProjection, MajorFunctionTable, ReadWriteParameters,
+    IrpId, IrpProjection, MajorFunctionTable, ReadWriteParameters, WdmDeviceObjectInit,
+    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
+    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_types::ClientId;
 use nt_types::{NtPath, ObjectId};
@@ -670,9 +675,13 @@ unsafe fn audit_data_queue(dq: u64) -> bool {
                 print_u64(quota as u64);
                 print_str(b" irp=");
                 print_hex(eirp as u32);
-                if eirp != 0 && eirp >= FSD_POOL_VADDR + POOL_DATA_OFF && eirp + 0x120 <= pool_end {
+                if eirp != 0
+                    && eirp >= FSD_POOL_VADDR + POOL_DATA_OFF
+                    && eirp + WDM_X64_IRP_SIZE as u64 <= pool_end
+                {
                     let stack = read_volatile((eirp + 0xb8) as *const u64);
-                    let mj = if stack >= FSD_POOL_VADDR + POOL_DATA_OFF && stack + 0x48 <= pool_end
+                    let mj = if stack >= FSD_POOL_VADDR + POOL_DATA_OFF
+                        && stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64 <= pool_end
                     {
                         read_volatile(stack as *const u8) as u64
                     } else {
@@ -757,10 +766,11 @@ unsafe fn audit_ccb(fid: u64) {
             continue;
         }
         FSD_FO_LIVE_CHECKS.fetch_add(1, Ordering::Relaxed);
-        let in_pool = held >= FSD_POOL_VADDR + POOL_DATA_OFF && held + 0x100 <= pool_end;
+        let in_pool = held >= FSD_POOL_VADDR + POOL_DATA_OFF
+            && held + WDM_X64_FILE_OBJECT_SIZE as u64 <= pool_end;
         let looks_like_fo = in_pool
-            && read_volatile(held as *const u16) == 5 // IO_TYPE_FILE
-            && read_volatile((held + 2) as *const u16) == 0x100;
+            && read_volatile(held as *const u16) == WDM_X64_IO_TYPE_FILE as u16
+            && read_volatile((held + 2) as *const u16) == WDM_X64_FILE_OBJECT_SIZE as u16;
         if !looks_like_fo && FSD_FO_CORRUPTED.fetch_add(1, Ordering::Relaxed) < 4 {
             print_str(b"[fsd-fo] CORRUPT FSD-held FILE_OBJECT ccb=0x");
             print_hex(ccb as u32);
@@ -1017,30 +1027,42 @@ extern "win64" fn s_io_create_device(
         } else {
             None
         };
-        // DEVICE_OBJECT is ~0x150 bytes (x64); allocate that + the driver extension contiguously.
-        let dev = pool_alloc(0x150 + ext_size);
+        let Some(alloc_len) = (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(ext_size) else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        let Ok(alloc_len_usize) = usize::try_from(alloc_len) else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        let dev = pool_alloc(alloc_len);
         if dev == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
-        // zero the body
-        let mut i = 0u64;
-        while i < 0x150 + ext_size {
-            write_unaligned((dev + i) as *mut u64, 0);
-            i += 8;
+        let head = if drv != 0 {
+            read_unaligned((drv + 8) as *const u64)
+        } else {
+            0
+        };
+        let extension = if ext_size != 0 {
+            dev + WDM_X64_DEVICE_OBJECT_SIZE as u64
+        } else {
+            0
+        };
+        let dev_bytes = core::slice::from_raw_parts_mut(dev as *mut u8, alloc_len_usize);
+        if write_wdm_device_object(
+            dev_bytes,
+            WdmDeviceObjectInit {
+                driver_object: drv,
+                next_device: head,
+                device_extension: extension,
+                device_type: dev_type as u32,
+            },
+        )
+        .is_err()
+        {
+            pool_free(dev);
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        // x64 DEVICE_OBJECT layout (references/nt5 io.h): Type@0, Size@2, DriverObject@8,
-        // NextDevice@0x10, CurrentIrp@0x20, Flags@0x30, DeviceExtension@0x40, DeviceType@0x48.
-        write_unaligned(dev as *mut i16, 3); // IO_TYPE_DEVICE
-        write_unaligned((dev + 2) as *mut u16, 0x150);
-        write_unaligned((dev + 8) as *mut u64, drv); // DriverObject
-        if ext_size != 0 {
-            write_unaligned((dev + 0x40) as *mut u64, dev + 0x150); // DeviceExtension (past the body)
-        }
-        write_unaligned((dev + 0x48) as *mut u32, dev_type as u32); // DeviceType
-                                                                    // link onto DriverObject->DeviceObject@8 (NextDevice@0x10).
         if drv != 0 {
-            let head = read_unaligned((drv + 8) as *const u64);
-            write_unaligned((dev + 0x10) as *mut u64, head);
             write_unaligned((drv + 8) as *mut u64, dev);
         }
         if dev_out != 0 {
@@ -1658,11 +1680,11 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
         FSD_SHARED_VADDR,
         FSD_CODE_VA,
         crate::spawn_hosts::DriverObjectSpec {
-            size: 0x150,
-            size_field: 0x150,
-            ext: 0x68,
-            ext_size: 0x50,
-            mj: 0x70,
+            size: WDM_X64_DRIVER_OBJECT_SIZE as u64,
+            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+            ext: WDM_X64_DRIVER_EXTENSION_OFFSET as u64,
+            ext_size: WDM_X64_DRIVER_EXTENSION_SIZE as u64,
+            mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
             pool: pool_alloc,
         },
@@ -1779,20 +1801,31 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         0
     };
     let owns_fo = existing == 0;
-    let fo = if owns_fo { pool_alloc(0x100) } else { existing };
+    let fo = if owns_fo {
+        pool_alloc(WDM_X64_FILE_OBJECT_SIZE as u64)
+    } else {
+        existing
+    };
     if fo == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     if owns_fo {
-        zero(fo, 0x100);
-        write_unaligned(fo as *mut i16, 5); // Type = IO_TYPE_FILE
-        write_unaligned((fo + 2) as *mut u16, 0x100);
-        write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
-        write_unaligned((fo + 0x18) as *mut u64, file_id); // FsContext
-                                                           // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
-        write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
-        write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
-        write_unaligned((fo + 0x60) as *mut u64, FSD_ARG_VADDR); // Buffer = the pipe name (UTF-16)
+        let fo_bytes = core::slice::from_raw_parts_mut(fo as *mut u8, WDM_X64_FILE_OBJECT_SIZE);
+        if write_wdm_file_object(
+            fo_bytes,
+            WdmFileObjectInit {
+                device_object: devobj,
+                fs_context: file_id,
+                file_name_len: inlen as u16,
+                file_name_max_len: (inlen + 2) as u16,
+                file_name_buffer: FSD_ARG_VADDR,
+            },
+        )
+        .is_err()
+        {
+            pool_free(fo);
+            return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+        }
     } else {
         // The open's FILE_OBJECT: npfs owns its contents (FsContext/FsContext2/Flags/PrivateCacheMap
         // were set by `NpSetFileObject` at create time and must persist). Leave them alone.
@@ -1818,33 +1851,19 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         data_index += 1;
     }
 
-    // IRP (0x120 bytes).
-    let irp = pool_alloc(0x120);
-    zero(irp, 0x120);
-    // Both buffered-I/O views refer to request-owned storage. Writes/sets arrive through `inlen`;
-    // reads reserve `outlen` and are copied back to the ARG transport only after completion.
-    write_unaligned((irp + 0x18) as *mut u64, data);
-    write_unaligned((irp + 0x70) as *mut u64, data); // UserBuffer
-                                                     // CurrentLocation@0x42 = 1, StackCount@0x43 = 1 (IoGetCurrentIrpStackLocation asserts this).
-    write_unaligned((irp + 0x42) as *mut u8, 1);
-    write_unaligned((irp + 0x43) as *mut u8, 1);
-
-    // IO_STACK_LOCATION (0x48 bytes).
-    let iosl = pool_alloc(0x48);
-    zero(iosl, 0x48);
-    write_unaligned(iosl as *mut u8, major as u8); // MajorFunction
-    write_unaligned((iosl + 1) as *mut u8, 0); // MinorFunction
-    write_unaligned((iosl + 0x20) as *mut u64, devobj); // DeviceObject
-    write_unaligned((iosl + 0x30) as *mut u64, fo); // FileObject
-                                                    // Parameters union @ iosl+0x08. Layouts (references/reactos ndk/iotypes.h; POINTER_ALIGNMENT =
-                                                    // DECLSPEC_ALIGN(8) on x64 → Reserved/FileAttributes 8-align, ShareAccess follows, next ptr 8-aligns):
-                                                    //  Create/CreatePipe: SecurityContext@iosl+0x08, Options@iosl+0x10, ShareAccess(USHORT)@iosl+0x1a,
-                                                    //    Parameters@iosl+0x20.
-                                                    //  Read/Write: Length(ULONG)@0x08, Key@0x10, ByteOffset(LARGE_INTEGER)@0x18.
-                                                    //  SetFile: Length(ULONG)@0x08, FileInformationClass (8-aligned) @0x10.
-                                                    //  FS/DeviceControl: OutputBufferLength@0x08, InputBufferLength@0x10, IoControlCode@0x18,
-                                                    //    Type3InputBuffer@0x20.
-    match major {
+    // IO_STACK_LOCATION. Parameters union @ +0x08:
+    // Create/CreatePipe: SecurityContext@+0x08, Options@+0x10, ShareAccess@+0x1a, Parameters@+0x20.
+    // Read/Write: Length@+0x08. SetFile: Length@+0x08, FileInformationClass@+0x10.
+    // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18.
+    let iosl = pool_alloc(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+    if iosl == 0 {
+        pool_free(data);
+        if owns_fo {
+            pool_free(fo);
+        }
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    let stack_parameters = match major {
         0 | 1 => {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
             // SecurityContext->{AccessState,DesiredAccess}, Options (disposition<<24), ShareAccess, and
@@ -1868,9 +1887,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                                                                  // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
                                                                  // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
             let disposition: u32 = if major == 1 { 3 } else { 1 }; // create-named-pipe=FILE_OPEN_IF, open=FILE_OPEN
-            write_unaligned((iosl + 0x10) as *mut u32, disposition << 24);
-            write_unaligned((iosl + 0x1a) as *mut u16, 3); // ShareAccess = FILE_SHARE_READ|WRITE (full duplex)
-            if major == 1 {
+            let named_pipe_parameters = if major == 1 {
                 // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
                 // MaximumInstances@0xc, InboundQuota@0x10, OutboundQuota@0x14, DefaultTimeout@0x18 (LI, must
                 // be < 0 = relative), TimeoutSpecified@0x20 (BOOLEAN, must be TRUE + MaximumInstances != 0).
@@ -1884,27 +1901,86 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 write_unaligned((params + 0x14) as *mut u32, 0x1000); // OutboundQuota
                 write_unaligned((params + 0x18) as *mut i64, -50_000_000i64); // DefaultTimeout = -5s (relative)
                 write_unaligned((params + 0x20) as *mut u8, 1); // TimeoutSpecified = TRUE
-                write_unaligned((iosl + 0x20) as *mut u64, params); // Parameters
+                Some(params)
+            } else {
+                None
+            };
+            WdmIoStackParameters::Create {
+                security_context: sec_ctx,
+                options: disposition << 24,
+                share_access: 3,
+                named_pipe_parameters,
             }
         }
-        IRP_MJ_READ => {
-            write_unaligned((iosl + 0x08) as *mut u32, outlen as u32);
+        IRP_MJ_READ => WdmIoStackParameters::Read {
+            length: outlen as u32,
+        },
+        IRP_MJ_WRITE => WdmIoStackParameters::Write {
+            length: inlen as u32,
+        },
+        IRP_MJ_SET_INFORMATION => WdmIoStackParameters::SetInformation {
+            length: inlen as u32,
+            information_class: fsctl as u32,
+        },
+        0xd | 0xe => WdmIoStackParameters::DeviceControl {
+            output_buffer_length: outlen as u32,
+            input_buffer_length: inlen as u32,
+            io_control_code: fsctl as u32,
+        },
+        _ => WdmIoStackParameters::None,
+    };
+    let iosl_bytes =
+        core::slice::from_raw_parts_mut(iosl as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE);
+    if write_wdm_io_stack_location(
+        iosl_bytes,
+        WdmIoStackLocationInit {
+            major: major as u8,
+            minor: 0,
+            device_object: devobj,
+            file_object: fo,
+            parameters: stack_parameters,
+        },
+    )
+    .is_err()
+    {
+        pool_free(iosl);
+        pool_free(data);
+        if owns_fo {
+            pool_free(fo);
         }
-        IRP_MJ_WRITE => {
-            write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
-        }
-        IRP_MJ_SET_INFORMATION => {
-            write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
-            write_unaligned((iosl + 0x10) as *mut u32, fsctl as u32);
-        }
-        0xd | 0xe => {
-            write_unaligned((iosl + 0x08) as *mut u32, outlen as u32);
-            write_unaligned((iosl + 0x10) as *mut u32, inlen as u32);
-            write_unaligned((iosl + 0x18) as *mut u32, fsctl as u32);
-        }
-        _ => {}
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
-    write_unaligned((irp + 0xb8) as *mut u64, iosl); // CurrentStackLocation
+
+    // IRP. Both buffered-I/O views refer to request-owned storage. Writes/sets arrive through
+    // `inlen`; reads reserve `outlen` and are copied back to the ARG transport after completion.
+    let irp = pool_alloc(WDM_X64_IRP_SIZE as u64);
+    if irp == 0 {
+        pool_free(iosl);
+        pool_free(data);
+        if owns_fo {
+            pool_free(fo);
+        }
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    let irp_bytes = core::slice::from_raw_parts_mut(irp as *mut u8, WDM_X64_IRP_SIZE);
+    if write_wdm_irp(
+        irp_bytes,
+        WdmIrpInit {
+            system_buffer: data,
+            user_buffer: data,
+            current_stack_location: iosl,
+        },
+    )
+    .is_err()
+    {
+        pool_free(irp);
+        pool_free(iosl);
+        pool_free(data);
+        if owns_fo {
+            pool_free(fo);
+        }
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
 
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
     // own consistency bugcheck (`NpBugCheck` → `KeBugCheckEx`) we unwind back here and fail THIS

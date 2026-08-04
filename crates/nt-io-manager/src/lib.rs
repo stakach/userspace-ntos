@@ -34,6 +34,7 @@ mod pipe;
 mod projection;
 mod read_write;
 mod store;
+mod wdm_x64;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use dispatch::{
@@ -62,6 +63,14 @@ pub use pipe::{
     STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING, STATUS_PIPE_NOT_AVAILABLE,
 };
 pub use store::{GenStore, IoId};
+pub use wdm_x64::{
+    write_wdm_device_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
+    WdmDeviceObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
+    WdmIrpInit, WdmLayoutError, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
+    WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+};
 
 #[cfg(feature = "object-manager")]
 pub use object_port::ObjectManagerLibraryPort;
@@ -1415,6 +1424,139 @@ mod tests {
         let fp = om.project_file(fid).unwrap();
         assert_eq!(fp.file_id, fid.0);
         assert_eq!(fp.device_id, dev.0);
+    }
+
+    fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ])
+    }
+
+    #[test]
+    fn wdm_x64_device_and_file_layouts_are_stable() {
+        let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
+        write_wdm_device_object(
+            &mut dev,
+            WdmDeviceObjectInit {
+                driver_object: 0x1111,
+                next_device: 0x2222,
+                device_extension: 0x3333,
+                device_type: 0x44,
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u16(&dev, 0x00), WDM_X64_IO_TYPE_DEVICE as u16);
+        assert_eq!(le_u16(&dev, 0x02), WDM_X64_DEVICE_OBJECT_SIZE as u16);
+        assert_eq!(le_u64(&dev, 0x08), 0x1111);
+        assert_eq!(le_u64(&dev, 0x10), 0x2222);
+        assert_eq!(le_u64(&dev, 0x40), 0x3333);
+        assert_eq!(le_u32(&dev, 0x48), 0x44);
+        assert!(dev.iter().skip(WDM_X64_DEVICE_OBJECT_SIZE).all(|b| *b == 0));
+
+        let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
+        write_wdm_file_object(
+            &mut file,
+            WdmFileObjectInit {
+                device_object: 0x4444,
+                fs_context: 0x5555,
+                file_name_len: 12,
+                file_name_max_len: 14,
+                file_name_buffer: 0x6666,
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u16(&file, 0x00), WDM_X64_IO_TYPE_FILE as u16);
+        assert_eq!(le_u16(&file, 0x02), WDM_X64_FILE_OBJECT_SIZE as u16);
+        assert_eq!(le_u64(&file, 0x08), 0x4444);
+        assert_eq!(le_u64(&file, 0x18), 0x5555);
+        assert_eq!(le_u16(&file, 0x58), 12);
+        assert_eq!(le_u16(&file, 0x5a), 14);
+        assert_eq!(le_u64(&file, 0x60), 0x6666);
+    }
+
+    #[test]
+    fn wdm_x64_irp_and_stack_layouts_are_stable() {
+        let mut irp = [0xCC; WDM_X64_IRP_SIZE];
+        write_wdm_irp(
+            &mut irp,
+            WdmIrpInit {
+                system_buffer: 0x1111,
+                user_buffer: 0x2222,
+                current_stack_location: 0x3333,
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u64(&irp, 0x18), 0x1111);
+        assert_eq!(irp[0x42], 1);
+        assert_eq!(irp[0x43], 1);
+        assert_eq!(le_u64(&irp, 0x70), 0x2222);
+        assert_eq!(le_u64(&irp, 0xb8), 0x3333);
+
+        let mut stack = [0xCC; WDM_X64_IO_STACK_LOCATION_SIZE];
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_DEVICE_CONTROL,
+                minor: 2,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::DeviceControl {
+                    output_buffer_length: 0x10,
+                    input_buffer_length: 0x20,
+                    io_control_code: 0x333000,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_DEVICE_CONTROL);
+        assert_eq!(stack[0x01], 2);
+        assert_eq!(le_u32(&stack, 0x08), 0x10);
+        assert_eq!(le_u32(&stack, 0x10), 0x20);
+        assert_eq!(le_u32(&stack, 0x18), 0x333000);
+        assert_eq!(le_u64(&stack, 0x20), 0x4444);
+        assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_CREATE_NAMED_PIPE,
+                minor: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::Create {
+                    security_context: 0x7777,
+                    options: 3 << 24,
+                    share_access: 3,
+                    named_pipe_parameters: Some(0x8888),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u64(&stack, 0x08), 0x7777);
+        assert_eq!(le_u32(&stack, 0x10), 3 << 24);
+        assert_eq!(le_u16(&stack, 0x1a), 3);
+        assert_eq!(le_u64(&stack, 0x20), 0x8888);
+        assert_eq!(le_u64(&stack, 0x30), 0x5555);
     }
 
     #[test]
