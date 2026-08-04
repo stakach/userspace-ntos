@@ -30,16 +30,15 @@ use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, DeviceCharacteristics,
-    DeviceControlParameters, DeviceFlags, DeviceRecord, DeviceType, DispatchContext,
-    DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend, DriverId,
-    DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters, IrpId,
-    IrpProjection, MajorFunctionTable, ReadWriteParameters, WdmFileObjectInit,
-    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
-    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
-    WDM_X64_IRP_SIZE,
+    DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext, DispatchOutcome,
+    DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId, InformationParameters,
+    IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort,
+    ReadWriteParameters, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
+    WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
-use nt_types::ClientId;
+use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 
 // Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
@@ -1065,27 +1064,7 @@ extern "win64" fn s_io_delete_device(dev: u64) {
         if let Some((index, inst)) = instance_by_device_object(dev) {
             if inst.device_id != 0 {
                 let device_id = nt_io_manager::DeviceId(inst.device_id);
-                let object_path = {
-                    let io = io_manager_mut();
-                    match io.can_delete_device(device_id) {
-                        Ok(()) => io
-                            .device(device_id)
-                            .filter(|record| record.object_id != ObjectId::NULL)
-                            .and_then(|record| record.name.as_ref())
-                            .and_then(nt_path_ascii_string),
-                        Err(nt_status::NtStatus::DELETE_PENDING) => {
-                            let _ = io.mark_device_delete_pending(device_id);
-                            return;
-                        }
-                        Err(_) => return,
-                    }
-                };
-                if let Some(path) = object_path.as_deref() {
-                    if crate::object_manager_delete_path(path).is_err() {
-                        return;
-                    }
-                }
-                match io_manager_mut().delete_device(device_id) {
+                match io_manager_mut().destroy_device(device_id) {
                     Ok(_) => {
                         let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
                         table[index].device_id = 0;
@@ -2772,8 +2751,28 @@ pub(crate) unsafe fn load_driver(
         tcb,
         reply_cap,
     };
-    let device_id = register_io_device(driver_id, &dc);
+    let device_id = match register_io_device(driver_id, &dc) {
+        Ok(device_id) => device_id,
+        Err(status) => {
+            print_str(b"[driver-launch] IoManager device publish failed status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b" for ");
+            print_str(driver_object_path.as_bytes());
+            print_str(b"\n");
+            destroy_registered_driver(driver_id);
+            return None;
+        }
+    };
     let dc = DriverComponent { device_id, ..dc };
+    if let Err(status) = register_io_symbolic_link(&dc) {
+        print_str(b"[driver-launch] IoManager symlink publish failed status=0x");
+        print_hex(status.raw() as u32);
+        print_str(b" for ");
+        print_str(driver_object_path.as_bytes());
+        print_str(b"\n");
+        destroy_registered_driver(driver_id);
+        return None;
+    }
     // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
     Some(dc)
@@ -2882,7 +2881,131 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 // ---------------------------------------------------------------------------------------------
 
 pub(crate) const IO_MANAGER_COMPONENT_ID: u64 = 0x494F_0000;
-type ExecutiveIoManager = IoManager<()>;
+
+#[derive(Clone, Copy, Default)]
+struct ExecutiveObjectManagerPort;
+
+impl ExecutiveObjectManagerPort {
+    fn ascii_path(path: &NtPath) -> Result<String, nt_status::NtStatus> {
+        nt_path_ascii_string(path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)
+    }
+}
+
+impl ObjectManagerPort for ExecutiveObjectManagerPort {
+    fn register_client(&mut self) -> ClientId {
+        ClientId(IO_MANAGER_COMPONENT_ID)
+    }
+
+    fn close_client(&mut self, _client: ClientId) -> Result<(), nt_status::NtStatus> {
+        Ok(())
+    }
+
+    fn create_driver_object(
+        &mut self,
+        name: &NtPath,
+        owner_local_id: u64,
+    ) -> Result<ObjectId, nt_status::NtStatus> {
+        let path = Self::ascii_path(name)?;
+        unsafe {
+            crate::object_manager_create_driver_path(&path, IO_MANAGER_COMPONENT_ID, owner_local_id)
+                .map(ObjectId)
+        }
+    }
+
+    fn delete_driver_object(
+        &mut self,
+        _object: ObjectId,
+        name: &NtPath,
+    ) -> Result<(), nt_status::NtStatus> {
+        let path = Self::ascii_path(name)?;
+        unsafe { crate::object_manager_delete_path(&path) }
+    }
+
+    fn create_device_object(
+        &mut self,
+        name: Option<&NtPath>,
+        owner_local_id: u64,
+    ) -> Result<ObjectId, nt_status::NtStatus> {
+        let path = Self::ascii_path(name.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)?;
+        unsafe {
+            crate::object_manager_create_device_path(&path, IO_MANAGER_COMPONENT_ID, owner_local_id)
+                .map(ObjectId)
+        }
+    }
+
+    fn delete_device_object(
+        &mut self,
+        _object: ObjectId,
+        name: Option<&NtPath>,
+    ) -> Result<(), nt_status::NtStatus> {
+        let path = Self::ascii_path(name.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)?;
+        unsafe { crate::object_manager_delete_path(&path) }
+    }
+
+    fn open_device_object(&mut self, path: &NtPath) -> Result<ObjectId, nt_status::NtStatus> {
+        let path = Self::ascii_path(path)?;
+        unsafe { crate::object_manager_lookup_path(&path).map(ObjectId) }
+    }
+
+    fn create_symbolic_link(
+        &mut self,
+        link: &NtPath,
+        target: &NtPath,
+    ) -> Result<(), nt_status::NtStatus> {
+        let link = Self::ascii_path(link)?;
+        let target = Self::ascii_path(target)?;
+        unsafe { crate::object_manager_create_symbolic_link_path(&link, &target) }
+    }
+
+    fn delete_symbolic_link(&mut self, link: &NtPath) -> Result<(), nt_status::NtStatus> {
+        let link = Self::ascii_path(link)?;
+        unsafe { crate::object_manager_delete_symbolic_link_path(&link) }
+    }
+
+    fn create_file_object_and_handle(
+        &mut self,
+        _client: ClientId,
+        device_object: ObjectId,
+        owner_local_id: u64,
+        desired_access: AccessMask,
+    ) -> Result<(ObjectId, HandleValue), nt_status::NtStatus> {
+        unsafe {
+            crate::object_manager_create_file_handle(
+                IO_MANAGER_COMPONENT_ID,
+                owner_local_id,
+                device_object.0,
+                desired_access,
+            )
+            .map(|(file, handle)| (ObjectId(file), HandleValue(handle)))
+        }
+    }
+
+    fn reference_file_by_handle(
+        &mut self,
+        _client: ClientId,
+        handle: HandleValue,
+        desired_access: AccessMask,
+    ) -> Result<ObjectId, nt_status::NtStatus> {
+        unsafe { crate::object_manager_reference_file_handle(handle, desired_access).map(ObjectId) }
+    }
+
+    fn reference_device(&mut self, device_object: ObjectId) -> Result<(), nt_status::NtStatus> {
+        if device_object == ObjectId::NULL {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+
+    fn close_handle(
+        &mut self,
+        _client: ClientId,
+        handle: HandleValue,
+    ) -> Result<(), nt_status::NtStatus> {
+        unsafe { crate::object_manager_close_handle(handle) }
+    }
+}
+
+type ExecutiveIoManager = IoManager<ExecutiveObjectManagerPort>;
 static mut DRIVER_IO_MANAGER: MaybeUninit<ExecutiveIoManager> = MaybeUninit::uninit();
 static mut DRIVER_IO_MANAGER_INIT: bool = false;
 
@@ -2891,7 +3014,7 @@ fn io_manager_mut() -> &'static mut ExecutiveIoManager {
         let init = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER_INIT);
         let slot = core::ptr::addr_of_mut!(DRIVER_IO_MANAGER);
         if !read_volatile(init) {
-            (*slot).write(IoManager::new(()));
+            (*slot).write(IoManager::new(ExecutiveObjectManagerPort));
             write_volatile(init, true);
         }
         (*slot).assume_init_mut()
@@ -3129,16 +3252,15 @@ fn dispatch_external_irp_to_device_record(
 fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {
     let name = parse_nt_path(driver_object_path)?;
     let io = io_manager_mut();
-    let backend = io.register_backend(Box::new(HostedDriverBackend { instance }));
     let mut dispatch = MajorFunctionTable::new();
-    dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(backend as u64)));
-    let record = DriverRecord::new(
-        ObjectId::NULL,
-        name,
-        DriverBackendId(backend as u64),
+    dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(0)));
+    io.create_driver_peer_with_major_table(
+        &name,
+        Box::new(HostedDriverBackend { instance }),
         dispatch,
-    );
-    Some(io.register_driver(record).raw())
+    )
+    .ok()
+    .map(|driver_id| driver_id.raw())
 }
 
 pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
@@ -3148,23 +3270,45 @@ pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
         .map(|driver_id| driver_id.raw())
 }
 
-fn register_io_device(driver_id: u64, dc: &DriverComponent) -> u64 {
+fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
     if dc.devobj == 0 || dc.device_name_len == 0 {
-        return 0;
+        return Ok(0);
     }
     let Some(name) = captured_nt_path(&dc.device_name_utf16, dc.device_name_len) else {
-        return 0;
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     };
-    let record = DeviceRecord::new(
-        ObjectId::NULL,
-        DriverId(driver_id),
-        Some(name),
-        DeviceType::UNKNOWN,
-        DeviceCharacteristics::empty(),
-        DeviceFlags::BUFFERED_IO,
-        0,
-    );
-    io_manager_mut().add_device(record).raw()
+    io_manager_mut()
+        .create_device(
+            DriverId(driver_id),
+            Some(&name),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .map(|device_id| device_id.raw())
+}
+
+fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtStatus> {
+    if dc.symlink_link_len == 0 && dc.symlink_target_len == 0 {
+        return Ok(());
+    }
+    let link = captured_nt_path(&dc.symlink_link_utf16, dc.symlink_link_len)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let target = captured_nt_path(&dc.symlink_target_utf16, dc.symlink_target_len)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    io_manager_mut().create_symbolic_link(&link, &target)
+}
+
+fn destroy_registered_driver(driver_id: u64) {
+    let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
+}
+
+pub(crate) fn device_object_id(device_id: u64) -> u64 {
+    io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .map(|device| device.object_id.0)
+        .unwrap_or(0)
 }
 
 /// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
@@ -3233,17 +3377,6 @@ fn register_instance(dc: &DriverComponent) {
     }
 }
 
-pub(crate) fn bind_driver_object_id(driver_id: u64, object_id: u64) -> bool {
-    if instance_by_driver_id(driver_id).is_none() {
-        return false;
-    }
-    if let Some(driver) = io_manager_mut().driver_mut(DriverId(driver_id)) {
-        driver.object_id = ObjectId(object_id);
-        return true;
-    }
-    false
-}
-
 pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
     io_manager_mut()
         .driver(DriverId(driver_id))
@@ -3256,17 +3389,6 @@ fn clear_instance(i: usize) {
     if i < t.len() {
         t[i] = EMPTY_INSTANCE;
     }
-}
-
-pub(crate) fn bind_device_object_id(device_id: u64, object_id: u64) -> bool {
-    if instance_by_device_id(device_id).is_none() {
-        return false;
-    }
-    if let Some(device) = io_manager_mut().device_mut(nt_io_manager::DeviceId(device_id)) {
-        device.object_id = ObjectId(object_id);
-        return true;
-    }
-    false
 }
 
 /// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
@@ -3326,51 +3448,10 @@ fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstanc
         .find(|(_, entry)| entry.used && entry.device_object == device_object)
 }
 
-fn driver_record_path(driver_id: u64) -> Option<String> {
+fn destroy_registered_driver_after_unload(driver_id: u64) -> Result<(), nt_status::NtStatus> {
     io_manager_mut()
-        .driver(DriverId(driver_id))
-        .map(|driver| &driver.name)
-        .and_then(nt_path_ascii_string)
-}
-
-fn driver_has_object_manager_name(driver_id: u64) -> bool {
-    io_manager_mut()
-        .driver(DriverId(driver_id))
-        .map(|driver| driver.object_id != ObjectId::NULL)
-        .unwrap_or(false)
-}
-
-fn device_object_manager_paths_for_driver(driver_id: u64) -> Vec<String> {
-    let io = io_manager_mut();
-    let devices = io.devices_of(DriverId(driver_id)).to_vec();
-    let mut paths = Vec::new();
-    for device in devices {
-        if let Some(path) = io
-            .device(device)
-            .filter(|record| record.object_id != ObjectId::NULL)
-            .and_then(|record| record.name.as_ref())
-            .and_then(nt_path_ascii_string)
-        {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-unsafe fn delete_driver_namespace_and_records(driver_id: u64) -> Result<(), nt_status::NtStatus> {
-    for path in device_object_manager_paths_for_driver(driver_id) {
-        crate::object_manager_delete_path(&path)?;
-    }
-    let driver_path = driver_record_path(driver_id);
-    if driver_has_object_manager_name(driver_id) {
-        if let Some(path) = driver_path.as_deref() {
-            crate::object_manager_delete_path(path)?;
-        } else {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-    }
-    io_manager_mut().remove_driver_records_after_unload(DriverId(driver_id))?;
-    Ok(())
+        .destroy_driver(DriverId(driver_id))
+        .map(|_| ())
 }
 
 unsafe fn dispatch_driver_unload_for_instance(
@@ -3447,7 +3528,7 @@ pub(crate) unsafe fn unload_driver_by_name(
     if inst.tcb != 0 {
         let _ = crate::tcb_suspend_r(inst.tcb);
     }
-    delete_driver_namespace_and_records(driver_id)?;
+    destroy_registered_driver_after_unload(driver_id)?;
     clear_instance(index);
     Ok(())
 }

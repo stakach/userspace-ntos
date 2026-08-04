@@ -17,9 +17,9 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_object_abi::{
-    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
-    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
-    ObReply,
+    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest,
+    ObQueryObjectInfo, ObReferenceFileHandleRequest, ObReply,
 };
 use nt_status::NtStatus;
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId};
@@ -213,6 +213,51 @@ impl<B: Backend> ObjectClient<B> {
             owner_local_id,
             permanent,
         )
+    }
+
+    /// Create an unnamed routed File object for `device_object` and open a handle
+    /// for this Object Manager client.
+    pub fn create_file_handle(
+        &mut self,
+        owner_component: u64,
+        owner_local_id: u64,
+        device_object: ObjectId,
+        desired_access: AccessMask,
+    ) -> Result<(ObjectId, HandleValue), NtStatus> {
+        let req = ObCreateFileHandleRequest {
+            abi_size: size_of::<ObCreateFileHandleRequest>() as u16,
+            _reserved: 0,
+            desired_access: desired_access.bits(),
+            owner_component,
+            owner_local_id,
+            device_object: device_object.0,
+        };
+        let buf = bytemuck::bytes_of(&req).to_vec();
+        let r = self
+            .backend
+            .call(opcode::OB_OP_CREATE_FILE_HANDLE, &buf, &mut []);
+        NtStatus(r.status).to_result()?;
+        Ok((ObjectId(r.detail0), HandleValue(r.detail1)))
+    }
+
+    /// Reference a File object by handle in this Object Manager client's handle table.
+    pub fn reference_file_handle(
+        &mut self,
+        handle: HandleValue,
+        desired_access: AccessMask,
+    ) -> Result<ObjectId, NtStatus> {
+        let req = ObReferenceFileHandleRequest {
+            abi_size: size_of::<ObReferenceFileHandleRequest>() as u16,
+            _reserved: 0,
+            desired_access: desired_access.bits(),
+            handle: handle.0,
+        };
+        let buf = bytemuck::bytes_of(&req).to_vec();
+        let r = self
+            .backend
+            .call(opcode::OB_OP_REFERENCE_FILE_HANDLE, &buf, &mut []);
+        NtStatus(r.status).to_result()?;
+        Ok(ObjectId(r.detail0))
     }
 
     /// Create a symbolic link `link` → `target`.

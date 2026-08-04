@@ -39,6 +39,8 @@ pub mod opcode {
     pub const OB_OP_QUERY_SYMBOLIC_LINK: u16 = 0x2022;
     pub const OB_OP_CREATE_DRIVER: u16 = 0x2023;
     pub const OB_OP_CREATE_DEVICE: u16 = 0x2024;
+    pub const OB_OP_CREATE_FILE_HANDLE: u16 = 0x2025;
+    pub const OB_OP_REFERENCE_FILE_HANDLE: u16 = 0x2026;
 
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
@@ -134,6 +136,33 @@ pub struct ObCreateIoObjectRequest {
     pub path_len_bytes: u32,
 }
 
+/// `OB_OP_CREATE_FILE_HANDLE` payload. Creates an unnamed routed File object for
+/// `device_object` and opens a handle for the calling Object Manager client.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObCreateFileHandleRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub desired_access: u32,
+    /// Component that owns the File object route.
+    pub owner_component: u64,
+    /// Component-local id for the File object projection.
+    pub owner_local_id: u64,
+    /// Canonical target Device object id.
+    pub device_object: u64,
+}
+
+/// `OB_OP_REFERENCE_FILE_HANDLE` payload. References a File object by handle in
+/// the calling Object Manager client's handle table.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObReferenceFileHandleRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub desired_access: u32,
+    pub handle: u64,
+}
+
 /// `OB_OP_LOOKUP_PATH` payload.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -193,12 +222,16 @@ const _: () = {
     assert!(size_of::<ObCreateDirectoryRequest>() == 16);
     assert!(size_of::<ObCreateSymbolicLinkRequest>() == 24);
     assert!(size_of::<ObCreateIoObjectRequest>() == 32);
+    assert!(size_of::<ObCreateFileHandleRequest>() == 32);
+    assert!(size_of::<ObReferenceFileHandleRequest>() == 16);
     assert!(size_of::<ObLookupPathRequest>() == 12);
     assert!(size_of::<ObQueryObjectInfo>() == 48);
     assert!(size_of::<ObCloseHandleRequest>() == 16);
     assert!(size_of::<ObReply>() == 24);
     // 8-byte alignment (u64 fields) except the all-32-bit ones.
     assert!(align_of::<ObOpenObjectRequest>() == 8);
+    assert!(align_of::<ObCreateFileHandleRequest>() == 8);
+    assert!(align_of::<ObReferenceFileHandleRequest>() == 8);
     assert!(align_of::<ObLookupPathRequest>() == 4);
 };
 

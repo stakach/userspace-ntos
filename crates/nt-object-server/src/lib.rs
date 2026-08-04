@@ -18,14 +18,14 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_object_abi::{
-    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
-    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
-    ObReply,
+    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest,
+    ObQueryObjectInfo, ObReferenceFileHandleRequest, ObReply,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
 use nt_types::{
-    AccessMask, AccessMode, CaseSensitivity, ClientId, HandleValue, NtPath, ObjAttrFlags,
+    AccessMask, AccessMode, CaseSensitivity, ClientId, HandleValue, NtPath, ObjAttrFlags, ObjectId,
     ObjectTypeId, UnicodeString,
 };
 
@@ -94,6 +94,8 @@ impl Server {
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
             opcode::OB_OP_CREATE_DRIVER => self.op_create_driver(in_buf),
             opcode::OB_OP_CREATE_DEVICE => self.op_create_device(in_buf),
+            opcode::OB_OP_CREATE_FILE_HANDLE => self.op_create_file_handle(client, in_buf),
+            opcode::OB_OP_REFERENCE_FILE_HANDLE => self.op_reference_file_handle(client, in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -224,6 +226,40 @@ impl Server {
             permanent_of(req.obj_attributes),
         )?;
         Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
+    }
+
+    fn op_create_file_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObCreateFileHandleRequest = read_req(buf)?;
+        check_size::<ObCreateFileHandleRequest>(req.abi_size)?;
+        let file = self.om.create_file(
+            ComponentId(req.owner_component),
+            req.owner_local_id,
+            ObjectId(req.device_object),
+        )?;
+        let handle = self.om.open_handle(
+            client,
+            &file,
+            AccessMask::from_bits_retain(req.desired_access),
+            ObjAttrFlags::empty(),
+        )?;
+        Ok(reply(NtStatus::SUCCESS, 0, file.id().0, handle.0))
+    }
+
+    fn op_reference_file_handle(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+    ) -> Result<ObReply, NtStatus> {
+        let req: ObReferenceFileHandleRequest = read_req(buf)?;
+        check_size::<ObReferenceFileHandleRequest>(req.abi_size)?;
+        let file_type = self.om.file_type().ok_or(NtStatus::OBJECT_TYPE_MISMATCH)?;
+        let file = self.om.reference_by_handle(
+            client,
+            HandleValue(req.handle),
+            Some(file_type),
+            AccessMask::from_bits_retain(req.desired_access),
+        )?;
+        Ok(reply(NtStatus::SUCCESS, 0, file.id().0, 0))
     }
 
     fn op_create_symlink(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {

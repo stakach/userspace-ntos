@@ -55,7 +55,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### D. Driver, Device, And Registry Discovery
 
-- `[~]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
+- `[x]` D1: Replace hardcoded GDI/display/keyboard driver preloads with loader and service-control
   driven driver objects.
 - `[x]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
@@ -1685,3 +1685,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D1 remains open only for
   eliminating the residual `IoManager<()>`/post-create bind split by giving the live executive a real
   Object Manager-backed I/O Manager port; D3 remains the real videoprt/miniport-created video stack.
+- D1 complete. The live executive driver route no longer instantiates `IoManager<()>` and no longer
+  post-creates Object Manager `Driver`/`Device` objects through a separate bind step. The Object
+  Manager service ABI now exposes the missing routed File object operations needed by a full
+  brokered `ObjectManagerPort`; the executive's port delegates driver, device, symbolic-link,
+  file-handle, lookup, and close operations to the live Object Manager service client. Hosted driver
+  registration now calls `IoManager::create_driver_peer_with_major_table`, `IoManager::create_device`,
+  and `IoManager::create_symbolic_link`; failure unwinds the registered driver route instead of
+  leaving half-published namespace state. Hosted `IoDeleteDevice` and native unload teardown now flow
+  through `destroy_device`/`destroy_driver`, so Object Manager namespace deletion is owned by the
+  I/O Manager port. Validation: `cargo test --manifest-path crates/nt-object-abi/Cargo.toml`,
+  `cargo test --manifest-path crates/nt-object-server/Cargo.toml`, `cargo test --manifest-path
+  crates/nt-io-manager/Cargo.toml`, `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and a source search for the retired `IoManager<()>` /
+  post-create bind symbols passed. Review adjustment: D1 is closed. The remaining open plan work is
+  D3's real videoprt/miniport-created video stack.

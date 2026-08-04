@@ -7739,6 +7739,32 @@ unsafe fn install_object_manager_client(client: &mut ObjectClient<ObChan<'static
     OBJECT_CLIENT_PTR = client as *mut _;
 }
 
+pub(crate) unsafe fn object_manager_create_driver_path(
+    path: &str,
+    owner_component: u64,
+    owner_local_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client
+        .create_driver(path, owner_component, owner_local_id, true)
+        .map(|id| id.0)
+}
+
+pub(crate) unsafe fn object_manager_create_device_path(
+    path: &str,
+    owner_component: u64,
+    owner_local_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client
+        .create_device(path, owner_component, owner_local_id, true)
+        .map(|id| id.0)
+}
+
 pub(crate) unsafe fn object_manager_delete_path(path: &str) -> Result<(), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
@@ -7746,14 +7772,67 @@ pub(crate) unsafe fn object_manager_delete_path(path: &str) -> Result<(), nt_sta
     client.delete_object(path, true)
 }
 
-pub(crate) unsafe fn object_manager_publish_driver_io_objects(
-    driver_object_path: &str,
-    dc: &driver_launch::DriverComponent,
-) -> Result<PublishedDriverIoObjects, nt_status::NtStatus> {
+pub(crate) unsafe fn object_manager_lookup_path(path: &str) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
         .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
-    publish_driver_io_objects(client, driver_object_path, dc)
+    client.lookup(path, true).map(|id| id.0)
+}
+
+pub(crate) unsafe fn object_manager_create_symbolic_link_path(
+    link: &str,
+    target: &str,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client.create_symbolic_link(link, target, true).map(|_| ())
+}
+
+pub(crate) unsafe fn object_manager_delete_symbolic_link_path(
+    link: &str,
+) -> Result<(), nt_status::NtStatus> {
+    object_manager_delete_path(link)
+}
+
+pub(crate) unsafe fn object_manager_create_file_handle(
+    owner_component: u64,
+    owner_local_id: u64,
+    device_object: u64,
+    desired_access: nt_types::AccessMask,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client
+        .create_file_handle(
+            owner_component,
+            owner_local_id,
+            nt_types::ObjectId(device_object),
+            desired_access,
+        )
+        .map(|(file, handle)| (file.0, handle.0))
+}
+
+pub(crate) unsafe fn object_manager_reference_file_handle(
+    handle: nt_types::HandleValue,
+    desired_access: nt_types::AccessMask,
+) -> Result<u64, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client
+        .reference_file_handle(handle, desired_access)
+        .map(|id| id.0)
+}
+
+pub(crate) unsafe fn object_manager_close_handle(
+    handle: nt_types::HandleValue,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client.close_handle(handle)
 }
 
 /// The Configuration Manager transport wrapper.
@@ -13626,68 +13705,12 @@ fn captured_utf16le_ascii_path(bytes: &[u8], len: u16) -> Option<alloc::string::
     Some(out)
 }
 
-pub(crate) struct PublishedDriverIoObjects {
-    pub driver_object_id: u64,
-    pub device_path: Option<alloc::string::String>,
-    pub device_object_id: u64,
-}
-
-fn publish_driver_io_objects<B: nt_object_client::Backend>(
-    object_client: &mut ObjectClient<B>,
-    driver_object_path: &str,
-    dc: &driver_launch::DriverComponent,
-) -> Result<PublishedDriverIoObjects, nt_status::NtStatus> {
-    let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
-    let driver_object =
-        object_client.create_driver(driver_object_path, owner_component, dc.driver_id, true)?;
-    if !driver_launch::bind_driver_object_id(dc.driver_id, driver_object.0) {
-        let _ = object_client.delete_object(driver_object_path, true);
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-
-    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
-    let mut device_object_id = 0;
-    if let Some(path) = device_path.as_deref() {
-        let device_object =
-            object_client.create_device(path, owner_component, dc.device_id, true)?;
-        if !driver_launch::bind_device_object_id(dc.device_id, device_object.0) {
-            let _ = object_client.delete_object(path, true);
-            let _ = driver_launch::bind_driver_object_id(dc.driver_id, 0);
-            let _ = object_client.delete_object(driver_object_path, true);
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        device_object_id = device_object.0;
-    }
-
-    if let (Some(link), Some(target)) = (
-        captured_utf16le_ascii_path(&dc.symlink_link_utf16, dc.symlink_link_len),
-        captured_utf16le_ascii_path(&dc.symlink_target_utf16, dc.symlink_target_len),
-    ) {
-        if let Err(status) = object_client.create_symbolic_link(&link, &target, true) {
-            if let Some(path) = device_path.as_deref() {
-                let _ = object_client.delete_object(path, true);
-                let _ = driver_launch::bind_device_object_id(dc.device_id, 0);
-            }
-            let _ = driver_launch::bind_driver_object_id(dc.driver_id, 0);
-            let _ = object_client.delete_object(driver_object_path, true);
-            return Err(status);
-        }
-    }
-
-    Ok(PublishedDriverIoObjects {
-        driver_object_id: driver_object.0,
-        device_path,
-        device_object_id,
-    })
-}
-
 fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     object_client: &mut ObjectClient<B>,
     dc: &driver_launch::DriverComponent,
     passed: &mut u64,
 ) {
     let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
-    let published = publish_driver_io_objects(object_client, "\\Driver\\Npfs", dc).ok();
     let driver_info = object_client.query_object("\\Driver\\Npfs", true).ok();
     let driver_bound = driver_info.is_some_and(|info| {
         info.route_kind == 1
@@ -13695,29 +13718,23 @@ fn publish_npfs_io_objects<B: nt_object_client::Backend>(
             && info.owner_local_id == dc.driver_id
             && driver_launch::driver_object_id(dc.driver_id) == info.object_id.0
     });
-    let driver_ok = published
-        .as_ref()
-        .is_some_and(|objects| objects.driver_object_id != 0)
-        && driver_bound
-        && dc.drvobj != 0;
+    let driver_ok = driver_bound && dc.drvobj != 0;
     check(b"npfs_driver_object_registered", driver_ok, passed);
 
-    let device_declared = published
-        .as_ref()
-        .and_then(|objects| objects.device_path.as_deref())
-        == Some("\\Device\\NamedPipe");
+    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
+    let device_declared = device_path.as_deref() == Some("\\Device\\NamedPipe");
     check(b"npfs_named_device_declared", device_declared, passed);
-    let device_ok = published.as_ref().is_some_and(|objects| {
-        objects.device_path.as_deref().is_some_and(|path| {
+    let device_ok = device_path.as_deref().is_some_and(|path| {
+        let object_id = driver_launch::device_object_id(dc.device_id);
+        object_id != 0 && {
             let info = object_client.query_object(path, true).ok();
-            objects.device_object_id != 0
-                && info.is_some_and(|info| {
-                    info.route_kind == 2
-                        && info.owner_component == owner_component
-                        && info.owner_local_id == dc.device_id
-                        && info.object_id.0 == objects.device_object_id
-                })
-        })
+            info.is_some_and(|info| {
+                info.route_kind == 2
+                    && info.owner_component == owner_component
+                    && info.owner_local_id == dc.device_id
+                    && info.object_id.0 == object_id
+            })
+        }
     });
     check(b"npfs_device_object_registered", device_ok, passed);
 }

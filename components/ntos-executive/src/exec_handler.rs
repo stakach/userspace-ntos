@@ -1690,15 +1690,12 @@ impl ExecNtHandler {
         let Some(fs) = exec_fs() else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let Some(dc) =
+        let Some(_dc) =
             driver_launch::load_driver(&fs, &image_path[..image_len], class, &driver_object_path)
         else {
             return STATUS_UNSUCCESSFUL;
         };
-        match object_manager_publish_driver_io_objects(&driver_object_path, &dc) {
-            Ok(_) => 0,
-            Err(status) => status.raw() as u32,
-        }
+        0
     }
 
     unsafe fn nt_unload_driver(&mut self, service_name_ustr: u64) -> u32 {

@@ -91,6 +91,34 @@ fn service_lookup_errors_map_through() {
 }
 
 #[test]
+fn service_creates_and_references_file_handles() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let mut c = client(&mut server, cid);
+
+    let dev = c.create_device("\\Device\\Io0", 0x494f, 10, true).unwrap();
+    let (file, handle) = c
+        .create_file_handle(0x494f, 99, dev, AccessMask::GENERIC_READ)
+        .unwrap();
+    assert_eq!(
+        c.reference_file_handle(handle, AccessMask::GENERIC_READ)
+            .unwrap(),
+        file
+    );
+    assert_eq!(
+        c.reference_file_handle(handle, AccessMask::GENERIC_WRITE)
+            .unwrap_err(),
+        NtStatus::ACCESS_DENIED
+    );
+    c.close_handle(handle).unwrap();
+    assert_eq!(
+        c.reference_file_handle(handle, AccessMask::GENERIC_READ)
+            .unwrap_err(),
+        NtStatus::INVALID_HANDLE
+    );
+}
+
+#[test]
 fn client_death_closes_handles_permanent_survives() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);

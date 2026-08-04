@@ -906,6 +906,38 @@ mod tests {
             t.get(major::IRP_MJ_DEVICE_CONTROL),
             DispatchTarget::DriverPeer(DriverPeerId(3))
         );
+        t.retarget(DispatchTarget::DriverPeer(DriverPeerId(9)));
+        assert_eq!(
+            t.get(major::IRP_MJ_DEVICE_CONTROL),
+            DispatchTarget::DriverPeer(DriverPeerId(9))
+        );
+    }
+
+    #[test]
+    fn driver_peer_create_uses_object_port_and_supplied_major_table() {
+        let mut om = io();
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set(
+            major::IRP_MJ_DEVICE_CONTROL,
+            DispatchTarget::DriverPeer(DriverPeerId(0)),
+        );
+        let driver = om
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\Peer"),
+                Box::new(MockDriverBackend::new()),
+                dispatch,
+            )
+            .unwrap();
+        let record = om.driver(driver).unwrap();
+        assert_ne!(record.object_id, ObjectId::NULL);
+        assert_eq!(
+            record.dispatch.get(major::IRP_MJ_DEVICE_CONTROL),
+            DispatchTarget::DriverPeer(DriverPeerId(record.backend.0))
+        );
+        assert_eq!(
+            record.dispatch.get(major::IRP_MJ_CREATE),
+            DispatchTarget::Unsupported
+        );
     }
 
     proptest! {

@@ -67,16 +67,46 @@ impl<P: ObjectManagerPort> IoManager<P> {
         backend: Box<dyn DriverDispatchBackend>,
         peer: bool,
     ) -> Result<DriverId, NtStatus> {
+        let mut table = MajorFunctionTable::new();
+        for m in SUPPORTED_MAJORS {
+            let target = if peer {
+                DispatchTarget::DriverPeer(DriverPeerId(0))
+            } else {
+                DispatchTarget::Mock(MockDispatchId(0))
+            };
+            table.set(m, target);
+        }
+        self.install_driver_with_table(name, backend, peer, table)
+    }
+
+    /// Create an isolated driver peer using an explicit major-function table.
+    ///
+    /// Hosted WDM components populate their own `MajorFunction[]` table at runtime, so their
+    /// canonical I/O Manager record needs the same broad dispatch surface instead of the small
+    /// built-in synchronous-driver default.
+    pub fn create_driver_peer_with_major_table(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        table: MajorFunctionTable,
+    ) -> Result<DriverId, NtStatus> {
+        self.install_driver_with_table(name, backend, true, table)
+    }
+
+    fn install_driver_with_table(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        peer: bool,
+        mut table: MajorFunctionTable,
+    ) -> Result<DriverId, NtStatus> {
         let idx = self.register_backend(backend);
         let target = if peer {
             DispatchTarget::DriverPeer(DriverPeerId(idx as u64))
         } else {
             DispatchTarget::Mock(MockDispatchId(idx as u64))
         };
-        let mut table = MajorFunctionTable::new();
-        for m in SUPPORTED_MAJORS {
-            table.set(m, target);
-        }
+        table.retarget(target);
         let driver_id = self.register_driver(DriverRecord::new(
             ObjectId::NULL,
             name.clone(),

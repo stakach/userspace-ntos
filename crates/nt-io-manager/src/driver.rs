@@ -73,6 +73,15 @@ impl MajorFunctionTable {
     pub fn set_all(&mut self, target: DispatchTarget) {
         self.entries = [target; IO_MAJOR_FUNCTION_COUNT];
     }
+
+    /// Replace every supported entry with `target`, preserving unsupported entries.
+    pub fn retarget(&mut self, target: DispatchTarget) {
+        for slot in &mut self.entries {
+            if !matches!(*slot, DispatchTarget::Unsupported) {
+                *slot = target;
+            }
+        }
+    }
 }
 
 bitflags::bitflags! {
