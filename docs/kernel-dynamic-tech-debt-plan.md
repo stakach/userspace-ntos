@@ -1701,3 +1701,12 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none`, `git diff --check`, and a source search for the retired `IoManager<()>` /
   post-create bind symbols passed. Review adjustment: D1 is closed. The remaining open plan work is
   D3's real videoprt/miniport-created video stack.
+- D3 continued. The win32k display route no longer bakes in the old 1024x768, 4096-byte stride, or
+  0x300000-byte framebuffer assumptions. Phase 0a now publishes the real BOOTBOOT framebuffer width,
+  height, scanline, byte size, and bits-per-plane into the display registration contract, and
+  `video_device` receives that discovered mode when it answers Video0 mode and map-memory IOCTLs.
+  Validation: `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D3 remains open for
+  replacing the temporary boot framebuffer route with a real videoprt/miniport-created device
+  object/interface and I/O path.

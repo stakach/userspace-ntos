@@ -10202,6 +10202,13 @@ impl SystemHiveDisplayDriverSpec {
             display_driver_leaf: &self.display_driver_leaf[..self.display_driver_leaf_len],
             device_description: &self.device_description[..self.device_description_len],
             vga_compatible: self.vga_compatible,
+            framebuffer_size: FB_SIZE_BYTES.load(Ordering::Relaxed),
+            mode: win32k_subsystem::DisplayModeSpec {
+                width: FB_WIDTH.load(Ordering::Relaxed) as u32,
+                height: FB_HEIGHT.load(Ordering::Relaxed) as u32,
+                stride: FB_SCANLINE.load(Ordering::Relaxed) as u32,
+                bits_per_plane: FB_BITS_PER_PLANE.load(Ordering::Relaxed) as u32,
+            },
         }
     }
 
@@ -13289,6 +13296,11 @@ pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// (the display DLL's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA so GDI writes pixels to the real fb).
 static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
+static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
+static FB_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
+static FB_BITS_PER_PLANE: AtomicU64 = AtomicU64::new(0);
 /// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
 static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
 /// Count (of the 768-px sampled grid) whose value == [`FB_DESKTOP_BG`] after the desktop-graphics
@@ -14854,6 +14866,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // frames into win32k's VSpace (the display DLL draws pixels there -> the real framebuffer).
             FB_FRAME_BASE.store(base_slot, Ordering::Relaxed);
             FB_FRAME_COUNT.store(n_pages, Ordering::Relaxed);
+            FB_WIDTH.store(fb_w, Ordering::Relaxed);
+            FB_HEIGHT.store(fb_h, Ordering::Relaxed);
+            FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
+            FB_SIZE_BYTES.store(fb_size, Ordering::Relaxed);
+            FB_BITS_PER_PLANE.store(32, Ordering::Relaxed);
             check(b"exec_framebuffer_map", map_ok, &mut passed);
 
             if map_ok {
@@ -16783,6 +16800,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(display_spec_view.display_driver_leaf);
                     print_str(b" description=");
                     print_str(display_spec_view.device_description);
+                    print_str(b" mode=");
+                    print_u64(display_spec_view.mode.width as u64);
+                    print_str(b"x");
+                    print_u64(display_spec_view.mode.height as u64);
+                    print_str(b" stride=");
+                    print_u64(display_spec_view.mode.stride as u64);
+                    print_str(b" size=0x");
+                    print_hex(display_spec_view.framebuffer_size as u32);
                     print_str(b"\n");
                     let route_published =
                         win32k_subsystem::publish_display_device_route(&display_spec_view);

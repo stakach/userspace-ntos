@@ -4733,6 +4733,16 @@ pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) display_driver_leaf: &'a [u8],
     pub(crate) device_description: &'a [u8],
     pub(crate) vga_compatible: u32,
+    pub(crate) framebuffer_size: u64,
+    pub(crate) mode: DisplayModeSpec,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DisplayModeSpec {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) stride: u32,
+    pub(crate) bits_per_plane: u32,
 }
 
 fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
@@ -4789,6 +4799,11 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
         || spec.installed_display_driver.is_empty()
         || spec.display_driver_leaf.is_empty()
         || spec.device_description.is_empty()
+        || spec.framebuffer_size == 0
+        || spec.mode.width == 0
+        || spec.mode.height == 0
+        || spec.mode.stride == 0
+        || spec.mode.bits_per_plane == 0
     {
         return false;
     }
@@ -4798,12 +4813,12 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
                 driver_name: spec.service_name,
                 service_registry_path: spec.service_registry_path,
                 framebuffer_va: WIN32K_FB_VA,
-                framebuffer_size: WIN32K_FB_SIZE,
+                framebuffer_size: spec.framebuffer_size,
                 mode: crate::video_device::VideoModeSpec {
-                    width: 1024,
-                    height: 768,
-                    stride: 4096,
-                    bits_per_plane: 32,
+                    width: spec.mode.width,
+                    height: spec.mode.height,
+                    stride: spec.mode.stride,
+                    bits_per_plane: spec.mode.bits_per_plane,
                 },
                 allocate_projection: pool_alloc,
             },
@@ -7864,9 +7879,8 @@ pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
 /// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. The
 /// executive video-device boundary returns this VA for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`, so the
 /// display driver writes pixels straight to the real framebuffer.
-/// 1024x768x32 scanline 4096 = 0x300000 = 768 pages (2 PTs at 0x0900/0x0920).
+/// The size and mode are discovered from BootInfo in Phase 0a and carried in `DisplayRegistrySpec`.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
-pub const WIN32K_FB_SIZE: u64 = 0x30_0000;
 
 /// Record the loaded display DLL info selected from the SYSTEM hive. Some ReactOS display DLLs have
 /// no export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` can special-case to
