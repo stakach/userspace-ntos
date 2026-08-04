@@ -112,6 +112,23 @@ impl<B: Backend> ObjectClient<B> {
         Ok(ObjectId(r.detail0))
     }
 
+    /// Delete a named object from its parent directory. This unlinks the namespace route; outstanding
+    /// references stay governed by the Object Manager store.
+    pub fn delete_object(&mut self, path: &str, case_insensitive: bool) -> Result<(), NtStatus> {
+        let units = utf16(path);
+        let req = ObLookupPathRequest {
+            abi_size: size_of::<ObLookupPathRequest>() as u16,
+            flags: case_flag(case_insensitive),
+            path_offset: size_of::<ObLookupPathRequest>() as u32,
+            path_len_bytes: byte_len(&units),
+        };
+        let buf = pack(&req, &units);
+        let r = self
+            .backend
+            .call(opcode::OB_OP_DELETE_OBJECT, &buf, &mut []);
+        NtStatus(r.status).to_result()
+    }
+
     /// Resolve a path and return its object/routing metadata.
     pub fn query_object(
         &mut self,

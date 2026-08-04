@@ -32,6 +32,7 @@ pub mod opcode {
     pub const OB_OP_REFERENCE_HANDLE: u16 = 0x2013;
     pub const OB_OP_DEREFERENCE_OBJECT: u16 = 0x2014;
     pub const OB_OP_MAKE_TEMPORARY: u16 = 0x2015;
+    pub const OB_OP_DELETE_OBJECT: u16 = 0x2016;
 
     pub const OB_OP_CREATE_DIRECTORY: u16 = 0x2020;
     pub const OB_OP_CREATE_SYMBOLIC_LINK: u16 = 0x2021;

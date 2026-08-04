@@ -7733,6 +7733,19 @@ impl nt_object_client::Backend for ObChan<'_> {
     }
 }
 
+static mut OBJECT_CLIENT_PTR: *mut ObjectClient<ObChan<'static>> = core::ptr::null_mut();
+
+unsafe fn install_object_manager_client(client: &mut ObjectClient<ObChan<'static>>) {
+    OBJECT_CLIENT_PTR = client as *mut _;
+}
+
+pub(crate) unsafe fn object_manager_delete_path(path: &str) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    client.delete_object(path, true)
+}
+
 /// The Configuration Manager transport wrapper.
 struct CmChan<'a>(RingChannel<'a>);
 impl nt_config_client::Backend for CmChan<'_> {
@@ -14027,6 +14040,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         REQ_DATA_VADDR,
         REP_DATA_VADDR,
     )));
+    install_object_manager_client(&mut c);
 
     let mut passed = 0u64;
     check(b"exec_ob_ping", c.ping().is_success(), &mut passed);
@@ -14056,6 +14070,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_ob_query_symbolic_link",
         matches!(&target, Ok(t) if t.as_slice() == expected.as_slice()),
+        &mut passed,
+    );
+    check(
+        b"exec_ob_delete_symbolic_link",
+        c.delete_object("\\??\\Link", true).is_ok(),
+        &mut passed,
+    );
+    check(
+        b"exec_ob_lookup_deleted_symbolic_link",
+        c.lookup("\\??\\Link", true).is_err(),
         &mut passed,
     );
     match handle {

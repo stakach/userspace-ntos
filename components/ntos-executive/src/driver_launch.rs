@@ -24,6 +24,7 @@ use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
@@ -1061,7 +1062,28 @@ extern "win64" fn s_io_delete_device(dev: u64) {
     unsafe {
         if let Some((index, inst)) = instance_by_device_object(dev) {
             if inst.device_id != 0 {
-                match io_manager_mut().delete_device(nt_io_manager::DeviceId(inst.device_id)) {
+                let device_id = nt_io_manager::DeviceId(inst.device_id);
+                let object_path = {
+                    let io = io_manager_mut();
+                    match io.can_delete_device(device_id) {
+                        Ok(()) => io
+                            .device(device_id)
+                            .filter(|record| record.object_id != ObjectId::NULL)
+                            .and_then(|record| record.name.as_ref())
+                            .and_then(nt_path_ascii_string),
+                        Err(nt_status::NtStatus::DELETE_PENDING) => {
+                            let _ = io.mark_device_delete_pending(device_id);
+                            return;
+                        }
+                        Err(_) => return,
+                    }
+                };
+                if let Some(path) = object_path.as_deref() {
+                    if crate::object_manager_delete_path(path).is_err() {
+                        return;
+                    }
+                }
+                match io_manager_mut().delete_device(device_id) {
                     Ok(_) => {
                         let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
                         table[index].device_id = 0;
@@ -1083,6 +1105,17 @@ extern "win64" fn s_io_delete_device(dev: u64) {
             write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, verdict);
         }
     }
+}
+
+fn nt_path_ascii_string(path: &NtPath) -> Option<String> {
+    let mut out = String::new();
+    for unit in path.to_units() {
+        if !(0x20..=0x7e).contains(&unit) {
+            return None;
+        }
+        out.push(char::from_u32(unit as u32)?);
+    }
+    Some(out)
 }
 
 /// `PDEVICE_OBJECT IoAttachDeviceToDeviceStack(PDEVICE_OBJECT SourceDevice, PDEVICE_OBJECT TargetDevice)`.

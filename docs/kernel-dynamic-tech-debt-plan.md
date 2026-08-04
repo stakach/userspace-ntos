@@ -1651,3 +1651,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   executive still instantiates `IoManager<()>`, so D1 remains open for switching the executive to a
   real Object Manager port and routing `NtUnloadDriver`/SCM stop through `destroy_driver`; D3 remains
   the real videoprt/miniport-created video stack.
+- D1 continued. Object Manager namespace deletion is now a real service/client ABI operation instead
+  of an in-process-only helper. `nt-object-abi` exposes `OB_OP_DELETE_OBJECT`, the client stub sends
+  bounded UTF-16 path requests, the server unlinks named objects through `remove_named_object`, and
+  host roundtrips prove deleted symbolic links and device objects disappear from lookup. The live
+  executive publishes its Object Manager client as the single executive-side service channel, and the
+  hosted `IoDeleteDevice` path now preflights canonical I/O Manager deleteability, marks
+  delete-pending when references/upper attachments block removal, deletes the Object Manager namespace
+  route for published named devices, and only then removes the canonical device record plus hosted WDM
+  projection. Validation: `cargo test --manifest-path crates/nt-object-server/Cargo.toml`,
+  `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, `cargo fmt --manifest-path
+  components/ntos-executive/Cargo.toml`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-object-delete-20260804.log` reached `RUN_RC=0`, `249/282
+  executive->isolated-service checks passed`, `PASS exec_ob_delete_symbolic_link`, `PASS
+  exec_ob_lookup_deleted_symbolic_link`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_irp_transport_call_bound`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for routing driver-object unload/SCM stop through live driver teardown and then
+  eliminating the residual `IoManager<()>`/post-create bind split; D3 remains the real
+  videoprt/miniport-created video stack.

@@ -86,6 +86,7 @@ impl Server {
             opcode::OB_OP_PING => Ok(ok()),
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
+            opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
@@ -124,9 +125,24 @@ impl Server {
 
     fn op_lookup(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObLookupPathRequest = read_req(buf)?;
+        check_size::<ObLookupPathRequest>(req.abi_size)?;
         let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
         let obj = self.om.lookup_path(&path, case_of(req.flags))?;
         Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
+    }
+
+    fn op_delete_object(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObLookupPathRequest = read_req(buf)?;
+        check_size::<ObLookupPathRequest>(req.abi_size)?;
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let leaf = path.leaf().ok_or(NtStatus::INVALID_PARAMETER)?.clone();
+        let parent_path = path.parent().ok_or(NtStatus::INVALID_PARAMETER)?;
+        let parent = self
+            .om
+            .lookup_path(&parent_path, CaseSensitivity::CaseInsensitive)?;
+        self.om
+            .remove_named_object(&parent, &leaf, case_of(req.flags))?;
+        Ok(ok())
     }
 
     fn op_query_object(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<ObReply, NtStatus> {
@@ -401,6 +417,11 @@ mod tests {
         assert_eq!(info.owner_component, 0x5000);
         assert_eq!(info.owner_local_id, 0x20);
         assert_eq!(info.route_kind, 2);
+
+        let r = s.dispatch(c, opcode::OB_OP_DELETE_OBJECT, &query_req, &mut []);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+        let r = s.dispatch(c, opcode::OB_OP_LOOKUP_PATH, &query_req, &mut []);
+        assert_eq!(r.status, NtStatus::OBJECT_NAME_NOT_FOUND.raw());
     }
 
     fn io_req(path: &str, owner_component: u64, owner_local_id: u64) -> Vec<u8> {

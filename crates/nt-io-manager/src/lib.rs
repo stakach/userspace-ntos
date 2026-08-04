@@ -271,14 +271,13 @@ impl<P> IoManager<P> {
     /// Delete a device record when no open file references or upper attachments remain. If the
     /// device is still referenced, mark it delete-pending and leave the record live.
     pub fn delete_device(&mut self, id: DeviceId) -> Result<DeviceRecord, NtStatus> {
-        if self.device(id).is_none() {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        if self.device_has_live_files(id) || self.has_upper_attachment(id) {
-            if let Some(device) = self.device_mut(id) {
-                device.delete_pending = true;
+        if let Err(status) = self.can_delete_device(id) {
+            if status == NtStatus::DELETE_PENDING {
+                if let Some(device) = self.device_mut(id) {
+                    device.delete_pending = true;
+                }
             }
-            return Err(NtStatus::DELETE_PENDING);
+            return Err(status);
         }
         if self
             .device(id)
@@ -288,6 +287,31 @@ impl<P> IoManager<P> {
             let _ = self.detach_device_from_stack(id);
         }
         self.remove_device(id).ok_or(NtStatus::INVALID_PARAMETER)
+    }
+
+    /// Return whether a device can be removed without changing I/O Manager state.
+    pub fn can_delete_device(&self, id: DeviceId) -> Result<(), NtStatus> {
+        if self.device(id).is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self.device_has_live_files(id) || self.has_upper_attachment(id) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        Ok(())
+    }
+
+    /// Mark a device delete-pending if open file references or upper attachments still block removal.
+    pub fn mark_device_delete_pending(&mut self, id: DeviceId) -> Result<(), NtStatus> {
+        match self.can_delete_device(id) {
+            Ok(()) => Ok(()),
+            Err(NtStatus::DELETE_PENDING) => {
+                if let Some(device) = self.device_mut(id) {
+                    device.delete_pending = true;
+                }
+                Err(NtStatus::DELETE_PENDING)
+            }
+            Err(status) => Err(status),
+        }
     }
 
     fn clear_attachment_edges(&mut self, removed: DeviceId) {
@@ -602,6 +626,10 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(
+            om.can_delete_device(dev).err(),
+            Some(NtStatus::DELETE_PENDING)
+        );
         assert_eq!(om.delete_device(dev).err(), Some(NtStatus::DELETE_PENDING));
         assert!(om.device(dev).unwrap().delete_pending);
     }

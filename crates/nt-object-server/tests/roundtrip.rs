@@ -51,6 +51,12 @@ fn full_service_roundtrip() {
     let expected: Vec<u16> = "\\Device\\Test0".encode_utf16().collect();
     assert_eq!(target, expected);
 
+    c.delete_object("\\??\\Link", true).unwrap();
+    assert_eq!(
+        c.lookup("\\??\\Link", true).unwrap_err(),
+        NtStatus::OBJECT_NAME_NOT_FOUND
+    );
+
     c.close_handle(h).unwrap();
     // closing again is a stale handle
     assert_eq!(c.close_handle(h).unwrap_err(), NtStatus::INVALID_HANDLE);
