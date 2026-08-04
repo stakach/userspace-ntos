@@ -7,8 +7,9 @@
 //! offsets.
 
 pub const WDM_X64_DRIVER_OBJECT_SIZE: usize = 0x150;
-pub const WDM_X64_DRIVER_EXTENSION_OFFSET: usize = 0x68;
+pub const WDM_X64_DRIVER_EXTENSION_OFFSET: usize = 0x30;
 pub const WDM_X64_DRIVER_EXTENSION_SIZE: usize = 0x50;
+pub const WDM_X64_DRIVER_UNLOAD_OFFSET: usize = 0x68;
 pub const WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET: usize = 0x70;
 
 pub const WDM_X64_DEVICE_OBJECT_SIZE: usize = 0x150;
@@ -29,8 +30,8 @@ pub enum WdmLayoutError {
 pub struct WdmDriverObjectInit {
     pub size_field: u16,
     pub device_object: u64,
-    pub driver_extension_offset: usize,
     pub driver_extension: u64,
+    pub driver_unload: u64,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -103,12 +104,17 @@ pub fn write_wdm_driver_object(
     init: WdmDriverObjectInit,
 ) -> Result<(), WdmLayoutError> {
     require(bytes, 4)?;
-    require(bytes, init.driver_extension_offset.saturating_add(8))?;
+    require(bytes, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET)?;
     zero(bytes);
     put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DRIVER);
     put_u16(bytes, 0x02, init.size_field);
     put_u64(bytes, 0x08, init.device_object);
-    put_u64(bytes, init.driver_extension_offset, init.driver_extension);
+    put_u64(
+        bytes,
+        WDM_X64_DRIVER_EXTENSION_OFFSET,
+        init.driver_extension,
+    );
+    put_u64(bytes, WDM_X64_DRIVER_UNLOAD_OFFSET, init.driver_unload);
     Ok(())
 }
 

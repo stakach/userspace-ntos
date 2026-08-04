@@ -6,7 +6,6 @@
 //! the File object + IRP on failure so no reference or record leaks.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use nt_io_abi::major;
 use nt_status::NtStatus;
@@ -146,32 +145,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
     /// Mark a driver unload requested and mark its devices delete-pending.
     pub fn request_driver_unload(&mut self, driver: DriverId) -> Result<(), NtStatus> {
-        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
-        let record = self.driver_mut(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
-        if record.unload_state == DriverUnloadState::Unloaded {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        record.unload_state = DriverUnloadState::UnloadRequested;
-        for device in devices {
-            if let Some(record) = self.device_mut(device) {
-                record.delete_pending = true;
-            }
-        }
-        Ok(())
+        self.request_driver_unload_records(driver)
     }
 
     /// Complete a driver unload when all owned devices are free of open files and upper attachments.
     /// This tears down Object Manager device/driver objects as well as I/O Manager records.
     pub fn destroy_driver(&mut self, driver: DriverId) -> Result<DriverRecord, NtStatus> {
         self.request_driver_unload(driver)?;
-        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
-        if devices
-            .iter()
-            .any(|device| self.device_has_live_files(*device) || self.has_upper_attachment(*device))
-        {
-            return Err(NtStatus::DELETE_PENDING);
-        }
+        self.can_destroy_driver(driver)?;
 
+        let devices = self.devices_of(driver).to_vec();
         for device in devices {
             self.destroy_device(device)?;
         }

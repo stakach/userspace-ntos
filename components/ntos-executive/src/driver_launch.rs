@@ -34,10 +34,10 @@ use nt_io_manager::{
     DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend, DriverId,
     DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters, IrpId,
     IrpProjection, MajorFunctionTable, ReadWriteParameters, WdmFileObjectInit,
-    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
-    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
-    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
-    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
+    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
+    WDM_X64_IRP_SIZE,
 };
 use nt_types::ClientId;
 use nt_types::{NtPath, ObjectId};
@@ -163,6 +163,7 @@ pub const SH_MJ_TABLE: u64 = 0x18; // out: recorded DriverObject->MajorFunction[
 pub const SH_DEVOBJ: u64 = 0x20; // out: the control DEVICE_OBJECT VA (u64)
 pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
 pub const SH_DRVOBJ: u64 = 0x30; // out: the component-local DRIVER_OBJECT VA (u64)
+pub const SH_DRIVER_UNLOAD: u64 = 0x38; // out: DriverObject->DriverUnload after DriverEntry (u64)
 pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // out: IoCreateDevice DeviceName bytes (u16)
 pub const SH_SYMLINK_LINK_LEN: u64 = 0x82; // out: IoCreateSymbolicLink LinkName bytes (u16)
 pub const SH_SYMLINK_TARGET_LEN: u64 = 0x84; // out: IoCreateSymbolicLink DeviceName bytes (u16)
@@ -194,6 +195,7 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
+pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -1764,8 +1766,9 @@ pub fn fsd_export_addr(name: &str) -> u64 {
 /// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
 /// DriverEntry-preamble → dispatch-loop shape to [`crate::spawn_hosts::component_main`], plugging the
 /// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
-/// [`fsd_post_driver_entry`], and the FSD [`DriverObjectSpec`] (size 0x150, ext ptr @0x68, ext size
-/// 0x50, MajorFunction @0x70). The bespoke inline `dispatch_loop`/`send_done`/`recv_req` are retired
+/// [`fsd_post_driver_entry`], and the FSD [`DriverObjectSpec`] (size 0x150, DriverExtension pointer
+/// @0x30, DriverUnload @0x68, MajorFunction @0x70). The bespoke inline
+/// `dispatch_loop`/`send_done`/`recv_req` are retired
 /// in favour of the harness's shared implementation (one [`call_on`] per dispatch). This is the
 /// component-side leg of the FSD's migration onto the unified harness (Phase B, Step 2). Both the
 /// npfs instance and the 2nd `IrpFsdTest.sys` instance share this entry, so BOTH now run on the harness.
@@ -1778,16 +1781,15 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
     print_hex(entry_rva);
     print_str(b"\n");
 
-    // The x64 DRIVER_OBJECT is 0x150 bytes: Type@0=4, Size@2, DriverExtension ptr @0x68 (ext block
-    // 0x50), MajorFunction[]@0x70 (28 entries * 8 = 0xE0 → ends at 0x150). Hand the whole preamble +
-    // persistent recv→dispatch→reply loop to the SHARED harness.
+    // The x64 DRIVER_OBJECT is 0x150 bytes: Type@0=4, Size@2, DriverExtension ptr @0x30 (ext block
+    // 0x50), DriverUnload@0x68, MajorFunction[]@0x70 (28 entries * 8 = 0xE0 → ends at 0x150).
+    // Hand the whole preamble + persistent recv→dispatch→reply loop to the SHARED harness.
     crate::spawn_hosts::component_main(
         FSD_SHARED_VADDR,
         FSD_CODE_VA,
         crate::spawn_hosts::DriverObjectSpec {
             size: WDM_X64_DRIVER_OBJECT_SIZE as u64,
             size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
-            ext: WDM_X64_DRIVER_EXTENSION_OFFSET as u64,
             ext_size: WDM_X64_DRIVER_EXTENSION_SIZE as u64,
             mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
@@ -1806,8 +1808,13 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
 /// diagnostic prints so the boot serial keeps its `[fsd-host] DriverEntry returned ...` line.
 unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
     let mj_create = read_unaligned((drv + 0x70) as *const u64);
+    let driver_unload = read_unaligned((drv + WDM_X64_DRIVER_UNLOAD_OFFSET as u64) as *const u64);
     let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
     write_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *mut u64, drv);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_DRIVER_UNLOAD) as *mut u64,
+        driver_unload,
+    );
     // Pool high-water (diagnostic; not read by the executive — parity with the old inline entry).
     let pool_used = read_volatile(FSD_POOL_VADDR as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
@@ -1827,6 +1834,15 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
 /// This is the EXACT body the retired inline `dispatch_loop` ran per request.
 unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let major = req.sel;
+    if major == FSD_DISPATCH_UNLOAD {
+        let unload = read_volatile((req.drv + WDM_X64_DRIVER_UNLOAD_OFFSET as u64) as *const u64);
+        if unload == 0 {
+            return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
+        }
+        let f: extern "win64" fn(u64) = core::mem::transmute(unload as *const ());
+        f(req.drv);
+        return (0, 0);
+    }
     let mj_base = req.drv + 0x70;
     let handler = read_volatile((mj_base + major * 8) as *const u64);
     if handler != 0 {
@@ -2252,6 +2268,8 @@ pub(crate) struct DriverComponent {
     pub drvobj: u64,
     /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
     pub devobj: u64,
+    /// The DriverObject->DriverUnload pointer captured after DriverEntry.
+    pub driver_unload: u64,
     /// UTF-16LE path captured from `IoCreateDevice(DeviceName)`, if the driver created a named
     /// device object.
     pub device_name_len: u16,
@@ -2497,7 +2515,8 @@ pub(crate) const MAX_DRIVER_INSTANCES: usize = 4;
 static mut FSD_RIGHTS: [[u64; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES] =
     [[RW_NX; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES];
 
-/// Next free instance slot (bump — a driver launched via [`load_driver`] never unloads in this host).
+/// Next free instance slot. Slots are retired on unload, but the bump id is not reused yet because
+/// the seL4 cap/window reclamation work is intentionally separate from the NT lifetime contract.
 static DRIVER_NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
@@ -2687,6 +2706,7 @@ pub(crate) unsafe fn load_driver(
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
     let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
+    let driver_unload = read_volatile((win.shared_va + SH_DRIVER_UNLOAD) as *const u64);
     let (device_name_len, device_name_utf16) =
         read_shared_path_capture(win.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
     let (symlink_link_len, symlink_link_utf16) =
@@ -2717,7 +2737,17 @@ pub(crate) unsafe fn load_driver(
     print_str(b" devobj=0x");
     print_hex((devobj >> 32) as u32);
     print_hex(devobj as u32);
+    print_str(b" unload=0x");
+    print_hex((driver_unload >> 32) as u32);
+    print_hex(driver_unload as u32);
     print_str(b"\n");
+
+    if !finished || de_status != 0 {
+        print_str(b"[driver-launch] DriverEntry failed; refusing to register ");
+        print_str(driver_object_path.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
 
     let driver_id = register_io_driver(driver_object_path, instance)?;
     let dc = DriverComponent {
@@ -2725,6 +2755,7 @@ pub(crate) unsafe fn load_driver(
         fault_ep,
         drvobj,
         devobj,
+        driver_unload,
         device_name_len,
         device_name_utf16,
         symlink_link_len,
@@ -3110,6 +3141,13 @@ fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> 
     Some(io.register_driver(record).raw())
 }
 
+pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
+    let path = parse_nt_path(path)?;
+    io_manager_mut()
+        .driver_id_by_name(&path)
+        .map(|driver_id| driver_id.raw())
+}
+
 fn register_io_device(driver_id: u64, dc: &DriverComponent) -> u64 {
     if dc.devobj == 0 || dc.device_name_len == 0 {
         return 0;
@@ -3142,6 +3180,7 @@ pub(crate) struct DriverInstance {
     pub device_id: u64,
     pub driver_object: u64,
     pub device_object: u64,
+    pub driver_unload: u64,
     pub ready: bool,
     pub used: bool,
 }
@@ -3157,6 +3196,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     device_id: 0,
     driver_object: 0,
     device_object: 0,
+    driver_unload: 0,
     ready: false,
     used: false,
 };
@@ -3183,6 +3223,7 @@ fn register_instance(dc: &DriverComponent) {
             device_id: dc.device_id,
             driver_object: dc.drvobj,
             device_object: dc.devobj,
+            driver_unload: dc.driver_unload,
             // Default readiness = npfs's historic rule (parked + a control device object). A
             // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
             // is marked ready explicitly by the caller via `register_instance_ready`.
@@ -3208,6 +3249,13 @@ pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
         .driver(DriverId(driver_id))
         .map(|driver| driver.object_id.0)
         .unwrap_or(0)
+}
+
+fn clear_instance(i: usize) {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
+    if i < t.len() {
+        t[i] = EMPTY_INSTANCE;
+    }
 }
 
 pub(crate) fn bind_device_object_id(device_id: u64, object_id: u64) -> bool {
@@ -3276,6 +3324,132 @@ fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstanc
         .copied()
         .enumerate()
         .find(|(_, entry)| entry.used && entry.device_object == device_object)
+}
+
+fn driver_record_path(driver_id: u64) -> Option<String> {
+    io_manager_mut()
+        .driver(DriverId(driver_id))
+        .map(|driver| &driver.name)
+        .and_then(nt_path_ascii_string)
+}
+
+fn driver_has_object_manager_name(driver_id: u64) -> bool {
+    io_manager_mut()
+        .driver(DriverId(driver_id))
+        .map(|driver| driver.object_id != ObjectId::NULL)
+        .unwrap_or(false)
+}
+
+fn device_object_manager_paths_for_driver(driver_id: u64) -> Vec<String> {
+    let io = io_manager_mut();
+    let devices = io.devices_of(DriverId(driver_id)).to_vec();
+    let mut paths = Vec::new();
+    for device in devices {
+        if let Some(path) = io
+            .device(device)
+            .filter(|record| record.object_id != ObjectId::NULL)
+            .and_then(|record| record.name.as_ref())
+            .and_then(nt_path_ascii_string)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+unsafe fn delete_driver_namespace_and_records(driver_id: u64) -> Result<(), nt_status::NtStatus> {
+    for path in device_object_manager_paths_for_driver(driver_id) {
+        crate::object_manager_delete_path(&path)?;
+    }
+    let driver_path = driver_record_path(driver_id);
+    if driver_has_object_manager_name(driver_id) {
+        if let Some(path) = driver_path.as_deref() {
+            crate::object_manager_delete_path(path)?;
+        } else {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+    }
+    io_manager_mut().remove_driver_records_after_unload(DriverId(driver_id))?;
+    Ok(())
+}
+
+unsafe fn dispatch_driver_unload_for_instance(
+    index: usize,
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    if inst.driver_object == 0 || inst.driver_unload == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_UNLOAD);
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        callback_client: None,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(index, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    nt_status::NtStatus(pr.status).to_result()
+}
+
+/// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove
+/// canonical I/O Manager records and Object Manager namespace entries.
+pub(crate) unsafe fn unload_driver_by_name(
+    driver_object_path: &str,
+) -> Result<(), nt_status::NtStatus> {
+    let driver_id =
+        driver_id_by_name(driver_object_path).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let (index, inst) =
+        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if inst.driver_unload == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    {
+        let io = io_manager_mut();
+        io.request_driver_unload_records(DriverId(driver_id))?;
+        if let Err(status) = io.can_destroy_driver(DriverId(driver_id)) {
+            if status == nt_status::NtStatus::DELETE_PENDING {
+                return Ok(());
+            }
+            return Err(status);
+        }
+    }
+
+    dispatch_driver_unload_for_instance(index, inst)?;
+    if inst.tcb != 0 {
+        let _ = crate::tcb_suspend_r(inst.tcb);
+    }
+    delete_driver_namespace_and_records(driver_id)?;
+    clear_instance(index);
+    Ok(())
 }
 
 fn device_id_by_name(path: &str) -> Option<u64> {

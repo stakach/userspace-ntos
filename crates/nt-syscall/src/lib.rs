@@ -94,6 +94,10 @@ pub enum NativeService {
     NtUnloadKey,
     NtUnloadKey2,
     NtUnloadKeyEx,
+    // Driver load/unload (§16.3): SCM calls these with
+    // `\Registry\Machine\System\CurrentControlSet\Services\<Name>`.
+    NtLoadDriver,
+    NtUnloadDriver,
     // Memory / section (§16.4)
     NtAllocateVirtualMemory,
     NtFreeVirtualMemory,
@@ -266,6 +270,8 @@ impl NativeService {
             NtUnloadKey => "NtUnloadKey",
             NtUnloadKey2 => "NtUnloadKey2",
             NtUnloadKeyEx => "NtUnloadKeyEx",
+            NtLoadDriver => "NtLoadDriver",
+            NtUnloadDriver => "NtUnloadDriver",
             NtAllocateVirtualMemory => "NtAllocateVirtualMemory",
             NtFreeVirtualMemory => "NtFreeVirtualMemory",
             NtReadVirtualMemory => "NtReadVirtualMemory",
@@ -501,6 +507,8 @@ impl NativeService {
         NativeService::NtUnloadKey,
         NativeService::NtUnloadKey2,
         NativeService::NtUnloadKeyEx,
+        NativeService::NtLoadDriver,
+        NativeService::NtUnloadDriver,
         NativeService::NtCreateMutant,
         NativeService::NtOpenMutant,
         NativeService::NtReleaseMutant,

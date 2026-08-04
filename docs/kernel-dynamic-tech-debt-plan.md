@@ -1671,3 +1671,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   remains open for routing driver-object unload/SCM stop through live driver teardown and then
   eliminating the residual `IoManager<()>`/post-create bind split; D3 remains the real
   videoprt/miniport-created video stack.
+- D1 continued. Native driver service control now has real syscall identities and live hosted-driver
+  lifetime routing. `NtLoadDriver` and `NtUnloadDriver` are registered in the Windows 7 service table,
+  capture SCM `\Registry\Machine\System\...\Services\<name>` paths, require `SeLoadDriverPrivilege`,
+  resolve demand-start service image paths from the SYSTEM hive, launch the `.sys` through the dynamic
+  driver loader, and publish `Driver`/`Device` Object Manager routes transactionally. Hosted
+  `DRIVER_OBJECT` layout now uses the NT x64 `DriverExtension` and `DriverUnload` offsets, captures a
+  real `DriverUnload` pointer after `DriverEntry`, and routes unload through the component dispatch
+  loop before deleting Object Manager namespace routes and canonical I/O Manager records. Validation:
+  `cargo test --manifest-path crates/nt-syscall/Cargo.toml`, `cargo test --manifest-path
+  crates/nt-io-manager/Cargo.toml`, `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D1 remains open only for
+  eliminating the residual `IoManager<()>`/post-create bind split by giving the live executive a real
+  Object Manager-backed I/O Manager port; D3 remains the real videoprt/miniport-created video stack.

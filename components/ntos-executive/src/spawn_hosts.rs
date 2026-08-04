@@ -1295,9 +1295,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     }
 }
 
-/// The DRIVER_OBJECT byte layout a component's `DriverEntry` expects. FSD = { size:0x150, ext:0x68 };
-/// win32k = { size:0x200, ext:0x30 }. `component_main` builds a zeroed DRIVER_OBJECT of `size` with
-/// Type=4 @0, Size @2, a zeroed DriverExtension pointer @`ext`, and MajorFunction @`mj`.
+/// The DRIVER_OBJECT byte layout a component's `DriverEntry` expects. `component_main` builds a
+/// zeroed DRIVER_OBJECT of `size` with Type=4 @0, Size @2, a DriverExtension pointer at the NT x64
+/// offset, a zero DriverUnload slot, and MajorFunction @`mj`.
 #[derive(Clone, Copy)]
 pub(crate) struct DriverObjectSpec {
     /// The DRIVER_OBJECT allocation size (bytes reserved from `pool`).
@@ -1305,7 +1305,6 @@ pub(crate) struct DriverObjectSpec {
     /// The value written into the DRIVER_OBJECT `Size` field @2. USUALLY == `size` (FSD), but win32k
     /// allocates 0x200 yet stamps Size=336 (0x150) — so this is a distinct field to preserve that.
     pub size_field: u16,
-    pub ext: u64,
     pub ext_size: u64,
     pub mj: u64,
     /// Shared-frame offset to record `drv + mj` (the MajorFunction[] base) into, for the executive to
@@ -1348,7 +1347,8 @@ pub(crate) unsafe fn component_main(
 ) -> ! {
     let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
 
-    // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension@spec.ext, MajorFunction@spec.mj).
+    // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension at the NT x64 offset, DriverUnload=0,
+    // MajorFunction@spec.mj).
     let drv = (spec.pool)(spec.size);
     let ext = (spec.pool)(spec.ext_size);
     let mut j = 0u64;
@@ -1362,8 +1362,8 @@ pub(crate) unsafe fn component_main(
         WdmDriverObjectInit {
             size_field: spec.size_field,
             device_object: 0,
-            driver_extension_offset: spec.ext as usize,
             driver_extension: ext,
+            driver_unload: 0,
         },
     )
     .is_err()

@@ -1577,6 +1577,151 @@ impl ExecNtHandler {
         0
     }
 
+    unsafe fn capture_driver_service_registry_path(
+        &self,
+        ustr_va: u64,
+    ) -> Result<alloc::string::String, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
+        const MAX_DRIVER_SERVICE_PATH_BYTES: usize = 1024;
+
+        if ustr_va == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut header = [0u8; 16];
+        if !self.xas_read(ustr_va, &mut header) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let byte_len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let maximum_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let buffer = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if byte_len == 0 || buffer == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if (byte_len & 1) != 0 || byte_len > maximum_len || byte_len > 0xFFFC {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        if byte_len > MAX_DRIVER_SERVICE_PATH_BYTES {
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        }
+        let mut bytes = [0u8; MAX_DRIVER_SERVICE_PATH_BYTES];
+        if !self.xas_read(buffer, &mut bytes[..byte_len]) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut path = alloc::string::String::new();
+        for index in 0..byte_len / 2 {
+            let unit = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+            if !(0x20..=0x7e).contains(&unit) {
+                return Err(STATUS_OBJECT_NAME_INVALID);
+            }
+            path.push(char::from_u32(unit as u32).ok_or(STATUS_OBJECT_NAME_INVALID)?);
+        }
+        Ok(path)
+    }
+
+    fn driver_service_name_from_registry_path(path: &str) -> Result<alloc::string::String, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
+
+        let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+        if comps.len() != 6
+            || !comps[0].eq_ignore_ascii_case("Registry")
+            || !comps[1].eq_ignore_ascii_case("Machine")
+            || !comps[2].eq_ignore_ascii_case("System")
+            || !(comps[3].eq_ignore_ascii_case("CurrentControlSet")
+                || comps[3].eq_ignore_ascii_case("ControlSet001"))
+            || !comps[4].eq_ignore_ascii_case("Services")
+        {
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        }
+        let service = comps[5];
+        if service.is_empty() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let bytes = service.as_bytes();
+        if !bytes
+            .iter()
+            .copied()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+            || bytes.windows(2).any(|w| w == b"..")
+        {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        Ok(alloc::string::String::from(service))
+    }
+
+    fn driver_object_path_for_service(service: &str) -> alloc::string::String {
+        let mut path = alloc::string::String::from("\\Driver\\");
+        path.push_str(service);
+        path
+    }
+
+    unsafe fn nt_load_driver(&mut self, service_name_ustr: u64) -> u32 {
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+        if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        let service_path = match self.capture_driver_service_registry_path(service_name_ustr) {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let service = match Self::driver_service_name_from_registry_path(&service_path) {
+            Ok(service) => service,
+            Err(status) => return status,
+        };
+        let driver_object_path = Self::driver_object_path_for_service(&service);
+        if driver_launch::driver_id_by_name(&driver_object_path).is_some() {
+            return STATUS_IMAGE_ALREADY_LOADED;
+        }
+
+        let mut image_path = [0u8; 180];
+        let Some((image_len, class)) =
+            system_hive_demand_driver_launch_spec(&service, &mut image_path)
+        else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let Some(fs) = exec_fs() else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let Some(dc) =
+            driver_launch::load_driver(&fs, &image_path[..image_len], class, &driver_object_path)
+        else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        match object_manager_publish_driver_io_objects(&driver_object_path, &dc) {
+            Ok(_) => 0,
+            Err(status) => status.raw() as u32,
+        }
+    }
+
+    unsafe fn nt_unload_driver(&mut self, service_name_ustr: u64) -> u32 {
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+
+        if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        let service_path = match self.capture_driver_service_registry_path(service_name_ustr) {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let service = match Self::driver_service_name_from_registry_path(&service_path) {
+            Ok(service) => service,
+            Err(status) => return status,
+        };
+        let driver_object_path = Self::driver_object_path_for_service(&service);
+        match driver_launch::unload_driver_by_name(&driver_object_path) {
+            Ok(()) => 0,
+            Err(status) => status.raw() as u32,
+        }
+    }
+
     /// `NtUnloadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1796` (`NtUnloadKey2`) plus the event
     /// form. Detach a hive `NtLoadKey*` mounted: the mount goes, its backing slot is released, and
     /// the write overlay's keys under that path are detached too — otherwise the writes made
@@ -9910,6 +10055,8 @@ impl ExecNtHandler {
                 self.nt_unload_key_ex(args[0], args[1] as u32, 0)
             },
             NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key_ex(args[0], 0, args[1]) },
+            NativeService::NtLoadDriver => unsafe { self.nt_load_driver(args[0]) },
+            NativeService::NtUnloadDriver => unsafe { self.nt_unload_driver(args[0]) },
             NativeService::NtDeleteValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,

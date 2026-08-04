@@ -11,8 +11,7 @@ use core::ptr::{read_unaligned, write_unaligned};
 use nt_io_manager::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object, WdmDeviceObjectInit,
     WdmDriverObjectInit, WdmFileObjectInit, WDM_X64_DEVICE_OBJECT_SIZE,
-    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
-    WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
 };
 
 const VIDEO_DRIVER_NAME_CAP: usize = 32;
@@ -148,8 +147,8 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
         WdmDriverObjectInit {
             size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
             device_object: device,
-            driver_extension_offset: WDM_X64_DRIVER_EXTENSION_OFFSET,
             driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
+            driver_unload: 0,
         },
     )
     .is_err()

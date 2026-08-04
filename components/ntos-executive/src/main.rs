@@ -7746,6 +7746,16 @@ pub(crate) unsafe fn object_manager_delete_path(path: &str) -> Result<(), nt_sta
     client.delete_object(path, true)
 }
 
+pub(crate) unsafe fn object_manager_publish_driver_io_objects(
+    driver_object_path: &str,
+    dc: &driver_launch::DriverComponent,
+) -> Result<PublishedDriverIoObjects, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+    publish_driver_io_objects(client, driver_object_path, dc)
+}
+
 /// The Configuration Manager transport wrapper.
 struct CmChan<'a>(RingChannel<'a>);
 impl nt_config_client::Backend for CmChan<'_> {
@@ -9782,6 +9792,10 @@ pub const SSN_NT_UNLOAD_KEY: u64 = 272;
 pub const SSN_NT_UNLOAD_KEY2: u64 = 273;
 /// `NtUnloadKeyEx(POBJECT_ATTRIBUTES TargetKey, HANDLE Event)`.
 pub const SSN_NT_UNLOAD_KEY_EX: u64 = 274;
+/// SCM driver control (`services.exe`): load/unload a service key under
+/// `\Registry\Machine\System\CurrentControlSet\Services`.
+pub const SSN_NT_LOAD_DRIVER: u64 = 101;
+pub const SSN_NT_UNLOAD_DRIVER: u64 = 271;
 
 /// Print a `str`'s printable ASCII to the debug console (`?` for anything else) — registry mount
 /// paths and hive file names are runtime strings, so the trace has to be able to show them.
@@ -9895,10 +9909,11 @@ fn driver_launch_spec_from_registry_values(
     type_value: u32,
     start_value: u32,
     out_path: &mut [u8],
+    max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
-    // NT service start values: 0=BOOT_START, 1=SYSTEM_START, 2=AUTO_START. Only boot/system drivers
-    // are loaded here; later SCM work owns auto/demand starts.
-    if start_value > 1 {
+    // NT service start values: 0=BOOT_START, 1=SYSTEM_START, 2=AUTO_START, 3=DEMAND_START,
+    // 4=DISABLED. Callers choose the maximum accepted start policy for their route.
+    if start_value > max_start || start_value >= 4 {
         return None;
     }
     let class = if type_value & 0x2 != 0 {
@@ -9937,7 +9952,7 @@ fn config_hive_driver_launch_spec(
     }
     let type_value = hive.query_dword(key, "Type")?;
     let start_value = hive.query_dword(key, "Start")?;
-    driver_launch_spec_from_registry_values(image_path, type_value, start_value, out_path)
+    driver_launch_spec_from_registry_values(image_path, type_value, start_value, out_path, 1)
 }
 
 fn system_hive_driver_launch_spec(
@@ -9955,7 +9970,25 @@ fn system_hive_driver_launch_spec(
     let start_value = hive
         .value(key, "Start")
         .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path)
+    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path, 1)
+}
+
+fn system_hive_demand_driver_launch_spec(
+    service_name: &str,
+    out_path: &mut [u8],
+) -> Option<(usize, driver_launch::DriverClass)> {
+    let hive = system_hive_regf()?;
+    let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
+    key_path.push_str(service_name);
+    let key = hive.open_key(&key_path)?;
+    let image_path = hive.value(key, "ImagePath")?;
+    let type_value = hive
+        .value(key, "Type")
+        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
+    let start_value = hive
+        .value(key, "Start")
+        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
+    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path, 3)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {
@@ -11866,6 +11899,8 @@ fn build_nt_table() -> NativeServiceTable {
                     u32::MAX
                 },
             ),
+            (NativeService::NtLoadDriver, SSN_NT_LOAD_DRIVER as u32),
+            (NativeService::NtUnloadDriver, SSN_NT_UNLOAD_DRIVER as u32),
             (
                 NativeService::NtSetSystemInformation,
                 SSN_NT_SET_SYSTEM_INFORMATION as u32,
@@ -13591,50 +13626,100 @@ fn captured_utf16le_ascii_path(bytes: &[u8], len: u16) -> Option<alloc::string::
     Some(out)
 }
 
+pub(crate) struct PublishedDriverIoObjects {
+    pub driver_object_id: u64,
+    pub device_path: Option<alloc::string::String>,
+    pub device_object_id: u64,
+}
+
+fn publish_driver_io_objects<B: nt_object_client::Backend>(
+    object_client: &mut ObjectClient<B>,
+    driver_object_path: &str,
+    dc: &driver_launch::DriverComponent,
+) -> Result<PublishedDriverIoObjects, nt_status::NtStatus> {
+    let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
+    let driver_object =
+        object_client.create_driver(driver_object_path, owner_component, dc.driver_id, true)?;
+    if !driver_launch::bind_driver_object_id(dc.driver_id, driver_object.0) {
+        let _ = object_client.delete_object(driver_object_path, true);
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+
+    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
+    let mut device_object_id = 0;
+    if let Some(path) = device_path.as_deref() {
+        let device_object =
+            object_client.create_device(path, owner_component, dc.device_id, true)?;
+        if !driver_launch::bind_device_object_id(dc.device_id, device_object.0) {
+            let _ = object_client.delete_object(path, true);
+            let _ = driver_launch::bind_driver_object_id(dc.driver_id, 0);
+            let _ = object_client.delete_object(driver_object_path, true);
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        device_object_id = device_object.0;
+    }
+
+    if let (Some(link), Some(target)) = (
+        captured_utf16le_ascii_path(&dc.symlink_link_utf16, dc.symlink_link_len),
+        captured_utf16le_ascii_path(&dc.symlink_target_utf16, dc.symlink_target_len),
+    ) {
+        if let Err(status) = object_client.create_symbolic_link(&link, &target, true) {
+            if let Some(path) = device_path.as_deref() {
+                let _ = object_client.delete_object(path, true);
+                let _ = driver_launch::bind_device_object_id(dc.device_id, 0);
+            }
+            let _ = driver_launch::bind_driver_object_id(dc.driver_id, 0);
+            let _ = object_client.delete_object(driver_object_path, true);
+            return Err(status);
+        }
+    }
+
+    Ok(PublishedDriverIoObjects {
+        driver_object_id: driver_object.0,
+        device_path,
+        device_object_id,
+    })
+}
+
 fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     object_client: &mut ObjectClient<B>,
     dc: &driver_launch::DriverComponent,
     passed: &mut u64,
 ) {
     let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
-    let driver_created = object_client
-        .create_driver("\\Driver\\Npfs", owner_component, dc.driver_id, true)
-        .ok();
+    let published = publish_driver_io_objects(object_client, "\\Driver\\Npfs", dc).ok();
     let driver_info = object_client.query_object("\\Driver\\Npfs", true).ok();
     let driver_bound = driver_info.is_some_and(|info| {
         info.route_kind == 1
             && info.owner_component == owner_component
             && info.owner_local_id == dc.driver_id
-            && driver_launch::bind_driver_object_id(dc.driver_id, info.object_id.0)
             && driver_launch::driver_object_id(dc.driver_id) == info.object_id.0
     });
-    let driver_ok = driver_created.is_some() && driver_bound && dc.drvobj != 0;
+    let driver_ok = published
+        .as_ref()
+        .is_some_and(|objects| objects.driver_object_id != 0)
+        && driver_bound
+        && dc.drvobj != 0;
     check(b"npfs_driver_object_registered", driver_ok, passed);
 
-    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
-    let device_declared = device_path.as_deref() == Some("\\Device\\NamedPipe");
+    let device_declared = published
+        .as_ref()
+        .and_then(|objects| objects.device_path.as_deref())
+        == Some("\\Device\\NamedPipe");
     check(b"npfs_named_device_declared", device_declared, passed);
-    let device_ok = device_path.as_deref().is_some_and(|path| {
-        let created = object_client
-            .create_device(path, owner_component, dc.device_id, true)
-            .ok();
-        let info = object_client.query_object(path, true).ok();
-        created.is_some()
-            && info.is_some_and(|info| {
-                info.route_kind == 2
-                    && info.owner_component == owner_component
-                    && info.owner_local_id == dc.device_id
-                    && driver_launch::bind_device_object_id(dc.device_id, info.object_id.0)
-            })
+    let device_ok = published.as_ref().is_some_and(|objects| {
+        objects.device_path.as_deref().is_some_and(|path| {
+            let info = object_client.query_object(path, true).ok();
+            objects.device_object_id != 0
+                && info.is_some_and(|info| {
+                    info.route_kind == 2
+                        && info.owner_component == owner_component
+                        && info.owner_local_id == dc.device_id
+                        && info.object_id.0 == objects.device_object_id
+                })
+        })
     });
     check(b"npfs_device_object_registered", device_ok, passed);
-
-    if let (Some(link), Some(target)) = (
-        captured_utf16le_ascii_path(&dc.symlink_link_utf16, dc.symlink_link_len),
-        captured_utf16le_ascii_path(&dc.symlink_target_utf16, dc.symlink_target_len),
-    ) {
-        let _ = object_client.create_symbolic_link(&link, &target, true);
-    }
 }
 
 fn park() -> ! {

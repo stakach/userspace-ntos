@@ -70,9 +70,9 @@ pub use wdm_x64::{
     write_wdm_io_stack_location, write_wdm_irp, WdmDeviceObjectInit, WdmDriverObjectInit,
     WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WdmLayoutError,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
-    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER,
-    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
+    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE,
+    WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 
 #[cfg(feature = "object-manager")]
@@ -153,6 +153,66 @@ impl<P> IoManager<P> {
             .iter()
             .find(|(_, d)| d.object_id == object_id)
             .map(|(id, _)| id)
+    }
+
+    /// Resolve a driver by its canonical NT object path.
+    pub fn driver_id_by_name(&self, name: &NtPath) -> Option<DriverId> {
+        self.drivers
+            .iter()
+            .find(|(_, d)| &d.name == name)
+            .map(|(id, _)| id)
+    }
+
+    /// Mark a driver unload requested and mark its devices delete-pending. This mutates only
+    /// canonical I/O Manager records; Object Manager namespace teardown is owned by the caller or by
+    /// the Object Manager-backed APIs in `open.rs`.
+    pub fn request_driver_unload_records(&mut self, driver: DriverId) -> Result<(), NtStatus> {
+        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
+        let record = self.driver_mut(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if record.unload_state == DriverUnloadState::Unloaded {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        record.unload_state = DriverUnloadState::UnloadRequested;
+        for device in devices {
+            if let Some(record) = self.device_mut(device) {
+                record.delete_pending = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return whether a driver can be removed without changing I/O Manager state.
+    pub fn can_destroy_driver(&self, driver: DriverId) -> Result<(), NtStatus> {
+        if self.driver(driver).is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self
+            .devices_of(driver)
+            .iter()
+            .any(|device| self.device_has_live_files(*device) || self.has_upper_attachment(*device))
+        {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        Ok(())
+    }
+
+    /// Remove driver/device records after the caller has run any required driver-owned unload
+    /// routine and torn down Object Manager names.
+    pub fn remove_driver_records_after_unload(
+        &mut self,
+        driver: DriverId,
+    ) -> Result<DriverRecord, NtStatus> {
+        self.request_driver_unload_records(driver)?;
+        self.can_destroy_driver(driver)?;
+        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
+        for device in devices {
+            self.delete_device(device)?;
+        }
+        let mut record = self
+            .remove_driver(driver)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        record.unload_state = DriverUnloadState::Unloaded;
+        Ok(record)
     }
 
     // --- Devices -----------------------------------------------------------
@@ -518,8 +578,10 @@ mod tests {
         om.device_mut(dev).unwrap().object_id = device_obj;
 
         assert_eq!(om.driver_id_by_object_id(driver_obj), Some(drv));
+        assert_eq!(om.driver_id_by_name(&path("\\Driver\\Test")), Some(drv));
         assert_eq!(om.device_id_by_object_id(device_obj), Some(dev));
         assert_eq!(om.device_id_by_name(&path("\\Device\\Test0")), Some(dev));
+        assert_eq!(om.driver_id_by_name(&path("\\Driver\\Missing")), None);
         assert_eq!(om.device_id_by_name(&path("\\Device\\Missing")), None);
         assert_eq!(om.driver_id_by_object_id(ObjectId(0x333)), None);
         assert_eq!(om.device_id_by_object_id(ObjectId(0x333)), None);
@@ -1910,8 +1972,8 @@ mod tests {
             WdmDriverObjectInit {
                 size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
                 device_object: 0x6666,
-                driver_extension_offset: WDM_X64_DRIVER_EXTENSION_OFFSET,
                 driver_extension: 0x7777,
+                driver_unload: 0x8888,
             },
         )
         .unwrap();
@@ -1919,6 +1981,7 @@ mod tests {
         assert_eq!(le_u16(&driver, 0x02), WDM_X64_DRIVER_OBJECT_SIZE as u16);
         assert_eq!(le_u64(&driver, 0x08), 0x6666);
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
+        assert_eq!(le_u64(&driver, WDM_X64_DRIVER_UNLOAD_OFFSET), 0x8888);
 
         let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
         write_wdm_device_object(
