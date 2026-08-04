@@ -1530,6 +1530,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   canonical I/O ids to the isolated component instance; it no longer allocates its own driver/device
   identities. Validation: `cargo fmt --manifest-path components/ntos-executive/Cargo.toml` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`
-  passed. Review adjustment: D1 remains open for replacing the private seL4 transport map with an
-  `nt-io-manager` dispatch backend/IRP lifecycle path and moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT`
-  projection construction out of `driver_launch`.
+  passed, and `.tmp/full-boot-driver-route-iomanager-20260804.log` reached `RUN_RC=0`,
+  `247/280 executive->isolated-service checks passed`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_services_spawned`, `PASS exec_lsass_spawned`, `PASS exec_video_device_objects_registered`,
+  `PASS exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review
+  adjustment: D1 remains open for replacing the private seL4 transport map with an `nt-io-manager`
+  dispatch backend/IRP lifecycle path and moving WDM `DRIVER_OBJECT`/`DEVICE_OBJECT` projection
+  construction out of `driver_launch`.
