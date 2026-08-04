@@ -1454,3 +1454,24 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_msgina_logon_dialog_painted`, and `244/277` executive-to-isolated-service checks passing.
   Review adjustment: D1 remains open for service-control-created driver objects and real device
   ownership beyond the current GDI/display driver request path.
+- D1 continued. Removed the last static `DriverSpec`/`DRIVERS` proof-driver list from the
+  executive. `IrpFsdTest.sys` is now declared as
+  `ControlSet001\Services\IrpFsdTest` in the generated config hive with `ImagePath`, `Type`, and
+  `Start`; the boot path decodes that hive, applies the same boot/system driver policy used for
+  regf-backed services, and launches the second isolated IRP driver from service metadata. The
+  missing/malformed-service path now leaves the launch gate visibly red instead of falling back to a
+  compiled-in path. Validation: `cargo fmt --manifest-path crates/nt-hive-core/Cargo.toml`,
+  `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo test --manifest-path crates/nt-hive-core/Cargo.toml
+  generated_hive_declares_irp_fsd_test_service`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-service-driven-proof-driver-20260804.log` reached the microtest sentinel with
+  `SYSTEM.DAT ... size=663`, `Config Manager decoded hive (663 bytes)`, `launching service
+  IrpFsdTest from config hive path=reactos\system32\drivers\irpfsdtest.sys`, `PASS
+  exec_second_irp_driver_via_harness`, `PASS exec_pump_screens_bound_notification`, `PASS
+  exec_fsd_on_shared_harness`, `PASS exec_win32k_load_contract`, `PASS
+  exec_video_device_objects_registered`, `PASS exec_win32k_desktop_painted`, `PASS
+  exec_msgina_modal_paint_prefix`, `PASS exec_msgina_logon_dialog_painted`, and `244/277`
+  executive-to-isolated-service checks passing. Review adjustment: D1 remains open for real
+  IoManager/service-control-created `DRIVER_OBJECT`/`DEVICE_OBJECT` ownership; D3 remains open for a
+  real videoprt/miniport-created video device stack.

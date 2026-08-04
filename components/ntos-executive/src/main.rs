@@ -1481,7 +1481,7 @@ static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 /// can never steal a component's binding.
 ///
 /// (The plan sized this at 2 — one per live instance. It is sized at
-/// [`driver_launch::MAX_DRIVER_INSTANCES`] instead so that adding a third `DriverSpec` cannot
+/// [`driver_launch::MAX_DRIVER_INSTANCES`] instead so that a later service-launched driver cannot
 /// silently leave a component with cptr 0 and therefore no transport at all.)
 static REPLY_FSD_SLOT: [AtomicU64; driver_launch::MAX_DRIVER_INSTANCES] =
     [const { AtomicU64::new(0) }; driver_launch::MAX_DRIVER_INSTANCES];
@@ -9876,6 +9876,56 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
     RegfHive::new(bytes)
 }
 
+fn driver_launch_spec_from_registry_values(
+    image_path_data: &[u8],
+    type_value: u32,
+    start_value: u32,
+    out_path: &mut [u8],
+) -> Option<(usize, driver_launch::DriverClass)> {
+    // NT service start values: 0=BOOT_START, 1=SYSTEM_START, 2=AUTO_START. Only boot/system drivers
+    // are loaded here; later SCM work owns auto/demand starts.
+    if start_value > 1 {
+        return None;
+    }
+    let class = if type_value & 0x2 != 0 {
+        driver_launch::DriverClass::Fsd
+    } else if type_value & 0x1 != 0 {
+        driver_launch::DriverClass::Device
+    } else {
+        return None;
+    };
+    let path_len = registry_utf16_ascii_path(image_path_data, out_path)?;
+    Some((path_len, class))
+}
+
+fn config_hive_driver_launch_spec(
+    service_name: &str,
+    out_path: &mut [u8],
+) -> Option<(usize, driver_launch::DriverClass)> {
+    let hive_size =
+        unsafe { core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) } as usize;
+    if hive_size == 0 || hive_size > 0x0f00 {
+        return None;
+    }
+    let hive_bytes = unsafe {
+        core::slice::from_raw_parts((STORAGE_SHARED_VADDR + 0x100) as *const u8, hive_size)
+    };
+    let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
+    let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
+    key_path.push_str(service_name);
+    let key = hive.open_key(&key_path)?;
+    let (image_type, image_path) = hive.query_value(key, "ImagePath")?;
+    if !matches!(
+        image_type,
+        nt_hive_core::RegistryValueType::Sz | nt_hive_core::RegistryValueType::ExpandSz
+    ) {
+        return None;
+    }
+    let type_value = hive.query_dword(key, "Type")?;
+    let start_value = hive.query_dword(key, "Start")?;
+    driver_launch_spec_from_registry_values(image_path, type_value, start_value, out_path)
+}
+
 fn system_hive_driver_launch_spec(
     service_name: &str,
     out_path: &mut [u8],
@@ -9891,20 +9941,7 @@ fn system_hive_driver_launch_spec(
     let start_value = hive
         .value(key, "Start")
         .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    // NT service start values: 0=BOOT_START, 1=SYSTEM_START, 2=AUTO_START. Only boot/system drivers
-    // are loaded here; later SCM work owns auto/demand starts.
-    if start_value > 1 {
-        return None;
-    }
-    let class = if type_value & 0x2 != 0 {
-        driver_launch::DriverClass::Fsd
-    } else if type_value & 0x1 != 0 {
-        driver_launch::DriverClass::Device
-    } else {
-        return None;
-    };
-    let path_len = registry_utf16_ascii_path(&image_path.1, out_path)?;
-    Some((path_len, class))
+    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {
@@ -17422,22 +17459,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
         }
 
-        // --- G3: the DECLARATIVE user-specified driver list. A driver runs by adding ONE
-        // `DriverSpec { path, class }` here (the "user specifies drivers to run" surface) + staging
-        // the .sys by-path — ZERO bespoke executive code. npfs.sys above is the same declarative
-        // `load_driver(path, Fsd)` call (its rich data-plane specs stay inline). This list is the
-        // GENERAL substrate: a SECOND, DIFFERENT IRP driver (`IrpFsdTest.sys`, staged by-path like
-        // the fixtures) loads through the SAME `load_driver`/`component_main`/`component_pump`
-        // harness. It proves multi-instance reuse (G1+G2+G3): its own isolated PML4 (!= npfs's) +
-        // an IRP round-trip through the shared dispatch pump.
-        use driver_launch::{DriverClass, DriverSpec};
-        static DRIVERS: &[DriverSpec] = &[DriverSpec {
-            path: b"reactos\\system32\\drivers\\IrpFsdTest.sys",
-            class: DriverClass::Fsd,
-        }];
-        for spec in DRIVERS {
-            print_str(b"[driver-launch] launching user-specified driver via the general path\n");
-            if let Some(dc) = load_driver(&fs, spec.path, spec.class) {
+        // --- G3: second boot/system service through the same general driver path. The proof fixture
+        // service is declared in the generated SYSTEM.DAT hive, so the executive selects it from
+        // service metadata instead of a compiled-in driver list.
+        let mut proof_driver_path = [0u8; 128];
+        let proof_driver_spec =
+            config_hive_driver_launch_spec("IrpFsdTest", &mut proof_driver_path);
+        if let Some((proof_driver_path_len, proof_driver_class)) = proof_driver_spec {
+            print_str(b"[driver-launch] launching service IrpFsdTest from config hive path=");
+            print_str(&proof_driver_path[..proof_driver_path_len]);
+            print_str(b"\n");
+            if let Some(dc) = load_driver(
+                &fs,
+                &proof_driver_path[..proof_driver_path_len],
+                proof_driver_class,
+            ) {
                 // This minimal FSD fills its MajorFunction[] table but creates NO control
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
                 let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
@@ -17543,9 +17579,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             } else {
                 print_str(
-                    b"[driver-launch] 2nd driver launch returned None (not staged / load failed)\n",
+                    b"[driver-launch] IrpFsdTest launch returned None (not staged / load failed)\n",
                 );
             }
+        } else {
+            print_str(
+                b"[driver-launch] IrpFsdTest service has no boot/system ImagePath in config hive\n",
+            );
         }
     }
 

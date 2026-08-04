@@ -1935,8 +1935,8 @@ pub(crate) enum DriverClass {
     Fsd,
     /// A generic IRP filter/class driver (FS/bus filter). Same IRP substrate + caps as [`Fsd`]; the
     /// distinction is policy documentation (IRP forwarding is driver logic, not a harness concern).
-    // Future-wiring: a user-specified filter-driver class seam (design §5.4); no `DriverSpec`
-    // constructs it yet, but `caps_and_layout_for` already routes it. Intentional — matches `Device`.
+    // Future-wiring: a registry-selected filter-driver class seam (design §5.4); no current service
+    // selects it yet, but `caps_and_layout_for` already routes it. Intentional — matches `Device`.
     #[allow(dead_code)]
     Filter,
     /// Hardware device driver — same IRP substrate as [`Fsd`], plus a device-cap section (MMIO BAR
@@ -1979,16 +1979,6 @@ pub(crate) fn caps_and_layout_for(class: DriverClass) -> (HostCaps, bool) {
         // win32k's unique privileged class — NOT routed through load_driver's IRP builder.
         DriverClass::GuiSyscallServer => (HostCaps::default(), false),
     }
-}
-
-/// A user-specifiable driver to launch by-path: the `.sys` path + its policy [`DriverClass`]. The
-/// boot iterates a static [`DRIVERS`] list, calling [`load_driver`] for each — the "user specifies
-/// drivers to run" surface (registry `\Services` / boot-arg population is a later increment; a static
-/// list proves the reuse). Adding a driver = stage the `.sys` by-path + add ONE `DriverSpec`.
-#[derive(Clone, Copy)]
-pub(crate) struct DriverSpec {
-    pub path: &'static [u8],
-    pub class: DriverClass,
 }
 
 /// A launched, isolated driver component — the caps + VAs the executive keeps to route IRPs to it.
@@ -2226,7 +2216,8 @@ static DRIVER_NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
 /// MULTI-INSTANCE: each call takes a fresh instance slot; instance 0 uses the fixed npfs executive
 /// VAs (byte-identical), instance N≥1 a distinct executive window ([`ExecVaWindow::for_instance`]).
 /// The live driver state is recorded in [`DRIVER_INSTANCES`] so [`dispatch_irp`] can route to any of
-/// N drivers by instance index. Adding a new IRP driver needs ZERO bespoke code — a `DriverSpec`.
+/// N drivers by instance index. Adding a boot/system IRP driver means declaring a `Services\<Name>`
+/// record with an image path, type, and start policy, then handing that metadata to this loader.
 ///
 /// Fault-contained: the component's DriverEntry faults land on ITS fault EP (this loop demand-maps
 /// benign pages + reports a wall) — a driver crash never brings down the executive root.
