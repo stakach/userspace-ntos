@@ -5,18 +5,13 @@
 //! reach back into the historical descriptor table.
 #![allow(clippy::all)]
 
-use crate::{
-    register_hosted_process_runtime, HostedProcessRuntime, CSRSS_PROCESS_RUNTIME,
-    EXPLORER_PROCESS_RUNTIME, LSASS_PROCESS_RUNTIME, SERVICES_PROCESS_RUNTIME,
-    SMSS_PROCESS_RUNTIME, USERINIT_PROCESS_RUNTIME, WINLOGON_PROCESS_RUNTIME,
-};
+use crate::register_hosted_process_runtime_for_image;
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedBootstrapLoadSpec {
     pub(crate) disk_path: &'static [u8],
     pub(crate) stem: &'static [u8],
     pub(crate) image: nt_exe_image::OwnedHostedProcessImage,
-    pub(crate) runtime: HostedProcessRuntime,
 }
 
 #[derive(Clone, Copy)]
@@ -30,13 +25,12 @@ struct HostedBootstrapManifestEntry {
     command_line: &'static [u8],
     image_root: nt_exe_image::HostedImageRoot,
     probe_fragment: &'static [u8],
-    runtime: HostedProcessRuntime,
 }
 
 impl HostedBootstrapManifestEntry {
-    fn image(self) -> nt_exe_image::OwnedHostedProcessImage {
+    fn image(self, pi: usize) -> nt_exe_image::OwnedHostedProcessImage {
         nt_exe_image::OwnedHostedProcessImage::new(
-            self.runtime.pi,
+            pi,
             self.top_badge,
             self.leaf,
             self.leaf,
@@ -49,12 +43,11 @@ impl HostedBootstrapManifestEntry {
         .expect("hosted bootstrap image manifest entry is static and validated")
     }
 
-    fn load_spec(self) -> HostedBootstrapLoadSpec {
+    fn load_spec(self, pi: usize) -> HostedBootstrapLoadSpec {
         HostedBootstrapLoadSpec {
             disk_path: self.disk_path,
             stem: self.stem,
-            image: self.image(),
-            runtime: self.runtime,
+            image: self.image(pi),
         }
     }
 }
@@ -69,7 +62,6 @@ const SMSS_BOOTSTRAP_MANIFEST: HostedBootstrapManifestEntry = HostedBootstrapMan
     command_line: b"smss.exe",
     image_root: nt_exe_image::HostedImageRoot::System32,
     probe_fragment: b"",
-    runtime: SMSS_PROCESS_RUNTIME,
 };
 
 const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
@@ -83,7 +75,6 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"csrss",
-        runtime: CSRSS_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\winlogon.exe",
@@ -95,7 +86,6 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"winlogon.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"winlogon",
-        runtime: WINLOGON_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\services.exe",
@@ -107,7 +97,6 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"services.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"services",
-        runtime: SERVICES_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: b"reactos\\system32\\lsass.exe",
@@ -119,7 +108,6 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"lsass.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"lsass",
-        runtime: LSASS_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: br"reactos\system32\userinit.exe",
@@ -131,7 +119,6 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"userinit.exe",
         image_root: nt_exe_image::HostedImageRoot::System32,
         probe_fragment: b"userinit",
-        runtime: USERINIT_PROCESS_RUNTIME,
     },
     HostedBootstrapManifestEntry {
         disk_path: br"reactos\explorer.exe",
@@ -143,32 +130,30 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
         command_line: b"explorer.exe",
         image_root: nt_exe_image::HostedImageRoot::SystemRoot,
         probe_fragment: b"explorer",
-        runtime: EXPLORER_PROCESS_RUNTIME,
     },
 ];
 
 pub(crate) const HOSTED_BOOTSTRAP_LOAD_COUNT: usize = HOSTED_BOOTSTRAP_MANIFEST.len();
 
 pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
-    SMSS_BOOTSTRAP_MANIFEST.image()
+    SMSS_BOOTSTRAP_MANIFEST.image(0)
 }
 
 pub(crate) fn hosted_bootstrap_load_spec(index: usize) -> Option<HostedBootstrapLoadSpec> {
     HOSTED_BOOTSTRAP_MANIFEST
         .get(index)
         .copied()
-        .map(HostedBootstrapManifestEntry::load_spec)
+        .map(|entry| entry.load_spec(index + 1))
 }
 
 pub(crate) fn register_loaded_hosted_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
     image: nt_exe_image::OwnedHostedProcessImage,
-    runtime: HostedProcessRuntime,
     loaded: bool,
 ) -> Result<(), nt_exe_image::HostedImageRegistrationError> {
     if loaded {
         catalog.register(image)?;
-        register_hosted_process_runtime(runtime)
+        register_hosted_process_runtime_for_image(image.as_ref())
             .expect("hosted process runtime layout must register once when image is loaded");
     }
     Ok(())

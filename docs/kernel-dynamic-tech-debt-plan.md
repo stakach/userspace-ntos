@@ -28,7 +28,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[x]` A0: Inventory the current hardcoded dynamic-debt boundaries.
 - `[x]` A1: Remove fixed `pi` dispatch from hosted child executable metadata lookup.
-- `[~]` A2: Replace the static hosted image table with a dynamic image/session registration
+- `[x]` A2: Replace the static hosted image table with a dynamic image/session registration
   contract driven by created sections and process parameters.
 - `[x]` A3: Move `PM_PIDS`, `PM_TIDS`, and thread pool mirrors behind process-manager keyed
   lookup APIs so callers stop indexing process identity through mechanism slots.
@@ -1493,3 +1493,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: D1 remains open because guest-visible `DRIVER_OBJECT`/`DEVICE_OBJECT` bodies
   are still component pool projections and IRPs still dispatch by component instance/device pointer;
   the next D1 step should move dispatch/projection ownership into a proper IoManager boundary.
+- A2 complete. Bootstrap hosted-image records now carry only image/session intent; SMSS is registered
+  as process index 0 and child process indexes are derived from manifest order at load time. Runtime
+  placement is allocated when loaded image metadata is admitted into the runtime catalog via
+  `register_hosted_process_runtime_for_image`, preserving the current VA bands while removing the
+  per-image `*_PROCESS_RUNTIME` constants and manifest runtime payloads. Standalone SMSS SEC_IMAGE
+  demos use the same registration path, so the executive no longer has a parallel static runtime
+  table to fall back to. Validation: `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-hosted-runtime-allocator-20260804.log` reached the microtest sentinel with
+  `247/280 executive->isolated-service checks passed`, `PASS
+  exec_process_manager_dynamic_allocations`, `PASS exec_services_spawned`, `PASS
+  exec_lsass_spawned`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_logon_dialog_painted`, and
+  `PASS exec_fsd_on_shared_harness`. Review adjustment: the remaining static policy is the
+  bootstrap manifest itself and the conserved VA-band layout; those are now future session-manager
+  and address-space allocator work, not hosted-image-table fallbacks.

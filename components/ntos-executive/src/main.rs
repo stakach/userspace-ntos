@@ -14481,7 +14481,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let si_fault_c = copy_cap(si_fault);
         let smss_image = smss_bootstrap_image();
         reset_hosted_process_runtimes();
-        register_hosted_process_runtime(SMSS_PROCESS_RUNTIME)
+        register_hosted_process_runtime_for_image(smss_image.as_ref())
             .expect("SMSS runtime layout must register before SEC_IMAGE demo spawn");
         let spawn = spawn_hosted_sec_image_for_image(
             smss_image.as_ref(),
@@ -17834,7 +17834,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let smss_image = smss_bootstrap_image();
                     reset_hosted_process_runtimes();
-                    register_hosted_process_runtime(SMSS_PROCESS_RUNTIME)
+                    register_hosted_process_runtime_for_image(smss_image.as_ref())
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image.as_ref(),

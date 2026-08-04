@@ -1,7 +1,8 @@
 //! Hosted-process runtime placement and SEC_IMAGE spawn helpers.
 //!
-//! This module contains the fixed per-process mechanism layout that still needs to become a real
-//! allocator. Keeping it out of the syscall service loop makes the remaining tech debt explicit.
+//! Runtime placement is allocated when an image is admitted into the hosted-image catalog. The
+//! address bands below preserve the current boot layout, but callers no longer pass image-specific
+//! `HostedProcessRuntime` constants around as identity.
 #![allow(clippy::all)]
 use crate::*;
 
@@ -22,6 +23,7 @@ pub(crate) struct HostedProcessRuntime {
 pub(crate) enum HostedProcessRuntimeRegistrationError {
     InvalidPi,
     DuplicatePi,
+    MissingLayout,
 }
 
 #[derive(Clone, Copy)]
@@ -75,89 +77,131 @@ pub(crate) fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRu
     unsafe { (&*core::ptr::addr_of!(HOSTED_PROCESS_RUNTIMES)).get_by_pi(pi) }
 }
 
-pub(crate) const SMSS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 0,
-    priority: 100,
-    env_scratch_va: 0x0000_0100_1074_0000,
-    stack_mirror_va: SMSS_STACK_MIRROR_VA,
-    heap_mirror_va: SMSS_HEAP_MIRROR_VA,
-    active_image_mirror_va: IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: 0,
-    scratch_base: SMSS_SCRATCH_BASE,
-    spawned: None,
-};
+#[derive(Clone, Copy)]
+struct HostedProcessAddressLayout {
+    env_scratch_va: u64,
+    stack_mirror_va: u64,
+    heap_mirror_va: u64,
+    image_mirror_va: u64,
+}
 
-pub(crate) const CSRSS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 1,
-    priority: 101,
-    env_scratch_va: 0x0000_0100_1078_0000,
-    stack_mirror_va: CSRSS_STACK_MIRROR_VA,
-    heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
-    active_image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: 0,
-    scratch_base: CSRSS_SCRATCH_BASE,
-    spawned: Some(&CSRSS_SPAWNED),
-};
+const HOSTED_PROCESS_PRIORITY_BASE: u64 = 100;
+const SMSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1074_0000;
+const CSRSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1078_0000;
 
-pub(crate) const WINLOGON_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 2,
-    priority: 102,
-    env_scratch_va: WINLOGON_MAIN_TEB_MIRROR_VA,
-    stack_mirror_va: WINLOGON_STACK_MIRROR_VA,
-    heap_mirror_va: WINLOGON_HEAP_MIRROR_VA,
-    active_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: WINLOGON_IMAGE_MIRROR_VA,
-    scratch_base: WINLOGON_SCRATCH_BASE,
-    spawned: Some(&WINLOGON_SPAWNED),
-};
+fn spawned_signal_for_pi(pi: usize) -> Option<&'static AtomicU64> {
+    match pi {
+        1 => Some(&CSRSS_SPAWNED),
+        2 => Some(&WINLOGON_SPAWNED),
+        3 => Some(&SERVICES_SPAWNED),
+        4 => Some(&LSASS_SPAWNED),
+        5 => Some(&USERINIT_SPAWNED),
+        6 => Some(&EXPLORER_SPAWNED),
+        _ => None,
+    }
+}
 
-pub(crate) const SERVICES_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 3,
-    priority: 103,
-    env_scratch_va: SERVICES_ENV_SCRATCH_VA,
-    stack_mirror_va: SERVICES_STACK_MIRROR_VA,
-    heap_mirror_va: SERVICES_HEAP_MIRROR_VA,
-    active_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: SERVICES_IMAGE_MIRROR_VA,
-    scratch_base: SERVICES_SCRATCH_BASE,
-    spawned: Some(&SERVICES_SPAWNED),
-};
+fn core_service_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
+    if !(2..=4).contains(&pi) {
+        return None;
+    }
+    let service_index = (pi - 2) as u64;
+    let stack_mirror_va = match pi {
+        2 => WINLOGON_STACK_MIRROR_VA,
+        3 => SERVICES_STACK_MIRROR_VA,
+        4 => LSASS_STACK_MIRROR_VA,
+        _ => return None,
+    };
+    let env_scratch_va = match pi {
+        2 => WINLOGON_MAIN_TEB_MIRROR_VA,
+        3 => SERVICES_ENV_SCRATCH_VA,
+        4 => LSASS_ENV_SCRATCH_VA,
+        _ => return None,
+    };
+    let heap_mirror_va = WINLOGON_HEAP_MIRROR_VA + service_index * 0x40_0000;
+    Some(HostedProcessAddressLayout {
+        env_scratch_va,
+        stack_mirror_va,
+        heap_mirror_va,
+        image_mirror_va: heap_mirror_va + 0x20_0000,
+    })
+}
 
-pub(crate) const LSASS_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 4,
-    priority: 104,
-    env_scratch_va: LSASS_ENV_SCRATCH_VA,
-    stack_mirror_va: LSASS_STACK_MIRROR_VA,
-    heap_mirror_va: LSASS_HEAP_MIRROR_VA,
-    active_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: LSASS_IMAGE_MIRROR_VA,
-    scratch_base: LSASS_SCRATCH_BASE,
-    spawned: Some(&LSASS_SPAWNED),
-};
+fn shell_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
+    let stack_mirror_va = match pi {
+        5 => USERINIT_STACK_MIRROR_VA,
+        6 => EXPLORER_STACK_MIRROR_VA,
+        _ => return None,
+    };
+    Some(HostedProcessAddressLayout {
+        env_scratch_va: stack_mirror_va + 0x10_0000,
+        stack_mirror_va,
+        heap_mirror_va: stack_mirror_va + 0x20_0000,
+        image_mirror_va: stack_mirror_va + 0x40_0000,
+    })
+}
 
-pub(crate) const USERINIT_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 5,
-    priority: 105,
-    env_scratch_va: USERINIT_ENV_SCRATCH_VA,
-    stack_mirror_va: USERINIT_STACK_MIRROR_VA,
-    heap_mirror_va: USERINIT_HEAP_MIRROR_VA,
-    active_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: USERINIT_IMAGE_MIRROR_VA,
-    scratch_base: USERINIT_SCRATCH_BASE,
-    spawned: Some(&USERINIT_SPAWNED),
-};
+fn address_layout_for_image(
+    image: nt_exe_image::HostedProcessImageRef<'_>,
+) -> Option<HostedProcessAddressLayout> {
+    match image.role {
+        nt_exe_image::HostedProcessRole::NativeSession if image.pi == 0 => {
+            Some(HostedProcessAddressLayout {
+                env_scratch_va: SMSS_ENV_SCRATCH_VA,
+                stack_mirror_va: SMSS_STACK_MIRROR_VA,
+                heap_mirror_va: SMSS_HEAP_MIRROR_VA,
+                image_mirror_va: IMAGE_MIRROR_VA,
+            })
+        }
+        nt_exe_image::HostedProcessRole::Win32Subsystem if image.pi == 1 => {
+            Some(HostedProcessAddressLayout {
+                env_scratch_va: CSRSS_ENV_SCRATCH_VA,
+                stack_mirror_va: CSRSS_STACK_MIRROR_VA,
+                heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
+                image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
+            })
+        }
+        nt_exe_image::HostedProcessRole::InteractiveLogon
+        | nt_exe_image::HostedProcessRole::NonInteractiveService => core_service_layout(image.pi),
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+        | nt_exe_image::HostedProcessRole::InteractiveShell => shell_layout(image.pi),
+        nt_exe_image::HostedProcessRole::NativeSession
+        | nt_exe_image::HostedProcessRole::Win32Subsystem => None,
+    }
+}
 
-pub(crate) const EXPLORER_PROCESS_RUNTIME: HostedProcessRuntime = HostedProcessRuntime {
-    pi: 6,
-    priority: 106,
-    env_scratch_va: EXPLORER_ENV_SCRATCH_VA,
-    stack_mirror_va: EXPLORER_STACK_MIRROR_VA,
-    heap_mirror_va: EXPLORER_HEAP_MIRROR_VA,
-    active_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
-    spawn_image_mirror_va: EXPLORER_IMAGE_MIRROR_VA,
-    scratch_base: EXPLORER_SCRATCH_BASE,
-    spawned: Some(&EXPLORER_SPAWNED),
-};
+fn runtime_for_image(
+    image: nt_exe_image::HostedProcessImageRef<'_>,
+) -> Result<HostedProcessRuntime, HostedProcessRuntimeRegistrationError> {
+    if image.pi >= MAX_PI {
+        return Err(HostedProcessRuntimeRegistrationError::InvalidPi);
+    }
+    let layout = address_layout_for_image(image)
+        .ok_or(HostedProcessRuntimeRegistrationError::MissingLayout)?;
+    let spawned = spawned_signal_for_pi(image.pi);
+    let spawn_image_mirror_va = match image.role {
+        nt_exe_image::HostedProcessRole::NativeSession
+        | nt_exe_image::HostedProcessRole::Win32Subsystem => 0,
+        _ => layout.image_mirror_va,
+    };
+    Ok(HostedProcessRuntime {
+        pi: image.pi,
+        priority: HOSTED_PROCESS_PRIORITY_BASE + image.pi as u64,
+        env_scratch_va: layout.env_scratch_va,
+        stack_mirror_va: layout.stack_mirror_va,
+        heap_mirror_va: layout.heap_mirror_va,
+        active_image_mirror_va: layout.image_mirror_va,
+        spawn_image_mirror_va,
+        scratch_base: SMSS_SCRATCH_BASE + image.pi as u64 * DEMAND_SCRATCH_WINDOW,
+        spawned,
+    })
+}
+
+pub(crate) fn register_hosted_process_runtime_for_image(
+    image: nt_exe_image::HostedProcessImageRef<'_>,
+) -> Result<(), HostedProcessRuntimeRegistrationError> {
+    register_hosted_process_runtime(runtime_for_image(image)?)
+}
 
 fn expect_hosted_process_runtime(pi: usize) -> HostedProcessRuntime {
     hosted_process_runtime_for_pi(pi).expect("hosted process runtime layout must be registered")

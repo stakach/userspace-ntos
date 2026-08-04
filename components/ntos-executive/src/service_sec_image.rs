@@ -244,7 +244,7 @@ unsafe fn load_hosted_bootstrap_image(
         let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
-    register_loaded_hosted_image(catalog, spec.image, spec.runtime, pe.is_some())
+    register_loaded_hosted_image(catalog, spec.image, pe.is_some())
         .expect("hosted bootstrap image metadata must register once when loaded");
     (pe, va)
 }
@@ -2667,7 +2667,6 @@ pub(crate) unsafe fn service_sec_image(
     register_loaded_hosted_image(
         exe_image_catalog,
         smss_bootstrap_image(),
-        SMSS_PROCESS_RUNTIME,
         !pe.bytes().is_empty(),
     )
     .expect("SMSS hosted image metadata must register once");
