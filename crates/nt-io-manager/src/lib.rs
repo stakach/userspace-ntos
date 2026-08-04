@@ -911,6 +911,11 @@ mod tests {
             t.get(major::IRP_MJ_DEVICE_CONTROL),
             DispatchTarget::DriverPeer(DriverPeerId(9))
         );
+        t.retarget(DispatchTarget::Kernel(DriverBackendId(11)));
+        assert_eq!(
+            t.get(major::IRP_MJ_DEVICE_CONTROL),
+            DispatchTarget::Kernel(DriverBackendId(11))
+        );
     }
 
     #[test]
@@ -933,6 +938,33 @@ mod tests {
         assert_eq!(
             record.dispatch.get(major::IRP_MJ_DEVICE_CONTROL),
             DispatchTarget::DriverPeer(DriverPeerId(record.backend.0))
+        );
+        assert_eq!(
+            record.dispatch.get(major::IRP_MJ_CREATE),
+            DispatchTarget::Unsupported
+        );
+    }
+
+    #[test]
+    fn kernel_driver_create_uses_kernel_backend_target() {
+        let mut om = io();
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set(
+            major::IRP_MJ_DEVICE_CONTROL,
+            DispatchTarget::Kernel(DriverBackendId(0)),
+        );
+        let driver = om
+            .create_kernel_driver_with_major_table(
+                &path("\\Driver\\KernelVideo"),
+                Box::new(MockDriverBackend::new()),
+                dispatch,
+            )
+            .unwrap();
+        let record = om.driver(driver).unwrap();
+        assert_ne!(record.object_id, ObjectId::NULL);
+        assert_eq!(
+            record.dispatch.get(major::IRP_MJ_DEVICE_CONTROL),
+            DispatchTarget::Kernel(record.backend)
         );
         assert_eq!(
             record.dispatch.get(major::IRP_MJ_CREATE),

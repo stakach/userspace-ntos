@@ -140,6 +140,7 @@ impl<P> IoManager<P> {
             .get(major_fn);
         let idx = match target {
             DispatchTarget::Mock(id) => id.0 as usize,
+            DispatchTarget::Kernel(id) => id.0 as usize,
             DispatchTarget::DriverPeer(id) => id.0 as usize,
             DispatchTarget::Unsupported => {
                 return Ok(DispatchOutcome::Failed {

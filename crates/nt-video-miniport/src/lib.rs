@@ -89,6 +89,35 @@ impl BootFramebufferMiniport {
         }
     }
 
+    pub fn dispatch_buffered_io_control(
+        &self,
+        ioctl: u32,
+        system_buffer: &mut [u8],
+        input_len: usize,
+        output_len: usize,
+    ) -> Result<usize, VideoMiniportError> {
+        if input_len > system_buffer.len() {
+            return Err(VideoMiniportError::BufferTooSmall { needed: input_len });
+        }
+        if output_len > system_buffer.len() {
+            return Err(VideoMiniportError::BufferTooSmall { needed: output_len });
+        }
+        match ioctl {
+            IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES => {
+                self.query_num_available_modes(&mut system_buffer[..output_len])
+            }
+            IOCTL_VIDEO_QUERY_AVAIL_MODES | IOCTL_VIDEO_QUERY_CURRENT_MODE => {
+                self.query_mode(&mut system_buffer[..output_len])
+            }
+            IOCTL_VIDEO_SET_CURRENT_MODE => self.set_current_mode(&system_buffer[..input_len]),
+            IOCTL_VIDEO_MAP_VIDEO_MEMORY => {
+                require_input(&system_buffer[..input_len], VIDEO_MEMORY_SIZE_X64)?;
+                self.write_video_memory_information(&mut system_buffer[..output_len])
+            }
+            _ => Err(VideoMiniportError::UnsupportedIoctl),
+        }
+    }
+
     pub fn mode(&self) -> VideoModeSpec {
         self.mode
     }
@@ -150,6 +179,13 @@ impl BootFramebufferMiniport {
         output: &mut [u8],
     ) -> Result<usize, VideoMiniportError> {
         require_input(input, VIDEO_MEMORY_SIZE_X64)?;
+        self.write_video_memory_information(output)
+    }
+
+    fn write_video_memory_information(
+        &self,
+        output: &mut [u8],
+    ) -> Result<usize, VideoMiniportError> {
         require_output(output, VIDEO_MEMORY_INFORMATION_SIZE_X64)?;
         if self.mapping.size_bytes > u32::MAX as u64 {
             return Err(VideoMiniportError::FramebufferTooLarge);
@@ -383,6 +419,23 @@ mod tests {
         assert_eq!(u32_at(&out, 8), 1280 * 800 * 4);
         assert_eq!(u64_at(&out, 16), 0x0000_0100_0900_0000);
         assert_eq!(u32_at(&out, 24), 1280 * 800 * 4);
+    }
+
+    #[test]
+    fn buffered_ioctl_dispatch_uses_one_system_buffer() {
+        let input = 0u64.to_le_bytes();
+        let mut sys = [0u8; VIDEO_MEMORY_INFORMATION_SIZE_X64];
+        sys[..input.len()].copy_from_slice(&input);
+        let written = miniport()
+            .dispatch_buffered_io_control(
+                IOCTL_VIDEO_MAP_VIDEO_MEMORY,
+                &mut sys,
+                VIDEO_MEMORY_SIZE_X64,
+                VIDEO_MEMORY_INFORMATION_SIZE_X64,
+            )
+            .unwrap();
+        assert_eq!(written, VIDEO_MEMORY_INFORMATION_SIZE_X64);
+        assert_eq!(u64_at(&sys, 16), 0x0000_0100_0900_0000);
     }
 
     #[test]

@@ -3263,11 +3263,43 @@ fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> 
     .map(|driver_id| driver_id.raw())
 }
 
+pub(crate) fn register_kernel_io_driver_with_major_table(
+    driver_object_path: &str,
+    backend: Box<dyn DriverDispatchBackend>,
+    dispatch: MajorFunctionTable,
+) -> Result<u64, nt_status::NtStatus> {
+    let name = parse_nt_path(driver_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    io_manager_mut()
+        .create_kernel_driver_with_major_table(&name, backend, dispatch)
+        .map(|driver_id| driver_id.raw())
+}
+
 pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
     let path = parse_nt_path(path)?;
     io_manager_mut()
         .driver_id_by_name(&path)
         .map(|driver_id| driver_id.raw())
+}
+
+pub(crate) fn register_kernel_io_device(
+    driver_id: u64,
+    device_path: &str,
+    device_type: DeviceType,
+    characteristics: DeviceCharacteristics,
+    flags: DeviceFlags,
+    extension_size: u32,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    let name = parse_nt_path(device_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let device_id = io_manager_mut().create_device(
+        DriverId(driver_id),
+        Some(&name),
+        device_type,
+        characteristics,
+        flags,
+        extension_size,
+    )?;
+    let object_id = device_object_id(device_id.raw());
+    Ok((device_id.raw(), object_id))
 }
 
 fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
@@ -3302,6 +3334,10 @@ fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtSt
 
 fn destroy_registered_driver(driver_id: u64) {
     let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
+}
+
+pub(crate) fn destroy_io_driver(driver_id: u64) {
+    destroy_registered_driver(driver_id);
 }
 
 pub(crate) fn device_object_id(device_id: u64) -> u64 {
@@ -3533,7 +3569,7 @@ pub(crate) unsafe fn unload_driver_by_name(
     Ok(())
 }
 
-fn device_id_by_name(path: &str) -> Option<u64> {
+pub(crate) fn device_id_by_name(path: &str) -> Option<u64> {
     let path = parse_nt_path(path)?;
     io_manager_mut()
         .device_id_by_name(&path)
@@ -3730,6 +3766,25 @@ pub(crate) unsafe fn dispatch_irp_to_device(
     if !inst.ready || inst.driver_id == 0 || inst.device_object == 0 {
         return None;
     }
+    if io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .is_none()
+    {
+        return None;
+    }
+    dispatch_external_irp_to_device_record(device_id, major, fsctl, file_id, in_data, out)
+}
+
+/// Route one IRP to any canonical I/O Manager device route, including kernel-owned in-process
+/// devices that do not have a launched seL4 driver instance.
+pub(crate) unsafe fn dispatch_irp_to_io_device(
+    device_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
     if io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))
         .is_none()

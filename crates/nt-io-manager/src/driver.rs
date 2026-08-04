@@ -29,6 +29,8 @@ pub enum DispatchTarget {
     Unsupported,
     /// Handled by an in-process mock backend (tests / bring-up).
     Mock(MockDispatchId),
+    /// Handled by a kernel-owned in-process backend.
+    Kernel(DriverBackendId),
     /// Handled by an isolated driver peer over SURT.
     DriverPeer(DriverPeerId),
 }

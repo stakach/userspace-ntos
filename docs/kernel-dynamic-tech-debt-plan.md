@@ -1722,3 +1722,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   passed. Review adjustment: the temporary Video0 object projection remains in `video_device`; the
   next D3 step is to register that route through canonical I/O Manager driver/device/file records
   instead of direct projection-pointer lookups.
+- D3 continued. Video0 now registers as a canonical kernel-owned I/O Manager route instead of a
+  video-only dispatch path. `nt-io-manager` has an explicit `DispatchTarget::Kernel` and
+  `create_kernel_driver_with_major_table` for in-kernel backends, while the executive registers
+  `\Driver\<display-service>` and `\Device\Video0` through the live Object Manager-backed I/O
+  Manager. `video_device` keeps the win32k-facing projected WDM bodies, but validates them against
+  the canonical device record and routes `EngDeviceIoControl` through
+  `IoManager::build_and_dispatch_external_to_device`; the boot framebuffer miniport handles the IRP
+  from the same `METHOD_BUFFERED` system-buffer contract as other I/O Manager drivers. Validation:
+  `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, `cargo test --manifest-path
+  crates/nt-video-miniport/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`
+  passed. Review adjustment: the remaining D3 debt is the win32k import bridge still returning a
+  static projected `FILE_OBJECT` for `IoGetDeviceObjectPointer`; the next step is to create/reference
+  a canonical I/O Manager file object for that open.

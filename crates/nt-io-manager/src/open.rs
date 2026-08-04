@@ -34,6 +34,13 @@ const SUPPORTED_MAJORS: [u8; 8] = [
     major::IRP_MJ_FLUSH_BUFFERS,
 ];
 
+#[derive(Clone, Copy)]
+enum DriverInstallKind {
+    Mock,
+    Kernel,
+    Peer,
+}
+
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Register an I/O client with the Object Manager (its handles live there).
     pub fn register_client(&mut self) -> ClientId {
@@ -79,6 +86,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.install_driver_with_table(name, backend, peer, table)
     }
 
+    /// Create a kernel-owned in-process driver using an explicit major-function table.
+    pub fn create_kernel_driver_with_major_table(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        table: MajorFunctionTable,
+    ) -> Result<DriverId, NtStatus> {
+        self.install_driver_with_table_kind(name, backend, DriverInstallKind::Kernel, table)
+    }
+
     /// Create an isolated driver peer using an explicit major-function table.
     ///
     /// Hosted WDM components populate their own `MajorFunction[]` table at runtime, so their
@@ -98,13 +115,28 @@ impl<P: ObjectManagerPort> IoManager<P> {
         name: &NtPath,
         backend: Box<dyn DriverDispatchBackend>,
         peer: bool,
+        table: MajorFunctionTable,
+    ) -> Result<DriverId, NtStatus> {
+        let kind = if peer {
+            DriverInstallKind::Peer
+        } else {
+            DriverInstallKind::Mock
+        };
+        self.install_driver_with_table_kind(name, backend, kind, table)
+    }
+
+    fn install_driver_with_table_kind(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        kind: DriverInstallKind,
         mut table: MajorFunctionTable,
     ) -> Result<DriverId, NtStatus> {
         let idx = self.register_backend(backend);
-        let target = if peer {
-            DispatchTarget::DriverPeer(DriverPeerId(idx as u64))
-        } else {
-            DispatchTarget::Mock(MockDispatchId(idx as u64))
+        let target = match kind {
+            DriverInstallKind::Mock => DispatchTarget::Mock(MockDispatchId(idx as u64)),
+            DriverInstallKind::Kernel => DispatchTarget::Kernel(DriverBackendId(idx as u64)),
+            DriverInstallKind::Peer => DispatchTarget::DriverPeer(DriverPeerId(idx as u64)),
         };
         table.retarget(target);
         let driver_id = self.register_driver(DriverRecord::new(
