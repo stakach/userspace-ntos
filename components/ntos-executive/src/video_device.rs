@@ -2,14 +2,20 @@
 //!
 //! ReactOS' normal path has videoprt create `\Device\Video0`, publish
 //! `HARDWARE\DEVICEMAP\VIDEO`, and service the display driver's video IOCTLs through the I/O
-//! manager. Until the real videoprt/miniport stack is hosted, this module owns that boundary and
-//! exposes only the narrow projection win32k needs to discover the selected display route.
+//! manager. Until the real videoprt/miniport stack is hosted, this module owns that boundary as a
+//! registered video route with projected NT driver/device/file object bodies that win32k can
+//! dereference.
 
 use core::ptr::{read_unaligned, write_unaligned};
 
+const VIDEO_DRIVER_OBJECT_BYTES: u64 = 0x150;
+const VIDEO_DRIVER_EXTENSION_BYTES: u64 = 0x50;
 const VIDEO_DEVICE_OBJECT_BYTES: u64 = 0x150;
 const VIDEO_FILE_OBJECT_BYTES: u64 = 0x100;
+const VIDEO_DRIVER_NAME_CAP: usize = 32;
 const VIDEO_SERVICE_PATH_CAP: usize = 128;
+const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
+const FILE_DEVICE_VIDEO: u32 = 0x23;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
@@ -41,6 +47,7 @@ impl VideoModeSpec {
 }
 
 pub(crate) struct VideoDeviceRegistration<'a> {
+    pub(crate) driver_name: &'a [u8],
     pub(crate) service_registry_path: &'a [u8],
     pub(crate) framebuffer_va: u64,
     pub(crate) framebuffer_size: u64,
@@ -50,8 +57,11 @@ pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) allocate_projection: unsafe fn(u64) -> u64,
 }
 
+static mut VIDEO_DRIVER_OBJECT: u64 = 0;
 static mut VIDEO_DEVICE_OBJECT: u64 = 0;
 static mut VIDEO_FILE_OBJECT: u64 = 0;
+static mut VIDEO_DRIVER_NAME: [u8; VIDEO_DRIVER_NAME_CAP] = [0; VIDEO_DRIVER_NAME_CAP];
+static mut VIDEO_DRIVER_NAME_LEN: u8 = 0;
 static mut VIDEO_SERVICE_PATH: [u8; VIDEO_SERVICE_PATH_CAP] = [0; VIDEO_SERVICE_PATH_CAP];
 static mut VIDEO_SERVICE_PATH_LEN: u8 = 0;
 static mut VIDEO_FRAMEBUFFER_VA: u64 = 0;
@@ -62,7 +72,9 @@ static mut VIDEO_DEVICE_READY: bool = false;
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     reg: &VideoDeviceRegistration<'_>,
 ) -> bool {
-    if reg.service_registry_path.is_empty()
+    if !ascii_component_is_safe(reg.driver_name)
+        || reg.driver_name.len() > VIDEO_DRIVER_NAME_CAP
+        || reg.service_registry_path.is_empty()
         || reg.service_registry_path.len() > VIDEO_SERVICE_PATH_CAP
         || reg.framebuffer_va == 0
         || reg.framebuffer_size == 0
@@ -77,6 +89,10 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         return false;
     }
 
+    let driver_name = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_NAME);
+    driver_name.fill(0);
+    driver_name[..reg.driver_name.len()].copy_from_slice(reg.driver_name);
+    VIDEO_DRIVER_NAME_LEN = reg.driver_name.len() as u8;
     let path = &mut *core::ptr::addr_of_mut!(VIDEO_SERVICE_PATH);
     path.fill(0);
     path[..reg.service_registry_path.len()].copy_from_slice(reg.service_registry_path);
@@ -89,28 +105,82 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
 }
 
 pub(crate) fn video_device_map_ready() -> bool {
-    unsafe { VIDEO_DEVICE_READY && VIDEO_SERVICE_PATH_LEN != 0 }
+    unsafe {
+        VIDEO_DEVICE_READY
+            && VIDEO_DRIVER_NAME_LEN != 0
+            && VIDEO_SERVICE_PATH_LEN != 0
+            && VIDEO_DRIVER_OBJECT != 0
+            && VIDEO_DEVICE_OBJECT != 0
+            && VIDEO_FILE_OBJECT != 0
+    }
+}
+
+pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
+    unsafe {
+        (
+            video_device_map_ready() as u64,
+            VIDEO_DRIVER_OBJECT,
+            VIDEO_DEVICE_OBJECT,
+            VIDEO_FILE_OBJECT,
+        )
+    }
 }
 
 unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bool {
-    if VIDEO_DEVICE_OBJECT != 0 && VIDEO_FILE_OBJECT != 0 {
+    if VIDEO_DRIVER_OBJECT != 0 && VIDEO_DEVICE_OBJECT != 0 && VIDEO_FILE_OBJECT != 0 {
         return true;
     }
+    let driver = allocate_projection(VIDEO_DRIVER_OBJECT_BYTES + VIDEO_DRIVER_EXTENSION_BYTES);
     let device = allocate_projection(VIDEO_DEVICE_OBJECT_BYTES);
     let file = allocate_projection(VIDEO_FILE_OBJECT_BYTES);
-    if device == 0 || file == 0 {
+    if driver == 0 || device == 0 || file == 0 {
         return false;
     }
-    // Minimal x64 IO object headers. win32k currently needs stable identities plus the
-    // FILE_OBJECT.DeviceObject back-link.
+    let zero = |base: u64, len: u64| {
+        let mut off = 0u64;
+        while off < len {
+            write_unaligned((base + off) as *mut u64, 0);
+            off += 8;
+        }
+    };
+    zero(
+        driver,
+        VIDEO_DRIVER_OBJECT_BYTES + VIDEO_DRIVER_EXTENSION_BYTES,
+    );
+    zero(device, VIDEO_DEVICE_OBJECT_BYTES);
+    zero(file, VIDEO_FILE_OBJECT_BYTES);
+
+    // Minimal x64 IO object bodies. win32k needs stable identities, DEVICE_OBJECT.DriverObject, the
+    // DriverObject.DeviceObject head link, and the FILE_OBJECT.DeviceObject back-link.
+    write_unaligned(driver as *mut i16, 4); // IO_TYPE_DRIVER
+    write_unaligned((driver + 2) as *mut u16, VIDEO_DRIVER_OBJECT_BYTES as u16);
+    write_unaligned(
+        (driver + 0x68) as *mut u64,
+        driver + VIDEO_DRIVER_OBJECT_BYTES,
+    ); // DriverExtension
+    write_unaligned((driver + 8) as *mut u64, device); // DriverObject.DeviceObject
+
     write_unaligned(device as *mut u16, 3); // IO_TYPE_DEVICE
     write_unaligned((device + 2) as *mut u16, VIDEO_DEVICE_OBJECT_BYTES as u16);
+    write_unaligned((device + 8) as *mut u64, driver); // DriverObject
+    write_unaligned((device + 0x48) as *mut u32, FILE_DEVICE_VIDEO); // DeviceType
+
     write_unaligned(file as *mut u16, 5); // IO_TYPE_FILE
     write_unaligned((file + 2) as *mut u16, VIDEO_FILE_OBJECT_BYTES as u16);
     write_unaligned((file + 8) as *mut u64, device);
+    VIDEO_DRIVER_OBJECT = driver;
     VIDEO_DEVICE_OBJECT = device;
     VIDEO_FILE_OBJECT = file;
     true
+}
+
+fn ascii_component_is_safe(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .copied()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && !name.windows(2).any(|w| w == b"..")
 }
 
 fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
@@ -220,10 +290,10 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     }
     let len = read_unaligned(name as *const u16) as usize;
     let buf = read_unaligned((name + 8) as *const u64);
-    if !wstr_eq_ascii(buf, len, b"\\Device\\Video0") {
+    if !wstr_eq_ascii(buf, len, VIDEO_DEVICE_PATH) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    if VIDEO_FILE_OBJECT == 0 || VIDEO_DEVICE_OBJECT == 0 {
+    if VIDEO_DRIVER_OBJECT == 0 || VIDEO_FILE_OBJECT == 0 || VIDEO_DEVICE_OBJECT == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     if !fileobj_out.is_null() {

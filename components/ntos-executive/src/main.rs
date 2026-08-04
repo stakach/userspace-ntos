@@ -10031,6 +10031,7 @@ impl SystemHiveDisplayDriverSpec {
 
     fn win32k_spec(&self) -> win32k_subsystem::DisplayRegistrySpec<'_> {
         win32k_subsystem::DisplayRegistrySpec {
+            service_name: &self.service_name[..self.service_name_len],
             service_key_pattern: &self.service_key_pattern[..self.service_key_pattern_len],
             service_registry_path: &self.service_registry_path[..self.service_registry_path_len],
             installed_display_driver: &self.installed_display_driver
@@ -18699,6 +18700,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         } else {
             b"\n".as_slice()
         });
+        let (video_ready, video_driver, video_device, video_file) =
+            video_device::video_device_projection_proofs();
+        print_str(b"[video-device] projection ready=");
+        print_u64(video_ready);
+        print_str(b" driver=0x");
+        print_hex((video_driver >> 32) as u32);
+        print_hex(video_driver as u32);
+        print_str(b" device=0x");
+        print_hex((video_device >> 32) as u32);
+        print_hex(video_device as u32);
+        print_str(b" file=0x");
+        print_hex((video_file >> 32) as u32);
+        print_hex(video_file as u32);
+        print_str(b"\n");
+        check(
+            b"exec_video_device_objects_registered",
+            video_ready == 1 && video_driver != 0 && video_device != 0 && video_file != 0,
+            &mut passed,
+        );
         // PERMANENT GATE: the sampled framebuffer grid must have fully changed from the magenta marker
         // and hold the authentic WC_DESKTOP background painted by winlogon's natural boot flow. The only
         // accepted exception is the exact grid sample covered by the real arrow cursor.

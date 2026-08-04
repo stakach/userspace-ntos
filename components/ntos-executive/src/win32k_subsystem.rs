@@ -4726,6 +4726,7 @@ static mut WIN32K_REG_HANDLES: [Win32kRegHandle; WIN32K_REG_HANDLE_CAP] =
     [Win32kRegHandle::EMPTY; WIN32K_REG_HANDLE_CAP];
 
 pub(crate) struct DisplayRegistrySpec<'a> {
+    pub(crate) service_name: &'a [u8],
     pub(crate) service_key_pattern: &'a [u8],
     pub(crate) service_registry_path: &'a [u8],
     pub(crate) installed_display_driver: &'a [u8],
@@ -4782,7 +4783,8 @@ fn close_win32k_reg_handle(handle: u64) -> bool {
 
 fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
     let _ = spec.vga_compatible;
-    if spec.service_key_pattern.is_empty()
+    if spec.service_name.is_empty()
+        || spec.service_key_pattern.is_empty()
         || spec.service_registry_path.is_empty()
         || spec.installed_display_driver.is_empty()
         || spec.display_driver_leaf.is_empty()
@@ -4793,6 +4795,7 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
     unsafe {
         crate::video_device::publish_boot_framebuffer_video_device(
             &crate::video_device::VideoDeviceRegistration {
+                driver_name: spec.service_name,
                 service_registry_path: spec.service_registry_path,
                 framebuffer_va: WIN32K_FB_VA,
                 framebuffer_size: WIN32K_FB_SIZE,

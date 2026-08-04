@@ -1425,3 +1425,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   executive-to-isolated-service checks passing. Review adjustment: D1 remains open for
   service-control-created driver objects/device ownership and for replacing the fixed static-import
   image slot with dynamic driver-image address allocation.
+- D3 continued. `\Device\Video0` no longer exposes two anonymous pool blocks as the display object
+  boundary. The SYSTEM-hive selected display service name is carried into the win32k display
+  registration, and `video_device` publishes a registered route with projected NT `DRIVER_OBJECT`,
+  `DEVICE_OBJECT`, and `FILE_OBJECT` bodies linked through the expected x64 fields. `IoGetDeviceObjectPointer`
+  and `EngDeviceIoControl` now require that registered projection, and the desktop gate proves
+  `exec_video_device_objects_registered` before accepting framebuffer paint. Validation: `cargo fmt
+  --manifest-path components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-video-objects-20260804.log` reached the microtest sentinel with
+  `[video-device] projection ready=1`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, `PASS exec_msgina_modal_paint_prefix`, `PASS
+  exec_msgina_logon_dialog_painted`, and `244/277` executive-to-isolated-service checks passing.
+  Review adjustment: D3 remains open for a real videoprt/miniport-created device stack and any
+  remaining keyboard/device route scaffolding.
