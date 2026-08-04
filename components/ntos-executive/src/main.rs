@@ -7849,6 +7849,61 @@ impl nt_config_client::Backend for CmChan<'_> {
     }
 }
 
+static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
+const CONFIG_STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+
+unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
+    CONFIG_CLIENT_PTR = client as *mut _;
+}
+
+pub(crate) unsafe fn config_manager_create_key(path: &str) -> Result<u64, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+    client.create_key(path)
+}
+
+pub(crate) unsafe fn config_manager_open_key(path: &str) -> bool {
+    CONFIG_CLIENT_PTR
+        .as_mut()
+        .map(|client| client.open_key(path))
+        .unwrap_or(false)
+}
+
+pub(crate) unsafe fn config_manager_set_dword(
+    key_path: &str,
+    name: &str,
+    value: u32,
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+    client.set_dword(key_path, name, value)
+}
+
+pub(crate) unsafe fn config_manager_set_value(
+    key_path: &str,
+    name: &str,
+    value_type: u32,
+    data: &[u8],
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+    client.set_value(key_path, name, value_type, data)
+}
+
+pub(crate) unsafe fn config_manager_query_value(
+    key_path: &str,
+    name: &str,
+    out: &mut [u8],
+) -> Result<(u32, usize), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+    client.query_value(key_path, name, out)
+}
+
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).
 struct IoChan<'a>(RingChannel<'a>);
 impl nt_io_client::Backend for IoChan<'_> {
@@ -14214,6 +14269,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         CM_REQ_VADDR,
         CM_REP_VADDR,
     )));
+    install_config_manager_client(&mut cm);
     let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
     check(b"exec_cm_ping", cm.ping(), &mut passed);
     check(
@@ -14230,6 +14286,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_cm_query_dword",
         cm.query_dword(svc_key, "Start") == Ok(3),
+        &mut passed,
+    );
+    let raw_value = b"v\0i\0d\0e\0o\0\0\0";
+    let mut raw_out = [0u8; 32];
+    check(
+        b"exec_cm_set_value",
+        cm.set_value(svc_key, "RawName", 1, raw_value).is_ok(),
+        &mut passed,
+    );
+    check(
+        b"exec_cm_query_value",
+        matches!(cm.query_value(svc_key, "RawName", &mut raw_out), Ok((1, n)) if n == raw_value.len())
+            && &raw_out[..raw_value.len()] == raw_value,
         &mut passed,
     );
 

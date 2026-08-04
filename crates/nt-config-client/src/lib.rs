@@ -2,7 +2,8 @@
 //!
 //! Encodes each call into the [`nt_config_abi`] wire form, hands it to a pluggable
 //! [`Backend`] (SURT rings on the kernel; in-process in tests), and decodes the
-//! [`CmReply`]. Mirrors `nt-object-client`.
+//! [`CmReply`]. Supports path-addressed keys plus DWORD and raw typed values. Mirrors
+//! `nt-object-client`.
 
 #![no_std]
 
@@ -10,7 +11,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use nt_config_abi::{opcode, CmKeyRequest, CmReply, CmValueRequest};
+use nt_config_abi::{opcode, CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest};
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
 /// `out_buf` for future variable-length replies).
@@ -77,6 +78,44 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
+    /// Set a raw typed registry value. The key is created if absent, matching `set_dword`.
+    pub fn set_value(
+        &mut self,
+        key_path: &str,
+        name: &str,
+        value_type: u32,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        let r = self.raw_value_op(
+            opcode::CM_OP_SET_VALUE,
+            key_path,
+            name,
+            value_type,
+            data,
+            &mut [],
+        );
+        if r.status == STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(r.status)
+        }
+    }
+
+    /// Query a raw typed registry value into `out`. Returns `(REG_* type, bytes_written)`.
+    pub fn query_value(
+        &mut self,
+        key_path: &str,
+        name: &str,
+        out: &mut [u8],
+    ) -> Result<(u32, usize), i32> {
+        let r = self.raw_value_op(opcode::CM_OP_QUERY_VALUE, key_path, name, 0, &[], out);
+        if r.status == STATUS_SUCCESS {
+            Ok((r.detail0 as u32, r.information as usize))
+        } else {
+            Err(r.status)
+        }
+    }
+
     fn key_op(&mut self, op: u16, path: &str) -> CmReply {
         let path_bytes = utf16_bytes(path);
         let hdr = CmKeyRequest {
@@ -109,6 +148,38 @@ impl<B: Backend> ConfigClient<B> {
         buf.extend_from_slice(&key_bytes);
         buf.extend_from_slice(&name_bytes);
         self.backend.call(op, &buf, &mut [])
+    }
+
+    fn raw_value_op(
+        &mut self,
+        op: u16,
+        key_path: &str,
+        name: &str,
+        value_type: u32,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> CmReply {
+        let key_bytes = utf16_bytes(key_path);
+        let name_bytes = utf16_bytes(name);
+        let base = core::mem::size_of::<CmRawValueRequest>() as u32;
+        let data_offset = base + key_bytes.len() as u32 + name_bytes.len() as u32;
+        let hdr = CmRawValueRequest {
+            abi_size: base as u16,
+            _pad: 0,
+            value_type,
+            key_offset: base,
+            key_len_bytes: key_bytes.len() as u32,
+            name_offset: base + key_bytes.len() as u32,
+            name_len_bytes: name_bytes.len() as u32,
+            data_offset,
+            data_len_bytes: data.len() as u32,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(hdr.as_bytes());
+        buf.extend_from_slice(&key_bytes);
+        buf.extend_from_slice(&name_bytes);
+        buf.extend_from_slice(data);
+        self.backend.call(op, &buf, out)
     }
 }
 
@@ -150,6 +221,20 @@ mod tests {
         let k2 = r"\Registry\Machine\Software\Demo2";
         assert!(c.set_dword(k2, "Answer", 42).is_ok());
         assert_eq!(c.query_dword(k2, "Answer"), Ok(42));
+    }
+
+    #[test]
+    fn set_query_raw_value_roundtrip() {
+        let mut c = client();
+        let k = r"\Registry\Machine\Hardware\DeviceMap\Video";
+        let data = b"v\0i\0d\0e\0o\0\0\0";
+        assert!(c.set_value(k, r"\Device\Video0", 1, data).is_ok());
+        let mut out = [0u8; 32];
+        assert_eq!(
+            c.query_value(k, r"\Device\Video0", &mut out),
+            Ok((1, data.len()))
+        );
+        assert_eq!(&out[..data.len()], data);
     }
 
     #[test]

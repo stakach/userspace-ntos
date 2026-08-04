@@ -3342,6 +3342,10 @@ pub(crate) fn device_control_on_io_handle(
     )
 }
 
+pub(crate) fn close_io_handle(handle: u64) -> Result<(), nt_status::NtStatus> {
+    io_manager_mut().close(ClientId(IO_MANAGER_COMPONENT_ID), HandleValue(handle))
+}
+
 fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
     if dc.devobj == 0 || dc.device_name_len == 0 {
         return Ok(0);

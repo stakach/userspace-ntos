@@ -59,7 +59,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   driven driver objects.
 - `[x]` D2: Replace driver-name matches in system information calls with registered module/device
   state.
-- `[~]` D3: Replace remaining win32k video/keyboard registry mirrors and temporary video object
+- `[x]` D3: Replace remaining win32k video/keyboard registry mirrors and temporary video object
   scaffolding with real hive data, Configuration Manager state, and driver-created device
   interfaces.
 
@@ -1749,3 +1749,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   passed. Review adjustment: D3 remains open only for the broader replacement of the boot
   framebuffer miniport/projection with a real videoprt/display-miniport-created stack and for auditing
   the remaining win32k import hooks against Configuration Manager/Object Manager boundaries.
+- D3 complete. Video0's DeviceMap registry state now flows through the live Configuration Manager
+  service instead of a video-private key/value emitter. The CM ABI/client/server support raw typed
+  values in addition to DWORDs; the executive installs the live CM client as a kernel service channel;
+  `video_device` publishes `\Registry\Machine\Hardware\DeviceMap\Video` with `MaxObjectNumber` and
+  `\Device\Video0` values during canonical Video0 route registration; and win32k's
+  `ZwOpenKey`/`ZwQueryValueKey` import bridge reads those DeviceMap bytes back from CM while still
+  requiring the registered I/O Manager Video0 route to be live. The old bounded display/keyboard
+  registry mirrors, direct DeviceMap value synthesis, fixed framebuffer geometry, direct projection
+  pointer dispatch, and anonymous Video0 open path are gone. Validation: `cargo test --manifest-path
+  crates/nt-config-client/Cargo.toml`, `cargo test --manifest-path crates/nt-config-server/Cargo.toml`,
+  `cargo test --manifest-path crates/nt-config-abi/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, and `git diff --check` passed. Review closure: this closes
+  the dynamic-tech-debt plan. A fully hosted videoprt/display-miniport stack remains the next feature
+  frontier for replacing the boot framebuffer miniport, but it is no longer masking a hardcoded
+  registry/device fallback in this plan.

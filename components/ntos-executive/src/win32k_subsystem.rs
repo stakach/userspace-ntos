@@ -4689,18 +4689,20 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
 // win32ss/user/ntuser/display.c) open registry keys through ntoskrnl imports. These trampolines now
 // resolve those imports against real executive-owned state: the mounted SYSTEM hive for service and
-// keyboard-layout keys, plus the runtime Video0 device-map link published when the selected display
-// route is registered. There is no key/value mirror: ZwOpenKey only mints an opaque handle to a live
-// target, and ZwQueryValueKey reads the value from that target.
-// Video0's DeviceMap value, projected IO object identities, and framebuffer IOCTL state are owned by
-// `video_device`; win32k only carries opaque registry handles to that executive-owned route.
+// keyboard-layout keys, plus the runtime Video0 DeviceMap key published through Configuration
+// Manager when the selected display route is registered. There is no key/value mirror: ZwOpenKey
+// only mints an opaque handle to a live target, and ZwQueryValueKey reads the value from that target.
+// Video0's projected IO object identities and framebuffer IOCTL state are owned by `video_device`;
+// win32k only carries opaque registry handles to the registry authority.
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const WIN32K_REG_HANDLE_CAP: usize = 16;
 const WIN32K_REG_PATH_CAP: usize = 192;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
+const WIN32K_REG_VALUE_DATA_CAP: usize = 512;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
+const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Win32kRegHandleTarget {
@@ -4971,7 +4973,9 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
                 }
             }
         } else if is_video_device_map_key(path) {
-            if !crate::video_device::video_device_map_ready() {
+            if !crate::video_device::video_device_map_ready()
+                || !crate::config_manager_open_key(VIDEO_DEVICE_MAP_KEY_STR)
+            {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             Win32kRegHandleTarget::VideoDeviceMap
@@ -5029,6 +5033,25 @@ unsafe fn query_system_hive_value(
     emit_kvpi_bytes(kvi, length, result_len, value_type, &data)
 }
 
+unsafe fn query_config_manager_value(
+    key_path: &str,
+    name: &[u8],
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+) -> i32 {
+    let Ok(name) = core::str::from_utf8(name) else {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+    let mut data = [0u8; WIN32K_REG_VALUE_DATA_CAP];
+    match crate::config_manager_query_value(key_path, name, &mut data) {
+        Ok((value_type, data_len)) => {
+            emit_kvpi_bytes(kvi, length, result_len, value_type, &data[..data_len])
+        }
+        Err(status) => status,
+    }
+}
+
 /// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
 /// KeyValueInformation, ULONG Length, PULONG ResultLength)`.
 extern "win64" fn s_zw_query_value_key(
@@ -5055,7 +5078,7 @@ extern "win64" fn s_zw_query_value_key(
         match target {
             Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
             Win32kRegHandleTarget::VideoDeviceMap => {
-                crate::video_device::query_video_device_map_value(name, kvi, length, result_len)
+                query_config_manager_value(VIDEO_DEVICE_MAP_KEY_STR, name, kvi, length, result_len)
             }
             Win32kRegHandleTarget::SystemHive { key } => {
                 query_system_hive_value(key, name, kvi, length, result_len)

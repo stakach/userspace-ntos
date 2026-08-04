@@ -21,6 +21,10 @@ pub mod opcode {
     pub const CM_OP_SET_DWORD: u16 = 0x2120;
     /// Query a DWORD value. Reply `detail0` = value; not-found status if absent.
     pub const CM_OP_QUERY_DWORD: u16 = 0x2121;
+    /// Set a typed raw value on a key (created if absent).
+    pub const CM_OP_SET_VALUE: u16 = 0x2122;
+    /// Query a typed raw value. Reply `detail0` = REG_* type, `information` = data bytes.
+    pub const CM_OP_QUERY_VALUE: u16 = 0x2123;
 }
 
 /// The reply every Configuration Manager op returns (field-for-field over `SurtCqe`).
@@ -57,6 +61,22 @@ pub struct CmValueRequest {
     pub name_len_bytes: u32,
 }
 
+/// `set_value` / `query_value`: a key path + value name, plus optional raw value bytes. `value_type`
+/// is used by set and ignored by query; query returns the type in [`CmReply::detail0`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CmRawValueRequest {
+    pub abi_size: u16,
+    pub _pad: u16,
+    pub value_type: u32,
+    pub key_offset: u32,
+    pub key_len_bytes: u32,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub data_offset: u32,
+    pub data_len_bytes: u32,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -83,6 +103,7 @@ macro_rules! wire {
 }
 wire!(CmKeyRequest);
 wire!(CmValueRequest);
+wire!(CmRawValueRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.

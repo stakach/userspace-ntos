@@ -2,12 +2,14 @@
 //!
 //! ReactOS' normal path has videoprt create `\Device\Video0`, publish
 //! `HARDWARE\DEVICEMAP\VIDEO`, and service the display driver's video IOCTLs through the I/O
-//! manager. Until the real videoprt/miniport stack is hosted, this module owns that boundary as a
-//! registered video route with projected NT driver/device/file object bodies that win32k can
-//! dereference.
+//! manager. Until the real videoprt/miniport stack is hosted, this module owns the boot framebuffer
+//! route as a canonical I/O Manager driver/device/open plus projected NT driver/device/file object
+//! bodies that win32k can dereference. The DeviceMap values are published through Configuration
+//! Manager, not through a private video registry table.
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::ptr::{read_unaligned, write_unaligned};
 
 use nt_io_abi::major;
@@ -30,11 +32,11 @@ const VIDEO_DRIVER_NAME_CAP: usize = 32;
 const VIDEO_SERVICE_PATH_CAP: usize = 128;
 const VIDEO_DEVICE_PATH_STR: &str = "\\Device\\Video0";
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
+const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
+const VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE: &str = "MaxObjectNumber";
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
-const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const REG_SZ: u32 = 1;
-const REG_DWORD: u32 = 4;
 
 pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) driver_name: &'a [u8],
@@ -87,6 +89,11 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     }
     VIDEO_MINIPORT = Some(miniport);
     if !ensure_video_io_route(reg.driver_name) {
+        VIDEO_MINIPORT = None;
+        return false;
+    }
+    if !publish_video_device_map(reg.service_registry_path) {
+        teardown_video_io_route();
         VIDEO_MINIPORT = None;
         return false;
     }
@@ -299,6 +306,21 @@ unsafe fn video_io_route_ready() -> bool {
         && crate::driver_launch::device_object_id(VIDEO_DEVICE_ID) == VIDEO_DEVICE_OBJECT_ID
 }
 
+unsafe fn teardown_video_io_route() {
+    if VIDEO_FILE_HANDLE != 0 {
+        let _ = crate::driver_launch::close_io_handle(VIDEO_FILE_HANDLE);
+    }
+    if VIDEO_DRIVER_ID != 0 {
+        crate::driver_launch::destroy_io_driver(VIDEO_DRIVER_ID);
+    }
+    VIDEO_DRIVER_ID = 0;
+    VIDEO_DEVICE_ID = 0;
+    VIDEO_DEVICE_OBJECT_ID = 0;
+    VIDEO_FILE_HANDLE = 0;
+    VIDEO_FILE_ID = 0;
+    VIDEO_FILE_OBJECT_ID = 0;
+}
+
 struct BootVideoDriverBackend;
 
 impl DriverDispatchBackend for BootVideoDriverBackend {
@@ -382,18 +404,6 @@ fn ascii_component_is_safe(name: &[u8]) -> bool {
         && !name.windows(2).any(|w| w == b"..")
 }
 
-fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
-}
-
 unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
     if buf == 0 || len_bytes / 2 != pat.len() {
         return false;
@@ -414,69 +424,36 @@ unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
     true
 }
 
-unsafe fn emit_kvpi_wsz(kvi: u64, length: u64, result_len: *mut u32, rtype: u32, s: &[u8]) -> i32 {
-    let nchars = s.len() + 1;
-    let dbytes = (nchars * 2) as u64;
-    let need = 0xC + dbytes;
-    if !result_len.is_null() {
-        write_unaligned(result_len, need as u32);
-    }
-    if kvi == 0 || length < need {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-    write_unaligned(kvi as *mut u32, 0);
-    write_unaligned((kvi + 4) as *mut u32, rtype);
-    write_unaligned((kvi + 8) as *mut u32, dbytes as u32);
-    let d = kvi + 0xC;
-    for (i, &b) in s.iter().enumerate() {
-        write_unaligned((d + (i * 2) as u64) as *mut u16, b as u16);
-    }
-    write_unaligned((d + (s.len() * 2) as u64) as *mut u16, 0);
-    0
-}
-
-unsafe fn emit_kvpi_dword(kvi: u64, length: u64, result_len: *mut u32, val: u32) -> i32 {
-    let need = 0xC + 4;
-    if !result_len.is_null() {
-        write_unaligned(result_len, need as u32);
-    }
-    if kvi == 0 || length < need {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-    write_unaligned(kvi as *mut u32, 0);
-    write_unaligned((kvi + 4) as *mut u32, REG_DWORD);
-    write_unaligned((kvi + 8) as *mut u32, 4);
-    write_unaligned((kvi + 0xC) as *mut u32, val);
-    0
-}
-
-pub(crate) unsafe fn query_video_device_map_value(
-    name: &[u8],
-    kvi: u64,
-    length: u64,
-    result_len: *mut u32,
-) -> i32 {
-    if !video_device_map_ready() {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    if ascii_eq_ignore_case(name, b"maxobjectnumber") {
-        return emit_kvpi_dword(kvi, length, result_len, 0);
-    }
-    if ascii_eq_ignore_case(name, b"\\device\\video0") {
-        let service_path = &*core::ptr::addr_of!(VIDEO_SERVICE_PATH);
-        let service_path_len = VIDEO_SERVICE_PATH_LEN as usize;
-        if service_path_len == 0 {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+fn utf16le_nul_from_ascii(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut data = Vec::with_capacity(bytes.len() * 2 + 2);
+    for &b in bytes {
+        if !b.is_ascii() {
+            return None;
         }
-        return emit_kvpi_wsz(
-            kvi,
-            length,
-            result_len,
-            REG_SZ,
-            &service_path[..service_path_len],
-        );
+        data.extend_from_slice(&(b as u16).to_le_bytes());
     }
-    STATUS_OBJECT_NAME_NOT_FOUND
+    data.extend_from_slice(&[0, 0]);
+    Some(data)
+}
+
+unsafe fn publish_video_device_map(service_registry_path: &[u8]) -> bool {
+    let Some(service_path_data) = utf16le_nul_from_ascii(service_registry_path) else {
+        return false;
+    };
+    crate::config_manager_create_key(VIDEO_DEVICE_MAP_KEY_STR).is_ok()
+        && crate::config_manager_set_dword(
+            VIDEO_DEVICE_MAP_KEY_STR,
+            VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE,
+            0,
+        )
+        .is_ok()
+        && crate::config_manager_set_value(
+            VIDEO_DEVICE_MAP_KEY_STR,
+            VIDEO_DEVICE_PATH_STR,
+            REG_SZ,
+            &service_path_data,
+        )
+        .is_ok()
 }
 
 pub(crate) unsafe fn video_get_device_object_pointer(
