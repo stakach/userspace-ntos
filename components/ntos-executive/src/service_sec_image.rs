@@ -28,6 +28,7 @@ static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -54,12 +55,15 @@ const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFF
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
 const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
     (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
+const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
+    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
 const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
+const ETO_PDY: u64 = 0x02000;
 const WM_QUIT: u32 = 0x0012;
 const STRETCH_DIBITS_FAIL_MISSING_SP: u64 = 1;
 const STRETCH_DIBITS_FAIL_STACK_TAIL: u64 = 2;
@@ -7371,6 +7375,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut stretch_dibits_probe_aux0 = 0u64;
                 let mut stretch_dibits_probe_aux1 = 0u64;
                 let mut stretch_dibits_probe_aux2 = 0u64;
+                let mut ext_text_out_stack_args = [0u64; 5];
+                let mut ext_text_out_stack_arg_count = 0usize;
+                let mut ext_text_out_probe_failed = false;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -8348,6 +8355,202 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
+                } else if m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN && uses_client_gdi {
+                    // NtGdiExtTextOutW probes/copies its caller-owned RECT, WCHAR string, and
+                    // optional Dx array before GreExtTextOutW consumes them. Do that capture at the
+                    // cross-VSpace boundary so nested WM_PAINT text draws never hand isolated win32k
+                    // raw explorer/winlogon heap pointers.
+                    if sp == 0 {
+                        ext_text_out_probe_failed = true;
+                    } else {
+                        let mut tail = [0u64; 5];
+                        let mut tail_ok = true;
+                        let mut i = 0usize;
+                        while i < tail.len() {
+                            match client_read_u64_mapped(
+                                pi as u64,
+                                sp + 0x28 + i as u64 * 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            ) {
+                                Some(value) => tail[i] = value,
+                                None => {
+                                    tail_ok = false;
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        if !tail_ok {
+                            ext_text_out_probe_failed = true;
+                        } else {
+                            let unsafe_rect = tail[0];
+                            let unsafe_string = tail[1];
+                            let count = tail[2] as u32 as u64;
+                            let unsafe_dx = tail[3];
+                            let codepage = tail[4] as u32 as u64;
+                            let fu_options = a3 as u32 as u64;
+                            let dx_units = if fu_options & ETO_PDY != 0 { 2 } else { 1 };
+                            let string_bytes = count.checked_mul(2);
+                            let dx_bytes = if unsafe_dx != 0 && count != 0 {
+                                count.checked_mul(4).and_then(|bytes| bytes.checked_mul(dx_units))
+                            } else {
+                                Some(0)
+                            };
+                            if count > 0xffff || (count != 0 && unsafe_string == 0) {
+                                ext_text_out_probe_failed = true;
+                            } else if let (Some(string_bytes), Some(dx_bytes)) =
+                                (string_bytes, dx_bytes)
+                            {
+                                let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
+                                let cap = WIN32K_EXT_TEXT_OUT_STAGE_BYTES as u64;
+                                let mut offset = 0u64;
+                                let mut layout_ok = true;
+                                let staged_rect = if unsafe_rect != 0 {
+                                    let out = base + offset;
+                                    match align_up_u64(offset + 16, 8) {
+                                        Some(next) => offset = next,
+                                        None => layout_ok = false,
+                                    }
+                                    out
+                                } else {
+                                    0
+                                };
+                                let staged_dx = if layout_ok && dx_bytes != 0 {
+                                    let out = base + offset;
+                                    match align_up_u64(offset + dx_bytes, 8) {
+                                        Some(next) => offset = next,
+                                        None => layout_ok = false,
+                                    }
+                                    out
+                                } else {
+                                    0
+                                };
+                                let staged_string = if layout_ok && string_bytes != 0 {
+                                    let out = base + offset;
+                                    match align_up_u64(offset + string_bytes, 8) {
+                                        Some(next) => offset = next,
+                                        None => layout_ok = false,
+                                    }
+                                    out
+                                } else {
+                                    0
+                                };
+                                if !layout_ok || offset > cap {
+                                    ext_text_out_probe_failed = true;
+                                } else {
+                                    if offset != 0 {
+                                        core::ptr::write_bytes(
+                                            base as *mut u8,
+                                            0,
+                                            offset as usize,
+                                        );
+                                    }
+                                    let rect_ok = unsafe_rect == 0 || {
+                                        prefill_client_copyin_dll_range_pages(
+                                            pi as u64,
+                                            unsafe_rect,
+                                            16,
+                                            scratch_base,
+                                            &reg,
+                                            &dll_pes,
+                                        );
+                                        img_spawn::client_copyin_mapped(
+                                            pi as u64,
+                                            unsafe_rect,
+                                            core::slice::from_raw_parts_mut(
+                                                staged_rect as *mut u8,
+                                                16,
+                                            ),
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        )
+                                    };
+                                    let dx_ok = unsafe_dx == 0 || dx_bytes == 0 || {
+                                        prefill_client_copyin_dll_range_pages(
+                                            pi as u64,
+                                            unsafe_dx,
+                                            dx_bytes as usize,
+                                            scratch_base,
+                                            &reg,
+                                            &dll_pes,
+                                        );
+                                        img_spawn::client_copyin_mapped(
+                                            pi as u64,
+                                            unsafe_dx,
+                                            core::slice::from_raw_parts_mut(
+                                                staged_dx as *mut u8,
+                                                dx_bytes as usize,
+                                            ),
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        )
+                                    };
+                                    let string_ok = count == 0 || {
+                                        prefill_client_copyin_dll_range_pages(
+                                            pi as u64,
+                                            unsafe_string,
+                                            string_bytes as usize,
+                                            scratch_base,
+                                            &reg,
+                                            &dll_pes,
+                                        );
+                                        img_spawn::client_copyin_mapped(
+                                            pi as u64,
+                                            unsafe_string,
+                                            core::slice::from_raw_parts_mut(
+                                                staged_string as *mut u8,
+                                                string_bytes as usize,
+                                            ),
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        )
+                                    };
+                                    if rect_ok && dx_ok && string_ok {
+                                        d_a3 = fu_options;
+                                        ext_text_out_stack_args = [
+                                            staged_rect,
+                                            staged_string,
+                                            count,
+                                            staged_dx,
+                                            codepage,
+                                        ];
+                                        ext_text_out_stack_arg_count =
+                                            ext_text_out_stack_args.len();
+                                        let n = EXT_TEXT_OUT_MARSHAL_TRACE
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if n < 48 {
+                                            print_str(b"[w32marshal] NtGdiExtTextOutW pi=");
+                                            print_u64(pi as u64);
+                                            print_str(b" hdc=0x");
+                                            print_hex_u64(a0);
+                                            print_str(b" count=");
+                                            print_u64(count);
+                                            print_str(b" options=0x");
+                                            print_hex(fu_options as u32);
+                                            print_str(b" rect=0x");
+                                            print_hex_u64(unsafe_rect);
+                                            print_str(b" str=0x");
+                                            print_hex_u64(unsafe_string);
+                                            print_str(b" dx=0x");
+                                            print_hex_u64(unsafe_dx);
+                                            print_str(b" bytes=");
+                                            print_u64(offset);
+                                            print_str(b"\n");
+                                        }
+                                    } else {
+                                        ext_text_out_probe_failed = true;
+                                    }
+                                }
+                            } else {
+                                ext_text_out_probe_failed = true;
+                            }
+                        }
+                    }
                 } else if m0 == 0x125c && sp != 0 {
                     // NtUserLoadKeyboardLayoutEx has a client PUNICODE_STRING KLID in its stack
                     // tail. ReactOS probes/copies it before loading the layout; isolated win32k must
@@ -9281,10 +9484,11 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
-                // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
-                // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
-                // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
-                if m0 == 0x122f {
+                // NtUserCreateWindowStation(0x122f) and NtUserCreateDesktop(0x122d) both take a
+                // client OBJECT_ATTRIBUTES whose ObjectName points at a client UNICODE_STRING and
+                // buffer. Capture that bounded graph into the win32k argument window so both the
+                // real handler and our post-dispatch observers see a component-local pointer graph.
+                if m0 == 0x122f || m0 == 0x122d {
                     let mut oa = [0u8; 0x30];
                     let oa_ok = img_spawn::client_copyin_mapped(
                         pi as u64,
@@ -9329,7 +9533,9 @@ pub(crate) unsafe fn service_sec_image(
                             faults as usize,
                             scratch_base,
                         );
-                    print_str(b"[w32diag] 0x122f OA=0x");
+                    print_str(b"[w32diag] user-object OA ssn=0x");
+                    print_hex(m0 as u32);
+                    print_str(b" OA=0x");
                     print_hex((a0 >> 32) as u32);
                     print_hex(a0 as u32);
                     print_str(b" real-Length=0x");
@@ -9391,9 +9597,9 @@ pub(crate) unsafe fn service_sec_image(
                             core::ptr::write_unaligned((arg + 0x10) as *mut u64, arg + 0x30);
                             core::ptr::write_unaligned((arg + 0x38) as *mut u64, arg + 0x40);
                             d_a0 = arg;
-                            print_str(
-                                b"[w32marshal] captured named window-station OA graph bytes=",
-                            );
+                            print_str(b"[w32marshal] captured named user-object OA graph ssn=0x");
+                            print_hex(m0 as u32);
+                            print_str(b" bytes=");
                             print_u64(0x40 + name_max as u64);
                             print_str(b"\n");
                         }
@@ -9584,6 +9790,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> 0\n");
                     }
                     (0, true)
+                } else if ext_text_out_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiExtTextOutW input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hdc=0x");
+                        print_hex_u64(a0);
+                        print_str(b" options=0x");
+                        print_hex(a3 as u32);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if text_extent_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9727,6 +9947,9 @@ pub(crate) unsafe fn service_sec_image(
                         && create_dibitmap_stack_arg_count == create_dibitmap_stack_args.len();
                     let stretch_dibits_staged_stack = m0 == 0x1082
                         && stretch_dibits_stack_arg_count == stretch_dibits_stack_args.len();
+                    let ext_text_out_staged_stack =
+                        m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
+                            && ext_text_out_stack_arg_count == ext_text_out_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
                     let char_width_staged_stack =
@@ -9761,6 +9984,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &create_dibitmap_stack_args)
                     } else if stretch_dibits_staged_stack {
                         (sp, &stretch_dibits_stack_args)
+                    } else if ext_text_out_staged_stack {
+                        (sp, &ext_text_out_stack_args)
                     } else if text_extent_staged_stack {
                         (sp, &text_extent_stack_args)
                     } else if char_width_staged_stack {

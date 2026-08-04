@@ -3284,6 +3284,7 @@ static WIN32K_NONINTERACTIVE_WINSTA_SKIPS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CSRSS_BOOTSTRAP_REKEYS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_HANDLE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_BODY: AtomicU64 = AtomicU64::new(0);
+static WIN32K_DEFAULT_DESKTOP_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -3680,21 +3681,12 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     sync_threadinfo_process(w32thread);
     publish_selected_context(process_index, thread_index);
 
-    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
-        && BOUND_DESK_PDESKINFO != 0
-        && BOUND_DESK_BODY != 0
-    {
-        write_volatile(
-            (w32thread + THREADINFO_RPDESK_OFF) as *mut u64,
-            BOUND_DESK_BODY,
-        );
-        write_volatile(
-            (w32thread + THREADINFO_PDESKINFO_OFF) as *mut u64,
-            BOUND_DESK_PDESKINFO,
-        );
-        let pci = read_volatile((w32thread + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-        if pci != 0 {
-            write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
+    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
+        let ppi = current_w32process();
+        if let Some((hdesk, desk_body, pdeskinfo)) =
+            selected_thread_desktop(process_role, ppi, w32thread)
+        {
+            publish_thread_desktop_binding(w32thread, hdesk, desk_body, pdeskinfo);
         }
     }
 
@@ -4156,12 +4148,26 @@ unsafe fn seed_inherited_process_window_station(process_index: usize) {
     }
 }
 
-unsafe fn publish_default_desktop(hdesk: u64, desk_body: u64) {
+unsafe fn publish_default_desktop(hdesk: u64, desk_body: u64, source: &[u8]) {
     if hdesk == 0 || desk_body == 0 {
         return;
     }
+    let old_hdesk = WIN32K_DEFAULT_DESKTOP_HANDLE.load(Ordering::Relaxed);
+    let old_body = WIN32K_DEFAULT_DESKTOP_BODY.load(Ordering::Relaxed);
     WIN32K_DEFAULT_DESKTOP_HANDLE.store(hdesk, Ordering::Relaxed);
     WIN32K_DEFAULT_DESKTOP_BODY.store(desk_body, Ordering::Relaxed);
+    if (old_hdesk != hdesk || old_body != desk_body)
+        && WIN32K_DEFAULT_DESKTOP_PUBLISHES.fetch_add(1, Ordering::Relaxed) < 16
+    {
+        print_str(b"[win32k-host] published default desktop from ");
+        print_str(source);
+        print_str(b" hDesk=0x");
+        print_hex(hdesk as u32);
+        print_str(b" body=0x");
+        print_hex((desk_body >> 32) as u32);
+        print_hex(desk_body as u32);
+        print_str(b"\n");
+    }
 }
 
 unsafe fn default_desktop() -> Option<(u64, u64)> {
@@ -4174,6 +4180,102 @@ unsafe fn default_desktop() -> Option<(u64, u64)> {
         return None;
     }
     Some((hdesk, desk_body))
+}
+
+unsafe fn ensure_desktop_runtime_fields(desk_body: u64) -> Option<u64> {
+    if desk_body == 0 {
+        return None;
+    }
+    if read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
+        write_volatile(
+            (desk_body + DESKTOP_PHEAP_OFF) as *mut u64,
+            WIN32K_HEAP_HANDLE,
+        );
+    }
+    let pdeskinfo = read_volatile((desk_body + 0x08) as *const u64);
+    if pdeskinfo == 0 {
+        return None;
+    }
+    if read_volatile(pdeskinfo as *const u64) == 0 {
+        write_volatile(pdeskinfo as *mut u64, WIN32K_HEAP_VADDR);
+        write_volatile(
+            (pdeskinfo + 0x08) as *mut u64,
+            WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
+        );
+    }
+    Some(pdeskinfo)
+}
+
+unsafe fn process_startup_desktop(ppi: u64) -> Option<(u64, u64, u64)> {
+    if ppi == 0 {
+        return None;
+    }
+    let hdesk = read_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *const u64);
+    let desk_body = read_volatile((ppi + PROCESSINFO_RPDESK_STARTUP_OFF) as *const u64);
+    if hdesk == 0 || desk_body == 0 {
+        return None;
+    }
+    if (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk) != desk_body {
+        return None;
+    }
+    ensure_desktop_runtime_fields(desk_body).map(|pdeskinfo| (hdesk, desk_body, pdeskinfo))
+}
+
+unsafe fn selected_thread_desktop(
+    process_role: u64,
+    ppi: u64,
+    pti: u64,
+) -> Option<(u64, u64, u64)> {
+    if pti == 0 {
+        return None;
+    }
+
+    let current_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+    let current_info = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
+    if current_body != 0 && current_info != 0 {
+        let current_hdesk = read_volatile((pti + THREADINFO_HDESK_OFF) as *const u64);
+        return Some((current_hdesk, current_body, current_info));
+    }
+
+    let shell_client = process_role == HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP
+        || process_role == HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL;
+    if shell_client {
+        if let Some(startup) = process_startup_desktop(ppi) {
+            return Some(startup);
+        }
+    }
+
+    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+        && BOUND_DESK_BODY != 0
+        && BOUND_DESK_PDESKINFO != 0
+    {
+        return Some((0, BOUND_DESK_BODY, BOUND_DESK_PDESKINFO));
+    }
+
+    process_startup_desktop(ppi)
+}
+
+unsafe fn publish_thread_desktop_binding(pti: u64, hdesk: u64, desk_body: u64, pdeskinfo: u64) {
+    if pti == 0 || desk_body == 0 || pdeskinfo == 0 {
+        return;
+    }
+    let Some(pdeskinfo) = ensure_desktop_runtime_fields(desk_body) else {
+        return;
+    };
+    write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, desk_body);
+    write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, pdeskinfo);
+    if hdesk != 0 {
+        write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, hdesk);
+    }
+    let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+    if pci != 0 {
+        write_volatile((pci + 0x20) as *mut u64, pdeskinfo);
+    }
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64,
+        pdeskinfo,
+    );
+    write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, pti);
 }
 
 unsafe fn seed_default_startup_desktop_for_process(ppi: u64, pti: u64) -> bool {
@@ -6436,68 +6538,17 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         write_volatile(head as *mut u64, head);
         write_volatile((head + 8) as *mut u64, head);
     }
-    // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
-    // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
-    // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent top-level dispatch.
-    //
-    // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
-    // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
-    // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
-    // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
-    // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
-    // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
-    // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
-    // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
-    // re-opens exactly this wall — so we restore both here (idempotent).
-    //
-    // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
-    // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
-    // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
-    // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
-    if top_level && BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
-        if BOUND_DESK_BODY != 0 {
-            write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
-            // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
-            // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
-            if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-                write_volatile(
-                    (BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64,
-                    WIN32K_HEAP_HANDLE,
-                );
-            }
+    // Reassert the selected client's own desktop binding before normal dispatch. Logon threads keep
+    // the secure desktop they established through NtUserSetThreadDesktop; shell clients inherit the
+    // process startup desktop that winlogon supplied through WinSta0\Default.
+    if top_level
+        && ssn != SSN_NT_USER_SET_THREAD_DESKTOP
+        && process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+    {
+        let ppi = current_w32process();
+        if let Some((hdesk, desk_body, pdeskinfo)) = selected_thread_desktop(process_role, ppi, t) {
+            publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);
         }
-        write_volatile(
-            (t + THREADINFO_PDESKINFO_OFF) as *mut u64,
-            BOUND_DESK_PDESKINFO,
-        );
-        let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-        if pci != 0 {
-            write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
-        }
-        // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING — bracket the bound DESKTOPINFO's window range over
-        // the WHOLE unified USER/desktop heap. In real win32k IntCreateDesktop sets
-        // pvDesktopBase/pvDesktopLimit to the per-desktop heap's [base,limit); our host allocates
-        // every window/class/handle-entry out of the single shared arena at WIN32K_HEAP_VADDR
-        // (s_rtl_allocate_heap ignores the desktop-heap handle). So the client-side
-        // DesktopPtrToUser range check (Ptr in [base,limit) → Ptr-ulClientDelta) must accept any
-        // heap-resident PWND/CLS: set base=heap start, limit=heap end. Idempotent (only sets when
-        // still zero). DESKTOPINFO: pvDesktopBase@0x00, pvDesktopLimit@0x08 (ntuser.h).
-        if read_volatile(BOUND_DESK_PDESKINFO as *const u64) == 0 {
-            write_volatile(BOUND_DESK_PDESKINFO as *mut u64, WIN32K_HEAP_VADDR);
-            write_volatile(
-                (BOUND_DESK_PDESKINFO + 0x08) as *mut u64,
-                WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
-            );
-        }
-        // Publish the two server-VA facts the executive needs to seed the GUI client's
-        // TEB.Win32ClientInfo (pDeskInfo = DESKTOPINFO−delta; Win32ThreadInfo = pti == head.pti),
-        // so user32's client-side ValidateHwnd/IntCallMessageProc resolve the SAS window and run
-        // its real SASWindowProc without a syscall. Written every dispatch (cheap, coherent frame).
-        write_volatile(
-            (WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64,
-            BOUND_DESK_PDESKINFO,
-        );
-        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, t);
     }
     if ssn == SSN_NT_USER_INITIALIZE_REAL {
         // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
@@ -7117,6 +7168,9 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 print_hex(desk_body as u32);
                 print_str(b"\n");
             }
+            if object_attributes_name_leaf_eq_ascii(a0, b"default") {
+                publish_default_desktop(hdesk, desk_body, b"NtUserCreateDesktop(Default)");
+            }
         }
     }
     // ★ BATCH 43 — LATCH the thread↔desktop connection winlogon's OWN NtUserSetThreadDesktop makes.
@@ -7725,7 +7779,7 @@ unsafe fn create_winsta_and_desktop() {
         let sret = switch(hdesk);
         let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
         if sret != 0 && gpdesk == desk_body {
-            publish_default_desktop(hdesk, desk_body);
+            publish_default_desktop(hdesk, desk_body, b"bootstrap");
         }
         print_str(b"[win32k-host] NtUserSwitchDesktop -> ret=0x");
         print_hex(sret as u32);
