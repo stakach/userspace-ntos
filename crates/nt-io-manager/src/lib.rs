@@ -13,6 +13,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use nt_status::NtStatus;
 use nt_types::{NtPath, ObjectId};
 
 mod cancel;
@@ -178,7 +179,13 @@ impl<P> IoManager<P> {
         self.devices.get_mut(id)
     }
     pub fn remove_device(&mut self, id: DeviceId) -> Option<DeviceRecord> {
-        self.devices.remove(id)
+        let record = self.devices.remove(id)?;
+        if let Some(driver) = self.drivers.get_mut(record.driver_id) {
+            driver.devices.retain(|device| *device != id);
+        }
+        self.clear_attachment_edges(id);
+        self.recompute_device_stacks();
+        Some(record)
     }
     pub fn device_count(&self) -> usize {
         self.devices.len()
@@ -206,6 +213,160 @@ impl<P> IoManager<P> {
             .get(driver)
             .map(|d| d.devices.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Attach `source` above the current top of `target`'s device stack, returning the lower device
+    /// that `source` attached to. This is the canonical record-level half of
+    /// `IoAttachDeviceToDeviceStack`; guest-visible WDM pointers are translated by the driver host.
+    pub fn attach_device_to_stack(
+        &mut self,
+        source: DeviceId,
+        target: DeviceId,
+    ) -> Result<DeviceId, NtStatus> {
+        if source == target {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let (source_delete_pending, source_attached) = match self.device(source) {
+            Some(device) => (device.delete_pending, device.attached_to.is_some()),
+            None => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        let lower = match self.device(target) {
+            Some(device) if !device.delete_pending => {
+                if self.device(device.top_of_stack).is_some() {
+                    device.top_of_stack
+                } else {
+                    target
+                }
+            }
+            Some(_) => return Err(NtStatus::DELETE_PENDING),
+            None => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        if source_delete_pending || self.device(lower).map(|d| d.delete_pending).unwrap_or(true) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        if source_attached || self.has_upper_attachment(source) || lower == source {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+
+        self.device_mut(source)
+            .expect("validated source")
+            .attached_to = Some(lower);
+        self.recompute_device_stacks();
+        Ok(lower)
+    }
+
+    /// Detach `source` from the lower device it is attached to, returning that lower device.
+    pub fn detach_device_from_stack(&mut self, source: DeviceId) -> Result<DeviceId, NtStatus> {
+        let lower = match self.device(source) {
+            Some(device) => device.attached_to.ok_or(NtStatus::INVALID_PARAMETER)?,
+            None => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        self.device_mut(source)
+            .expect("validated source")
+            .attached_to = None;
+        self.recompute_device_stacks();
+        Ok(lower)
+    }
+
+    /// Delete a device record when no open file references or upper attachments remain. If the
+    /// device is still referenced, mark it delete-pending and leave the record live.
+    pub fn delete_device(&mut self, id: DeviceId) -> Result<DeviceRecord, NtStatus> {
+        if self.device(id).is_none() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let referenced_by_file = self
+            .files
+            .iter()
+            .any(|(_, file)| file.device_id == id && !file.state.is_closed());
+        if referenced_by_file || self.has_upper_attachment(id) {
+            if let Some(device) = self.device_mut(id) {
+                device.delete_pending = true;
+            }
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        if self
+            .device(id)
+            .and_then(|device| device.attached_to)
+            .is_some()
+        {
+            let _ = self.detach_device_from_stack(id);
+        }
+        self.remove_device(id).ok_or(NtStatus::INVALID_PARAMETER)
+    }
+
+    fn clear_attachment_edges(&mut self, removed: DeviceId) {
+        let ids = self.devices.ids();
+        for id in ids {
+            if let Some(device) = self.devices.get_mut(id) {
+                if device.attached_to == Some(removed) {
+                    device.attached_to = None;
+                    device.stack_size = 1;
+                    device.top_of_stack = id;
+                }
+            }
+        }
+    }
+
+    fn has_upper_attachment(&self, lower: DeviceId) -> bool {
+        self.devices
+            .iter()
+            .any(|(_, device)| device.attached_to == Some(lower))
+    }
+
+    fn recompute_device_stacks(&mut self) {
+        let ids = self.devices.ids();
+        let mut updates = Vec::new();
+        for id in ids.iter().copied() {
+            updates.push((
+                id,
+                self.device_stack_size(id),
+                self.device_top_of_stack(id, &ids),
+            ));
+        }
+        for (id, stack_size, top_of_stack) in updates {
+            if let Some(device) = self.devices.get_mut(id) {
+                device.stack_size = stack_size;
+                device.top_of_stack = top_of_stack;
+            }
+        }
+    }
+
+    fn device_stack_size(&self, id: DeviceId) -> u8 {
+        let mut size = 1u8;
+        let mut current = id;
+        let mut guard = 0usize;
+        while guard < self.device_count() {
+            let Some(lower) = self.device(current).and_then(|device| device.attached_to) else {
+                break;
+            };
+            if self.device(lower).is_none() || lower == current {
+                break;
+            }
+            size = size.saturating_add(1);
+            current = lower;
+            guard += 1;
+        }
+        size
+    }
+
+    fn device_top_of_stack(&self, id: DeviceId, ids: &[DeviceId]) -> DeviceId {
+        let mut top = id;
+        let mut guard = 0usize;
+        while guard < ids.len() {
+            let Some(upper) = ids.iter().copied().find(|candidate| {
+                self.device(*candidate)
+                    .and_then(|device| device.attached_to)
+                    == Some(top)
+            }) else {
+                break;
+            };
+            if upper == top {
+                break;
+            }
+            top = upper;
+            guard += 1;
+        }
+        top
     }
 
     // --- Files -------------------------------------------------------------
@@ -292,6 +453,18 @@ mod tests {
         ))
     }
 
+    fn named_device(om: &mut IoManager<MockObjectPort>, driver: DriverId, name: &str) -> DeviceId {
+        om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            Some(path(name)),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ))
+    }
+
     #[test]
     fn driver_device_registration() {
         let mut om = io();
@@ -303,7 +476,7 @@ mod tests {
         let d = om.device(dev).unwrap();
         assert_eq!(d.id, dev);
         assert_eq!(d.driver_id, drv);
-        assert_eq!(d.top_of_stack, dev); // single-device stack (v0.1)
+        assert_eq!(d.top_of_stack, dev);
         assert_eq!(om.devices_of(drv), &[dev]);
         assert!(d.is_buffered_io());
     }
@@ -335,12 +508,100 @@ mod tests {
         assert!(om.remove_device(dev).is_some());
         assert!(om.device(dev).is_none()); // stale id no longer resolves
         assert!(om.remove_device(dev).is_none()); // double remove is a no-op
+        assert!(om.devices_of(drv).is_empty());
 
         // Reusing the slot yields a fresh id; the old id stays stale.
         let dev2 = a_device(&mut om, drv);
         assert_ne!(dev2, dev);
         assert!(om.device(dev).is_none());
         assert!(om.device(dev2).is_some());
+        assert_eq!(om.devices_of(drv), &[dev2]);
+    }
+
+    #[test]
+    fn attach_and_detach_device_stack_updates_all_top_links() {
+        let mut om = io();
+        let drv = a_driver(&mut om);
+        let lower = named_device(&mut om, drv, "\\Device\\Lower");
+        let filter = named_device(&mut om, drv, "\\Device\\Filter");
+        let upper = named_device(&mut om, drv, "\\Device\\Upper");
+
+        assert_eq!(om.attach_device_to_stack(filter, lower), Ok(lower));
+        assert_eq!(om.device(filter).unwrap().attached_to, Some(lower));
+        assert_eq!(om.device(filter).unwrap().stack_size, 2);
+        assert_eq!(om.device(lower).unwrap().top_of_stack, filter);
+        assert_eq!(om.device(filter).unwrap().top_of_stack, filter);
+
+        assert_eq!(om.attach_device_to_stack(upper, lower), Ok(filter));
+        assert_eq!(om.device(upper).unwrap().attached_to, Some(filter));
+        assert_eq!(om.device(upper).unwrap().stack_size, 3);
+        assert_eq!(om.device(lower).unwrap().top_of_stack, upper);
+        assert_eq!(om.device(filter).unwrap().top_of_stack, upper);
+        assert_eq!(om.device(upper).unwrap().top_of_stack, upper);
+
+        assert_eq!(om.detach_device_from_stack(upper), Ok(filter));
+        assert_eq!(om.device(upper).unwrap().attached_to, None);
+        assert_eq!(om.device(upper).unwrap().top_of_stack, upper);
+        assert_eq!(om.device(upper).unwrap().stack_size, 1);
+        assert_eq!(om.device(lower).unwrap().top_of_stack, filter);
+        assert_eq!(om.device(filter).unwrap().top_of_stack, filter);
+    }
+
+    #[test]
+    fn delete_device_marks_pending_until_references_detach() {
+        let mut om = io();
+        let drv = a_driver(&mut om);
+        let lower = named_device(&mut om, drv, "\\Device\\Lower");
+        let upper = named_device(&mut om, drv, "\\Device\\Upper");
+        assert_eq!(om.attach_device_to_stack(upper, lower), Ok(lower));
+
+        assert_eq!(
+            om.delete_device(lower).err(),
+            Some(NtStatus::DELETE_PENDING)
+        );
+        assert!(om.device(lower).unwrap().delete_pending);
+        assert!(om.device(lower).is_some());
+
+        assert_eq!(om.detach_device_from_stack(upper), Ok(lower));
+        assert!(om.delete_device(upper).is_ok());
+        assert!(om.device(upper).is_none());
+        assert!(!om.devices_of(drv).contains(&upper));
+
+        assert!(om.delete_device(lower).is_ok());
+        assert!(om.device(lower).is_none());
+        assert!(om.devices_of(drv).is_empty());
+    }
+
+    #[test]
+    fn delete_device_waits_for_open_files() {
+        let mut om = io();
+        let client = om.register_client();
+        let drv = om
+            .create_driver(&path("\\Driver\\Refs"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        let dev = om
+            .create_device(
+                drv,
+                Some(&path("\\Device\\Refs")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let _handle = om
+            .open(
+                client,
+                &path("\\Device\\Refs"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(om.delete_device(dev).err(), Some(NtStatus::DELETE_PENDING));
+        assert!(om.device(dev).unwrap().delete_pending);
     }
 
     #[test]

@@ -45,8 +45,9 @@ bitflags::bitflags! {
 }
 
 /// Canonical I/O Manager device record (spec §11.1). `object_id` points at the
-/// Object Manager `Device` object. For v0.1 there are no attachment stacks:
-/// `top_of_stack == id` and `attached_to == None`.
+/// Object Manager `Device` object. Attachment stacks are represented by the
+/// lower device in `attached_to`; every live device records the current
+/// `top_of_stack` for fast dispatch/open routing.
 pub struct DeviceRecord {
     pub id: DeviceId,
     pub object_id: ObjectId,

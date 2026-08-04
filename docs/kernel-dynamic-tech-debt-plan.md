@@ -1621,3 +1621,21 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   remains open for making this projection boundary part of canonical I/O Manager/driver-host
   lifetime, including `IoDeleteDevice`, unload cleanup, and real device-stack attachment; D3 remains
   the real videoprt/miniport-created video stack.
+- D1 continued. Device lifetime and stack ownership now have canonical I/O Manager APIs instead of
+  raw store removal. `remove_device` unlinks the owning driver's device list and clears stale stack
+  edges; `attach_device_to_stack`, `detach_device_from_stack`, and `delete_device` maintain
+  `attached_to`, `top_of_stack`, `stack_size`, and `delete_pending` invariants with host tests for
+  stale ids, stacked filters, detach, and open-file delete-pending behavior. Hosted ntoskrnl exports
+  now bind `IoDeleteDevice`, `IoAttachDeviceToDeviceStack`, and `IoDetachDevice` explicitly: registered
+  devices update canonical I/O Manager state before freeing/unlinking their component-local WDM
+  projections, pre-registration DriverEntry cleanup clears the shared capture, and mixed known/unknown
+  attach requests fail with `NULL` rather than falling through to the old fail-soft import path.
+  Validation: `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, `cargo fmt --manifest-path
+  components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-driver-device-lifetime-stack-20260804.log` reached `RUN_RC=0`, `247/280
+  executive->isolated-service checks passed`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_irp_transport_call_bound`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for real driver unload/SCM stop lifetime and Object Manager device-object teardown;
+  D3 remains the real videoprt/miniport-created video stack.

@@ -1053,6 +1053,93 @@ extern "win64" fn s_io_create_device(
     0 // STATUS_SUCCESS
 }
 
+/// `void IoDeleteDevice(PDEVICE_OBJECT)`.
+extern "win64" fn s_io_delete_device(dev: u64) {
+    if dev == 0 {
+        return;
+    }
+    unsafe {
+        if let Some((index, inst)) = instance_by_device_object(dev) {
+            if inst.device_id != 0 {
+                match io_manager_mut().delete_device(nt_io_manager::DeviceId(inst.device_id)) {
+                    Ok(_) => {
+                        let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
+                        table[index].device_id = 0;
+                        table[index].device_object = 0;
+                        table[index].ready = false;
+                    }
+                    Err(nt_status::NtStatus::DELETE_PENDING) => return,
+                    Err(_) => return,
+                }
+            }
+        }
+
+        crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
+        if read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == dev {
+            write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
+            clear_shared_path_len(SH_DEVICE_NAME_LEN);
+            let verdict = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32)
+                & !(V_DEVICE | V_NAMED_DEVICE);
+            write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, verdict);
+        }
+    }
+}
+
+/// `PDEVICE_OBJECT IoAttachDeviceToDeviceStack(PDEVICE_OBJECT SourceDevice, PDEVICE_OBJECT TargetDevice)`.
+extern "win64" fn s_io_attach_device_to_device_stack(source: u64, target: u64) -> u64 {
+    unsafe {
+        let lower = match crate::hosted_driver_projection::attach_hosted_device_projection(
+            source, target,
+        ) {
+            Some(lower) => lower,
+            None => return 0,
+        };
+
+        let source_instance = instance_by_device_object(source);
+        let target_instance = instance_by_device_object(target);
+        match (source_instance, target_instance) {
+            (Some((_, source_inst)), Some((_, target_inst)))
+                if source_inst.device_id != 0 && target_inst.device_id != 0 =>
+            {
+                match io_manager_mut().attach_device_to_stack(
+                    nt_io_manager::DeviceId(source_inst.device_id),
+                    nt_io_manager::DeviceId(target_inst.device_id),
+                ) {
+                    Ok(lower_id) => instance_by_device_id(lower_id.raw())
+                        .map(|(_, inst)| inst.device_object)
+                        .unwrap_or(lower),
+                    Err(_) => {
+                        crate::hosted_driver_projection::detach_hosted_device_projection(lower);
+                        0
+                    }
+                }
+            }
+            (None, None) => lower,
+            _ => {
+                crate::hosted_driver_projection::detach_hosted_device_projection(lower);
+                0
+            }
+        }
+    }
+}
+
+/// `void IoDetachDevice(PDEVICE_OBJECT TargetDevice)`.
+extern "win64" fn s_io_detach_device(lower: u64) {
+    if lower == 0 {
+        return;
+    }
+    unsafe {
+        let upper = crate::hosted_driver_projection::hosted_attached_device(lower);
+        if let Some((_, upper_inst)) = instance_by_device_object(upper) {
+            if upper_inst.device_id != 0 {
+                let _ = io_manager_mut()
+                    .detach_device_from_stack(nt_io_manager::DeviceId(upper_inst.device_id));
+            }
+        }
+        crate::hosted_driver_projection::detach_hosted_device_projection(lower);
+    }
+}
+
 /// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
 /// link so the executive can publish it through the kernel object namespace after DriverEntry.
 extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
@@ -1478,6 +1565,18 @@ fn register_fsd_trampolines() {
     );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
     reg.bind("IoCreateDevice", s_io_create_device as usize as u64);
+    reg.bind(
+        "IoDeleteDevice",
+        s_io_delete_device as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoAttachDeviceToDeviceStack",
+        s_io_attach_device_to_device_stack as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoDetachDevice",
+        s_io_detach_device as *const () as usize as u64,
+    );
     reg.bind(
         "IoCreateSymbolicLink",
         s_io_create_symbolic_link as usize as u64,
@@ -3136,6 +3235,14 @@ fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
         .copied()
         .enumerate()
         .find(|(_, entry)| entry.used && entry.device_id == device_id)
+}
+
+fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {
+    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    t.iter()
+        .copied()
+        .enumerate()
+        .find(|(_, entry)| entry.used && entry.device_object == device_object)
 }
 
 fn device_id_by_name(path: &str) -> Option<u64> {
