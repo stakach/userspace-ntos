@@ -30,6 +30,9 @@ pub trait ObjectManagerPort {
         owner_local_id: u64,
     ) -> Result<ObjectId, NtStatus>;
 
+    /// Delete a `Driver` object during driver unload.
+    fn delete_driver_object(&mut self, object: ObjectId, name: &NtPath) -> Result<(), NtStatus>;
+
     /// Create a `Device` object, named under `\Device` (or unnamed for tests).
     /// `owner_local_id` is the I/O Manager's `DeviceId`.
     fn create_device_object(
@@ -37,6 +40,13 @@ pub trait ObjectManagerPort {
         name: Option<&NtPath>,
         owner_local_id: u64,
     ) -> Result<ObjectId, NtStatus>;
+
+    /// Delete a `Device` object during `IoDeleteDevice`/driver unload.
+    fn delete_device_object(
+        &mut self,
+        object: ObjectId,
+        name: Option<&NtPath>,
+    ) -> Result<(), NtStatus>;
 
     /// Resolve a device path (following symbolic links) to its `Device` object.
     fn open_device_object(&mut self, path: &NtPath) -> Result<ObjectId, NtStatus>;
@@ -150,6 +160,17 @@ impl ObjectManagerPort for MockObjectPort {
         Ok(id)
     }
 
+    fn delete_driver_object(&mut self, object: ObjectId, name: &NtPath) -> Result<(), NtStatus> {
+        let before = self.drivers.len();
+        self.drivers
+            .retain(|(path, id)| id != &object && path != name);
+        if self.drivers.len() == before {
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        } else {
+            Ok(())
+        }
+    }
+
     fn create_device_object(
         &mut self,
         name: Option<&NtPath>,
@@ -164,6 +185,26 @@ impl ObjectManagerPort for MockObjectPort {
         }
         self.device_ids.push(id);
         Ok(id)
+    }
+
+    fn delete_device_object(
+        &mut self,
+        object: ObjectId,
+        name: Option<&NtPath>,
+    ) -> Result<(), NtStatus> {
+        let before_ids = self.device_ids.len();
+        self.device_ids.retain(|id| id != &object);
+        if let Some(name) = name {
+            self.devices
+                .retain(|(path, id)| id != &object && path != name);
+        } else {
+            self.devices.retain(|(_, id)| id != &object);
+        }
+        if self.device_ids.len() == before_ids {
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        } else {
+            Ok(())
+        }
     }
 
     fn open_device_object(&mut self, path: &NtPath) -> Result<ObjectId, NtStatus> {
@@ -322,6 +363,16 @@ mod library {
             Ok(r.id())
         }
 
+        fn delete_driver_object(
+            &mut self,
+            _object: ObjectId,
+            name: &NtPath,
+        ) -> Result<(), NtStatus> {
+            let (parent, leaf) = self.split(name)?;
+            self.om.remove_named_object(&parent, &leaf, CI)?;
+            Ok(())
+        }
+
         fn create_device_object(
             &mut self,
             name: Option<&NtPath>,
@@ -333,6 +384,17 @@ mod library {
                 .om
                 .create_device(&parent, &leaf, self.component, owner_local_id, true)?;
             Ok(r.id())
+        }
+
+        fn delete_device_object(
+            &mut self,
+            _object: ObjectId,
+            name: Option<&NtPath>,
+        ) -> Result<(), NtStatus> {
+            let name = name.ok_or(NtStatus::INVALID_PARAMETER)?;
+            let (parent, leaf) = self.split(name)?;
+            self.om.remove_named_object(&parent, &leaf, CI)?;
+            Ok(())
         }
 
         fn open_device_object(&mut self, path: &NtPath) -> Result<ObjectId, NtStatus> {

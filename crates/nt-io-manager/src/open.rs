@@ -6,6 +6,7 @@
 //! the File object + IRP on failure so no reference or record leaks.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use nt_io_abi::major;
 use nt_status::NtStatus;
@@ -14,7 +15,8 @@ use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
 use crate::device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 use crate::dispatch::{DispatchOutcome, DriverDispatchBackend};
 use crate::driver::{
-    DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, MajorFunctionTable, MockDispatchId,
+    DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, DriverUnloadState,
+    MajorFunctionTable, MockDispatchId,
 };
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
 use crate::irp::{CreateParameters, IoParameters, IoStackLocation, IrpRecord, IrpState};
@@ -129,6 +131,59 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 Err(e)
             }
         }
+    }
+
+    /// Destroy a device through the I/O Manager and Object Manager. If open files or upper
+    /// attachments still reference it, the record is left live and marked delete-pending.
+    pub fn destroy_device(&mut self, device: DeviceId) -> Result<DeviceRecord, NtStatus> {
+        let record = self.delete_device(device)?;
+        if record.object_id != ObjectId::NULL {
+            self.port
+                .delete_device_object(record.object_id, record.name.as_ref())?;
+        }
+        Ok(record)
+    }
+
+    /// Mark a driver unload requested and mark its devices delete-pending.
+    pub fn request_driver_unload(&mut self, driver: DriverId) -> Result<(), NtStatus> {
+        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
+        let record = self.driver_mut(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if record.unload_state == DriverUnloadState::Unloaded {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        record.unload_state = DriverUnloadState::UnloadRequested;
+        for device in devices {
+            if let Some(record) = self.device_mut(device) {
+                record.delete_pending = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete a driver unload when all owned devices are free of open files and upper attachments.
+    /// This tears down Object Manager device/driver objects as well as I/O Manager records.
+    pub fn destroy_driver(&mut self, driver: DriverId) -> Result<DriverRecord, NtStatus> {
+        self.request_driver_unload(driver)?;
+        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
+        if devices
+            .iter()
+            .any(|device| self.device_has_live_files(*device) || self.has_upper_attachment(*device))
+        {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+
+        for device in devices {
+            self.destroy_device(device)?;
+        }
+        let mut record = self
+            .remove_driver(driver)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        record.unload_state = DriverUnloadState::Unloaded;
+        if record.object_id != ObjectId::NULL {
+            self.port
+                .delete_driver_object(record.object_id, &record.name)?;
+        }
+        Ok(record)
     }
 
     /// Create a symbolic link through the Object Manager (spec §11.4).

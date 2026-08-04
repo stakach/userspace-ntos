@@ -1639,3 +1639,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
   remains open for real driver unload/SCM stop lifetime and Object Manager device-object teardown;
   D3 remains the real videoprt/miniport-created video stack.
+- D1 continued. `nt-io-manager` now has Object Manager-aware teardown APIs for driver/device
+  lifetime. The Object Manager port contract can delete named `Driver` and `Device` objects; the mock
+  port and library adapter implement those deletes, and `destroy_device`, `request_driver_unload`,
+  and `destroy_driver` drive delete-pending state, owned device removal, namespace teardown, and
+  `DriverUnloadState::Unloaded` without half-unloading a driver that still has open device references.
+  Host tests cover device route removal, full driver unload with multiple devices, and unload refusal
+  while an open file still references a device. Validation: `cargo test --manifest-path
+  crates/nt-io-manager/Cargo.toml` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: the live
+  executive still instantiates `IoManager<()>`, so D1 remains open for switching the executive to a
+  real Object Manager port and routing `NtUnloadDriver`/SCM stop through `destroy_driver`; D3 remains
+  the real videoprt/miniport-created video stack.

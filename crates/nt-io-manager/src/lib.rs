@@ -274,11 +274,7 @@ impl<P> IoManager<P> {
         if self.device(id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let referenced_by_file = self
-            .files
-            .iter()
-            .any(|(_, file)| file.device_id == id && !file.state.is_closed());
-        if referenced_by_file || self.has_upper_attachment(id) {
+        if self.device_has_live_files(id) || self.has_upper_attachment(id) {
             if let Some(device) = self.device_mut(id) {
                 device.delete_pending = true;
             }
@@ -311,6 +307,12 @@ impl<P> IoManager<P> {
         self.devices
             .iter()
             .any(|(_, device)| device.attached_to == Some(lower))
+    }
+
+    fn device_has_live_files(&self, id: DeviceId) -> bool {
+        self.files
+            .iter()
+            .any(|(_, file)| file.device_id == id && !file.state.is_closed())
     }
 
     fn recompute_device_stacks(&mut self) {
@@ -602,6 +604,121 @@ mod tests {
 
         assert_eq!(om.delete_device(dev).err(), Some(NtStatus::DELETE_PENDING));
         assert!(om.device(dev).unwrap().delete_pending);
+    }
+
+    #[test]
+    fn destroy_device_removes_object_manager_route() {
+        let mut om = io();
+        let drv = om
+            .create_driver(
+                &path("\\Driver\\DeleteOne"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let dev = om
+            .create_device(
+                drv,
+                Some(&path("\\Device\\DeleteOne")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+
+        assert!(om.destroy_device(dev).is_ok());
+        assert!(om.device(dev).is_none());
+        assert!(om.devices_of(drv).is_empty());
+        assert_eq!(
+            om.port_mut()
+                .open_device_object(&path("\\Device\\DeleteOne")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn destroy_driver_removes_devices_and_driver_record() {
+        let mut om = io();
+        let drv = om
+            .create_driver(
+                &path("\\Driver\\Unloadable"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let dev0 = om
+            .create_device(
+                drv,
+                Some(&path("\\Device\\Unload0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let dev1 = om
+            .create_device(
+                drv,
+                Some(&path("\\Device\\Unload1")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+
+        let record = om.destroy_driver(drv).unwrap();
+        assert_eq!(record.unload_state, DriverUnloadState::Unloaded);
+        assert!(om.driver(drv).is_none());
+        assert!(om.device(dev0).is_none());
+        assert!(om.device(dev1).is_none());
+        assert_eq!(
+            om.port_mut().open_device_object(&path("\\Device\\Unload0")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            om.port_mut().open_device_object(&path("\\Device\\Unload1")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn destroy_driver_waits_for_open_device_references() {
+        let mut om = io();
+        let client = om.register_client();
+        let drv = om
+            .create_driver(&path("\\Driver\\Busy"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        let dev = om
+            .create_device(
+                drv,
+                Some(&path("\\Device\\Busy")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        let _handle = om
+            .open(
+                client,
+                &path("\\Device\\Busy"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(om.destroy_driver(drv).err(), Some(NtStatus::DELETE_PENDING));
+        assert_eq!(
+            om.driver(drv).unwrap().unload_state,
+            DriverUnloadState::UnloadRequested
+        );
+        assert!(om.device(dev).unwrap().delete_pending);
+        assert_eq!(
+            om.port_mut().open_device_object(&path("\\Device\\Busy")),
+            Ok(om.device(dev).unwrap().object_id)
+        );
     }
 
     #[test]
