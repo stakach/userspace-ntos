@@ -3287,9 +3287,9 @@ pub(crate) unsafe fn service_sec_image(
         // LSA RPC bind PDU and answers `LsarOpenPolicy` for lsass' own self-RPC.
         let is_lsa_worker = badge == LSA_WORKER_BADGE;
         // Generic workers have one badge per process and slot. The first five processes keep the
-        // legacy dense range (slot 0: 16..20, slot 1: 21..25); later hosted processes use the aux
-        // range decoded by tp_worker_identity_from_badge. The role is orthogonal to listener
-        // recognizers: it shares process state and mirrors, but not
+        // legacy dense range for slot 0 (16..20) and slot 1 (21..25); extra slots and later hosted
+        // processes use the aux range decoded by tp_worker_identity_from_badge. The role is
+        // orthogonal to listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);

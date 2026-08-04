@@ -500,14 +500,18 @@ pub const LSA_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1399_0000;
 /// just past the LSA worker's own mirror window (0x1399_0000 + 10 pages).
 pub const LSA_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_139A_0000;
 /// The fault-EP badge for lsass' per-connection LSA RPC worker — the loop maps it to (pi 4, worker),
-/// switching ACTIVE_STACK_MIRROR to the worker's own mirror. Next free after the generic TP worker
-/// badges (16..25).
+/// switching ACTIVE_STACK_MIRROR to the worker's own mirror. Kept just above the legacy generic
+/// worker badge range (slots 0/1, badges 16..25); additional generic slots use the aux badge range.
 pub const LSA_WORKER_BADGE: u64 = 26;
 const _: () = {
-    // The worker's target window must not alias the generic TP worker slot-1 window in the SAME
-    // VSpace, and its executive-side mirror + scratch must stay inside the 0x1380 mirror PT and
-    // clear of both the SCM worker's mirror (0x1398) and TP_WORKER_EXEC_BASE (0x13A0).
-    assert!(LSA_WORKER_REGION_BASE >= TP_WORKER_SLOT1_REGION_BASE + 0x4_0000);
+    // The worker's target window must not alias any generic TP worker high-slot window in the SAME
+    // VSpace, and its executive-side mirror + scratch must stay inside the 0x1380 mirror PT and clear
+    // of both the SCM worker's mirror (0x1398) and TP_WORKER_EXEC_BASE (0x13A0).
+    assert!(
+        LSA_WORKER_REGION_BASE
+            >= TP_WORKER_SLOT1_REGION_BASE
+                + (TP_WORKER_SLOT_COUNT as u64 - 1) * TP_WORKER_EXEC_STRIDE
+    );
     assert!(
         LSA_WORKER_STACK_MIRROR_VA >= SCM_WORKER_STACK_MIRROR_VA + SCM_WORKER_STACK_FRAMES * 0x1000
     );
@@ -525,7 +529,8 @@ const _: () = {
 // target is the current process can use this generic layout at the same target VAs in each process
 // (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
 pub const TP_WORKER_PI_COUNT: usize = 5;
-pub const TP_WORKER_SLOT_COUNT: usize = 2;
+pub const TP_WORKER_LEGACY_SLOT_COUNT: usize = 2;
+pub const TP_WORKER_SLOT_COUNT: usize = 5;
 pub const TP_WORKER_BADGE_BASE: u64 = 16;
 pub const TP_WORKER_AUX_BADGE_BASE: u64 = 0x200;
 pub const TP_WORKER_STACK_BASE: u64 = 0x0000_0100_1058_0000;
@@ -544,44 +549,69 @@ pub const TP_WORKER_SLOT1_IPCBUF_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x1_000
 pub const TP_WORKER_SLOT1_TEB_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x2_0000;
 pub const TP_WORKER_SLOT1_TRAMP_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x3_0000;
 pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
-/// Executive-side windows for hosted-process indices beyond the first five. The two legacy
-/// `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and are only disjoint for
-/// `pi < TP_WORKER_PI_COUNT`; later hosted processes would otherwise alias slot 1's window. Those
-/// indices get their own densely-packed `(pi, slot)` region here: a genuinely free 32 MiB gap
-/// between the file-buffer POOL (`0x1500`+24*2 MiB = `0x1800`)
-/// and `FSD_EXEC_BASE` (`0x1A00`). `pi < TP_WORKER_PI_COUNT` is byte-identical to before.
+/// Executive-side windows for worker identities outside the legacy slot-0/slot-1, first-five-pi
+/// layout. The two legacy `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and
+/// are only disjoint for `pi < TP_WORKER_PI_COUNT`; later hosted processes and extra worker slots get
+/// densely-packed `(pi, slot)` regions here: a genuinely free 32 MiB gap between the file-buffer POOL
+/// (`0x1500`+24*2 MiB = `0x1800`) and `FSD_EXEC_BASE` (`0x1A00`). Legacy slots for
+/// `pi < TP_WORKER_PI_COUNT` are byte-identical to before.
 pub const TP_WORKER_AUX_EXEC_BASE: u64 = 0x0000_0100_1800_0000;
 
 #[inline]
-pub const fn tp_worker_badge(pi: usize, slot: usize) -> u64 {
+pub const fn tp_worker_aux_index(pi: usize, slot: usize) -> usize {
     if pi < TP_WORKER_PI_COUNT {
+        (slot - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT + pi
+    } else {
+        (TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT
+            + (pi - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT
+            + slot
+    }
+}
+
+#[inline]
+pub const fn tp_worker_badge(pi: usize, slot: usize) -> u64 {
+    if pi < TP_WORKER_PI_COUNT && slot < TP_WORKER_LEGACY_SLOT_COUNT {
         TP_WORKER_BADGE_BASE + slot as u64 * TP_WORKER_PI_COUNT as u64 + pi as u64
     } else {
-        let index = (pi - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT + slot;
-        TP_WORKER_AUX_BADGE_BASE + index as u64
+        TP_WORKER_AUX_BADGE_BASE + tp_worker_aux_index(pi, slot) as u64
     }
 }
 
 #[inline]
 pub const fn tp_worker_identity_from_badge(badge: u64) -> Option<(usize, usize)> {
     let offset = badge.wrapping_sub(TP_WORKER_BADGE_BASE);
-    if offset < (TP_WORKER_PI_COUNT * TP_WORKER_SLOT_COUNT) as u64 {
+    if offset < (TP_WORKER_PI_COUNT * TP_WORKER_LEGACY_SLOT_COUNT) as u64 {
         Some((
             offset as usize % TP_WORKER_PI_COUNT,
             offset as usize / TP_WORKER_PI_COUNT,
         ))
     } else {
         let aux_offset = badge.wrapping_sub(TP_WORKER_AUX_BADGE_BASE);
-        if aux_offset < ((MAX_PI - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT) as u64 {
+        let live_extra = (TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT;
+        if aux_offset < live_extra as u64 {
             let index = aux_offset as usize;
             Some((
-                TP_WORKER_PI_COUNT + index / TP_WORKER_SLOT_COUNT,
-                index % TP_WORKER_SLOT_COUNT,
+                index % TP_WORKER_PI_COUNT,
+                TP_WORKER_LEGACY_SLOT_COUNT + index / TP_WORKER_PI_COUNT,
             ))
         } else {
-            None
+            let later_offset = aux_offset - live_extra as u64;
+            if later_offset < ((MAX_PI - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT) as u64 {
+                let index = later_offset as usize;
+                Some((
+                    TP_WORKER_PI_COUNT + index / TP_WORKER_SLOT_COUNT,
+                    index % TP_WORKER_SLOT_COUNT,
+                ))
+            } else {
+                None
+            }
         }
     }
+}
+
+#[inline]
+pub const fn tp_worker_high_region_base(slot: usize) -> u64 {
+    TP_WORKER_SLOT1_REGION_BASE + (slot as u64 - 1) * TP_WORKER_EXEC_STRIDE
 }
 
 #[inline]
@@ -589,7 +619,7 @@ pub const fn tp_worker_stack_base(slot: usize) -> u64 {
     if slot == 0 {
         TP_WORKER_STACK_BASE
     } else {
-        TP_WORKER_SLOT1_STACK_BASE
+        tp_worker_high_region_base(slot)
     }
 }
 
@@ -608,7 +638,7 @@ pub const fn tp_worker_ipcbuf_va(slot: usize) -> u64 {
     if slot == 0 {
         TP_WORKER_IPCBUF_VA
     } else {
-        TP_WORKER_SLOT1_IPCBUF_VA
+        tp_worker_high_region_base(slot) + 0x1_0000
     }
 }
 
@@ -617,7 +647,7 @@ pub const fn tp_worker_teb_va(slot: usize) -> u64 {
     if slot == 0 {
         TP_WORKER_TEB_VA
     } else {
-        TP_WORKER_SLOT1_TEB_VA
+        tp_worker_high_region_base(slot) + 0x2_0000
     }
 }
 
@@ -626,24 +656,22 @@ pub const fn tp_worker_tramp_va(slot: usize) -> u64 {
     if slot == 0 {
         TP_WORKER_TRAMP_VA
     } else {
-        TP_WORKER_SLOT1_TRAMP_VA
+        tp_worker_high_region_base(slot) + 0x3_0000
     }
 }
 
 #[inline]
 pub const fn tp_worker_stack_mirror_va(pi: usize, slot: usize) -> u64 {
-    if pi >= TP_WORKER_PI_COUNT {
-        // Later hosted processes use their own densely-packed region (see TP_WORKER_AUX_EXEC_BASE);
-        // it never aliases the two legacy per-slot regions.
-        let index = (pi - TP_WORKER_PI_COUNT) * TP_WORKER_SLOT_COUNT + slot;
-        return TP_WORKER_AUX_EXEC_BASE + index as u64 * TP_WORKER_EXEC_STRIDE;
-    }
-    let base = if slot == 0 {
-        TP_WORKER_EXEC_BASE
+    if pi < TP_WORKER_PI_COUNT && slot < TP_WORKER_LEGACY_SLOT_COUNT {
+        let base = if slot == 0 {
+            TP_WORKER_EXEC_BASE
+        } else {
+            TP_WORKER_SLOT1_EXEC_BASE
+        };
+        base + pi as u64 * TP_WORKER_EXEC_STRIDE
     } else {
-        TP_WORKER_SLOT1_EXEC_BASE
-    };
-    base + pi as u64 * TP_WORKER_EXEC_STRIDE
+        TP_WORKER_AUX_EXEC_BASE + tp_worker_aux_index(pi, slot) as u64 * TP_WORKER_EXEC_STRIDE
+    }
 }
 
 #[inline]
@@ -689,6 +717,7 @@ const _: () = {
     assert!(
         nt_syscall_abi::native_ipc_buffer_va(TP_WORKER_SLOT1_TEB_VA) == TP_WORKER_SLOT1_IPCBUF_VA
     );
+    assert!(nt_syscall_abi::native_ipc_buffer_va(tp_worker_teb_va(4)) == tp_worker_ipcbuf_va(4));
     assert!(SM_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
     assert!(SM_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
@@ -737,11 +766,15 @@ const _: () = {
     assert!(TP_WORKER_STACK_BASE >= WORK_CLUSTER_BASE);
     assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
     assert!(TP_WORKER_AUX_BADGE_BASE >= 0x100);
+    assert!(TP_WORKER_SLOT_COUNT > TP_WORKER_LEGACY_SLOT_COUNT);
+    assert!(TP_WORKER_SLOT_COUNT <= 5);
     assert!(tp_worker_badge(0, 0) == 16);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 0) == 20);
     assert!(tp_worker_badge(0, 1) == 21);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 1) == 25);
-    assert!(tp_worker_badge(TP_WORKER_PI_COUNT, 0) == TP_WORKER_AUX_BADGE_BASE);
+    assert!(tp_worker_badge(0, 2) == TP_WORKER_AUX_BADGE_BASE);
+    assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 2) == TP_WORKER_AUX_BADGE_BASE + 4);
+    assert!(tp_worker_badge(TP_WORKER_PI_COUNT, 0) == TP_WORKER_AUX_BADGE_BASE + 15);
     match tp_worker_identity_from_badge(tp_worker_badge(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1)) {
         Some((pi, slot)) => {
             assert!(pi == MAX_PI - 1);
@@ -759,19 +792,30 @@ const _: () = {
             <= TP_WORKER_EXEC_BASE + 0x20_0000
     );
     assert!(TP_WORKER_SLOT1_REGION_BASE & 0x1f_ffff == 0);
-    assert!(TP_WORKER_SLOT1_TRAMP_VA + 0x1000 <= TP_WORKER_SLOT1_REGION_BASE + 0x20_0000);
+    assert!(tp_worker_tramp_va(TP_WORKER_SLOT_COUNT - 1) + 0x1000 <= LSA_WORKER_REGION_BASE);
     assert!(
         tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 1) + 0x4000
             <= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000
     );
-    // The AUX region (throwaway/self-test process indices) must not alias either live region, and
-    // must stay inside the free 32 MiB gap [POOL end 0x1800_0000, FSD_EXEC_BASE 0x1A00_0000).
+    assert!(
+        tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT - 1, TP_WORKER_LEGACY_SLOT_COUNT)
+            >= TP_WORKER_AUX_EXEC_BASE
+    );
+    // The AUX region must not alias either legacy mirror region, and must stay inside the free 32 MiB
+    // gap [POOL end 0x1800_0000, FSD_EXEC_BASE 0x1A00_0000).
     assert!(TP_WORKER_AUX_EXEC_BASE >= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
     assert!(
         tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
             <= 0x0000_0100_1A00_0000
     );
-    assert!(tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0) == TP_WORKER_AUX_EXEC_BASE);
+    assert!(tp_worker_stack_mirror_va(0, TP_WORKER_LEGACY_SLOT_COUNT) == TP_WORKER_AUX_EXEC_BASE);
+    assert!(
+        tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT, 0)
+            == TP_WORKER_AUX_EXEC_BASE
+                + ((TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT)
+                    as u64
+                    * TP_WORKER_EXEC_STRIDE
+    );
 };
 
 /// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
