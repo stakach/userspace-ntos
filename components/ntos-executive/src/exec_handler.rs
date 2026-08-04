@@ -874,32 +874,6 @@ impl ExecNtHandler {
         print_str(b", from HKLM\\SYSTEM\\...\\Nls\\Language\\Default)\n");
     }
 
-    /// `userenv!CreateEnvironmentBlock` opens `HKCU\Volatile Environment` after the profile hive is
-    /// loaded. ReactOS' profile creation path copies `config\default` into `ntuser.dat`, and that
-    /// prototype hive has `Environment` but not the logon-session volatile key. On NT the session
-    /// manager/profile machinery creates the key dynamically; model that as a write overlay child of
-    /// the mounted user hive, so normal `NtOpenKey`/`NtQueryKey` traffic sees an empty real key.
-    unsafe fn provision_user_volatile_environment(&mut self, mount_path: &str) {
-        if !PROVISION_USER_VOLATILE_ENVIRONMENT {
-            return;
-        }
-        let mut full = alloc::string::String::from(mount_path);
-        full.push_str("\\Volatile Environment");
-        let canon = self.overlay_canon(&full);
-        if self.overlay.find(&canon).is_none() && self.overlay.len() >= OVERLAY_KEY_MAX as usize {
-            print_str(b"[cm-load] volatile environment provision skipped: overlay full\n");
-            return;
-        }
-        let (_, created) = self.overlay.create(&canon);
-        self.overlay_dirty = true;
-        if created {
-            USER_VOLATILE_ENV_PROVISIONED.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-load] provisioned ");
-            print_ascii_str(&full);
-            print_str(b"\n");
-        }
-    }
-
     fn is_dynamic_user_volatile_env_canon(canon: &str) -> bool {
         canon.starts_with(r"\registry\user\s-") && canon.ends_with(r"\volatile environment")
     }
@@ -1607,9 +1581,7 @@ impl ExecNtHandler {
         // value with the SAME value in the `.Default` prototype the profile hive was copied from.
         // Byte-for-byte equality of a non-empty value is what makes "a REAL hive is mounted here"
         // a measurement instead of a claim.
-        let mount_path = self.hive_mounts[self.hive_mounts.len() - 1].mount.clone();
-        self.provision_user_volatile_environment(&mount_path);
-        let mut env_path = mount_path;
+        let mut env_path = self.hive_mounts[self.hive_mounts.len() - 1].mount.clone();
         env_path.push_str("\\Environment");
         let mounted_temp = self
             .resolve_key(&env_path)
@@ -10139,6 +10111,17 @@ impl ExecNtHandler {
                             print_str(b" created\n");
                         }
                     }
+                } else if self.current_process_is_winlogon()
+                    && Self::is_dynamic_user_volatile_env_canon(&canon)
+                {
+                    let created_counted = (!existed) as u64;
+                    let previous =
+                        USER_VOLATILE_ENV_CREATED.fetch_add(created_counted, Ordering::Relaxed);
+                    if created_counted != 0 && previous < 4 {
+                        print_str(b"[cm-load] NtCreateKey ");
+                        print_ascii_str(&canon);
+                        print_str(b" created by winlogon\n");
+                    }
                 }
                 let status = self.mint_registry_key(
                     OVERLAY_KEY_TAG | (oidx as u32),
@@ -10413,13 +10396,13 @@ impl ExecNtHandler {
                 info[0x20..0x24].copy_from_slice(&values.to_le_bytes());
                 info[0x24..0x28].copy_from_slice(&max_vname.to_le_bytes());
                 info[0x28..0x2c].copy_from_slice(&max_vdata.to_le_bytes());
-                if values == 0
-                    && self
-                        .registry_target_path(key)
-                        .as_deref()
-                        .is_some_and(Self::is_dynamic_user_volatile_env_canon)
+                if self
+                    .registry_target_path(key)
+                    .as_deref()
+                    .is_some_and(Self::is_dynamic_user_volatile_env_canon)
                 {
-                    USER_VOLATILE_ENV_QUERIED_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    USER_VOLATILE_ENV_QUERIED.fetch_add(1, Ordering::Relaxed);
+                    USER_VOLATILE_ENV_QUERY_VALUE_COUNT.store(values as u64, Ordering::Relaxed);
                 }
                 let total = struct_size.to_le_bytes();
                 if use_xas_write {
