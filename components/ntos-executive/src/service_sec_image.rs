@@ -990,7 +990,7 @@ fn winlogon_thread_teb_alias_for(
     is_wl_worker: bool,
 ) -> Option<u64> {
     if let Some((2, tp_slot)) = tp_worker_identity {
-        return Some(tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000);
+        return Some(tp_worker_teb_mirror_va(2, tp_slot));
     }
     if is_wl_worker {
         return Some(match badge {
@@ -1016,6 +1016,16 @@ fn hosted_gui_thread_teb_alias_for(
 ) -> Option<u64> {
     if pi == 2 {
         return winlogon_thread_teb_alias_for(badge, tp_worker_identity, is_wl_worker);
+    }
+    if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+        if tp_pi != pi || current_tid == 0 {
+            return None;
+        }
+        return (nt_handler.hosted_thread_tid_for_role(
+            pi,
+            HostedThreadRole::TpWorker { slot: tp_slot },
+        ) == Some(current_tid))
+        .then_some(tp_worker_teb_mirror_va(pi, tp_slot));
     }
     let Some(main_tid) = nt_handler.pm_main_tid_for_pi(pi) else {
         return None;

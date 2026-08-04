@@ -675,6 +675,11 @@ pub const fn tp_worker_stack_mirror_va(pi: usize, slot: usize) -> u64 {
 }
 
 #[inline]
+pub const fn tp_worker_teb_mirror_va(pi: usize, slot: usize) -> u64 {
+    tp_worker_stack_mirror_va(pi, slot) + TP_WORKER_STACK_FRAMES * 0x1000
+}
+
+#[inline]
 pub const fn tp_worker_env_scratch_va(pi: usize, slot: usize) -> u64 {
     tp_worker_stack_mirror_va(pi, slot) + TP_WORKER_ENV_SCRATCH_OFFSET
 }

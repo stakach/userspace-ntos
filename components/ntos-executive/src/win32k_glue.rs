@@ -600,9 +600,7 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
         Some(HostedThreadRole::WinlogonWorker { slot: 2 }) => {
             WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
         }
-        Some(HostedThreadRole::TpWorker { slot }) => {
-            tp_worker_stack_mirror_va(winlogon_pi, slot) + TP_WORKER_STACK_FRAMES * 0x1000
-        }
+        Some(HostedThreadRole::TpWorker { slot }) => tp_worker_teb_mirror_va(winlogon_pi, slot),
         _ => return None,
     };
     Some(alias)
@@ -610,12 +608,22 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
 
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let pi = callback_client_owner_pi(client)?;
-    if client.tid == 0 || client.top_badge == 0 || client.badge != client.top_badge {
+    if client.tid == 0 {
         return None;
     }
     if callback_client_is_explorer(client) {
-        let alias = crate::env_scratch_base_for_pi(pi);
-        (alias != 0).then_some(alias)
+        match client.role {
+            Some(HostedThreadRole::Main) if client.top_badge != 0 && client.badge == client.top_badge => {
+                let alias = crate::env_scratch_base_for_pi(pi);
+                (alias != 0).then_some(alias)
+            }
+            Some(HostedThreadRole::TpWorker { slot })
+                if tp_worker_identity_from_badge(client.badge) == Some((pi, slot)) =>
+            {
+                Some(tp_worker_teb_mirror_va(pi, slot))
+            }
+            _ => None,
+        }
     } else {
         None
     }
