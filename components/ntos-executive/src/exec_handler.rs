@@ -14586,35 +14586,38 @@ impl ExecNtHandler {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
                     } else if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else if let Some((st, file_id)) = self.npfs_route(
-                        0, 0, &Self::pipe_leaf16(&name16), 0,
-                    ) {
-                        status = st as u32;
-                        if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
-                            let options = args[8] as u32;
-                            let synchronous = options
-                                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
-                                    | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-                                != 0;
-                            if let Some(handle) =
-                                self.mint_file_handle(file_id, args[1] as u32, synchronous)
-                            {
-                                self.queue_write(args[0], handle);
-                                info = nt_fs::FILE_OPENED as u64;
-                                // ★ BATCH 34: client CONNECT (winlogon's NtCreateFile on \pipe\ntsvcs)
-                                // paired with the server end by name → complete the pending async
-                                // server listen FOR THAT PIPE NAME (signal its completion event → the
-                                // SCM listener's NtWaitForMultipleObjects wakes to read the bind PDU).
-                                self.pipe_connect_redrive =
-                                    nt_io_manager::pipe_name_hash(&Self::pipe_leaf16(&name16));
-                            } else {
-                                status = 0xC000_009A;
-                            }
-                        } else if status == nt_fs::STATUS_SUCCESS {
-                            status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
-                        }
                     } else {
-                        status = nt_fs::STATUS_OBJECT_PATH_NOT_FOUND;
+                        let leaf = Self::pipe_leaf16(&name16);
+                        match self.npfs_route(0, 0, &leaf, 0) {
+                            Some((st, file_id)) => {
+                                status = st as u32;
+                                if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
+                                    let options = args[8] as u32;
+                                    let synchronous = options
+                                        & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                            | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                                        != 0;
+                                    if let Some(handle) =
+                                        self.mint_file_handle(file_id, args[1] as u32, synchronous)
+                                    {
+                                        self.queue_write(args[0], handle);
+                                        info = nt_fs::FILE_OPENED as u64;
+                                        // ★ BATCH 34: client CONNECT (winlogon's NtCreateFile on \pipe\ntsvcs)
+                                        // paired with the server end by name → complete the pending async
+                                        // server listen FOR THAT PIPE NAME (signal its completion event → the
+                                        // SCM listener's NtWaitForMultipleObjects wakes to read the bind PDU).
+                                        let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
+                                        self.pipe_connect_redrive = pipe_hash;
+                                        crate::pipe_fid_name_remember(file_id, pipe_hash);
+                                    } else {
+                                        status = 0xC000_009A;
+                                    }
+                                } else if status == nt_fs::STATUS_SUCCESS {
+                                    status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                                }
+                            }
+                            None => status = nt_fs::STATUS_OBJECT_PATH_NOT_FOUND,
+                        };
                     }
                 } else if let Some(relative) = crate::writable_fs::writable_path(&name16) {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable

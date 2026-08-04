@@ -5037,7 +5037,17 @@ pub(crate) unsafe fn service_sec_image(
                 let me = page_map_r(cc, bpage, rights, pml4);
                 if ce != 0 || me != 0 {
                     let _ = cnode_delete_recycle_r(cc);
-                    print_str(b"[map-fail] va=0x");
+                    // Multiple threads in one process can fault the same shared DLL text page before
+                    // the first handler reply reaches user mode. The first event maps the page; the
+                    // second sees seL4_DeleteFirst on the same VA. That is an idempotent stale fault,
+                    // not resource exhaustion, so resume the second thread.
+                    let duplicate_shared_fault =
+                        ce == 0 && me == 8 && shareable && is_fault_page && cached != 0;
+                    print_str(if duplicate_shared_fault {
+                        b"[map-idempotent] va=0x"
+                    } else {
+                        b"[map-fail] va=0x"
+                    });
                     print_hex(bpage as u32);
                     print_str(b" copy=");
                     print_u64(ce);
@@ -5046,7 +5056,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" shared=");
                     print_u64(shareable as u64);
                     print_str(b"\n");
-                    if ce != 0 || me != 8 || is_fault_page {
+                    if ce != 0 || me != 8 || (is_fault_page && !duplicate_shared_fault) {
                         allocation_failed = true;
                         break;
                     }
