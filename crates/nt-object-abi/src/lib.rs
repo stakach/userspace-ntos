@@ -36,6 +36,8 @@ pub mod opcode {
     pub const OB_OP_CREATE_DIRECTORY: u16 = 0x2020;
     pub const OB_OP_CREATE_SYMBOLIC_LINK: u16 = 0x2021;
     pub const OB_OP_QUERY_SYMBOLIC_LINK: u16 = 0x2022;
+    pub const OB_OP_CREATE_DRIVER: u16 = 0x2023;
+    pub const OB_OP_CREATE_DEVICE: u16 = 0x2024;
 
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
@@ -116,6 +118,21 @@ pub struct ObCreateSymbolicLinkRequest {
     pub target_len_bytes: u32,
 }
 
+/// `OB_OP_CREATE_DRIVER` / `OB_OP_CREATE_DEVICE` payload.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObCreateIoObjectRequest {
+    pub abi_size: u16,
+    pub obj_attributes: u16,
+    pub desired_access: u32,
+    /// Component that owns the driver/device object.
+    pub owner_component: u64,
+    /// Component-local id for the object projection.
+    pub owner_local_id: u64,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+}
+
 /// `OB_OP_LOOKUP_PATH` payload.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -157,6 +174,7 @@ const _: () = {
     assert!(size_of::<ObOpenObjectRequest>() == 24);
     assert!(size_of::<ObCreateDirectoryRequest>() == 16);
     assert!(size_of::<ObCreateSymbolicLinkRequest>() == 24);
+    assert!(size_of::<ObCreateIoObjectRequest>() == 32);
     assert!(size_of::<ObLookupPathRequest>() == 12);
     assert!(size_of::<ObCloseHandleRequest>() == 16);
     assert!(size_of::<ObReply>() == 24);

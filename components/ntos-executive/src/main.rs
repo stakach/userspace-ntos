@@ -13559,6 +13559,55 @@ fn check(name: &[u8], ok: bool, passed: &mut u64) {
     print_str(b"\n");
 }
 
+fn captured_utf16le_ascii_path(bytes: &[u8], len: u16) -> Option<alloc::string::String> {
+    let len = len as usize;
+    if len == 0 || len > bytes.len() || (len & 1) != 0 {
+        return None;
+    }
+    let mut out = alloc::string::String::new();
+    let mut off = 0usize;
+    while off < len {
+        let unit = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+        if !(0x20..=0x7e).contains(&unit) {
+            return None;
+        }
+        out.push(char::from_u32(unit as u32)?);
+        off += 2;
+    }
+    Some(out)
+}
+
+fn publish_npfs_io_objects<B: nt_object_client::Backend>(
+    object_client: &mut ObjectClient<B>,
+    dc: &driver_launch::DriverComponent,
+    passed: &mut u64,
+) {
+    let owner_component = 0x4452_0000u64 | dc.instance as u64;
+    let driver_ok = object_client
+        .create_driver("\\Driver\\Npfs", owner_component, dc.instance as u64, true)
+        .is_ok()
+        && object_client.lookup("\\Driver\\Npfs", true).is_ok();
+    check(b"npfs_driver_object_registered", driver_ok, passed);
+
+    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
+    let device_declared = device_path.as_deref() == Some("\\Device\\NamedPipe");
+    check(b"npfs_named_device_declared", device_declared, passed);
+    let device_ok = device_path.as_deref().is_some_and(|path| {
+        object_client
+            .create_device(path, owner_component, dc.devobj, true)
+            .is_ok()
+            && object_client.lookup(path, true).is_ok()
+    });
+    check(b"npfs_device_object_registered", device_ok, passed);
+
+    if let (Some(link), Some(target)) = (
+        captured_utf16le_ascii_path(&dc.symlink_link_utf16, dc.symlink_link_len),
+        captured_utf16le_ascii_path(&dc.symlink_target_utf16, dc.symlink_target_len),
+    ) {
+        let _ = object_client.create_symbolic_link(&link, &target, true);
+    }
+}
+
 fn park() -> ! {
     loop {
         yield_now();
@@ -16871,6 +16920,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
             if let Some(dc) = load_driver(&fs, &npfs_path[..npfs_path_len], npfs_class) {
                 register_npfs(&dc);
+                publish_npfs_io_objects(&mut c, &dc, &mut passed);
                 // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
                 check(
                     b"npfs_driver_entry_entered",

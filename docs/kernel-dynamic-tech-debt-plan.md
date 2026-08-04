@@ -1475,3 +1475,21 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   executive-to-isolated-service checks passing. Review adjustment: D1 remains open for real
   IoManager/service-control-created `DRIVER_OBJECT`/`DEVICE_OBJECT` ownership; D3 remains open for a
   real videoprt/miniport-created video device stack.
+- D1 continued. The Object Manager service ABI now supports typed `OB_OP_CREATE_DRIVER` and
+  `OB_OP_CREATE_DEVICE` requests, with client/server support and host coverage. The live
+  driver-launch `IoCreateDevice` path validates and captures the driver-declared `DeviceName`
+  instead of treating the component pool pointer as the only device identity, and malformed
+  `UNICODE_STRING` inputs fail with `STATUS_INVALID_PARAMETER`. `IoCreateSymbolicLink` no longer
+  blindly succeeds; it captures validated link/target declarations for root-side namespace
+  publication. NPFS now publishes `\Driver\Npfs` and the captured `\Device\NamedPipe` through
+  Object Manager before accepting the existing IRP gates. Validation:
+  `cargo test --manifest-path crates/nt-object-server/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-driver-io-objects-20260804.log` reached the microtest sentinel with `PASS
+  npfs_driver_object_registered`, `PASS npfs_named_device_declared`, `PASS
+  npfs_device_object_registered`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_video_device_objects_registered`, `PASS exec_win32k_desktop_painted`, `PASS
+  exec_msgina_logon_dialog_painted`, and `247/280` executive-to-isolated-service checks passing.
+  Review adjustment: D1 remains open because guest-visible `DRIVER_OBJECT`/`DEVICE_OBJECT` bodies
+  are still component pool projections and IRPs still dispatch by component instance/device pointer;
+  the next D1 step should move dispatch/projection ownership into a proper IoManager boundary.

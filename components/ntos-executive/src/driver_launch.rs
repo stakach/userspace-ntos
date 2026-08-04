@@ -145,7 +145,14 @@ pub const SH_DE_STATUS: u64 = 0x10; // out: DriverEntry NTSTATUS (i32)
 pub const SH_MJ_TABLE: u64 = 0x18; // out: recorded DriverObject->MajorFunction[] base VA (u64)
 pub const SH_DEVOBJ: u64 = 0x20; // out: the control DEVICE_OBJECT VA (u64)
 pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
-                                    // IRP dispatch request/reply (executive → FSD, via the shared page).
+pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // out: IoCreateDevice DeviceName bytes (u16)
+pub const SH_SYMLINK_LINK_LEN: u64 = 0x82; // out: IoCreateSymbolicLink LinkName bytes (u16)
+pub const SH_SYMLINK_TARGET_LEN: u64 = 0x84; // out: IoCreateSymbolicLink DeviceName bytes (u16)
+pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
+pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
+pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
+pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
+// IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
 pub const SH_REQ_MINOR: u64 = 0x48; // in:  minor function (u64)
 pub const SH_REQ_FSCTL: u64 = 0x50; // in:  control code or FILE_INFORMATION_CLASS (u64)
@@ -163,6 +170,8 @@ pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_DEVICE: u32 = 8; // IoCreateDevice(control device) succeeded
 pub const V_MJ: u32 = 0x10; // DriverObject->MajorFunction[IRP_MJ_CREATE] is non-null (table filled)
 pub const V_REGFS: u32 = 0x20; // IoRegisterFileSystem was called
+pub const V_NAMED_DEVICE: u32 = 0x40; // IoCreateDevice declared a valid NT DeviceName
+pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/target
 
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
@@ -946,6 +955,32 @@ extern "win64" fn s_rtl_init_empty_unicode_string(dst: u64, buf: u64, maxlen: u6
     }
 }
 
+unsafe fn unicode_string_parts(us: u64) -> Option<(u64, u16)> {
+    if us == 0 {
+        return None;
+    }
+    let len = read_unaligned(us as *const u16);
+    let buf = read_unaligned((us + 8) as *const u64);
+    if len == 0 || len as usize > SH_CAPTURED_PATH_BYTES || (len & 1) != 0 || buf == 0 {
+        return None;
+    }
+    Some((buf, len))
+}
+
+unsafe fn clear_shared_path_len(len_off: u64) {
+    write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, 0);
+}
+
+unsafe fn copy_wstr_to_shared(src: u64, len: u16, len_off: u64, buf_off: u64) {
+    let mut off = 0u64;
+    while off < len as u64 {
+        let b = read_volatile((src + off) as *const u8);
+        write_volatile((FSD_SHARED_VADDR + buf_off + off) as *mut u8, b);
+        off += 1;
+    }
+    write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, len);
+}
+
 /// `NTSTATUS IoCreateDevice(PDRIVER_OBJECT, ULONG DeviceExtensionSize, PUNICODE_STRING DeviceName,
 /// DEVICE_TYPE, ULONG Characteristics, BOOLEAN Exclusive, PDEVICE_OBJECT *DeviceObject)`.
 /// Allocate a DEVICE_OBJECT (with the requested extension) from the pool, minimally initialize it,
@@ -954,13 +989,22 @@ extern "win64" fn s_rtl_init_empty_unicode_string(dst: u64, buf: u64, maxlen: u6
 extern "win64" fn s_io_create_device(
     drv: u64,
     ext_size: u64,
-    _name: u64,
+    name: u64,
     dev_type: u64,
     _chars: u64,
     _excl: u64,
     dev_out: u64,
 ) -> i32 {
     unsafe {
+        clear_shared_path_len(SH_DEVICE_NAME_LEN);
+        let named_device = if name != 0 {
+            match unicode_string_parts(name) {
+                Some(parts) => Some(parts),
+                None => return 0xC000_000Du32 as i32, // STATUS_INVALID_PARAMETER
+            }
+        } else {
+            None
+        };
         // DEVICE_OBJECT is ~0x150 bytes (x64); allocate that + the driver extension contiguously.
         let dev = pool_alloc(0x150 + ext_size);
         if dev == 0 {
@@ -992,15 +1036,38 @@ extern "win64" fn s_io_create_device(
         }
         // record it for the executive
         write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, dev);
-        let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
-        write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_DEVICE);
+        let mut v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32) | V_DEVICE;
+        if let Some((name_buf, name_len)) = named_device {
+            copy_wstr_to_shared(name_buf, name_len, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
+            v |= V_NAMED_DEVICE;
+        }
+        write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
     }
     0 // STATUS_SUCCESS
 }
 
-/// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — no-op success (the executive
-/// object namespace owns \?? symlinks; the driver just declares one).
-extern "win64" fn s_io_create_symbolic_link(_a: u64, _b: u64) -> i32 {
+/// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
+/// link so the executive can publish it through the kernel object namespace after DriverEntry.
+extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
+    unsafe {
+        clear_shared_path_len(SH_SYMLINK_LINK_LEN);
+        clear_shared_path_len(SH_SYMLINK_TARGET_LEN);
+        let Some((link_buf, link_len)) = unicode_string_parts(link) else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        let Some((target_buf, target_len)) = unicode_string_parts(target) else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        copy_wstr_to_shared(link_buf, link_len, SH_SYMLINK_LINK_LEN, SH_SYMLINK_LINK_BUF);
+        copy_wstr_to_shared(
+            target_buf,
+            target_len,
+            SH_SYMLINK_TARGET_LEN,
+            SH_SYMLINK_TARGET_BUF,
+        );
+        let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
+        write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_SYMLINK);
+    }
     0
 }
 
@@ -1989,6 +2056,15 @@ pub(crate) struct DriverComponent {
     pub fault_ep: u64,
     /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
     pub devobj: u64,
+    /// UTF-16LE path captured from `IoCreateDevice(DeviceName)`, if the driver created a named
+    /// device object.
+    pub device_name_len: u16,
+    pub device_name_utf16: [u8; SH_CAPTURED_PATH_BYTES],
+    /// UTF-16LE paths captured from `IoCreateSymbolicLink`, if the driver declared a link.
+    pub symlink_link_len: u16,
+    pub symlink_link_utf16: [u8; SH_CAPTURED_PATH_BYTES],
+    pub symlink_target_len: u16,
+    pub symlink_target_utf16: [u8; SH_CAPTURED_PATH_BYTES],
     /// The DriverEntry verdict bitmask ([`V_ENTERED`] etc.).
     pub verdict: u32,
     /// Whether DriverEntry ran to its dispatch loop (parked) vs faulted mid-init.
@@ -2004,6 +2080,24 @@ pub(crate) struct DriverComponent {
     pub tcb: u64,
     /// The DEDICATED MCS reply object backing this component's `Call` dispatch transport.
     pub reply_cap: u64,
+}
+
+unsafe fn read_shared_path_capture(
+    shared_va: u64,
+    len_off: u64,
+    buf_off: u64,
+) -> (u16, [u8; SH_CAPTURED_PATH_BYTES]) {
+    let len = read_volatile((shared_va + len_off) as *const u16);
+    let mut out = [0u8; SH_CAPTURED_PATH_BYTES];
+    if len as usize > SH_CAPTURED_PATH_BYTES || (len & 1) != 0 {
+        return (0, out);
+    }
+    let mut off = 0usize;
+    while off < len as usize {
+        out[off] = read_volatile((shared_va + buf_off + off as u64) as *const u8);
+        off += 1;
+    }
+    (len, out)
 }
 
 /// Copy `n` bytes from `src` to `dst` (both mapped in the executive). HEAP-FREE, byte-wise-safe
@@ -2385,6 +2479,12 @@ pub(crate) unsafe fn load_driver(
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
+    let (device_name_len, device_name_utf16) =
+        read_shared_path_capture(win.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
+    let (symlink_link_len, symlink_link_utf16) =
+        read_shared_path_capture(win.shared_va, SH_SYMLINK_LINK_LEN, SH_SYMLINK_LINK_BUF);
+    let (symlink_target_len, symlink_target_utf16) =
+        read_shared_path_capture(win.shared_va, SH_SYMLINK_TARGET_LEN, SH_SYMLINK_TARGET_BUF);
     print_str(b"[npfs-svc] DriverEntry ");
     if finished {
         print_str(b"RETURNED status=0x");
@@ -2415,6 +2515,12 @@ pub(crate) unsafe fn load_driver(
         pml4,
         fault_ep,
         devobj,
+        device_name_len,
+        device_name_utf16,
+        symlink_link_len,
+        symlink_link_utf16,
+        symlink_target_len,
+        symlink_target_utf16,
         verdict,
         finished,
         exec_shared_va: win.shared_va,

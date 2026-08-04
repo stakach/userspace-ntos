@@ -17,8 +17,8 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_object_abi::{
-    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateSymbolicLinkRequest,
-    ObLookupPathRequest, ObOpenObjectRequest, ObReply,
+    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
+    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObReply,
 };
 use nt_status::NtStatus;
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId};
@@ -119,6 +119,40 @@ impl<B: Backend> ObjectClient<B> {
         Ok(ObjectId(r.detail0))
     }
 
+    /// Create a typed driver object at `path`.
+    pub fn create_driver(
+        &mut self,
+        path: &str,
+        owner_component: u64,
+        owner_local_id: u64,
+        permanent: bool,
+    ) -> Result<ObjectId, NtStatus> {
+        self.create_io_object(
+            opcode::OB_OP_CREATE_DRIVER,
+            path,
+            owner_component,
+            owner_local_id,
+            permanent,
+        )
+    }
+
+    /// Create a typed device object at `path`.
+    pub fn create_device(
+        &mut self,
+        path: &str,
+        owner_component: u64,
+        owner_local_id: u64,
+        permanent: bool,
+    ) -> Result<ObjectId, NtStatus> {
+        self.create_io_object(
+            opcode::OB_OP_CREATE_DEVICE,
+            path,
+            owner_component,
+            owner_local_id,
+            permanent,
+        )
+    }
+
     /// Create a symbolic link `link` → `target`.
     pub fn create_symbolic_link(
         &mut self,
@@ -144,6 +178,30 @@ impl<B: Backend> ObjectClient<B> {
         let r = self
             .backend
             .call(opcode::OB_OP_CREATE_SYMBOLIC_LINK, &buf, &mut []);
+        NtStatus(r.status).to_result()?;
+        Ok(ObjectId(r.detail0))
+    }
+
+    fn create_io_object(
+        &mut self,
+        opcode: u16,
+        path: &str,
+        owner_component: u64,
+        owner_local_id: u64,
+        permanent: bool,
+    ) -> Result<ObjectId, NtStatus> {
+        let units = utf16(path);
+        let req = ObCreateIoObjectRequest {
+            abi_size: size_of::<ObCreateIoObjectRequest>() as u16,
+            obj_attributes: perm_flag(permanent),
+            desired_access: 0,
+            owner_component,
+            owner_local_id,
+            path_offset: size_of::<ObCreateIoObjectRequest>() as u32,
+            path_len_bytes: byte_len(&units),
+        };
+        let buf = pack(&req, &units);
+        let r = self.backend.call(opcode, &buf, &mut []);
         NtStatus(r.status).to_result()?;
         Ok(ObjectId(r.detail0))
     }

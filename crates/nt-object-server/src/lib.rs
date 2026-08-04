@@ -18,10 +18,10 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_object_abi::{
-    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateSymbolicLinkRequest,
-    ObLookupPathRequest, ObOpenObjectRequest, ObReply,
+    opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
+    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObReply,
 };
-use nt_object_manager::{ClientKind, ObjectManager, ObjectRef};
+use nt_object_manager::{ClientKind, ComponentId, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
 use nt_types::{
     AccessMask, AccessMode, CaseSensitivity, ClientId, HandleValue, NtPath, ObjAttrFlags,
@@ -89,6 +89,8 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
+            opcode::OB_OP_CREATE_DRIVER => self.op_create_driver(in_buf),
+            opcode::OB_OP_CREATE_DEVICE => self.op_create_device(in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -132,6 +134,36 @@ impl Server {
         let permanent = permanent_of(req.obj_attributes);
         let dir = self.om.create_directory(&parent, &leaf, permanent)?;
         Ok(reply(NtStatus::SUCCESS, 0, dir.id().0, 0))
+    }
+
+    fn op_create_driver(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObCreateIoObjectRequest = read_req(buf)?;
+        check_size::<ObCreateIoObjectRequest>(req.abi_size)?;
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let (parent, leaf) = self.split_parent(&path)?;
+        let obj = self.om.create_driver(
+            &parent,
+            &leaf,
+            ComponentId(req.owner_component),
+            req.owner_local_id,
+            permanent_of(req.obj_attributes),
+        )?;
+        Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
+    }
+
+    fn op_create_device(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObCreateIoObjectRequest = read_req(buf)?;
+        check_size::<ObCreateIoObjectRequest>(req.abi_size)?;
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let (parent, leaf) = self.split_parent(&path)?;
+        let obj = self.om.create_device(
+            &parent,
+            &leaf,
+            ComponentId(req.owner_component),
+            req.owner_local_id,
+            permanent_of(req.obj_attributes),
+        )?;
+        Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
     }
 
     fn op_create_symlink(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
@@ -279,5 +311,55 @@ mod tests {
         buf.copy_from_slice(bytemuck::bytes_of(&bad));
         let r = s.dispatch(c, opcode::OB_OP_OPEN_OBJECT, &buf, &mut []);
         assert_eq!(r.status, NtStatus::INVALID_PARAMETER.raw());
+    }
+
+    #[test]
+    fn create_driver_and_device_objects() {
+        let mut s = Server::new().unwrap();
+        let c = s.connect(ClientKind::DriverHost, AccessMode::KernelMode);
+
+        let driver_req = io_req("\\Driver\\Npfs", 0x5000, 1);
+        let r = s.dispatch(c, opcode::OB_OP_CREATE_DRIVER, &driver_req, &mut []);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+        let driver = s
+            .object_manager()
+            .lookup_path(
+                &NtPath::parse_str("\\Driver\\Npfs").unwrap(),
+                CaseSensitivity::CaseInsensitive,
+            )
+            .unwrap();
+        assert_eq!(driver.id().0, r.detail0);
+        assert_eq!(Some(driver.type_id()), s.object_manager().driver_type());
+
+        let device_req = io_req("\\Device\\NamedPipe", 0x5000, 0x20);
+        let r = s.dispatch(c, opcode::OB_OP_CREATE_DEVICE, &device_req, &mut []);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+        let device = s
+            .object_manager()
+            .lookup_path(
+                &NtPath::parse_str("\\Device\\NamedPipe").unwrap(),
+                CaseSensitivity::CaseInsensitive,
+            )
+            .unwrap();
+        assert_eq!(device.id().0, r.detail0);
+        assert_eq!(Some(device.type_id()), s.object_manager().device_type());
+    }
+
+    fn io_req(path: &str, owner_component: u64, owner_local_id: u64) -> Vec<u8> {
+        let units: Vec<u16> = path.encode_utf16().collect();
+        let req = ObCreateIoObjectRequest {
+            abi_size: size_of::<ObCreateIoObjectRequest>() as u16,
+            obj_attributes: ObjAttrFlags::PERMANENT.bits() as u16,
+            desired_access: 0,
+            owner_component,
+            owner_local_id,
+            path_offset: size_of::<ObCreateIoObjectRequest>() as u32,
+            path_len_bytes: (units.len() * 2) as u32,
+        };
+        let mut buf = bytemuck::bytes_of(&req).to_vec();
+        for unit in units {
+            buf.extend_from_slice(&unit.to_le_bytes());
+        }
+        buf
     }
 }
