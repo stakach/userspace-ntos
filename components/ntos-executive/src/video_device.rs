@@ -15,12 +15,11 @@ use core::ptr::{read_unaligned, write_unaligned};
 
 use nt_io_abi::major;
 use nt_io_manager::{
-    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
-    DeviceCharacteristics, DeviceFlags, DeviceType, DispatchContext, DispatchOutcome,
-    DispatchTarget, DriverBackendId, DriverDispatchBackend, IrpId, IrpProjection, IoParameters,
-    MajorFunctionTable, WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
-    WDM_X64_FILE_OBJECT_SIZE,
+    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object, DeviceCharacteristics,
+    DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget, DriverBackendId,
+    DriverDispatchBackend, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
+    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WDM_X64_DEVICE_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use nt_video_miniport::{
@@ -234,10 +233,7 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
         return false;
     }
     write_wdm_file_object(
-        core::slice::from_raw_parts_mut(
-            VIDEO_FILE_OBJECT as *mut u8,
-            WDM_X64_FILE_OBJECT_SIZE,
-        ),
+        core::slice::from_raw_parts_mut(VIDEO_FILE_OBJECT as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
         WdmFileObjectInit {
             device_object: VIDEO_DEVICE_OBJECT,
             fs_context: file_id,
@@ -583,11 +579,7 @@ pub(crate) unsafe fn video_device_io_control(
         }
     };
     if ioctl as u32 == IOCTL_VIDEO_INIT_WIN32K_CALLBACKS {
-        if in_buf == 0
-            || out_buf == 0
-            || in_len < 16
-            || out_len < VIDEO_WIN32K_CALLBACKS_SIZE_X64
-        {
+        if in_buf == 0 || out_buf == 0 || in_len < 16 || out_len < VIDEO_WIN32K_CALLBACKS_SIZE_X64 {
             return 1;
         }
         let phys_disp = read_unaligned(in_buf as *const u64);

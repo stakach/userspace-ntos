@@ -130,7 +130,7 @@ unsafe fn csr_api_worker_create_thread(
         } else {
             nt_handler.resolve_process_for_access(process_handle, PROCESS_CREATE_THREAD)?
         };
-        if target_pi >= TP_WORKER_PI_COUNT {
+        if target_pi >= MAX_PI {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let Some(target_pml4) = nt_handler.hosted_process_vspace(target_pi) else {
@@ -2326,7 +2326,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     main_fault_ep: u64,
     resume: bool,
 ) -> u64 {
-    if pi >= TP_WORKER_PI_COUNT || worker_slot >= TP_WORKER_SLOT_COUNT {
+    if pi >= MAX_PI || worker_slot >= TP_WORKER_SLOT_COUNT {
         return 0;
     }
     if img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed) == 0 {

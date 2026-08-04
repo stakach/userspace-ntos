@@ -29,15 +29,15 @@ use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
 use nt_io_manager::{
-    write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, DeviceCharacteristics,
-    DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext, DispatchOutcome,
-    DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId, InformationParameters,
-    IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort,
-    ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
-    WdmIoStackParameters, WdmIrpInit, CreateOptions, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE,
-    WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
-    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
+    DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext,
+    DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId,
+    InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
+    ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
+    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
+    WDM_X64_IRP_SIZE,
 };
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
@@ -3319,12 +3319,7 @@ pub(crate) fn open_io_device(
     )?;
     let (file_id, device_id, file_object_id) =
         io_manager_mut().reference_open_file_details(client, handle, AccessMask::empty())?;
-    Ok((
-        handle.0,
-        file_id.raw(),
-        device_id.raw(),
-        file_object_id.0,
-    ))
+    Ok((handle.0, file_id.raw(), device_id.raw(), file_object_id.0))
 }
 
 pub(crate) fn device_control_on_io_handle(

@@ -1087,7 +1087,8 @@ impl ExecNtHandler {
             }
         }
         let live = smss_read_ustr(ustr_va);
-        if expected_units.is_some_and(|n| live.len() >= n) || expected_units.is_none() && !live.is_empty()
+        if expected_units.is_some_and(|n| live.len() >= n)
+            || expected_units.is_none() && !live.is_empty()
         {
             return live;
         }
@@ -2744,8 +2745,26 @@ impl ExecNtHandler {
             }
         }
         self.pm.reserve_handles(pid, PM_HANDLE_RESERVE);
-        let token = self.token_store.insert(nt_security::AccessToken::system());
-        let _ = self.pm.replace_process_primary_token(pid, Some(token));
+        let (token, inherited_token) =
+            if let Some(parent_token) = self.pm.process_primary_token(parent) {
+                if self.token_store.retain(parent_token).is_ok() {
+                    (parent_token, true)
+                } else {
+                    (
+                        self.token_store.insert(nt_security::AccessToken::system()),
+                        false,
+                    )
+                }
+            } else {
+                (
+                    self.token_store.insert(nt_security::AccessToken::system()),
+                    false,
+                )
+            };
+        if let Err(status) = self.pm.replace_process_primary_token(pid, Some(token)) {
+            let _ = self.token_store.release(token);
+            return Err(status);
+        }
         self.token_dirty = true;
         self.process_dirty = true;
         PM_DYNAMIC_PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -2759,7 +2778,13 @@ impl ExecNtHandler {
             print_u64(parent as u64);
             print_str(b" image=");
             print_str(name.as_bytes());
-            print_str(b"\n");
+            print_str(b" token=");
+            print_u64(token.raw() as u64);
+            print_str(if inherited_token {
+                b" inherited\n" as &[u8]
+            } else {
+                b" system\n" as &[u8]
+            });
         }
         Ok(child_pi)
     }
@@ -4273,6 +4298,114 @@ impl ExecNtHandler {
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
     }
+
+    unsafe fn create_generic_local_tp_worker_thread(&mut self, args: &[u64]) -> Option<u32> {
+        if args.len() <= 3 || args[3] != u64::MAX || self.pi >= MAX_PI {
+            return None;
+        }
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let sp = get_recv_mr(16);
+        let ctx_va = smss_stack_read(sp + 0x30);
+        let start =
+            nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
+        let scheduler_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
+        let completion_rva = img_spawn::OUR_TP_COMPLETION_WORKER_RVA.load(Ordering::Relaxed);
+        let scheduler_entry = NTDLL_BASE.wrapping_add(scheduler_rva);
+        let completion_entry = NTDLL_BASE.wrapping_add(completion_rva);
+
+        // Native ntdll starts directly at RtlpWorkerThread. Kernel32's installed hook starts at
+        // BaseThreadStartup and carries RtlpWorkerThread in RCX. Keep those stable slot preferences;
+        // all other same-process creates claim the next available generic worker slot.
+        let preferred_slot = if scheduler_rva != 0
+            && (start.rip == scheduler_entry || start.rcx == scheduler_entry)
+        {
+            Some(0)
+        } else if completion_rva != 0
+            && (start.rip == completion_entry || start.rcx == completion_entry)
+        {
+            Some(1)
+        } else {
+            None
+        };
+        let tp_slot = if let Some(slot) = preferred_slot {
+            self.hosted_thread_tid_for_role(self.pi, HostedThreadRole::TpWorker { slot })
+                .is_none()
+                .then_some(slot)
+        } else {
+            let lsa_extra_connection = crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
+                && self.current_process_is_lsass()
+                && self.current_thread_has_role(HostedThreadRole::LsassListener3)
+                && self
+                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                    .is_some();
+            let slot = self.first_free_hosted_tp_worker_slot(self.pi);
+            if lsa_extra_connection {
+                if slot.is_some() {
+                    crate::LSA_RPC_EXTRA_WORKERS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                    print_str(
+                        b"[lsa-worker] additional \\lsarpc connection: claiming a generic worker slot\n",
+                    );
+                } else {
+                    print_str(
+                        b"[lsa-worker] additional \\lsarpc connection: no free generic worker slot\n",
+                    );
+                }
+            }
+            slot
+        };
+        let Some(tp_slot) = tp_slot else {
+            print_str(b"[tp-worker] no free local worker slot pi=");
+            print_u64(self.pi as u64);
+            print_str(b" pid=");
+            print_u64(pid as u64);
+            print_str(b" entry=0x");
+            print_hex((start.rip >> 32) as u32);
+            print_hex(start.rip as u32);
+            print_str(b"\n");
+            return Some(0xC000_009A);
+        };
+
+        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+        let Some((pool_slot, tid, handle)) =
+            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+        else {
+            return Some(0xC000_009A);
+        };
+        if !self.reserve_hosted_tp_worker_slot(self.pi, tp_slot, tid) {
+            self.abandon_created_hosted_thread(pool_slot, tid, handle);
+            return Some(0xC000_009A);
+        }
+        self.pm
+            .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
+        self.queue_write(args[0], handle);
+        let cid_ptr = smss_stack_read(sp + 0x28);
+        if cid_ptr != 0 {
+            self.queue_write(cid_ptr, pid as u64);
+            self.queue_write(cid_ptr + 8, tid);
+        }
+        self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
+            pi: self.pi,
+            slot: tp_slot,
+        });
+        print_str(b"[tp-worker] claimed pi=");
+        print_u64(self.pi as u64);
+        print_str(b" badge=");
+        print_u64(tp_worker_badge(self.pi, tp_slot));
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" entry=0x");
+        print_hex((start.rip >> 32) as u32);
+        print_hex(start.rip as u32);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
+        if tp_slot != 0 {
+            print_str(b" slot=");
+            print_u64(tp_slot as u64);
+        }
+        print_str(b"\n");
+        Some(0)
+    }
+
     /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
     /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
     /// at boot for the non-leaking heap solution; this alloc-free field write completes it).
@@ -11830,125 +11963,6 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // Bounded generic fallback. Identify it by ntdll's exact private worker entrypoint,
-                // never by creation order: smss and the RPC servers legitimately create additional
-                // native threads after their known listeners and must retain their own routes.
-                if args[3] == u64::MAX && self.pi < TP_WORKER_PI_COUNT {
-                    unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30);
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let scheduler_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
-                        let completion_rva = img_spawn::OUR_TP_COMPLETION_WORKER_RVA.load(Ordering::Relaxed);
-                        let scheduler_entry = NTDLL_BASE.wrapping_add(scheduler_rva);
-                        let completion_entry = NTDLL_BASE.wrapping_add(completion_rva);
-                        // Native ntdll starts directly at RtlpWorkerThread. Kernel32's installed
-                        // hook starts at BaseThreadStartup and carries RtlpWorkerThread in RCX.
-                        let tp_slot = if scheduler_rva != 0
-                            && (start.rip == scheduler_entry || start.rcx == scheduler_entry)
-                        {
-                            Some(0)
-                        } else if completion_rva != 0
-                            && (start.rip == completion_entry || start.rcx == completion_entry)
-                        {
-                            Some(1)
-                        } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
-                            && self.current_process_is_lsass()
-                            && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                            && self
-                                .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
-                                .is_some()
-                        {
-                            // ★ THE SECOND `\pipe\lsarpc` CLIENT. rpcrt4 spawns ONE per-connection
-                            // `RPCRT4_io_thread` per accepted connection (`RPCRT4_new_client`,
-                            // `rpc_server.c:627`). The first — lsass' own self-RPC — takes the named
-                            // `LSA_WORKER` slot, which is a server thread and therefore never frees
-                            // it. So when winlogon's post-profile `LsaOpenPolicy` binds to
-                            // `\pipe\lsarpc`, the recognizer above falls through, nothing else claims
-                            // the create, and `NtCreateThread` answers STATUS_INSUFFICIENT_RESOURCES:
-                            // measured as `rpcrt4 rpc_server.c:631 failed to create thread,
-                            // error=5aa` (`ERROR_NO_SYSTEM_RESOURCES`). rpcrt4 then simply RELEASES
-                            // the connection — nobody ever reads winlogon's bind PDU — so winlogon
-                            // wait-parks on its async `\pipe\lsarpc` read while lsass parks in
-                            // `NtWaitForMultipleObjects`, and the boot has no runnable signaler left.
-                            //
-                            // The answer is to COMPLETE THE RPC, not to guess at a park/wake gap: give
-                            // the additional connection worker a real thread. It needs no new named
-                            // slot — the generic `(pi, slot)` hosted-thread layout is already fully
-                            // general (badge, target VAs, executive mirror + env scratch, multiplex
-                            // sub-select) and this process has a free slot, so this claims one.
-                            let free = self.first_free_hosted_tp_worker_slot(self.pi);
-                            if free.is_some() {
-                                crate::LSA_RPC_EXTRA_WORKERS_CLAIMED
-                                    .fetch_add(1, Ordering::Relaxed);
-                                print_str(b"[lsa-worker] SECOND \\lsarpc connection (winlogon's LSA bind): named slot busy -> claiming a generic worker slot\n");
-                            } else {
-                                print_str(b"[lsa-worker] SECOND \\lsarpc connection: NO free worker slot -> the bind cannot be serviced\n");
-                            }
-                            free
-                        } else {
-                            None
-                        };
-                        if let Some(tp_slot) = tp_slot {
-                            let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                            if let Some((pool_slot, tid, handle)) = self.nt_create_thread_handle(
-                                start.rip,
-                                create_suspended,
-                                args[1] as u32,
-                            ) {
-                                if !self.reserve_hosted_tp_worker_slot(self.pi, tp_slot, tid) {
-                                    let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
-                                    let _ = self.close_process_handle(pid, handle);
-                                    let _ = self.pm.set_thread_state(
-                                        tid as nt_process::ThreadId,
-                                        nt_process::ThreadState::Initialized,
-                                    );
-                                    self.release_pool_usage_slot(self.pi, pool_slot);
-                                    self.set_pool_thread_suspended(self.pi, pool_slot, false);
-                                    return 0xC000_009A;
-                                }
-                                self.pm.set_thread_teb(
-                                    tid as nt_process::ThreadId,
-                                    tp_worker_teb_va(tp_slot),
-                                );
-                                let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
-                                self.queue_write(args[0], handle);
-                                let cid_ptr = smss_stack_read(sp + 0x28);
-                                if cid_ptr != 0 {
-                                    self.queue_write(cid_ptr, pid as u64);
-                                    self.queue_write(cid_ptr + 8, tid);
-                                }
-                                self.thread_spawn_request = Some(
-                                    HostedThreadSpawnRequest::TpWorker {
-                                        pi: self.pi,
-                                        slot: tp_slot,
-                                    },
-                                );
-                                print_str(b"[tp-worker] claimed pi=");
-                                print_u64(self.pi as u64);
-                                print_str(b" badge=");
-                                print_u64(tp_worker_badge(self.pi, tp_slot));
-                                print_str(b" tid=");
-                                print_u64(tid);
-                                print_str(b" entry=0x");
-                                print_hex((start.rip >> 32) as u32);
-                                print_hex(start.rip as u32);
-                                print_str(b" suspended=");
-                                print_u64(create_suspended as u64);
-                                if tp_slot != 0 {
-                                    print_str(b" slot=");
-                                    print_u64(tp_slot as u64);
-                                }
-                                print_str(b"\n");
-                                return 0;
-                            }
-                            return 0xC000_009A;
-                        }
-                    }
-                }
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_smss()
                     && self
@@ -11992,6 +12006,14 @@ impl ExecNtHandler {
                         }
                         return 0xC000_009A;
                     }
+                }
+                // Generic same-process NtCreateThread fallback. Named SM/CSR/RPC routes above keep
+                // their custom layouts; every remaining local hosted thread gets a real generic
+                // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
+                if let Some(status) =
+                    unsafe { self.create_generic_local_tp_worker_thread(args) }
+                {
+                    return status;
                 }
                 // A successful NtCreateThread must publish a typed Thread handle backed by an
                 // ETHREAD. Do not mint an opaque handle for an unrecognized or exhausted route:
@@ -15992,26 +16014,61 @@ impl ExecNtHandler {
                 // DLL (NtCreateSection/NtMapViewOfSection/the fault router all go through the registry +
                 // dll_pes). This is what retires the eager DLL list — no maintained table.
                 if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
-                    if let Some(slot) = demand_load_dll(
-                        reg,
-                        ctx.dll_pe_store,
-                        DLL_REG_COUNT,
-                        &nb[..nlen],
-                    ) {
-                        // Pin the heap mark past the load's registry allocations (service loop consumes).
-                        self.dll_loaded_dirty = true;
-                        dll_i = Some(slot);
-                    } else if !self.current_process_is_winlogon()
-                        && (nb[..nlen].ends_with(b".dll")
-                            || nb[..nlen].windows(4).any(|w| w == b".dll"))
-                    {
-                        // DIAG: a .dll open that missed the registry AND failed to demand-load — log it
-                        // so we can see which dependency the loader requested that we couldn't satisfy.
-                        print_str(b"[demand-miss] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" name=");
-                        print_str(&nb[..nlen.min(64)]);
-                        print_str(b"\n");
+                    let load =
+                        demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen]);
+                    match load {
+                        Ok(slot) => {
+                            // Pin the heap mark past the load's registry allocations (service loop consumes).
+                            self.dll_loaded_dirty = true;
+                            dll_i = Some(slot);
+                        }
+                        Err(err) => {
+                            // DIAG: a .dll open that missed the registry AND failed to demand-load —
+                            // log it so we can see which dependency the loader requested that we
+                            // couldn't satisfy.
+                            if !self.current_process_is_winlogon()
+                                && (nb[..nlen].ends_with(b".dll")
+                                    || nb[..nlen].windows(4).any(|w| w == b".dll"))
+                            {
+                                print_str(b"[demand-miss] pi=");
+                                print_u64(self.pi as u64);
+                                print_str(b" reason=");
+                                print_str(err.tag());
+                                match err {
+                                    DemandLoadError::StoreTooSmall { slot, store_len } => {
+                                        print_str(b" slot=");
+                                        print_u64(slot as u64);
+                                        print_str(b" store_len=");
+                                        print_u64(store_len as u64);
+                                    }
+                                    DemandLoadError::PoolExhausted { size } => {
+                                        print_str(b" size=");
+                                        print_u64(size as u64);
+                                    }
+                                    DemandLoadError::ShortRead { expected, actual } => {
+                                        print_str(b" expected=");
+                                        print_u64(expected as u64);
+                                        print_str(b" actual=");
+                                        print_u64(actual as u64);
+                                    }
+                                    DemandLoadError::ArenaExhausted { image_size } => {
+                                        print_str(b" image_size=");
+                                        print_u64(image_size);
+                                    }
+                                    DemandLoadError::UnsupportedImageName
+                                    | DemandLoadError::SxsProbe
+                                    | DemandLoadError::DeniedDiverter
+                                    | DemandLoadError::NoReservedSlot
+                                    | DemandLoadError::NoMountedFs
+                                    | DemandLoadError::FileMissing
+                                    | DemandLoadError::EmptyFile
+                                    | DemandLoadError::PeParseFailed => {}
+                                }
+                                print_str(b" name=");
+                                print_str(&nb[..nlen.min(64)]);
+                                print_str(b"\n");
+                            }
+                        }
                     }
                 }
                 let mut opened_handle = 0;

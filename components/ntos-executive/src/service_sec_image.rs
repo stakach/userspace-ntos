@@ -3286,8 +3286,10 @@ pub(crate) unsafe fn service_sec_image(
         // N-threads multiplex generalized to lsass' dynamically-spawned rpcrt4 io_thread. It reads the
         // LSA RPC bind PDU and answers `LsarOpenPolicy` for lsass' own self-RPC.
         let is_lsa_worker = badge == LSA_WORKER_BADGE;
-        // Generic ntdll workers have one badge per process and role (slot 0: 16..20, slot 1: 21..25).
-        // role orthogonal to the listener recognizers: it shares process state and mirrors, but not
+        // Generic workers have one badge per process and slot. The first five processes keep the
+        // legacy dense range (slot 0: 16..20, slot 1: 21..25); later hosted processes use the aux
+        // range decoded by tp_worker_identity_from_badge. The role is orthogonal to listener
+        // recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
@@ -14941,7 +14943,7 @@ unsafe fn spawn_requested_local_thread(
             });
         }
         HostedThreadSpawnRequest::TpWorker { pi, slot } => {
-            if pi < TP_WORKER_PI_COUNT && slot < TP_WORKER_SLOT_COUNT {
+            if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
                 spawn_requested_tp_worker(
                     nt_handler,
                     pi,
@@ -15024,14 +15026,13 @@ unsafe fn spawn_requested_tp_worker(
 /// (`tp_worker_identity_from_badge` → `mirror_ctx_for`) sub-selects it exactly like any other extra
 /// thread of that process — a remote thread is not a special kind of thread once it exists.
 ///
-/// A target index outside the live range has no place in that multiplex; such a request only comes
-/// from a post-loop self-test, which supplies its own endpoint and services the thread itself.
+/// Any hosted-process index under MAX_PI has a unique worker badge and mirror window.
 pub(crate) unsafe fn spawn_requested_remote_thread(
     nt_handler: &mut ExecNtHandler,
     request: &RemoteThreadRequest,
     fault_ep: u64,
 ) -> u64 {
-    if request.target_pi >= TP_WORKER_PI_COUNT {
+    if request.target_pi >= MAX_PI || request.slot >= TP_WORKER_SLOT_COUNT {
         return 0;
     }
     let badged = mint_badged(fault_ep, tp_worker_badge(request.target_pi, request.slot));

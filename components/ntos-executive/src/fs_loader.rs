@@ -532,6 +532,42 @@ fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
     }
 }
 
+/// Demand-load failure reason, kept compact so serial logs can identify the exact missing mechanism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DemandLoadError {
+    UnsupportedImageName,
+    SxsProbe,
+    DeniedDiverter,
+    NoReservedSlot,
+    StoreTooSmall { slot: usize, store_len: usize },
+    NoMountedFs,
+    FileMissing,
+    EmptyFile,
+    PoolExhausted { size: u32 },
+    ShortRead { expected: u32, actual: u32 },
+    PeParseFailed,
+    ArenaExhausted { image_size: u64 },
+}
+
+impl DemandLoadError {
+    pub(crate) fn tag(self) -> &'static [u8] {
+        match self {
+            DemandLoadError::UnsupportedImageName => b"unsupported-name",
+            DemandLoadError::SxsProbe => b"sxs-probe",
+            DemandLoadError::DeniedDiverter => b"denied-diverter",
+            DemandLoadError::NoReservedSlot => b"no-reserved-slot",
+            DemandLoadError::StoreTooSmall { .. } => b"store-too-small",
+            DemandLoadError::NoMountedFs => b"no-mounted-fs",
+            DemandLoadError::FileMissing => b"file-missing",
+            DemandLoadError::EmptyFile => b"empty-file",
+            DemandLoadError::PoolExhausted { .. } => b"pool-exhausted",
+            DemandLoadError::ShortRead { .. } => b"short-read",
+            DemandLoadError::PeParseFailed => b"pe-parse-failed",
+            DemandLoadError::ArenaExhausted { .. } => b"arena-exhausted",
+        }
+    }
+}
+
 /// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
 /// the real `\reactos\system32` FS, load its bytes into the (reset-safe, cap-mapped) pool, claim a
 /// pre-reserved registry slot, activate it (stem + geometry, assigning a compact collision-free base),
@@ -540,29 +576,26 @@ fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
 /// NtOpenFile→NtCreateSection→NtMapViewOfSection flow then treat it exactly like a boot-registered
 /// DLL (no code-path difference — it operates on the `PeFile` slice + the registry).
 ///
-/// Returns `None` if the name isn't a supported DLL/driver image, the file isn't on the FS, no
-/// reserved slot is free, or the parse fails.
-///
 /// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
 /// survives the per-syscall reset). `dll_pe_store` is a `service_sec_image` stack local (also not the
 /// bump heap). The ONLY bump-heap allocations here are the registry's inline slot fill (no growth —
 /// `activate` writes in place). So the caller need only advance `heap_mark` for any transient it
-/// itself allocated around this call; `demand_load_dll`'s own state is inherently reset-safe. This is
-/// the `overlay_dirty` precedent, minimized.
+/// itself allocated around this call; `demand_load_dll_result`'s own state is inherently reset-safe.
+/// This is the `overlay_dirty` precedent, minimized.
 ///
 /// # Safety
 /// `store` must point at a live `[Option<PeFile>; N]` whose slots outlive the service loop; `reg`
 /// must be the live registry. Single-threaded executive; no aliasing.
-pub(crate) unsafe fn demand_load_dll(
+pub(crate) unsafe fn demand_load_dll_result(
     reg: &mut nt_dll_registry::Registry,
     store: *mut Option<nt_pe_loader::PeFile<'static>>,
     store_len: usize,
     folded_name: &[u8],
-) -> Option<usize> {
-    let (leaf, stem) = split_dll_leaf(folded_name)?;
+) -> Result<usize, DemandLoadError> {
+    let (leaf, stem) = split_dll_leaf(folded_name).ok_or(DemandLoadError::UnsupportedImageName)?;
     // Reject SxS/actctx probes (the registry's own rule) so we never demand-load a manifest as a DLL.
     if nt_dll_registry::Registry::is_sxs_probe(folded_name) {
-        return None;
+        return Err(DemandLoadError::SxsProbe);
     }
     // BEHAVIORAL-PARITY DENYLIST (a tiny documented set, NOT a content list): a few System32 DLLs,
     // if satisfied, DIVERT a hosted process down an optional side-path the boot must NOT take at the
@@ -576,21 +609,22 @@ pub(crate) unsafe fn demand_load_dll(
     // parity — a denylist of DIVERTERS, not an allowlist of content. Revisit when the diverted
     // side-path (app-compat DB) is actually implemented.
     if stem == b"apphelp" {
-        return None;
+        return Err(DemandLoadError::DeniedDiverter);
     }
-    let slot = reg.first_free()?;
+    let slot = reg.first_free().ok_or(DemandLoadError::NoReservedSlot)?;
     if slot >= store_len {
-        return None; // registry has a reserved slot but the parallel PE store doesn't — capacity bug
+        // registry has a reserved slot but the parallel PE store doesn't — capacity bug
+        return Err(DemandLoadError::StoreTooSmall { slot, store_len });
     }
-    let fs = exec_fs()?;
-    let (va, sz) = open_sys32_read(&fs, leaf)?;
+    let fs = exec_fs().ok_or(DemandLoadError::NoMountedFs)?;
+    let (va, sz) = open_sys32_read_result(&fs, leaf)?;
     let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
-    let pe = nt_pe_loader::PeFile::parse(bytes).ok()?;
+    let pe = nt_pe_loader::PeFile::parse(bytes).map_err(|_| DemandLoadError::PeParseFailed)?;
     let ext = image_extent(&pe);
     let entry = pe.entry_point_rva();
     // Claim the reserved slot and compact VA range. Arena exhaustion is a truthful load failure.
     if !reg.activate(slot, stem, ext, entry) {
-        return None;
+        return Err(DemandLoadError::ArenaExhausted { image_size: ext });
     }
     let base = reg.base(slot);
     // Relocate to the compact arena base + patch OptionalHeader.ImageBase.
@@ -614,22 +648,25 @@ pub(crate) unsafe fn demand_load_dll(
     print_str(b" base 0x");
     print_hex(base as u32);
     print_str(b"\n");
-    Some(slot)
+    Ok(slot)
 }
 
 /// Read `\reactos\system32\<leaf>` into a fresh pool buffer, returning `(va, size)`. Like
 /// `load_file_to_pool` but with the System32 prefix built in.
-unsafe fn open_sys32_read(fs: &Fat32, leaf: &[u8]) -> Option<(u64, u32)> {
-    let (cluster, size) = open_sys32(fs, leaf)?;
+unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), DemandLoadError> {
+    let (cluster, size) = open_sys32(fs, leaf).ok_or(DemandLoadError::FileMissing)?;
     if size == 0 {
-        return None;
+        return Err(DemandLoadError::EmptyFile);
     }
-    let va = pool_alloc(size)?;
+    let va = pool_alloc(size).ok_or(DemandLoadError::PoolExhausted { size })?;
     let read = fat_read_file(fs, cluster, size, va);
     if read < size {
-        return None;
+        return Err(DemandLoadError::ShortRead {
+            expected: size,
+            actual: read,
+        });
     }
-    Some((va, size))
+    Ok((va, size))
 }
 
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
