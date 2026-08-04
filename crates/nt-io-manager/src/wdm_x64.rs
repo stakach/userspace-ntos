@@ -26,6 +26,13 @@ pub enum WdmLayoutError {
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WdmDriverObjectInit {
+    pub size_field: u16,
+    pub driver_extension_offset: usize,
+    pub driver_extension: u64,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmDeviceObjectInit {
     pub driver_object: u64,
     pub next_device: u64,
@@ -88,6 +95,19 @@ pub struct WdmIoStackLocationInit {
     pub device_object: u64,
     pub file_object: u64,
     pub parameters: WdmIoStackParameters,
+}
+
+pub fn write_wdm_driver_object(
+    bytes: &mut [u8],
+    init: WdmDriverObjectInit,
+) -> Result<(), WdmLayoutError> {
+    require(bytes, 4)?;
+    require(bytes, init.driver_extension_offset.saturating_add(8))?;
+    zero(bytes);
+    put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DRIVER);
+    put_u16(bytes, 0x02, init.size_field);
+    put_u64(bytes, init.driver_extension_offset, init.driver_extension);
+    Ok(())
 }
 
 pub fn write_wdm_device_object(

@@ -65,12 +65,13 @@ pub use pipe::{
 };
 pub use store::{GenStore, IoId};
 pub use wdm_x64::{
-    write_wdm_device_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
-    WdmDeviceObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
-    WdmIrpInit, WdmLayoutError, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET,
-    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
-    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
-    WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
+    write_wdm_io_stack_location, write_wdm_irp, WdmDeviceObjectInit, WdmDriverObjectInit,
+    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WdmLayoutError,
+    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER,
+    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 
 #[cfg(feature = "object-manager")]
@@ -1497,6 +1498,20 @@ mod tests {
 
     #[test]
     fn wdm_x64_device_and_file_layouts_are_stable() {
+        let mut driver = [0xCC; WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE];
+        write_wdm_driver_object(
+            &mut driver,
+            WdmDriverObjectInit {
+                size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+                driver_extension_offset: WDM_X64_DRIVER_EXTENSION_OFFSET,
+                driver_extension: 0x7777,
+            },
+        )
+        .unwrap();
+        assert_eq!(le_u16(&driver, 0x00), WDM_X64_IO_TYPE_DRIVER as u16);
+        assert_eq!(le_u16(&driver, 0x02), WDM_X64_DRIVER_OBJECT_SIZE as u16);
+        assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
+
         let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
         write_wdm_device_object(
             &mut dev,

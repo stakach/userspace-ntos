@@ -10,6 +10,7 @@
 //! caps). Behaviour is byte-identical to the old bespoke spawners.
 #![allow(clippy::all)]
 use crate::*;
+use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
 /// Where a region's frame caps come from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1349,20 +1350,25 @@ pub(crate) unsafe fn component_main(
 
     // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension@spec.ext, MajorFunction@spec.mj).
     let drv = (spec.pool)(spec.size);
-    let mut i = 0u64;
-    while i < spec.size {
-        core::ptr::write_unaligned((drv + i) as *mut u64, 0);
-        i += 8;
-    }
-    core::ptr::write_unaligned(drv as *mut i16, 4); // Type = IO_TYPE_DRIVER
-    core::ptr::write_unaligned((drv + 2) as *mut u16, spec.size_field); // Size (may differ from alloc)
     let ext = (spec.pool)(spec.ext_size);
     let mut j = 0u64;
     while j < spec.ext_size {
         core::ptr::write_unaligned((ext + j) as *mut u64, 0);
         j += 8;
     }
-    core::ptr::write_unaligned((drv + spec.ext) as *mut u64, ext);
+    let driver_bytes = core::slice::from_raw_parts_mut(drv as *mut u8, spec.size as usize);
+    if write_wdm_driver_object(
+        driver_bytes,
+        WdmDriverObjectInit {
+            size_field: spec.size_field,
+            driver_extension_offset: spec.ext as usize,
+            driver_extension: ext,
+        },
+    )
+    .is_err()
+    {
+        panic!("invalid DriverObjectSpec");
+    }
 
     // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
     let reg_path = (spec.pool)(0x18);
