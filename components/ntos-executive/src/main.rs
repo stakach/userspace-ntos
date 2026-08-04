@@ -51,6 +51,7 @@ mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
+mod hosted_driver_projection;
 mod rendezvous;
 mod writable_fs;
 pub(crate) use rendezvous::*;

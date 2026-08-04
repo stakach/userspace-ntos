@@ -28,15 +28,15 @@ use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_io_abi::major;
 use nt_io_manager::{
-    write_wdm_device_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
-    DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceRecord, DeviceType,
-    DispatchContext, DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend,
-    DriverId, DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters,
-    IrpId, IrpProjection, MajorFunctionTable, ReadWriteParameters, WdmDeviceObjectInit,
-    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
-    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, DeviceCharacteristics,
+    DeviceControlParameters, DeviceFlags, DeviceRecord, DeviceType, DispatchContext,
+    DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend, DriverId,
+    DriverPeerId, DriverRecord, FileId, InformationParameters, IoManager, IoParameters, IrpId,
+    IrpProjection, MajorFunctionTable, ReadWriteParameters, WdmFileObjectInit,
+    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
+    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_types::ClientId;
 use nt_types::{NtPath, ObjectId};
@@ -1027,44 +1027,17 @@ extern "win64" fn s_io_create_device(
         } else {
             None
         };
-        let Some(alloc_len) = (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(ext_size) else {
-            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
+            drv,
+            ext_size,
+            dev_type as u32,
+            pool_alloc,
+            pool_free,
+        ) {
+            Ok(projection) => projection,
+            Err(status) => return status,
         };
-        let Ok(alloc_len_usize) = usize::try_from(alloc_len) else {
-            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
-        };
-        let dev = pool_alloc(alloc_len);
-        if dev == 0 {
-            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
-        }
-        let head = if drv != 0 {
-            read_unaligned((drv + 8) as *const u64)
-        } else {
-            0
-        };
-        let extension = if ext_size != 0 {
-            dev + WDM_X64_DEVICE_OBJECT_SIZE as u64
-        } else {
-            0
-        };
-        let dev_bytes = core::slice::from_raw_parts_mut(dev as *mut u8, alloc_len_usize);
-        if write_wdm_device_object(
-            dev_bytes,
-            WdmDeviceObjectInit {
-                driver_object: drv,
-                next_device: head,
-                device_extension: extension,
-                device_type: dev_type as u32,
-            },
-        )
-        .is_err()
-        {
-            pool_free(dev);
-            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
-        }
-        if drv != 0 {
-            write_unaligned((drv + 8) as *mut u64, dev);
-        }
+        let dev = projection.device_object();
         if dev_out != 0 {
             write_unaligned(dev_out as *mut u64, dev);
         }

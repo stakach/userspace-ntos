@@ -1606,3 +1606,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D3
   remains open for replacing the temporary boot framebuffer route with a real videoprt/miniport
   created device object/interface and I/O path.
+- D1 continued. Hosted `IoCreateDevice` allocation and `DriverObject->DeviceObject` insertion moved
+  out of the `driver_launch` ntoskrnl export trampoline into `hosted_driver_projection`. The
+  trampoline now validates/captures the optional `DeviceName`, delegates component-local WDM
+  `DEVICE_OBJECT` allocation/header writing/linking plus allocation rollback to the focused
+  projection boundary, and only publishes the out-param/shared-page verdict for the executive to
+  reconcile with canonical I/O Manager records. Validation: `cargo fmt --manifest-path
+  components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-hosted-device-projection-module-20260804.log` reached `RUN_RC=0`, `247/280
+  executive->isolated-service checks passed`, `PASS exec_fsd_on_shared_harness`, `PASS
+  exec_irp_transport_call_bound`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
+  remains open for making this projection boundary part of canonical I/O Manager/driver-host
+  lifetime, including `IoDeleteDevice`, unload cleanup, and real device-stack attachment; D3 remains
+  the real videoprt/miniport-created video stack.
