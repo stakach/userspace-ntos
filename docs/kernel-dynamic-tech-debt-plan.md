@@ -1710,3 +1710,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   x86_64-unknown-none`, and `git diff --check` passed. Review adjustment: D3 remains open for
   replacing the temporary boot framebuffer route with a real videoprt/miniport-created device
   object/interface and I/O path.
+- D3 continued. Extracted the boot-framebuffer Video0 miniport IOCTL contract into the new
+  host-testable `nt-video-miniport` crate. `video_device` now validates the BOOTBOOT framebuffer
+  mapping through that crate and delegates `VIDEO_NUM_MODES`, `VIDEO_MODE_INFORMATION`,
+  `VIDEO_MODE`, and `VIDEO_MEMORY_INFORMATION` encoding instead of carrying executive-local IOCTL
+  constants and raw field writers. Unsupported video IOCTLs still fail visibly; only the proven
+  framebuf display-driver mode/query/map path is implemented. Validation: `cargo test
+  --manifest-path crates/nt-video-miniport/Cargo.toml`, `cargo fmt --manifest-path
+  components/ntos-executive/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`
+  passed. Review adjustment: the temporary Video0 object projection remains in `video_device`; the
+  next D3 step is to register that route through canonical I/O Manager driver/device/file records
+  instead of direct projection-pointer lookups.

@@ -13,40 +13,20 @@ use nt_io_manager::{
     WdmDriverObjectInit, WdmFileObjectInit, WDM_X64_DEVICE_OBJECT_SIZE,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
 };
+use nt_video_miniport::{
+    BootFramebufferMiniport, FramebufferMapping, IOCTL_VIDEO_MAP_VIDEO_MEMORY,
+};
+
+pub(crate) use nt_video_miniport::VideoModeSpec;
 
 const VIDEO_DRIVER_NAME_CAP: usize = 32;
 const VIDEO_SERVICE_PATH_CAP: usize = 128;
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
-const FILE_DEVICE_VIDEO: u32 = 0x23;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
-
-// Video-miniport IOCTLs (ntddvdeo.h: FILE_DEVICE_VIDEO=0x23, METHOD_BUFFERED, FILE_ANY_ACCESS).
-const IOCTL_VIDEO_QUERY_AVAIL_MODES: u64 = 0x0023_0400;
-const IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES: u64 = 0x0023_0404;
-const IOCTL_VIDEO_QUERY_CURRENT_MODE: u64 = 0x0023_0408;
-const IOCTL_VIDEO_SET_CURRENT_MODE: u64 = 0x0023_040C;
-const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u64 = 0x0023_0458;
-
-#[derive(Clone, Copy)]
-pub(crate) struct VideoModeSpec {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) stride: u32,
-    pub(crate) bits_per_plane: u32,
-}
-
-impl VideoModeSpec {
-    const EMPTY: Self = Self {
-        width: 0,
-        height: 0,
-        stride: 0,
-        bits_per_plane: 0,
-    };
-}
 
 pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) driver_name: &'a [u8],
@@ -66,9 +46,7 @@ static mut VIDEO_DRIVER_NAME: [u8; VIDEO_DRIVER_NAME_CAP] = [0; VIDEO_DRIVER_NAM
 static mut VIDEO_DRIVER_NAME_LEN: u8 = 0;
 static mut VIDEO_SERVICE_PATH: [u8; VIDEO_SERVICE_PATH_CAP] = [0; VIDEO_SERVICE_PATH_CAP];
 static mut VIDEO_SERVICE_PATH_LEN: u8 = 0;
-static mut VIDEO_FRAMEBUFFER_VA: u64 = 0;
-static mut VIDEO_FRAMEBUFFER_SIZE: u64 = 0;
-static mut VIDEO_MODE: VideoModeSpec = VideoModeSpec::EMPTY;
+static mut VIDEO_MINIPORT: Option<BootFramebufferMiniport> = None;
 static mut VIDEO_DEVICE_READY: bool = false;
 
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
@@ -78,15 +56,18 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         || reg.driver_name.len() > VIDEO_DRIVER_NAME_CAP
         || reg.service_registry_path.is_empty()
         || reg.service_registry_path.len() > VIDEO_SERVICE_PATH_CAP
-        || reg.framebuffer_va == 0
-        || reg.framebuffer_size == 0
-        || reg.mode.width == 0
-        || reg.mode.height == 0
-        || reg.mode.stride == 0
-        || reg.mode.bits_per_plane == 0
     {
         return false;
     }
+    let Ok(miniport) = BootFramebufferMiniport::new(
+        FramebufferMapping {
+            virtual_address: reg.framebuffer_va,
+            size_bytes: reg.framebuffer_size,
+        },
+        reg.mode,
+    ) else {
+        return false;
+    };
     if !ensure_video_objects(reg.allocate_projection) {
         return false;
     }
@@ -99,9 +80,7 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     path.fill(0);
     path[..reg.service_registry_path.len()].copy_from_slice(reg.service_registry_path);
     VIDEO_SERVICE_PATH_LEN = reg.service_registry_path.len() as u8;
-    VIDEO_FRAMEBUFFER_VA = reg.framebuffer_va;
-    VIDEO_FRAMEBUFFER_SIZE = reg.framebuffer_size;
-    VIDEO_MODE = reg.mode;
+    VIDEO_MINIPORT = Some(miniport);
     VIDEO_DEVICE_READY = true;
     true
 }
@@ -114,6 +93,7 @@ pub(crate) fn video_device_map_ready() -> bool {
             && VIDEO_DRIVER_OBJECT != 0
             && VIDEO_DEVICE_OBJECT != 0
             && VIDEO_FILE_OBJECT != 0
+            && core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)).is_some()
     }
 }
 
@@ -161,7 +141,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
             driver_object: driver,
             next_device: 0,
             device_extension: 0,
-            device_type: FILE_DEVICE_VIDEO,
+            device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
         },
     )
     .is_err()
@@ -319,36 +299,11 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     0
 }
 
-unsafe fn fill_video_mode(out: u64) {
-    let mode = VIDEO_MODE;
-    let w = |off: u64, v: u32| write_unaligned((out + off) as *mut u32, v);
-    w(0, 80); // Length (== ModeInformationLength; nonzero = a valid mode)
-    w(4, 1); // ModeIndex
-    w(8, mode.width); // VisScreenWidth
-    w(12, mode.height); // VisScreenHeight
-    w(16, mode.stride); // ScreenStride (bytes/scanline)
-    w(20, 1); // NumberOfPlanes
-    w(24, mode.bits_per_plane);
-    w(28, 60); // Frequency
-    w(32, 320); // XMillimeter
-    w(36, 240); // YMillimeter
-    w(40, 8); // NumberRedBits
-    w(44, 8); // NumberGreenBits
-    w(48, 8); // NumberBlueBits
-    w(52, 0x00FF_0000); // RedMask
-    w(56, 0x0000_FF00); // GreenMask
-    w(60, 0x0000_00FF); // BlueMask
-    w(64, 0x0000_0003); // VIDEO_MODE_COLOR | VIDEO_MODE_GRAPHICS
-    w(68, mode.width); // VideoMemoryBitmapWidth
-    w(72, mode.height); // VideoMemoryBitmapHeight
-    w(76, 0); // DriverSpecificAttributeFlags
-}
-
 pub(crate) unsafe fn video_device_io_control(
     hdev: u64,
     ioctl: u64,
-    _in_buf: u64,
-    _in_len: u64,
+    in_buf: u64,
+    in_len: u64,
     out_buf: u64,
     out_len: u64,
     bytes_ret: *mut u32,
@@ -356,48 +311,45 @@ pub(crate) unsafe fn video_device_io_control(
     if !video_device_map_ready() || hdev != VIDEO_DEVICE_OBJECT {
         return 1;
     }
+    let Some(miniport) = core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)) else {
+        return 1;
+    };
+    if ioctl > u32::MAX as u64 {
+        return 1;
+    }
+    let input = if in_len == 0 {
+        &[]
+    } else if in_buf != 0 {
+        core::slice::from_raw_parts(in_buf as *const u8, in_len as usize)
+    } else {
+        return 1;
+    };
+    let output = if out_len == 0 {
+        &mut []
+    } else if out_buf != 0 {
+        core::slice::from_raw_parts_mut(out_buf as *mut u8, out_len as usize)
+    } else {
+        return 1;
+    };
     let set_ret = |n: u32| {
         if !bytes_ret.is_null() {
             write_unaligned(bytes_ret, n);
         }
     };
-    match ioctl {
-        IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES => {
-            if out_buf != 0 && out_len >= 8 {
-                write_unaligned(out_buf as *mut u32, 1); // NumModes
-                write_unaligned((out_buf + 4) as *mut u32, 80); // ModeInformationLength
-                set_ret(8);
-                return 0;
-            }
-        }
-        IOCTL_VIDEO_QUERY_AVAIL_MODES | IOCTL_VIDEO_QUERY_CURRENT_MODE => {
-            if out_buf != 0 && out_len >= 80 {
-                fill_video_mode(out_buf);
-                set_ret(80);
-                return 0;
-            }
-        }
-        IOCTL_VIDEO_SET_CURRENT_MODE => {
-            set_ret(0);
-            return 0;
-        }
-        IOCTL_VIDEO_MAP_VIDEO_MEMORY => {
-            if out_buf != 0 && out_len >= 32 {
-                write_unaligned(out_buf as *mut u64, VIDEO_FRAMEBUFFER_VA); // VideoRamBase
-                write_unaligned((out_buf + 8) as *mut u32, VIDEO_FRAMEBUFFER_SIZE as u32);
-                write_unaligned((out_buf + 16) as *mut u64, VIDEO_FRAMEBUFFER_VA);
-                write_unaligned((out_buf + 24) as *mut u32, VIDEO_FRAMEBUFFER_SIZE as u32);
-                set_ret(32);
+    match miniport.dispatch_io_control(ioctl as u32, input, output) {
+        Ok(bytes) => {
+            set_ret(bytes as u32);
+            if ioctl as u32 == IOCTL_VIDEO_MAP_VIDEO_MEMORY {
+                let mapping = miniport.mapping();
                 crate::print_str(
                     b"[video-device] IOCTL_VIDEO_MAP_VIDEO_MEMORY -> FrameBufferBase=0x",
                 );
-                crate::print_hex((VIDEO_FRAMEBUFFER_VA >> 32) as u32);
-                crate::print_hex(VIDEO_FRAMEBUFFER_VA as u32);
+                crate::print_hex((mapping.virtual_address >> 32) as u32);
+                crate::print_hex(mapping.virtual_address as u32);
                 crate::print_str(b"\n");
-                return 0;
             }
+            0
         }
-        _ => {}
+        Err(_) => 1,
     }
-    1
 }
