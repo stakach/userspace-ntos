@@ -1736,3 +1736,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   passed. Review adjustment: the remaining D3 debt is the win32k import bridge still returning a
   static projected `FILE_OBJECT` for `IoGetDeviceObjectPointer`; the next step is to create/reference
   a canonical I/O Manager file object for that open.
+- D3 continued. `IoGetDeviceObjectPointer("\\Device\\Video0")` now has a canonical I/O Manager open
+  behind its projected win32k `FILE_OBJECT`. `nt-io-manager` exposes
+  `reference_open_file_details`, the executive opens `\Device\Video0` through the live Object
+  Manager-backed I/O Manager during video route publication, records the canonical handle/file id/file
+  object id, and rewrites the projected WDM `FILE_OBJECT.FsContext` with that file id. Video
+  `EngDeviceIoControl` now uses the normal handle-based `IoManager::device_control` path instead of
+  the temporary external device dispatch wrapper, so IRPs carry the canonical open file id. Validation:
+  `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, `cargo test --manifest-path
+  crates/nt-video-miniport/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`
+  passed. Review adjustment: D3 remains open only for the broader replacement of the boot
+  framebuffer miniport/projection with a real videoprt/display-miniport-created stack and for auditing
+  the remaining win32k import hooks against Configuration Manager/Object Manager boundaries.

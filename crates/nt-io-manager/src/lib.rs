@@ -1341,6 +1341,25 @@ mod tests {
     }
 
     #[test]
+    fn open_file_details_reference_canonical_file_and_device() {
+        let mut om = io();
+        let client = setup_device(&mut om);
+        let handle = open_read(&mut om, client, "\\Device\\Test0").unwrap();
+        let (file_id, device_id, file_object) = om
+            .reference_open_file_details(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+
+        let file = om.file(file_id).unwrap();
+        assert_eq!(file.device_id, device_id);
+        assert_eq!(file.object_id, file_object);
+        assert_ne!(file_object, ObjectId::NULL);
+        assert_eq!(
+            om.reference_open_file_details(client, handle, AccessMask::GENERIC_WRITE),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+    }
+
+    #[test]
     fn open_unknown_path_rejected() {
         let mut om = io();
         let client = setup_device(&mut om);

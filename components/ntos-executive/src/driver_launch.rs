@@ -33,10 +33,11 @@ use nt_io_manager::{
     DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext, DispatchOutcome,
     DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId, InformationParameters,
     IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort,
-    ReadWriteParameters, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
-    WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
-    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
-    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmIoStackParameters, WdmIrpInit, CreateOptions, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
+    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
@@ -3302,6 +3303,45 @@ pub(crate) fn register_kernel_io_device(
     Ok((device_id.raw(), object_id))
 }
 
+pub(crate) fn open_io_device(
+    device_path: &str,
+    desired_access: AccessMask,
+) -> Result<(u64, u64, u64, u64), nt_status::NtStatus> {
+    let path = parse_nt_path(device_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let client = ClientId(IO_MANAGER_COMPONENT_ID);
+    let handle = io_manager_mut().open(
+        client,
+        &path,
+        desired_access,
+        ShareAccess::READ | ShareAccess::WRITE | ShareAccess::DELETE,
+        CreateOptions::NON_DIRECTORY_FILE,
+        1,
+    )?;
+    let (file_id, device_id, file_object_id) =
+        io_manager_mut().reference_open_file_details(client, handle, AccessMask::empty())?;
+    Ok((
+        handle.0,
+        file_id.raw(),
+        device_id.raw(),
+        file_object_id.0,
+    ))
+}
+
+pub(crate) fn device_control_on_io_handle(
+    handle: u64,
+    ioctl: u32,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<u64, nt_status::NtStatus> {
+    io_manager_mut().device_control(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        HandleValue(handle),
+        ioctl,
+        input,
+        output,
+    )
+}
+
 fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
     if dc.devobj == 0 || dc.device_name_len == 0 {
         return Ok(0);
@@ -3766,25 +3806,6 @@ pub(crate) unsafe fn dispatch_irp_to_device(
     if !inst.ready || inst.driver_id == 0 || inst.device_object == 0 {
         return None;
     }
-    if io_manager_mut()
-        .device(nt_io_manager::DeviceId(device_id))
-        .is_none()
-    {
-        return None;
-    }
-    dispatch_external_irp_to_device_record(device_id, major, fsctl, file_id, in_data, out)
-}
-
-/// Route one IRP to any canonical I/O Manager device route, including kernel-owned in-process
-/// devices that do not have a launched seL4 driver instance.
-pub(crate) unsafe fn dispatch_irp_to_io_device(
-    device_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Option<(i32, u64)> {
     if io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))
         .is_none()

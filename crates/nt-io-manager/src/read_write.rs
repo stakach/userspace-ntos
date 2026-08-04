@@ -140,6 +140,21 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok((file_id, file.device_id))
     }
 
+    /// Reference an open File by handle and return the canonical file/device/object identities.
+    pub fn reference_open_file_details(
+        &mut self,
+        client: ClientId,
+        handle: HandleValue,
+        required_access: AccessMask,
+    ) -> Result<(FileId, DeviceId, ObjectId), NtStatus> {
+        let (file_id, device_id) = self.reference_open_file(client, handle, required_access)?;
+        let file_object = self
+            .file(file_id)
+            .ok_or(NtStatus::INVALID_HANDLE)?
+            .object_id;
+        Ok((file_id, device_id, file_object))
+    }
+
     /// Build an IRP for `major` with `params` + `system_buffer`, dispatch it, and
     /// complete it synchronously, returning `IoStatus.Information`.
     pub(crate) fn build_and_dispatch_sync(

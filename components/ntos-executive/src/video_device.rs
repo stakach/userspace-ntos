@@ -58,6 +58,9 @@ static mut VIDEO_MINIPORT: Option<BootFramebufferMiniport> = None;
 static mut VIDEO_DRIVER_ID: u64 = 0;
 static mut VIDEO_DEVICE_ID: u64 = 0;
 static mut VIDEO_DEVICE_OBJECT_ID: u64 = 0;
+static mut VIDEO_FILE_HANDLE: u64 = 0;
+static mut VIDEO_FILE_ID: u64 = 0;
+static mut VIDEO_FILE_OBJECT_ID: u64 = 0;
 static mut VIDEO_DEVICE_READY: bool = false;
 
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
@@ -184,6 +187,26 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
     true
 }
 
+unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
+    if VIDEO_FILE_OBJECT == 0 || VIDEO_DEVICE_OBJECT == 0 {
+        return false;
+    }
+    write_wdm_file_object(
+        core::slice::from_raw_parts_mut(
+            VIDEO_FILE_OBJECT as *mut u8,
+            WDM_X64_FILE_OBJECT_SIZE,
+        ),
+        WdmFileObjectInit {
+            device_object: VIDEO_DEVICE_OBJECT,
+            fs_context: file_id,
+            file_name_len: 0,
+            file_name_max_len: 0,
+            file_name_buffer: 0,
+        },
+    )
+    .is_ok()
+}
+
 fn video_driver_object_path(driver_name: &[u8]) -> Option<String> {
     if !ascii_component_is_safe(driver_name) {
         return None;
@@ -207,7 +230,13 @@ fn video_dispatch_table() -> MajorFunctionTable {
 }
 
 unsafe fn ensure_video_io_route(driver_name: &[u8]) -> bool {
-    if VIDEO_DRIVER_ID != 0 && VIDEO_DEVICE_ID != 0 && VIDEO_DEVICE_OBJECT_ID != 0 {
+    if VIDEO_DRIVER_ID != 0
+        && VIDEO_DEVICE_ID != 0
+        && VIDEO_DEVICE_OBJECT_ID != 0
+        && VIDEO_FILE_HANDLE != 0
+        && VIDEO_FILE_ID != 0
+        && VIDEO_FILE_OBJECT_ID != 0
+    {
         return true;
     }
     let Some(driver_path) = video_driver_object_path(driver_name) else {
@@ -235,9 +264,27 @@ unsafe fn ensure_video_io_route(driver_name: &[u8]) -> bool {
             return false;
         }
     };
+    let (file_handle, file_id, opened_device_id, file_object_id) =
+        match crate::driver_launch::open_io_device(
+            VIDEO_DEVICE_PATH_STR,
+            nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
+        ) {
+            Ok(open) => open,
+            Err(_) => {
+                crate::driver_launch::destroy_io_driver(driver_id);
+                return false;
+            }
+        };
+    if opened_device_id != device_id || !rewrite_video_file_projection(file_id) {
+        crate::driver_launch::destroy_io_driver(driver_id);
+        return false;
+    }
     VIDEO_DRIVER_ID = driver_id;
     VIDEO_DEVICE_ID = device_id;
     VIDEO_DEVICE_OBJECT_ID = device_object_id;
+    VIDEO_FILE_HANDLE = file_handle;
+    VIDEO_FILE_ID = file_id;
+    VIDEO_FILE_OBJECT_ID = file_object_id;
     true
 }
 
@@ -245,6 +292,9 @@ unsafe fn video_io_route_ready() -> bool {
     VIDEO_DRIVER_ID != 0
         && VIDEO_DEVICE_ID != 0
         && VIDEO_DEVICE_OBJECT_ID != 0
+        && VIDEO_FILE_HANDLE != 0
+        && VIDEO_FILE_ID != 0
+        && VIDEO_FILE_OBJECT_ID != 0
         && crate::driver_launch::device_id_by_name(VIDEO_DEVICE_PATH_STR) == Some(VIDEO_DEVICE_ID)
         && crate::driver_launch::device_object_id(VIDEO_DEVICE_ID) == VIDEO_DEVICE_OBJECT_ID
 }
@@ -475,7 +525,7 @@ pub(crate) unsafe fn video_device_io_control(
     if ioctl > u32::MAX as u64 {
         return 1;
     }
-    let device_id = VIDEO_DEVICE_ID;
+    let file_handle = VIDEO_FILE_HANDLE;
     let input = if in_len == 0 {
         &[]
     } else if in_buf != 0 {
@@ -495,15 +545,13 @@ pub(crate) unsafe fn video_device_io_control(
             write_unaligned(bytes_ret, n);
         }
     };
-    match crate::driver_launch::dispatch_irp_to_io_device(
-        device_id,
-        major::IRP_MJ_DEVICE_CONTROL as u64,
-        ioctl,
-        0,
+    match crate::driver_launch::device_control_on_io_handle(
+        file_handle,
+        ioctl as u32,
         input,
         output,
     ) {
-        Some((status, information)) if status >= 0 && information <= u32::MAX as u64 => {
+        Ok(information) if information <= u32::MAX as u64 => {
             set_ret(information as u32);
             if ioctl as u32 == IOCTL_VIDEO_MAP_VIDEO_MEMORY {
                 let Some(miniport) =
