@@ -19,9 +19,10 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
-    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObReply,
+    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
+    ObReply,
 };
-use nt_object_manager::{ClientKind, ComponentId, ObjectManager, ObjectRef};
+use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
 use nt_types::{
     AccessMask, AccessMode, CaseSensitivity, ClientId, HandleValue, NtPath, ObjAttrFlags,
@@ -86,6 +87,7 @@ impl Server {
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
+            opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
@@ -125,6 +127,48 @@ impl Server {
         let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
         let obj = self.om.lookup_path(&path, case_of(req.flags))?;
         Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
+    }
+
+    fn op_query_object(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<ObReply, NtStatus> {
+        let req: ObLookupPathRequest = read_req(buf)?;
+        check_size::<ObLookupPathRequest>(req.abi_size)?;
+        let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
+        let obj = self.om.lookup_path(&path, case_of(req.flags))?;
+        let mut info = ObQueryObjectInfo {
+            object_id: obj.id().0,
+            type_id: obj.type_id().0 as u64,
+            ..ObQueryObjectInfo::default()
+        };
+        obj.with_body(|body| match body {
+            ObjectBody::Driver(d) => {
+                info.owner_component = d.owner.0;
+                info.owner_local_id = d.owner_local_id;
+                info.route_kind = 1;
+            }
+            ObjectBody::Device(d) => {
+                info.owner_component = d.owner.0;
+                info.owner_local_id = d.owner_local_id;
+                info.route_kind = 2;
+            }
+            ObjectBody::File(f) => {
+                info.owner_component = f.owner.0;
+                info.owner_local_id = f.owner_local_id;
+                info.related_object_id = f.device.0;
+                info.route_kind = 3;
+            }
+            _ => {}
+        });
+        let bytes = bytemuck::bytes_of(&info);
+        let dst = out_buf
+            .get_mut(..bytes.len())
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        dst.copy_from_slice(bytes);
+        Ok(reply(
+            NtStatus::SUCCESS,
+            bytes.len() as u32,
+            info.object_id,
+            info.type_id,
+        ))
     }
 
     fn op_create_directory(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
@@ -343,6 +387,20 @@ mod tests {
             .unwrap();
         assert_eq!(device.id().0, r.detail0);
         assert_eq!(Some(device.type_id()), s.object_manager().device_type());
+
+        let query_req = lookup_req("\\Device\\NamedPipe");
+        let mut out = [0u8; core::mem::size_of::<ObQueryObjectInfo>()];
+        let r = s.dispatch(c, opcode::OB_OP_QUERY_OBJECT, &query_req, &mut out);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+        assert_eq!(
+            r.information as usize,
+            core::mem::size_of::<ObQueryObjectInfo>()
+        );
+        let info = bytemuck::pod_read_unaligned::<ObQueryObjectInfo>(&out);
+        assert_eq!(info.object_id, device.id().0);
+        assert_eq!(info.owner_component, 0x5000);
+        assert_eq!(info.owner_local_id, 0x20);
+        assert_eq!(info.route_kind, 2);
     }
 
     fn io_req(path: &str, owner_component: u64, owner_local_id: u64) -> Vec<u8> {
@@ -354,6 +412,21 @@ mod tests {
             owner_component,
             owner_local_id,
             path_offset: size_of::<ObCreateIoObjectRequest>() as u32,
+            path_len_bytes: (units.len() * 2) as u32,
+        };
+        let mut buf = bytemuck::bytes_of(&req).to_vec();
+        for unit in units {
+            buf.extend_from_slice(&unit.to_le_bytes());
+        }
+        buf
+    }
+
+    fn lookup_req(path: &str) -> Vec<u8> {
+        let units: Vec<u16> = path.encode_utf16().collect();
+        let req = ObLookupPathRequest {
+            abi_size: size_of::<ObLookupPathRequest>() as u16,
+            flags: ObjAttrFlags::CASE_INSENSITIVE.bits() as u16,
+            path_offset: size_of::<ObLookupPathRequest>() as u32,
             path_len_bytes: (units.len() * 2) as u32,
         };
         let mut buf = bytemuck::bytes_of(&req).to_vec();

@@ -145,6 +145,7 @@ pub const SH_DE_STATUS: u64 = 0x10; // out: DriverEntry NTSTATUS (i32)
 pub const SH_MJ_TABLE: u64 = 0x18; // out: recorded DriverObject->MajorFunction[] base VA (u64)
 pub const SH_DEVOBJ: u64 = 0x20; // out: the control DEVICE_OBJECT VA (u64)
 pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
+pub const SH_DRVOBJ: u64 = 0x30; // out: the component-local DRIVER_OBJECT VA (u64)
 pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // out: IoCreateDevice DeviceName bytes (u16)
 pub const SH_SYMLINK_LINK_LEN: u64 = 0x82; // out: IoCreateSymbolicLink LinkName bytes (u16)
 pub const SH_SYMLINK_TARGET_LEN: u64 = 0x84; // out: IoCreateSymbolicLink DeviceName bytes (u16)
@@ -1668,6 +1669,7 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
 unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
     let mj_create = read_unaligned((drv + 0x70) as *const u64);
     let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
+    write_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *mut u64, drv);
     // Pool high-water (diagnostic; not read by the executive — parity with the old inline entry).
     let pool_used = read_volatile(FSD_POOL_VADDR as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
@@ -2054,6 +2056,8 @@ pub(crate) struct DriverComponent {
     pub pml4: u64,
     /// The component's fault endpoint (also the IRP dispatch channel: plain Send/Recv).
     pub fault_ep: u64,
+    /// The component-local DRIVER_OBJECT projection built for this driver.
+    pub drvobj: u64,
     /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
     pub devobj: u64,
     /// UTF-16LE path captured from `IoCreateDevice(DeviceName)`, if the driver created a named
@@ -2076,6 +2080,10 @@ pub(crate) struct DriverComponent {
     pub exec_arg_va: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
     pub instance: usize,
+    /// Canonical executive/I/O route id for this driver binding.
+    pub driver_id: u64,
+    /// Canonical executive/I/O route id for this driver's named control device, if any.
+    pub device_id: u64,
     /// The component host's TCB — used to `TCB_Suspend` it if its pump WALLS (transport risk R2).
     pub tcb: u64,
     /// The DEDICATED MCS reply object backing this component's `Call` dispatch transport.
@@ -2478,6 +2486,7 @@ pub(crate) unsafe fn load_driver(
 
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
+    let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     let (device_name_len, device_name_utf16) =
         read_shared_path_capture(win.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
@@ -2511,9 +2520,16 @@ pub(crate) unsafe fn load_driver(
     print_hex(devobj as u32);
     print_str(b"\n");
 
+    let driver_id = DRIVER_NEXT_BINDING_ID.fetch_add(1, Ordering::Relaxed);
+    let device_id = if devobj != 0 {
+        DEVICE_NEXT_ROUTE_ID.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
     let dc = DriverComponent {
         pml4,
         fault_ep,
+        drvobj,
         devobj,
         device_name_len,
         device_name_utf16,
@@ -2526,10 +2542,12 @@ pub(crate) unsafe fn load_driver(
         exec_shared_va: win.shared_va,
         exec_arg_va: win.arg_va,
         instance,
+        driver_id,
+        device_id,
         tcb,
         reply_cap,
     };
-    // Record the live instance so `dispatch_irp(instance, ...)` can route to it from anywhere.
+    // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
     Some(dc)
 }
@@ -2629,14 +2647,17 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The live launched IRP-driver instance table + the generic IRP dispatch call.
+// The live launched IRP-driver route table + the generic IRP dispatch transport.
 //
-// De-singletoned (multi-driver): the executive keeps a small table of live [`DriverComponent`]s
-// keyed by instance index. [`dispatch_irp(instance, …)`] routes an IRP to ANY launched driver;
-// `npfs_dispatch_irp` is the instance-0 (npfs) convenience wrapper so the many existing npfs call
-// sites are unchanged. Each instance carries its OWN executive-side SHARED/ARG VAs, fault EP, and
-// PML4 — two drivers coexist with fully isolated windows.
+// De-singletoned (multi-driver): the executive keeps small tables of live [`DriverComponent`]s keyed
+// by canonical driver/device route ids. The instance slot is only the transport mechanism needed to
+// wake an isolated component; call sites route through a driver id, device id, Object Manager device
+// object id, or captured named-device path.
 // ---------------------------------------------------------------------------------------------
+
+pub(crate) const IO_MANAGER_COMPONENT_ID: u64 = 0x494F_0000;
+static DRIVER_NEXT_BINDING_ID: AtomicU64 = AtomicU64::new(1);
+static DEVICE_NEXT_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
 #[derive(Clone, Copy)]
@@ -2647,6 +2668,8 @@ pub(crate) struct DriverInstance {
     pub exec_arg_va: u64,
     pub tcb: u64,
     pub reply_cap: u64,
+    pub driver_id: u64,
+    pub device_id: u64,
     pub ready: bool,
     pub used: bool,
 }
@@ -2658,6 +2681,8 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_arg_va: 0,
     tcb: 0,
     reply_cap: 0,
+    driver_id: 0,
+    device_id: 0,
     ready: false,
     used: false,
 };
@@ -2665,6 +2690,56 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
 static mut DRIVER_INSTANCES: [DriverInstance; MAX_DRIVER_INSTANCES] =
     [EMPTY_INSTANCE; MAX_DRIVER_INSTANCES];
+
+#[derive(Clone, Copy)]
+struct DriverBinding {
+    id: u64,
+    instance: usize,
+    driver_object: u64,
+    object_id: u64,
+    ready: bool,
+    used: bool,
+}
+
+const EMPTY_DRIVER_BINDING: DriverBinding = DriverBinding {
+    id: 0,
+    instance: 0,
+    driver_object: 0,
+    object_id: 0,
+    ready: false,
+    used: false,
+};
+
+static mut DRIVER_BINDINGS: [DriverBinding; MAX_DRIVER_INSTANCES] =
+    [EMPTY_DRIVER_BINDING; MAX_DRIVER_INSTANCES];
+
+#[derive(Clone, Copy)]
+struct DeviceRoute {
+    id: u64,
+    driver_id: u64,
+    instance: usize,
+    device_object: u64,
+    object_id: u64,
+    name_len: u16,
+    name_utf16: [u8; SH_CAPTURED_PATH_BYTES],
+    ready: bool,
+    used: bool,
+}
+
+const EMPTY_DEVICE_ROUTE: DeviceRoute = DeviceRoute {
+    id: 0,
+    driver_id: 0,
+    instance: 0,
+    device_object: 0,
+    object_id: 0,
+    name_len: 0,
+    name_utf16: [0; SH_CAPTURED_PATH_BYTES],
+    ready: false,
+    used: false,
+};
+
+static mut DEVICE_ROUTES: [DeviceRoute; MAX_DRIVER_INSTANCES] =
+    [EMPTY_DEVICE_ROUTE; MAX_DRIVER_INSTANCES];
 
 /// Record a launched driver in [`DRIVER_INSTANCES`] (called by [`load_driver`]). "Ready" iff it
 /// parked at its dispatch loop with a control DEVICE_OBJECT (an FSD; a filter/device without an
@@ -2680,6 +2755,8 @@ fn register_instance(dc: &DriverComponent) {
             exec_arg_va: dc.exec_arg_va,
             tcb: dc.tcb,
             reply_cap: dc.reply_cap,
+            driver_id: dc.driver_id,
+            device_id: dc.device_id,
             // Default readiness = npfs's historic rule (parked + a control device object). A
             // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
             // is marked ready explicitly by the caller via `register_instance_ready`.
@@ -2687,20 +2764,152 @@ fn register_instance(dc: &DriverComponent) {
             used: true,
         };
     }
+    register_driver_binding(dc);
+    if dc.device_id != 0 {
+        register_device_route(dc);
+    }
+}
+
+fn register_driver_binding(dc: &DriverComponent) {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
+    if dc.instance < t.len() {
+        t[dc.instance] = DriverBinding {
+            id: dc.driver_id,
+            instance: dc.instance,
+            driver_object: dc.drvobj,
+            object_id: 0,
+            ready: dc.finished && (dc.verdict & V_MJ) != 0,
+            used: true,
+        };
+    }
+}
+
+fn register_device_route(dc: &DriverComponent) {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
+    if dc.instance < t.len() {
+        t[dc.instance] = DeviceRoute {
+            id: dc.device_id,
+            driver_id: dc.driver_id,
+            instance: dc.instance,
+            device_object: dc.devobj,
+            object_id: 0,
+            name_len: dc.device_name_len,
+            name_utf16: dc.device_name_utf16,
+            ready: dc.finished && dc.devobj != 0,
+            used: true,
+        };
+    }
+}
+
+pub(crate) fn bind_driver_object_id(driver_id: u64, object_id: u64) -> bool {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
+    for entry in t.iter_mut() {
+        if entry.used && entry.id == driver_id {
+            entry.object_id = object_id;
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
+    driver_binding(driver_id)
+        .map(|entry| entry.object_id)
+        .unwrap_or(0)
+}
+
+pub(crate) fn bind_device_object_id(device_id: u64, object_id: u64) -> bool {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
+    for entry in t.iter_mut() {
+        if entry.used && entry.id == device_id {
+            entry.object_id = object_id;
+            return true;
+        }
+    }
+    false
+}
+
+fn driver_binding(driver_id: u64) -> Option<DriverBinding> {
+    let t = unsafe { &*core::ptr::addr_of!(DRIVER_BINDINGS) };
+    t.iter()
+        .copied()
+        .find(|entry| entry.used && entry.id == driver_id)
+}
+
+fn device_route(device_id: u64) -> Option<DeviceRoute> {
+    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
+    t.iter()
+        .copied()
+        .find(|entry| entry.used && entry.id == device_id)
+}
+
+fn device_route_by_object_id(object_id: u64) -> Option<DeviceRoute> {
+    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
+    t.iter()
+        .copied()
+        .find(|entry| entry.used && entry.object_id != 0 && entry.object_id == object_id)
+}
+
+fn device_route_name_eq_ascii(entry: &DeviceRoute, path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if entry.name_len as usize != bytes.len() * 2 {
+        return false;
+    }
+    for (i, b) in bytes.iter().copied().enumerate() {
+        if b > 0x7f {
+            return false;
+        }
+        let off = i * 2;
+        if entry.name_utf16[off] != b || entry.name_utf16[off + 1] != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn device_route_by_name(path: &str) -> Option<DeviceRoute> {
+    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
+    t.iter()
+        .copied()
+        .find(|entry| entry.used && device_route_name_eq_ascii(entry, path))
 }
 
 /// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
 /// a minimal driver that fills MajorFunction[] but creates no control DEVICE_OBJECT).
-pub(crate) fn register_instance_ready(i: usize, ready: bool) {
+fn register_instance_ready(i: usize, ready: bool) {
     let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
     if i < t.len() && t[i].used {
         t[i].ready = ready;
+        let driver_id = t[i].driver_id;
+        let device_id = t[i].device_id;
+        let drivers = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
+        for entry in drivers.iter_mut() {
+            if entry.used && entry.id == driver_id {
+                entry.ready = ready;
+            }
+        }
+        let devices = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
+        for entry in devices.iter_mut() {
+            if entry.used && entry.id == device_id {
+                entry.ready = ready;
+            }
+        }
     }
 }
 
-/// The PML4 (VSpace) cap of launched instance `i` (0 = not launched) — for the isolation proof.
-pub(crate) fn instance_pml4(i: usize) -> u64 {
-    instance(i).map(|d| d.pml4).unwrap_or(0)
+/// Mark a launched driver ready/unready for dispatch by canonical driver route id.
+pub(crate) fn register_driver_ready(driver_id: u64, ready: bool) {
+    if let Some(binding) = driver_binding(driver_id) {
+        register_instance_ready(binding.instance, ready);
+    }
+}
+
+/// The PML4 (VSpace) cap of a launched driver route (0 = not launched).
+pub(crate) fn driver_pml4(driver_id: u64) -> u64 {
+    driver_binding(driver_id)
+        .and_then(|binding| instance(binding.instance))
+        .map(|d| d.pml4)
+        .unwrap_or(0)
 }
 
 /// Snapshot of a live instance, or None if `i` isn't launched.
@@ -2713,20 +2922,27 @@ fn instance(i: usize) -> Option<DriverInstance> {
     }
 }
 
-/// Record a launched npfs component (instance 0). Kept for source compatibility — `load_driver`
-/// already registered it in [`DRIVER_INSTANCES`]; this only re-asserts the npfs (instance-0) row.
-pub(crate) fn register_npfs(dc: &DriverComponent) {
-    register_instance(dc);
-}
-
-/// Whether npfs (instance 0) is launched + parked at its dispatch loop (ready to serve IRPs).
+/// Whether the driver-declared `\Device\NamedPipe` route is ready to serve IRPs.
 pub(crate) fn npfs_ready() -> bool {
-    instance(0).map(|d| d.ready).unwrap_or(false)
+    device_route_by_name("\\Device\\NamedPipe")
+        .map(|route| route.ready)
+        .unwrap_or(false)
 }
 
-/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP to instance 0.
+/// The PML4 (VSpace) cap behind `\Device\NamedPipe` (0 = not launched).
+pub(crate) fn npfs_pml4() -> u64 {
+    device_route_by_name("\\Device\\NamedPipe")
+        .and_then(|route| instance(route.instance))
+        .map(|d| d.pml4)
+        .unwrap_or(0)
+}
+
+/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the last dispatched IRP to
+/// `\Device\NamedPipe`.
 pub(crate) unsafe fn npfs_last_file_id() -> u64 {
-    let sh = instance(0)
+    let inst = device_route_by_name("\\Device\\NamedPipe").map(|route| route.instance);
+    let sh = inst
+        .and_then(instance)
         .map(|d| d.exec_shared_va)
         .unwrap_or(FSD_SHARED_VADDR);
     read_volatile((sh + SH_REQ_FILEID) as *const u64)
@@ -2738,9 +2954,9 @@ pub(crate) unsafe fn npfs_last_file_id() -> u64 {
 /// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame
 /// (buffered I/O); `out` receives the driver's output. Returns `None` if `inst` isn't ready.
 ///
-/// This is the SHARED multi-driver dispatch engine — no per-driver code. `npfs_dispatch_irp` is the
-/// instance-0 wrapper.
-pub(crate) unsafe fn dispatch_irp(
+/// This is the private component transport engine. Public callers route through driver/device ids
+/// and Object Manager object ids.
+unsafe fn dispatch_irp_for_instance(
     inst: usize,
     major: u64,
     fsctl: u64,
@@ -2855,8 +3071,72 @@ pub(crate) unsafe fn dispatch_irp(
     Some((st, info))
 }
 
-/// Route one IRP to the isolated npfs component (instance 0). Thin wrapper over [`dispatch_irp`]
-/// so the many existing npfs call sites are unchanged. Returns `None` if npfs isn't ready.
+/// Route one IRP to a launched driver by its canonical driver route id.
+pub(crate) unsafe fn dispatch_irp_to_driver(
+    driver_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let binding = driver_binding(driver_id)?;
+    if !binding.ready || binding.driver_object == 0 {
+        return None;
+    }
+    dispatch_irp_for_instance(binding.instance, major, fsctl, file_id, in_data, out)
+}
+
+/// Route one IRP to a launched device by its canonical device route id.
+pub(crate) unsafe fn dispatch_irp_to_device(
+    device_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let route = device_route(device_id)?;
+    if !route.ready || route.driver_id == 0 || route.device_object == 0 {
+        return None;
+    }
+    dispatch_irp_for_instance(route.instance, major, fsctl, file_id, in_data, out)
+}
+
+/// Route one IRP to a launched device by the Object Manager Device object id.
+pub(crate) unsafe fn dispatch_irp_to_device_object(
+    object_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let route = device_route_by_object_id(object_id)?;
+    if !route.ready || route.driver_id == 0 || route.device_object == 0 {
+        return None;
+    }
+    dispatch_irp_for_instance(route.instance, major, fsctl, file_id, in_data, out)
+}
+
+unsafe fn dispatch_irp_to_named_device(
+    path: &str,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    let route = device_route_by_name(path)?;
+    if route.object_id != 0 {
+        dispatch_irp_to_device_object(route.object_id, major, fsctl, file_id, in_data, out)
+    } else {
+        dispatch_irp_to_device(route.id, major, fsctl, file_id, in_data, out)
+    }
+}
+
+/// Route one IRP to the driver-declared `\Device\NamedPipe` route. Kept as a semantic npfs wrapper
+/// for existing named-pipe call sites; it no longer assumes instance 0.
 pub(crate) unsafe fn npfs_dispatch_irp(
     major: u64,
     fsctl: u64,
@@ -2864,5 +3144,5 @@ pub(crate) unsafe fn npfs_dispatch_irp(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    dispatch_irp(0, major, fsctl, file_id, in_data, out)
+    dispatch_irp_to_named_device("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
 }

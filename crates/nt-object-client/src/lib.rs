@@ -18,7 +18,8 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateIoObjectRequest,
-    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObReply,
+    ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
+    ObReply,
 };
 use nt_status::NtStatus;
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId};
@@ -32,6 +33,16 @@ pub trait Backend {
 /// The Object Manager client.
 pub struct ObjectClient<B> {
     backend: B,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub object_id: ObjectId,
+    pub type_id: ObjectTypeId,
+    pub owner_component: u64,
+    pub owner_local_id: u64,
+    pub related_object_id: ObjectId,
+    pub route_kind: u32,
 }
 
 impl<B: Backend> ObjectClient<B> {
@@ -99,6 +110,40 @@ impl<B: Backend> ObjectClient<B> {
         let r = self.backend.call(opcode::OB_OP_LOOKUP_PATH, &buf, &mut []);
         NtStatus(r.status).to_result()?;
         Ok(ObjectId(r.detail0))
+    }
+
+    /// Resolve a path and return its object/routing metadata.
+    pub fn query_object(
+        &mut self,
+        path: &str,
+        case_insensitive: bool,
+    ) -> Result<ObjectInfo, NtStatus> {
+        let units = utf16(path);
+        let req = ObLookupPathRequest {
+            abi_size: size_of::<ObLookupPathRequest>() as u16,
+            flags: case_flag(case_insensitive),
+            path_offset: size_of::<ObLookupPathRequest>() as u32,
+            path_len_bytes: byte_len(&units),
+        };
+        let buf = pack(&req, &units);
+        let mut out = vec![0u8; size_of::<ObQueryObjectInfo>()];
+        let r = self
+            .backend
+            .call(opcode::OB_OP_QUERY_OBJECT, &buf, &mut out);
+        NtStatus(r.status).to_result()?;
+        if r.information as usize != size_of::<ObQueryObjectInfo>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let info = bytemuck::try_pod_read_unaligned::<ObQueryObjectInfo>(&out)
+            .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        Ok(ObjectInfo {
+            object_id: ObjectId(info.object_id),
+            type_id: ObjectTypeId(info.type_id as u32),
+            owner_component: info.owner_component,
+            owner_local_id: info.owner_local_id,
+            related_object_id: ObjectId(info.related_object_id),
+            route_kind: info.route_kind,
+        })
     }
 
     /// Create a directory at `path`, returning its object id.

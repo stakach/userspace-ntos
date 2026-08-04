@@ -143,6 +143,23 @@ pub struct ObLookupPathRequest {
     pub path_len_bytes: u32,
 }
 
+/// `OB_OP_QUERY_OBJECT` fixed result.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObQueryObjectInfo {
+    pub object_id: u64,
+    pub type_id: u64,
+    /// For Driver/Device/File bodies, the kernel component that owns the routed object.
+    pub owner_component: u64,
+    /// For Driver/Device/File bodies, the owner-local canonical id.
+    pub owner_local_id: u64,
+    /// For File bodies, the target Device object id. Zero for non-File objects.
+    pub related_object_id: u64,
+    /// 0 = unrouted/other, 1 = Driver, 2 = Device, 3 = File.
+    pub route_kind: u32,
+    pub _reserved: u32,
+}
+
 /// `OB_OP_CLOSE_HANDLE` payload.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -176,6 +193,7 @@ const _: () = {
     assert!(size_of::<ObCreateSymbolicLinkRequest>() == 24);
     assert!(size_of::<ObCreateIoObjectRequest>() == 32);
     assert!(size_of::<ObLookupPathRequest>() == 12);
+    assert!(size_of::<ObQueryObjectInfo>() == 48);
     assert!(size_of::<ObCloseHandleRequest>() == 16);
     assert!(size_of::<ObReply>() == 24);
     // 8-byte alignment (u64 fields) except the all-32-bit ones.

@@ -1509,3 +1509,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `PASS exec_fsd_on_shared_harness`. Review adjustment: the remaining static policy is the
   bootstrap manifest itself and the conserved VA-band layout; those are now future session-manager
   and address-space allocator work, not hosted-image-table fallbacks.
+- D1 continued. Driver/device namespace publication now stores canonical executive I/O route ids in
+  Object Manager `Driver`/`Device` bodies instead of component instance numbers or guest pool
+  pointers. `OB_OP_QUERY_OBJECT` returns fixed route metadata for Driver/Device/File bodies, NPFS
+  binds `\Driver\Npfs` and `\Device\NamedPipe` by querying Object Manager metadata, and public IRP
+  dispatch helpers route by driver id, device id, Object Manager device object id, or the
+  driver-declared named-device route. The raw component instance dispatcher is now private transport
+  machinery, redundant `register_npfs` re-registration is gone, and the second proof driver uses its
+  driver route id even though it has no control device. Validation: `cargo test --manifest-path
+  crates/nt-object-server/Cargo.toml`, `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `git diff --check` passed. Review adjustment: D1 remains open until these executive route
+  tables are folded into the canonical `nt-io-manager` driver/device stores and driver-created
+  projections are owned from that boundary rather than `driver_launch`.

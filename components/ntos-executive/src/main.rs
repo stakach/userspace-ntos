@@ -13582,21 +13582,36 @@ fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     dc: &driver_launch::DriverComponent,
     passed: &mut u64,
 ) {
-    let owner_component = 0x4452_0000u64 | dc.instance as u64;
-    let driver_ok = object_client
-        .create_driver("\\Driver\\Npfs", owner_component, dc.instance as u64, true)
-        .is_ok()
-        && object_client.lookup("\\Driver\\Npfs", true).is_ok();
+    let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
+    let driver_created = object_client
+        .create_driver("\\Driver\\Npfs", owner_component, dc.driver_id, true)
+        .ok();
+    let driver_info = object_client.query_object("\\Driver\\Npfs", true).ok();
+    let driver_bound = driver_info.is_some_and(|info| {
+        info.route_kind == 1
+            && info.owner_component == owner_component
+            && info.owner_local_id == dc.driver_id
+            && driver_launch::bind_driver_object_id(dc.driver_id, info.object_id.0)
+            && driver_launch::driver_object_id(dc.driver_id) == info.object_id.0
+    });
+    let driver_ok = driver_created.is_some() && driver_bound && dc.drvobj != 0;
     check(b"npfs_driver_object_registered", driver_ok, passed);
 
     let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
     let device_declared = device_path.as_deref() == Some("\\Device\\NamedPipe");
     check(b"npfs_named_device_declared", device_declared, passed);
     let device_ok = device_path.as_deref().is_some_and(|path| {
-        object_client
-            .create_device(path, owner_component, dc.devobj, true)
-            .is_ok()
-            && object_client.lookup(path, true).is_ok()
+        let created = object_client
+            .create_device(path, owner_component, dc.device_id, true)
+            .ok();
+        let info = object_client.query_object(path, true).ok();
+        created.is_some()
+            && info.is_some_and(|info| {
+                info.route_kind == 2
+                    && info.owner_component == owner_component
+                    && info.owner_local_id == dc.device_id
+                    && driver_launch::bind_device_object_id(dc.device_id, info.object_id.0)
+            })
     });
     check(b"npfs_device_object_registered", device_ok, passed);
 
@@ -16919,7 +16934,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(&npfs_path[..npfs_path_len]);
             print_str(b"\n");
             if let Some(dc) = load_driver(&fs, &npfs_path[..npfs_path_len], npfs_class) {
-                register_npfs(&dc);
                 publish_npfs_io_objects(&mut c, &dc, &mut passed);
                 // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
                 check(
@@ -17527,24 +17541,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // This minimal FSD fills its MajorFunction[] table but creates NO control
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
                 let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
-                driver_launch::register_instance_ready(dc.instance, irp_ready);
+                driver_launch::register_driver_ready(dc.driver_id, irp_ready);
 
                 // Isolation: the 2nd driver runs in its OWN VSpace — a PML4 distinct from npfs's
-                // (instance 0) AND the executive's.
-                let npfs_pml4 = driver_launch::instance_pml4(0);
-                let distinct_pml4 =
-                    dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE && dc.pml4 != npfs_pml4;
+                // named-pipe driver AND the executive's.
+                let npfs_pml4 = driver_launch::npfs_pml4();
+                let proof_pml4 = driver_launch::driver_pml4(dc.driver_id);
+                let distinct_pml4 = proof_pml4 != 0
+                    && proof_pml4 != CAP_INIT_THREAD_VSPACE
+                    && proof_pml4 != npfs_pml4;
 
                 // IRP round-trip through the SHARED component_pump: dispatch IRP_MJ_CREATE (major 0)
-                // to the 2nd driver's own instance; its handler sets STATUS_SUCCESS + Information =
-                // 0x5A5A. Prove the completion propagated back through the shared dispatch engine.
+                // through the 2nd driver's canonical route id; its handler sets STATUS_SUCCESS +
+                // Information = 0x5A5A. Prove the completion propagated back through the shared
+                // dispatch engine without exposing the component instance as the public route.
                 let mut out = [0u8; 16];
                 // ★★ NEGATIVE-CONTROL INJECTION (Phase 4): make a BOUND-NOTIFICATION delivery land
                 // on this dispatch's pump recv, deliberately. See `inject_bound_notification_tick`.
                 let tick_absorbed_before = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
                 let tick_armed = inject_bound_notification_tick();
-                let rt = driver_launch::dispatch_irp(
-                    dc.instance,
+                let rt = driver_launch::dispatch_irp_to_driver(
+                    dc.driver_id,
                     0, /* IRP_MJ_CREATE */
                     0,
                     0,
@@ -17561,8 +17578,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 retract_bound_notification_tick();
                 let mut irp_ok = false;
                 if let Some((st, info)) = rt {
-                    print_str(b"[driver-launch] 2nd-driver instance=");
-                    print_u64(dc.instance as u64);
+                    print_str(b"[driver-launch] 2nd-driver driver-id=");
+                    print_u64(dc.driver_id);
                     print_str(b" IRP_MJ_CREATE -> status=0x");
                     print_hex(st as u32);
                     print_str(b" info=0x");
