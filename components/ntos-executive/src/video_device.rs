@@ -8,10 +8,13 @@
 
 use core::ptr::{read_unaligned, write_unaligned};
 
-const VIDEO_DRIVER_OBJECT_BYTES: u64 = 0x150;
-const VIDEO_DRIVER_EXTENSION_BYTES: u64 = 0x50;
-const VIDEO_DEVICE_OBJECT_BYTES: u64 = 0x150;
-const VIDEO_FILE_OBJECT_BYTES: u64 = 0x100;
+use nt_io_manager::{
+    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object, WdmDeviceObjectInit,
+    WdmDriverObjectInit, WdmFileObjectInit, WDM_X64_DEVICE_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_FILE_OBJECT_SIZE,
+};
+
 const VIDEO_DRIVER_NAME_CAP: usize = 32;
 const VIDEO_SERVICE_PATH_CAP: usize = 128;
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
@@ -130,44 +133,56 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
     if VIDEO_DRIVER_OBJECT != 0 && VIDEO_DEVICE_OBJECT != 0 && VIDEO_FILE_OBJECT != 0 {
         return true;
     }
-    let driver = allocate_projection(VIDEO_DRIVER_OBJECT_BYTES + VIDEO_DRIVER_EXTENSION_BYTES);
-    let device = allocate_projection(VIDEO_DEVICE_OBJECT_BYTES);
-    let file = allocate_projection(VIDEO_FILE_OBJECT_BYTES);
+    let driver_len = WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE;
+    let driver = allocate_projection(driver_len as u64);
+    let device = allocate_projection(WDM_X64_DEVICE_OBJECT_SIZE as u64);
+    let file = allocate_projection(WDM_X64_FILE_OBJECT_SIZE as u64);
     if driver == 0 || device == 0 || file == 0 {
         return false;
     }
-    let zero = |base: u64, len: u64| {
-        let mut off = 0u64;
-        while off < len {
-            write_unaligned((base + off) as *mut u64, 0);
-            off += 8;
-        }
-    };
-    zero(
-        driver,
-        VIDEO_DRIVER_OBJECT_BYTES + VIDEO_DRIVER_EXTENSION_BYTES,
-    );
-    zero(device, VIDEO_DEVICE_OBJECT_BYTES);
-    zero(file, VIDEO_FILE_OBJECT_BYTES);
 
     // Minimal x64 IO object bodies. win32k needs stable identities, DEVICE_OBJECT.DriverObject, the
     // DriverObject.DeviceObject head link, and the FILE_OBJECT.DeviceObject back-link.
-    write_unaligned(driver as *mut i16, 4); // IO_TYPE_DRIVER
-    write_unaligned((driver + 2) as *mut u16, VIDEO_DRIVER_OBJECT_BYTES as u16);
-    write_unaligned(
-        (driver + 0x68) as *mut u64,
-        driver + VIDEO_DRIVER_OBJECT_BYTES,
-    ); // DriverExtension
-    write_unaligned((driver + 8) as *mut u64, device); // DriverObject.DeviceObject
-
-    write_unaligned(device as *mut u16, 3); // IO_TYPE_DEVICE
-    write_unaligned((device + 2) as *mut u16, VIDEO_DEVICE_OBJECT_BYTES as u16);
-    write_unaligned((device + 8) as *mut u64, driver); // DriverObject
-    write_unaligned((device + 0x48) as *mut u32, FILE_DEVICE_VIDEO); // DeviceType
-
-    write_unaligned(file as *mut u16, 5); // IO_TYPE_FILE
-    write_unaligned((file + 2) as *mut u16, VIDEO_FILE_OBJECT_BYTES as u16);
-    write_unaligned((file + 8) as *mut u64, device);
+    if write_wdm_driver_object(
+        core::slice::from_raw_parts_mut(driver as *mut u8, driver_len),
+        WdmDriverObjectInit {
+            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+            device_object: device,
+            driver_extension_offset: WDM_X64_DRIVER_EXTENSION_OFFSET,
+            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
+        },
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if write_wdm_device_object(
+        core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
+        WdmDeviceObjectInit {
+            driver_object: driver,
+            next_device: 0,
+            device_extension: 0,
+            device_type: FILE_DEVICE_VIDEO,
+        },
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if write_wdm_file_object(
+        core::slice::from_raw_parts_mut(file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
+        WdmFileObjectInit {
+            device_object: device,
+            fs_context: 0,
+            file_name_len: 0,
+            file_name_max_len: 0,
+            file_name_buffer: 0,
+        },
+    )
+    .is_err()
+    {
+        return false;
+    }
     VIDEO_DRIVER_OBJECT = driver;
     VIDEO_DEVICE_OBJECT = device;
     VIDEO_FILE_OBJECT = file;

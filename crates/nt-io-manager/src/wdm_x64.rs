@@ -28,6 +28,7 @@ pub enum WdmLayoutError {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmDriverObjectInit {
     pub size_field: u16,
+    pub device_object: u64,
     pub driver_extension_offset: usize,
     pub driver_extension: u64,
 }
@@ -106,6 +107,7 @@ pub fn write_wdm_driver_object(
     zero(bytes);
     put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DRIVER);
     put_u16(bytes, 0x02, init.size_field);
+    put_u64(bytes, 0x08, init.device_object);
     put_u64(bytes, init.driver_extension_offset, init.driver_extension);
     Ok(())
 }

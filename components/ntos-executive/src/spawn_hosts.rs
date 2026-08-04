@@ -1361,6 +1361,7 @@ pub(crate) unsafe fn component_main(
         driver_bytes,
         WdmDriverObjectInit {
             size_field: spec.size_field,
+            device_object: 0,
             driver_extension_offset: spec.ext as usize,
             driver_extension: ext,
         },

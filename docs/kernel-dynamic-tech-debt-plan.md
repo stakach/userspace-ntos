@@ -1594,3 +1594,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
   remains open for real I/O Manager ownership of guest-visible `IoCreateDevice` allocation/lifetime;
   D3 remains the real videoprt/miniport-created video stack.
+- D3 continued. The executive-owned boot framebuffer `video_device` projection now uses the shared
+  `nt-io-manager` WDM x64 writers for its `DRIVER_OBJECT`, `DEVICE_OBJECT`, and `FILE_OBJECT`
+  headers instead of carrying local object-size constants and raw offset writes. The module still
+  owns the temporary Video0 route until videoprt/display miniport hosting creates the real stack, but
+  the compatibility object bytes are no longer a separate video-only implementation. Validation:
+  `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/full-boot-video-wdm-writers-20260804.log` reached `RUN_RC=0`, `247/280
+  executive->isolated-service checks passed`, `PASS exec_video_device_objects_registered`, `PASS
+  exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D3
+  remains open for replacing the temporary boot framebuffer route with a real videoprt/miniport
+  created device object/interface and I/O path.

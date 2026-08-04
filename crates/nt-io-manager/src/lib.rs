@@ -1503,6 +1503,7 @@ mod tests {
             &mut driver,
             WdmDriverObjectInit {
                 size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+                device_object: 0x6666,
                 driver_extension_offset: WDM_X64_DRIVER_EXTENSION_OFFSET,
                 driver_extension: 0x7777,
             },
@@ -1510,6 +1511,7 @@ mod tests {
         .unwrap();
         assert_eq!(le_u16(&driver, 0x00), WDM_X64_IO_TYPE_DRIVER as u16);
         assert_eq!(le_u16(&driver, 0x02), WDM_X64_DRIVER_OBJECT_SIZE as u16);
+        assert_eq!(le_u64(&driver, 0x08), 0x6666);
         assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x7777);
 
         let mut dev = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE + 16];
