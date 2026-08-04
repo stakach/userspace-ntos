@@ -1566,3 +1566,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   exec_win32k_desktop_painted`, and `PASS exec_msgina_logon_dialog_painted`. Review adjustment: D1
   remains open for moving driver-created device-stack ownership/lifetime and remaining hosted-driver
   projection state out of `driver_launch`; D3 remains the real videoprt/miniport-created video stack.
+- D1 continued. Removed the duplicate executive `DRIVER_BINDINGS` and `DEVICE_ROUTES` route tables.
+  Canonical driver/device lookup by route id, Object Manager object id, and NT device path now comes
+  from `nt-io-manager` records, with host-test coverage for the new lookup helpers. `driver_launch`
+  keeps only the private seL4 transport instance table needed to wake a hosted driver component, and
+  public dispatch wrappers resolve through the I/O Manager before entering that transport backend.
+  Validation: `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`,
+  `cargo fmt --manifest-path components/ntos-executive/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `git diff --check`, and `.tmp/full-boot-driver-routes-iomanager-only-20260804.log` reached
+  `RUN_RC=0`, `247/280 executive->isolated-service checks passed`, `PASS
+  exec_fsd_on_shared_harness`, `PASS exec_irp_transport_call_bound`, `PASS
+  exec_video_device_objects_registered`, `PASS exec_win32k_desktop_painted`, and `PASS
+  exec_msgina_logon_dialog_painted`. Review adjustment: D1 remains open for moving the
+  guest-visible `IoCreateDevice` projection ownership/lifetime out of `driver_launch`; D3 remains the
+  real videoprt/miniport-created video stack.

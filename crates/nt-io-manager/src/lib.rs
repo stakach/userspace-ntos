@@ -13,6 +13,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use nt_types::{NtPath, ObjectId};
 
 mod cancel;
 mod close;
@@ -144,6 +145,14 @@ impl<P> IoManager<P> {
         self.drivers.len()
     }
 
+    /// Resolve a driver by its Object Manager `Driver` object id.
+    pub fn driver_id_by_object_id(&self, object_id: ObjectId) -> Option<DriverId> {
+        self.drivers
+            .iter()
+            .find(|(_, d)| d.object_id == object_id)
+            .map(|(id, _)| id)
+    }
+
     // --- Devices -----------------------------------------------------------
 
     /// Add a device record, assigning its id + `top_of_stack` (v0.1: itself) and
@@ -172,6 +181,22 @@ impl<P> IoManager<P> {
     }
     pub fn device_count(&self) -> usize {
         self.devices.len()
+    }
+
+    /// Resolve a device by its Object Manager `Device` object id.
+    pub fn device_id_by_object_id(&self, object_id: ObjectId) -> Option<DeviceId> {
+        self.devices
+            .iter()
+            .find(|(_, d)| d.object_id == object_id)
+            .map(|(id, _)| id)
+    }
+
+    /// Resolve a named device by its canonical NT path.
+    pub fn device_id_by_name(&self, name: &NtPath) -> Option<DeviceId> {
+        self.devices
+            .iter()
+            .find(|(_, d)| d.name.as_ref() == Some(name))
+            .map(|(id, _)| id)
     }
 
     /// The devices owned by a driver (empty for an unknown driver).
@@ -280,6 +305,24 @@ mod tests {
         assert_eq!(d.top_of_stack, dev); // single-device stack (v0.1)
         assert_eq!(om.devices_of(drv), &[dev]);
         assert!(d.is_buffered_io());
+    }
+
+    #[test]
+    fn driver_device_records_resolve_by_object_id_and_name() {
+        let mut om = io();
+        let drv = a_driver(&mut om);
+        let dev = a_device(&mut om, drv);
+        let driver_obj = ObjectId(0x111);
+        let device_obj = ObjectId(0x222);
+        om.driver_mut(drv).unwrap().object_id = driver_obj;
+        om.device_mut(dev).unwrap().object_id = device_obj;
+
+        assert_eq!(om.driver_id_by_object_id(driver_obj), Some(drv));
+        assert_eq!(om.device_id_by_object_id(device_obj), Some(dev));
+        assert_eq!(om.device_id_by_name(&path("\\Device\\Test0")), Some(dev));
+        assert_eq!(om.device_id_by_name(&path("\\Device\\Missing")), None);
+        assert_eq!(om.driver_id_by_object_id(ObjectId(0x333)), None);
+        assert_eq!(om.device_id_by_object_id(ObjectId(0x333)), None);
     }
 
     #[test]

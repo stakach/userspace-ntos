@@ -2738,12 +2738,11 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The live launched IRP-driver route table + the generic IRP dispatch transport.
+// The live launched IRP-driver transport table + the generic IRP dispatch transport.
 //
-// De-singletoned (multi-driver): the executive keeps small tables of live [`DriverComponent`]s keyed
-// by canonical driver/device route ids. The instance slot is only the transport mechanism needed to
-// wake an isolated component; call sites route through a driver id, device id, Object Manager device
-// object id, or captured named-device path.
+// De-singletoned (multi-driver): canonical driver/device identity, names, and Object Manager ids
+// live in [`IoManager`]. This module keeps only the private seL4 transport state needed to wake an
+// isolated component instance.
 // ---------------------------------------------------------------------------------------------
 
 pub(crate) const IO_MANAGER_COMPONENT_ID: u64 = 0x494F_0000;
@@ -3036,6 +3035,8 @@ pub(crate) struct DriverInstance {
     pub reply_cap: u64,
     pub driver_id: u64,
     pub device_id: u64,
+    pub driver_object: u64,
+    pub device_object: u64,
     pub ready: bool,
     pub used: bool,
 }
@@ -3049,6 +3050,8 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     reply_cap: 0,
     driver_id: 0,
     device_id: 0,
+    driver_object: 0,
+    device_object: 0,
     ready: false,
     used: false,
 };
@@ -3056,56 +3059,6 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
 static mut DRIVER_INSTANCES: [DriverInstance; MAX_DRIVER_INSTANCES] =
     [EMPTY_INSTANCE; MAX_DRIVER_INSTANCES];
-
-#[derive(Clone, Copy)]
-struct DriverBinding {
-    id: u64,
-    instance: usize,
-    driver_object: u64,
-    object_id: u64,
-    ready: bool,
-    used: bool,
-}
-
-const EMPTY_DRIVER_BINDING: DriverBinding = DriverBinding {
-    id: 0,
-    instance: 0,
-    driver_object: 0,
-    object_id: 0,
-    ready: false,
-    used: false,
-};
-
-static mut DRIVER_BINDINGS: [DriverBinding; MAX_DRIVER_INSTANCES] =
-    [EMPTY_DRIVER_BINDING; MAX_DRIVER_INSTANCES];
-
-#[derive(Clone, Copy)]
-struct DeviceRoute {
-    id: u64,
-    driver_id: u64,
-    instance: usize,
-    device_object: u64,
-    object_id: u64,
-    name_len: u16,
-    name_utf16: [u8; SH_CAPTURED_PATH_BYTES],
-    ready: bool,
-    used: bool,
-}
-
-const EMPTY_DEVICE_ROUTE: DeviceRoute = DeviceRoute {
-    id: 0,
-    driver_id: 0,
-    instance: 0,
-    device_object: 0,
-    object_id: 0,
-    name_len: 0,
-    name_utf16: [0; SH_CAPTURED_PATH_BYTES],
-    ready: false,
-    used: false,
-};
-
-static mut DEVICE_ROUTES: [DeviceRoute; MAX_DRIVER_INSTANCES] =
-    [EMPTY_DEVICE_ROUTE; MAX_DRIVER_INSTANCES];
 
 /// Record a launched driver in [`DRIVER_INSTANCES`] (called by [`load_driver`]). "Ready" iff it
 /// parked at its dispatch loop with a control DEVICE_OBJECT (an FSD; a filter/device without an
@@ -3123,6 +3076,8 @@ fn register_instance(dc: &DriverComponent) {
             reply_cap: dc.reply_cap,
             driver_id: dc.driver_id,
             device_id: dc.device_id,
+            driver_object: dc.drvobj,
+            device_object: dc.devobj,
             // Default readiness = npfs's historic rule (parked + a control device object). A
             // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
             // is marked ready explicitly by the caller via `register_instance_ready`.
@@ -3130,120 +3085,35 @@ fn register_instance(dc: &DriverComponent) {
             used: true,
         };
     }
-    register_driver_binding(dc);
-    if dc.device_id != 0 {
-        register_device_route(dc);
-    }
-}
-
-fn register_driver_binding(dc: &DriverComponent) {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
-    if dc.instance < t.len() {
-        t[dc.instance] = DriverBinding {
-            id: dc.driver_id,
-            instance: dc.instance,
-            driver_object: dc.drvobj,
-            object_id: 0,
-            ready: dc.finished && (dc.verdict & V_MJ) != 0,
-            used: true,
-        };
-    }
-}
-
-fn register_device_route(dc: &DriverComponent) {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
-    if dc.instance < t.len() {
-        t[dc.instance] = DeviceRoute {
-            id: dc.device_id,
-            driver_id: dc.driver_id,
-            instance: dc.instance,
-            device_object: dc.devobj,
-            object_id: 0,
-            name_len: dc.device_name_len,
-            name_utf16: dc.device_name_utf16,
-            ready: dc.finished && dc.devobj != 0,
-            used: true,
-        };
-    }
 }
 
 pub(crate) fn bind_driver_object_id(driver_id: u64, object_id: u64) -> bool {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
-    for entry in t.iter_mut() {
-        if entry.used && entry.id == driver_id {
-            entry.object_id = object_id;
-            if let Some(driver) = io_manager_mut().driver_mut(DriverId(driver_id)) {
-                driver.object_id = ObjectId(object_id);
-            }
-            return true;
-        }
+    if instance_by_driver_id(driver_id).is_none() {
+        return false;
+    }
+    if let Some(driver) = io_manager_mut().driver_mut(DriverId(driver_id)) {
+        driver.object_id = ObjectId(object_id);
+        return true;
     }
     false
 }
 
 pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
-    driver_binding(driver_id)
-        .map(|entry| entry.object_id)
+    io_manager_mut()
+        .driver(DriverId(driver_id))
+        .map(|driver| driver.object_id.0)
         .unwrap_or(0)
 }
 
 pub(crate) fn bind_device_object_id(device_id: u64, object_id: u64) -> bool {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
-    for entry in t.iter_mut() {
-        if entry.used && entry.id == device_id {
-            entry.object_id = object_id;
-            if let Some(device) = io_manager_mut().device_mut(nt_io_manager::DeviceId(device_id)) {
-                device.object_id = ObjectId(object_id);
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn driver_binding(driver_id: u64) -> Option<DriverBinding> {
-    let t = unsafe { &*core::ptr::addr_of!(DRIVER_BINDINGS) };
-    t.iter()
-        .copied()
-        .find(|entry| entry.used && entry.id == driver_id)
-}
-
-fn device_route(device_id: u64) -> Option<DeviceRoute> {
-    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
-    t.iter()
-        .copied()
-        .find(|entry| entry.used && entry.id == device_id)
-}
-
-fn device_route_by_object_id(object_id: u64) -> Option<DeviceRoute> {
-    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
-    t.iter()
-        .copied()
-        .find(|entry| entry.used && entry.object_id != 0 && entry.object_id == object_id)
-}
-
-fn device_route_name_eq_ascii(entry: &DeviceRoute, path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if entry.name_len as usize != bytes.len() * 2 {
+    if instance_by_device_id(device_id).is_none() {
         return false;
     }
-    for (i, b) in bytes.iter().copied().enumerate() {
-        if b > 0x7f {
-            return false;
-        }
-        let off = i * 2;
-        if entry.name_utf16[off] != b || entry.name_utf16[off + 1] != 0 {
-            return false;
-        }
+    if let Some(device) = io_manager_mut().device_mut(nt_io_manager::DeviceId(device_id)) {
+        device.object_id = ObjectId(object_id);
+        return true;
     }
-    true
-}
-
-fn device_route_by_name(path: &str) -> Option<DeviceRoute> {
-    let t = unsafe { &*core::ptr::addr_of!(DEVICE_ROUTES) };
-    t.iter()
-        .copied()
-        .find(|entry| entry.used && device_route_name_eq_ascii(entry, path))
+    false
 }
 
 /// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
@@ -3252,35 +3122,20 @@ fn register_instance_ready(i: usize, ready: bool) {
     let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
     if i < t.len() && t[i].used {
         t[i].ready = ready;
-        let driver_id = t[i].driver_id;
-        let device_id = t[i].device_id;
-        let drivers = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_BINDINGS) };
-        for entry in drivers.iter_mut() {
-            if entry.used && entry.id == driver_id {
-                entry.ready = ready;
-            }
-        }
-        let devices = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_ROUTES) };
-        for entry in devices.iter_mut() {
-            if entry.used && entry.id == device_id {
-                entry.ready = ready;
-            }
-        }
     }
 }
 
 /// Mark a launched driver ready/unready for dispatch by canonical driver route id.
 pub(crate) fn register_driver_ready(driver_id: u64, ready: bool) {
-    if let Some(binding) = driver_binding(driver_id) {
-        register_instance_ready(binding.instance, ready);
+    if let Some((i, _)) = instance_by_driver_id(driver_id) {
+        register_instance_ready(i, ready);
     }
 }
 
 /// The PML4 (VSpace) cap of a launched driver route (0 = not launched).
 pub(crate) fn driver_pml4(driver_id: u64) -> u64 {
-    driver_binding(driver_id)
-        .and_then(|binding| instance(binding.instance))
-        .map(|d| d.pml4)
+    instance_by_driver_id(driver_id)
+        .map(|(_, d)| d.pml4)
         .unwrap_or(0)
 }
 
@@ -3294,28 +3149,60 @@ fn instance(i: usize) -> Option<DriverInstance> {
     }
 }
 
+fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
+    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    t.iter()
+        .copied()
+        .enumerate()
+        .find(|(_, entry)| entry.used && entry.driver_id == driver_id)
+}
+
+fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
+    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    t.iter()
+        .copied()
+        .enumerate()
+        .find(|(_, entry)| entry.used && entry.device_id == device_id)
+}
+
+fn device_id_by_name(path: &str) -> Option<u64> {
+    let path = parse_nt_path(path)?;
+    io_manager_mut()
+        .device_id_by_name(&path)
+        .map(|device_id| device_id.raw())
+}
+
+fn device_id_by_object_id(object_id: u64) -> Option<u64> {
+    if object_id == 0 {
+        return None;
+    }
+    io_manager_mut()
+        .device_id_by_object_id(ObjectId(object_id))
+        .map(|device_id| device_id.raw())
+}
+
 /// Whether the driver-declared `\Device\NamedPipe` route is ready to serve IRPs.
 pub(crate) fn npfs_ready() -> bool {
-    device_route_by_name("\\Device\\NamedPipe")
-        .map(|route| route.ready)
+    device_id_by_name("\\Device\\NamedPipe")
+        .and_then(instance_by_device_id)
+        .map(|(_, d)| d.ready)
         .unwrap_or(false)
 }
 
 /// The PML4 (VSpace) cap behind `\Device\NamedPipe` (0 = not launched).
 pub(crate) fn npfs_pml4() -> u64 {
-    device_route_by_name("\\Device\\NamedPipe")
-        .and_then(|route| instance(route.instance))
-        .map(|d| d.pml4)
+    device_id_by_name("\\Device\\NamedPipe")
+        .and_then(instance_by_device_id)
+        .map(|(_, d)| d.pml4)
         .unwrap_or(0)
 }
 
 /// The opaque FILE_OBJECT id (npfs's `FsContext`) from the last dispatched IRP to
 /// `\Device\NamedPipe`.
 pub(crate) unsafe fn npfs_last_file_id() -> u64 {
-    let inst = device_route_by_name("\\Device\\NamedPipe").map(|route| route.instance);
-    let sh = inst
-        .and_then(instance)
-        .map(|d| d.exec_shared_va)
+    let sh = device_id_by_name("\\Device\\NamedPipe")
+        .and_then(instance_by_device_id)
+        .map(|(_, d)| d.exec_shared_va)
         .unwrap_or(FSD_SHARED_VADDR);
     read_volatile((sh + SH_REQ_FILEID) as *const u64)
 }
@@ -3452,8 +3339,11 @@ pub(crate) unsafe fn dispatch_irp_to_driver(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let binding = driver_binding(driver_id)?;
-    if !binding.ready || binding.driver_object == 0 {
+    let (_, inst) = instance_by_driver_id(driver_id)?;
+    if !inst.ready || inst.driver_object == 0 {
+        return None;
+    }
+    if io_manager_mut().driver(DriverId(driver_id)).is_none() {
         return None;
     }
     dispatch_external_irp_to_driver_record(driver_id, major, fsctl, file_id, in_data, out)
@@ -3468,8 +3358,14 @@ pub(crate) unsafe fn dispatch_irp_to_device(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let route = device_route(device_id)?;
-    if !route.ready || route.driver_id == 0 || route.device_object == 0 {
+    let (_, inst) = instance_by_device_id(device_id)?;
+    if !inst.ready || inst.driver_id == 0 || inst.device_object == 0 {
+        return None;
+    }
+    if io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .is_none()
+    {
         return None;
     }
     dispatch_external_irp_to_device_record(device_id, major, fsctl, file_id, in_data, out)
@@ -3484,11 +3380,8 @@ pub(crate) unsafe fn dispatch_irp_to_device_object(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let route = device_route_by_object_id(object_id)?;
-    if !route.ready || route.driver_id == 0 || route.device_object == 0 {
-        return None;
-    }
-    dispatch_external_irp_to_device_record(route.id, major, fsctl, file_id, in_data, out)
+    let device_id = device_id_by_object_id(object_id)?;
+    dispatch_irp_to_device(device_id, major, fsctl, file_id, in_data, out)
 }
 
 unsafe fn dispatch_irp_to_named_device(
@@ -3499,11 +3392,15 @@ unsafe fn dispatch_irp_to_named_device(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let route = device_route_by_name(path)?;
-    if route.object_id != 0 {
-        dispatch_irp_to_device_object(route.object_id, major, fsctl, file_id, in_data, out)
+    let device_id = device_id_by_name(path)?;
+    let object_id = io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .map(|device| device.object_id.0)
+        .unwrap_or(0);
+    if object_id != 0 {
+        dispatch_irp_to_device_object(object_id, major, fsctl, file_id, in_data, out)
     } else {
-        dispatch_irp_to_device(route.id, major, fsctl, file_id, in_data, out)
+        dispatch_irp_to_device(device_id, major, fsctl, file_id, in_data, out)
     }
 }
 
