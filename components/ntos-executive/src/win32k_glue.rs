@@ -1863,6 +1863,21 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     (result.status, stack_ok)
 }
 
+unsafe fn win32k_test_fault_idle_probe(client: Win32kClientContext) -> (u64, bool, bool) {
+    let (status, ok) =
+        win32k_dispatch_wide(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0, 0, &[], client);
+    let parked = take_user_callback_pump_suspended();
+    if parked {
+        let (cancel_status, cancel_ok) = cancel_suspended_user_callback();
+        print_str(b"[user-callback] idle probe parked unexpectedly; cancel status=0x");
+        print_hex(cancel_status as u32);
+        print_str(b" ok=");
+        print_u64(cancel_ok as u64);
+        print_str(b"\n");
+    }
+    (status, ok, parked)
+}
+
 /// Crash-site diagnostic for a client that faulted while a user-mode callback was in flight. Prints
 /// the faulting GPRs plus the exact client-side state `user32`'s `ValidateHwnd`/`DesktopPtrToUser`
 /// read to produce a `PWND`: the `CLIENTINFO.CallbackWnd` triple the callback bridge maintains
@@ -2088,16 +2103,7 @@ pub(crate) struct DeadClientVictimTermination {
 
 #[derive(Clone, Copy)]
 pub(crate) struct WinlogonCallbackThread {
-    pub pi: usize,
-    pub badge: u64,
-    pub tid: u64,
-    pub tcb: u64,
-    pub role: HostedThreadRole,
-    pub process_role: nt_exe_image::HostedProcessRole,
-    pub top_badge: u64,
-    pub teb: u64,
-    pub peb_mirror: u64,
-    pub scratch_base: u64,
+    pub client: Win32kClientContext,
     pub stack_top: u64,
 }
 
@@ -2195,8 +2201,8 @@ pub(crate) const NESTED_SLIP_ALL: u64 = 0x3f;
 ///
 /// Returns the `NESTED_SLIP_*` proof mask.
 pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
-    client_pid: u64,
     victim: WinlogonCallbackThread,
+    probe_client: Win32kClientContext,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
     const FNID_SENDMESSAGE: u64 = 0x02B1; // ntuser.h — the plain SendMessage arm
@@ -2204,20 +2210,10 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     const STATUS_UNSUCCESSFUL: u64 = 0xc000_0001;
 
     let mut proof = 0u64;
-    let (system_sid, system_sid_len) = local_system_sid_native();
-    let WinlogonCallbackThread {
-        pi,
-        badge,
-        tid,
-        tcb,
-        role,
-        process_role,
-        top_badge,
-        teb,
-        peb_mirror,
-        scratch_base,
-        stack_top,
-    } = victim;
+    let WinlogonCallbackThread { client, stack_top } = victim;
+    let badge = client.badge;
+    let tid = client.tid;
+    let tcb = client.tcb;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
     // the redirect's callout-frame write has guaranteed room, exactly as the dead-client injection
     // does. `complete_controlled_user_callback` restores the thread's context at the end.
@@ -2239,25 +2235,6 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     print_str(b" dispatch-depth=");
     print_u64(crate::spawn_hosts::dispatch_depth());
     print_str(b"\n");
-
-    let client = Win32kClientContext {
-        pi: pi as u32,
-        pid: client_pid,
-        badge,
-        tid,
-        tcb,
-        eprocess: 0,
-        ethread: 0,
-        role: Some(role),
-        process_role: Some(process_role),
-        top_badge,
-        teb,
-        peb_mirror,
-        scratch_base,
-        token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
-        token_user_sid: system_sid,
-        token_user_sid_len: system_sid_len,
-    };
 
     // (1) SUSPEND an outer dispatch inside a REAL user-mode callback.
     let sas_hwnd = core::ptr::read_volatile(
@@ -2381,7 +2358,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     let mut outer_resumed = false;
     for _ in 0..8 {
         let Some(returned) =
-            complete_controlled_user_callback(2, badge, tid, 0, 0, STATUS_UNSUCCESSFUL)
+            complete_controlled_user_callback(client.pi, badge, tid, 0, 0, STATUS_UNSUCCESSFUL)
         else {
             break;
         };
@@ -2403,13 +2380,14 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
         crate::spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
     let stacks_drained =
         active_after == 0 && continuation_after == 0 && depth_after == 0 && suspended_after == 0;
-    let (probe_status, probe_ok) = if stacks_drained {
-        win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0)
+    let (probe_status, probe_ok, probe_parked) = if stacks_drained {
+        win32k_test_fault_idle_probe(probe_client)
     } else {
-        (0, false)
+        (0, false, false)
     };
     if stacks_drained
         && probe_ok
+        && !probe_parked
         && probe_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64
     {
         proof |= NESTED_SLIP_DRAINED_IDLE;
@@ -2428,6 +2406,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     print_u64(suspended_after);
     print_str(b" probe=0x");
     print_hex(probe_status as u32);
+    print_str(b" probe-parked=");
+    print_u64(probe_parked as u64);
     print_str(b" proof=0x");
     print_hex(proof as u32);
     print_str(b"\n");
@@ -2435,8 +2415,8 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
 }
 
 pub(crate) unsafe fn inject_dead_client_callback_unwind(
-    client_pid: u64,
     victim: WinlogonCallbackThread,
+    probe_client: Win32kClientContext,
     terminate_victim: &mut dyn FnMut(u64) -> DeadClientVictimTermination,
 ) -> u64 {
     const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007; // NtUserMessageCall (7 args)
@@ -2456,22 +2436,12 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE | SWP_FRAMECHANGED;
 
     let mut proof = 0u64;
-    let (system_sid, system_sid_len) = local_system_sid_native();
     // (0) VICTIM SELECTION — caller supplies an expendable winlogon worker thread resolved from
     // the registered hosted-thread runtime table.
-    let WinlogonCallbackThread {
-        pi,
-        badge,
-        tid,
-        tcb,
-        role,
-        process_role,
-        top_badge,
-        teb,
-        peb_mirror,
-        scratch_base,
-        stack_top,
-    } = victim;
+    let WinlogonCallbackThread { client, stack_top } = victim;
+    let badge = client.badge;
+    let tid = client.tid;
+    let tcb = client.tcb;
     // Park the victim's RSP at the top of its ORIGINAL (always-mapped, executive-registered) stack so
     // the redirect's callout-frame write has guaranteed room. The thread is about to be destroyed, so
     // its live context is irrelevant; this only removes a spurious failure mode from the self-test.
@@ -2495,24 +2465,6 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     print_u64(write_error);
     print_str(b"\n");
 
-    let client = Win32kClientContext {
-        pi: pi as u32,
-        pid: client_pid,
-        badge,
-        tid,
-        tcb,
-        eprocess: 0,
-        ethread: 0,
-        role: Some(role),
-        process_role: Some(process_role),
-        top_badge,
-        teb,
-        peb_mirror,
-        scratch_base,
-        token_authentication_id: SYSTEM_TOKEN_AUTHENTICATION_ID,
-        token_user_sid: system_sid,
-        token_user_sid_len: system_sid_len,
-    };
     // (1) Drive a REAL win32k dispatch that reaches a client window procedure. WM_NULL is the
     // do-nothing message, so the only observable effect is the reverse transition itself.
     let sas_hwnd = core::ptr::read_volatile(
@@ -2588,12 +2540,12 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
         windowpos[28..32].copy_from_slice(&0i32.to_le_bytes());
         windowpos[32..36].copy_from_slice(&(PROBE_SET_WINDOW_POS_FLAGS as u32).to_le_bytes());
         if !crate::img_spawn::client_copyout_mapped(
-            2,
+            client.pi as u64,
             windowpos_va,
             &windowpos,
             &[],
             0,
-            scratch_base,
+            client.scratch_base,
         ) {
             print_str(b"[cb-inject] failed to stage WINDOWPOS hwnd=0x");
             print_hex(hwnd as u32);
@@ -2688,8 +2640,15 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     // win32k is genuinely BACK in its normal dispatch receive loop, not stranded: a fresh dispatch
     // round-trips and COMPLETES. Had the unwind not resumed + re-parked it, this would WALL — which
     // is exactly what the wedge looked like.
-    let (probe_status, probe_ok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
-    if probe_ok && probe_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64 {
+    let (probe_status, probe_ok, probe_parked) = if active_after == 0 && continuation_after == 0 {
+        win32k_test_fault_idle_probe(probe_client)
+    } else {
+        (0, false, false)
+    };
+    if probe_ok
+        && !probe_parked
+        && probe_status == win32k_subsystem::TEST_FAULT_STATUS as u32 as u64
+    {
         proof |= DEAD_CLIENT_INJECT_WIN32K_IDLE;
     }
     print_str(b"[cb-inject] recovery: frames-unwound=");
@@ -2702,6 +2661,8 @@ pub(crate) unsafe fn inject_dead_client_callback_unwind(
     print_hex(probe_status as u32);
     print_str(b" ok=");
     print_u64(probe_ok as u64);
+    print_str(b" parked=");
+    print_u64(probe_parked as u64);
     print_str(b" proof=0x");
     print_hex(proof as u32);
     print_str(b"\n");

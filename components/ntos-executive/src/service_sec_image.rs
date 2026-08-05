@@ -12567,16 +12567,14 @@ pub(crate) unsafe fn service_sec_image(
     }
     if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
         if let Some(callback_thread) = winlogon_callback_thread_candidate(&nt_handler) {
-            if let Some(client_pid) = nt_handler.pm_pid_for_pi(callback_thread.pi) {
+            if let Some(probe_client) = winlogon_main_probe_client(&nt_handler) {
                 // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
                 // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
                 // dead-client injection below still finds a live, redirectable thread. Order matters: the
                 // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
                 // park and this injection could not arm.
-                let nested_proof = win32k_glue::inject_win32k_nested_dispatch_slip(
-                    client_pid as u64,
-                    callback_thread,
-                );
+                let nested_proof =
+                    win32k_glue::inject_win32k_nested_dispatch_slip(callback_thread, probe_client);
                 WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
                 let mut terminate_victim = |victim_tid: u64| {
                     let terminated =
@@ -12587,13 +12585,13 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 };
                 let proof = win32k_glue::inject_dead_client_callback_unwind(
-                    client_pid as u64,
                     callback_thread,
+                    probe_client,
                     &mut terminate_victim,
                 );
                 DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
             } else {
-                print_str(b"[cb-inject] runtime-registered winlogon callback worker has no pid\n");
+                print_str(b"[cb-inject] runtime-registered winlogon main thread has no live probe context\n");
             }
         } else {
             print_str(b"[cb-inject] no runtime-registered winlogon callback worker -> skipped\n");
@@ -16075,7 +16073,6 @@ fn winlogon_callback_thread_candidate(
 ) -> Option<win32k_glue::WinlogonCallbackThread> {
     let process_role = nt_exe_image::HostedProcessRole::InteractiveLogon;
     let pi = hosted_pi_for_role(nt_handler, process_role)?;
-    let top_badge = nt_handler.hosted_process_top_badge(pi)?;
     let candidates = [
         (
             HostedThreadRole::WinlogonWorker { slot: 1 },
@@ -16090,22 +16087,50 @@ fn winlogon_callback_thread_candidate(
     ];
     for (role, teb, stack_top) in candidates {
         if let Some((tid, tcb, badge)) = nt_handler.hosted_thread_identity_for_role(pi, role) {
-            return Some(win32k_glue::WinlogonCallbackThread {
+            let client = win32k_client_context_for_thread(
+                nt_handler,
                 pi,
                 badge,
                 tid,
                 tcb,
-                role,
-                process_role,
-                top_badge,
+                Some(role),
                 teb,
-                peb_mirror: hosted_peb_mirror_for_pi(pi),
-                scratch_base: hosted_scratch_base_for_pi(pi),
-                stack_top,
-            });
+                hosted_peb_mirror_for_pi(pi),
+                hosted_scratch_base_for_pi(pi),
+            );
+            return Some(win32k_glue::WinlogonCallbackThread { client, stack_top });
         }
     }
     None
+}
+
+#[inline]
+fn winlogon_main_probe_client(
+    nt_handler: &ExecNtHandler,
+) -> Option<win32k_glue::Win32kClientContext> {
+    let pi = hosted_pi_for_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveLogon,
+    )?;
+    let badge = nt_handler.hosted_process_top_badge(pi)?;
+    let tid = nt_handler.pm_main_tid_for_pi(pi).map(u64::from)?;
+    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi)?;
+    let teb = nt_handler
+        .pm
+        .thread_teb(tid as nt_process::ThreadId)
+        .filter(|teb| *teb != 0)
+        .unwrap_or(SMSS_TEB_VA);
+    Some(win32k_client_context_for_thread(
+        nt_handler,
+        pi,
+        badge,
+        tid,
+        tcb,
+        Some(HostedThreadRole::Main),
+        teb,
+        hosted_peb_mirror_for_pi(pi),
+        hosted_scratch_base_for_pi(pi),
+    ))
 }
 
 #[inline]

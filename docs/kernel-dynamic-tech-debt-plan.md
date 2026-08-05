@@ -1969,3 +1969,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   The remaining red gates are the existing `exec_user_callback_dead_client_unwind` and
   `exec_win32k_transport_call_nested` harness drains; profile load, userinit, explorer, and visible
   shell chrome are back on the genuine path.
+- G3 callback-drain validation complete. The post-quiesce nested/dead-client proof helpers now use
+  runtime-built `Win32kClientContext` records instead of rebuilding winlogon identity inside
+  `win32k_glue`, and the stale `pi=2` callback-return/client-copyout literals in those helpers are
+  gone. The nested proof still exercises the expendable winlogon worker for the actual outer/nested
+  callback chain, but its final "win32k idle" dispatch now probes with winlogon's live main-thread
+  context, matching the dead-client recovery proof and avoiding a follow-on worker
+  `ClientThreadSetup` callback. Unexpected idle-probe callbacks are explicitly cancelled so a failed
+  probe cannot contaminate the next gate. Validation: `rustfmt`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `cd rust-micro && ./scripts/build_kernel.sh
+  extern-rootserver`, and graphical boot `desktop-render-r102-nested-main-idle-probe-20260805-225007`
+  passed to the microtest sentinel with `285/285` executive checks. Evidence: nested transport proof
+  `0x3f/0x3f`, dead-client unwind proof `0x3f/0x3f`, `suspended-outstanding=0`, both idle probes
+  returned `0x600d600d` with `parked=0`, profile load/userinit/explorer gates stayed green, and
+  `.tmp/desktop-render-r102-nested-main-idle-probe-20260805-225007.png` shows the rendered desktop
+  taskbar and clock.
