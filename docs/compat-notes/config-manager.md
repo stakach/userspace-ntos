@@ -16,8 +16,9 @@ metadata only — no handles, IRPs, or driver pointers.
 - `ConfigManager`: the registry + higher-level records.
   - Services (§9): `register_service` / `register_typed_service` (→ `Services\<Name>` +
     `Parameters` + typed ImagePath/Type/Start/ErrorControl/Class metadata),
-    `boot_system_driver_candidates`, `boot_system_pnp_driver_candidates`, `service_key_path`
-    (DriverEntry RegistryPath, case-preserved), `service_parameters_key`,
+    `boot_system_driver_candidates`, `boot_system_pnp_driver_candidates`,
+    `boot_system_pnp_driver_bindings` (selected device service + bound `Enum` devnodes),
+    `service_key_path` (DriverEntry RegistryPath, case-preserved), `service_parameters_key`,
     `set_service_parameter`.
   - Devnodes (§10): `register_devnode` and `index_registry_devnodes` (→
     `Enum\<InstanceId>` + Service/PdoName/HardwareID/CompatibleIDs),

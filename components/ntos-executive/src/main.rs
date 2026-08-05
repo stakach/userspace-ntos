@@ -11396,6 +11396,16 @@ pub(crate) struct DriverServiceLaunchSpec {
     pub(crate) driver_object_path: alloc::string::String,
     pub(crate) image_path: alloc::vec::Vec<u8>,
     pub(crate) class: driver_launch::DriverClass,
+    pub(crate) devnodes: alloc::vec::Vec<DriverServiceDevnodeSpec>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DriverServiceDevnodeSpec {
+    pub(crate) instance_id: alloc::string::String,
+    pub(crate) pdo_name: Option<alloc::string::String>,
+    pub(crate) hardware_ids: alloc::vec::Vec<alloc::string::String>,
+    pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
 
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
@@ -11434,6 +11444,7 @@ fn current_driver_host_can_boot_launch(
 fn owned_driver_launch_spec_from_service_metadata(
     service: nt_config_manager::ServiceMetadata,
     max_start: u32,
+    devnodes: alloc::vec::Vec<DriverServiceDevnodeSpec>,
 ) -> Option<DriverServiceLaunchSpec> {
     let mut image_path = [0u8; 180];
     let (image_path_len, class) =
@@ -11445,7 +11456,23 @@ fn owned_driver_launch_spec_from_service_metadata(
         driver_object_path,
         image_path: alloc::vec::Vec::from(&image_path[..image_path_len]),
         class,
+        devnodes,
     })
+}
+
+fn driver_service_devnode_specs(
+    cm: &nt_config_manager::ConfigManager,
+    service_name: &str,
+) -> alloc::vec::Vec<DriverServiceDevnodeSpec> {
+    cm.devnodes_for_service(service_name)
+        .into_iter()
+        .map(|devnode| DriverServiceDevnodeSpec {
+            instance_id: devnode.instance_id.clone(),
+            pdo_name: devnode.pdo_name.clone(),
+            hardware_ids: devnode.hardware_ids.clone(),
+            compatible_ids: devnode.compatible_ids.clone(),
+        })
+        .collect()
 }
 
 fn config_hive_boot_system_driver_launch_spec(
@@ -11503,7 +11530,8 @@ fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<DriverServiceLaunch
         .into_iter()
         .filter(|service| current_driver_host_can_boot_launch(&cm, service))
         .filter_map(|service| {
-            owned_driver_launch_spec_from_service_metadata(service, SERVICE_SYSTEM_START)
+            let devnodes = driver_service_devnode_specs(&cm, &service.name);
+            owned_driver_launch_spec_from_service_metadata(service, SERVICE_SYSTEM_START, devnodes)
         })
         .collect()
 }
@@ -11514,7 +11542,8 @@ pub(crate) fn system_hive_driver_service_launch_spec(
 ) -> Option<DriverServiceLaunchSpec> {
     let cm = system_hive_config_manager()?;
     let service = cm.service_metadata(service_name)?;
-    owned_driver_launch_spec_from_service_metadata(service, max_start)
+    let devnodes = driver_service_devnode_specs(&cm, service_name);
+    owned_driver_launch_spec_from_service_metadata(service, max_start, devnodes)
 }
 
 pub(crate) fn system_hive_driver_service_object_path(
@@ -18880,6 +18909,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(spec.service_name.as_bytes());
             print_str(b" path=");
             print_str(&spec.image_path);
+            if !spec.devnodes.is_empty() {
+                print_str(b" devnodes=");
+                print_u64(spec.devnodes.len() as u64);
+                print_str(b" first=");
+                print_str(spec.devnodes[0].instance_id.as_bytes());
+            }
             print_str(b"\n");
             if let Some(dc) =
                 load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)

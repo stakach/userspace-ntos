@@ -108,6 +108,12 @@ pub struct ServiceMetadata {
     pub object_name: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PnpDriverBinding {
+    pub service: ServiceMetadata,
+    pub devnodes: Vec<DevnodeRecord>,
+}
+
 impl ServiceMetadata {
     pub fn is_driver(&self) -> bool {
         self.driver_service_class().is_some()
@@ -372,11 +378,31 @@ impl ConfigManager {
     /// Boot/system device-class drivers selected by service metadata and bound to at least one
     /// imported `Enum` devnode.
     pub fn boot_system_pnp_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.boot_system_pnp_driver_bindings()
+            .into_iter()
+            .map(|binding| binding.service)
+            .collect()
+    }
+
+    /// Boot/system device-class driver bindings: selected service metadata plus the imported
+    /// `Enum` devnodes that bind to each service.
+    pub fn boot_system_pnp_driver_bindings(&self) -> Vec<PnpDriverBinding> {
         self.boot_system_driver_candidates()
             .into_iter()
-            .filter(|service| {
-                service.driver_service_class() == Some(DriverServiceClass::Device)
-                    && self.service_has_devnodes(&service.name)
+            .filter_map(|service| {
+                if service.driver_service_class() != Some(DriverServiceClass::Device) {
+                    return None;
+                }
+                let devnodes: Vec<DevnodeRecord> = self
+                    .devnodes_for_service(&service.name)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if devnodes.is_empty() {
+                    None
+                } else {
+                    Some(PnpDriverBinding { service, devnodes })
+                }
             })
             .collect()
     }
@@ -1212,6 +1238,14 @@ mod tests {
             .map(|service| service.name)
             .collect();
         assert_eq!(names, alloc::vec![String::from("BoundDevice")]);
+        let bindings = cm.boot_system_pnp_driver_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].service.name, "BoundDevice");
+        assert_eq!(bindings[0].devnodes.len(), 1);
+        assert_eq!(
+            bindings[0].devnodes[0].instance_id,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"
+        );
     }
 
     #[test]

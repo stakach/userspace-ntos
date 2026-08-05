@@ -80,8 +80,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue B3 by carrying selected `Enum` devnode descriptors/resources from the executive boot
-   plan into hosted device-driver Start/AddDevice.
+1. Continue B3 by adding executive-owned AddDevice/StartDevice dispatch for the devnode descriptors
+   now carried by boot/demand driver launch specs.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -239,3 +239,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and `cargo check --manifest-path components/driver-host-direg/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: B3's remaining integration work is executive-owned AddDevice/StartDevice for
   registry-selected devnodes, not local component fixture cleanup.
+- B3 continued. Config Manager now exposes `boot_system_pnp_driver_bindings()` so callers can carry
+  selected device-driver service metadata with the exact imported `Enum` devnode records that bind
+  to it. The executive's `DriverServiceLaunchSpec` now includes copied devnode descriptors
+  (`instance_id`, `PdoName`, `HardwareID`, `CompatibleIDs`) for both boot and demand driver launch
+  specs, and the boot trace prints the selected devnode count/first instance. Validation:
+  `cargo test -p nt-config-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should consume these descriptors by invoking AddDevice and
+  StartDevice through the hosted driver path once device resources are assigned.
