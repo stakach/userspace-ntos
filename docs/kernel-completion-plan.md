@@ -80,12 +80,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Finish B3 generic hardware grants: move DMA/common-buffer ownership behind the same
-   registry-selected hosted-driver resource boundary as MMIO/interrupt grants.
+1. Add a generic hosted-driver hardware proof: registry-selected driver reaches
+   `MmMapIoSpace`, `IoConnectInterrupt`, `IoGetDmaAdapter`, and common-buffer evidence, then wire
+   real interrupt delivery to the connected ISR token.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-3. Add a boot proof that the generic registry-selected hosted-driver path reaches equivalent real
-   MMIO/interrupt/DMA evidence, then retire the old bespoke NIC driver proof.
+3. Retire the old bespoke NIC driver proof after the generic registry-selected path proves
+   equivalent real MMIO/interrupt/DMA behavior.
 4. Audit remaining static driver-object construction sites that are not service-key-derived,
    especially video and object-server tests, and classify whether they are fixtures or real debt.
 5. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
@@ -321,3 +322,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: DMA/common-buffer ownership is still fixture-hosted; the next B3 slice should
   expose `IoGetDmaAdapter`/common-buffer allocation on the generic hosted-driver path using
   `nt-dma-manager`, then add the boot evidence needed to retire the bespoke NIC proof.
+- B3 continued. Generic hosted device drivers now have a resource-bound DMA surface:
+  `nt-dma-manager` can register broker-provided common buffers at a fixed logical address/IOVA,
+  the executive binds `IoGetDmaAdapter` plus `AllocateCommonBuffer`/`FreeCommonBuffer` projections,
+  maps the broker-owned DMA frame into the hosted driver's VSpace, creates a canonical adapter for
+  the devnode owner, and records post-START common-buffer evidence back into `nt-dma-manager`.
+  Validation: `cargo test -p nt-dma-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: MMIO, interrupt connection, and DMA/common-buffer ownership are now on the
+  generic registry-selected boundary. The remaining B3 work before removing the old NIC proof is a
+  boot gate showing the generic path reaches real hardware evidence and real interrupt delivery to
+  the connected ISR token.

@@ -18955,6 +18955,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                             grant.assignment.int_vector,
                                             grant.assignment.int_latched,
                                             grant.assignment.int_affinity,
+                                            DMA_VADDR,
+                                            nic_dma_frame,
+                                            1,
+                                            NIC_IOVA,
+                                            grant.assignment.dma_len,
                                         ) {
                                             Ok(()) => {
                                                 print_str(

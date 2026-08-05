@@ -204,16 +204,36 @@ impl DmaManager {
         length: u64,
         backing_va: u64,
     ) -> Result<CommonBufferGrant, DmaError> {
+        let logical_base = self.alloc_logical();
+        self.register_common_buffer_at(owner, adapter_id, logical_base, length, backing_va)
+    }
+
+    /// Register a broker-provided common buffer at a caller-selected device logical address.
+    /// This is used when a trusted bus/PnP broker already installed an IOMMU mapping and the
+    /// driver-visible logical address must match that mapping.
+    pub fn register_common_buffer_at(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        length: u64,
+        backing_va: u64,
+    ) -> Result<CommonBufferGrant, DmaError> {
         let (max_length, dma64) = {
             let a = self.adapter(adapter_id, owner)?;
             (a.max_length, a.dma64)
         };
-        if length == 0 || length > max_length {
+        if logical_base == 0 || length == 0 || length > max_length {
             return Err(DmaError::OutOfRange);
         }
-        let logical_base = self.alloc_logical();
-        if !dma64 && logical_base + length > 0xFFFF_FFFF {
+        let logical_end = logical_base
+            .checked_add(length)
+            .ok_or(DmaError::OutOfRange)?;
+        if !dma64 && logical_end > 0x1_0000_0000 {
             return Err(DmaError::OutOfRange);
+        }
+        if self.logical_range_in_use(logical_base, length) {
+            return Err(DmaError::LogicalViolation);
         }
         let id = self.next_cb_id;
         self.next_cb_id += 1;
@@ -230,6 +250,29 @@ impl DmaManager {
             common_buffer_id: id,
             logical_base,
         })
+    }
+
+    fn logical_range_in_use(&self, logical_base: u64, length: u64) -> bool {
+        let Some(end) = logical_base.checked_add(length) else {
+            return true;
+        };
+        for cb in self.common_buffers.iter().filter(|c| c.active) {
+            let Some(cb_end) = cb.logical_base.checked_add(cb.length) else {
+                return true;
+            };
+            if logical_base < cb_end && cb.logical_base < end {
+                return true;
+            }
+        }
+        for mapping in self.mappings.iter().filter(|m| m.active) {
+            let Some(mapping_end) = mapping.logical_base.checked_add(mapping.length) else {
+                return true;
+            };
+            if logical_base < mapping_end && mapping.logical_base < end {
+                return true;
+            }
+        }
+        false
     }
 
     /// `FreeCommonBuffer` (spec §11.2): validate the logical address + length belong
@@ -360,6 +403,36 @@ mod tests {
         // The sim device decodes the logical address to the backing buffer.
         assert_eq!(d.decode_logical(g.logical_base, 4096), Ok(0x1_0000));
         assert_eq!(d.decode_logical(g.logical_base + 100, 4), Ok(0x1_0064));
+    }
+
+    #[test]
+    fn broker_registered_common_buffer_uses_supplied_logical_address() {
+        let mut d = DmaManager::new();
+        let a = d.register_adapter(owner(), true, 4096, true);
+        let g = d
+            .register_common_buffer_at(owner(), a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+
+        assert_eq!(g.logical_base, 0x1000);
+        assert_eq!(d.decode_logical(0x1000, 16), Ok(0x2_0000));
+        assert_eq!(d.decode_logical(0x1080, 4), Ok(0x2_0080));
+    }
+
+    #[test]
+    fn broker_registered_common_buffer_rejects_logical_overlap() {
+        let mut d = DmaManager::new();
+        let a = d.register_adapter(owner(), true, 4096, true);
+        d.register_common_buffer_at(owner(), a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+
+        assert_eq!(
+            d.register_common_buffer_at(owner(), a, 0x1800, 1024, 0x3_0000),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            d.register_common_buffer_at(owner(), a, 0, 1024, 0x3_0000),
+            Err(DmaError::OutOfRange)
+        );
     }
 
     #[test]

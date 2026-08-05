@@ -27,6 +27,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
+use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
 use nt_io_abi::major;
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
@@ -185,6 +186,16 @@ pub const SH_RESOURCE_INTERRUPT_ROUTINE: u64 = 0x3E0; // out: connected ISR rout
 pub const SH_RESOURCE_INTERRUPT_CONTEXT: u64 = 0x3E8; // out: connected ISR context
 pub const SH_ROOT_PDO_FORWARDED_MINOR: u64 = 0x3F0; // out: lower PDO PnP minor forwarded
 pub const SH_ROOT_PDO_FORWARDED_STATUS: u64 = 0x3F8; // out: lower PDO completion status
+pub const SH_DMA_COMMON_VA: u64 = 0x400; // in: component VA for the granted common buffer
+pub const SH_DMA_COMMON_LEN: u64 = 0x408; // in: granted common-buffer length
+pub const SH_DMA_COMMON_LOGICAL: u64 = 0x410; // in: granted device logical address / IOVA
+pub const SH_DMA_ADAPTER_ID: u64 = 0x418; // in: canonical nt-dma-manager adapter id
+pub const SH_DMA_ADAPTER_BLOB: u64 = 0x420; // out: driver-visible DMA_ADAPTER projection
+pub const SH_DMA_OPS_BLOB: u64 = 0x428; // out: driver-visible DMA_OPERATIONS projection
+pub const SH_DMA_REQUESTED_LEN: u64 = 0x430; // out: AllocateCommonBuffer requested length
+pub const SH_DMA_ALLOCATED_VA: u64 = 0x438; // out: AllocateCommonBuffer CPU VA
+pub const SH_DMA_ALLOCATED_LOGICAL: u64 = 0x440; // out: AllocateCommonBuffer logical address
+pub const SH_DMA_FREED_LOGICAL: u64 = 0x448; // out: last FreeCommonBuffer logical address
 
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
@@ -1378,6 +1389,162 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
     }
 }
 
+/// `PDMA_ADAPTER IoGetDmaAdapter(PDEVICE_OBJECT, PDEVICE_DESCRIPTION, PULONG)` — build a
+/// driver-local DMA adapter projection only when PnP granted this devnode a DMA common buffer.
+extern "win64" fn s_io_get_dma_adapter(
+    _pdo: u64,
+    _device_description: u64,
+    number_of_map_registers: *mut u32,
+) -> u64 {
+    unsafe {
+        let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
+        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
+        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
+        let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
+        if adapter_id == 0 || grant_va == 0 || grant_len == 0 || grant_logical == 0 {
+            return 0;
+        }
+        let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+        if active_adapter != 0 {
+            if !number_of_map_registers.is_null() {
+                write_unaligned(number_of_map_registers, 64);
+            }
+            return active_adapter;
+        }
+
+        let ops = pool_alloc(0x100);
+        if ops == 0 {
+            return 0;
+        }
+        let adapter = pool_alloc(0x40);
+        if adapter == 0 {
+            pool_free(ops);
+            return 0;
+        }
+
+        // DMA_OPERATIONS: Size@0, PutDmaAdapter@8, AllocateCommonBuffer@16,
+        // FreeCommonBuffer@24. Other operations stay NULL until the generic MDL map path exists.
+        write_unaligned(ops as *mut u32, 0x100);
+        write_unaligned(
+            (ops + 8) as *mut u64,
+            s_dma_put_adapter as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 16) as *mut u64,
+            s_dma_allocate_common_buffer as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 24) as *mut u64,
+            s_dma_free_common_buffer as *const () as usize as u64,
+        );
+
+        // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8.
+        write_unaligned(adapter as *mut u16, 1);
+        write_unaligned((adapter + 2) as *mut u16, 0x40);
+        write_unaligned((adapter + 8) as *mut u64, ops);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64,
+            adapter,
+        );
+        write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, ops);
+        if !number_of_map_registers.is_null() {
+            write_unaligned(number_of_map_registers, 64);
+        }
+        adapter
+    }
+}
+
+/// `PutDmaAdapter` — release the component-local adapter projection.
+extern "win64" fn s_dma_put_adapter(adapter: u64) {
+    unsafe {
+        let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+        if adapter != 0 && adapter == active {
+            let ops = read_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *const u64);
+            pool_free(adapter);
+            if ops != 0 {
+                pool_free(ops);
+            }
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, 0);
+        }
+    }
+}
+
+/// `AllocateCommonBuffer` — return the one common buffer PnP granted to this devnode.
+extern "win64" fn s_dma_allocate_common_buffer(
+    adapter: u64,
+    length: u32,
+    logical_out: *mut i64,
+    _cache_enabled: u8,
+) -> u64 {
+    unsafe {
+        let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
+        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
+        let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
+        let allocated = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
+        let requested = length as u64;
+        if adapter == 0
+            || adapter != active
+            || grant_va == 0
+            || grant_len == 0
+            || grant_logical == 0
+            || requested == 0
+            || requested > grant_len
+            || allocated != 0
+        {
+            return 0;
+        }
+
+        core::ptr::write_bytes(grant_va as *mut u8, 0, requested as usize);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
+            requested,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64,
+            grant_va,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
+            grant_logical,
+        );
+        if !logical_out.is_null() {
+            write_unaligned(logical_out, grant_logical as i64);
+        }
+        grant_va
+    }
+}
+
+/// `FreeCommonBuffer` — release the common-buffer projection if it matches the active grant.
+extern "win64" fn s_dma_free_common_buffer(
+    _adapter: u64,
+    length: u32,
+    logical: i64,
+    virtual_address: u64,
+    _cache_enabled: u8,
+) {
+    unsafe {
+        let active_logical =
+            read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
+        let active_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *const u64);
+        let active_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *const u64);
+        if active_logical != 0
+            && logical as u64 == active_logical
+            && virtual_address == active_va
+            && length as u64 == active_len
+        {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
+                active_logical,
+            );
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+        }
+    }
+}
+
 /// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
 /// link so the executive can publish it through the kernel object namespace after DriverEntry.
 extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
@@ -1846,6 +2013,10 @@ fn register_fsd_trampolines() {
     reg.bind(
         "PoStartNextPowerIrp",
         s_po_start_next_power_irp as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDmaAdapter",
+        s_io_get_dma_adapter as *const () as usize as u64,
     );
     reg.bind(
         "MmMapIoSpace",
@@ -3778,6 +3949,7 @@ static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDI
     [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
+static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 
 const HOSTED_MMIO_RESOURCE_KIND: u64 = 1;
 const HOSTED_INTERRUPT_RESOURCE_KIND: u64 = 2;
@@ -3798,6 +3970,10 @@ fn hosted_resource_owner(binding: HostedDeviceBinding) -> ResourceOwner {
     ResourceOwner::new(binding.driver_id, binding.device_id)
 }
 
+fn hosted_dma_owner(binding: HostedDeviceBinding) -> DmaOwner {
+    DmaOwner::new(binding.driver_id, binding.device_id)
+}
+
 unsafe fn hosted_root_bus_mut() -> &'static mut nt_root_bus::RootBus {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_BUS);
     if slot.is_none() {
@@ -3814,6 +3990,14 @@ unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_dma_manager_mut() -> &'static mut HostedDmaManager {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DMA_MANAGER);
+    if slot.is_none() {
+        *slot = Some(HostedDmaManager::new());
+    }
+    slot.as_mut().unwrap()
+}
+
 fn hosted_hal_status(error: HalError) -> nt_status::NtStatus {
     match error {
         HalError::WrongOwner | HalError::AccessDenied => nt_status::NtStatus::ACCESS_DENIED,
@@ -3825,8 +4009,18 @@ fn hosted_hal_status(error: HalError) -> nt_status::NtStatus {
     }
 }
 
+fn hosted_dma_status(error: DmaError) -> nt_status::NtStatus {
+    match error {
+        DmaError::WrongOwner | DmaError::LogicalViolation => nt_status::NtStatus::ACCESS_DENIED,
+        DmaError::StaleId | DmaError::Inactive | DmaError::OutOfRange => {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        }
+    }
+}
+
 unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) {
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
+    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
 }
 
 unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
@@ -3841,6 +4035,16 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ADAPTER_ID) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_OPS_BLOB) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
 }
 
 unsafe fn register_hosted_root_pdo(
@@ -4278,6 +4482,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     interrupt_vector: u32,
     interrupt_latched: bool,
     interrupt_affinity: u64,
+    dma_va: u64,
+    dma_frame_base: u64,
+    dma_pages: u64,
+    dma_logical: u64,
+    dma_len: u64,
 ) -> Result<(), nt_status::NtStatus> {
     if mmio_phys == 0
         || mmio_len == 0
@@ -4286,6 +4495,17 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || mmio_pages == 0
         || interrupt_vector == 0
         || interrupt_affinity > u32::MAX as u64
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let has_dma =
+        dma_va != 0 || dma_frame_base != 0 || dma_pages != 0 || dma_logical != 0 || dma_len != 0;
+    if has_dma
+        && (dma_va == 0
+            || dma_frame_base == 0
+            || dma_pages == 0
+            || dma_logical == 0
+            || dma_len == 0)
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -4313,6 +4533,35 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         page += 1;
+    }
+
+    let mut mapped_dma_len = 0u64;
+    let mut dma_adapter_id = 0u64;
+    if has_dma {
+        mapped_dma_len = dma_len.min(dma_pages.saturating_mul(0x1000));
+        if mapped_dma_len == 0 || dma_len > mapped_dma_len {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        ensure_paging(dma_va, inst.pml4);
+        let mut dma_page = 0u64;
+        while dma_page < dma_pages {
+            let err = page_map_r(
+                copy_cap(dma_frame_base + dma_page),
+                dma_va + dma_page * 0x1000,
+                RW_NX,
+                inst.pml4,
+            );
+            if err != 0 {
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
+            dma_page += 1;
+        }
+        dma_adapter_id = hosted_dma_manager_mut().register_adapter(
+            hosted_dma_owner(binding),
+            true,
+            dma_len,
+            true,
+        );
     }
 
     let rm = hosted_resource_manager_mut();
@@ -4355,6 +4604,16 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, dma_va);
+    write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, mapped_dma_len);
+    write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, dma_logical);
+    write_volatile((sh + SH_DMA_ADAPTER_ID) as *mut u64, dma_adapter_id);
+    write_volatile((sh + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_OPS_BLOB) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
     Ok(())
 }
 
@@ -4406,6 +4665,42 @@ unsafe fn record_hosted_resource_usage(
         if connected == 0 {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
+    }
+
+    let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
+    let dma_adapter_blob = read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64);
+    let dma_grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let dma_grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
+    let dma_grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    if dma_adapter_blob != 0 && dma_adapter_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let dma_requested_len = read_volatile((sh + SH_DMA_REQUESTED_LEN) as *const u64);
+    let dma_allocated_va = read_volatile((sh + SH_DMA_ALLOCATED_VA) as *const u64);
+    let dma_allocated_logical = read_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
+    if dma_requested_len != 0 || dma_allocated_va != 0 || dma_allocated_logical != 0 {
+        if dma_adapter_id == 0
+            || dma_adapter_blob == 0
+            || dma_grant_va == 0
+            || dma_grant_len == 0
+            || dma_grant_logical == 0
+            || dma_requested_len == 0
+            || dma_requested_len > dma_grant_len
+            || dma_allocated_va != dma_grant_va
+            || dma_allocated_logical != dma_grant_logical
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        hosted_dma_manager_mut()
+            .register_common_buffer_at(
+                hosted_dma_owner(binding),
+                dma_adapter_id,
+                dma_allocated_logical,
+                dma_requested_len,
+                dma_allocated_va,
+            )
+            .map_err(hosted_dma_status)?;
     }
 
     Ok(())
