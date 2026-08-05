@@ -3981,7 +3981,6 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let direct_draw_returns = EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed);
     let gdi_batch_flushes = EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
     let gdi_batch_records = EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed);
-    let gdi_batch_max_offset = EXPLORER_GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     let process_self_term = explorer_bit != 0
         && (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & explorer_bit) != 0;
     print_str(b"[explorer-image] opens=");
@@ -4055,8 +4054,6 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(gdi_batch_flushes);
     print_str(b"/");
     print_u64(gdi_batch_records);
-    print_str(b" batch-max-Offset=0x");
-    print_hex(gdi_batch_max_offset as u32);
     print_str(b"\n");
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();
@@ -7370,7 +7367,6 @@ pub(crate) static EXPLORER_END_PAINTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_DIRECT_GDI_DRAW_RETURNS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_RECORDS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `client`, exactly
 /// where `KiSystemCallHandler` runs it. The executive reads the live TEB only to decide whether
@@ -7400,10 +7396,6 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
         EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
         EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
-        let explorer_previous = EXPLORER_GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
-        if offset as u64 > explorer_previous {
-            EXPLORER_GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
-        }
     }
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
     GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);

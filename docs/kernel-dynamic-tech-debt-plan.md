@@ -89,7 +89,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` G2: Trace explorer shell-window paint from USER invalidation through real WndProc, GDI batch
   execution, surface dirtying, and framebuffer presentation until non-background shell chrome pixels
   are proven.
-- `[~]` G3: Audit and reduce temporary shell-paint instrumentation now that the real framebuffer
+- `[x]` G3: Audit and reduce temporary shell-paint instrumentation now that the real framebuffer
   proof exists; keep only narrow counters that guard actual USER/GDI/surface boundaries, and replace
   any remaining modeled presentation helpers with real window/surface ownership.
 - `[x]` G4: Add a stable framebuffer proof for explorer shell chrome, distinct from desktop
@@ -1985,3 +1985,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   returned `0x600d600d` with `parked=0`, profile load/userinit/explorer gates stayed green, and
   `.tmp/desktop-render-r102-nested-main-idle-probe-20260805-225007.png` shows the rendered desktop
   taskbar and clock.
+- G3 complete. The remaining shell-paint cleanup audit found one explorer-only GDI batch max-offset
+  trace and a bounded explorer `SetWindowLong`/WndProc trace logger that no longer guarded behavior.
+  Both were removed while keeping durable gates for the real boundaries: explorer BeginPaint/EndPaint,
+  direct GDI draw returns, GDI batch flush/record counts, client-installed WndProc without replay,
+  shell COM class service, and full framebuffer readback. No modeled shell presentation helper was
+  found in the explorer chrome path; pixels still come from win32k USER/GDI ownership and the boot
+  framebuffer readback. Validation: `rustfmt`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `cd rust-micro && ./scripts/build_kernel.sh
+  extern-rootserver`, and headless boot `desktop-render-r103-g3-closeout-20260805-231053` passed to
+  the microtest sentinel with `285/285` executive checks. Evidence: `exec_explorer_shell_chrome_painted`,
+  `exec_user_callback_dead_client_unwind`, and `exec_win32k_transport_call_nested` all passed;
+  explorer paint proof was `begin/end=6/6`, `direct-gdi-returns=47`,
+  `batch-flush/records=41/41`, and framebuffer readback found `27375` non-background pixels over
+  bounds `0,384..1023,767`.

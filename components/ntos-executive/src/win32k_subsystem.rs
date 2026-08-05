@@ -400,15 +400,11 @@ const W32PROCESS_FLAGS_OFF: u64 = 0x0C;
 const W32PROCESS_W32PID_OFF: u64 = 0x40;
 const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
 const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
-/// WND->head.pti and WND->lpfnWndProc offsets (ntuser.h: THRDESKHEAD at +0, lpfnWndProc after
-/// rcWindow/rcClient). Used only for bounded diagnostics around SetWindowLongPtr(GWLP_WNDPROC).
+/// WND->head.pti offset (ntuser.h: THRDESKHEAD at +0).
 const WND_HEAD_PTI_OFF: u64 = 0x10;
-const WND_LPFNWNDPROC_OFF: u64 = 0x90;
 const SSN_NT_USER_SET_WINDOW_LONG: u64 = 0x105b;
 const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
-static WIN32K_EXPLORER_SETWINDOWLONG_TRACES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_EXPLORER_SETWNDPROC_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
@@ -6951,66 +6947,17 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             b"\n"
         });
     }
-    let trace_setwndproc = (ssn == SSN_NT_USER_SET_WINDOW_LONG
+    let explorer_setwndproc = (ssn == SSN_NT_USER_SET_WINDOW_LONG
         || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
         && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
         && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6;
-    if (ssn == SSN_NT_USER_SET_WINDOW_LONG || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
-        && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6
-    {
-        let n = WIN32K_EXPLORER_SETWINDOWLONG_TRACES.fetch_add(1, Ordering::Relaxed);
-        if n < 64 {
-            print_str(b"[win32k-setwindowlong] explorer hwnd=0x");
-            print_hex(a0 as u32);
-            print_str(b" ssn=0x");
-            print_hex(ssn as u32);
-            print_str(if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
-                b" origin=replay"
-            } else {
-                b" origin=client"
-            });
-            print_str(b" index=0x");
-            print_hex((a1 >> 32) as u32);
-            print_hex(a1 as u32);
-            print_str(b" value=0x");
-            print_hex((a2 >> 32) as u32);
-            print_hex(a2 as u32);
-            print_str(b" ansi=");
-            print_u64(a3 & 1);
-            print_str(b"\n");
-        }
-    }
-    let trace_no = if trace_setwndproc {
+    if explorer_setwndproc {
         if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
             WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.fetch_add(1, Ordering::Relaxed);
         } else {
             WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS.fetch_add(1, Ordering::Relaxed);
         }
-        WIN32K_EXPLORER_SETWNDPROC_TRACES.fetch_add(1, Ordering::Relaxed)
-    } else {
-        u64::MAX
-    };
-    let trace_pwnd = if trace_no < 32 { hwnd_to_pwnd(a0) } else { 0 };
-    let trace_pti = if trace_pwnd != 0 {
-        read_volatile((trace_pwnd + WND_HEAD_PTI_OFF) as *const u64)
-    } else {
-        0
-    };
-    let trace_owner_ppi = if trace_pti != 0 {
-        read_volatile((trace_pti + THREADINFO_PPI_OFF) as *const u64)
-    } else {
-        0
-    };
-    let trace_current_ppi = if trace_no < 32 {
-        current_w32process()
-    } else {
-        0
-    };
-    let trace_old_proc = if trace_pwnd != 0 {
-        read_volatile((trace_pwnd + WND_LPFNWNDPROC_OFF) as *const u64)
-    } else {
-        0
-    };
+    }
     if ssn == SSN_NT_USER_SET_THREAD_DESKTOP {
         prepare_set_thread_desktop(a0);
     }
@@ -7245,43 +7192,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         _ => return STATUS_INVALID_SYSTEM_SERVICE,
     };
-    if trace_no < 32 {
-        let new_proc = if trace_pwnd != 0 {
-            read_volatile((trace_pwnd + WND_LPFNWNDPROC_OFF) as *const u64)
-        } else {
-            0
-        };
-        print_str(b"[win32k-setwndproc] explorer hwnd=0x");
-        print_hex(a0 as u32);
-        print_str(if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
-            b" origin=replay"
-        } else {
-            b" origin=client"
-        });
-        print_str(b" pwnd=0x");
-        print_hex((trace_pwnd >> 32) as u32);
-        print_hex(trace_pwnd as u32);
-        print_str(b" old=0x");
-        print_hex((trace_old_proc >> 32) as u32);
-        print_hex(trace_old_proc as u32);
-        print_str(b" requested=0x");
-        print_hex((a2 >> 32) as u32);
-        print_hex(a2 as u32);
-        print_str(b" new=0x");
-        print_hex((new_proc >> 32) as u32);
-        print_hex(new_proc as u32);
-        print_str(b" owner-ppi=0x");
-        print_hex((trace_owner_ppi >> 32) as u32);
-        print_hex(trace_owner_ppi as u32);
-        print_str(b" current-ppi=0x");
-        print_hex((trace_current_ppi >> 32) as u32);
-        print_hex(trace_current_ppi as u32);
-        print_str(b" ret=0x");
-        print_hex((ret >> 32) as u32);
-        print_hex(ret as u32);
-        print_str(b"\n");
-    }
-
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
     //
     // ROOT CAUSE (instruction-confirmed, NtUserSwitchDesktop RVA 0x6c2f8/0x6c579): winlogon's switch is
