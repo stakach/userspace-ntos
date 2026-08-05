@@ -18930,7 +18930,74 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 print_str(b" device_id=");
                                 print_u64(device_id);
                                 print_str(b"\n");
-                                match driver_launch::start_hosted_device(device_id, &[]) {
+                                let mut start_resources = alloc::vec::Vec::new();
+                                if let Some(grant) = assign_devnode_pci_resources(
+                                    devnode,
+                                    &pci_devices,
+                                    NIC_MSI_VECTOR as u32,
+                                    true,
+                                    0x1000,
+                                    0x4000,
+                                ) {
+                                    if nic_bar_base != 0 && grant.assignment.mmio_phys == nic_mmio {
+                                        match driver_launch::grant_hosted_device_resources(
+                                            device_id,
+                                            grant.assignment.mmio_phys,
+                                            grant.assignment.mmio_len.min(0x4000),
+                                            NIC_VADDR,
+                                            nic_bar_base,
+                                            4,
+                                            grant.assignment.int_vector,
+                                            grant.assignment.int_affinity,
+                                        ) {
+                                            Ok(()) => {
+                                                print_str(
+                                                    b"[driver-launch] assigned resources service=",
+                                                );
+                                                print_str(spec.service_name.as_bytes());
+                                                print_str(b" devnode=");
+                                                print_str(devnode.instance_id.as_bytes());
+                                                print_str(b" pci=0:");
+                                                print_u64(grant.device.dev as u64);
+                                                print_str(b".");
+                                                print_u64(grant.device.func as u64);
+                                                print_str(b" mmio=0x");
+                                                print_hex(grant.assignment.mmio_phys as u32);
+                                                print_str(b" len=");
+                                                print_u64(grant.assignment.mmio_len.min(0x4000));
+                                                print_str(b" vector=");
+                                                print_u64(grant.assignment.int_vector as u64);
+                                                print_str(b"\n");
+                                                start_resources = grant.resource_list;
+                                            }
+                                            Err(status) => {
+                                                print_str(
+                                                    b"[driver-launch] resource grant failed service=",
+                                                );
+                                                print_str(spec.service_name.as_bytes());
+                                                print_str(b" devnode=");
+                                                print_str(devnode.instance_id.as_bytes());
+                                                print_str(b" status=0x");
+                                                print_hex(status.raw() as u32);
+                                                print_str(b"\n");
+                                            }
+                                        }
+                                    } else {
+                                        print_str(
+                                            b"[driver-launch] no mapped BAR grant for service=",
+                                        );
+                                        print_str(spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" mmio=0x");
+                                        print_hex(grant.assignment.mmio_phys as u32);
+                                        print_str(b"\n");
+                                    }
+                                }
+                                match driver_launch::start_hosted_device(
+                                    device_id,
+                                    &start_resources,
+                                ) {
                                     Ok(()) => {
                                         print_str(b"[driver-launch] StartDevice service=");
                                         print_str(spec.service_name.as_bytes());

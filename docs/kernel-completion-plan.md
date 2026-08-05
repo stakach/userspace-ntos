@@ -80,13 +80,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue B3 by adding executive-owned AddDevice/StartDevice dispatch for the devnode descriptors
-   now carried by boot/demand driver launch specs.
+1. Finish B3 root-bus PDO identity/state: hosted AddDevice still receives a structural PDO
+   projection, while the kernel needs a devnode-backed PDO object that can own forwarded PnP state.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-3. Audit remaining static driver-object construction sites that are not service-key-derived,
+3. Retire the old bespoke NIC driver proof once the generic registry-selected hosted-driver path
+   proves equivalent real MMIO/interrupt/DMA evidence.
+4. Audit remaining static driver-object construction sites that are not service-key-derived,
    especially video and object-server tests, and classify whether they are fixtures or real debt.
-4. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
+5. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
    the seeded Configuration Manager authority.
 
 ## Review Log
@@ -290,3 +292,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   of the executive. Validation: `cargo test -p nt-pnp`. Review adjustment: the next B3 slice should
   use this matcher in the executive boot plan to assign per-devnode `CM_RESOURCE_LIST`s, map the
   matching BAR into the hosted component, and bind `MmMapIoSpace`/`IoConnectInterrupt` to the grant.
+- B3 continued. The executive boot plan now resolves each registry-selected PCI devnode through the
+  `nt-pnp` matcher, builds a physical-address `CM_RESOURCE_LIST` for START, maps the already-claimed
+  BAR into the hosted driver's VSpace, and binds `MmMapIoSpace`, `MmUnmapIoSpace`,
+  `IoConnectInterrupt`, and `IoDisconnectInterrupt` to the active grant instead of the unbound-import
+  fallback. If a devnode resolves to hardware the broker has not granted yet, START is still sent
+  without resources and the driver's real failure is preserved. Validation: `cargo test -p nt-pnp`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3 still needs devnode-backed root-bus PDO state and generic interrupt/DMA
+  resource-manager grants before the old bespoke NIC driver proof can be removed.

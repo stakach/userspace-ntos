@@ -16,6 +16,9 @@
 //! primitives (`claim_device_pages`, `make_object`, `untyped_retype`) — driven here
 //! from the enumerated resource list rather than hand-authored constants.
 #![allow(clippy::all)]
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::*;
 use nt_pnp::{
     assign_resources, assignment_to_cm_list, enumerate_bus, find_device_for_class, DriverClass,
@@ -64,18 +67,66 @@ pub(crate) fn assign_nic(
     })
 }
 
-/// Write the driver-visible `CM_RESOURCE_LIST` for `assign` into the resource frame at
-/// `reslist_va` — the exact bytes a WDK driver reads at `IRP_MN_START_DEVICE`. `mmio_va` is the
-/// driver-visible VA of the minted MMIO window (where the BAR frame caps are mapped in the driver's
-/// VSpace), `mmio_len` the length exposed to the driver. This is the resource-assignment grant made
-/// concrete: the descriptor names the caps the broker minted, at the VAs they are mapped.
+/// The PCI function and translated START resource bytes selected for one registry devnode.
+pub(crate) struct DevnodePciResourceGrant {
+    pub device: PciDevice,
+    pub assignment: ResourceAssignment,
+    pub resource_list: Vec<u8>,
+}
+
+/// Resolve a registry-selected devnode against the enumerated PCI bus and build the physical
+/// `CM_RESOURCE_LIST` that will be passed to the hosted driver's `IRP_MN_START_DEVICE`.
+pub(crate) fn assign_devnode_pci_resources(
+    devnode: &crate::DriverServiceDevnodeSpec,
+    devices: &[PciDevice],
+    int_vector: u32,
+    int_latched: bool,
+    dma_len: u64,
+    granted_mmio_len: u32,
+) -> Option<DevnodePciResourceGrant> {
+    let device = nt_pnp::find_pci_device_for_devnode(
+        devices,
+        &devnode.instance_id,
+        &devnode.hardware_ids,
+        &devnode.compatible_ids,
+    )?;
+    let assignment = assign_resources(
+        device,
+        int_vector,
+        int_latched,
+        /*affinity=*/ 1,
+        dma_len,
+    )?;
+    let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
+    if mmio_len == 0 || mmio_len > u32::MAX as u64 {
+        return None;
+    }
+    let mut resource_list = vec![0u8; MEMORY_INTERRUPT_LIST_SIZE];
+    let n = assignment_to_cm_list(
+        &mut resource_list,
+        device.bus as u32,
+        &assignment,
+        assignment.mmio_phys,
+        mmio_len as u32,
+    )?;
+    resource_list.truncate(n);
+    Some(DevnodePciResourceGrant {
+        device: device.clone(),
+        assignment,
+        resource_list,
+    })
+}
+
+/// Write a `CM_RESOURCE_LIST` for `assign` into the resource frame at `reslist_va` — the exact bytes
+/// a WDK driver reads at `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; use
+/// the translated physical address for drivers that call `MmMapIoSpace`.
 pub(crate) unsafe fn write_cm_resource_list(
     reslist_va: u64,
     bus_number: u32,
     assign: &ResourceAssignment,
-    mmio_va: u64,
+    memory_start: u64,
     mmio_len: u32,
 ) {
     let buf = core::slice::from_raw_parts_mut(reslist_va as *mut u8, MEMORY_INTERRUPT_LIST_SIZE);
-    let _ = assignment_to_cm_list(buf, bus_number, assign, mmio_va, mmio_len);
+    let _ = assignment_to_cm_list(buf, bus_number, assign, memory_start, mmio_len);
 }

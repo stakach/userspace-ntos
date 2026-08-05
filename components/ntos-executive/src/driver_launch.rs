@@ -172,6 +172,17 @@ pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
 pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
+pub const SH_RESOURCE_MMIO_PHYS: u64 = 0x3A0; // in: granted physical BAR base for MmMapIoSpace
+pub const SH_RESOURCE_MMIO_LEN: u64 = 0x3A8; // in: granted mapped BAR length
+pub const SH_RESOURCE_MMIO_VA: u64 = 0x3B0; // in: component VA for the mapped BAR
+pub const SH_RESOURCE_INTERRUPT_VECTOR: u64 = 0x3B8; // in: granted interrupt vector/level (u32)
+pub const SH_RESOURCE_INTERRUPT_AFFINITY: u64 = 0x3C0; // in: granted interrupt affinity
+pub const SH_RESOURCE_MMIO_MAPPED_PHYS: u64 = 0x3C8; // out: last MmMapIoSpace phys
+pub const SH_RESOURCE_MMIO_MAPPED_LEN: u64 = 0x3D0; // out: last MmMapIoSpace length
+pub const SH_RESOURCE_INTERRUPT_OBJECT: u64 = 0x3D8; // out: PKINTERRUPT projection
+pub const SH_RESOURCE_INTERRUPT_ROUTINE: u64 = 0x3E0; // out: connected ISR routine
+pub const SH_RESOURCE_INTERRUPT_CONTEXT: u64 = 0x3E8; // out: connected ISR context
+
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
 pub const SH_REQ_MINOR: u64 = 0x48; // in:  minor function (u64)
@@ -1232,6 +1243,127 @@ extern "win64" fn s_po_call_driver(device: u64, irp: u64) -> i32 {
 /// `void PoStartNextPowerIrp(PIRP)`.
 extern "win64" fn s_po_start_next_power_irp(_irp: u64) {}
 
+/// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
+/// for a BAR range the executive already granted to this hosted driver. Requests outside the active
+/// grant fail with NULL; there is no success fallback.
+extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 {
+    unsafe {
+        let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
+        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
+        if grant_phys == 0 || grant_len == 0 || grant_va == 0 || length == 0 || phys < grant_phys {
+            return 0;
+        }
+        let offset = phys - grant_phys;
+        if offset > grant_len || length > grant_len - offset {
+            return 0;
+        }
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+            phys,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+            length,
+        );
+        grant_va + offset
+    }
+}
+
+/// `void MmUnmapIoSpace(PVOID, SIZE_T)` — revoke the recorded projection. The VSpace mapping is
+/// owned by the executive grant and is torn down with the component.
+extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
+    unsafe {
+        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
+        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        if grant_va != 0 && base >= grant_va && base < grant_va + grant_len {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+                0,
+            );
+        }
+    }
+}
+
+/// `NTSTATUS IoConnectInterrupt(...)` — validate the requested vector against the active PnP grant
+/// and hand back a component-local interrupt projection.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn s_io_connect_interrupt(
+    interrupt_obj_out: *mut u64,
+    service_routine: u64,
+    service_context: u64,
+    _spin_lock: u64,
+    vector: u32,
+    _irql: u8,
+    _sync_irql: u8,
+    _mode: u32,
+    _share: u8,
+    affinity: u64,
+    _floating: u8,
+) -> i32 {
+    unsafe {
+        let granted_vector =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+        let granted_affinity =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
+        if granted_vector == 0
+            || vector != granted_vector
+            || (affinity != 0 && granted_affinity != 0 && affinity != granted_affinity)
+        {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        }
+        let projection = pool_alloc(0x20);
+        if projection == 0 {
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+        write_unaligned(projection as *mut u32, vector);
+        write_unaligned((projection + 8) as *mut u64, service_routine);
+        write_unaligned((projection + 16) as *mut u64, service_context);
+        if !interrupt_obj_out.is_null() {
+            write_unaligned(interrupt_obj_out, projection);
+        }
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+            projection,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+            service_routine,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+            service_context,
+        );
+        0
+    }
+}
+
+/// `void IoDisconnectInterrupt(PKINTERRUPT)` — clear the connected projection if it is the active
+/// one for this hosted driver.
+extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
+    unsafe {
+        let active = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
+        if pkinterrupt != 0 && pkinterrupt == active {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                0,
+            );
+        }
+    }
+}
+
 /// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
 /// link so the executive can publish it through the kernel object namespace after DriverEntry.
 extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
@@ -1700,6 +1832,22 @@ fn register_fsd_trampolines() {
     reg.bind(
         "PoStartNextPowerIrp",
         s_po_start_next_power_irp as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmMapIoSpace",
+        s_mm_map_io_space as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmUnmapIoSpace",
+        s_mm_unmap_io_space as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoConnectInterrupt",
+        s_io_connect_interrupt as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoDisconnectInterrupt",
+        s_io_disconnect_interrupt as *const () as usize as u64,
     );
     reg.bind(
         "IoCreateSymbolicLink",
@@ -3989,6 +4137,71 @@ pub(crate) unsafe fn call_add_device_for_driver(
         table[index].ready = true;
     }
     Ok(device_id.raw())
+}
+
+/// Grant a hosted device driver access to the MMIO/interrupt resources selected for its devnode.
+///
+/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: BAR frames are
+/// mapped into the isolated component VSpace, and the shared page records the only physical range
+/// and interrupt vector that `MmMapIoSpace`/`IoConnectInterrupt` may accept.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn grant_hosted_device_resources(
+    device_id: u64,
+    mmio_phys: u64,
+    mmio_len: u64,
+    mmio_va: u64,
+    mmio_frame_base: u64,
+    mmio_pages: u64,
+    interrupt_vector: u32,
+    interrupt_affinity: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if mmio_phys == 0
+        || mmio_len == 0
+        || mmio_va == 0
+        || mmio_frame_base == 0
+        || mmio_pages == 0
+        || interrupt_vector == 0
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let mapped_len = mmio_len.min(mmio_pages.saturating_mul(0x1000));
+    ensure_paging(mmio_va, inst.pml4);
+    let mut page = 0u64;
+    while page < mmio_pages {
+        let err = page_map_r(
+            copy_cap(mmio_frame_base + page),
+            mmio_va + page * 0x1000,
+            RW_NX,
+            inst.pml4,
+        );
+        if err != 0 {
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        page += 1;
+    }
+
+    let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
+    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mapped_len);
+    write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, mmio_va);
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
+        interrupt_vector,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
+        interrupt_affinity,
+    );
+    write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    Ok(())
 }
 
 /// Send `IRP_MN_START_DEVICE` to a hosted FDO. `resource_list` is the caller-selected

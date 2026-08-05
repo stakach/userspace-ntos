@@ -486,22 +486,21 @@ pub fn assign_resources(
 }
 
 /// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` (memory + interrupt) a WDK driver
-/// reads at `IRP_MN_START_DEVICE`. `mmio_va` is the *driver-visible* address of the MMIO window
-/// (where the executive maps the minted BAR frames in the driver's VSpace) — the driver dereferences
-/// the descriptor's `Memory.Start`, so it must be the VA the caps are mapped at, not the physaddr.
+/// reads at `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; callers should
+/// pass the translated physical address for real WDM drivers that call `MmMapIoSpace`.
 /// Writes into `buf` (>= [`MEMORY_INTERRUPT_LIST_SIZE`]); returns the byte length written.
 pub fn assignment_to_cm_list(
     buf: &mut [u8],
     bus_number: u32,
     assign: &ResourceAssignment,
-    mmio_va: u64,
+    memory_start: u64,
     mmio_len: u32,
 ) -> Option<usize> {
     nt_cm_resources::build_memory_interrupt_list(
         buf,
         bus_number,
         MemoryDescriptor {
-            start: mmio_va,
+            start: memory_start,
             length: mmio_len,
             flags: CM_RESOURCE_MEMORY_READ_WRITE,
             share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
@@ -780,13 +779,13 @@ mod tests {
         assert!(assign.int_latched);
         assert_eq!(assign.dma_len, 0x1000);
 
-        // The driver-visible resource list names the driver's MMIO VA + the assigned vector.
+        // The resource list names the caller-supplied translated memory address + vector.
         let mut buf = [0u8; MEMORY_INTERRUPT_LIST_SIZE];
-        let mmio_va = 0x0000_0100_105F_0000u64;
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, mmio_va, 0x4000).unwrap();
+        let memory_start = 0xFEBC_0000u64;
+        let n = assignment_to_cm_list(&mut buf, 0, &assign, memory_start, 0x4000).unwrap();
         assert_eq!(n, MEMORY_INTERRUPT_LIST_SIZE);
         let (mem, int) = nt_cm_resources::decode_memory_interrupt_list(&buf).unwrap();
-        assert_eq!(mem.start, mmio_va);
+        assert_eq!(mem.start, memory_start);
         assert_eq!(mem.length, 0x4000);
         assert_eq!(int.vector, 5);
         assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LATCHED);
