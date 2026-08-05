@@ -1765,3 +1765,33 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the dynamic-tech-debt plan. A fully hosted videoprt/display-miniport stack remains the next feature
   frontier for replacing the boot framebuffer miniport, but it is no longer masking a hardcoded
   registry/device fallback in this plan.
+
+## Explorer Shell Chrome Frontier
+
+- E1 complete. Explorer now survives interleaved nested user callbacks by deferring out-of-order
+  `NtCallbackReturn` packets until the corresponding callback frame is at the global top of the
+  parked continuation stack. Validation: `rustfmt --edition 2021 --config skip_children=true`
+  over the touched files, `cargo test -p nt-user-callback`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`,
+  `./components/ntos-executive/build.sh`, `cd rust-micro && ./scripts/build_kernel.sh
+  extern-rootserver`, and headless gate `desktop-render-r40-deferred-callback-20260805-123654`
+  passed. Screenshot follow-up `desktop-render-r41-screenshot-20260805-124745` proved genuine
+  explorer launch, shell class/message registration, real WndProc install, `WM_PAINT`,
+  `NtUserBeginPaint`, GDI text/fill calls, and `NtUserEndPaint`, but the framebuffer still contained
+  only the desktop background plus cursor/bottom artifacts. Review adjustment: the remaining E2 work
+  is real shell chrome pixels, starting with USER/GDI syscall pointer contracts used by explorer paint.
+- E2 complete. `NtUserBeginPaint`/`NtUserEndPaint` now stage `PAINTSTRUCT` across the isolated
+  win32k boundary instead of passing a hosted-client stack pointer directly. This mirrors ReactOS'
+  `NtUserBeginPaint` copy-to-caller and `NtUserEndPaint` probe/copy-in contracts, returns zero on
+  failed probes/copyout, and leaves win32k responsible for the real `IntBeginPaint`/`IntEndPaint`
+  state transitions. Validation: `rustfmt --edition 2021 --config skip_children=true
+  components/ntos-executive/src/service_sec_image.rs`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`,
+  `./components/ntos-executive/build.sh`, `cd rust-micro && ./scripts/build_kernel.sh
+  extern-rootserver`, and graphical boot run `desktop-render-r42-paintstruct-20260805-130406`
+  passed with `284/284` checks. The run exercised staged `PAINTSTRUCT` for winlogon and explorer
+  paint, explorer spawned genuinely, installed client WndProcs, and ran real nested paint callbacks.
+  Screenshot analysis still shows only the desktop background, cursor, and the two bottom artifacts
+  (`311` non-background pixels, same as r41). Review adjustment: E3 is the remaining real shell
+  chrome pixel work; inspect dirty-window accounting, window-surface flush, and any USER/GDI geometry
+  copyback gaps instead of adding framebuffer scaffolding.

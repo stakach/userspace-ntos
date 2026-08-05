@@ -36,6 +36,7 @@ static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -66,6 +67,9 @@ const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
     (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
+const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
+const NTUSER_BEGIN_PAINT_SSN: u64 = 0x1016;
+const NTUSER_END_PAINT_SSN: u64 = 0x1018;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
 const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
@@ -8003,6 +8007,8 @@ pub(crate) unsafe fn service_sec_image(
                 let mut ext_text_out_stack_args = [0u64; 5];
                 let mut ext_text_out_stack_arg_count = 0usize;
                 let mut ext_text_out_probe_failed = false;
+                let mut paintstruct_copyout = (0u64, 0u64);
+                let mut paintstruct_probe_failed = false;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -9173,6 +9179,75 @@ pub(crate) unsafe fn service_sec_image(
                             } else {
                                 ext_text_out_probe_failed = true;
                             }
+                        }
+                    }
+                } else if m0 == NTUSER_BEGIN_PAINT_SSN {
+                    // NtUserBeginPaint writes a caller-owned PAINTSTRUCT after IntBeginPaint returns.
+                    // Stage that out-param in the shared win32k argument page so isolated win32k never
+                    // receives an explorer/winlogon stack VA.
+                    if d_a1 == 0 {
+                        paintstruct_probe_failed = true;
+                    } else {
+                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_PAINTSTRUCT_STAGE_BYTES);
+                        d_a1 = arg;
+                        paintstruct_copyout = (a1, arg);
+                        let n = PAINTSTRUCT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 {
+                            print_str(b"[w32marshal] NtUserBeginPaint pi=");
+                            print_u64(pi as u64);
+                            print_str(b" hwnd=0x");
+                            print_hex_u64(a0);
+                            print_str(b" ps=0x");
+                            print_hex_u64(a1);
+                            print_str(b" staged=0x");
+                            print_hex_u64(arg);
+                            print_str(b"\n");
+                        }
+                    }
+                } else if m0 == NTUSER_END_PAINT_SSN {
+                    // NtUserEndPaint probes and copies the caller's PAINTSTRUCT before IntEndPaint.
+                    // Capture it into provider-owned memory at the cross-VSpace boundary.
+                    if d_a1 == 0 {
+                        paintstruct_probe_failed = true;
+                    } else {
+                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_PAINTSTRUCT_STAGE_BYTES);
+                        prefill_client_copyin_dll_range_pages(
+                            pi as u64,
+                            d_a1,
+                            WIN32K_PAINTSTRUCT_STAGE_BYTES,
+                            scratch_base,
+                            &reg,
+                            &dll_pes,
+                        );
+                        let input = core::slice::from_raw_parts_mut(
+                            arg as *mut u8,
+                            WIN32K_PAINTSTRUCT_STAGE_BYTES,
+                        );
+                        if img_spawn::client_copyin_mapped(
+                            pi as u64,
+                            d_a1,
+                            input,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            d_a1 = arg;
+                            let n = PAINTSTRUCT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 32 {
+                                print_str(b"[w32marshal] NtUserEndPaint pi=");
+                                print_u64(pi as u64);
+                                print_str(b" hwnd=0x");
+                                print_hex_u64(a0);
+                                print_str(b" ps=0x");
+                                print_hex_u64(a1);
+                                print_str(b" staged=0x");
+                                print_hex_u64(arg);
+                                print_str(b"\n");
+                            }
+                        } else {
+                            paintstruct_probe_failed = true;
                         }
                     }
                 } else if m0 == 0x125c && sp != 0 {
@@ -10468,6 +10543,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if paintstruct_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] paint PAINTSTRUCT probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" ssn=0x");
+                        print_hex(m0 as u32);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a0);
+                        print_str(b" ps=0x");
+                        print_hex_u64(a1);
+                        print_str(b" -> 0\n");
+                    }
+                    (0, true)
                 } else if text_extent_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -10811,6 +10900,34 @@ pub(crate) unsafe fn service_sec_image(
                                 print_u64(get_icon_info_copyout.resource.is_some() as u64);
                                 print_str(b" bpp=0x");
                                 print_hex_u64(get_icon_info_copyout.bpp_client);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if m0 == NTUSER_BEGIN_PAINT_SSN && r.1 && r.0 != 0 {
+                        let (client_ps, staged_ps) = paintstruct_copyout;
+                        let ps_ok = client_ps != 0
+                            && img_spawn::client_copyout_mapped(
+                                pi as u64,
+                                client_ps,
+                                core::slice::from_raw_parts(
+                                    staged_ps as *const u8,
+                                    WIN32K_PAINTSTRUCT_STAGE_BYTES,
+                                ),
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                        if !ps_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(b"[win32k-svc] NtUserBeginPaint PAINTSTRUCT copy-out failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" hwnd=0x");
+                                print_hex_u64(a0);
+                                print_str(b" ps=0x");
+                                print_hex_u64(client_ps);
                                 print_str(b"\n");
                             }
                             r = (0, true);
