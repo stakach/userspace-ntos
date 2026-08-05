@@ -438,6 +438,22 @@ impl ConfigManager {
         if let Some(p) = pdo_name {
             self.registry.set_string(enum_key, "PdoName", p);
         }
+        if !hardware_ids.is_empty() {
+            self.registry.set_value(
+                enum_key,
+                "HardwareID",
+                RegistryValueType::MultiSz,
+                encode_multi_sz(hardware_ids),
+            );
+        }
+        if !compatible_ids.is_empty() {
+            self.registry.set_value(
+                enum_key,
+                "CompatibleIDs",
+                RegistryValueType::MultiSz,
+                encode_multi_sz(compatible_ids),
+            );
+        }
         let id = self.alloc_id();
         self.devnodes.push(DevnodeRecord {
             id,
@@ -450,6 +466,95 @@ impl ConfigManager {
             properties: PropertyBag::default(),
         });
         id
+    }
+
+    /// Index one already-existing `Enum\<InstanceId>` key as a devnode record.
+    ///
+    /// This is the import path for boot hives: the registry tree remains authoritative and the
+    /// devnode table becomes a searchable metadata index over it.
+    pub fn index_registry_devnode(&mut self, instance_id: &str) -> Option<DevnodeId> {
+        if let Some(id) = self.devnode(instance_id).map(|d| d.id) {
+            return Some(id);
+        }
+        let enum_key = self.registry.open_key(&devnode_path(instance_id))?;
+        self.index_registry_devnode_key(instance_id, enum_key)
+    }
+
+    /// Recursively index all devnode-shaped keys under
+    /// `\Registry\Machine\System\CurrentControlSet\Enum`.
+    pub fn index_registry_devnodes(&mut self) -> usize {
+        let Some(enum_root) = self.registry.open_key(ENUM_PATH) else {
+            return 0;
+        };
+        self.index_registry_devnodes_from_key(enum_root, String::new())
+    }
+
+    fn index_registry_devnodes_from_key(
+        &mut self,
+        key: RegistryKeyId,
+        instance_id: String,
+    ) -> usize {
+        let mut count = 0usize;
+        if !instance_id.is_empty() && self.index_registry_devnode_key(&instance_id, key).is_some() {
+            count += 1;
+        }
+
+        let child_names = self.registry.enum_subkeys(key);
+        for child_name in child_names {
+            let Some(child_key) = self.registry.open_subkey(key, &child_name) else {
+                continue;
+            };
+            let child_instance = if instance_id.is_empty() {
+                child_name
+            } else {
+                let mut child_instance = instance_id.clone();
+                child_instance.push('\\');
+                child_instance.push_str(&child_name);
+                child_instance
+            };
+            count += self.index_registry_devnodes_from_key(child_key, child_instance);
+        }
+        count
+    }
+
+    fn index_registry_devnode_key(
+        &mut self,
+        instance_id: &str,
+        enum_key: RegistryKeyId,
+    ) -> Option<DevnodeId> {
+        if self.devnode(instance_id).is_some() {
+            return None;
+        }
+        let service = self.registry.query_string(enum_key, "Service");
+        let pdo_name = self.registry.query_string(enum_key, "PdoName");
+        let hardware_ids = self
+            .registry
+            .query_multi_string(enum_key, "HardwareID")
+            .unwrap_or_default();
+        let compatible_ids = self
+            .registry
+            .query_multi_string(enum_key, "CompatibleIDs")
+            .unwrap_or_default();
+        if service.is_none()
+            && pdo_name.is_none()
+            && hardware_ids.is_empty()
+            && compatible_ids.is_empty()
+        {
+            return None;
+        }
+
+        let id = self.alloc_id();
+        self.devnodes.push(DevnodeRecord {
+            id,
+            instance_id: instance_id.into(),
+            service,
+            pdo_name,
+            hardware_ids,
+            compatible_ids,
+            enum_key,
+            properties: PropertyBag::default(),
+        });
+        Some(id)
     }
 
     fn devnode_mut(&mut self, id: DevnodeId) -> Option<&mut DevnodeRecord> {
@@ -921,15 +1026,24 @@ mod tests {
             .set_string(custom_key, "ObjectName", r"\Driver\VendorCustom");
 
         assert_eq!(
-            cm.service_metadata("Npfs").unwrap().driver_object_path().as_deref(),
+            cm.service_metadata("Npfs")
+                .unwrap()
+                .driver_object_path()
+                .as_deref(),
             Some(r"\FileSystem\Npfs")
         );
         assert_eq!(
-            cm.service_metadata("Disk").unwrap().driver_object_path().as_deref(),
+            cm.service_metadata("Disk")
+                .unwrap()
+                .driver_object_path()
+                .as_deref(),
             Some(r"\Driver\Disk")
         );
         assert_eq!(
-            cm.service_metadata("FsRec").unwrap().driver_object_path().as_deref(),
+            cm.service_metadata("FsRec")
+                .unwrap()
+                .driver_object_path()
+                .as_deref(),
             Some(r"\FileSystem\FsRec")
         );
         assert_eq!(
@@ -1066,6 +1180,78 @@ mod tests {
         assert_eq!(
             cm.registry().query_string(key, "Service").as_deref(),
             Some("KmdfInterfaceRegistryTest")
+        );
+        assert_eq!(
+            cm.registry().query_multi_string(key, "HardwareID").unwrap(),
+            alloc::vec![String::from(r"ROOT\KMDF_INTERFACE_TEST")]
+        );
+        assert_eq!(
+            cm.registry()
+                .query_multi_string(key, "CompatibleIDs")
+                .unwrap(),
+            alloc::vec![String::from(r"ROOT\USERSPLACE_NTOS_INTERFACE_TEST")]
+        );
+    }
+
+    #[test]
+    fn registry_enum_tree_indexes_devnodes_for_service_binding() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "E1000",
+            r"system32\drivers\e1000.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        let key = cm
+            .registry_mut()
+            .create_key(r"\Registry\Machine\System\CurrentControlSet\Enum\PCI\VEN_8086&DEV_100E\3&11583659&0&18");
+        cm.registry_mut().set_string(key, "Service", "E1000");
+        cm.registry_mut()
+            .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
+        cm.registry_mut().set_value(
+            key,
+            "HardwareID",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
+        );
+        cm.registry_mut().set_value(
+            key,
+            "CompatibleIDs",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&[r"PCI\CC_020000", r"PCI\CC_0200"]),
+        );
+        cm.registry_mut().create_key(
+            r"\Registry\Machine\System\CurrentControlSet\Enum\PCI\VEN_8086&DEV_100E\Properties",
+        );
+
+        assert_eq!(cm.index_registry_devnodes(), 1);
+        assert_eq!(cm.index_registry_devnodes(), 0);
+
+        let dn = cm
+            .devnode(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18")
+            .unwrap();
+        let dn_id = dn.id;
+        assert_eq!(dn.enum_key, key);
+        assert_eq!(dn.service.as_deref(), Some("E1000"));
+        assert_eq!(dn.pdo_name.as_deref(), Some(r"\Device\NTPNP_PCI0001"));
+        assert_eq!(
+            dn.hardware_ids,
+            alloc::vec![
+                String::from(r"PCI\VEN_8086&DEV_100E"),
+                String::from(r"PCI\VEN_8086"),
+            ]
+        );
+        assert_eq!(
+            dn.compatible_ids,
+            alloc::vec![String::from(r"PCI\CC_020000"), String::from(r"PCI\CC_0200"),]
+        );
+        assert_eq!(cm.devnodes_for_service("e1000").len(), 1);
+        assert_eq!(
+            cm.index_registry_devnode(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"),
+            Some(dn_id)
         );
     }
 

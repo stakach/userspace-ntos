@@ -108,6 +108,45 @@ fn imports_control_set_services_into_config_manager() {
 }
 
 #[test]
+fn imports_control_set_enum_into_config_manager() {
+    let mut h = Hive::new(HiveKind::System);
+    let dn = h.create_key(r"ControlSet001\Enum\PCI\VEN_8086&DEV_100E\3&11583659&0&18");
+    h.set_value(dn, "Service", RegistryValueType::Sz, utf16le_sz("E1000"));
+    h.set_value(
+        dn,
+        "PdoName",
+        RegistryValueType::Sz,
+        utf16le_sz(r"\Device\NTPNP_PCI0001"),
+    );
+    h.set_value(
+        dn,
+        "HardwareID",
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
+    );
+
+    let mut cm = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_enum_into_config_manager(&h, &mut cm, "ControlSet001"),
+        1
+    );
+
+    let indexed = cm
+        .devnode(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18")
+        .unwrap();
+    assert_eq!(indexed.service.as_deref(), Some("E1000"));
+    assert_eq!(indexed.pdo_name.as_deref(), Some(r"\Device\NTPNP_PCI0001"));
+    assert_eq!(
+        indexed.hardware_ids,
+        alloc::vec![
+            String::from(r"PCI\VEN_8086&DEV_100E"),
+            String::from(r"PCI\VEN_8086"),
+        ]
+    );
+    assert_eq!(cm.devnodes_for_service("e1000").len(), 1);
+}
+
+#[test]
 fn image_checksum_rejects_corruption() {
     let h = Hive::new(HiveKind::System);
     let mut bytes = encode_image(&h);

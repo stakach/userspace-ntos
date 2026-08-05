@@ -51,7 +51,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   launch on one service-key to driver-object path.
 - `[x]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
-- `[ ]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
+- `[~]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
   drivers create device objects/interfaces through I/O Manager mechanisms.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
@@ -192,3 +192,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: B3 is now the main driver-stack gap. The current boot/system plan is still
   filtered to the registry `File System` load group because hosted device/bus/filter bring-up needs
   devnode-to-service binding and PnP-owned device creation.
+- B3 started. `nt-config-manager` can now persist and index `Enum\<InstanceId>` devnodes from the
+  registry tree, including `Service`, `PdoName`, `HardwareID`, and `CompatibleIDs`, and can enumerate
+  devnodes by bound service without requiring fixture registration. Both generated hives and REGF
+  hives now import `ControlSetXXX\Enum` into the live Configuration Manager registry and build that
+  devnode index after import. Validation: `cargo test -p nt-config-manager`,
+  `cargo test -p nt-hive-core`, `cargo test -p nt-hive-regf`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should feed these registry-indexed devnodes into the PnP
+  Manager's lifecycle model, replacing static fixture devnode creation with service-bound devnode
+  creation and preserving the kernel/policy split.

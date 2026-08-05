@@ -30,7 +30,9 @@ pub use reactos_registration::{
 pub use codec::{
     decode_image, encode_image, encode_log_record, replay_log, HiveDecodeError, HiveLogOp,
 };
-pub use config_import::import_control_set_services_into_config_manager;
+pub use config_import::{
+    import_control_set_enum_into_config_manager, import_control_set_services_into_config_manager,
+};
 pub use hive::{
     apply_ccs_alias, CellId, Hive, HiveId, HiveKind, HiveMountTable, RegistryValueType,
     CURRENT_CONTROL_SET_TARGET, SYSTEM_HIVE_PATH,

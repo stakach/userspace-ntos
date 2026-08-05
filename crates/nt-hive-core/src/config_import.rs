@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use nt_config_manager::{ConfigManager, Registry, RegistryKeyId, SERVICES_PATH};
+use nt_config_manager::{ConfigManager, Registry, RegistryKeyId, ENUM_PATH, SERVICES_PATH};
 
 use crate::Hive;
 
@@ -32,6 +32,24 @@ pub fn import_control_set_services_into_config_manager(
         import_hive_key(hive, src_service, cm.registry_mut(), dst_service);
     }
     count
+}
+
+/// Import `ControlSetXXX\Enum` from a hive into
+/// `\Registry\Machine\System\CurrentControlSet\Enum`, then index devnode records from the imported
+/// registry keys.
+pub fn import_control_set_enum_into_config_manager(
+    hive: &Hive,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_enum_path = alloc::string::String::from(control_set);
+    src_enum_path.push_str("\\Enum");
+    let Some(src_enum) = hive.open_key(&src_enum_path) else {
+        return 0;
+    };
+    let dst_enum = cm.registry_mut().create_key(ENUM_PATH);
+    import_hive_key(hive, src_enum, cm.registry_mut(), dst_enum);
+    cm.index_registry_devnodes()
 }
 
 fn import_hive_key(hive: &Hive, src: crate::CellId, dst: &mut Registry, dst_key: RegistryKeyId) {

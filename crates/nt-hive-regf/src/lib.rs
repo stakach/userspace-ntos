@@ -25,7 +25,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_config_manager::{
-    ConfigManager, Registry, RegistryKeyId, RegistryValueType, SERVICES_PATH,
+    ConfigManager, Registry, RegistryKeyId, RegistryValueType, ENUM_PATH, SERVICES_PATH,
     SERVICE_GROUP_ORDER_PATH,
 };
 
@@ -394,6 +394,7 @@ impl<'a> RegfHive<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlSetImportCounts {
     pub services: usize,
+    pub enum_devnodes: usize,
     pub service_group_order_values: usize,
 }
 
@@ -405,6 +406,7 @@ pub fn import_control_set_boot_config_into_config_manager(
 ) -> ControlSetImportCounts {
     ControlSetImportCounts {
         services: import_control_set_services_into_config_manager(hive, cm, control_set),
+        enum_devnodes: import_control_set_enum_into_config_manager(hive, cm, control_set),
         service_group_order_values: import_control_set_service_group_order_into_config_manager(
             hive,
             cm,
@@ -433,6 +435,24 @@ pub fn import_control_set_services_into_config_manager(
         import_regf_key(hive, src_service, cm.registry_mut(), dst_service);
     }
     count
+}
+
+/// Import `ControlSetXXX\Enum` from a read-only REGF hive into
+/// `\Registry\Machine\System\CurrentControlSet\Enum`, then index devnode records from the imported
+/// registry keys.
+pub fn import_control_set_enum_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_enum_path = String::from(control_set);
+    src_enum_path.push_str("\\Enum");
+    let Some(src_enum) = hive.open_key(&src_enum_path) else {
+        return 0;
+    };
+    let dst_enum = cm.registry_mut().create_key(ENUM_PATH);
+    import_regf_key(hive, src_enum, cm.registry_mut(), dst_enum);
+    cm.index_registry_devnodes()
 }
 
 /// Import `ControlSetXXX\Control\ServiceGroupOrder` from a read-only REGF hive into
@@ -591,12 +611,19 @@ mod tests {
         const PARAMETERS: u32 = 0x300;
         const CONTROL: u32 = 0x880;
         const SERVICE_GROUP_ORDER: u32 = 0x900;
+        const ENUM: u32 = 0xb00;
+        const ENUM_PCI: u32 = 0xb80;
+        const ENUM_DEVICE: u32 = 0xc00;
+        const ENUM_INSTANCE: u32 = 0xc80;
 
         const ROOT_LIST: u32 = 0x380;
         const CS_LIST: u32 = 0x3c0;
         const SERVICES_LIST: u32 = 0x400;
         const NPFS_LIST: u32 = 0x440;
         const CONTROL_LIST: u32 = 0x980;
+        const ENUM_LIST: u32 = 0xd00;
+        const ENUM_PCI_LIST: u32 = 0xd40;
+        const ENUM_DEVICE_LIST: u32 = 0xd80;
 
         const NPFS_VALUE_LIST: u32 = 0x480;
         const VK_IMAGE: u32 = 0x500;
@@ -610,6 +637,13 @@ mod tests {
         const SGO_VALUE_LIST: u32 = 0x9c0;
         const VK_SGO_LIST: u32 = 0xa00;
         const SGO_LIST_DATA: u32 = 0xa80;
+        const ENUM_INSTANCE_VALUE_LIST: u32 = 0xdc0;
+        const VK_ENUM_SERVICE: u32 = 0xe00;
+        const VK_ENUM_PDO: u32 = 0xe80;
+        const VK_ENUM_HWID: u32 = 0xf00;
+        const ENUM_SERVICE_DATA: u32 = 0xf80;
+        const ENUM_PDO_DATA: u32 = 0x1000;
+        const ENUM_HWID_DATA: u32 = 0x1080;
 
         let mut data = vec![0u8; 0x3000];
         data[..4].copy_from_slice(b"regf");
@@ -627,17 +661,27 @@ mod tests {
             CONTROL,
             b"ServiceGroupOrder",
         );
+        write_nk(&mut data, ENUM, CONTROL_SET, b"Enum");
+        write_nk(&mut data, ENUM_PCI, ENUM, b"PCI");
+        write_nk(&mut data, ENUM_DEVICE, ENUM_PCI, b"VEN_8086&DEV_100E");
+        write_nk(&mut data, ENUM_INSTANCE, ENUM_DEVICE, b"3&11583659&0&18");
 
         write_subkey_list(&mut data, ROOT_LIST, &[CONTROL_SET]);
-        write_subkey_list(&mut data, CS_LIST, &[SERVICES, CONTROL]);
+        write_subkey_list(&mut data, CS_LIST, &[SERVICES, CONTROL, ENUM]);
         write_subkey_list(&mut data, SERVICES_LIST, &[NPFS]);
         write_subkey_list(&mut data, NPFS_LIST, &[PARAMETERS]);
         write_subkey_list(&mut data, CONTROL_LIST, &[SERVICE_GROUP_ORDER]);
+        write_subkey_list(&mut data, ENUM_LIST, &[ENUM_PCI]);
+        write_subkey_list(&mut data, ENUM_PCI_LIST, &[ENUM_DEVICE]);
+        write_subkey_list(&mut data, ENUM_DEVICE_LIST, &[ENUM_INSTANCE]);
         set_nk_subkeys(&mut data, ROOT, ROOT_LIST);
         set_nk_subkeys(&mut data, CONTROL_SET, CS_LIST);
         set_nk_subkeys(&mut data, SERVICES, SERVICES_LIST);
         set_nk_subkeys(&mut data, NPFS, NPFS_LIST);
         set_nk_subkeys(&mut data, CONTROL, CONTROL_LIST);
+        set_nk_subkeys(&mut data, ENUM, ENUM_LIST);
+        set_nk_subkeys(&mut data, ENUM_PCI, ENUM_PCI_LIST);
+        set_nk_subkeys(&mut data, ENUM_DEVICE, ENUM_DEVICE_LIST);
 
         write_value_list(
             &mut data,
@@ -693,6 +737,56 @@ mod tests {
             &mut data,
             HBIN_BASE + VK_SGO_LIST as usize + 4 + 0x04,
             group_order.len() as u32,
+        );
+
+        write_value_list(
+            &mut data,
+            ENUM_INSTANCE_VALUE_LIST,
+            &[VK_ENUM_SERVICE, VK_ENUM_PDO, VK_ENUM_HWID],
+        );
+        set_nk_values(&mut data, ENUM_INSTANCE, ENUM_INSTANCE_VALUE_LIST, 3);
+        let enum_service = utf16le_sz("E1000");
+        write_data_cell(&mut data, ENUM_SERVICE_DATA, &enum_service);
+        write_vk_data(
+            &mut data,
+            VK_ENUM_SERVICE,
+            b"Service",
+            RegistryValueType::Sz as u32,
+            ENUM_SERVICE_DATA,
+        );
+        write_u32(
+            &mut data,
+            HBIN_BASE + VK_ENUM_SERVICE as usize + 4 + 0x04,
+            enum_service.len() as u32,
+        );
+        let pdo_name = utf16le_sz(r"\Device\NTPNP_PCI0001");
+        write_data_cell(&mut data, ENUM_PDO_DATA, &pdo_name);
+        write_vk_data(
+            &mut data,
+            VK_ENUM_PDO,
+            b"PdoName",
+            RegistryValueType::Sz as u32,
+            ENUM_PDO_DATA,
+        );
+        write_u32(
+            &mut data,
+            HBIN_BASE + VK_ENUM_PDO as usize + 4 + 0x04,
+            pdo_name.len() as u32,
+        );
+        let hardware_ids =
+            nt_config_manager::encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]);
+        write_data_cell(&mut data, ENUM_HWID_DATA, &hardware_ids);
+        write_vk_data(
+            &mut data,
+            VK_ENUM_HWID,
+            b"HardwareID",
+            RegistryValueType::MultiSz as u32,
+            ENUM_HWID_DATA,
+        );
+        write_u32(
+            &mut data,
+            HBIN_BASE + VK_ENUM_HWID as usize + 4 + 0x04,
+            hardware_ids.len() as u32,
         );
 
         data
@@ -776,6 +870,7 @@ mod tests {
             counts,
             ControlSetImportCounts {
                 services: 1,
+                enum_devnodes: 1,
                 service_group_order_values: 1,
             }
         );
@@ -787,6 +882,18 @@ mod tests {
             ]
         );
         assert_eq!(cm.boot_system_driver_candidates()[0].name, "Npfs");
+        let devnode = cm
+            .devnode(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18")
+            .unwrap();
+        assert_eq!(devnode.service.as_deref(), Some("E1000"));
+        assert_eq!(devnode.pdo_name.as_deref(), Some(r"\Device\NTPNP_PCI0001"));
+        assert_eq!(
+            devnode.hardware_ids,
+            vec![
+                String::from(r"PCI\VEN_8086&DEV_100E"),
+                String::from(r"PCI\VEN_8086"),
+            ]
+        );
     }
 
     #[test]
@@ -881,6 +988,7 @@ mod tests {
         let counts =
             import_control_set_boot_config_into_config_manager(&hive, &mut cm, "ControlSet001");
         assert!(counts.services > 0, "expected imported service keys");
+        eprintln!("imported Enum devnodes: {}", counts.enum_devnodes);
         assert!(
             counts.service_group_order_values > 0,
             "expected ServiceGroupOrder values"
