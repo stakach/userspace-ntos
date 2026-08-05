@@ -5,8 +5,8 @@
 //!
 //! This GENERALIZES the bespoke boot-time spawners (`spawn_driver_host` NIC, `spawn_storage_host`,
 //! `spawn_kmdf_host`, `spawn_win32k_host`) into ONE runtime service — like Win32 `CreateProcess` /
-//! the general `NtCreateThread`. Any `.sys` becomes launchable dynamically. The first client is
-//! **npfs.sys** (an FSD-class descriptor, NO device caps).
+//! the general `NtCreateThread`. Any registry-declared `.sys` in a supported policy class becomes
+//! launchable dynamically.
 //!
 //! POLICY CLASSES (see `project_driver_model.md`):
 //!   * [`DriverClass::Fsd`]    — file-system drivers (npfs, fastfat, ntfs): image + heap/pool + stack
@@ -18,7 +18,7 @@
 //!     Syscall substrate + paint-loop protocol are NOT routed through the IRP builder here).
 //!
 //! The existing bespoke spawners are follow-on migrations onto this path (their descriptor-builders
-//! already exist post effort-1); this increment builds the general path + proves it with npfs.
+//! already exist post effort-1); the named-pipe provider remains the deepest FSD data-plane proof.
 
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
@@ -109,7 +109,7 @@ pub const FSD_ARG_FRAMES: u64 = 4;
 // entry / pool / dispatch loop all reference these fixed values). What MUST differ per instance is the
 // EXECUTIVE-side mapping window — the executive maps every live instance's aliased CODE/DATA/SHARED/
 // ARG frames into its OWN VSpace to (a) load+relocate the PE and (b) marshal IRPs — so two instances
-// cannot both map at `FSD_CODE_VA`. Instance 0 (npfs) keeps the fixed VAs EXACTLY (byte-identical);
+// cannot both map at `FSD_CODE_VA`. Instance 0 keeps the fixed FSD VAs EXACTLY (byte-identical);
 // instance N≥1 gets a distinct executive window at `FSD_EXEC_BASE + (N-1)*FSD_EXEC_STRIDE`, well clear
 // of every other executive mapping (past the 48 MiB file pool at 0x100_1500_0000..0x100_1800_0000).
 //
@@ -120,7 +120,7 @@ pub const FSD_EXEC_BASE: u64 = 0x0000_0100_1A00_0000;
 pub const FSD_EXEC_STRIDE: u64 = 0x0000_0000_0100_0000; // 16 MiB per instance window
 
 /// The executive-side VA window for launching an instance's frames. Instance 0 == the fixed
-/// (npfs) VAs (behavior-preserving); instance N≥1 == a distinct high window.
+/// historical FSD VAs (behavior-preserving); instance N≥1 == a distinct high window.
 #[derive(Clone, Copy)]
 pub(crate) struct ExecVaWindow {
     pub code_va: u64,
@@ -2506,7 +2506,7 @@ static DRIVER_NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
 /// the GUI syscall server ([`DriverClass::GuiSyscallServer`], win32k) keeps its own Syscall substrate
 /// and is NOT routed here — see [`crate::win32k_subsystem`].
 ///
-/// MULTI-INSTANCE: each call takes a fresh instance slot; instance 0 uses the fixed npfs executive
+/// MULTI-INSTANCE: each call takes a fresh instance slot; instance 0 uses the fixed FSD executive
 /// VAs (byte-identical), instance N≥1 a distinct executive window ([`ExecVaWindow::for_instance`]).
 /// The live driver state is recorded in [`DRIVER_INSTANCES`] so [`dispatch_irp`] can route to any of
 /// N drivers by instance index. Adding a boot/system IRP driver means declaring a `Services\<Name>`

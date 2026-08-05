@@ -870,6 +870,68 @@ mod tests {
     }
 
     #[test]
+    fn local_reactos_system_hive_boot_driver_metadata() {
+        let path = "../../rust-micro/.tmp/reactos/reactos/system32/config/system";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: staged `config\\system` not present");
+            return;
+        };
+        let hive = RegfHive::new(&bytes).expect("the staged `config\\system` must be a regf hive");
+        let mut cm = ConfigManager::new();
+        let counts =
+            import_control_set_boot_config_into_config_manager(&hive, &mut cm, "ControlSet001");
+        assert!(counts.services > 0, "expected imported service keys");
+        assert!(
+            counts.service_group_order_values > 0,
+            "expected ServiceGroupOrder values"
+        );
+        assert!(
+            !cm.service_group_order().is_empty(),
+            "expected a non-empty ServiceGroupOrder list"
+        );
+        let drivers = cm.boot_system_driver_candidates();
+        eprintln!(
+            "boot/system driver prefix: {:?}",
+            drivers
+                .iter()
+                .take(12)
+                .map(|service| (
+                    service.name.as_str(),
+                    service.start_type,
+                    service.load_order_group.as_deref(),
+                    service.tag,
+                    service.image_path.as_deref(),
+                ))
+                .collect::<Vec<_>>()
+        );
+        let npfs_rank = drivers
+            .iter()
+            .position(|service| service.name.eq_ignore_ascii_case("Npfs"));
+        eprintln!("Npfs rank in boot/system driver candidates: {npfs_rank:?}");
+        if let Some(rank) = npfs_rank {
+            let start = rank.saturating_sub(4);
+            let end = (rank + 5).min(drivers.len());
+            eprintln!(
+                "Npfs boot/system neighborhood: {:?}",
+                drivers[start..end]
+                    .iter()
+                    .map(|service| (
+                        service.name.as_str(),
+                        service.start_type,
+                        service.load_order_group.as_deref(),
+                        service.tag,
+                        service.image_path.as_deref(),
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            npfs_rank.is_some(),
+            "expected Npfs in boot/system driver candidates"
+        );
+    }
+
+    #[test]
     fn rejects_non_regf() {
         assert!(RegfHive::new(&[0u8; 0x2000]).is_none());
         assert!(RegfHive::new(b"not a hive").is_none());

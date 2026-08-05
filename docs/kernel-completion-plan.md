@@ -49,7 +49,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 - `[ ]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
   launch on one service-key to driver-object path.
-- `[~]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
+- `[x]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
 - `[ ]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
   drivers create device objects/interfaces through I/O Manager mechanisms.
@@ -149,3 +149,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `ConfigManager` view uses that broader import. Validation: `cargo test -p nt-hive-regf`. Review
   adjustment: the ordered metadata is now available from real REGF hives; the next B2 slice should
   replace the remaining NPFS-named launch proof with an ordered boot/system launch plan.
+- B2 complete for the current hosted FSD boundary. The executive now builds an ordered boot/system
+  driver launch plan from real SYSTEM-hive service metadata, narrows it to the registry `File System`
+  load-order group that the current FSD host can execute, launches those candidates through the
+  generic driver path, and discovers the named-pipe provider by the `\Device\NamedPipe` object it
+  publishes rather than by `Npfs` service name. Validation: `cargo test -p nt-hive-regf` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3/B4 now own expanding the same ordered plan to boot bus, device, filter, and
+  PnP-bound drivers instead of filtering to the FSD load group.
