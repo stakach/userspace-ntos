@@ -72,6 +72,16 @@ impl CmServer {
         }
     }
 
+    /// Build a server around an already-seeded Configuration Manager.
+    pub fn with_config(cm: ConfigManager) -> Self {
+        Self { cm }
+    }
+
+    /// Direct read access to the registry authority.
+    pub fn config(&self) -> &ConfigManager {
+        &self.cm
+    }
+
     /// Direct access to the registry authority (for seeding hives at boot).
     pub fn config_mut(&mut self) -> &mut ConfigManager {
         &mut self.cm

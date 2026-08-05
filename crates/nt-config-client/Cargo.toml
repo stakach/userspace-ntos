@@ -11,6 +11,7 @@ authors.workspace = true
 nt-config-abi = { workspace = true }
 
 [dev-dependencies]
+nt-config-manager = { workspace = true }
 nt-config-server = { workspace = true }
 
 [lints.clippy]

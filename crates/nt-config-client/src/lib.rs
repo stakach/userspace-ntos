@@ -186,6 +186,9 @@ impl<B: Backend> ConfigClient<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nt_config_manager::{
+        encode_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_WIN32_SHARE_PROCESS,
+    };
     use nt_config_server::CmServer;
 
     /// In-process backend: dispatch straight into the server (no ring).
@@ -199,9 +202,11 @@ mod tests {
     }
 
     fn client() -> ConfigClient<Direct> {
-        ConfigClient::new(Direct {
-            server: CmServer::new(),
-        })
+        client_with_server(CmServer::new())
+    }
+
+    fn client_with_server(server: CmServer) -> ConfigClient<Direct> {
+        ConfigClient::new(Direct { server })
     }
 
     #[test]
@@ -235,6 +240,33 @@ mod tests {
             Ok((1, data.len()))
         );
         assert_eq!(&out[..data.len()], data);
+    }
+
+    #[test]
+    fn seeded_config_manager_services_are_visible() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "RpcSs",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        let mut c = client_with_server(CmServer::with_config(cm));
+        let key = r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs";
+        assert!(c.open_key(key));
+        assert_eq!(c.query_dword(key, "Type"), Ok(SERVICE_WIN32_SHARE_PROCESS));
+        assert_eq!(c.query_dword(key, "Start"), Ok(SERVICE_AUTO_START));
+
+        let expected = encode_sz(r"%SystemRoot%\system32\svchost.exe -k rpcss");
+        let mut out = [0u8; 128];
+        assert_eq!(
+            c.query_value(key, "ImagePath", &mut out),
+            Ok((1, expected.len()))
+        );
+        assert_eq!(&out[..expected.len()], expected.as_slice());
     }
 
     #[test]

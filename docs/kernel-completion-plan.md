@@ -129,3 +129,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: A3 still needs the actual SCM service-start request path to choose Win32
   service process creation from `ServiceMetadata`, and B2 should replace the NPFS-specific boot
   proof with ordered boot/system driver enumeration.
+- A3 continued. `nt-config-server` can now be constructed around an already-seeded
+  `ConfigManager`, and the client/server host test proves a seeded `Services\<Name>` tree is visible
+  through the existing CM wire API. This is the construction hook needed for a single boot-seeded CM
+  authority instead of a fresh empty registry service. Validation: `cargo test -p nt-config-client`
+  and `cargo test -p nt-config-server`. Review adjustment: the executive still has to pass imported
+  boot hive state into the isolated CM service, or retire the parallel executive-local registry read
+  path behind that service.
