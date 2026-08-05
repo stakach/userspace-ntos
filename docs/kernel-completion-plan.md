@@ -333,3 +333,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   generic registry-selected boundary. The remaining B3 work before removing the old NIC proof is a
   boot gate showing the generic path reaches real hardware evidence and real interrupt delivery to
   the connected ISR token.
+- B3 continued. The generic hosted-driver path now exposes a service-agnostic
+  `HostedHardwareEvidence` snapshot after `START_DEVICE`, covering MMIO map evidence, interrupt
+  connection evidence, DMA adapter/common-buffer evidence, and root-PDO started state. The boot
+  driver loop prints per-devnode and aggregate hardware evidence when any registry-selected device
+  driver receives a grant, without adding a service-name gate or making absent hardware evidence
+  pass. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should run the boot, inspect this generic evidence trace, and
+  convert the dynamic evidence into real gates once the registry-selected path is confirmed.

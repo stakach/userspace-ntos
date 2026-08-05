@@ -3944,6 +3944,52 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     used: false,
 };
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostedHardwareEvidence {
+    pub resource_mmio_phys: u64,
+    pub resource_mmio_len: u64,
+    pub mmio_mapped_phys: u64,
+    pub mmio_mapped_len: u64,
+    pub interrupt_vector: u32,
+    pub interrupt_object: u64,
+    pub interrupt_routine: u64,
+    pub interrupt_context: u64,
+    pub dma_adapter_id: u64,
+    pub dma_adapter_blob: u64,
+    pub dma_common_va: u64,
+    pub dma_common_len: u64,
+    pub dma_common_logical: u64,
+    pub dma_requested_len: u64,
+    pub dma_allocated_va: u64,
+    pub dma_allocated_logical: u64,
+    pub root_pdo_started: bool,
+}
+
+impl HostedHardwareEvidence {
+    pub(crate) fn resource_granted(self) -> bool {
+        self.resource_mmio_phys != 0
+            || self.interrupt_vector != 0
+            || self.dma_common_va != 0
+            || self.dma_common_logical != 0
+    }
+
+    pub(crate) fn mmio_mapped(self) -> bool {
+        self.mmio_mapped_phys != 0 && self.mmio_mapped_len != 0
+    }
+
+    pub(crate) fn interrupt_connected(self) -> bool {
+        self.interrupt_object != 0 && self.interrupt_routine != 0
+    }
+
+    pub(crate) fn dma_adapter_created(self) -> bool {
+        self.dma_adapter_id != 0 && self.dma_adapter_blob != 0
+    }
+
+    pub(crate) fn dma_common_allocated(self) -> bool {
+        self.dma_allocated_va != 0 && self.dma_allocated_logical != 0 && self.dma_requested_len != 0
+    }
+}
+
 const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
 static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
     [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
@@ -4126,6 +4172,39 @@ fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDe
         .iter()
         .copied()
         .find(|slot| slot.used && slot.device_object == device_object)
+}
+
+pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)?;
+    let sh = inst.exec_shared_va;
+    let root_pdo_started = unsafe {
+        (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
+            .as_ref()
+            .map(|bus| bus.pdo_started(binding.pdo_object))
+            .unwrap_or(false)
+    };
+    Some(unsafe {
+        HostedHardwareEvidence {
+            resource_mmio_phys: read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64),
+            resource_mmio_len: read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64),
+            mmio_mapped_phys: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
+            mmio_mapped_len: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
+            interrupt_vector: read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32),
+            interrupt_object: read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64),
+            interrupt_routine: read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64),
+            interrupt_context: read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64),
+            dma_adapter_id: read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64),
+            dma_adapter_blob: read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64),
+            dma_common_va: read_volatile((sh + SH_DMA_COMMON_VA) as *const u64),
+            dma_common_len: read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64),
+            dma_common_logical: read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64),
+            dma_requested_len: read_volatile((sh + SH_DMA_REQUESTED_LEN) as *const u64),
+            dma_allocated_va: read_volatile((sh + SH_DMA_ALLOCATED_VA) as *const u64),
+            dma_allocated_logical: read_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *const u64),
+            root_pdo_started,
+        }
+    })
 }
 
 fn clear_hosted_device_binding_by_device_id(device_id: u64) {

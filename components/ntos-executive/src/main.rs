@@ -18898,6 +18898,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // by the DEVICE_OBJECT it publishes, not by a compiled-in service or image name.
     if let Some(fs) = exec_fs() {
         let mut named_pipe_provider = None;
+        let mut generic_hw_granted = false;
+        let mut generic_hw_mmio_mapped = false;
+        let mut generic_hw_interrupt_connected = false;
+        let mut generic_hw_dma_adapter = false;
+        let mut generic_hw_dma_common = false;
+        let mut generic_hw_root_started = false;
         for spec in system_hive_boot_driver_launch_specs() {
             if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
@@ -19015,6 +19021,45 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                         print_str(b" devnode=");
                                         print_str(devnode.instance_id.as_bytes());
                                         print_str(b" status=0x00000000\n");
+                                        if let Some(evidence) =
+                                            driver_launch::hosted_hardware_evidence(device_id)
+                                        {
+                                            if evidence.resource_granted() {
+                                                generic_hw_granted = true;
+                                                generic_hw_mmio_mapped |= evidence.mmio_mapped();
+                                                generic_hw_interrupt_connected |=
+                                                    evidence.interrupt_connected();
+                                                generic_hw_dma_adapter |=
+                                                    evidence.dma_adapter_created();
+                                                generic_hw_dma_common |=
+                                                    evidence.dma_common_allocated();
+                                                generic_hw_root_started |=
+                                                    evidence.root_pdo_started;
+                                                print_str(
+                                                    b"[driver-launch] hardware evidence service=",
+                                                );
+                                                print_str(spec.service_name.as_bytes());
+                                                print_str(b" devnode=");
+                                                print_str(devnode.instance_id.as_bytes());
+                                                print_str(b" mmio=");
+                                                print_u64(evidence.mmio_mapped() as u64);
+                                                print_str(b" mmio_len=");
+                                                print_u64(evidence.resource_mmio_len);
+                                                print_str(b" int=");
+                                                print_u64(evidence.interrupt_connected() as u64);
+                                                print_str(b" int_ctx=");
+                                                print_u64((evidence.interrupt_context != 0) as u64);
+                                                print_str(b" dma_adapter=");
+                                                print_u64(evidence.dma_adapter_created() as u64);
+                                                print_str(b" dma_common=");
+                                                print_u64(evidence.dma_common_allocated() as u64);
+                                                print_str(b" dma_len=");
+                                                print_u64(evidence.dma_common_len);
+                                                print_str(b" root_started=");
+                                                print_u64(evidence.root_pdo_started as u64);
+                                                print_str(b"\n");
+                                            }
+                                        }
                                     }
                                     Err(status) => {
                                         print_str(b"[driver-launch] StartDevice failed service=");
@@ -19058,6 +19103,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(spec.service_name.as_bytes());
                 print_str(b" load failed\n");
             }
+        }
+        if generic_hw_granted {
+            print_str(b"[driver-launch] generic hardware summary mmio=");
+            print_u64(generic_hw_mmio_mapped as u64);
+            print_str(b" int=");
+            print_u64(generic_hw_interrupt_connected as u64);
+            print_str(b" dma_adapter=");
+            print_u64(generic_hw_dma_adapter as u64);
+            print_str(b" dma_common=");
+            print_u64(generic_hw_dma_common as u64);
+            print_str(b" root_started=");
+            print_u64(generic_hw_root_started as u64);
+            print_str(b"\n");
         }
         if let Some((dc, driver_object_path)) = named_pipe_provider {
             publish_npfs_io_objects(&mut c, &dc, &driver_object_path, &mut passed);
