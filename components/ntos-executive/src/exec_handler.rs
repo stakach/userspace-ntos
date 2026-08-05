@@ -1736,9 +1736,11 @@ impl ExecNtHandler {
         }
 
         let mut image_path = [0u8; 180];
-        let Some((image_len, class)) =
-            system_hive_demand_driver_launch_spec(&service, &mut image_path)
-        else {
+        let Some((image_len, class)) = system_hive_driver_launch_spec(
+            &service,
+            &mut image_path,
+            nt_config_manager::SERVICE_DEMAND_START,
+        ) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let Some(fs) = exec_fs() else {

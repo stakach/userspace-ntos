@@ -69,6 +69,23 @@ pub struct ServiceRecord {
     pub error_control: u32,
 }
 
+/// The kernel launch class implied by a driver service's `Type` bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DriverServiceClass {
+    Device,
+    FileSystem,
+}
+
+pub fn driver_service_class_from_type(service_type: u32) -> Option<DriverServiceClass> {
+    if service_type & SERVICE_FILE_SYSTEM_DRIVER != 0 {
+        Some(DriverServiceClass::FileSystem)
+    } else if service_type & SERVICE_DRIVER_TYPE_MASK != 0 {
+        Some(DriverServiceClass::Device)
+    } else {
+        None
+    }
+}
+
 /// Typed view of a `Services\<Name>` key.
 ///
 /// This is read from the registry tree instead of the in-memory service index so imported hives
@@ -91,8 +108,7 @@ pub struct ServiceMetadata {
 
 impl ServiceMetadata {
     pub fn is_driver(&self) -> bool {
-        self.service_type
-            .is_some_and(|ty| ty & SERVICE_DRIVER_TYPE_MASK != 0)
+        self.driver_service_class().is_some()
     }
 
     pub fn is_win32_service(&self) -> bool {
@@ -106,6 +122,10 @@ impl ServiceMetadata {
 
     pub fn has_launch_image(&self) -> bool {
         self.image_path.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
+    pub fn driver_service_class(&self) -> Option<DriverServiceClass> {
+        driver_service_class_from_type(self.service_type?)
     }
 }
 
@@ -719,6 +739,7 @@ mod tests {
         );
         assert!(svc.is_win32_service());
         assert!(!svc.is_driver());
+        assert_eq!(svc.driver_service_class(), None);
         assert!(svc.has_launch_image());
     }
 
@@ -767,6 +788,14 @@ mod tests {
         let drivers = cm.boot_system_driver_candidates();
         assert_eq!(drivers.len(), 1);
         assert_eq!(drivers[0].name, "Npfs");
+        assert_eq!(
+            drivers[0].driver_service_class(),
+            Some(DriverServiceClass::FileSystem)
+        );
+        assert_eq!(
+            driver_service_class_from_type(SERVICE_KERNEL_DRIVER),
+            Some(DriverServiceClass::Device)
+        );
 
         let all_auto = cm.service_candidates_by_start_and_type(
             &[SERVICE_AUTO_START],

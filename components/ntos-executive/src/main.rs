@@ -79,6 +79,9 @@ use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
+use nt_config_manager::{
+    driver_service_class_from_type, DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START,
+};
 use nt_hive_core::apply_ccs_alias;
 use nt_hive_regf::{KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
@@ -11374,17 +11377,13 @@ fn driver_launch_spec_from_registry_values(
     out_path: &mut [u8],
     max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
-    // NT service start values: 0=BOOT_START, 1=SYSTEM_START, 2=AUTO_START, 3=DEMAND_START,
-    // 4=DISABLED. Callers choose the maximum accepted start policy for their route.
-    if start_value > max_start || start_value >= 4 {
+    // Callers choose the maximum accepted NT service start policy for their route.
+    if start_value > max_start || start_value >= SERVICE_DISABLED {
         return None;
-    }
-    let class = if type_value & 0x2 != 0 {
-        driver_launch::DriverClass::Fsd
-    } else if type_value & 0x1 != 0 {
-        driver_launch::DriverClass::Device
-    } else {
-        return None;
+    };
+    let class = match driver_service_class_from_type(type_value)? {
+        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
+        DriverServiceClass::Device => driver_launch::DriverClass::Device,
     };
     let path_len = registry_utf16_ascii_path(image_path_data, out_path)?;
     Some((path_len, class))
@@ -11415,43 +11414,43 @@ fn config_hive_driver_launch_spec(
     }
     let type_value = hive.query_dword(key, "Type")?;
     let start_value = hive.query_dword(key, "Start")?;
-    driver_launch_spec_from_registry_values(image_path, type_value, start_value, out_path, 1)
+    driver_launch_spec_from_registry_values(
+        image_path,
+        type_value,
+        start_value,
+        out_path,
+        SERVICE_SYSTEM_START,
+    )
 }
 
 fn system_hive_driver_launch_spec(
     service_name: &str,
     out_path: &mut [u8],
+    max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
     let hive = system_hive_regf()?;
     let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
     key_path.push_str(service_name);
     let key = hive.open_key(&key_path)?;
-    let image_path = hive.value(key, "ImagePath")?;
+    let (image_type, image_path) = hive.value(key, "ImagePath")?;
+    if image_type != nt_hive_core::RegistryValueType::Sz as u32
+        && image_type != nt_hive_core::RegistryValueType::ExpandSz as u32
+    {
+        return None;
+    }
     let type_value = hive
         .value(key, "Type")
         .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
     let start_value = hive
         .value(key, "Start")
         .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path, 1)
-}
-
-fn system_hive_demand_driver_launch_spec(
-    service_name: &str,
-    out_path: &mut [u8],
-) -> Option<(usize, driver_launch::DriverClass)> {
-    let hive = system_hive_regf()?;
-    let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
-    key_path.push_str(service_name);
-    let key = hive.open_key(&key_path)?;
-    let image_path = hive.value(key, "ImagePath")?;
-    let type_value = hive
-        .value(key, "Type")
-        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    let start_value = hive
-        .value(key, "Start")
-        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    driver_launch_spec_from_registry_values(&image_path.1, type_value, start_value, out_path, 3)
+    driver_launch_spec_from_registry_values(
+        &image_path,
+        type_value,
+        start_value,
+        out_path,
+        max_start,
+    )
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {
@@ -18787,7 +18786,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // launchable from registry state; the existing bespoke spawners are follow-on migrations.
     if let Some(fs) = exec_fs() {
         let mut npfs_path = [0u8; 128];
-        let npfs_spec = system_hive_driver_launch_spec("Npfs", &mut npfs_path);
+        let npfs_spec =
+            system_hive_driver_launch_spec("Npfs", &mut npfs_path, SERVICE_SYSTEM_START);
         if let Some((npfs_path_len, npfs_class)) = npfs_spec {
             print_str(b"[driver-launch] launching Npfs from SYSTEM hive path=");
             print_str(&npfs_path[..npfs_path_len]);

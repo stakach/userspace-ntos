@@ -46,6 +46,7 @@ nt-address-space = { path = "../../crates/nt-address-space" }
 nt-syscall-abi = { path = "../../crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "../../crates/nt-ntdll-layout" }
 nt-config-abi = { path = "../../crates/nt-config-abi" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-config-server = { path = "../../crates/nt-config-server" }
 nt-config-client = { path = "../../crates/nt-config-client" }
 nt-io-abi = { path = "../../crates/nt-io-abi" }

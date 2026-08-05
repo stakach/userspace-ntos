@@ -103,3 +103,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Validation: `cargo test -p nt-config-manager` and `cargo test -p nt-config-store`.
   Review adjustment: A3 should replace executive-local service value parsing helpers with this
   metadata boundary, then delete the duplicate parser code.
+- A3 started. Driver service `Type` decoding moved behind `nt-config-manager`'s
+  `driver_service_class_from_type`, and the executive's SYSTEM-hive driver lookup now has one
+  parameterized helper for boot/system and demand-start routes. The old demand-start duplicate
+  parser was removed. Validation: `cargo test -p nt-config-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: next A3 slice should move the actual early-boot hive import toward
+  `ConfigManager::service_metadata_list()` or an equivalent snapshot-backed live CM view so the
+  executive stops naming individual services while selecting driver candidates.
