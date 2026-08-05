@@ -3578,13 +3578,84 @@ unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {
     );
 }
 
+#[derive(Clone, Copy)]
+struct Win32kCallbackRequestContext {
+    pi: u32,
+    pid: u64,
+    tid: u64,
+    client_teb: u64,
+    supplied_eprocess: u64,
+    supplied_ethread: u64,
+    process_role: u64,
+}
+
+unsafe fn current_user_callback_request_context() -> Option<Win32kCallbackRequestContext> {
+    let sh = WIN32K_SHARED_VADDR;
+    let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let pid = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
+    let tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    if pi == 0 || pi > u32::MAX as u64 || pid == 0 || tid == 0 {
+        return None;
+    }
+    Some(Win32kCallbackRequestContext {
+        pi: pi as u32,
+        pid,
+        tid,
+        client_teb: read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64),
+        supplied_eprocess: read_volatile((sh + SH_REQ_EPROCESS) as *const u64),
+        supplied_ethread: read_volatile((sh + SH_REQ_ETHREAD) as *const u64),
+        process_role: read_volatile((sh + SH_REQ_PROCESS_ROLE) as *const u64),
+    })
+}
+
+unsafe fn restore_user_callback_request_context(
+    context: Win32kCallbackRequestContext,
+) -> bool {
+    restore_current_context_for_user_callback_resume_inner(
+        context.pi,
+        context.pid,
+        context.tid,
+        context.client_teb,
+        context.supplied_eprocess,
+        context.supplied_ethread,
+        context.process_role,
+        false,
+        false,
+    )
+}
+
 pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     pi: u32,
     pid: u64,
     tid: u64,
+    client_teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
     process_role: u64,
+) -> bool {
+    restore_current_context_for_user_callback_resume_inner(
+        pi,
+        pid,
+        tid,
+        client_teb,
+        supplied_eprocess,
+        supplied_ethread,
+        process_role,
+        true,
+        true,
+    )
+}
+
+unsafe fn restore_current_context_for_user_callback_resume_inner(
+    pi: u32,
+    pid: u64,
+    tid: u64,
+    client_teb: u64,
+    supplied_eprocess: u64,
+    supplied_ethread: u64,
+    process_role: u64,
+    publish_context: bool,
+    trace_resume: bool,
 ) -> bool {
     if pid == 0 || tid == 0 {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -3640,6 +3711,22 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
     let w32process = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
     let w32thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+    if client_teb != 0 {
+        WIN32K_THREAD_CTX_TEB[thread_index].store(client_teb, Ordering::Relaxed);
+    }
+    let Some(teb) = seed_win32k_callout_teb(thread_index) else {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: callback resume could not select TEB pi=");
+            print_u64(pi as u64);
+            print_str(b" pid=");
+            print_u64(pid);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b"\n");
+        }
+        return false;
+    };
     if eprocess == 0
         || ethread == 0
         || w32process == 0
@@ -3672,6 +3759,8 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    prepare_ethread_for_win32k_callout(thread_index, teb);
+    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
     write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
@@ -3679,7 +3768,9 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
     write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, w32thread);
     write_volatile(w32thread as *mut u64, ethread);
     sync_threadinfo_process(w32thread);
-    publish_selected_context(process_index, thread_index);
+    if publish_context {
+        publish_selected_context(process_index, thread_index);
+    }
 
     if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
         let ppi = current_w32process();
@@ -3690,25 +3781,30 @@ pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
         }
     }
 
-    let n = WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES.fetch_add(1, Ordering::Relaxed);
-    if n < 24 {
-        let refs = read_volatile((w32thread + 0x2f8) as *const u64);
-        let locks = read_volatile((w32thread + 0x344) as *const u32);
-        print_str(b"[win32k-context] callback resume selected pi=");
-        print_u64(pi as u64);
-        print_str(b" pid=");
-        print_u64(pid);
-        print_str(b" tid=");
-        print_u64(tid);
-        print_str(b" pti=0x");
-        print_hex((w32thread >> 32) as u32);
-        print_hex(w32thread as u32);
-        print_str(b" refs=0x");
-        print_hex((refs >> 32) as u32);
-        print_hex(refs as u32);
-        print_str(b" locks=");
-        print_u64(locks as u64);
-        print_str(b"\n");
+    if trace_resume {
+        let n = WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES.fetch_add(1, Ordering::Relaxed);
+        if n < 24 {
+            let refs = read_volatile((w32thread + 0x2f8) as *const u64);
+            let locks = read_volatile((w32thread + 0x344) as *const u32);
+            print_str(b"[win32k-context] callback resume selected pi=");
+            print_u64(pi as u64);
+            print_str(b" pid=");
+            print_u64(pid);
+            print_str(b" tid=");
+            print_u64(tid);
+            print_str(b" pti=0x");
+            print_hex((w32thread >> 32) as u32);
+            print_hex(w32thread as u32);
+            print_str(b" teb=0x");
+            print_hex((teb >> 32) as u32);
+            print_hex(teb as u32);
+            print_str(b" refs=0x");
+            print_hex((refs >> 32) as u32);
+            print_hex(refs as u32);
+            print_str(b" locks=");
+            print_u64(locks as u64);
+            print_str(b"\n");
+        }
     }
     true
 }
@@ -5357,6 +5453,7 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             return 0xC000_0023u32 as i32;
         }
 
+        let callback_request_context = current_user_callback_request_context();
         let frame =
             (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
         let mut header = read_volatile(core::ptr::addr_of!((*frame).header));
@@ -5428,6 +5525,7 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                         client_pi as u32,
                         process_id,
                         thread_id,
+                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64),
                         supplied_eprocess,
                         supplied_ethread,
                         process_role,
@@ -5441,6 +5539,11 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                         drv: 0,
                     });
+                    if let Some(context) = callback_request_context {
+                        if !restore_user_callback_request_context(context) {
+                            return 0xC000_000Du32 as i32;
+                        }
+                    }
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                     // The nested completion IS the next receive.
@@ -5453,8 +5556,12 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         if nt_user_callback::validate_reply(&request, &reply).is_err() {
             return 0xC000_0001u32 as i32;
         }
+        if let Some(context) = callback_request_context {
+            if !restore_user_callback_request_context(context) {
+                return 0xC000_000Du32 as i32;
+            }
+        }
 
-        let size = reply.output_length as u64;
         let buf = core::ptr::addr_of!((*frame).payload) as u64;
         if !out_buf.is_null() {
             write_volatile(out_buf, buf);

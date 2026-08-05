@@ -1546,6 +1546,27 @@ unsafe fn resume_suspended_user_callback_component(
         (sh + win32k_subsystem::SH_REQ_PROCESS_ROLE) as *mut u64,
         callback_process_role_code(client.process_role) as u64,
     );
+    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
+        client.pi,
+        client.pid,
+        client.tid,
+        client.teb,
+        client.eprocess,
+        client.ethread,
+        callback_process_role_code(client.process_role) as u64,
+    ) {
+        return crate::spawn_hosts::PumpResult {
+            status: 0xC000_000Du32 as i32,
+            result: 0xC000_000Du32 as u64,
+            completed: false,
+            callback_suspended: false,
+            wall_ip: 0,
+            wall_addr: 0,
+            wall_label: 0,
+            faults: 0,
+            demand: 0,
+        };
+    }
     let channel = crate::spawn_hosts::PumpChannel {
         fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
         pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
