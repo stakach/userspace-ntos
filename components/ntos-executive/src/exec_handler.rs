@@ -1707,12 +1707,6 @@ impl ExecNtHandler {
         Ok(alloc::string::String::from(service))
     }
 
-    fn driver_object_path_for_service(service: &str) -> alloc::string::String {
-        let mut path = alloc::string::String::from("\\Driver\\");
-        path.push_str(service);
-        path
-    }
-
     unsafe fn nt_load_driver(&mut self, service_name_ustr: u64) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -1730,24 +1724,21 @@ impl ExecNtHandler {
             Ok(service) => service,
             Err(status) => return status,
         };
-        let driver_object_path = Self::driver_object_path_for_service(&service);
-        if driver_launch::driver_id_by_name(&driver_object_path).is_some() {
-            return STATUS_IMAGE_ALREADY_LOADED;
-        }
-
-        let mut image_path = [0u8; 180];
-        let Some((image_len, class)) = system_hive_driver_launch_spec(
+        let Some(spec) = system_hive_driver_service_launch_spec(
             &service,
-            &mut image_path,
             nt_config_manager::SERVICE_DEMAND_START,
         ) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
+        if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() {
+            return STATUS_IMAGE_ALREADY_LOADED;
+        }
+
         let Some(fs) = exec_fs() else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let Some(_dc) =
-            driver_launch::load_driver(&fs, &image_path[..image_len], class, &driver_object_path)
+            driver_launch::load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
         else {
             return STATUS_UNSUCCESSFUL;
         };
@@ -1768,7 +1759,7 @@ impl ExecNtHandler {
             Ok(service) => service,
             Err(status) => return status,
         };
-        let driver_object_path = Self::driver_object_path_for_service(&service);
+        let driver_object_path = driver_object_path_from_service_name(&service);
         match driver_launch::unload_driver_by_name(&driver_object_path) {
             Ok(()) => 0,
             Err(status) => status.raw() as u32,

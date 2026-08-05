@@ -11390,10 +11390,11 @@ struct ConfigHiveDriverLaunchSpec {
     class: driver_launch::DriverClass,
 }
 
-struct SystemHiveDriverLaunchSpec {
-    service_name: alloc::string::String,
-    image_path: alloc::vec::Vec<u8>,
-    class: driver_launch::DriverClass,
+pub(crate) struct DriverServiceLaunchSpec {
+    pub(crate) service_name: alloc::string::String,
+    pub(crate) driver_object_path: alloc::string::String,
+    pub(crate) image_path: alloc::vec::Vec<u8>,
+    pub(crate) class: driver_launch::DriverClass,
 }
 
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
@@ -11423,15 +11424,24 @@ fn current_driver_host_can_boot_launch(service: &nt_config_manager::ServiceMetad
             .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP))
 }
 
+pub(crate) fn driver_object_path_from_service_name(service_name: &str) -> alloc::string::String {
+    let mut path = alloc::string::String::from("\\Driver\\");
+    path.push_str(service_name);
+    path
+}
+
 fn owned_driver_launch_spec_from_service_metadata(
     service: nt_config_manager::ServiceMetadata,
     max_start: u32,
-) -> Option<SystemHiveDriverLaunchSpec> {
+) -> Option<DriverServiceLaunchSpec> {
     let mut image_path = [0u8; 180];
     let (image_path_len, class) =
         driver_launch_spec_from_service_metadata(&service, &mut image_path, max_start)?;
-    Some(SystemHiveDriverLaunchSpec {
-        service_name: service.name,
+    let service_name = service.name;
+    let driver_object_path = driver_object_path_from_service_name(&service_name);
+    Some(DriverServiceLaunchSpec {
+        service_name,
+        driver_object_path,
         image_path: alloc::vec::Vec::from(&image_path[..image_path_len]),
         class,
     })
@@ -11482,7 +11492,7 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     Some(cm)
 }
 
-fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<SystemHiveDriverLaunchSpec> {
+fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<DriverServiceLaunchSpec> {
     let Some(cm) = system_hive_config_manager() else {
         return alloc::vec::Vec::new();
     };
@@ -11495,14 +11505,13 @@ fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<SystemHiveDriverLau
         .collect()
 }
 
-fn system_hive_driver_launch_spec(
+pub(crate) fn system_hive_driver_service_launch_spec(
     service_name: &str,
-    out_path: &mut [u8],
     max_start: u32,
-) -> Option<(usize, driver_launch::DriverClass)> {
+) -> Option<DriverServiceLaunchSpec> {
     let cm = system_hive_config_manager()?;
     let service = cm.service_metadata(service_name)?;
-    driver_launch_spec_from_service_metadata(&service, out_path, max_start)
+    owned_driver_launch_spec_from_service_metadata(service, max_start)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {
@@ -18836,9 +18845,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Some(fs) = exec_fs() {
         let mut named_pipe_provider = None;
         for spec in system_hive_boot_driver_launch_specs() {
-            let mut driver_object_path = alloc::string::String::from("\\Driver\\");
-            driver_object_path.push_str(&spec.service_name);
-            if driver_launch::driver_id_by_name(&driver_object_path).is_some() {
+            if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
                 print_str(spec.service_name.as_bytes());
                 print_str(b"\n");
@@ -18849,11 +18856,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b" path=");
             print_str(&spec.image_path);
             print_str(b"\n");
-            if let Some(dc) = load_driver(&fs, &spec.image_path, spec.class, &driver_object_path) {
+            if let Some(dc) =
+                load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
+            {
                 let device_path =
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
                 if device_path.as_deref() == Some("\\Device\\NamedPipe") {
-                    named_pipe_provider = Some((dc, driver_object_path));
+                    named_pipe_provider = Some((dc, spec.driver_object_path));
                     break;
                 }
                 print_str(b"[driver-launch] service ");

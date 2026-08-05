@@ -47,7 +47,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### B. Driver Stack Bring-Up From Service Metadata
 
-- `[ ]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
+- `[~]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
   launch on one service-key to driver-object path.
 - `[x]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
@@ -157,3 +157,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: B3/B4 now own expanding the same ordered plan to boot bus, device, filter, and
   PnP-bound drivers instead of filtering to the FSD load group.
+- B1 started. Boot FSD launch and `NtLoadDriver` now consume the same `DriverServiceLaunchSpec`
+  shape: registry service name, derived `\Driver\<Service>` object path, normalized image path, and
+  driver class. `NtLoadDriver` no longer keeps a separate image-path/class tuple parser or local
+  driver-object path builder. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: finish B1 by routing SCM driver start/stop onto the same spec and making unload
+  policy share service metadata rather than only the derived object path.
