@@ -81,6 +81,19 @@ pub enum HostedProcessRole {
     InteractiveShell,
 }
 
+impl HostedProcessRole {
+    pub fn uses_win32_client_gdi(self) -> bool {
+        matches!(
+            self,
+            Self::Win32Subsystem
+                | Self::InteractiveLogon
+                | Self::NonInteractiveService
+                | Self::InteractiveShellBootstrap
+                | Self::InteractiveShell
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnTarget {
     pub pi: usize,
@@ -1499,6 +1512,16 @@ mod tests {
         assert!(!catalog.path_is_noninteractive_service(b"winlogon.exe"));
         assert!(!catalog.path_is_noninteractive_service(b"explorer.exe"));
         assert!(!catalog.path_is_noninteractive_service(b"service-helper.exe"));
+    }
+
+    #[test]
+    fn hosted_roles_advertise_win32_client_gdi_capability() {
+        assert!(!HostedProcessRole::NativeSession.uses_win32_client_gdi());
+        assert!(HostedProcessRole::Win32Subsystem.uses_win32_client_gdi());
+        assert!(HostedProcessRole::InteractiveLogon.uses_win32_client_gdi());
+        assert!(HostedProcessRole::NonInteractiveService.uses_win32_client_gdi());
+        assert!(HostedProcessRole::InteractiveShellBootstrap.uses_win32_client_gdi());
+        assert!(HostedProcessRole::InteractiveShell.uses_win32_client_gdi());
     }
 
     #[test]

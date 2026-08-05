@@ -1339,6 +1339,45 @@ pub unsafe extern "C" fn LdrpInitialize(
         let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
         // SAFETY: on-target, marker is a mapped stack buffer.
         unsafe { dbg_print_bytes(marker.as_ptr(), marker.len()) };
+        {
+            let ldr = if peb != 0 {
+                unsafe { core::ptr::read_unaligned((peb + 0x18) as *const u64) }
+            } else {
+                0
+            };
+            let params = if peb != 0 {
+                unsafe { core::ptr::read_unaligned((peb + 0x20) as *const u64) }
+            } else {
+                0
+            };
+            let mut buf = [0u8; 96];
+            let mut n = 0usize;
+            let put = |buf: &mut [u8; 96], n: &mut usize, b: &[u8]| {
+                for &c in b {
+                    if *n < buf.len() {
+                        buf[*n] = c;
+                        *n += 1;
+                    }
+                }
+            };
+            let put_hex = |buf: &mut [u8; 96], n: &mut usize, v: u64| {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for i in (0..16).rev() {
+                    if *n < buf.len() {
+                        let nib = ((v >> (i * 4)) & 0xf) as usize;
+                        buf[*n] = HEX[nib];
+                        *n += 1;
+                    }
+                }
+            };
+            put(&mut buf, &mut n, b"nt-ntdll: ldrp peb=0x");
+            put_hex(&mut buf, &mut n, peb);
+            put(&mut buf, &mut n, b" ldr=0x");
+            put_hex(&mut buf, &mut n, ldr);
+            put(&mut buf, &mut n, b" params=0x");
+            put_hex(&mut buf, &mut n, params);
+            unsafe { dbg_print_bytes(buf.as_ptr(), n) };
+        }
 
         let ntdll = ntdll_base as u64;
         let smss = smss_base as u64;

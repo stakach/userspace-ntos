@@ -1,6 +1,6 @@
 # Kernel Dynamic Tech Debt Plan
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 ## Objective
 
@@ -80,6 +80,19 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` F3: Replace modal-pump synthetic `PeekMessage`/`GetMessage(WM_PAINT)` scaffolding with
   queue state produced by real window invalidation and dispatch.
 - `[x]` F4: Add framebuffer proof for the credential dialog after the real paint path is wired.
+
+### G. Explorer Shell Chrome Pixels
+
+- `[x]` G1: Keep generic sections, hosted-worker lifetime, and thread mechanism resources dynamic
+  enough for genuine `userinit.exe` and `explorer.exe` launch without section or win32k pool
+  exhaustion.
+- `[~]` G2: Trace explorer shell-window paint from USER invalidation through real WndProc, GDI batch
+  execution, surface dirtying, and framebuffer presentation until non-background shell chrome pixels
+  are proven.
+- `[ ]` G3: Replace any remaining shell-paint instrumentation or modeled presentation helpers with
+  real window/surface ownership.
+- `[ ]` G4: Add a stable framebuffer proof for explorer shell chrome, distinct from desktop
+  background and cursor artifacts.
 
 ## Review Log
 
@@ -1795,3 +1808,113 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   (`311` non-background pixels, same as r41). Review adjustment: E3 is the remaining real shell
   chrome pixel work; inspect dirty-window accounting, window-surface flush, and any USER/GDI geometry
   copyback gaps instead of adding framebuffer scaffolding.
+- E3 started. `KeGdiFlushUserBatch` no longer clears `GdiTebBatch` records in the executive without
+  executing them. The syscall-entry path now passes the dynamic `Win32kClientContext` into a private
+  win32k callout selector, and the component invokes the real
+  `WIN32_CALLOUTS_FPNS.BatchFlushRoutine` that ReactOS registered through
+  `PsEstablishWin32Callouts`. The bridge opens a narrow writable mapping for the caller's
+  `TEB.GdiBatchCount` while `NtGdiFlushUserBatch` runs, then restores the normal read-only TEB-tail
+  policy. Validation so far: `rustfmt --edition 2021 --config skip_children=true` over the touched
+  Rust files and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: finish E3 by building/booting and comparing the
+  screenshot for new explorer chrome pixels; if framebuffer remains background-only, inspect
+  dirty-window accounting and geometry copyback with batch replay no longer masking GDI draws.
+- E3 continued. Graphical run `desktop-render-r44-gdibatch-remap-20260805-134117` proved the first
+  TEB-tail fault was gone and reached real winlogon/userinit progress, but the batch callout still
+  failed because the win32k client attach remap tried to map over a live leaf after an unchecked
+  fire-and-forget unmap. The attach table now tracks page rights, and TEB-tail COW, explicit
+  `NtGdiFlushUserBatch` remaps, ordinary client attach maps, and detach cleanup use checked
+  map/unmap calls so stale attach records fail visibly instead of masquerading as insufficient
+  resources. Validation so far: `rustfmt --edition 2021 --config skip_children=true` over the
+  touched Rust files and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none` passed. Review adjustment: rerun the single graphics boot and close this
+  slice only if the real batch flush completes with zero failures.
+- E3 continued. Graphical run `desktop-render-r45-gdibatch-checked-20260805-135300` showed the
+  remaining `NtGdiFlushUserBatch` remap failure was `seL4_FailedLookup`, not `DeleteFirst`: the
+  sparse win32k pager had marked paging levels as present after fire-and-forget structure maps whose
+  failures were invisible, then later leaf maps skipped the missing PT rebuild. The win32k sparse
+  pager now uses checked retype/map calls and records a level only after success or a genuine
+  already-present (`DeleteFirst`) response; win32k private/zero-fill demand maps are checked too, so
+  missing paging infrastructure cannot be hidden behind an anonymous page. Review adjustment: rerun
+  the single graphics boot and require zero GDI batch callout failures before moving back to dirty
+  region/window-surface diagnostics.
+- E3 continued. Graphical run `desktop-render-r46-gdibatch-paging-20260805-140643` reached genuine
+  `userinit` launch of `explorer.exe`, explorer CSR connect, win32k process/thread callouts, and
+  system-font load, but repeated `NtGdiFlushUserBatch` callouts still failed while remapping the
+  caller TEB tail because the leaf `Page_Map` saw `seL4_FailedLookup` after the sparse pager believed
+  the covering hierarchy existed. The attach mapper now performs checked cap-copy plus checked leaf
+  map through one helper for normal client attach, GDI batch remap, and TEB-tail COW; on a real
+  `FailedLookup` it invalidates the cached PDPT/PD/PT keys for that page, rebuilds the hierarchy,
+  and retries once with diagnostics instead of returning a synthetic success. Review adjustment:
+  rerun the single graphics boot and require the repair to eliminate `BatchFlushRoutine failed`
+  before using the run for shell-chrome framebuffer analysis.
+- E3 continued. Graphical run `desktop-render-r47-gdibatch-repair-20260805-142127` reached the
+  desktop framebuffer, started real services and LSASS, and exercised LSASS `NtUserProcessConnect`
+  through the win32k process/thread callout path without the old batch-remap `FailedLookup`
+  signatures. It exposed a stale shared-context publication instead: while LSASS was suspended in an
+  api7 callback, a services win32k dispatch later consumed LSASS' published PID/TID as if it were
+  services' result. Win32k context publication is now a one-shot handoff: dispatch entry clears it,
+  dispatch completion takes and clears it, and `NtCallbackReturn` completion imports the callback
+  owner's publication before waking deferred callers. Review adjustment: rebuild and run r48; require
+  no `published PID mismatch`/stale-context diagnostics before treating LSASS/service overlap as
+  clean and moving back to explorer shell chrome pixels.
+- E3 continued. Graphical run `desktop-render-r48-context-take-20260805-143218` advanced past the
+  previous LSASS/services overlap to genuine `userinit.exe` launch of `explorer.exe`; explorer opened
+  its real image, entered `NtUserProcessConnect`, completed the api7 client callback, and seeded its
+  private system font. The run also proved that clearing the shared slot only after the executive
+  wrapper returns is too late: a win32k dispatch can publish process context, suspend in
+  `KeUserModeCallback`, and allow another client dispatch before the wrapper has consumed that
+  publication. The handoff now captures and clears the publication at the callback-suspension
+  boundary, keyed by dynamic client identity, and the executive imports that captured context before
+  falling back to the shared slot. Review adjustment: rebuild and run r49; require zero
+  `stale published` diagnostics. The remaining visible pager issue is the real
+  `seL4_InvalidCapability` while retyping the win32k mirror PT for winlogon's
+  `0x10000511000` user page during profile loading; keep it visible rather than treating it as an
+  already-present mapping.
+- E3 continued. Graphical run `desktop-render-r49-suspended-context-20260805-144652` proved the
+  first suspension-time capture point was not sufficient: LSASS still published pid 8 during
+  `NtUserProcessConnect`, suspended in api7, and services later saw that stale publication while
+  expected pid 7. The handoff is now also captured at the glue-level component-pump return whenever
+  `win32k_dispatch_wide_with_completion_args` observes `callback_suspended`, which is the last common
+  point before any caller-path wrapper, redirect, or deferred resume can let another client dispatch.
+  Review adjustment: rerun as r50 and require the LSASS/services overlap to complete with zero
+  `stale published` diagnostics before committing this slice.
+- E3 continued. Graphical run `desktop-render-r51-owned-context-20260805-150608` proved the
+  publication handoff is now owned by the suspended client instead of a shared stale slot: no
+  `stale published`, `identity mismatch`, or suspended-publication mismatch diagnostics appeared
+  while winlogon, services, LSASS, userinit, and explorer all reached real `NtUserProcessConnect`.
+  Explorer genuinely spawned, completed api7, redirected api0 callbacks, installed client WndProcs,
+  and opened the shell COM classes. The remaining shell-chrome blocker is lower level:
+  `NtGdiFlushUserBatch` still failed every callout because the narrow writable remap could not copy
+  the caller TEB-tail frame cap (`seL4_FailedLookup` on winlogon's worker TEB), so
+  `tail-write-windows` stayed zero; the run also kept the visible VM pool-headroom and
+  `0x10000511000` win32k sparse-pager diagnostics. Review adjustment: keep the dynamic context
+  ownership fix, repair durable GUI-client TEB frame ownership for the real batch callout, then rerun
+  a single graphics boot and require zero GDI batch failures before returning to framebuffer chrome
+  analysis.
+- E3/F continued. Graphical run `desktop-render-r76-user-stack-vad-reclaim-20260805-190233`
+  reached real explorer shell traffic but exhausted hosted-thread CNode objects while short-lived
+  worker threads were churned. Hosted thread spawn now returns structured mechanism caps, runtime
+  records own those private CNodes, and thread termination deletes/recycles them alongside TCB,
+  user-stack VAD, and worker-window resources. The follow-up run
+  `desktop-render-r77-thread-cnode-reclaim-20260805-191418` exposed an earlier cleanup regression:
+  win32k's component image had been punched with hosted-client env holes at `0x1000051..55`, but
+  those pages contain real rootserver text (`win32k_ob::ObHandleTable` among others). The hole
+  machinery is now removed, hosted SEC_IMAGE TEB/params/PEB/desktop/trampoline pages live in a
+  dedicated env band at `HOSTED_CLIENT_ENV_BASE = 0x10001600000`, and hosted process/selftest VSpaces
+  reserve that PT explicitly. Review adjustment: rebuild and run the single graphics boot again;
+  require win32k DriverEntry to return and the `0x10FA` dispatch-loop proof to pass before measuring
+  whether CNode reclamation carries explorer past the r76 worker churn frontier.
+- G1 complete. Graphical run `desktop-render-r83-typed-generic-sections-20260805-202526` reached
+  genuine `userinit.exe` and `explorer.exe` launch with explorer win32k traffic, real api0 callback
+  redirects, client WndProc installation, shell COM class opens, and `win32k-pool-exhaustions=0`.
+  Generic non-image sections now back anonymous/disk/overlay sections through real
+  `HandleObject::Section` handles, so duplicated section handles (`0x1168`, `0x116c` in the run)
+  map/fault through the same section object instead of falling into `NtMapViewOfSection unsupported`.
+  Validation: `rustfmt`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `cd rust-micro && ./scripts/build_kernel.sh extern-rootserver`, and the single graphical boot all
+  completed to the microtest sentinel. Review adjustment: G2 starts at real shell chrome pixels. The
+  framebuffer proof still reports only desktop background (`non-bg 0`), and the remaining known
+  failing gates are DBGK callback selftests, user-callback drain/dead-client harness checks,
+  nested win32k transport drain, and VM pool headroom.

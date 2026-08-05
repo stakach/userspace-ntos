@@ -148,7 +148,7 @@ unsafe fn csr_api_worker_create_thread(
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
         let tid_id = tid as nt_process::ThreadId;
-        let handle = match nt_handler.pm.insert_handle(
+        let handle = match nt_handler.insert_process_handle(
             caller_pid,
             nt_process::HandleObject::Thread(tid_id),
             desired_access,
@@ -180,7 +180,7 @@ unsafe fn csr_api_worker_create_thread(
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let badged_fault_ep = mint_badged(main_fault_ep, tp_worker_badge(target_pi, worker_slot));
-        let tcb = spawn_slot_thread(&RemoteThreadSpawn {
+        let spawned = spawn_slot_thread(&RemoteThreadSpawn {
             target_pi,
             slot: worker_slot,
             pml4: target_pml4,
@@ -192,8 +192,8 @@ unsafe fn csr_api_worker_create_thread(
             native: true,
             resume: !create_suspended,
         });
-        if tcb == 0 {
-            let _ = nt_handler.release_hosted_thread_runtime(tid);
+        if spawned.tcb() == 0 {
+            nt_handler.release_unmapped_hosted_tp_worker_slot(target_pi, worker_slot, tid);
             let _ = nt_handler.close_process_handle(caller_pid, handle);
             let _ = nt_handler
                 .pm
@@ -209,14 +209,13 @@ unsafe fn csr_api_worker_create_thread(
         let _ = nt_handler
             .pm
             .set_thread_create_time(tid_id, nt_system_time_100ns() as i64);
-        nt_handler.register_hosted_thread_tcb(
+        nt_handler.register_hosted_thread_spawn(
             target_pi,
             tid,
-            tcb,
+            spawned,
             tp_worker_badge(target_pi, worker_slot),
             HostedThreadRole::TpWorker { slot: worker_slot },
         );
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         if target_pi == 1 {
             PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -242,7 +241,7 @@ unsafe fn csr_api_worker_create_thread(
         print_str(b" tid=");
         print_u64(tid);
         print_str(b" tcb=0x");
-        print_hex(tcb as u32);
+        print_hex(spawned.tcb() as u32);
         print_str(b" entry=0x");
         print_hex((start.rip >> 32) as u32);
         print_hex(start.rip as u32);
@@ -268,7 +267,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(
     port_handle: u64,
     cid_proc: u64,
     cid_thread: u64,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
     // thread must too. The hosted-syscalls flag is hybrid now: OUR ntdll's `Call(CT_FAULT,
     // label=0x4E54)` still arrives natively with MR0=SSN, while raw Windows syscall stubs fault as NT
@@ -417,7 +416,7 @@ unsafe fn sm_open_process_call(
         match nt_handler.open_process_captured(object_attributes, client_id, desired_access) {
             Ok((owner, handle)) => {
                 if sm_stack_copyout(process_handle, &(handle as u64).to_le_bytes()) {
-                    nt_handler.account_published_pm_handle(owner);
+                    let _ = owner;
                     0
                 } else {
                     let _ = nt_handler.pm.take_handle(owner, handle);
@@ -465,7 +464,7 @@ unsafe fn sm_open_thread_call(
     {
         Ok((owner, handle)) => {
             if sm_stack_copyout(thread_handle, &(handle as u64).to_le_bytes()) {
-                nt_handler.account_published_pm_handle(owner);
+                let _ = owner;
                 0
             } else {
                 let _ = nt_handler.pm.take_handle(owner, handle);
@@ -1347,7 +1346,6 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                                 ) {
                                     Ok(handle) => {
                                         sm_stack_write(target_out, handle as u64);
-                                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                                         0
                                     }
                                     Err(status) => status as u64,
@@ -1902,12 +1900,6 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                                                 target_out,
                                                 &(handle as u64).to_le_bytes(),
                                             );
-                                            let count =
-                                                nt_handler.pm.handle_count(target_pid) as u64;
-                                            if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-                                                PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-                                            }
-                                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                                             0
                                         }
                                         Ok(handle) => {
@@ -2056,7 +2048,7 @@ pub(crate) unsafe fn spawn_csr_loop_thread(
     param: u64,
     pid: u64,
     tid: u64,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     spawn_hosted_thread(&HostedThread {
         pml4: csrss_pml4,
         client_pi: 1,
@@ -2092,7 +2084,7 @@ pub(crate) unsafe fn spawn_csr_sb_loop_thread(
     param: u64,
     pid: u64,
     tid: u64,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     spawn_hosted_thread(&HostedThread {
         pml4: csrss_pml4,
         client_pi: 1,
@@ -2238,7 +2230,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let (scr, teb_va, stack_base, stack_frames, ipcbuf_va, tramp_va, stack_mirror_va, badge) =
         match slot {
             0 => (
@@ -2271,7 +2263,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
                 WINLOGON_WORKER3_STACK_MIRROR_VA,
                 WINLOGON_WORKER3_BADGE,
             ),
-            _ => return 0,
+            _ => return HostedThreadSpawnResult::failed(),
         };
     let worker_ep = mint_badged(main_fault_ep, badge);
     spawn_hosted_thread(&HostedThread {
@@ -2325,12 +2317,12 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     if pi >= MAX_PI || worker_slot >= TP_WORKER_SLOT_COUNT {
-        return 0;
+        return HostedThreadSpawnResult::failed();
     }
     if img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed) == 0 {
-        return 0;
+        return HostedThreadSpawnResult::failed();
     }
     let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi, worker_slot));
     spawn_slot_thread(&RemoteThreadSpawn {
@@ -2390,7 +2382,7 @@ pub(crate) struct RemoteThreadSpawn {
 /// enters the start routine directly, for a target with no ntdll mapped. `fault_ep` is the endpoint
 /// the thread's faults and syscalls are delivered to (the badged main service EP for a live
 /// process; a private endpoint when the caller services the thread itself).
-pub(crate) unsafe fn spawn_slot_thread(spawn: &RemoteThreadSpawn) -> u64 {
+pub(crate) unsafe fn spawn_slot_thread(spawn: &RemoteThreadSpawn) -> HostedThreadSpawnResult {
     let RemoteThreadSpawn {
         target_pi,
         slot,
@@ -2404,12 +2396,12 @@ pub(crate) unsafe fn spawn_slot_thread(spawn: &RemoteThreadSpawn) -> u64 {
         resume,
     } = *spawn;
     if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || fault_ep == 0 {
-        return 0;
+        return HostedThreadSpawnResult::failed();
     }
     let loader_context = if use_loader {
         let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
         if loader_rva == 0 {
-            return 0;
+            return HostedThreadSpawnResult::failed();
         }
         // The caller-supplied stack allocation is not mapped into this userspace kernel, so
         // normalize both INITIAL_TEB and CONTEXT.Rsp to the fixed 16-page slot stack before entering
@@ -2468,7 +2460,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
@@ -2519,7 +2511,7 @@ pub(crate) unsafe fn spawn_scm_worker_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let worker_ep = mint_badged(main_fault_ep, SCM_WORKER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
@@ -2566,7 +2558,7 @@ pub(crate) unsafe fn spawn_lsa_worker_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let worker_ep = mint_badged(main_fault_ep, LSA_WORKER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
@@ -2613,7 +2605,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
@@ -2657,7 +2649,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
@@ -2694,7 +2686,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
-) -> u64 {
+) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,

@@ -183,6 +183,158 @@ pub(crate) struct Win32kPublishedContext {
     pub w32thread: u64,
 }
 
+impl Win32kPublishedContext {
+    const EMPTY: Self = Self {
+        pid: 0,
+        tid: 0,
+        eprocess: 0,
+        ethread: 0,
+        w32process: 0,
+        w32thread: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct SuspendedPublishedContext {
+    valid: u64,
+    pi: u32,
+    pid: u64,
+    tid: u64,
+    published: Win32kPublishedContext,
+}
+
+impl SuspendedPublishedContext {
+    const EMPTY: Self = Self {
+        valid: 0,
+        pi: 0,
+        pid: 0,
+        tid: 0,
+        published: Win32kPublishedContext::EMPTY,
+    };
+}
+
+const SUSPENDED_PUBLISHED_CONTEXT_CAP: usize = 16;
+static mut SUSPENDED_PUBLISHED_CONTEXTS: [SuspendedPublishedContext;
+    SUSPENDED_PUBLISHED_CONTEXT_CAP] =
+    [SuspendedPublishedContext::EMPTY; SUSPENDED_PUBLISHED_CONTEXT_CAP];
+static USER_CALLBACK_SUSPENDED_CONTEXT_CAPTURES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_SUSPENDED_CONTEXT_DROPS: AtomicU64 = AtomicU64::new(0);
+
+fn published_context_has_data(context: Win32kPublishedContext) -> bool {
+    context.pid != 0
+        || context.tid != 0
+        || context.eprocess != 0
+        || context.ethread != 0
+        || context.w32process != 0
+        || context.w32thread != 0
+}
+
+fn published_context_matches_client(
+    context: Win32kPublishedContext,
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> bool {
+    published_context_matches_ids(context, client.pid, client.tid)
+}
+
+fn published_context_matches_ids(
+    context: Win32kPublishedContext,
+    expected_pid: u64,
+    expected_tid: u64,
+) -> bool {
+    (expected_pid == 0 && expected_tid == 0)
+        || (expected_pid != 0 && context.pid != 0 && context.pid == expected_pid)
+        || (expected_tid != 0 && context.tid != 0 && context.tid == expected_tid)
+}
+
+unsafe fn capture_suspended_published_win32k_context(
+    client: crate::spawn_hosts::UserCallbackClient,
+) {
+    let published = published_win32k_context();
+    if !published_context_has_data(published) {
+        return;
+    }
+    if !published_context_matches_client(published, client) {
+        let n = USER_CALLBACK_SUSPENDED_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            print_str(b"[win32k-context] suspended publication mismatch client-pid=");
+            print_u64(client.pid);
+            print_str(b" actual-pid=");
+            print_u64(published.pid);
+            print_str(b" client-tid=");
+            print_u64(client.tid);
+            print_str(b" actual-tid=");
+            print_u64(published.tid);
+            print_str(b" -> retained for owner\n");
+        }
+        return;
+    }
+    clear_published_win32k_context();
+
+    let slots =
+        core::ptr::addr_of_mut!(SUSPENDED_PUBLISHED_CONTEXTS) as *mut SuspendedPublishedContext;
+    let mut free = SUSPENDED_PUBLISHED_CONTEXT_CAP;
+    let mut i = 0usize;
+    while i < SUSPENDED_PUBLISHED_CONTEXT_CAP {
+        let slot = core::ptr::read(slots.add(i));
+        if slot.valid == 0 {
+            if free == SUSPENDED_PUBLISHED_CONTEXT_CAP {
+                free = i;
+            }
+        } else if slot.pi == client.pi
+            && slot.pid == client.pid
+            && (slot.tid == client.tid || slot.tid == 0 || client.tid == 0)
+        {
+            free = i;
+            break;
+        }
+        i += 1;
+    }
+
+    let target = if free < SUSPENDED_PUBLISHED_CONTEXT_CAP {
+        free
+    } else {
+        let n = USER_CALLBACK_SUSPENDED_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            print_str(b"[win32k-context] suspended publication table full -> oldest slot reused\n");
+        }
+        0
+    };
+    core::ptr::write(
+        slots.add(target),
+        SuspendedPublishedContext {
+            valid: 1,
+            pi: client.pi,
+            pid: client.pid,
+            tid: client.tid,
+            published,
+        },
+    );
+    USER_CALLBACK_SUSPENDED_CONTEXT_CAPTURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) unsafe fn take_suspended_published_win32k_context(
+    pi: u32,
+    pid: u64,
+    tid: u64,
+) -> Option<Win32kPublishedContext> {
+    let slots =
+        core::ptr::addr_of_mut!(SUSPENDED_PUBLISHED_CONTEXTS) as *mut SuspendedPublishedContext;
+    let mut i = 0usize;
+    while i < SUSPENDED_PUBLISHED_CONTEXT_CAP {
+        let slot = core::ptr::read(slots.add(i));
+        if slot.valid != 0
+            && slot.pi == pi
+            && (pid == 0 || slot.pid == pid || slot.published.pid == pid)
+            && (tid == 0 || slot.tid == tid || slot.published.tid == 0 || slot.published.tid == tid)
+        {
+            core::ptr::write(slots.add(i), SuspendedPublishedContext::EMPTY);
+            return Some(slot.published);
+        }
+        i += 1;
+    }
+    None
+}
+
 pub(crate) unsafe fn published_win32k_context() -> Win32kPublishedContext {
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     Win32kPublishedContext {
@@ -197,6 +349,35 @@ pub(crate) unsafe fn published_win32k_context() -> Win32kPublishedContext {
             (sh + win32k_subsystem::SH_CTX_W32THREAD) as *const u64,
         ),
     }
+}
+
+pub(crate) unsafe fn clear_published_win32k_context() {
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    for offset in [
+        win32k_subsystem::SH_CTX_PROCESS_ID,
+        win32k_subsystem::SH_CTX_THREAD_ID,
+        win32k_subsystem::SH_CTX_EPROCESS,
+        win32k_subsystem::SH_CTX_ETHREAD,
+        win32k_subsystem::SH_CTX_W32PROCESS,
+        win32k_subsystem::SH_CTX_W32THREAD,
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, 0);
+    }
+}
+
+pub(crate) unsafe fn take_matching_published_win32k_context(
+    expected_pid: u64,
+    expected_tid: u64,
+) -> Option<Win32kPublishedContext> {
+    let context = published_win32k_context();
+    if !published_context_has_data(context) {
+        return None;
+    }
+    if !published_context_matches_ids(context, expected_pid, expected_tid) {
+        return None;
+    }
+    clear_published_win32k_context();
+    Some(context)
 }
 
 const CALLBACK_ROLE_NONE: u32 = 0;
@@ -1282,6 +1463,7 @@ pub(crate) unsafe fn service_user_callback(
     }
 
     if suspend_component {
+        capture_suspended_published_win32k_context(client);
         print_str(b"[user-callback] B component continuation parked in callback receive loop\n");
         Some(UserCallbackDisposition::SuspendComponent)
     } else {
@@ -3056,12 +3238,15 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
 
 // --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---
 // win32k-side paging structures provisioned for the shared client window, and pages already mapped,
-// keyed by a level-tagged aligned index (SYS_SEND paging_struct_map is fire-and-forget so we can't
-// detect "already mapped" — track it). Client VAs are all < 0x100_0000_0000 (PML4 slots 0/1), never
-// win32k's own PML4[2] (>= 0x100_..), so building a fresh PDPT/PD/PT hierarchy here can't collide
-// with win32k's own mappings.
+// keyed by a level-tagged aligned index. Hosted client VAs can overlap win32k's high PML4 slot, so
+// the sparse pager treats `DeleteFirst` while mapping a paging structure as "that level already
+// exists" and only records levels whose map was observed to succeed or already be present.
 pub(crate) static mut W32_CLIENT_SEEN: [u64; 8192] = [0; 8192];
 pub(crate) static mut W32_CLIENT_SEEN_N: usize = 0;
+const SEL4_FAILED_LOOKUP: u64 = 6;
+const SEL4_DELETE_FIRST: u64 = 8;
+static W32_PAGING_REPAIR_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static W32_PAGING_REPAIR_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) unsafe fn w32_seen(key: u64) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
     let a = core::ptr::addr_of!(W32_CLIENT_SEEN) as *const u64;
@@ -3082,35 +3267,315 @@ pub(crate) unsafe fn w32_mark(key: u64) {
         core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n + 1);
     }
 }
+
+unsafe fn w32_forget(key: u64) -> bool {
+    let mut n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
+    let entries = core::ptr::addr_of_mut!(W32_CLIENT_SEEN) as *mut u64;
+    let mut i = 0usize;
+    let mut removed = false;
+    while i < n {
+        if core::ptr::read(entries.add(i)) == key {
+            let last = n - 1;
+            if i != last {
+                core::ptr::write(entries.add(i), core::ptr::read(entries.add(last)));
+            }
+            core::ptr::write(entries.add(last), 0);
+            n = last;
+            core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n);
+            removed = true;
+        } else {
+            i += 1;
+        }
+    }
+    removed
+}
+
+unsafe fn w32_client_paging_keys(page: u64) -> (u64, u64, u64) {
+    (
+        (1u64 << 60) | (page >> 39),
+        (2u64 << 60) | (page >> 30),
+        (3u64 << 60) | (page >> 21),
+    )
+}
+
+unsafe fn w32_forget_client_paging(page: u64) {
+    let (pdpt, pd, pt) = w32_client_paging_keys(page);
+    let removed = (w32_forget(pt) as u64) + (w32_forget(pd) as u64) + (w32_forget(pdpt) as u64);
+    if W32_PAGING_REPAIR_ATTEMPTS.fetch_add(1, Ordering::Relaxed) < 16 {
+        print_str(b"[w32paging] stale hierarchy suspected page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" forgot=");
+        print_u64(removed);
+        print_str(b"\n");
+    }
+}
+
+unsafe fn ensure_w32_paging_level(
+    key: u64,
+    object_type: u64,
+    map_label: u64,
+    page: u64,
+    w_pml4: u64,
+    level: &[u8],
+) -> bool {
+    if w32_seen(key) {
+        return true;
+    }
+    let slot = alloc_slot();
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
+    if retype != 0 {
+        print_str(b"[w32paging] retype ");
+        print_str(level);
+        print_str(b" failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" error=");
+        print_u64(retype);
+        print_str(b"\n");
+        let _ = cnode_delete_recycle_r(slot);
+        return false;
+    }
+    let map = paging_struct_map_r(slot, map_label, page, w_pml4);
+    if map == 0 {
+        w32_mark(key);
+        return true;
+    }
+    let _ = cnode_delete_recycle_r(slot);
+    if map == SEL4_DELETE_FIRST {
+        w32_mark(key);
+        return true;
+    }
+    print_str(b"[w32paging] map ");
+    print_str(level);
+    print_str(b" failed page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" error=");
+    print_u64(map);
+    print_str(b"\n");
+    false
+}
 /// Ensure win32k's VSpace has a PDPT/PD/PT chain covering `page` (each created once, tracked in
 /// W32_CLIENT_SEEN). Used both for FOREIGN client pages (PML4[0/1], fresh hierarchy) AND for
 /// win32k-OWN demand-mapped regions (the demand-mapped pool at 0x0A00, whose 2 MiB PTs don't exist
-/// yet). Deterministic because `page_map`/`paging_struct_map` are SYS_SEND (fire-and-forget) and
-/// can't report a missing-PT error to drive a retry — so the PT must be created up front. For
-/// win32k-own PML4[2] pages the PDPT/PD already exist; the duplicate retype+map fails silently
-/// (seL4 won't replace an occupied slot) and only the fresh PT actually takes.
-pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) {
-    let k_pdpt = (1u64 << 60) | (page >> 39);
-    if !w32_seen(k_pdpt) {
-        let s = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, s);
-        let _ = paging_struct_map(s, LBL_X86_PDPT_MAP, page, w_pml4);
-        w32_mark(k_pdpt);
+/// yet). Returns false when a required paging-structure map really failed.
+pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) -> bool {
+    let (k_pdpt, k_pd, k_pt) = w32_client_paging_keys(page);
+    if !ensure_w32_paging_level(
+        k_pdpt,
+        OBJ_X86_PDPT,
+        LBL_X86_PDPT_MAP,
+        page,
+        w_pml4,
+        b"pdpt",
+    ) {
+        return false;
     }
-    let k_pd = (2u64 << 60) | (page >> 30);
-    if !w32_seen(k_pd) {
-        let s = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, s);
-        let _ = paging_struct_map(s, LBL_X86_PAGE_DIRECTORY_MAP, page, w_pml4);
-        w32_mark(k_pd);
+    if !ensure_w32_paging_level(
+        k_pd,
+        OBJ_X86_PAGE_DIRECTORY,
+        LBL_X86_PAGE_DIRECTORY_MAP,
+        page,
+        w_pml4,
+        b"pd",
+    ) {
+        return false;
     }
-    let k_pt = (3u64 << 60) | (page >> 21);
-    if !w32_seen(k_pt) {
-        let s = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, s);
-        let _ = paging_struct_map(s, LBL_X86_PAGE_TABLE_MAP, page, w_pml4);
-        w32_mark(k_pt);
+    ensure_w32_paging_level(
+        k_pt,
+        OBJ_X86_PAGE_TABLE,
+        LBL_X86_PAGE_TABLE_MAP,
+        page,
+        w_pml4,
+        b"pt",
+    )
+}
+
+unsafe fn w32_map_frame_copy_checked(
+    frame: u64,
+    page: u64,
+    rights: u64,
+    w_pml4: u64,
+    what: &[u8],
+) -> u64 {
+    if !ensure_w32_client_paging(page, w_pml4) {
+        return 0;
     }
+
+    let (cc, copy_error) = copy_cap_r(frame);
+    if copy_error != 0 {
+        print_str(b"[w32attach] ");
+        print_str(what);
+        print_str(b" copy failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" frame=0x");
+        print_hex(frame as u32);
+        print_str(b" error=");
+        print_u64(copy_error);
+        print_str(b"\n");
+        if cc != 0 {
+            let _ = cnode_delete_recycle_r(cc);
+        }
+        return 0;
+    }
+
+    let map = page_map_r(cc, page, rights, w_pml4);
+    if map == 0 {
+        return cc;
+    }
+    let _ = cnode_delete_recycle_r(cc);
+
+    if map == SEL4_FAILED_LOOKUP {
+        w32_forget_client_paging(page);
+        if ensure_w32_client_paging(page, w_pml4) {
+            let (retry, retry_copy) = copy_cap_r(frame);
+            if retry_copy == 0 {
+                let retry_map = page_map_r(retry, page, rights, w_pml4);
+                if retry_map == 0 {
+                    if W32_PAGING_REPAIR_SUCCESSES.fetch_add(1, Ordering::Relaxed) < 16 {
+                        print_str(b"[w32paging] repaired hierarchy for ");
+                        print_str(what);
+                        print_str(b" page=0x");
+                        print_hex((page >> 32) as u32);
+                        print_hex(page as u32);
+                        print_str(b"\n");
+                    }
+                    return retry;
+                }
+                print_str(b"[w32attach] ");
+                print_str(what);
+                print_str(b" retry map failed page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" rights=0x");
+                print_hex(rights as u32);
+                print_str(b" error=");
+                print_u64(retry_map);
+                print_str(b"\n");
+            } else {
+                print_str(b"[w32attach] ");
+                print_str(what);
+                print_str(b" retry copy failed page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" frame=0x");
+                print_hex(frame as u32);
+                print_str(b" error=");
+                print_u64(retry_copy);
+                print_str(b"\n");
+            }
+            if retry != 0 {
+                let _ = cnode_delete_recycle_r(retry);
+            }
+            return 0;
+        }
+    }
+
+    print_str(b"[w32attach] ");
+    print_str(what);
+    print_str(b" map failed page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" rights=0x");
+    print_hex(rights as u32);
+    print_str(b" error=");
+    print_u64(map);
+    print_str(b"\n");
+    0
+}
+
+unsafe fn w32_map_registered_client_frame_copy_checked(
+    pi: u64,
+    page: u64,
+    rights: u64,
+    w_pml4: u64,
+    what: &[u8],
+) -> u64 {
+    if !ensure_w32_client_paging(page, w_pml4) {
+        return 0;
+    }
+
+    let (cc, source, copy_error) = crate::csrss_frame_copy_exact_for_win32k(pi, page);
+    if copy_error != 0 {
+        print_str(b"[w32attach] ");
+        print_str(what);
+        print_str(b" copy failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" source=0x");
+        print_hex(source as u32);
+        print_str(b" error=");
+        print_u64(copy_error);
+        print_str(b"\n");
+        return 0;
+    }
+
+    let map = page_map_r(cc, page, rights, w_pml4);
+    if map == 0 {
+        return cc;
+    }
+    let _ = cnode_delete_recycle_r(cc);
+
+    if map == SEL4_FAILED_LOOKUP {
+        w32_forget_client_paging(page);
+        if ensure_w32_client_paging(page, w_pml4) {
+            let (retry, retry_source, retry_copy) =
+                crate::csrss_frame_copy_exact_for_win32k(pi, page);
+            if retry_copy == 0 {
+                let retry_map = page_map_r(retry, page, rights, w_pml4);
+                if retry_map == 0 {
+                    if W32_PAGING_REPAIR_SUCCESSES.fetch_add(1, Ordering::Relaxed) < 16 {
+                        print_str(b"[w32paging] repaired hierarchy for ");
+                        print_str(what);
+                        print_str(b" page=0x");
+                        print_hex((page >> 32) as u32);
+                        print_hex(page as u32);
+                        print_str(b"\n");
+                    }
+                    return retry;
+                }
+                print_str(b"[w32attach] ");
+                print_str(what);
+                print_str(b" retry map failed page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" rights=0x");
+                print_hex(rights as u32);
+                print_str(b" error=");
+                print_u64(retry_map);
+                print_str(b"\n");
+            } else {
+                print_str(b"[w32attach] ");
+                print_str(what);
+                print_str(b" retry copy failed page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" source=0x");
+                print_hex(retry_source as u32);
+                print_str(b" error=");
+                print_u64(retry_copy);
+                print_str(b"\n");
+            }
+            if retry != 0 {
+                let _ = cnode_delete_recycle_r(retry);
+            }
+            return 0;
+        }
+    }
+
+    print_str(b"[w32attach] ");
+    print_str(what);
+    print_str(b" map failed page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" rights=0x");
+    print_hex(rights as u32);
+    print_str(b" error=");
+    print_u64(map);
+    print_str(b"\n");
+    0
 }
 // --- win32k per-client attach/detach (the KeStackAttachProcess model) ---------------------------
 // win32k's client window is shared with EXACTLY ONE GUI client at a time. csrss (pi 1) and winlogon
@@ -3134,32 +3599,75 @@ pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(1);
 pub(crate) const W32_ATTACH_CAP: usize = 8192;
 pub(crate) static mut W32_ATTACH_PAGE: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
 pub(crate) static mut W32_ATTACH_SLOT: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
+pub(crate) static mut W32_ATTACH_RIGHTS: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
 pub(crate) static mut W32_ATTACH_N: usize = 0;
 /// Is `page` currently mapped into win32k for the attached client?
 pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let a = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
+    let pages = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
+    let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
     for i in 0..n {
-        if core::ptr::read(a.add(i)) == page {
+        if core::ptr::read(pages.add(i)) == page && core::ptr::read(slots.add(i)) != 0 {
             return true;
         }
     }
     false
 }
-/// Re-point `page`'s attach record at a NEW copy-cap `slot` (the copy-on-write swap below), so the
-/// detach Unmap tears down whichever frame is actually mapped. Returns the OLD slot, or 0.
-pub(crate) unsafe fn w32_attach_replace_slot(page: u64, slot: u64) -> u64 {
+
+unsafe fn w32_attach_remove_at(index: usize, n: usize) {
+    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
+    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
+    let rights = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
+    let last = n - 1;
+    if index != last {
+        core::ptr::write(pages.add(index), core::ptr::read(pages.add(last)));
+        core::ptr::write(slots.add(index), core::ptr::read(slots.add(last)));
+        core::ptr::write(rights.add(index), core::ptr::read(rights.add(last)));
+    }
+    core::ptr::write(pages.add(last), 0);
+    core::ptr::write(slots.add(last), 0);
+    core::ptr::write(rights.add(last), 0);
+    core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), last);
+}
+
+/// Re-point `page`'s attach record at a NEW copy-cap `slot` with `rights` (the copy-on-write and
+/// narrow-remap swaps below), so detach Unmap tears down whichever frame is actually mapped.
+/// Returns the OLD slot and OLD rights, or `(0, 0)`.
+pub(crate) unsafe fn w32_attach_replace_mapping(page: u64, slot: u64, rights: u64) -> (u64, u64) {
     let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
     let pages = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
     let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
+    let rights_table = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
     for i in 0..n {
         if core::ptr::read(pages.add(i)) == page {
             let old = core::ptr::read(slots.add(i));
-            core::ptr::write(slots.add(i), slot);
-            return old;
+            let old_rights = core::ptr::read(rights_table.add(i));
+            if slot == 0 {
+                w32_attach_remove_at(i, n);
+            } else {
+                core::ptr::write(slots.add(i), slot);
+                core::ptr::write(rights_table.add(i), rights);
+            }
+            return (old, old_rights);
         }
     }
-    0
+    if slot != 0 {
+        w32_attach_record(page, slot, rights);
+    }
+    (0, 0)
+}
+
+/// Forget a page's attach record after its leaf has been unmapped and no mapped cap remains.
+pub(crate) unsafe fn w32_attach_remove(page: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
+    for i in 0..n {
+        if core::ptr::read(pages.add(i)) == page {
+            w32_attach_remove_at(i, n);
+            return true;
+        }
+    }
+    false
 }
 
 /// ★ COPY-ON-WRITE the caller's TEB tail out from under a win32k store.
@@ -3191,27 +3699,40 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
         print_str(b"\n");
         return false;
     }
-    let old = w32_attach_replace_slot(page, 0);
+    let (old, old_rights) = w32_attach_replace_mapping(page, 0, 0);
     if old != 0 {
-        let error = page_unmap(old);
-        let _ = cnode_delete_recycle_r(old);
+        let error = page_unmap_r(old);
         if error != 0 {
             print_str(b"[teb-tail] COW unmap failed error=");
             print_u64(error);
             print_str(b"\n");
+            let _ = w32_attach_replace_mapping(page, old, old_rights);
+            return false;
         }
     }
-    let cc = copy_cap(shadow);
-    let error = page_map(cc, page, RW_NX, w_pml4);
-    if error != 0 {
-        print_str(b"[teb-tail] COW map failed error=");
-        print_u64(error);
-        print_str(b"\n");
-        let _ = cnode_delete_recycle_r(cc);
+    let cc = w32_map_frame_copy_checked(shadow, page, RW_NX, w_pml4, b"teb-tail COW");
+    if cc == 0 {
+        if old != 0 {
+            let restore = page_map_r(old, page, old_rights, w_pml4);
+            if restore == 0 {
+                let _ = w32_attach_replace_mapping(page, old, old_rights);
+            } else {
+                print_str(b"[teb-tail] COW restore failed error=");
+                print_u64(restore);
+                print_str(b"\n");
+                let _ = w32_attach_remove(page);
+                let _ = cnode_delete_recycle_r(old);
+            }
+        }
         return false;
     }
-    if w32_attach_replace_slot(page, cc) == 0 {
-        w32_attach_record(page, cc);
+    if old != 0 {
+        let _ = cnode_delete_recycle_r(old);
+    }
+    if old != 0 {
+        let _ = w32_attach_replace_mapping(page, cc, RW_NX);
+    } else {
+        w32_attach_record(page, cc, RW_NX);
     }
     if seen < 6 {
         print_str(b"[teb-tail] win32k STORE into the client TEB tail REFUSED (page=0x");
@@ -3231,19 +3752,130 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
 }
 
 /// Record that `page` is now mapped into win32k via copy-cap `slot` (for a later detach Unmap).
-pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    if n < W32_ATTACH_CAP {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64).add(n),
-            page,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64).add(n),
-            slot,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), n + 1);
+pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64, rights: u64) {
+    if slot == 0 {
+        let _ = w32_attach_remove(page);
+        return;
     }
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
+    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
+    let rights_table = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
+    for i in 0..n {
+        if core::ptr::read(pages.add(i)) == page {
+            core::ptr::write(slots.add(i), slot);
+            core::ptr::write(rights_table.add(i), rights);
+            return;
+        }
+    }
+    if n < W32_ATTACH_CAP {
+        core::ptr::write(pages.add(n), page);
+        core::ptr::write(slots.add(n), slot);
+        core::ptr::write(rights_table.add(n), rights);
+        core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), n + 1);
+    } else {
+        print_str(b"[w32attach] attach table full page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+    }
+}
+
+/// Re-map a currently selected client frame into win32k with explicit rights. This is used for
+/// narrow kernel-owned transitions where the normal demand mapping policy is too broad; for example
+/// `NtGdiFlushUserBatch` must legitimately clear `TEB.GdiBatchCount` even though the rest of the
+/// TEB tail remains read-only to ordinary win32k dispatches.
+///
+/// If the page is already attached, the attached win32k cap is the source of truth for this rights
+/// flip: unmap it, then map the same cap again with the requested rights. The client-frame registry
+/// is used only to create a missing attach mapping. Re-copying from the registry during a RO/RW flip
+/// makes the transition depend on long-lived source cptrs that are unrelated to the attached leaf.
+pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
+    page: u64,
+    pi: u64,
+    rights: u64,
+) -> bool {
+    let w_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
+    if w_pml4 == 0 {
+        return false;
+    }
+    if crate::csrss_frame_get_exact(pi, page).0 == 0 {
+        return false;
+    }
+    let was_mapped = w32_attach_mapped(page);
+    let (old, old_rights) = if was_mapped {
+        w32_attach_replace_mapping(page, 0, 0)
+    } else {
+        (0, 0)
+    };
+    if old != 0 {
+        let error = page_unmap_r(old);
+        if error != 0 {
+            print_str(b"[w32attach] remap unmap failed page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" error=");
+            print_u64(error);
+            print_str(b"\n");
+            let _ = w32_attach_replace_mapping(page, old, old_rights);
+            return false;
+        }
+
+        let mut map = page_map_r(old, page, rights, w_pml4);
+        if map == SEL4_FAILED_LOOKUP {
+            w32_forget_client_paging(page);
+            if ensure_w32_client_paging(page, w_pml4) {
+                map = page_map_r(old, page, rights, w_pml4);
+                if map == 0 && W32_PAGING_REPAIR_SUCCESSES.fetch_add(1, Ordering::Relaxed) < 16 {
+                    print_str(b"[w32paging] repaired hierarchy for remap-existing page=0x");
+                    print_hex((page >> 32) as u32);
+                    print_hex(page as u32);
+                    print_str(b"\n");
+                }
+            }
+        }
+
+        if map == 0 {
+            let _ = w32_attach_replace_mapping(page, old, rights);
+        } else {
+            print_str(b"[w32attach] remap existing map failed page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" rights=0x");
+            print_hex(rights as u32);
+            print_str(b" error=");
+            print_u64(map);
+            print_str(b"\n");
+
+            let restore = page_map_r(old, page, old_rights, w_pml4);
+            if restore == 0 {
+                let _ = w32_attach_replace_mapping(page, old, old_rights);
+            } else {
+                print_str(b"[w32attach] remap restore failed page=0x");
+                print_hex((page >> 32) as u32);
+                print_hex(page as u32);
+                print_str(b" error=");
+                print_u64(restore);
+                print_str(b"\n");
+                let _ = w32_attach_remove(page);
+                let _ = cnode_delete_recycle_r(old);
+            }
+            return false;
+        }
+    } else {
+        let cc = w32_map_registered_client_frame_copy_checked(pi, page, rights, w_pml4, b"remap");
+        if cc == 0 {
+            return false;
+        }
+        w32_attach_record(page, cc, rights);
+    }
+    if crate::W32_CLIENT_TEB_TAIL_PROTECTED
+        && rights == crate::RO_NX
+        && crate::is_teb_tail_page(page)
+    {
+        crate::W32_TEB_TAIL_RO_MAPS.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 /// Attach win32k's client window to GUI client `pi` (the KeStackAttachProcess model). If a DIFFERENT
 /// client is currently attached, DETACH it: Unmap all its leaf client pages from win32k so the new
@@ -3260,8 +3892,7 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
         // asid → csrss/winlogon's own VSpace mapping is untouched), then delete the transient copy
         // cap so the executive's root-slot allocator can recycle it.
         let cap = core::ptr::read(slots.add(i));
-        let error = page_unmap(cap);
-        let _ = cnode_delete_recycle_r(cap);
+        let error = page_unmap_r(cap);
         if error != 0 {
             print_str(b"[w32attach] page_unmap failed page=0x");
             print_hex(
@@ -3272,6 +3903,7 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
             print_str(b"\n");
             return false;
         }
+        let _ = cnode_delete_recycle_r(cap);
     }
     print_str(b"[w32attach] client ");
     print_u64(prev);
@@ -3293,11 +3925,6 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     if already_mapped {
         return true; // already shared for the currently-attached client
     }
-    let fr = csrss_frame_get(pi, page);
-    if fr == 0 {
-        return false;
-    }
-    ensure_w32_client_paging(page, w_pml4);
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
     // the client so writes propagate back (out-params). Non-executable — client data, not code.
     //
@@ -3311,21 +3938,19 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
         crate::W32_TEB_TAIL_RO_MAPS.fetch_add(1, Ordering::Relaxed);
     }
     let rights = if protect_tail { crate::RO_NX } else { RW_NX };
-    let cc = copy_cap(fr);
-    let error = page_map(cc, page, rights, w_pml4);
-    if error != 0 {
-        print_str(b"[w32attach] page_map failed page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b" pi=");
-        print_u64(pi);
-        print_str(b" error=");
-        print_u64(error);
-        print_str(b"\n");
-        let _ = cnode_delete_recycle_r(cc);
+    let cc = if crate::csrss_frame_get_exact(pi, page).0 != 0 {
+        w32_map_registered_client_frame_copy_checked(pi, page, rights, w_pml4, b"attach")
+    } else {
+        let fr = csrss_frame_get(pi, page);
+        if fr == 0 {
+            return false;
+        }
+        w32_map_frame_copy_checked(fr, page, rights, w_pml4, b"attach")
+    };
+    if cc == 0 {
         return false;
     }
-    w32_attach_record(page, cc);
+    w32_attach_record(page, cc, rights);
     true
 }
 
@@ -3937,6 +4562,48 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     )
 }
 
+pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) -> (u64, bool) {
+    const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
+    const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009Au32 as u64;
+
+    if client.pi == 0 || client.teb == 0 {
+        return (STATUS_INVALID_PARAMETER, true);
+    }
+
+    let client_pi = client.pi as u64;
+    if !w32_client_attach(client_pi) {
+        return (STATUS_INSUFFICIENT_RESOURCES, false);
+    }
+
+    let tail_page = (client.teb + nt_user_callback::TEB_GDI_BATCH_COUNT) & !0xFFF;
+    if !remap_attached_client_frame_in_win32k(tail_page, client_pi, RW_NX) {
+        return (STATUS_INSUFFICIENT_RESOURCES, true);
+    }
+    crate::GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.fetch_add(1, Ordering::Relaxed);
+
+    let result = win32k_dispatch_wide(
+        win32k_subsystem::SSN_GDI_BATCH_FLUSH_CALLOUT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &[],
+        client,
+    );
+
+    if !remap_attached_client_frame_in_win32k(tail_page, client_pi, RO_NX) {
+        print_str(b"[gdi-batch] failed to restore read-only TEB tail mapping page=0x");
+        print_hex((tail_page >> 32) as u32);
+        print_hex(tail_page as u32);
+        print_str(b" pi=");
+        print_u64(client_pi);
+        print_str(b"\n");
+    }
+
+    result
+}
+
 pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     ssn: u64,
     a0: u64,
@@ -3968,16 +4635,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         return (0xC000_0001u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-    for offset in [
-        win32k_subsystem::SH_CTX_PROCESS_ID,
-        win32k_subsystem::SH_CTX_THREAD_ID,
-        win32k_subsystem::SH_CTX_EPROCESS,
-        win32k_subsystem::SH_CTX_ETHREAD,
-        win32k_subsystem::SH_CTX_W32PROCESS,
-        win32k_subsystem::SH_CTX_W32THREAD,
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, 0);
-    }
+    clear_published_win32k_context();
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
         Ok(nested) => nested,
@@ -4164,6 +4822,9 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     );
     retire_win32k_on_wall(&pr);
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
+    if pr.callback_suspended {
+        capture_suspended_published_win32k_context(client.callback_client());
+    }
     if nested_user_callback {
         if pr.callback_suspended {
             return (pr.result, false);

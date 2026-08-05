@@ -72,7 +72,7 @@ pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 /// TEB VA used by the SEC_IMAGE hosted-process main thread.
 ///
 /// Native syscall stubs read this value through the standard x64 `gs:[0x30]` TEB self pointer.
-pub const NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA: u64 = 0x0000_0100_0051_0000;
+pub const NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA: u64 = 0x0000_0100_1600_0000;
 
 /// TEB VA used by the older isolated-PE main-thread path.
 pub const NT_NATIVE_PE_MAIN_TEB_VA: u64 = 0x0000_0100_0057_0000;

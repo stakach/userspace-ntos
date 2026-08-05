@@ -361,6 +361,8 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
     HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
     PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
+    PM_HANDLE_CAP_MAX.store(0, Ordering::Relaxed);
+    PM_HANDLE_CAP_GROWTHS.store(0, Ordering::Relaxed);
 
     let smss_pid = pm.create_process("smss.exe", None, None);
     let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
@@ -615,6 +617,7 @@ impl ExecNtHandler {
         write_field!(thread_mechanisms, nt_user_host::ThreadMechanismTable::new());
         write_field!(pool_used, [0; MAX_PI]);
         write_field!(pool_suspended, [0; MAX_PI]);
+        write_field!(tp_worker_window_used, [0; MAX_PI]);
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, nt_security::TokenStore::with_capacity(64));
@@ -906,7 +909,7 @@ impl ExecNtHandler {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return 0xC000_0008;
         };
-        let handle = match self.pm.insert_handle(
+        let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::RegistryKey(target),
             Self::registry_map_access(desired),
@@ -914,11 +917,6 @@ impl ExecNtHandler {
             Ok(handle) => handle,
             Err(_) => return 0xC000_009A,
         };
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
         if !self.xas_write_u64(out, handle as u64) {
             let _ = self.pm.take_handle(pid, handle);
             return 0xC000_0005;
@@ -2091,6 +2089,10 @@ impl ExecNtHandler {
         (slot < PM_RUNTIME_THREAD_SLOTS).then_some(1u64 << slot)
     }
 
+    fn tp_worker_slot_bit(slot: usize) -> Option<u64> {
+        (slot < TP_WORKER_SLOT_COUNT && slot < 64).then_some(1u64 << slot)
+    }
+
     fn claim_pool_usage_slot(&mut self, pi: usize) -> Option<usize> {
         let used = self.pool_used.get_mut(pi)?;
         let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| *used & (1u64 << slot) == 0)?;
@@ -2195,6 +2197,7 @@ impl ExecNtHandler {
         }
         self.temporary_process_slots[pi] = 0;
         self.process_vspaces[pi] = 0;
+        self.clear_hosted_tp_worker_windows(pi);
     }
 
     pub(crate) fn register_temporary_pool_thread_slot(
@@ -2242,14 +2245,35 @@ impl ExecNtHandler {
         tcb: u64,
         badge: u64,
         role: HostedThreadRole,
-    ) {
+    ) -> bool {
         if self
             .thread_runtime
             .register(pi, tid, tcb, badge, role)
             .is_some()
         {
             publish_hosted_thread_runtime_gate(pi, role);
+            true
+        } else {
+            false
         }
+    }
+
+    pub(crate) fn register_hosted_thread_spawn(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        spawn: HostedThreadSpawnResult,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> bool {
+        if !self.register_hosted_thread_tcb(pi, tid, spawn.tcb(), badge, role) {
+            return false;
+        }
+        let mechanism = spawn.mechanism();
+        if mechanism.is_live() {
+            let _ = self.thread_runtime.set_mechanism_caps(tid, mechanism);
+        }
+        true
     }
 
     pub(crate) fn reserve_hosted_thread_runtime(
@@ -2277,6 +2301,77 @@ impl ExecNtHandler {
         self.thread_runtime
             .get_by_tid(tid)
             .map(|runtime| runtime.role)
+    }
+
+    pub(crate) fn remember_hosted_thread_user_stack(
+        &mut self,
+        tid: u64,
+        initial_teb: nt_thread_start::InitialTeb64,
+    ) -> bool {
+        let allocation_base = initial_teb.allocated_stack_base;
+        let stack_base = initial_teb.stack_base;
+        if allocation_base == 0
+            || stack_base <= allocation_base
+            || allocation_base & (nt_address_space::ALLOCATION_GRANULARITY - 1) != 0
+            || stack_base & (nt_address_space::PAGE_SIZE - 1) != 0
+        {
+            return false;
+        }
+        self.thread_runtime
+            .set_user_stack(tid, allocation_base, stack_base)
+            .is_some()
+    }
+
+    pub(crate) unsafe fn release_hosted_thread_user_stack_vad(
+        &mut self,
+        runtime: HostedThreadRuntime,
+    ) {
+        if runtime.pi >= MAX_PI || runtime.user_stack_allocation_base == 0 {
+            return;
+        }
+        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+            .add(runtime.pi);
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = core::ptr::read(vm_map);
+        *after = *before;
+        let plan = match after.free(
+            runtime.user_stack_allocation_base,
+            0,
+            nt_address_space::MEM_RELEASE,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => {
+                if USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[thread-term] user-stack VAD release skipped pi=");
+                    print_u64(runtime.pi as u64);
+                    print_str(b" tid=");
+                    print_u64(runtime.tid);
+                    print_str(b" base=0x");
+                    print_hex((runtime.user_stack_allocation_base >> 32) as u32);
+                    print_hex(runtime.user_stack_allocation_base as u32);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+                return;
+            }
+        };
+        let mut page = plan.base;
+        while page < plan.base + plan.size {
+            let old = before.extent_at(page);
+            let new = after.extent_at(page);
+            if old.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
+                && new
+                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
+            {
+                vm_unmap_private_page(runtime.pi, page);
+            }
+            page += nt_address_space::PAGE_SIZE;
+        }
+        core::ptr::write(vm_map, *after);
+        USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
     fn hosted_thread_tcb_for_nt_resume_thread(&self, tid: u64) -> Option<u64> {
@@ -2345,10 +2440,9 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn first_free_hosted_tp_worker_slot(&self, pi: usize) -> Option<usize> {
-        (0..TP_WORKER_SLOT_COUNT).find(|&slot| {
-            self.hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot })
-                .is_none()
-        })
+        let used = *self.tp_worker_window_used.get(pi)?;
+        (0..TP_WORKER_SLOT_COUNT)
+            .find(|&slot| Self::tp_worker_slot_bit(slot).is_some_and(|bit| used & bit == 0))
     }
 
     pub(crate) fn reserve_hosted_tp_worker_slot(
@@ -2360,12 +2454,51 @@ impl ExecNtHandler {
         if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
             return false;
         }
+        let Some(bit) = Self::tp_worker_slot_bit(slot) else {
+            return false;
+        };
+        if self.tp_worker_window_used[pi] & bit != 0 {
+            return false;
+        }
         let badge = tp_worker_badge(pi, slot);
         if !self.reserve_hosted_thread_runtime(pi, tid, badge, HostedThreadRole::TpWorker { slot })
         {
             return false;
         }
+        self.tp_worker_window_used[pi] |= bit;
         true
+    }
+
+    pub(crate) fn release_unmapped_hosted_tp_worker_slot(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: u64,
+    ) {
+        let _ = self.release_hosted_thread_runtime(tid);
+        unsafe { release_hosted_tp_worker_window_resources(pi, slot) };
+        self.clear_hosted_tp_worker_window_slot(pi, slot);
+    }
+
+    pub(crate) fn clear_hosted_tp_worker_window_slot(&mut self, pi: usize, slot: usize) {
+        if pi < MAX_PI {
+            if let Some(bit) = Self::tp_worker_slot_bit(slot) {
+                self.tp_worker_window_used[pi] &= !bit;
+            }
+        }
+    }
+
+    pub(crate) fn clear_hosted_tp_worker_windows(&mut self, pi: usize) {
+        if pi < MAX_PI {
+            for slot in 0..TP_WORKER_SLOT_COUNT {
+                unsafe { release_hosted_tp_worker_window_resources(pi, slot) };
+            }
+            self.tp_worker_window_used[pi] = 0;
+        }
+    }
+
+    pub(crate) fn hosted_tp_worker_window_mask(&self, pi: usize) -> u64 {
+        self.tp_worker_window_used.get(pi).copied().unwrap_or(0)
     }
 
     fn abandon_created_hosted_thread(&mut self, pool_slot: usize, tid: u64, handle: u64) {
@@ -2635,12 +2768,15 @@ impl ExecNtHandler {
         let mut identity_ok = 0u64;
         let mut main_threads_ok = 0u64;
         let mut min_handle_cap = usize::MAX;
+        let mut max_handle_cap = 0usize;
         for pi in 0..MAX_PI {
             let Some(pid) = self.pm_pid_for_pi(pi) else {
                 continue;
             };
             process_count += 1;
-            min_handle_cap = min_handle_cap.min(self.pm.handle_capacity(pid));
+            let handle_cap = self.pm.handle_capacity(pid);
+            min_handle_cap = min_handle_cap.min(handle_cap);
+            max_handle_cap = max_handle_cap.max(handle_cap);
             let distinct = (0..MAX_PI)
                 .all(|other_pi| other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid));
             if let Some(image) = self.hosted_process_image(pi) {
@@ -2681,6 +2817,31 @@ impl ExecNtHandler {
             },
             Ordering::Relaxed,
         );
+        PM_HANDLE_CAP_MAX.store(max_handle_cap as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn insert_process_handle(
+        &mut self,
+        pid: nt_process::ProcessId,
+        object: nt_process::HandleObject,
+        granted_access: u32,
+    ) -> Result<nt_process::Handle, u32> {
+        let cap_before = self.pm.handle_capacity(pid);
+        let handle = self.pm.insert_handle(pid, object, granted_access)?;
+        let cap_after = self.pm.handle_capacity(pid);
+        if cap_after > cap_before {
+            self.process_dirty = true;
+            PM_HANDLE_CAP_GROWTHS.fetch_add(1, Ordering::Relaxed);
+        }
+        if cap_after as u64 > PM_HANDLE_CAP_MAX.load(Ordering::Relaxed) {
+            PM_HANDLE_CAP_MAX.store(cap_after as u64, Ordering::Relaxed);
+        }
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Ok(handle)
     }
 
     fn allocate_hosted_process_slot(
@@ -2706,6 +2867,7 @@ impl ExecNtHandler {
         self.publish_registered_hosted_process_metadata(image)?;
         let pid = self.pm.create_process(name, Some(parent), None);
         self.process_vspaces[child_pi] = 0;
+        self.clear_hosted_tp_worker_windows(child_pi);
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
         self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)?;
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
@@ -2764,8 +2926,8 @@ impl ExecNtHandler {
     /// real EPROCESS handle table (path 1 of the nt-process convergence). Behaviour-preserving: the
     /// returned VALUE is still the global monotonic `next_handle` (so the reg/LPC/win32k consumers
     /// that match on handle values are unchanged), but the durable per-process table now OWNS the
-    /// handle — tagged with the value in a `HandleObject::Opaque` so `NtClose` can free it. The
-    /// pre-reserved capacity guarantees the `insert_handle` never reallocates under the reset.
+    /// handle — tagged with the value in a `HandleObject::Opaque` so `NtClose` can free it. Capacity
+    /// growth is centralized in [`insert_process_handle`], which pins the bump-heap mark before reset.
     pub(crate) fn mint_handle(&mut self) -> u64 {
         // Path 1b: return the process-LOCAL dense value the EPROCESS handle table allocates
         // (real NT `(slot+1)*4`), not a global monotonic value. Two processes each get their own
@@ -2773,15 +2935,7 @@ impl ExecNtHandler {
         // consumers (DLL registry) + pi-scoped scalar comparisons. Append-only (no_reuse) keeps
         // each value monotonic for the run so external bindings never see a recycled value.
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            if let Ok(h) = self
-                .pm
-                .insert_handle(pid, nt_process::HandleObject::Opaque(0), 0)
-            {
-                let c = self.pm.handle_count(pid) as u64;
-                if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-                    PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
-                }
-                PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+            if let Ok(h) = self.insert_process_handle(pid, nt_process::HandleObject::Opaque(0), 0) {
                 return h as u64;
             }
         }
@@ -2796,16 +2950,11 @@ impl ExecNtHandler {
     /// ownership plus a non-NULL value for ReactOS' per-process RTL keyed-event global.
     pub(crate) fn mint_keyed_event_handle(&mut self, access: u32) -> u64 {
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            if let Ok(h) = self.pm.insert_handle(
+            if let Ok(h) = self.insert_process_handle(
                 pid,
                 nt_process::HandleObject::Opaque(KEYEDEVENT_HANDLE_TAG),
                 access,
             ) {
-                let c = self.pm.handle_count(pid) as u64;
-                if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-                    PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
-                }
-                PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                 return h as u64;
             }
         }
@@ -2823,22 +2972,17 @@ impl ExecNtHandler {
         self.file_completion
             .insert_file(file_id, synchronous)
             .ok()?;
-        let handle =
-            match self
-                .pm
-                .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
-            {
-                Ok(handle) => handle,
-                Err(_) => {
-                    self.release_file_reference(file_id);
-                    return None;
-                }
-            };
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        let handle = match self.insert_process_handle(
+            pid,
+            nt_process::HandleObject::File(file_id),
+            access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                self.release_file_reference(file_id);
+                return None;
+            }
+        };
         Some(handle as u64)
     }
 
@@ -2851,8 +2995,7 @@ impl ExecNtHandler {
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let handle = self
-            .pm
-            .insert_handle(
+            .insert_process_handle(
                 pid,
                 nt_process::HandleObject::DiskFile {
                     first_cluster,
@@ -2861,11 +3004,6 @@ impl ExecNtHandler {
                 access,
             )
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -2936,7 +3074,7 @@ impl ExecNtHandler {
     pub(crate) fn mint_directory_handle(&mut self, first_cluster: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let object_id = self.directory_opens.create(first_cluster).ok()?;
-        let handle = match self.pm.insert_handle(
+        let handle = match self.insert_process_handle(
             pid,
             nt_process::HandleObject::Directory {
                 first_cluster,
@@ -2950,11 +3088,6 @@ impl ExecNtHandler {
                 return None;
             }
         };
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -2995,23 +3128,18 @@ impl ExecNtHandler {
             unsafe { crate::writable_fs::close(file_id) };
             return None;
         };
-        let handle =
-            match self
-                .pm
-                .insert_handle(pid, nt_process::HandleObject::OverlayFile(file_id), access)
-            {
-                Ok(handle) => handle,
-                Err(_) => {
-                    // The volume owns the file object until a handle takes it; give it back.
-                    unsafe { crate::writable_fs::close(file_id) };
-                    return None;
-                }
-            };
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        let handle = match self.insert_process_handle(
+            pid,
+            nt_process::HandleObject::OverlayFile(file_id),
+            access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                // The volume owns the file object until a handle takes it; give it back.
+                unsafe { crate::writable_fs::close(file_id) };
+                return None;
+            }
+        };
         Some(handle as u64)
     }
 
@@ -3029,14 +3157,8 @@ impl ExecNtHandler {
     pub(crate) fn mint_boot_status_handle(&mut self, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let handle = self
-            .pm
-            .insert_handle(pid, nt_process::HandleObject::BootStatusFile, access)
+            .insert_process_handle(pid, nt_process::HandleObject::BootStatusFile, access)
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -3150,18 +3272,12 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let tag = EVENT_HANDLE_TAG | event_index as u64;
         let handle = self
-            .pm
-            .insert_handle(
+            .insert_process_handle(
                 pid,
                 nt_process::HandleObject::Opaque(tag),
                 nt_kernel_exec::map_event_access(access),
             )
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -3222,18 +3338,12 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let tag = SEMAPHORE_HANDLE_TAG | index as u64;
         let handle = self
-            .pm
-            .insert_handle(
+            .insert_process_handle(
                 pid,
                 nt_process::HandleObject::Opaque(tag),
                 nt_kernel_exec::map_semaphore_access(access),
             )
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -3281,18 +3391,12 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let tag = MUTANT_HANDLE_TAG | index as u64;
         let handle = self
-            .pm
-            .insert_handle(
+            .insert_process_handle(
                 pid,
                 nt_process::HandleObject::Opaque(tag),
                 nt_kernel_exec::map_mutant_access(access),
             )
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
 
@@ -3844,9 +3948,7 @@ impl ExecNtHandler {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 
-        let caller = self
-            .pm_pid_for_pi(self.pi)
-            .ok_or(STATUS_INVALID_HANDLE)?;
+        let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
 
         if handle == u64::MAX {
             return self
@@ -3957,9 +4059,7 @@ impl ExecNtHandler {
             WaitObject::KIND_DISPATCHER => self.dispatcher_ready_for(object.id() as usize, thread),
             WaitObject::KIND_PROCESS => self.pm.is_process_signaled(object.id() as u32),
             WaitObject::KIND_THREAD => self.pm.is_thread_signaled(object.id() as u32),
-            WaitObject::KIND_WIN32K_EVENT => {
-                crate::win32k_subsystem::event_body_ready(object.id())
-            }
+            WaitObject::KIND_WIN32K_EVENT => crate::win32k_subsystem::event_body_ready(object.id()),
             _ => false,
         }
     }
@@ -3970,9 +4070,13 @@ impl ExecNtHandler {
 
     pub(crate) fn wait_object_consume_for(&mut self, object: WaitObject, thread: u64) -> bool {
         match object.kind() {
-            WaitObject::KIND_DISPATCHER => self.dispatcher_consume_for(object.id() as usize, thread),
+            WaitObject::KIND_DISPATCHER => {
+                self.dispatcher_consume_for(object.id() as usize, thread)
+            }
             WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => true,
-            WaitObject::KIND_WIN32K_EVENT => crate::win32k_subsystem::event_body_consume(object.id()),
+            WaitObject::KIND_WIN32K_EVENT => {
+                crate::win32k_subsystem::event_body_consume(object.id())
+            }
             _ => false,
         }
     }
@@ -3990,18 +4094,12 @@ impl ExecNtHandler {
     pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let handle = self
-            .pm
-            .insert_handle(
+            .insert_process_handle(
                 pid,
                 nt_process::HandleObject::IoCompletion(object_id),
                 access,
             )
             .ok()?;
-        let count = self.pm.handle_count(pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
     }
     fn io_completion_id_for(&self, handle: u64, required_access: u32) -> Result<u32, u32> {
@@ -4163,6 +4261,13 @@ impl ExecNtHandler {
         if start.rip == 0 {
             reject!(b"null-start-address", STATUS_INVALID_PARAMETER);
         }
+        let initial_teb_va = unsafe { smss_stack_read(sp + 0x38) };
+        let initial_teb = (initial_teb_va != 0).then(|| {
+            nt_thread_start::InitialTeb64::read(
+                |address| unsafe { smss_stack_read(address) },
+                initial_teb_va,
+            )
+        });
         let create_suspended = unsafe { smss_stack_read(sp + 0x40) } != 0;
         // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
         // workers — one window per extra thread of that process.
@@ -4181,14 +4286,14 @@ impl ExecNtHandler {
             self.release_pool_usage_slot(target_pi, pool_slot);
             reject!(b"reserve-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         }
-        let handle = match self.pm.insert_handle(
+        let handle = match self.insert_process_handle(
             caller_pid,
             nt_process::HandleObject::Thread(thread),
             args[1] as u32,
         ) {
             Ok(handle) => handle as u64,
             Err(status) => {
-                let _ = self.release_hosted_thread_runtime(tid);
+                self.release_unmapped_hosted_tp_worker_slot(target_pi, slot, tid);
                 let _ = self
                     .pm
                     .set_thread_state(thread, nt_process::ThreadState::Initialized);
@@ -4197,7 +4302,7 @@ impl ExecNtHandler {
             }
         };
         if !self.set_pool_thread_suspended(target_pi, pool_slot, create_suspended) {
-            let _ = self.release_hosted_thread_runtime(tid);
+            self.release_unmapped_hosted_tp_worker_slot(target_pi, slot, tid);
             let _ = self.close_process_handle(caller_pid, handle);
             let _ = self
                 .pm
@@ -4205,11 +4310,13 @@ impl ExecNtHandler {
             self.release_pool_usage_slot(target_pi, pool_slot);
             reject!(b"suspend-state", STATUS_INSUFFICIENT_RESOURCES);
         }
+        if let Some(initial_teb) = initial_teb {
+            let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
+        }
         self.pm.set_thread_teb(thread, tp_worker_teb_va(slot));
         let _ = self
             .pm
             .set_thread_create_time(thread, nt_system_time_100ns() as i64);
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         self.queue_write(args[0], handle);
         if cid_ptr != 0 {
@@ -4334,23 +4441,23 @@ impl ExecNtHandler {
             }
         };
         let t = tid as nt_process::ThreadId;
-        let h =
-            match self
-                .pm
-                .insert_handle(pid, nt_process::HandleObject::Thread(t), desired_access)
-            {
-                Ok(handle) => handle,
-                Err(_) => {
-                    if create_suspended {
-                        let _ = self.pm.resume_thread(t);
-                    }
-                    let _ = self
-                        .pm
-                        .set_thread_state(t, nt_process::ThreadState::Initialized);
-                    self.release_pool_usage_slot(self.pi, slot);
-                    return None;
+        let h = match self.insert_process_handle(
+            pid,
+            nt_process::HandleObject::Thread(t),
+            desired_access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                if create_suspended {
+                    let _ = self.pm.resume_thread(t);
                 }
-            };
+                let _ = self
+                    .pm
+                    .set_thread_state(t, nt_process::ThreadState::Initialized);
+                self.release_pool_usage_slot(self.pi, slot);
+                return None;
+            }
+        };
         let _ = self
             .pm
             .set_thread_create_time(t, nt_system_time_100ns() as i64);
@@ -4362,7 +4469,6 @@ impl ExecNtHandler {
             self.release_pool_usage_slot(self.pi, slot);
             return None;
         }
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
     }
@@ -4376,6 +4482,10 @@ impl ExecNtHandler {
         let ctx_va = smss_stack_read(sp + 0x30);
         let start =
             nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
+        let initial_teb_va = smss_stack_read(sp + 0x38);
+        let initial_teb = (initial_teb_va != 0).then(|| {
+            nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va)
+        });
         let scheduler_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
         let completion_rva = img_spawn::OUR_TP_COMPLETION_WORKER_RVA.load(Ordering::Relaxed);
         let scheduler_entry = NTDLL_BASE.wrapping_add(scheduler_rva);
@@ -4396,9 +4506,9 @@ impl ExecNtHandler {
             None
         };
         let tp_slot = if let Some(slot) = preferred_slot {
-            self.hosted_thread_tid_for_role(self.pi, HostedThreadRole::TpWorker { slot })
-                .is_none()
-                .then_some(slot)
+            Self::tp_worker_slot_bit(slot)
+                .filter(|bit| self.hosted_tp_worker_window_mask(self.pi) & *bit == 0)
+                .map(|_| slot)
         } else {
             let lsa_extra_connection = crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
                 && self.current_process_is_lsass()
@@ -4426,6 +4536,10 @@ impl ExecNtHandler {
             print_u64(self.pi as u64);
             print_str(b" pid=");
             print_u64(pid as u64);
+            print_str(b" windows-used=0x");
+            print_hex(self.hosted_tp_worker_window_mask(self.pi) as u32);
+            print_str(b" pool-used=0x");
+            print_hex(self.pool_used_mask(self.pi) as u32);
             print_str(b" entry=0x");
             print_hex((start.rip >> 32) as u32);
             print_hex(start.rip as u32);
@@ -4442,6 +4556,9 @@ impl ExecNtHandler {
         if !self.reserve_hosted_tp_worker_slot(self.pi, tp_slot, tid) {
             self.abandon_created_hosted_thread(pool_slot, tid, handle);
             return Some(0xC000_009A);
+        }
+        if let Some(initial_teb) = initial_teb {
+            let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
         }
         self.pm
             .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
@@ -4515,20 +4632,30 @@ impl ExecNtHandler {
         let caller_pid = self
             .pm_pid_for_pi(self.pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let handle = self.pm.open_process_by_client_id(
+        if self.pm.process(caller_pid).is_none() {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let target_pid = if client_id.unique_thread != 0 {
+            let thread = self
+                .pm
+                .thread(client_id.unique_thread)
+                .ok_or(nt_process::STATUS_INVALID_CID)?;
+            if thread.process_id != client_id.unique_process {
+                return Err(nt_process::STATUS_INVALID_CID);
+            }
+            thread.process_id
+        } else {
+            self.pm
+                .process(client_id.unique_process)
+                .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+            client_id.unique_process
+        };
+        let handle = self.insert_process_handle(
             caller_pid,
-            client_id,
+            nt_process::HandleObject::Process(target_pid),
             nt_process::map_process_access(desired_access),
         )?;
         Ok((caller_pid, handle))
-    }
-
-    pub(crate) fn account_published_pm_handle(&self, owner: nt_process::ProcessId) {
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        let count = self.pm.handle_count(owner) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
     }
 
     unsafe fn capture_object_attributes(
@@ -4590,7 +4717,6 @@ impl ExecNtHandler {
             let _ = self.pm.take_handle(owner, handle);
             return STATUS_ACCESS_VIOLATION;
         }
-        self.account_published_pm_handle(owner);
         0
     }
 
@@ -4619,9 +4745,24 @@ impl ExecNtHandler {
         let caller_pid = self
             .pm_pid_for_pi(self.pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let handle = self.pm.open_thread_by_client_id(
+        if self.pm.process(caller_pid).is_none() {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let missing_status = if client_id.unique_process == 0 {
+            nt_process::STATUS_INVALID_PARAMETER
+        } else {
+            nt_process::STATUS_INVALID_CID
+        };
+        let thread = self
+            .pm
+            .thread(client_id.unique_thread)
+            .ok_or(missing_status)?;
+        if client_id.unique_process != 0 && thread.process_id != client_id.unique_process {
+            return Err(nt_process::STATUS_INVALID_CID);
+        }
+        let handle = self.insert_process_handle(
             caller_pid,
-            client_id,
+            nt_process::HandleObject::Thread(client_id.unique_thread),
             nt_process::map_thread_access(desired_access),
         )?;
         Ok((caller_pid, handle))
@@ -4665,7 +4806,6 @@ impl ExecNtHandler {
             let _ = self.pm.take_handle(owner, handle);
             return STATUS_ACCESS_VIOLATION;
         }
-        self.account_published_pm_handle(owner);
         0
     }
 
@@ -5401,12 +5541,11 @@ impl ExecNtHandler {
                 let Some(object) = self.pm.process_debug_port(pid) else {
                     return Err(nt_process::dbgk::STATUS_PORT_NOT_SET);
                 };
-                let debug_handle = self.pm.insert_handle(
+                let debug_handle = self.insert_process_handle(
                     caller_pid,
                     nt_process::HandleObject::DebugObject(object),
                     nt_process::dbgk::DEBUG_OBJECT_ALL_ACCESS,
                 )?;
-                self.account_published_pm_handle(caller_pid);
                 published_handle = Some(debug_handle);
                 put_u64(&mut output, 0, debug_handle as u64);
                 0x08
@@ -7054,18 +7193,29 @@ impl ExecNtHandler {
             .pm
             .lookup_handle(source_pid, source_handle)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let source_access = self
+            .pm
+            .handle_access(source_pid, source_handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let source_flags = self
+            .pm
+            .handle_flags(source_pid, source_handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let desired_access = desired_access.map(|access| match object {
             nt_process::HandleObject::TokenObject(_) | nt_process::HandleObject::Token(_) => {
                 nt_security::map_token_access(access)
             }
             _ => access,
         });
-        let handle = self.pm.duplicate_handle_with_access(
-            source_pid,
-            source_handle,
+        let handle = self.insert_process_handle(
             target_pid,
-            desired_access,
+            object,
+            desired_access.unwrap_or(source_access),
         )?;
+        if let Err(status) = self.pm.set_handle_flags(target_pid, handle, source_flags) {
+            let _ = self.pm.take_handle(target_pid, handle);
+            return Err(status);
+        }
         let retained = match object {
             nt_process::HandleObject::TokenObject(token) => self
                 .token_store
@@ -7113,7 +7263,7 @@ impl ExecNtHandler {
     ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-        let handle = match self.pm.insert_handle(
+        let handle = match self.insert_process_handle(
             caller_pid,
             nt_process::HandleObject::TokenObject(token),
             nt_security::map_token_access(desired_access),
@@ -7124,11 +7274,6 @@ impl ExecNtHandler {
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
         };
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        let count = self.pm.handle_count(caller_pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
         if !self.xas_write_u64(out, handle as u64) {
             if let Ok(object) = self.pm.take_handle(caller_pid, handle) {
                 self.release_handle_object(object);
@@ -9566,13 +9711,6 @@ impl ExecNtHandler {
                             }
                             return STATUS_ACCESS_VIOLATION;
                         }
-                        if native_duplicate {
-                            let count = self.pm.handle_count(target_pid_for_peak.unwrap()) as u64;
-                            if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-                                PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-                            }
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                        }
                         0
                     }
                     Ok(None) => 0,
@@ -11465,7 +11603,7 @@ impl ExecNtHandler {
                         };
                         let sp = get_recv_mr(16);
                         let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        let handle = match self.pm.insert_handle(
+                        let handle = match self.insert_process_handle(
                             caller_pid,
                             nt_process::HandleObject::Thread(tid),
                             args[1] as u32,
@@ -11473,7 +11611,6 @@ impl ExecNtHandler {
                             Ok(handle) => handle as u64,
                             Err(status) => return status,
                         };
-                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                         self.queue_write(args[0], handle);
                         let cid_ptr = smss_stack_read(sp + 0x28);
                         if cid_ptr != 0 {
@@ -11568,6 +11705,7 @@ impl ExecNtHandler {
                             ) {
                                 return 0xC000_009A;
                             }
+                            let _ = self.remember_hosted_thread_user_stack(tid, initial_stack);
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle = R10
@@ -13292,14 +13430,55 @@ impl ExecNtHandler {
             NativeService::NtWriteVirtualMemory => unsafe {
                 self.nt_copy_virtual_memory(args, false)
             },
-            // NtUnmapViewOfSection(ProcessHandle, BaseAddress). We still never RECLAIM a mapped
-            // view (the bump allocator never frees) → STATUS_SUCCESS exactly as before; what is new
-            // is `DbgkUnMapViewOfSection`, which reports the unmap of an IMAGE view to the calling
-            // process's debugger. Only a view this process's map path RECORDED is an image view, so
-            // a data/anonymous base reports nothing — `MmUnmapViewOfSection`'s `if (DbgBase)`. With
-            // no debugger the helper returns on its first line.
-            NativeService::NtUnmapViewOfSection => {
-                self.dbgk_module_unload(self.pi, args.get(1).copied().unwrap_or(0));
+            // NtUnmapViewOfSection(ProcessHandle, BaseAddress). Generic data views are real VADs and
+            // are reclaimed through the VM map; image views still only report Dbgk unloads when the
+            // process manager has a tracked image module at that base.
+            NativeService::NtUnmapViewOfSection => unsafe {
+                const PROCESS_VM_OPERATION: u32 = 0x0008;
+                let base = args.get(1).copied().unwrap_or(0);
+                let (_target_pid, target_pi) =
+                    match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                        Ok(target) => target,
+                        Err(status) => return status,
+                    };
+                if let Some(ctx) = self.loop_ctx {
+                    let generic_sections = &mut *ctx.generic_sections;
+                    if let Some((_section_index, view)) =
+                        generic_sections.view_for_page(target_pi, base)
+                    {
+                        if view.base == base {
+                            let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+                                as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+                                .add(target_pi);
+                            let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+                            let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+                            *before = core::ptr::read(vm_map);
+                            *after = *before;
+                            let plan =
+                                match after.free(view.base, 0, nt_address_space::MEM_RELEASE) {
+                                    Ok(plan) => plan,
+                                    Err(status) => return status,
+                                };
+                            let mut page = plan.base;
+                            while page < plan.base + plan.size {
+                                let old = before.extent_at(page);
+                                let new = after.extent_at(page);
+                                if old.is_some_and(|extent| {
+                                    extent.state == nt_address_space::VmExtentState::Committed
+                                }) && new.is_none_or(|extent| {
+                                    extent.state != nt_address_space::VmExtentState::Committed
+                                }) {
+                                    vm_unmap_private_page(target_pi, page);
+                                }
+                                page += 0x1000;
+                            }
+                            core::ptr::write(vm_map, *after);
+                            let _ = generic_sections.unmap_view(target_pi, view.base);
+                            return 0;
+                        }
+                    }
+                }
+                self.dbgk_module_unload(target_pi, base);
                 0
             }
             NativeService::NtTestAlert
@@ -16295,74 +16474,246 @@ impl ExecNtHandler {
             // the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record the handle
             // so NtCreateProcess can spawn the real csrss image from it.
             NativeService::NtCreateSection => unsafe {
+                const SEC_IMAGE: u32 = 0x0100_0000;
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
+                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
                 let ctx = self.loop_ctx.unwrap();
-                let h = self.mint_handle();
                 let reg = &mut *ctx.reg;
                 let dll_pes = ctx.dll_pes();
                 let filled_pages = &mut *ctx.filled_pages;
                 let faults = &mut *ctx.faults;
                 let sp = get_recv_mr(16);
                 let out = get_recv_mr(9); // R10 = *SectionHandle
-                // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
-                csrss_out_write(
-                    out, h, filled_pages, faults, ctx.scratch_base, reg, dll_pes,
-                    ctx.pml4,
-                );
+                let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
+                let mut maxsize = 0u64;
+                if maxsize_ptr != 0 {
+                    let mut bytes = [0u8; 8];
+                    if !self.xas_read(maxsize_ptr, &mut bytes) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    maxsize = u64::from_le_bytes(bytes);
+                }
+                let page_protection = smss_stack_read(sp + 0x28) as u32;
+                let allocation_attrs = smss_stack_read(sp + 0x30) as u32;
                 let sec_file = smss_stack_read(sp + 0x38);
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
-                if let Ok(index) =
-                    (&mut *ctx.exe_images).create_section(self.pi, sec_file, h)
-                {
-                    let leaf = (&*ctx.exe_images).get(index).unwrap().leaf();
-                    if leaf == b"services.exe" {
-                        SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
-                    } else if leaf == b"lsass.exe" {
-                        LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
-                    } else if leaf == b"userinit.exe" {
-                        USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
-                    } else if leaf == b"explorer.exe" {
-                        EXPLORER_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+
+                if allocation_attrs & SEC_IMAGE != 0 {
+                    let exe_known = (&*ctx.exe_images)
+                        .index_for_file(self.pi, sec_file)
+                        .is_some();
+                    if exe_known || registry_slot.is_some() {
+                        let h = self.mint_handle();
+                        if exe_known {
+                            if let Ok(index) =
+                                (&mut *ctx.exe_images).create_section(self.pi, sec_file, h)
+                            {
+                                let leaf = (&*ctx.exe_images).get(index).unwrap().leaf();
+                                if leaf == b"services.exe" {
+                                    SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
+                                } else if leaf == b"lsass.exe" {
+                                    LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
+                                } else if leaf == b"userinit.exe" {
+                                    USERINIT_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+                                } else if leaf == b"explorer.exe" {
+                                    EXPLORER_IMAGE_SECTIONS.fetch_add(1, Ordering::Relaxed);
+                                }
+                                print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                                print_str(leaf);
+                                print_str(b" -> handle 0x");
+                                print_hex((h >> 32) as u32);
+                                print_hex(h as u32);
+                                print_str(b"\n");
+                            }
+                        }
+                        // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
+                        if let Some(i) = registry_slot {
+                            reg.set_section_handle(self.pi, i, h);
+                            if !self.current_process_is_winlogon() {
+                                print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                                print_str(reg.name(i));
+                                print_str(b" -> handle 0x");
+                                print_hex(h as u32);
+                                print_str(b"\n");
+                            }
+                        }
+                        if !csrss_out_write(
+                            out,
+                            h,
+                            filled_pages,
+                            faults,
+                            ctx.scratch_base,
+                            reg,
+                            dll_pes,
+                            ctx.pml4,
+                        ) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::CreateSection,
+                            0,
+                            registry_slot,
+                            sec_file,
+                            h,
+                            b"",
+                        );
+                        return 0;
                     }
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                    print_str(leaf);
-                    print_str(b" -> handle 0x");
-                    print_hex((h >> 32) as u32);
-                    print_hex(h as u32);
-                    print_str(b"\n");
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::CreateSection,
+                        STATUS_INVALID_FILE_FOR_SECTION,
+                        None,
+                        sec_file,
+                        0,
+                        b"",
+                    );
+                    return STATUS_INVALID_FILE_FOR_SECTION;
                 }
-                // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
-                if let Some(i) = registry_slot {
-                    reg.set_section_handle(self.pi, i, h);
-                    if !self.current_process_is_winlogon() {
-                        print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                        print_str(reg.name(i));
-                        print_str(b" -> handle 0x");
-                        print_hex(h as u32);
-                        print_str(b"\n");
-                    }
-                }
+
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
                 // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
                 if sec_file == 0
                     && self.current_process_is_csrss()
                     && *ctx.csrss_anon_section_handle == 0
                 {
-                    let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
-                    let size = if let Some(m) = smss_mirror(maxsize_ptr, 8) {
-                        core::ptr::read_volatile(m as *const u64)
-                    } else {
-                        0
-                    };
+                    let h = self.mint_handle();
                     *ctx.csrss_anon_section_handle = h;
                     // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
                     // window (demand-paged on touch, so unused pages cost nothing).
-                    *ctx.csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
+                    *ctx.csrss_anon_size = if maxsize == 0 { 0x10_0000 } else { maxsize };
+                    if !csrss_out_write(
+                        out,
+                        h,
+                        filled_pages,
+                        faults,
+                        ctx.scratch_base,
+                        reg,
+                        dll_pes,
+                        ctx.pml4,
+                    ) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
                     print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
                     print_hex(*ctx.csrss_anon_size as u32);
                     print_str(b" -> handle 0x");
                     print_hex(h as u32);
                     print_str(b"\n");
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::CreateSection,
+                        0,
+                        registry_slot,
+                        sec_file,
+                        h,
+                        b"",
+                    );
+                    return 0;
                 }
+
+                if let Err(status) = nt_address_space::validate_allocate_parameters(
+                    0,
+                    nt_address_space::MEM_COMMIT,
+                    page_protection,
+                ) {
+                    return status;
+                }
+
+                let (backing, backing_size) = if sec_file == 0 {
+                    if maxsize == 0 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    (GenericSectionBacking::anonymous(), maxsize)
+                } else {
+                    match self.disk_file_for(sec_file) {
+                        Err(status) => return status,
+                        Ok(Some((first_cluster, file_size))) => {
+                            let size = if maxsize == 0 {
+                                file_size as u64
+                            } else {
+                                maxsize
+                            };
+                            (
+                                GenericSectionBacking::disk(first_cluster, file_size),
+                                size,
+                            )
+                        }
+                        Ok(None) => {
+                            if let Some(file_id) = self.overlay_file_id_for(sec_file) {
+                                let Some(info) = crate::writable_fs::standard_information(file_id) else {
+                                    return nt_fs::STATUS_INVALID_HANDLE;
+                                };
+                                if info.is_directory {
+                                    return STATUS_INVALID_FILE_FOR_SECTION;
+                                }
+                                let size = if maxsize == 0 {
+                                    info.end_of_file
+                                } else {
+                                    maxsize
+                                };
+                                (GenericSectionBacking::overlay(file_id), size)
+                            } else {
+                                return STATUS_INVALID_FILE_FOR_SECTION;
+                            }
+                        }
+                    }
+                };
+                if backing_size == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
+                    return nt_fs::STATUS_INVALID_HANDLE;
+                };
+                let generic_sections = &mut *ctx.generic_sections;
+                let Some(index) = generic_sections.create(
+                    self.pi,
+                    0,
+                    backing_size,
+                    page_protection,
+                    backing,
+                ) else {
+                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                };
+                let h = match self.insert_process_handle(
+                    caller_pid,
+                    nt_process::HandleObject::Section(index as nt_process::SectionId),
+                    args[1] as u32,
+                ) {
+                    Ok(handle) => handle as u64,
+                    Err(status) => {
+                        generic_sections.clear_section(index);
+                        return status;
+                    }
+                };
+                if !generic_sections.bind_handle(index, h) {
+                    generic_sections.clear_section(index);
+                    let _ = self.close_process_handle(caller_pid, h);
+                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                }
+                if !csrss_out_write(
+                    out,
+                    h,
+                    filled_pages,
+                    faults,
+                    ctx.scratch_base,
+                    reg,
+                    dll_pes,
+                    ctx.pml4,
+                ) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                print_str(b"[section] create generic pi=");
+                print_u64(self.pi as u64);
+                print_str(b" handle=0x");
+                print_hex(h as u32);
+                print_str(b" size=0x");
+                print_hex((backing_size >> 32) as u32);
+                print_hex(backing_size as u32);
+                print_str(b" file=0x");
+                print_hex(sec_file as u32);
+                print_str(b"\n");
                 loader_trace_record(
                     self.pi,
                     LoaderOp::CreateSection,
@@ -16548,6 +16899,195 @@ impl ExecNtHandler {
                         None,
                         sect,
                         NLS_SECTION_CSRSS_VA,
+                        b"",
+                    );
+                    0
+                } else if let Some(section_index) = self
+                    .pm_pid_for_pi(self.pi)
+                    .and_then(|pid| {
+                        match self.pm.lookup_handle(pid, sect as nt_process::Handle) {
+                            Some(nt_process::HandleObject::Section(id)) => Some(id as usize),
+                            _ => None,
+                        }
+                    })
+                    .or_else(|| (&*ctx.generic_sections).index_for_handle(self.pi, sect))
+                {
+                    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                    const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
+                    const PROCESS_VM_OPERATION: u32 = 0x0008;
+                    const HIGHEST_VAD_ADDRESS: u64 = 0x0000_07ff_fffd_ffff;
+                    let generic_sections = &mut *ctx.generic_sections;
+                    let Some(section) = generic_sections.section(section_index) else {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    };
+                    let (target_pid, target_pi) =
+                        match self.resolve_process_for_access(args[1], PROCESS_VM_OPERATION) {
+                            Ok(target) => target,
+                            Err(status) => return status,
+                        };
+                    if self.pm.process(target_pid).is_some_and(|process| {
+                        matches!(
+                            process.state,
+                            nt_process::ProcessState::Exiting
+                                | nt_process::ProcessState::Terminated
+                        )
+                    }) {
+                        return nt_process::STATUS_PROCESS_IS_TERMINATING;
+                    }
+                    let base_ptr = get_recv_mr(7); // R8 = *BaseAddress
+                    let view_size_ptr = smss_stack_read(sp + 0x38);
+                    if base_ptr == 0
+                        || view_size_ptr == 0
+                        || !self.probe_user_output(base_ptr, 8)
+                        || !self.probe_user_output(view_size_ptr, 8)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    let mut word = [0u8; 8];
+                    if !self.xas_read(base_ptr, &mut word) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    let base_in = u64::from_le_bytes(word);
+                    if !self.xas_read(view_size_ptr, &mut word) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    let view_size_in = u64::from_le_bytes(word);
+                    let section_offset_ptr = smss_stack_read(sp + 0x30);
+                    let mut section_offset = 0u64;
+                    if section_offset_ptr != 0 {
+                        if !self.xas_read(section_offset_ptr, &mut word) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        section_offset = u64::from_le_bytes(word);
+                    }
+                    if base_in > HIGHEST_VAD_ADDRESS
+                        || section_offset & 0xfff != 0
+                        || section_offset > section.size
+                    {
+                        return STATUS_INVALID_VIEW_SIZE;
+                    }
+                    let remaining = section.size - section_offset;
+                    let wanted = if view_size_in == 0 {
+                        remaining
+                    } else {
+                        view_size_in.min(remaining)
+                    };
+                    let Some(map_size) = wanted.checked_add(0xfff).map(|v| v & !0xfff) else {
+                        return STATUS_INVALID_VIEW_SIZE;
+                    };
+                    if map_size == 0 {
+                        return STATUS_INVALID_VIEW_SIZE;
+                    }
+                    let zero_bits = get_recv_mr(8);
+                    if zero_bits > 53 {
+                        return nt_address_space::STATUS_INVALID_PARAMETER_3;
+                    }
+                    let placement_limit = if base_in == 0 && zero_bits != 0 {
+                        let highest = u64::MAX >> zero_bits;
+                        if highest > HIGHEST_VAD_ADDRESS {
+                            return nt_address_space::STATUS_INVALID_PARAMETER_3;
+                        }
+                        PRIVATE_VM_LIMIT.min(highest + 1)
+                    } else {
+                        PRIVATE_VM_LIMIT
+                    };
+                    let allocation_type = smss_stack_read(sp + 0x48) as u32;
+                    let win32_protect = smss_stack_read(sp + 0x50) as u32;
+                    let view_protection = if win32_protect == 0 {
+                        section.protection
+                    } else {
+                        win32_protect
+                    };
+                    if let Err(status) = nt_address_space::validate_allocate_parameters(
+                        zero_bits,
+                        nt_address_space::MEM_RESERVE
+                            | nt_address_space::MEM_COMMIT
+                            | (allocation_type & nt_address_space::MEM_TOP_DOWN),
+                        view_protection,
+                    ) {
+                        return status;
+                    }
+                    let procs = &mut *ctx.procs;
+                    let target = procs[target_pi];
+                    if target.pml4 == 0 || target.scratch_base == 0 {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    }
+                    let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+                        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+                        .add(target_pi);
+                    let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+                    let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+                    *before = core::ptr::read(vm_map);
+                    *after = *before;
+                    let plan = match after.allocate_below(
+                        (base_in != 0).then_some(base_in),
+                        map_size,
+                        nt_address_space::MEM_RESERVE
+                            | nt_address_space::MEM_COMMIT
+                            | (allocation_type & nt_address_space::MEM_TOP_DOWN),
+                        view_protection,
+                        placement_limit,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(status) => return status,
+                    };
+                    if !generic_sections.map_view(
+                        target_pi,
+                        section_index,
+                        plan.base,
+                        plan.size,
+                        section_offset,
+                        view_protection,
+                    ) {
+                        core::ptr::write(vm_map, *before);
+                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    core::ptr::write(vm_map, *after);
+                    crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
+                    if !csrss_out_write(
+                        base_ptr,
+                        plan.base,
+                        filled_pages,
+                        faults,
+                        scratch_base,
+                        reg,
+                        dll_pes,
+                        pml4,
+                    ) || !csrss_out_write(
+                        view_size_ptr,
+                        plan.size,
+                        filled_pages,
+                        faults,
+                        scratch_base,
+                        reg,
+                        dll_pes,
+                        pml4,
+                    ) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    print_str(b"[section] map generic owner-pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" target-pi=");
+                    print_u64(target_pi as u64);
+                    print_str(b" handle=0x");
+                    print_hex(sect as u32);
+                    print_str(b" base=0x");
+                    print_hex((plan.base >> 32) as u32);
+                    print_hex(plan.base as u32);
+                    print_str(b" size=0x");
+                    print_hex((plan.size >> 32) as u32);
+                    print_hex(plan.size as u32);
+                    print_str(b" off=0x");
+                    print_hex((section_offset >> 32) as u32);
+                    print_hex(section_offset as u32);
+                    print_str(b"\n");
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::MapViewOfSection,
+                        0,
+                        None,
+                        sect,
+                        plan.base,
                         b"",
                     );
                     0
@@ -16846,7 +17386,7 @@ impl ExecNtHandler {
                     }
                 }
                 let access = nt_process::dbgk::map_debug_object_access(args[1] as u32);
-                let Ok(handle) = self.pm.insert_handle(
+                let Ok(handle) = self.insert_process_handle(
                     pid,
                     nt_process::HandleObject::DebugObject(object),
                     access,

@@ -823,7 +823,7 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
     let caller = pm.create_process("caller.exe", None, None);
     let caller_thread = pm.create_thread(caller, 0x1000, 0, false).unwrap();
     let target = pm.create_process("target.exe", Some(caller), None);
-    assert!(pm.set_peb_base(target, 0x0000_0100_0053_0000));
+    assert!(pm.set_peb_base(target, 0x0000_0100_1602_0000));
     assert!(!pm.set_peb_base(0xffff_ffff, 0x1234));
     let target_main = pm.create_thread(target, 0x2000, 0, false).unwrap();
     let target_worker = pm.create_thread(target, 0x3000, 0, false).unwrap();
@@ -847,7 +847,7 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
 
     let basic = pm.query_process_basic(caller, handle as u64).unwrap();
     assert_eq!(basic.exit_status, STATUS_PENDING);
-    assert_eq!(basic.peb_base_address, 0x0000_0100_0053_0000);
+    assert_eq!(basic.peb_base_address, 0x0000_0100_1602_0000);
     assert_eq!(basic.unique_process_id, target);
     assert_eq!(basic.inherited_from_unique_process_id, caller);
     assert_eq!(

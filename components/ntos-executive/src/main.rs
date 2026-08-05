@@ -173,18 +173,14 @@ pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 /// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
 /// NTDLL_BASE + each import's export RVA.
 pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
-/// A hosted process's environment pages (TEB/PEB/params/trampoline). These live in the SAME 2 MiB
-/// image page table (the reserved IMAGE_BASE PT spans [0x40_0000, 0x60_0000)) but must sit BELOW
-/// PE_LOAD_BASE (0x56_0000) so they never collide with the hosted EXE's own image, which loads at
-/// PE_LOAD_BASE and grows UP. The OLD placement at 0x58/0x59/0x5A_0000 (= PE_LOAD_BASE + 0x20/0x30/
-/// 0x40 KiB) worked only because smss/csrss are tiny (<128 KiB); winlogon.exe is 245 KiB (image
-/// ends 0x59d000), so its .rdata (the TLS directory @ rva 0x20940 → 0x58_0940) was SHADOWED by the
-/// PEB page → LdrpInitializeTls read a zero AddressOfIndex and #PF'd writing through NULL. Placing
-/// the env block in [0x51_0000, 0x54_0000) keeps it clear of every hosted EXE (all load at
-/// 0x56_0000). Same VA in each VSpace (independent page tables), so one set of constants suffices.
-/// Layout (below PE_LOAD_BASE, distinct pages, in the reserved image PT): TEB @0x51 (2 pages),
-/// params+env @0x52 (2 pages), PEB @0x53 (1 page), trampoline @0x55 (1 page).
-pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
+/// Hosted SEC_IMAGE process environment pages. They live in a dedicated 2 MiB VA band, not in the
+/// executive/rootserver image window: win32k must be able to attach client TEB/PEB/params frames at
+/// these exact VAs while continuing to execute host glue code. The older 0x51..0x55 image-band
+/// layout overlapped real rootserver text once the component spawner stopped hiding map errors.
+pub const HOSTED_CLIENT_ENV_BASE: u64 = 0x0000_0100_1600_0000;
+/// 64 KiB spacing keeps the historical main-thread layout shape while fitting all env pages in one
+/// dedicated page table.
+pub const SMSS_TRAMP_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0004_0000;
 /// A per-hosted-process page holding a minimal client-side win32k DESKTOPINFO + a zeroed desktop
 /// WND, mapped at spawn (BATCH 39). user32's `GetThreadDesktopInfo()` reads
 /// `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and `GetThreadDesktopWnd()` then derefs
@@ -192,10 +188,10 @@ pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
 /// (winlogon) NULL-derefs at `[pDeskInfo+0x10]` (cr2=0x10). This page provides a readable
 /// DESKTOPINFO whose spwnd points at a zeroed WND (bracketed by pvDesktopBase/Limit, ulClientDelta=0
 /// so `DesktopPtrToUser(spwnd)` returns it unchanged). See BATCH 39 in ntdll_plan.md.
-pub const SMSS_DESKINFO_VA: u64 = 0x0000_0100_0054_0000;
-pub const SMSS_PEB_VA: u64 = 0x0000_0100_0053_0000;
-pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0052_0000;
-pub const SMSS_TEB_VA: u64 = 0x0000_0100_0051_0000;
+pub const SMSS_DESKINFO_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0003_0000;
+pub const SMSS_PEB_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0002_0000;
+pub const SMSS_PARAMS_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0001_0000;
+pub const SMSS_TEB_VA: u64 = HOSTED_CLIENT_ENV_BASE;
 /// A hosted process's MAIN thread's private `ACTIVATION_CONTEXT_STACK` page (`TEB+0x2C8` points
 /// here). It is one page past the two TEB pages and is deliberately NOT registered as a client
 /// frame: the TEB pages ARE registered (win32k dereferences the caller's TEB under the
@@ -203,6 +199,7 @@ pub const SMSS_TEB_VA: u64 = 0x0000_0100_0051_0000;
 /// page, which is what corrupted the ACS while it lived at `TEB+0x1800`.
 pub const ACS_PAGE_VA: u64 = SMSS_TEB_VA + 0x2000;
 const _: () = assert!(ACS_PAGE_VA + 0x1000 <= SMSS_PARAMS_VA);
+const _: () = assert!(SMSS_TRAMP_VA + 0x1000 <= HOSTED_CLIENT_ENV_BASE + 0x20_0000);
 /// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
 /// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
@@ -483,9 +480,10 @@ pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
 // answers it. Same VSpace, so the worker needs its OWN target VAs (distinct TEB → distinct GS base).
 //
 // The three lsass listener blocks already consume the SM (0x1044), 0x104C and WL_WORKER3 (0x1052)
-// windows, and 0x1058..0x105B belong to the generic TP worker slot 0, so this window follows
-// TP_WORKER_SLOT1's precedent of a HIGH target VA: 0x13F0, clear of slot 1's 0x13E0..0x13E3.
-pub const LSA_WORKER_REGION_BASE: u64 = 0x0000_0100_13F0_0000; // lsass VSpace (own pml4)
+// windows, and 0x1058..0x105B belong to the generic TP worker slot 0. The generic high worker
+// windows occupy 0x13E0..0x13FB, so this LSA-specific worker sits at the end of the same high thread
+// PT without overlapping any slot that lsass may claim dynamically.
+pub const LSA_WORKER_REGION_BASE: u64 = 0x0000_0100_13FC_0000; // lsass VSpace (own pml4)
 pub const LSA_WORKER_STACK_BASE: u64 = LSA_WORKER_REGION_BASE;
 pub const LSA_WORKER_STACK_FRAMES: u64 = 8;
 pub const LSA_WORKER_IPCBUF_VA: u64 = LSA_WORKER_REGION_BASE + 0x1_0000;
@@ -530,7 +528,7 @@ const _: () = {
 // (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
 pub const TP_WORKER_PI_COUNT: usize = 5;
 pub const TP_WORKER_LEGACY_SLOT_COUNT: usize = 2;
-pub const TP_WORKER_SLOT_COUNT: usize = 5;
+pub const TP_WORKER_SLOT_COUNT: usize = PM_RUNTIME_THREAD_SLOTS;
 pub const TP_WORKER_BADGE_BASE: u64 = 16;
 pub const TP_WORKER_AUX_BADGE_BASE: u64 = 0x200;
 pub const TP_WORKER_STACK_BASE: u64 = 0x0000_0100_1058_0000;
@@ -684,6 +682,157 @@ pub const fn tp_worker_env_scratch_va(pi: usize, slot: usize) -> u64 {
     tp_worker_stack_mirror_va(pi, slot) + TP_WORKER_ENV_SCRATCH_OFFSET
 }
 
+pub const TP_WORKER_STACK_FRAME_COUNT: usize = TP_WORKER_STACK_FRAMES as usize;
+
+#[derive(Clone, Copy)]
+struct HostedTpWorkerWindowResources {
+    live: bool,
+    stack_owner: [u64; TP_WORKER_STACK_FRAME_COUNT],
+    stack_target: [u64; TP_WORKER_STACK_FRAME_COUNT],
+    stack_mirror: [u64; TP_WORKER_STACK_FRAME_COUNT],
+    teb_owner: u64,
+    teb_target: u64,
+    teb_scratch: u64,
+    teb2_owner: u64,
+    teb2_target: u64,
+    teb2_scratch: u64,
+    acs_owner: u64,
+    acs_target: u64,
+    ipc_target: u64,
+    tramp_owner: u64,
+    tramp_target: u64,
+}
+
+impl HostedTpWorkerWindowResources {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            stack_owner: [0; TP_WORKER_STACK_FRAME_COUNT],
+            stack_target: [0; TP_WORKER_STACK_FRAME_COUNT],
+            stack_mirror: [0; TP_WORKER_STACK_FRAME_COUNT],
+            teb_owner: 0,
+            teb_target: 0,
+            teb_scratch: 0,
+            teb2_owner: 0,
+            teb2_target: 0,
+            teb2_scratch: 0,
+            acs_owner: 0,
+            acs_target: 0,
+            ipc_target: 0,
+            tramp_owner: 0,
+            tramp_target: 0,
+        }
+    }
+}
+
+static mut HOSTED_TP_WORKER_WINDOW_RESOURCES: [[HostedTpWorkerWindowResources;
+    TP_WORKER_SLOT_COUNT]; MAX_PI] =
+    [[HostedTpWorkerWindowResources::empty(); TP_WORKER_SLOT_COUNT]; MAX_PI];
+
+fn hosted_tp_worker_slot_from_layout(
+    pi: usize,
+    stack_base: u64,
+    teb_va: u64,
+    ipcbuf_va: u64,
+    tramp_va: u64,
+) -> Option<usize> {
+    if pi >= MAX_PI {
+        return None;
+    }
+    (0..TP_WORKER_SLOT_COUNT).find(|&slot| {
+        stack_base == tp_worker_stack_base(slot)
+            && teb_va == tp_worker_teb_va(slot)
+            && ipcbuf_va == tp_worker_ipcbuf_va(slot)
+            && tramp_va == tp_worker_tramp_va(slot)
+    })
+}
+
+unsafe fn recycle_mapped_cap(cap: u64) {
+    if cap != 0 {
+        let _ = page_unmap_r(cap);
+        let _ = cnode_delete_recycle_r(cap);
+    }
+}
+
+unsafe fn recycle_plain_cap(cap: u64) {
+    if cap != 0 {
+        let _ = cnode_delete_recycle_r(cap);
+    }
+}
+
+unsafe fn detach_win32k_attached_page_for_thread_release(pi: usize, page: u64) {
+    if W32_ATTACHED_PI.load(Ordering::Relaxed) != pi as u64 {
+        return;
+    }
+    let (cap, _) = w32_attach_replace_mapping(page, 0, 0);
+    recycle_mapped_cap(cap);
+}
+
+unsafe fn take_registered_thread_page(pi: usize, page: u64, owner: u64) {
+    detach_win32k_attached_page_for_thread_release(pi, page);
+    if let Some((frame, alias_cap, source_cap, _owns_frame)) = csrss_frame_take(pi as u64, page) {
+        recycle_mapped_cap(alias_cap);
+        if source_cap != owner && source_cap != frame && source_cap != alias_cap {
+            recycle_plain_cap(source_cap);
+        }
+    }
+}
+
+unsafe fn release_owned_thread_frame(owner: u64) {
+    if owner != 0 {
+        vm_frame_release(owner, 0);
+    }
+}
+
+unsafe fn store_hosted_tp_worker_window_resources(
+    pi: usize,
+    slot: usize,
+    resources: HostedTpWorkerWindowResources,
+) {
+    if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
+        let table = core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES)
+            as *mut [[HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT]; MAX_PI];
+        (*table)[pi][slot] = resources;
+    }
+}
+
+pub(crate) unsafe fn release_hosted_tp_worker_window_resources(pi: usize, slot: usize) {
+    if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
+        return;
+    }
+    let table = core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES)
+        as *mut [[HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT]; MAX_PI];
+    let resources = (*table)[pi][slot];
+    if !resources.live {
+        return;
+    }
+    (*table)[pi][slot] = HostedTpWorkerWindowResources::empty();
+
+    for index in 0..TP_WORKER_STACK_FRAME_COUNT {
+        let page = tp_worker_stack_base(slot) + index as u64 * 0x1000;
+        take_registered_thread_page(pi, page, resources.stack_owner[index]);
+        recycle_mapped_cap(resources.stack_target[index]);
+        recycle_mapped_cap(resources.stack_mirror[index]);
+        release_owned_thread_frame(resources.stack_owner[index]);
+    }
+
+    take_registered_thread_page(pi, tp_worker_teb_va(slot), resources.teb_owner);
+    recycle_mapped_cap(resources.teb_target);
+    recycle_mapped_cap(resources.teb_scratch);
+    release_owned_thread_frame(resources.teb_owner);
+
+    take_registered_thread_page(pi, tp_worker_teb_va(slot) + 0x1000, resources.teb2_owner);
+    recycle_mapped_cap(resources.teb2_target);
+    recycle_mapped_cap(resources.teb2_scratch);
+    release_owned_thread_frame(resources.teb2_owner);
+
+    recycle_mapped_cap(resources.acs_target);
+    release_owned_thread_frame(resources.acs_owner);
+    recycle_mapped_cap(resources.ipc_target);
+    recycle_mapped_cap(resources.tramp_target);
+    release_owned_thread_frame(resources.tramp_owner);
+}
+
 const fn hosted_thread_layout_is_disjoint(
     stack_base: u64,
     stack_frames: u64,
@@ -772,14 +921,19 @@ const _: () = {
     assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
     assert!(TP_WORKER_AUX_BADGE_BASE >= 0x100);
     assert!(TP_WORKER_SLOT_COUNT > TP_WORKER_LEGACY_SLOT_COUNT);
-    assert!(TP_WORKER_SLOT_COUNT <= 5);
+    assert!(TP_WORKER_SLOT_COUNT <= 8);
     assert!(tp_worker_badge(0, 0) == 16);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 0) == 20);
     assert!(tp_worker_badge(0, 1) == 21);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 1) == 25);
     assert!(tp_worker_badge(0, 2) == TP_WORKER_AUX_BADGE_BASE);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 2) == TP_WORKER_AUX_BADGE_BASE + 4);
-    assert!(tp_worker_badge(TP_WORKER_PI_COUNT, 0) == TP_WORKER_AUX_BADGE_BASE + 15);
+    assert!(
+        tp_worker_badge(TP_WORKER_PI_COUNT, 0)
+            == TP_WORKER_AUX_BADGE_BASE
+                + ((TP_WORKER_SLOT_COUNT - TP_WORKER_LEGACY_SLOT_COUNT) * TP_WORKER_PI_COUNT)
+                    as u64
+    );
     match tp_worker_identity_from_badge(tp_worker_badge(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1)) {
         Some((pi, slot)) => {
             assert!(pi == MAX_PI - 1);
@@ -1211,6 +1365,334 @@ const VM_REGION_CAPACITY: usize = 64;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
     [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
+
+const GENERIC_SECTION_BACKING_NONE: u8 = 0;
+const GENERIC_SECTION_BACKING_ANON: u8 = 1;
+const GENERIC_SECTION_BACKING_DISK: u8 = 2;
+const GENERIC_SECTION_BACKING_OVERLAY: u8 = 3;
+const GENERIC_SECTION_CAP: usize = 128;
+const GENERIC_SECTION_VIEW_CAP: usize = 256;
+const GENERIC_SECTION_PAGE_CAP: usize = 2048;
+
+#[derive(Clone, Copy)]
+pub(crate) struct GenericSectionBacking {
+    pub(crate) kind: u8,
+    pub(crate) first_cluster: u32,
+    pub(crate) file_size: u32,
+    pub(crate) overlay_file_id: u64,
+}
+
+impl GenericSectionBacking {
+    pub(crate) const fn none() -> Self {
+        Self {
+            kind: GENERIC_SECTION_BACKING_NONE,
+            first_cluster: 0,
+            file_size: 0,
+            overlay_file_id: 0,
+        }
+    }
+
+    pub(crate) const fn anonymous() -> Self {
+        Self {
+            kind: GENERIC_SECTION_BACKING_ANON,
+            first_cluster: 0,
+            file_size: 0,
+            overlay_file_id: 0,
+        }
+    }
+
+    pub(crate) const fn disk(first_cluster: u32, file_size: u32) -> Self {
+        Self {
+            kind: GENERIC_SECTION_BACKING_DISK,
+            first_cluster,
+            file_size,
+            overlay_file_id: 0,
+        }
+    }
+
+    pub(crate) const fn overlay(file_id: u64) -> Self {
+        Self {
+            kind: GENERIC_SECTION_BACKING_OVERLAY,
+            first_cluster: 0,
+            file_size: 0,
+            overlay_file_id: file_id,
+        }
+    }
+
+    pub(crate) const fn is_live(self) -> bool {
+        self.kind != GENERIC_SECTION_BACKING_NONE
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GenericSection {
+    pub(crate) live: bool,
+    pub(crate) owner_pi: usize,
+    pub(crate) handle: u64,
+    pub(crate) size: u64,
+    pub(crate) protection: u32,
+    pub(crate) backing: GenericSectionBacking,
+}
+
+impl GenericSection {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            live: false,
+            owner_pi: 0,
+            handle: 0,
+            size: 0,
+            protection: nt_address_space::PAGE_NOACCESS,
+            backing: GenericSectionBacking::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GenericSectionView {
+    pub(crate) live: bool,
+    pub(crate) pi: usize,
+    pub(crate) section_index: usize,
+    pub(crate) base: u64,
+    pub(crate) size: u64,
+    pub(crate) section_offset: u64,
+    pub(crate) protection: u32,
+}
+
+impl GenericSectionView {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            pi: 0,
+            section_index: usize::MAX,
+            base: 0,
+            size: 0,
+            section_offset: 0,
+            protection: nt_address_space::PAGE_NOACCESS,
+        }
+    }
+
+    fn contains(self, pi: usize, page: u64) -> bool {
+        self.live && self.pi == pi && page >= self.base && page < self.base + self.size
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GenericSectionPage {
+    live: bool,
+    section_index: usize,
+    page_index: u64,
+    frame: u64,
+}
+
+impl GenericSectionPage {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            section_index: usize::MAX,
+            page_index: 0,
+            frame: 0,
+        }
+    }
+}
+
+pub(crate) struct GenericSectionTable {
+    sections: [GenericSection; GENERIC_SECTION_CAP],
+    views: [GenericSectionView; GENERIC_SECTION_VIEW_CAP],
+    pages: [GenericSectionPage; GENERIC_SECTION_PAGE_CAP],
+}
+
+impl GenericSectionTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            sections: [GenericSection::empty(); GENERIC_SECTION_CAP],
+            views: [GenericSectionView::empty(); GENERIC_SECTION_VIEW_CAP],
+            pages: [GenericSectionPage::empty(); GENERIC_SECTION_PAGE_CAP],
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for section in &mut self.sections {
+            *section = GenericSection::empty();
+        }
+        for view in &mut self.views {
+            *view = GenericSectionView::empty();
+        }
+        for page in &mut self.pages {
+            *page = GenericSectionPage::empty();
+        }
+    }
+
+    pub(crate) fn create(
+        &mut self,
+        owner_pi: usize,
+        handle: u64,
+        size: u64,
+        protection: u32,
+        backing: GenericSectionBacking,
+    ) -> Option<usize> {
+        if size == 0 || !backing.is_live() {
+            return None;
+        }
+        if handle != 0 {
+            if let Some(index) = self.index_for_handle(owner_pi, handle) {
+                self.sections[index].size = size;
+                self.sections[index].protection = protection;
+                self.sections[index].backing = backing;
+                return Some(index);
+            }
+        }
+        for index in 0..self.sections.len() {
+            if !self.sections[index].live {
+                self.sections[index] = GenericSection {
+                    live: true,
+                    owner_pi,
+                    handle,
+                    size,
+                    protection,
+                    backing,
+                };
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn bind_handle(&mut self, index: usize, handle: u64) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        let Some(section) = self.sections.get_mut(index) else {
+            return false;
+        };
+        if !section.live {
+            return false;
+        }
+        section.handle = handle;
+        true
+    }
+
+    pub(crate) fn clear_section(&mut self, index: usize) {
+        if let Some(section) = self.sections.get_mut(index) {
+            *section = GenericSection::empty();
+        }
+        for view in &mut self.views {
+            if view.live && view.section_index == index {
+                *view = GenericSectionView::empty();
+            }
+        }
+        for page in &mut self.pages {
+            if page.live && page.section_index == index {
+                *page = GenericSectionPage::empty();
+            }
+        }
+    }
+
+    pub(crate) fn index_for_handle(&self, owner_pi: usize, handle: u64) -> Option<usize> {
+        self.sections.iter().position(|section| {
+            section.live && section.owner_pi == owner_pi && section.handle == handle
+        })
+    }
+
+    pub(crate) fn section(&self, index: usize) -> Option<GenericSection> {
+        self.sections
+            .get(index)
+            .copied()
+            .filter(|section| section.live)
+    }
+
+    pub(crate) fn map_view(
+        &mut self,
+        pi: usize,
+        section_index: usize,
+        base: u64,
+        size: u64,
+        section_offset: u64,
+        protection: u32,
+    ) -> bool {
+        if self.section(section_index).is_none() || base == 0 || size == 0 {
+            return false;
+        }
+        for view in &mut self.views {
+            if !view.live {
+                *view = GenericSectionView {
+                    live: true,
+                    pi,
+                    section_index,
+                    base,
+                    size,
+                    section_offset,
+                    protection,
+                };
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn unmap_view(&mut self, pi: usize, base: u64) -> Option<GenericSectionView> {
+        for view in &mut self.views {
+            if view.live && view.pi == pi && view.base == base {
+                let removed = *view;
+                *view = GenericSectionView::empty();
+                return Some(removed);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn view_for_page(
+        &self,
+        pi: usize,
+        page: u64,
+    ) -> Option<(usize, GenericSectionView)> {
+        for view in &self.views {
+            if view.contains(pi, page) {
+                return Some((view.section_index, *view));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
+        self.pages
+            .iter()
+            .find(|page| {
+                page.live && page.section_index == section_index && page.page_index == page_index
+            })
+            .map(|page| page.frame)
+            .filter(|frame| *frame != 0)
+    }
+
+    pub(crate) fn set_page_frame(
+        &mut self,
+        section_index: usize,
+        page_index: u64,
+        frame: u64,
+    ) -> bool {
+        if frame == 0 {
+            return false;
+        }
+        for page in &mut self.pages {
+            if page.live && page.section_index == section_index && page.page_index == page_index {
+                page.frame = frame;
+                return true;
+            }
+        }
+        for page in &mut self.pages {
+            if !page.live {
+                *page = GenericSectionPage {
+                    live: true,
+                    section_index,
+                    page_index,
+                    frame,
+                };
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Read-modify-write scratch for `NtAllocateVirtualMemory` / `NtFreeVirtualMemory`. A whole
 /// `VmRegionMap` is KILOBYTES, and the executive's rootserver stack floats immediately after its
 /// loaded image — two on-stack copies per call overflowed it into the guard page as soon as
@@ -3782,7 +4264,9 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
 ///  * the spawn canary at `TEB+0x1FC0` is intact, so nothing else walked the page either.
 unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     let flushes = GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
-    let discarded = GDI_BATCH_RECORDS_DISCARDED.load(Ordering::Relaxed);
+    let records = GDI_BATCH_RECORDS_FLUSHED.load(Ordering::Relaxed);
+    let failures = GDI_BATCH_FLUSH_FAILURES.load(Ordering::Relaxed);
+    let write_windows = GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.load(Ordering::Relaxed);
     let max_offset = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
     let ntrpc = core::ptr::read_volatile((tail + 0x698) as *const u64);
@@ -3795,8 +4279,12 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     let ntrpc_ok = ntrpc == 0 || (ntrpc >> 47) == 0;
     print_str(b"[gdi-batch] KeGdiFlushUserBatch flushes=");
     print_u64(flushes);
-    print_str(b" records-cleared=");
-    print_u64(discarded);
+    print_str(b" records-flushed=");
+    print_u64(records);
+    print_str(b" failures=");
+    print_u64(failures);
+    print_str(b" tail-write-windows=");
+    print_u64(write_windows);
     print_str(b" max-Offset=0x");
     print_hex(max_offset as u32);
     print_str(b"/0x");
@@ -3816,6 +4304,9 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
         b"exec_gdi_user_batch_flushed",
         GDI_USER_BATCH_FLUSH
             && flushes >= 1
+            && records >= 1
+            && failures == 0
+            && write_windows >= 1
             && max_offset <= GDI_BATCH_BUF_SIZE as u64
             && live_offset <= GDI_BATCH_BUF_SIZE
             && ntrpc_ok
@@ -3839,7 +4330,8 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
 ///     registered as a client frame, but no win32k demand fault ever asks for it, so
 ///     `map_csrss_page_into_win32k` never runs for it;
 ///  2. `W32_TEB_TAIL_WRITE_FAULTS == 0` — with the page mapped READ-ONLY into win32k (the class fix
-///     below), win32k never once took a store fault on it;
+///     below), win32k never once took an unexpected store fault on it. The registered
+///     `NtGdiFlushUserBatch` callout has a narrow write-through window for `TEB.GdiBatchCount`;
 ///  3. the frame is not ALIASED (`teb_tail_alias_scan`: exactly ONE registration, the legitimate
 ///     one), and the good→bad transition never straddled a win32k dispatch — sampled before AND
 ///     after every dispatch, at the single funnel every nested dispatch also goes through. It only
@@ -3865,7 +4357,8 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
 ///  * the protection was really LIVE (`WL_TEB2_CYCLES >= 1`) and really saw client traffic
 ///    (`WL_TEB2_EMULATED + WL_TEB2_WRITE_FAULTS >= 1`), so an intact tail is CONTAINMENT, not the
 ///    absence of anything happening;
-///  * win32k took ZERO stores on it — the refutation, asserted rather than narrated.
+///  * win32k took ZERO unexpected stores on it; the allowed GDI batch-count clear is counted by
+///    `GDI_BATCH_TEB_TAIL_WRITE_WINDOWS`.
 unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
     let maximum_length = core::ptr::read_volatile((tail + 0x25a) as *const u16);
@@ -3873,6 +4366,7 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     let canary = teb_tail_canary_intact(tail);
     let actctx = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2c8) as *const u64);
     let write_faults = W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed);
+    let batch_write_windows = GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.load(Ordering::Relaxed);
     let ro_maps = W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed);
     let repairs = TEB_TAIL_REPAIRS.load(Ordering::Relaxed);
     let cycles = WL_TEB2_CYCLES.load(Ordering::Relaxed);
@@ -3892,6 +4386,8 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     print_u64(ro_maps);
     print_str(b" store-faults=");
     print_u64(write_faults);
+    print_str(b" gdi-write-windows=");
+    print_u64(batch_write_windows);
     print_str(b" shadows=");
     print_u64(W32_TEB_TAIL_SHADOWS.load(Ordering::Relaxed));
     print_str(b" | client protected=");
@@ -3914,7 +4410,8 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
             // The protection was live and really saw the client writing this page…
             && cycles >= 1
             && emulated + client_stores >= 1
-            // …and win32k, the accused, never stored into it once.
+            // …and win32k, the accused, never took an unexpected store path. The only legitimate
+            // write-through is `NtGdiFlushUserBatch` clearing `TEB.GdiBatchCount`.
             && write_faults == 0,
         passed,
     );
@@ -5844,18 +6341,59 @@ static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_ALIAS: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_ALIAS_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_SOURCE_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_OWNS_FRAME: [bool; CSRSS_FRAME_CAP] = [false; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
 static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
-    let _ = csrss_frame_put_at_cap(pi, page, fr, 0, 0);
+    let _ = csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, 0);
+}
+pub(crate) unsafe fn csrss_frame_put_with_source(
+    pi: u64,
+    page: u64,
+    fr: u64,
+    source_cap: u64,
+) -> bool {
+    csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, source_cap)
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
 pub(crate) unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
-    let _ = csrss_frame_put_at_cap(pi, page, fr, alias, 0);
+    let _ = csrss_frame_put_at_cap_source(pi, page, fr, alias, 0, 0);
 }
 unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
+    csrss_frame_put_at_cap_source(pi, page, fr, alias, alias_cap, 0)
+}
+unsafe fn csrss_frame_put_at_cap_source(
+    pi: u64,
+    page: u64,
+    fr: u64,
+    alias: u64,
+    alias_cap: u64,
+    source_cap: u64,
+) -> bool {
+    csrss_frame_put_at_cap_source_owned(pi, page, fr, alias, alias_cap, source_cap, true)
+}
+
+pub(crate) unsafe fn csrss_frame_put_section_mapping(
+    pi: u64,
+    page: u64,
+    fr: u64,
+    source_cap: u64,
+) -> bool {
+    csrss_frame_put_at_cap_source_owned(pi, page, fr, 0, 0, source_cap, false)
+}
+
+unsafe fn csrss_frame_put_at_cap_source_owned(
+    pi: u64,
+    page: u64,
+    fr: u64,
+    alias: u64,
+    alias_cap: u64,
+    source_cap: u64,
+    owns_frame: bool,
+) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
@@ -5876,6 +6414,16 @@ unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_
                 if core::ptr::read(alias_caps.add(i)) == 0 {
                     core::ptr::write(alias_caps.add(i), alias_cap);
                 }
+            }
+            if source_cap != 0 {
+                let source_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64;
+                if core::ptr::read(source_caps.add(i)) == 0 {
+                    core::ptr::write(source_caps.add(i), source_cap);
+                }
+            }
+            let owned = core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool;
+            if core::ptr::read(owned.add(i)) != owns_frame {
+                return false;
             }
             return true;
         }
@@ -5901,6 +6449,14 @@ unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_
             (core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64).add(n),
             alias_cap,
         );
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64).add(n),
+            source_cap,
+        );
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool).add(n),
+            owns_frame,
+        );
         core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
         note_high_water(&CSRSS_FRAME_HW, (n + 1) as u64);
         true
@@ -5909,17 +6465,21 @@ unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_
         false
     }
 }
-unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64)> {
+unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64;
     let pis = core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8;
     let frs = core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64;
     let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
     let alias_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS_CAP) as *mut u64;
+    let source_caps = core::ptr::addr_of_mut!(CSRSS_FRAME_SOURCE_CAP) as *mut u64;
+    let owns_frames = core::ptr::addr_of_mut!(CSRSS_FRAME_OWNS_FRAME) as *mut bool;
     for index in 0..n {
         if core::ptr::read(vas.add(index)) == page && core::ptr::read(pis.add(index)) as u64 == pi {
             let frame = core::ptr::read(frs.add(index));
             let alias_cap = core::ptr::read(alias_caps.add(index));
+            let source_cap = core::ptr::read(source_caps.add(index));
+            let owns_frame = core::ptr::read(owns_frames.add(index));
             let last = n - 1;
             if index != last {
                 core::ptr::write(vas.add(index), core::ptr::read(vas.add(last)));
@@ -5927,14 +6487,24 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64)> {
                 core::ptr::write(frs.add(index), core::ptr::read(frs.add(last)));
                 core::ptr::write(aliases.add(index), core::ptr::read(aliases.add(last)));
                 core::ptr::write(alias_caps.add(index), core::ptr::read(alias_caps.add(last)));
+                core::ptr::write(
+                    source_caps.add(index),
+                    core::ptr::read(source_caps.add(last)),
+                );
+                core::ptr::write(
+                    owns_frames.add(index),
+                    core::ptr::read(owns_frames.add(last)),
+                );
             }
             core::ptr::write(vas.add(last), 0);
             core::ptr::write(pis.add(last), 0);
             core::ptr::write(frs.add(last), 0);
             core::ptr::write(aliases.add(last), 0);
             core::ptr::write(alias_caps.add(last), 0);
+            core::ptr::write(source_caps.add(last), 0);
+            core::ptr::write(owns_frames.add(last), false);
             core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), last);
-            return Some((frame, alias_cap));
+            return Some((frame, alias_cap, source_cap, owns_frame));
         }
     }
     None
@@ -5961,6 +6531,188 @@ unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
     } else {
         core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index))
     }
+}
+pub(crate) unsafe fn csrss_frame_source_cap_get(pi: u64, page: u64) -> u64 {
+    let (_, index) = csrss_frame_get_exact(pi, page);
+    if index == usize::MAX {
+        0
+    } else {
+        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index))
+    }
+}
+pub(crate) unsafe fn csrss_frame_clone_source_cap_get(pi: u64, page: u64) -> u64 {
+    let (frame, index) = csrss_frame_get_exact(pi, page);
+    if index == usize::MAX || frame == 0 {
+        return 0;
+    }
+    let source_cap =
+        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index));
+    if source_cap != 0 {
+        source_cap
+    } else {
+        frame
+    }
+}
+unsafe fn copy_registered_frame_cap(source: u64) -> (u64, u64) {
+    if source == 0 {
+        return (0, 3);
+    }
+    let (copied, error) = copy_cap_r(source);
+    if error == 0 {
+        return (copied, 0);
+    }
+    if copied != 0 {
+        let _ = cnode_delete_recycle_r(copied);
+    }
+    (0, error)
+}
+pub(crate) unsafe fn csrss_frame_create_source_copy(
+    parent: u64,
+    pi: u64,
+    page: u64,
+    what: &[u8],
+) -> u64 {
+    if parent == 0 {
+        print_str(b"[frame-source] ");
+        print_str(what);
+        print_str(b" missing parent pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+        return 0;
+    }
+    let (source, error) = copy_cap_r(parent);
+    if error == 0 {
+        return source;
+    }
+    if source != 0 {
+        let _ = cnode_delete_recycle_r(source);
+    }
+    print_str(b"[frame-source] ");
+    print_str(what);
+    print_str(b" copy failed pi=");
+    print_u64(pi);
+    print_str(b" page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" parent=0x");
+    print_hex(parent as u32);
+    print_str(b" error=");
+    print_u64(error);
+    print_str(b"\n");
+    0
+}
+
+static FRAME_SOURCE_PROBE_OK_LOGS: AtomicU64 = AtomicU64::new(0);
+static FRAME_SOURCE_PROBE_FAIL_LOGS: AtomicU64 = AtomicU64::new(0);
+static FRAME_SOURCE_REMAP_FAIL_PROBES: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn csrss_frame_probe_source_copy(pi: u64, page: u64, source_cap: u64, what: &[u8]) {
+    if source_cap == 0 {
+        return;
+    }
+    let (probe, error) = copy_cap_r(source_cap);
+    if error == 0 {
+        let _ = cnode_delete_recycle_r(probe);
+        if FRAME_SOURCE_PROBE_OK_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[frame-source] ");
+            print_str(what);
+            print_str(b" probe ok pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" source=0x");
+            print_hex(source_cap as u32);
+            print_str(b"\n");
+        }
+        return;
+    }
+    if FRAME_SOURCE_PROBE_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+        print_str(b"[frame-source] ");
+        print_str(what);
+        print_str(b" probe failed pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" source=0x");
+        print_hex(source_cap as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+    }
+}
+
+unsafe fn csrss_frame_probe_primary_after_source_failure(
+    pi: u64,
+    page: u64,
+    frame: u64,
+    source_cap: u64,
+    source_error: u64,
+) {
+    if FRAME_SOURCE_REMAP_FAIL_PROBES.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    let (root_cnode_probe, root_cnode_error) = copy_cap_r(CAP_INIT_THREAD_CNODE);
+    if root_cnode_error == 0 {
+        let _ = cnode_delete_recycle_r(root_cnode_probe);
+    }
+    let (root_vspace_probe, root_vspace_error) = copy_cap_r(CAP_INIT_THREAD_VSPACE);
+    if root_vspace_error == 0 {
+        let _ = cnode_delete_recycle_r(root_vspace_probe);
+    }
+    let (primary_probe, primary_error) = copy_cap_r(frame);
+    if primary_error == 0 {
+        let _ = cnode_delete_recycle_r(primary_probe);
+    }
+    print_str(b"[frame-source] remap source copy failed pi=");
+    print_u64(pi);
+    print_str(b" page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" source=0x");
+    print_hex(source_cap as u32);
+    print_str(b" source-error=");
+    print_u64(source_error);
+    print_str(b" primary=0x");
+    print_hex(frame as u32);
+    print_str(b" primary-probe-error=");
+    print_u64(primary_error);
+    print_str(b" root-cnode-probe-error=");
+    print_u64(root_cnode_error);
+    print_str(b" root-vspace-probe-error=");
+    print_u64(root_vspace_error);
+    print_str(b"\n");
+}
+
+/// Copy the registered per-client frame cap for a win32k attach/remap. Records that have a separate
+/// derivation source must copy from that source; source-less records copy their primary cap. Executive
+/// scratch aliases are intentionally not consulted here, because a missing/invalid source is a real
+/// frame-registration bug that should stay visible.
+pub(crate) unsafe fn csrss_frame_copy_exact_for_win32k(pi: u64, page: u64) -> (u64, u64, u64) {
+    let (frame, index) = csrss_frame_get_exact(pi, page);
+    if index == usize::MAX || frame == 0 {
+        return (0, 0, 3);
+    }
+    let source_cap = csrss_frame_source_cap_get(pi, page);
+    if source_cap != 0 {
+        let (source_copy, source_error) = copy_registered_frame_cap(source_cap);
+        if source_error != 0 {
+            csrss_frame_probe_primary_after_source_failure(
+                pi,
+                page,
+                frame,
+                source_cap,
+                source_error,
+            );
+        }
+        return (source_copy, source_cap, source_error);
+    }
+    let (copied, error) = copy_registered_frame_cap(frame);
+    (copied, frame, error)
 }
 unsafe fn client_range_has_backing(pi: u64, va: u64, len: usize) -> bool {
     if len == 0 {
@@ -6096,6 +6848,13 @@ pub(crate) static VM_FAIL_ALIAS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static VM_FAIL_REGISTRY: AtomicU64 = AtomicU64::new(0);
 /// High-water of the per-process VAD extent count (`VM_REGION_CAPACITY`).
 pub(crate) static VM_REGION_HW: AtomicU64 = AtomicU64::new(0);
+/// User stack VADs released by thread teardown (`TEB.FreeStackOnTermination` semantics).
+pub(crate) static USER_STACK_VAD_RELEASES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USER_STACK_VAD_RELEASE_FAILS: AtomicU64 = AtomicU64::new(0);
+/// Per-hosted-thread CSpace roots released after the owning TCB terminates. Short-lived ReactOS
+/// RPC/TP workers create one private CNode each; failing to delete it exhausts the kernel CNode pool.
+pub(crate) static HOSTED_THREAD_CNODE_RELEASES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HOSTED_THREAD_CNODE_RELEASE_FAILS: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes one retyped object of `obj` (user size `bits`) consumes, mirroring the kernel's
 /// `object_type::size_in_bits`.
@@ -6195,6 +6954,14 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(VM_REGION_HW.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(VM_REGION_CAPACITY as u64);
+    print_str(b" stack-vad-free=");
+    print_u64(USER_STACK_VAD_RELEASES.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(USER_STACK_VAD_RELEASE_FAILS.load(Ordering::Relaxed));
+    print_str(b" thread-cnode-free=");
+    print_u64(HOSTED_THREAD_CNODE_RELEASES.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(HOSTED_THREAD_CNODE_RELEASE_FAILS.load(Ordering::Relaxed));
     print_str(b" vm-fail pt=");
     print_u64(VM_FAIL_PT.load(Ordering::Relaxed));
     print_str(b" frame=");
@@ -6353,31 +7120,27 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
 // `store-faults = 0`): the writer was always the CLIENT's own gdi32, in the client's own window.
 //
 // **The fix is the kernel step, at the kernel's site, done by the kernel.** The executive is what
-// plays `KiSystemCallHandler` for a hosted process' win32k syscalls, so it performs the flush
-// through its OWN persistent aliases of the client's two TEB pages — never through win32k's view,
-// which keeps `exec_teb_not_clobbered_by_win32k`'s "win32k stored zero times" clause meaningful.
+// plays `KiSystemCallHandler` for a hosted process' win32k syscalls, so it observes the caller's
+// live `GdiBatchCount` and delegates execution to win32k's own registered
+// `WIN32_CALLOUTS_FPNS.BatchFlushRoutine`. That routine walks the records, draws them, and clears
+// `GdiTebBatch.Offset` / `.HDC` / `GdiBatchCount`, just like ReactOS expects.
 //
-// **What is NOT done here, stated honestly.** `NtGdiFlushUserBatch` also EXECUTES the batched
-// commands (`GdiFlushUserBatch(pDC, pHdr)` per record) before clearing. Our host does not: those
-// records are discarded, which is *exactly* what already happened before this batch (nothing ever
-// ran them), so this is a strict improvement with no rendering change — and the discarded count is
-// COUNTED (`GDI_BATCH_RECORDS_DISCARDED`) rather than hidden. Executing them means driving win32k's
-// registered `BatchFlushRoutine` over a staged TEB, which changes what gets drawn and belongs in its
-// own measured step.
+// The one host-specific wrinkle is the TEB-tail protection below: `GdiBatchCount` lives on the
+// second TEB page, which ordinary win32k dispatches see read-only. During this one registered
+// callout the bridge maps that page writable, then restores the normal read-only policy before the
+// next dispatch.
 /// Ship switch for the `KeGdiFlushUserBatch` kernel step (bypass control).
 pub(crate) const GDI_USER_BATCH_FLUSH: bool = true;
-/// ★ WHAT BOUNDING `Offset` COSTS, MEASURED — and why the flush WALKS the records it clears.
+/// ★ WHAT BOUNDING `Offset` COSTS, MEASURED — and why the flush executes the records it finds.
 ///
 /// `ExtTextOutW` (`objects/text.c:603`) and `PolyPatBlt` (`objects/painting.c:655`) re-check the LIVE
 /// `GdiTebBatch.Offset` after `GdiAllocBatchCommand` and fall through to the real
 /// `NtGdiExtTextOutW` / `NtGdiPolyPatBlt` **only when the record would not fit**. The runaway
 /// `Offset` made that check fail every time, so those calls reached win32k as real system calls.
-/// With `Offset` correctly bounded they start FITTING and are batched instead — and this host does
-/// not execute batch records, so winlogon's credential-edit `ExtTextOut` moved off the syscall path
-/// (measured: `gdi-readbacks` 1 -> 0). The DATA did not disappear, only its transport: the record in
-/// `GdiTebBatch` carries the same live `EDITSTATE.text`, and the flush reads it through the
-/// executive's TEB alias. Executing the records for real (win32k's registered `BatchFlushRoutine`)
-/// is the tracked follow-up — it changes what is DRAWN, which a corruption fix must not do blind.
+/// With `Offset` correctly bounded they start FITTING and are batched instead. The DATA did not
+/// disappear, only its transport: the record in `GdiTebBatch` carries the same live
+/// `EDITSTATE.text`, and the flush reads it through the executive's TEB alias before handing the
+/// batch to win32k's registered `BatchFlushRoutine` for real drawing.
 /// A control experiment that disabled batching outright (parking a non-HDC sentinel in
 /// `GdiTebBatch.HDC`, so `gdi32p.h:443` refuses every DC) was measured and REJECTED: 226/99 with 27
 /// FAILs — winlogon never reached its SAS post at all.
@@ -6389,47 +7152,45 @@ pub(crate) use nt_user_callback::{
 };
 /// Number of times the kernel step really ran on a live client win32k system call.
 pub(crate) static GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
-/// Batch records the flush cleared (and, for now, discarded) — the named fidelity gap.
-pub(crate) static GDI_BATCH_RECORDS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+/// Batch records handed to win32k's registered `BatchFlushRoutine`.
+pub(crate) static GDI_BATCH_RECORDS_FLUSHED: AtomicU64 = AtomicU64::new(0);
+/// Calls to the registered win32k batch flush routine that failed or walled.
+pub(crate) static GDI_BATCH_FLUSH_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Narrow writable mappings opened for `TEB.GdiBatchCount` while `NtGdiFlushUserBatch` runs.
+pub(crate) static GDI_BATCH_TEB_TAIL_WRITE_WINDOWS: AtomicU64 = AtomicU64::new(0);
 /// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
 /// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-/// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `pi`, exactly where
-/// `KiSystemCallHandler` runs it. Reads + clears `GdiBatchCount` / `GdiTebBatch.Offset` / `.HDC`
-/// through the EXECUTIVE's persistent aliases of the client's TEB pages (page 1 at `scr + 0x0000`,
-/// the tail at `scr + 0x5000`), so win32k's view of the tail is never involved.
-pub(crate) unsafe fn ke_gdi_flush_user_batch(pi: usize, client_teb: u64) {
-    if !GDI_USER_BATCH_FLUSH || client_teb != SMSS_TEB_VA {
-        // Only a process' MAIN thread TEB has a fixed executive alias; a hosted worker thread's TEB
-        // is a different VA and is not a win32k GUI client in this boot.
+/// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `client`, exactly
+/// where `KiSystemCallHandler` runs it. The executive reads the live TEB only to decide whether
+/// there is a batch and to keep the existing proof/readback counters; execution and clearing are
+/// delegated to win32k's registered `BatchFlushRoutine`.
+pub(crate) unsafe fn ke_gdi_flush_user_batch(
+    client: win32k_glue::Win32kClientContext,
+    teb_alias: u64,
+) {
+    if !GDI_USER_BATCH_FLUSH || client.teb == 0 || teb_alias == 0 {
         return;
     }
-    let env_scratch = env_scratch_base_for_pi(pi);
-    if env_scratch == 0 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
-        return;
-    }
-    // TEB.GdiBatchCount @ 0x1740 (tail page, offset 0x740); TEB.GdiTebBatch @ 0x2F0 (page 1):
-    // Offset @ 0x2F0, HDC @ 0x2F8, Buffer @ 0x300.
-    let count_field = (env_scratch + 0x4000 + TEB_GDI_BATCH_COUNT) as *mut u32;
+    // Main hosted processes use the historical env-scratch layout: page 1 at `alias + 0`, page 2 at
+    // `alias + 0x5000`. Real worker TEB mirrors are contiguous.
+    let tail_bias = if client.teb == SMSS_TEB_VA { 0x4000 } else { 0 };
+    let count_field = (teb_alias + tail_bias + TEB_GDI_BATCH_COUNT) as *const u32;
     let count = core::ptr::read_volatile(count_field);
     if count == 0 {
         return;
     }
-    let offset_field = (env_scratch + GDI_TEB_BATCH_OFFSET) as *mut u32;
+    let offset_field = (teb_alias + GDI_TEB_BATCH_OFFSET) as *const u32;
     let offset = core::ptr::read_volatile(offset_field);
     let previous = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     if offset as u64 > previous {
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
     }
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    GDI_BATCH_RECORDS_DISCARDED.fetch_add(count as u64, Ordering::Relaxed);
-    // ── WALK the records the flush is about to clear, with the host-tested
-    // `nt_user_callback::walk_gdi_batch` (the same list `NtGdiFlushUserBatch` walks). This is what
-    // keeps the credential READ-BACK real: bounding `Offset` moves winlogon's credential-edit
-    // `ExtTextOut` off the `NtGdiExtTextOutW` syscall path and INTO a `GdiBCTextOut` record, which
-    // carries the identical live `EDITSTATE.text`.
-    let buffer = env_scratch + GDI_TEB_BATCH_BUFFER;
+    GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);
+    // Keep the existing host-tested walk as a measurement/readback hook; win32k performs the draw.
+    let buffer = teb_alias + GDI_TEB_BATCH_BUFFER;
     let mut records = [0u8; nt_user_callback::GDI_BATCH_BUF_SIZE as usize];
     core::ptr::copy_nonoverlapping(buffer as *const u8, records.as_mut_ptr(), records.len());
     nt_user_callback::walk_gdi_batch(&records, offset, count, |record| {
@@ -6445,18 +7206,25 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(pi: usize, client_teb: u64) {
             }
         }
     });
-    // "Exit and clear out for the next round" (gdibatch.c:524).
-    //
-    // ★ `GdiTebBatch.HDC` is deliberately NOT cleared, and this is the one place we knowingly differ
-    // from `NtGdiFlushUserBatch` — because we clear the records without EXECUTING them. Real NT
-    // clears `HDC` because the batch has just been drawn. Clearing it here would instead let
-    // `GdiAllocBatchCommand` start batching for the NEXT DC, whose records we would then also
-    // discard. Left claimed, `GdiAllocBatchCommand` returns NULL for every other DC
-    // (`gdi32p.h:443`) and gdi32 issues a REAL win32k system call — which is exactly what this boot
-    // already did. Executing the records means driving win32k's registered `BatchFlushRoutine`;
-    // that changes what is drawn and belongs in its own measured step, not in a corruption fix.
-    core::ptr::write_volatile(offset_field, 0);
-    core::ptr::write_volatile(count_field, 0);
+    let (status, ok) = win32k_glue::win32k_flush_user_gdi_batch(client);
+    if !ok || status as u32 != 0 {
+        let failures = GDI_BATCH_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[gdi-batch] BatchFlushRoutine failed pi=");
+            print_u64(client.pi as u64);
+            print_str(b" tid=");
+            print_u64(client.tid);
+            print_str(b" teb=0x");
+            print_hex_u64(client.teb);
+            print_str(if ok {
+                b" status=0x"
+            } else {
+                b" WALL status=0x"
+            });
+            print_hex(status as u32);
+            print_str(b"\n");
+        }
+    }
 }
 
 ///
@@ -6944,6 +7712,14 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
     if real_frame == 0 {
         return 0;
     }
+    let real_source = {
+        let source_cap = csrss_frame_source_cap_get(pi, page);
+        if source_cap != 0 {
+            source_cap
+        } else {
+            real_frame
+        }
+    };
     let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_SHADOW_N));
     let pis = core::ptr::addr_of!(TEB_TAIL_SHADOW_PI) as *const u64;
     let pages = core::ptr::addr_of!(TEB_TAIL_SHADOW_PAGE) as *const u64;
@@ -6961,31 +7737,96 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
         }
         if TEB_TAIL_ALIAS_PT.swap(1, Ordering::Relaxed) == 0 {
             let pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-            let _ = paging_struct_map(
+            let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+            if retype != 0 {
+                let _ = cnode_delete_recycle_r(pt);
+                TEB_TAIL_ALIAS_PT.store(0, Ordering::Relaxed);
+                print_str(b"[teb-shadow] alias PT retype failed error=");
+                print_u64(retype);
+                print_str(b"\n");
+                return 0;
+            }
+            let map = paging_struct_map_r(
                 pt,
                 LBL_X86_PAGE_TABLE_MAP,
                 TEB_TAIL_ALIAS_BASE,
                 CAP_INIT_THREAD_VSPACE,
             );
+            if map != 0 {
+                let _ = cnode_delete_recycle_r(pt);
+                TEB_TAIL_ALIAS_PT.store(0, Ordering::Relaxed);
+                print_str(b"[teb-shadow] alias PT map failed error=");
+                print_u64(map);
+                print_str(b"\n");
+                return 0;
+            }
         }
-        let shadow = alloc_frame();
+        let (shadow, shadow_retype) = alloc_frame_r();
+        if shadow_retype != 0 {
+            if shadow != 0 {
+                let _ = cnode_delete_recycle_r(shadow);
+            }
+            print_str(b"[teb-shadow] shadow frame retype failed pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" error=");
+            print_u64(shadow_retype);
+            print_str(b"\n");
+            return 0;
+        }
         let real_alias = TEB_TAIL_ALIAS_BASE + (2 * n as u64) * 0x1000;
         let shadow_alias = real_alias + 0x1000;
-        let e_real = page_map_r(
-            copy_cap(real_frame),
-            real_alias,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        );
-        let e_shadow = page_map_r(
-            copy_cap(shadow),
-            shadow_alias,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        );
+        let (real_copy, real_copy_error) = copy_cap_r(real_source);
+        if real_copy_error != 0 {
+            if real_copy != 0 {
+                let _ = cnode_delete_recycle_r(real_copy);
+            }
+            let _ = cnode_delete_recycle_r(shadow);
+            print_str(b"[teb-shadow] real alias copy failed pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" source=0x");
+            print_hex(real_source as u32);
+            print_str(b" error=");
+            print_u64(real_copy_error);
+            print_str(b"\n");
+            return 0;
+        }
+        let (shadow_copy, shadow_copy_error) = copy_cap_r(shadow);
+        if shadow_copy_error != 0 {
+            if shadow_copy != 0 {
+                let _ = cnode_delete_recycle_r(shadow_copy);
+            }
+            let _ = cnode_delete_recycle_r(real_copy);
+            let _ = cnode_delete_recycle_r(shadow);
+            print_str(b"[teb-shadow] shadow alias copy failed pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" shadow=0x");
+            print_hex(shadow as u32);
+            print_str(b" error=");
+            print_u64(shadow_copy_error);
+            print_str(b"\n");
+            return 0;
+        }
+        let e_real = page_map_r(real_copy, real_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let e_shadow = page_map_r(shadow_copy, shadow_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
         if e_real != 0 || e_shadow != 0 {
-            print_str(b"[teb-shadow] alias map failed real/shadow=");
+            let _ = cnode_delete_recycle_r(real_copy);
+            let _ = cnode_delete_recycle_r(shadow_copy);
+            let _ = cnode_delete_recycle_r(shadow);
+            print_str(b"[teb-shadow] alias map failed pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" real/shadow=");
             print_u64(e_real);
             print_str(b"/");
             print_u64(e_shadow);
@@ -7294,9 +8135,21 @@ fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
 }
 
 unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
-    if let Some((frame, alias_cap)) = csrss_frame_take(pi as u64, page) {
+    if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
         vm_watch(b"unmap", pi, page, frame);
-        vm_frame_release(frame, alias_cap);
+        if owns_frame {
+            vm_frame_release(frame, alias_cap);
+        } else {
+            let _ = page_unmap_r(frame);
+            let _ = cnode_delete_recycle_r(frame);
+            if alias_cap != 0 {
+                let _ = page_unmap_r(alias_cap);
+                let _ = cnode_delete_recycle_r(alias_cap);
+            }
+        }
+        if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+            let _ = cnode_delete_recycle_r(source_cap);
+        }
     } else {
         vm_watch(b"unmap-miss", pi, page, 0);
     }
@@ -7393,7 +8246,12 @@ unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    (d, reply >> 12)
+    let label = reply >> 12;
+    if label != 0 {
+        recycle_deleted_root_slot(d);
+        return (0, label);
+    }
+    (d, 0)
 }
 unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
     let reply: u64;
@@ -7410,6 +8268,40 @@ unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
     );
     let label = reply >> 12;
     if label == 0 {
+        root_slot_note_occupied(dest);
+    }
+    label
+}
+unsafe fn cnode_copy_at_r(cnode: u64, dest: u64, src: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") cnode => _,
+        inout("rsi") LBL_CNODE_COPY << 12 => reply,
+        inout("r10") dest => _,
+        inout("r8") src => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+unsafe fn cnode_mint_r(cnode: u64, dest: u64, src: u64, badge: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") cnode => _,
+        inout("rsi") LBL_CNODE_MINT << 12 => reply,
+        inout("r10") dest => _,
+        inout("r8") src => _,
+        inout("r9") badge => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    let label = reply >> 12;
+    if label == 0 && cnode == CAP_INIT_THREAD_CNODE {
         root_slot_note_occupied(dest);
     }
     label
@@ -7679,6 +8571,12 @@ unsafe fn map_heap_pts(pml4: u64, frames: u64) {
             pml4,
         );
     }
+}
+
+pub(crate) unsafe fn map_hosted_client_env_pt(pml4: u64) {
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, HOSTED_CLIENT_ENV_BASE, pml4);
 }
 
 /// Build the standard executive-image paging skeleton in `pml4`: pdpt + pd for the image's 1 GiB
@@ -9198,6 +10096,40 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
+unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
+    let mechanism = runtime.mechanism;
+    if !mechanism.is_live() {
+        return;
+    }
+    let cnode_delete = if mechanism.cnode != 0 {
+        cnode_delete_recycle_r(mechanism.cnode)
+    } else {
+        0
+    };
+    let raw_delete = if mechanism.raw_cnode != 0 {
+        cnode_delete_recycle_r(mechanism.raw_cnode)
+    } else {
+        0
+    };
+    if cnode_delete == 0 && raw_delete == 0 {
+        HOSTED_THREAD_CNODE_RELEASES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        if HOSTED_THREAD_CNODE_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[thread-term] mechanism CNode release failed tid=");
+            print_u64(runtime.tid);
+            print_str(b" cnode=0x");
+            print_hex_u64(mechanism.cnode);
+            print_str(b" raw=0x");
+            print_hex_u64(mechanism.raw_cnode);
+            print_str(b" delete=");
+            print_u64(cnode_delete);
+            print_str(b"/");
+            print_u64(raw_delete);
+            print_str(b"\n");
+        }
+    }
+}
+
 unsafe fn pipe_io_cancel_thread(tid: u64) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let mut reply_caps = [0u64; PIPE_WAITER_N];
@@ -9250,7 +10182,26 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_u64(delete);
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
-        let _ = handler.release_hosted_thread_runtime(tid);
+        let pool_slot = handler.pm_pool_slot_for_tid(tid);
+        let role = handler.hosted_thread_role(tid);
+        let worker_slot = if let Some(HostedThreadRole::TpWorker { slot }) = role {
+            pool_slot.map(|(pi, _)| (pi, slot))
+        } else {
+            None
+        };
+        let runtime = handler.release_hosted_thread_runtime(tid);
+        if let Some((pi, slot)) = pool_slot {
+            let _ = handler.release_pool_usage_slot(pi, slot);
+            let _ = handler.set_pool_thread_suspended(pi, slot, false);
+        }
+        if let Some(runtime) = runtime {
+            handler.release_hosted_thread_user_stack_vad(runtime);
+            release_hosted_thread_mechanism_cnodes(runtime);
+        }
+        if let Some((pi, slot)) = worker_slot {
+            release_hosted_tp_worker_window_resources(pi, slot);
+            handler.clear_hosted_tp_worker_window_slot(pi, slot);
+        }
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -9291,6 +10242,7 @@ unsafe fn terminate_hosted_process_mechanisms(
             reclaimed += 1;
         }
     }
+    handler.clear_hosted_tp_worker_windows(process_index as usize);
     io_completion_cancel_process(handler, process_index);
     delay_timer_rearm(delay_queue);
     reclaimed
@@ -11146,6 +12098,10 @@ struct ExecLoopCtx {
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
     csrss_anon_size: *mut u64,
+    /// Generic data/pagefile section objects and mapped views. This is the real section-object path
+    /// for non-SEC_IMAGE mappings: NtCreateSection records backing, NtMapViewOfSection reserves a
+    /// VAD, and the fault router materialises pages on demand.
+    generic_sections: *mut GenericSectionTable,
     /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) + the
     /// PER-PROCESS once-only flag for the shared 0x8000_0000 DLL page-directory (indexed by pi:
     /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
@@ -11436,6 +12392,10 @@ struct ExecNtHandler {
     pool_used: [u64; MAX_PI],
     /// Runtime suspended-on-create mask for claimed pool ETHREADs.
     pool_suspended: [u64; MAX_PI],
+    /// Hosted worker stack/TEB VA windows consumed in each process VSpace. A thread exit can reclaim
+    /// the TCB and ETHREAD pool slot, but the fixed userspace stack/TEB mappings are not reusable
+    /// until full VAD-backed unmap/free exists; the mask is cleared only with the process VSpace.
+    tp_worker_window_used: [u64; MAX_PI],
     /// Executive-side seL4 mechanism runtime keyed by real NT TID. This is where live handler paths
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.
@@ -11610,12 +12570,65 @@ pub(crate) fn publish_hosted_thread_runtime_gate(pi: usize, role: HostedThreadRo
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedThreadMechanismCaps {
+    raw_cnode: u64,
+    cnode: u64,
+}
+
+impl HostedThreadMechanismCaps {
+    const fn empty() -> Self {
+        Self {
+            raw_cnode: 0,
+            cnode: 0,
+        }
+    }
+
+    const fn new(raw_cnode: u64, cnode: u64) -> Self {
+        Self { raw_cnode, cnode }
+    }
+
+    pub(crate) const fn is_live(self) -> bool {
+        self.raw_cnode != 0 || self.cnode != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedThreadSpawnResult {
+    tcb: u64,
+    mechanism: HostedThreadMechanismCaps,
+}
+
+impl HostedThreadSpawnResult {
+    pub(crate) const fn failed() -> Self {
+        Self {
+            tcb: 0,
+            mechanism: HostedThreadMechanismCaps::empty(),
+        }
+    }
+
+    const fn new(tcb: u64, mechanism: HostedThreadMechanismCaps) -> Self {
+        Self { tcb, mechanism }
+    }
+
+    pub(crate) const fn tcb(self) -> u64 {
+        self.tcb
+    }
+
+    pub(crate) const fn mechanism(self) -> HostedThreadMechanismCaps {
+        self.mechanism
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedThreadRuntime {
     pi: usize,
     tid: u64,
     tcb: u64,
     badge: u64,
     role: HostedThreadRole,
+    mechanism: HostedThreadMechanismCaps,
+    user_stack_allocation_base: u64,
+    user_stack_base: u64,
 }
 
 impl HostedThreadRuntime {
@@ -11626,6 +12639,9 @@ impl HostedThreadRuntime {
             tcb: 0,
             badge: 0,
             role: HostedThreadRole::Main,
+            mechanism: HostedThreadMechanismCaps::empty(),
+            user_stack_allocation_base: 0,
+            user_stack_base: 0,
         }
     }
 
@@ -11681,14 +12697,20 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
         if tid == 0 || tcb == 0 {
             return None;
         }
-        let runtime = HostedThreadRuntime {
+        let mut runtime = HostedThreadRuntime {
             pi,
             tid,
             tcb,
             badge,
             role,
+            mechanism: HostedThreadMechanismCaps::empty(),
+            user_stack_allocation_base: 0,
+            user_stack_base: 0,
         };
         if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
+            runtime.mechanism = existing.mechanism;
+            runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
+            runtime.user_stack_base = existing.user_stack_base;
             *existing = runtime;
             return Some(runtime);
         }
@@ -11716,6 +12738,40 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
             .iter()
             .copied()
             .find(|entry| entry.is_live() && entry.tid == tid)
+    }
+
+    fn set_user_stack(
+        &mut self,
+        tid: u64,
+        allocation_base: u64,
+        stack_base: u64,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || allocation_base == 0 || stack_base <= allocation_base {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
+        entry.user_stack_allocation_base = allocation_base;
+        entry.user_stack_base = stack_base;
+        Some(*entry)
+    }
+
+    fn set_mechanism_caps(
+        &mut self,
+        tid: u64,
+        mechanism: HostedThreadMechanismCaps,
+    ) -> Option<HostedThreadRuntime> {
+        if tid == 0 || !mechanism.is_live() {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
+        entry.mechanism = mechanism;
+        Some(*entry)
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -11818,6 +12874,25 @@ impl HostedThreadRuntimes {
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_tid(tid) }
+    }
+
+    fn set_user_stack(
+        &mut self,
+        tid: u64,
+        allocation_base: u64,
+        stack_base: u64,
+    ) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_user_stack(tid, allocation_base, stack_base) }
+    }
+
+    fn set_mechanism_caps(
+        &mut self,
+        tid: u64,
+        mechanism: HostedThreadMechanismCaps,
+    ) -> Option<HostedThreadRuntime> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_mechanism_caps(tid, mechanism) }
     }
 
     fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -12570,8 +13645,20 @@ struct HostedThread {
 /// `call`s the context RIP (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$ is a net).
 /// Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
 /// spawns all express (see the thin wrappers below).
-unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
+unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     let scr = t.scr;
+    let resource_pi = t.client_pi as usize;
+    let resource_slot = hosted_tp_worker_slot_from_layout(
+        resource_pi,
+        t.stack_base,
+        t.teb_va,
+        t.ipcbuf_va,
+        t.tramp_va,
+    );
+    let mut window_resources = HostedTpWorkerWindowResources::empty();
+    if resource_slot.is_some() {
+        window_resources.live = true;
+    }
     if t.stack_mirror_va != 0 {
         let pt_base = t.stack_mirror_va & !0x1f_ffffu64;
         let dynamic_base = SVC_LISTENER_STACK_MIRROR_VA & !0x1f_ffffu64;
@@ -12602,14 +13689,23 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     for i in 0..t.stack_frames {
         let f = alloc_frame();
         let page = t.stack_base + i * 0x1000;
-        page_map(copy_cap(f), page, RW_NX, t.pml4);
+        let target_cap = copy_cap(f);
+        page_map(target_cap, page, RW_NX, t.pml4);
+        let mut mirror_cap = 0;
         if t.stack_mirror_va != 0 {
+            mirror_cap = copy_cap(f);
             page_map(
-                copy_cap(f),
+                mirror_cap,
                 t.stack_mirror_va + i * 0x1000,
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
+        }
+        if window_resources.live && (i as usize) < TP_WORKER_STACK_FRAME_COUNT {
+            let index = i as usize;
+            window_resources.stack_owner[index] = f;
+            window_resources.stack_target[index] = target_cap;
+            window_resources.stack_mirror[index] = mirror_cap;
         }
         if t.client_pi != 0 {
             csrss_frame_put(t.client_pi, page, f);
@@ -12618,23 +13714,63 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
     // ActivationContextStackPointer@0x2C8 → an empty ACS in the 2nd TEB page.
     let teb = alloc_frame();
+    let teb_client = copy_cap(teb);
     let teb_scratch = copy_cap(teb);
     let teb_live_mirror = copy_cap(teb);
-    let teb_target_map = page_map(teb, t.teb_va, RW_NX, t.pml4);
-    if t.client_pi != 0 {
-        csrss_frame_put(t.client_pi, t.teb_va, teb);
-    }
+    let teb_target_map = page_map(teb_client, t.teb_va, RW_NX, t.pml4);
+    let teb_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
+        t.stack_mirror_va + t.stack_frames * 0x1000
+    } else {
+        0
+    };
     let teb_scratch_map = page_map(teb_scratch, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let teb_live_map = if t.stack_mirror_va != 0 {
+    let teb_live_map = if teb_live_alias != 0 {
         page_map(
             teb_live_mirror,
-            t.stack_mirror_va + t.stack_frames * 0x1000,
+            teb_live_alias,
             RW_NX,
             CAP_INIT_THREAD_VSPACE,
         )
     } else {
         0
     };
+    if window_resources.live {
+        window_resources.teb_owner = teb;
+        window_resources.teb_target = teb_client;
+        window_resources.teb_scratch = teb_scratch;
+    }
+    if t.client_pi != 0 {
+        let source_cap =
+            csrss_frame_create_source_copy(teb_client, t.client_pi, t.teb_va, b"thread-teb");
+        let alias = if teb_live_map == 0 { teb_live_alias } else { 0 };
+        let alias_cap = if teb_live_map == 0 {
+            teb_live_mirror
+        } else {
+            0
+        };
+        let registered = source_cap != 0
+            && csrss_frame_put_at_cap_source(
+                t.client_pi,
+                t.teb_va,
+                teb_client,
+                alias,
+                alias_cap,
+                source_cap,
+            );
+        if registered {
+            csrss_frame_probe_source_copy(t.client_pi, t.teb_va, source_cap, b"thread-teb");
+        } else {
+            if source_cap != 0 {
+                let _ = cnode_delete_recycle_r(source_cap);
+            }
+            print_str(b"[thread-life] failed to register thread TEB client frame pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            print_hex((t.teb_va >> 32) as u32);
+            print_hex(t.teb_va as u32);
+            print_str(b"\n");
+        }
+    }
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
     core::ptr::write_volatile((scr + 0x48) as *mut u64, t.cid_thread);
@@ -12664,27 +13800,81 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
     // TEB page 2: StaticUnicodeString (MaximumLength=522, Buffer in TEB) + DeallocationStack.
     let teb2 = alloc_frame();
+    let teb2_client = copy_cap(teb2);
     let teb2_scratch = copy_cap(teb2);
     let teb2_live_mirror = copy_cap(teb2);
-    let teb2_target_map = page_map(teb2, t.teb_va + 0x1000, RW_NX, t.pml4);
-    if t.client_pi != 0 {
-        csrss_frame_put(t.client_pi, t.teb_va + 0x1000, teb2);
-        // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
-        teb_tail_register(t.teb_va + 0x1000);
-    }
+    let teb2_target_map = page_map(teb2_client, t.teb_va + 0x1000, RW_NX, t.pml4);
+    let teb2_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
+        t.stack_mirror_va + (t.stack_frames + 1) * 0x1000
+    } else {
+        0
+    };
     let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     // DeallocationStack is in TEB page 2; populate it only after its scratch alias is mapped.
     core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
-    let teb2_live_map = if t.stack_mirror_va != 0 {
+    let teb2_live_map = if teb2_live_alias != 0 {
         page_map(
             teb2_live_mirror,
-            t.stack_mirror_va + (t.stack_frames + 1) * 0x1000,
+            teb2_live_alias,
             RW_NX,
             CAP_INIT_THREAD_VSPACE,
         )
     } else {
         0
     };
+    if window_resources.live {
+        window_resources.teb2_owner = teb2;
+        window_resources.teb2_target = teb2_client;
+        window_resources.teb2_scratch = teb2_scratch;
+    }
+    if t.client_pi != 0 {
+        let source_cap = csrss_frame_create_source_copy(
+            teb2_client,
+            t.client_pi,
+            t.teb_va + 0x1000,
+            b"thread-teb-tail",
+        );
+        let alias = if teb2_live_map == 0 {
+            teb2_live_alias
+        } else {
+            0
+        };
+        let alias_cap = if teb2_live_map == 0 {
+            teb2_live_mirror
+        } else {
+            0
+        };
+        let registered = source_cap != 0
+            && csrss_frame_put_at_cap_source(
+                t.client_pi,
+                t.teb_va + 0x1000,
+                teb2_client,
+                alias,
+                alias_cap,
+                source_cap,
+            );
+        if registered {
+            csrss_frame_probe_source_copy(
+                t.client_pi,
+                t.teb_va + 0x1000,
+                source_cap,
+                b"thread-teb-tail",
+            );
+        } else {
+            if source_cap != 0 {
+                let _ = cnode_delete_recycle_r(source_cap);
+            }
+            print_str(b"[thread-life] failed to register thread TEB tail client frame pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            let page = t.teb_va + 0x1000;
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b"\n");
+        }
+        // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
+        teb_tail_register(t.teb_va + 0x1000);
+    }
     // The private ACS page: written through its own scratch alias, then mapped at `acs_va` in the
     // target VSpace. Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
     // thread's activation-context stack, and not registering it means a win32k fault at that VA can
@@ -12698,7 +13888,12 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
     core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
     core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
-    let acs_target_map = page_map(copy_cap(acs_frame), acs_va, RW_NX, t.pml4);
+    let acs_target_cap = copy_cap(acs_frame);
+    let acs_target_map = page_map(acs_target_cap, acs_va, RW_NX, t.pml4);
+    if window_resources.live {
+        window_resources.acs_owner = acs_frame;
+        window_resources.acs_target = acs_target_cap;
+    }
     if acs_scratch_map != 0 || acs_target_map != 0 {
         print_str(b"[thread-life] ACS map failure scratch/target=");
         print_u64(acs_scratch_map);
@@ -12738,6 +13933,9 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     } else {
         page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     };
+    if window_resources.live {
+        window_resources.ipc_target = ipcbuf;
+    }
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let (tramp, e_tramp_frame) = if t.diag {
         alloc_frame_r()
@@ -12795,6 +13993,13 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     } else {
         page_map(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4)
     };
+    if window_resources.live {
+        window_resources.tramp_owner = tramp;
+        window_resources.tramp_target = tramp_tgt_cap;
+    }
+    if let Some(slot) = resource_slot {
+        store_hosted_tp_worker_window_resources(resource_pi, slot, window_resources);
+    }
     if t.diag {
         // Read the FIRST 8 bytes back through what we WROTE (executive alias) AND through a FRESH,
         // independent alias of the SAME `tramp` frame mapped at a throwaway VA — if these disagree, the
@@ -12826,55 +14031,84 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         print_str(b" (must match; expect 0x...48b9)\n");
     }
     // CNode (PML4 + the dedicated fault EP) + TCB.
-    let raw = alloc_slot();
-    // BATCH 36 DIAG: only the diag thread uses the SYS_CALL/`_r` error-returning variants (to surface
-    // a silent SYS_SEND failure); every other spawn keeps the byte-identical SYS_SEND fire-and-forget
-    // path so the baseline boot is unchanged.
-    let e_cn = if t.diag {
-        untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw)
-    } else {
-        untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw)
+    let Some(raw) = try_alloc_slot() else {
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
     };
-    let cnode = alloc_slot();
-    let _ = syscall5(
-        SYS_SEND,
-        CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
-        cnode,
-        raw,
-        CN_GUARD_BADGE,
-    );
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, t.pml4, 0);
-    let _ = syscall5(
-        SYS_SEND,
-        cnode,
-        LBL_CNODE_COPY << 12,
-        CT_FAULT,
-        copy_cap(t.fault_ep),
-        0,
-    );
-    let tcb = alloc_slot();
+    let e_cn = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    if e_cn != 0 {
+        recycle_deleted_root_slot(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    }
+    let Some(cnode) = try_alloc_slot() else {
+        let _ = cnode_delete_recycle_r(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    };
+    let e_cnode_mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE);
+    if e_cnode_mint != 0 {
+        recycle_deleted_root_slot(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    }
+    let e_cnode_pml4 = cnode_copy_at_r(cnode, CT_PML4, t.pml4);
+    let e_cnode_fault = cnode_copy_at_r(cnode, CT_FAULT, t.fault_ep);
+    if e_cnode_pml4 != 0 || e_cnode_fault != 0 {
+        let _ = cnode_delete_recycle_r(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    }
+    let Some(tcb) = try_alloc_slot() else {
+        let _ = cnode_delete_recycle_r(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    };
     let new_sp = t.stack_base + t.stack_frames * 0x1000 - 16;
-    let (e_tcb, e_space, e_ipc, e_regs) = if t.diag {
-        let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-        let e_space = tcb_set_space_r(tcb, CT_FAULT, cnode, t.pml4);
-        let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
-        let e_regs = tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0);
-        (e_tcb, e_space, e_ipc, e_regs)
+    let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let e_space = if e_tcb == 0 {
+        tcb_set_space_r(tcb, CT_FAULT, cnode, t.pml4)
     } else {
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-        let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
-        let _ = syscall5(
-            SYS_SEND,
-            tcb,
-            LBL_TCB_SET_IPC_BUFFER << 12,
-            t.ipcbuf_va,
-            ipcbuf,
-            0,
-        );
-        let _ = tcb_write_registers(tcb, t.tramp_va, new_sp, 0);
-        (0, 0, 0, 0)
+        u64::MAX
     };
+    let e_ipc = if e_tcb == 0 && e_space == 0 {
+        tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf)
+    } else {
+        u64::MAX
+    };
+    let e_regs = if e_tcb == 0 && e_space == 0 && e_ipc == 0 {
+        tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
+    } else {
+        u64::MAX
+    };
+    if e_tcb != 0 || e_space != 0 || e_ipc != 0 || e_regs != 0 {
+        if e_tcb == 0 {
+            let _ = cnode_delete_recycle_r(tcb);
+        } else {
+            recycle_deleted_root_slot(tcb);
+        }
+        let _ = cnode_delete_recycle_r(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
+        }
+        return HostedThreadSpawnResult::failed();
+    }
     let _ = tcb_set_gs_base(tcb, t.teb_va);
     let _ = tcb_set_priority(tcb, if t.prio != 0 { t.prio as u64 } else { 100 });
     if t.diag {
@@ -12917,7 +14151,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     if t.resume {
         let _ = tcb_resume(tcb);
     }
-    tcb
+    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
@@ -13097,12 +14331,9 @@ static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
 /// Incremented each time the live service loop resolves the current fault badge to its EPROCESS via
 /// the ProcessManager-backed handler lookup.
 static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
-/// Reserved handle-table capacity per hosted EPROCESS (path 1). Measured peak is < ~100 handles per
-/// process over a full boot; 256 is ~3× headroom so `insert_handle` never reallocates under the
-/// per-syscall bump reset (the non-leaking heap solution). ~256 × 24 B × 3 ≈ 18 KiB of the 2 MiB heap.
-// Path 1b: append-only handles (no slot reuse) mean a process's table grows to its TOTAL mint
-// count over the run, not its peak-concurrent count, so reserve generously (the whole boot mints
-// well under this per process; keeps the durable table from ever reallocating under the heap-reset).
+/// Initial handle-table capacity per hosted EPROCESS (path 1). This is only the bootstrap reserve:
+/// real hosted workloads can outgrow it, and the executive pins the bump-heap mark whenever a
+/// ProcessManager handle table expands after boot.
 const PM_HANDLE_RESERVE: usize = 1024;
 /// Total handles the executive has routed into the real per-EPROCESS handle tables (all mint sites).
 static PM_HANDLES_TRACKED: AtomicU64 = AtomicU64::new(0);
@@ -13111,9 +14342,14 @@ static PM_HANDLE_PEAK: AtomicU64 = AtomicU64::new(0);
 /// Handles freed from a per-EPROCESS table by a real `NtClose` (close-by-value-tag) — proves the
 /// lifecycle end of the handle path works (was a no-op success before path 1).
 static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
-/// The handle-table capacity reserved across live hosted EPROCESSes. The run proves no
-/// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
+/// Minimum current handle-table capacity across live hosted EPROCESSes. This stays at least the
+/// bootstrap reserve; heavily used processes can grow independently.
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
+/// Maximum current per-EPROCESS handle-table capacity across hosted processes.
+static PM_HANDLE_CAP_MAX: AtomicU64 = AtomicU64::new(0);
+/// Count of real handle-table capacity growths after the bootstrap reserve. Each growth sets
+/// `ExecNtHandler.process_dirty`, so the service loop pins the bump-heap mark before the next reset.
+static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 // === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
 /// Bit `pi` set once the target process's INITIAL thread has been created through `NtCreateThread`
 /// with a foreign `ProcessHandle` (`RtlCreateUserProcess`'s "create the process, then its first
@@ -16952,16 +18188,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     caps: HostCaps::default(),
                 };
                 let sc = spawn_component(&d);
-                win32k_glue::ensure_w32_client_paging(
+                if !win32k_glue::ensure_w32_client_paging(
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     sc.pml4,
-                );
-                let _ = page_map(
+                ) {
+                    print_str(b"[win32k-host] KUSER sparse paging setup failed\n");
+                }
+                let kuser_map = page_map_r(
                     copy_cap(kuser_frame),
                     win32k_subsystem::WIN32K_KUSER_SHARED_DATA_VA,
                     2 | PAGE_EXECUTE_NEVER,
                     sc.pml4,
                 );
+                if kuser_map != 0 {
+                    print_str(b"[win32k-host] KUSER map failed error=");
+                    print_u64(kuser_map);
+                    print_str(b"\n");
+                }
                 // Stash the globals the demand-map fault loop + per-client attach need. The stack frame
                 // base is the first FreshZeroed frame of the dedicated stack.
                 WIN32K_STACK_SLOT.store(sc.stack_frame_base, Ordering::Relaxed);
@@ -18530,23 +19773,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_BADGE_LOOKUPS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
-                    // Path 1 — handle-table routing: the ~15 executive handle-mint sites now record
-                    // every handle into the caller's REAL per-EPROCESS handle table, and NtClose frees
-                    // it (was a no-op). `exec_eprocess_handle_table_routed` = handles were routed;
-                    // `exec_eprocess_handle_table_no_realloc` = peak live count stayed BELOW the
-                    // pre-reserved capacity → insert_handle never reallocated under the per-syscall
-                    // bump reset (the non-leaking heap-reset solution proven under live load).
+                    // Path 1 — handle-table routing: the executive handle-mint sites now record every
+                    // handle into the caller's REAL per-EPROCESS handle table, and NtClose frees it
+                    // (was a no-op). The table starts with a bootstrap reserve, then grows
+                    // dynamically like NT's HANDLE_TABLE; each growth pins the bump-heap mark before
+                    // reset, so durable table storage is not reclaimed as transient syscall data.
                     let tracked = PM_HANDLES_TRACKED.load(Ordering::Relaxed);
                     let peak = PM_HANDLE_PEAK.load(Ordering::Relaxed);
-                    let cap = PM_HANDLE_CAP_BOOT.load(Ordering::Relaxed);
+                    let min_cap = PM_HANDLE_CAP_BOOT.load(Ordering::Relaxed);
+                    let max_cap = PM_HANDLE_CAP_MAX.load(Ordering::Relaxed);
+                    let growths = PM_HANDLE_CAP_GROWTHS.load(Ordering::Relaxed);
                     check(
                         b"exec_eprocess_handle_table_routed",
                         tracked >= 10,
                         &mut passed,
                     );
                     check(
-                        b"exec_eprocess_handle_table_no_realloc",
-                        cap >= PM_HANDLE_RESERVE as u64 && peak > 0 && peak < cap,
+                        b"exec_eprocess_handle_table_dynamic_capacity",
+                        min_cap >= PM_HANDLE_RESERVE as u64
+                            && max_cap >= min_cap
+                            && peak > 0
+                            && peak <= max_cap
+                            && (peak < min_cap || growths > 0),
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] nt-process path1: handles routed=0x");
@@ -18555,9 +19803,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_HANDLES_CLOSED.load(Ordering::Relaxed) as u32);
                     print_str(b" peak=0x");
                     print_hex(peak as u32);
-                    print_str(b" reserved=0x");
-                    print_hex(cap as u32);
-                    print_str(b" (no realloc)\n");
+                    print_str(b" initial-reserve-min=0x");
+                    print_hex(min_cap as u32);
+                    print_str(b" live-cap-max=0x");
+                    print_hex(max_cap as u32);
+                    print_str(b" growths=0x");
+                    print_hex(growths as u32);
+                    print_str(b" (dynamic capacity pinned)\n");
                     // Path 2 — lifecycle: real ETHREADs back the main threads (bound to their image
                     // entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm (proven
                     // by the post-loop self-test on a throwaway EPROCESS; hosted processes are untouched).

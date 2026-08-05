@@ -32,6 +32,11 @@ pub(crate) fn effective_ldrp_rva(explicit: u64) -> u64 {
     }
 }
 
+#[inline]
+unsafe fn zero_scratch_page(va: u64) {
+    core::ptr::write_bytes(va as *mut u8, 0, 0x1000);
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) pml4: u64,
@@ -248,11 +253,13 @@ pub(crate) unsafe fn spawn_pe_thread(
     let env_scratch = PE_SCRATCH_VADDR + pages as u64 * 0x1000;
     let teb = alloc_frame();
     let _ = page_map(teb, env_scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    zero_scratch_page(env_scratch);
     core::ptr::write_volatile((env_scratch + 0x30) as *mut u64, TEB_VA); // TEB self
     core::ptr::write_volatile((env_scratch + 0x60) as *mut u64, PEB_VA); // ProcessEnvironmentBlock
     let _ = page_map(copy_cap(teb), TEB_VA, RW_NX, pml4);
     let peb = alloc_frame();
     let _ = page_map(peb, env_scratch + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    zero_scratch_page(env_scratch + 0x1000);
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
     core::ptr::write_volatile(
         (env_scratch + 0x1000 + 0xb8) as *mut u32,
@@ -281,11 +288,13 @@ pub(crate) unsafe fn spawn_pe_thread(
     let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
     let kuser = alloc_frame();
     let _ = page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    zero_scratch_page(env_scratch + 0x3000);
     unsafe { initialize_kuser_snapshot(env_scratch + 0x3000) };
     let _ = page_map(copy_cap(kuser), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
     // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
     let ntdll = alloc_frame();
     let _ = page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    zero_scratch_page(env_scratch + 0x2000);
     for (j, &byte) in NTDLL_STUB.iter().enumerate() {
         core::ptr::write_volatile((env_scratch + 0x2000 + j as u64) as *mut u8, byte);
     }
@@ -428,6 +437,7 @@ pub(crate) unsafe fn spawn_sec_image(
     client_thread_id: u64,
     image_path: &[u8],
     cmd_line: &[u8],
+    seed_gdi_shared_handle_table: bool,
     // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
     // ReactOS ntdll's is 0x8e70 (its build-fixed RVA); OUR Rust ntdll's is DIFFERENT + not stable
     // across builds (0x1050 in the current build) — so the caller DERIVES it from OUR DLL's export
@@ -456,6 +466,9 @@ pub(crate) unsafe fn spawn_sec_image(
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
     map_tp_worker_slot1_pt(pml4);
+    if setup_env {
+        map_hosted_client_env_pt(pml4);
+    }
     // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if ntdll_base != 0 {
@@ -532,6 +545,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // TEB: self @0x30, PEB @0x60.
         let teb = alloc_frame();
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr);
         core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA); // NtTib.Self
         core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA); // ProcessEnvironmentBlock
         core::ptr::write_volatile((scr + 0x40) as *mut u64, client_process_id); // ClientId.UniqueProcess
@@ -566,8 +580,10 @@ pub(crate) unsafe fn spawn_sec_image(
         // the TEB tail (StaticUnicodeString/Buffer), shared into the process like the first.
         let teb2 = alloc_frame();
         let _ = page_map(teb2, scr + 0x5000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr + 0x5000);
         let acs_frame = alloc_frame();
         let _ = page_map(acs_frame, scr + 0x8000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr + 0x8000);
         let acs = scr + 0x8000; // ACS at offset 0 of its own page
         core::ptr::write_volatile((acs + 0x00) as *mut u64, 0); // ActiveFrame = NULL
         core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08); // FrameListCache.Flink = self
@@ -598,6 +614,7 @@ pub(crate) unsafe fn spawn_sec_image(
                                                                                              // zeroed WND at +0x800 (same page, bracketed by base/limit so DesktopPtrToUser accepts it).
         let deskinfo = alloc_frame();
         let _ = page_map(deskinfo, scr + 0x7000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr + 0x7000);
         core::ptr::write_volatile((scr + 0x7000 + 0x00) as *mut u64, SMSS_DESKINFO_VA); // pvDesktopBase
         core::ptr::write_volatile((scr + 0x7000 + 0x08) as *mut u64, SMSS_DESKINFO_VA + 0x1000); // pvDesktopLimit
         core::ptr::write_volatile((scr + 0x7000 + 0x10) as *mut u64, SMSS_DESKINFO_VA + 0x800); // spwnd -> zeroed WND
@@ -630,6 +647,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr + 0x1000);
         core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
         // Heap process-list array (what LdrpInitializeProcess sets up before the first
@@ -692,10 +710,10 @@ pub(crate) unsafe fn spawn_sec_image(
         // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
         // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
         // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
-        // table base on its only run. Gate this to hosted GUI clients that import/use gdi32 before
-        // their first real GDI validation: winlogon (pi 2), userinit (pi 5), and explorer (pi 6).
-        // The table frames are RO-mapped lazily on that client's win32k dispatch path.
-        if pi == 2 || pi == 5 || pi == 6 {
+        // table base on its only run. Hosted image policy decides whether this process participates
+        // in the Win32 client runtime; the table frames are RO-mapped lazily on that client's win32k
+        // dispatch path.
+        if seed_gdi_shared_handle_table {
             let gdi_server_base = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
                     as *const u64,
@@ -705,7 +723,20 @@ pub(crate) unsafe fn spawn_sec_image(
                 win32k_subsystem::GDI_SHARED_TABLE_VA + (gdi_server_base & 0xfff),
             );
         }
-        let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
+        let peb_target_map = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
+        if pi == 0 {
+            let ldr = core::ptr::read_volatile((scr + 0x1000 + 0x18) as *const u64);
+            let params_ptr = core::ptr::read_volatile((scr + 0x1000 + 0x20) as *const u64);
+            print_str(b"[spawn-env] smss peb-map=");
+            print_u64(peb_target_map);
+            print_str(b" ldr=0x");
+            print_hex((ldr >> 32) as u32);
+            print_hex(ldr as u32);
+            print_str(b" params=0x");
+            print_hex((params_ptr >> 32) as u32);
+            print_hex(params_ptr as u32);
+            print_str(b"\n");
+        }
         // Cross-process process creation finishes by writing Peb->ProcessParameters through
         // NtWriteVirtualMemory. Register the live PEB frame and its persistent executive alias so
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
@@ -746,6 +777,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let params = alloc_frame();
         let pp = scr + 0x3000;
         let _ = page_map(params, pp, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(pp);
         core::ptr::write_volatile((pp + 0x00) as *mut u32, 0x1000); // MaximumLength
         core::ptr::write_volatile((pp + 0x04) as *mut u32, 0x1000); // Length
                                                                     // Flags = RTL_USER_PROCESS_PARAMETERS_NORMALIZED (0x1): our UNICODE_STRING Buffers are
@@ -807,6 +839,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let env_frame = alloc_frame();
         let env_scr = scr + 0x4000;
         let _ = page_map(env_frame, env_scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(env_scr);
         {
             let mut off: u64 = 0;
             for var in [
@@ -831,6 +864,16 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((pp + 0x80) as *mut u64, SMSS_PARAMS_VA + 0x1000); // Environment
         let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
         let _ = page_map(copy_cap(env_frame), SMSS_PARAMS_VA + 0x1000, RW_NX, pml4);
+        if pi == 0 {
+            let flags = core::ptr::read_volatile((pp + 0x08) as *const u32);
+            let env = core::ptr::read_volatile((pp + 0x80) as *const u64);
+            print_str(b"[spawn-env] smss params flags=0x");
+            print_hex(flags);
+            print_str(b" env=0x");
+            print_hex((env >> 32) as u32);
+            print_hex(env as u32);
+            print_str(b"\n");
+        }
         // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
@@ -859,6 +902,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let kuser_f = alloc_frame();
         let kscr = scr + 0x6000; // next free page in the env-scratch window (past env at +0x4000/+0x5000)
         let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(kscr);
         unsafe { initialize_kuser_snapshot(kscr) };
         kuser_page_alias_put(pi, kscr);
         let _ = page_map(copy_cap(kuser_f), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
@@ -873,6 +917,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = pe.entry_point_rva();
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        zero_scratch_page(scr + 0x2000);
         let mut tb = alloc::vec::Vec::new();
         // Reserve 0x20 shadow space so LdrpInitialize's register-arg spills ([rsp+0x8..0x20]) land
         // WITHIN the stack, not above its top. RSP starts 16-aligned; sub 0x20 keeps it aligned so
@@ -1058,14 +1103,14 @@ unsafe fn with_recorded_frame_alias(
         return true;
     }
 
-    let (frame, _) = csrss_frame_get_exact(pi, page);
-    if frame == 0 || scratch_base == 0 {
+    let clone_source = csrss_frame_clone_source_cap_get(pi, page);
+    if clone_source == 0 || scratch_base == 0 {
         return false;
     }
     let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
     let cap = client_copy_temp_cap();
     let _ = cnode_delete_r(cap);
-    let copy_error = copy_cap_into_r(frame, cap);
+    let copy_error = copy_cap_into_r(clone_source, cap);
     let map_error = if copy_error == 0 {
         page_map_r(
             cap,
@@ -1208,11 +1253,16 @@ pub(crate) unsafe fn client_copyin_process_mapped(
                 persistent_alias + (current & 0xfff)
             } else {
                 let frame = {
-                    let frame = csrss_frame_get(pi, page);
+                    let frame = csrss_frame_clone_source_cap_get(pi, page);
                     if frame != 0 {
                         frame
                     } else {
-                        client_copyin_frame_get(pi, page)
+                        let frame = csrss_frame_get(pi, page);
+                        if frame != 0 {
+                            frame
+                        } else {
+                            client_copyin_frame_get(pi, page)
+                        }
                     }
                 };
                 if frame == 0 {
@@ -1324,7 +1374,7 @@ pub(crate) unsafe fn client_copyout_mapped(
         let destination = if persistent_alias != 0 {
             persistent_alias + (current & 0xfff)
         } else {
-            let (frame, _) = csrss_frame_get_exact(pi, page);
+            let frame = csrss_frame_clone_source_cap_get(pi, page);
             if frame != 0 {
                 let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
                 let cap = client_copy_temp_cap();
@@ -1393,7 +1443,7 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
         let destination = if persistent_alias != 0 {
             persistent_alias + (current & 0xFFF)
         } else {
-            let (frame, _) = csrss_frame_get_exact(pi, page);
+            let frame = csrss_frame_clone_source_cap_get(pi, page);
             if frame != 0 {
                 let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
                 let cap = client_copy_temp_cap();

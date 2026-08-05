@@ -188,12 +188,21 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let asid_error = vspace_assign_asid(pml4);
+    if asid_error != 0 {
+        print_str(b"[component-spawn] VSpace ASID assign failed pml4=0x");
+        print_hex(pml4 as u32);
+        print_str(b" error=");
+        print_u64(asid_error);
+        print_str(b"\n");
+    }
     map_image_skeleton(pml4, img_count);
     if d.map_heap_pt {
         map_heap_pt(pml4);
     }
     // Executive image frames.
     for i in 0..img_count {
+        let va = IMAGE_BASE + i * 0x1000;
         let cp = alloc_slot();
         let _ = syscall5(
             SYS_SEND,
@@ -203,12 +212,7 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
             img_start + i,
             0,
         );
-        let _ = page_map(
-            cp,
-            IMAGE_BASE + i * 0x1000,
-            rights_at(d.image_rights, i),
-            pml4,
-        );
+        let _ = page_map(cp, va, rights_at(d.image_rights, i), pml4);
     }
     // Stack.
     if d.stack_dedicated_pt {
@@ -1096,9 +1100,29 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                                 crate::print_hex(page as u32);
                                 crate::print_str(b" -> zero-fill (blit source buffer)\n");
                             }
-                            crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                            if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
+                                crate::win32k_glue::win32k_dispatch_backtrace();
+                                wall_ip = ip;
+                                wall_addr = addr;
+                                wall_label = label;
+                                break;
+                            }
                             let f = crate::alloc_frame();
-                            let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                            let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
+                            if map != 0 {
+                                crate::print_str(b"[w32disp] zero-fill map failed page=0x");
+                                crate::print_hex((page >> 32) as u32);
+                                crate::print_hex(page as u32);
+                                crate::print_str(b" error=");
+                                crate::print_u64(map);
+                                crate::print_str(b"\n");
+                                let _ = crate::cnode_delete_recycle_r(f);
+                                crate::win32k_glue::win32k_dispatch_backtrace();
+                                wall_ip = ip;
+                                wall_addr = addr;
+                                wall_label = label;
+                                break;
+                            }
                         } else {
                             crate::print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
                             crate::print_hex((page >> 32) as u32);
@@ -1114,9 +1138,29 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                         }
                     }
                 } else {
-                    crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                    if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
+                        crate::win32k_glue::win32k_dispatch_backtrace();
+                        wall_ip = ip;
+                        wall_addr = addr;
+                        wall_label = label;
+                        break;
+                    }
                     let f = crate::alloc_frame();
-                    let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                    let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
+                    if map != 0 {
+                        crate::print_str(b"[w32disp] private map failed page=0x");
+                        crate::print_hex((page >> 32) as u32);
+                        crate::print_hex(page as u32);
+                        crate::print_str(b" error=");
+                        crate::print_u64(map);
+                        crate::print_str(b"\n");
+                        let _ = crate::cnode_delete_recycle_r(f);
+                        crate::win32k_glue::win32k_dispatch_backtrace();
+                        wall_ip = ip;
+                        wall_addr = addr;
+                        wall_label = label;
+                        break;
+                    }
                 }
                 demand += 1;
             } else {
@@ -1141,12 +1185,30 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 }
                 let page = addr & !0xFFF;
                 if ch.caps.sparse_vspace {
-                    crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                    if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
+                        wall_ip = ip;
+                        wall_addr = addr;
+                        wall_label = label;
+                        break;
+                    }
                 } else {
                     crate::driver_launch::ensure_paging(page, ch.pml4);
                 }
                 let f = crate::alloc_frame();
-                let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
+                if map != 0 {
+                    crate::print_str(b"[svc] private map failed page=0x");
+                    crate::print_hex((page >> 32) as u32);
+                    crate::print_hex(page as u32);
+                    crate::print_str(b" error=");
+                    crate::print_u64(map);
+                    crate::print_str(b"\n");
+                    let _ = crate::cnode_delete_recycle_r(f);
+                    wall_ip = ip;
+                    wall_addr = addr;
+                    wall_label = label;
+                    break;
+                }
                 demand += 1;
             }
             // Resume the server + recv the next fault/DONE: `reply_on(R, len 0)` — a VMFault reply,

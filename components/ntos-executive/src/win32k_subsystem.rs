@@ -360,12 +360,17 @@ pub const SSN_NT_USER_INITIALIZE_REAL: u64 = 0x125A;
 /// longer relies on the single per-TCB `reply_to`, so a nested faulting SSN can't orphan an outer
 /// caller's reply.
 pub const SSN_TEST_FAULT: u64 = 0x1FFE;
+/// Private executive selector for ReactOS' registered `WIN32_CALLOUTS_FPNS.BatchFlushRoutine`.
+/// Real NT calls this through `KeGdiFlushUserBatch` before every win32k syscall when
+/// `TEB.GdiBatchCount != 0`; it is not an SSDT service.
+pub const SSN_GDI_BATCH_FLUSH_CALLOUT: u64 = 0x1FFD;
 /// Un-demand-paged, demand-pageable probe VA: past the win32k image tail (0x06A2_0000, so NOT
 /// flagged `in_image`) yet inside the same PD as the image, so the executive maps it with no new
 /// page table. Zeroed on first touch.
 pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
 /// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
 pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
+const WIN32_CALLOUT_BATCH_FLUSH_OFF: u64 = 6 * 8;
 
 /// win32k `.data` global `gptiDesktopThread` (desktop.c:54) RVA. `IntGetAndReferenceClass(WC_DESKTOP,
 /// bDesktopThread=TRUE)` (class.c:1457) reads it as the desktop thread's THREADINFO — NULL in our host
@@ -6728,7 +6733,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // Switch to the routed client's real TEB only where ReactOS may call kernel-mode NtCurrentTeb()
     // while capturing a user window-station/desktop name. The client attach path identity-maps the
     // registered TEB pages, so this remains the caller's live StaticUnicodeString/CLIENTINFO view.
-    let teb_context = if ssn == 0x122f || ssn == 0x122d {
+    let teb_context = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT || ssn == 0x122f || ssn == 0x122d {
         client_teb
     } else {
         WIN32K_KPCR_VA
@@ -6804,6 +6809,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let probe = read_volatile(TEST_FAULT_VA as *const u64);
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
         TEST_FAULT_STATUS as u32 as u64
+    } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
+        dispatch_gdi_batch_flush_callout(client_pi, client_teb)
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
@@ -6838,6 +6845,24 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_str(b"\n");
     }
     (result as u32 as i32, result)
+}
+
+/// Invoke win32k's real `WIN32_CALLOUTS_FPNS.BatchFlushRoutine` for the selected client thread.
+/// The caller's TEB is exposed through KPCR.PrcbData.CurrentThread.Teb by `win32k_dispatch` above.
+unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u64 {
+    const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
+    const STATUS_NOT_IMPLEMENTED: u64 = 0xC000_0002u32 as u64;
+
+    if client_pi == 0 || client_teb == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let routine = read_volatile((WIN32_CALLOUTS + WIN32_CALLOUT_BATCH_FLUSH_OFF) as *const u64);
+    if routine == 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    let flush: extern "win64" fn() -> i32 = core::mem::transmute(routine as *const ());
+    flush() as u32 as u64
 }
 
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
