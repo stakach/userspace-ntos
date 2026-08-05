@@ -2169,6 +2169,26 @@ mod tests {
         assert_eq!(le_u16(&stack, 0x1a), 3);
         assert_eq!(le_u64(&stack, 0x20), 0x8888);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_PNP,
+                minor: 0,
+                device_object: 0x4444,
+                file_object: 0,
+                parameters: WdmIoStackParameters::PnpStartDevice {
+                    allocated_resources: 0xAAAA,
+                    allocated_resources_translated: 0xBBBB,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_PNP);
+        assert_eq!(stack[0x01], 0);
+        assert_eq!(le_u64(&stack, 0x08), 0xAAAA);
+        assert_eq!(le_u64(&stack, 0x10), 0xBBBB);
+        assert_eq!(le_u64(&stack, 0x20), 0x4444);
     }
 
     #[test]

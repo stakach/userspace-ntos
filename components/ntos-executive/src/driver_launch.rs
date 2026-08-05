@@ -207,6 +207,8 @@ const STATUS_PENDING: u32 = 0x0000_0103;
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
 const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
 const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
+const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
+const IRP_MN_START_DEVICE: u64 = 0x00;
 /// `IRP_MJ_CLOSE` / `IRP_MJ_CLEANUP` — the requests that END an open (and therefore the ONLY
 /// requests that may destroy its FILE_OBJECT). See [`FILE_OBJECTS`].
 const IRP_MJ_CLOSE: u64 = 0x02;
@@ -1929,6 +1931,7 @@ pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
 /// @0x08, DeviceObject@0x20, FileObject@0x30 }.
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
     let inlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
     let outlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
     let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
@@ -2012,6 +2015,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    let mut pnp_resource_list = 0u64;
     let stack_parameters = match major {
         0 | 1 => {
             // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). The FSD derefs
@@ -2076,6 +2080,31 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             input_buffer_length: inlen as u32,
             io_control_code: fsctl as u32,
         },
+        IRP_MJ_PNP if minor == IRP_MN_START_DEVICE => {
+            if inlen != 0 {
+                let pnp_resource_capacity = (inlen + 7) & !7;
+                pnp_resource_list = pool_alloc(pnp_resource_capacity);
+                if pnp_resource_list == 0 {
+                    pool_free(iosl);
+                    pool_free(data);
+                    if owns_fo {
+                        pool_free(fo);
+                    }
+                    return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+                }
+                zero(pnp_resource_list, pnp_resource_capacity);
+                let mut index = 0u64;
+                while index < inlen {
+                    let byte = read_volatile((FSD_ARG_VADDR + index) as *const u8);
+                    write_volatile((pnp_resource_list + index) as *mut u8, byte);
+                    index += 1;
+                }
+            }
+            WdmIoStackParameters::PnpStartDevice {
+                allocated_resources: pnp_resource_list,
+                allocated_resources_translated: pnp_resource_list,
+            }
+        }
         _ => WdmIoStackParameters::None,
     };
     let iosl_bytes =
@@ -2084,7 +2113,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         iosl_bytes,
         WdmIoStackLocationInit {
             major: major as u8,
-            minor: 0,
+            minor: minor as u8,
             device_object: devobj,
             file_object: fo,
             parameters: stack_parameters,
@@ -2092,6 +2121,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     )
     .is_err()
     {
+        if pnp_resource_list != 0 {
+            pool_free(pnp_resource_list);
+        }
         pool_free(iosl);
         pool_free(data);
         if owns_fo {
@@ -2104,6 +2136,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // `inlen`; reads reserve `outlen` and are copied back to the ARG transport after completion.
     let irp = pool_alloc(WDM_X64_IRP_SIZE as u64);
     if irp == 0 {
+        if pnp_resource_list != 0 {
+            pool_free(pnp_resource_list);
+        }
         pool_free(iosl);
         pool_free(data);
         if owns_fo {
@@ -2123,6 +2158,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     .is_err()
     {
         pool_free(irp);
+        if pnp_resource_list != 0 {
+            pool_free(pnp_resource_list);
+        }
         pool_free(iosl);
         pool_free(data);
         if owns_fo {
@@ -2212,6 +2250,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             }
         }
         pool_free(data);
+        if pnp_resource_list != 0 {
+            pool_free(pnp_resource_list);
+        }
         pool_free(iosl);
         pool_free(irp);
         if irp_owns_fo {
@@ -3136,6 +3177,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
             dispatch_irp_for_instance(
                 self.instance,
                 irp.major as u64,
+                irp.minor as u64,
                 hosted_device_binding_by_device_id(irp.device_id.raw())
                     .map(|binding| binding.device_object)
                     .or_else(|| instance(self.instance).map(|inst| inst.device_object))
@@ -3811,6 +3853,34 @@ pub(crate) unsafe fn call_add_device_for_driver(
     Ok(device_id.raw())
 }
 
+/// Send `IRP_MN_START_DEVICE` to a hosted FDO. `resource_list` is the caller-selected
+/// `CM_RESOURCE_LIST` byte image; an empty slice represents a no-resource devnode.
+pub(crate) unsafe fn start_hosted_device(
+    device_id: u64,
+    resource_list: &[u8],
+) -> Result<(), nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if !inst.ready {
+        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+    }
+    let mut out = [];
+    let (status, _) = dispatch_irp_for_instance(
+        binding.instance,
+        IRP_MJ_PNP,
+        IRP_MN_START_DEVICE,
+        binding.device_object,
+        0,
+        0,
+        resource_list,
+        &mut out,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    nt_status::NtStatus(status).to_result()
+}
+
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove
 /// canonical I/O Manager records and Object Manager namespace entries.
 pub(crate) unsafe fn unload_driver_by_name(
@@ -3897,6 +3967,7 @@ pub(crate) unsafe fn npfs_last_file_id() -> u64 {
 unsafe fn dispatch_irp_for_instance(
     inst: usize,
     major: u64,
+    minor: u64,
     device_object: u64,
     fsctl: u64,
     file_id: u64,
@@ -3918,7 +3989,7 @@ unsafe fn dispatch_irp_for_instance(
     }
     write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, major);
-    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, minor);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, fsctl);
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
     write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);

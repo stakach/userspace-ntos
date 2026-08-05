@@ -265,3 +265,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: the next B3 slice should replace the structural PDO placeholder with
   registry/devnode-backed PDO identity and send `IRP_MN_START_DEVICE` with assigned resource lists.
+- B3 continued. The generic WDM stack writer now models
+  `Parameters.StartDevice.AllocatedResources{,Translated}` and the hosted driver IRP builder carries
+  PnP minor functions. Device-class boot launch now follows successful AddDevice with a real
+  `IRP_MJ_PNP/IRP_MN_START_DEVICE` dispatch through the hosted FDO, passing an explicit empty
+  resource list for no-resource devnodes and preserving real failure statuses for drivers that need
+  hardware resources. Validation: `cargo test -p nt-io-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3 still needs resource assignment from devnode/bus state, root-bus PDO
+  identity/forwarding, and the device-driver ntoskrnl exports (`IoCallDriver`, `MmMapIoSpace`,
+  `IoConnectInterrupt`) before hardware-backed StartDevice can replace the old NIC proof.

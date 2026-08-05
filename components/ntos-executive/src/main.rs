@@ -18930,6 +18930,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 print_str(b" device_id=");
                                 print_u64(device_id);
                                 print_str(b"\n");
+                                match driver_launch::start_hosted_device(device_id, &[]) {
+                                    Ok(()) => {
+                                        print_str(b"[driver-launch] StartDevice service=");
+                                        print_str(spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" status=0x00000000\n");
+                                    }
+                                    Err(status) => {
+                                        print_str(b"[driver-launch] StartDevice failed service=");
+                                        print_str(spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" status=0x");
+                                        print_hex(status.raw() as u32);
+                                        print_str(b"\n");
+                                    }
+                                }
                             }
                             Err(status) => {
                                 print_str(b"[driver-launch] AddDevice failed service=");
