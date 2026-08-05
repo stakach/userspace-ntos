@@ -256,3 +256,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the next B3 slice should add an executive dispatch path for AddDevice, backed by
   service-bound PDO projection and a subsequent `IRP_MN_START_DEVICE` dispatch with assigned
   resources.
+- B3 continued. Device-class boot launch specs now invoke the hosted driver's real
+  `DriverExtension->AddDevice` through the shared component pump. The component side allocates a
+  WDM-shaped PDO, calls AddDevice inside the hosted driver's address space, and returns the FDO
+  created by the driver's own `IoCreateDevice`; the executive publishes that FDO as an unnamed I/O
+  Manager device and records the canonical device-id to hosted `DEVICE_OBJECT` binding for later IRP
+  routing. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should replace the structural PDO placeholder with
+  registry/devnode-backed PDO identity and send `IRP_MN_START_DEVICE` with assigned resource lists.

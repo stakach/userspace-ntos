@@ -18919,6 +18919,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if let Some(dc) =
                 load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
             {
+                if spec.class == driver_launch::DriverClass::Device {
+                    for devnode in &spec.devnodes {
+                        match driver_launch::call_add_device_for_driver(dc.driver_id) {
+                            Ok(device_id) => {
+                                print_str(b"[driver-launch] AddDevice service=");
+                                print_str(spec.service_name.as_bytes());
+                                print_str(b" devnode=");
+                                print_str(devnode.instance_id.as_bytes());
+                                print_str(b" device_id=");
+                                print_u64(device_id);
+                                print_str(b"\n");
+                            }
+                            Err(status) => {
+                                print_str(b"[driver-launch] AddDevice failed service=");
+                                print_str(spec.service_name.as_bytes());
+                                print_str(b" devnode=");
+                                print_str(devnode.instance_id.as_bytes());
+                                print_str(b" status=0x");
+                                print_hex(status.raw() as u32);
+                                print_str(b"\n");
+                            }
+                        }
+                    }
+                }
                 let device_path =
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
                 if device_path.as_deref() == Some("\\Device\\NamedPipe") {

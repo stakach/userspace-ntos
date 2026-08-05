@@ -34,8 +34,8 @@ use nt_io_manager::{
     DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId,
     InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
     ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
-    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
@@ -199,6 +199,7 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
+pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -1065,15 +1066,20 @@ extern "win64" fn s_io_delete_device(dev: u64) {
         return;
     }
     unsafe {
-        if let Some((index, inst)) = instance_by_device_object(dev) {
-            if inst.device_id != 0 {
-                let device_id = nt_io_manager::DeviceId(inst.device_id);
+        if let Some(binding) = hosted_device_binding_by_device_object(dev) {
+            if binding.device_id != 0 {
+                let device_id = nt_io_manager::DeviceId(binding.device_id);
                 match io_manager_mut().destroy_device(device_id) {
                     Ok(_) => {
+                        clear_hosted_device_binding_by_device_id(binding.device_id);
                         let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
-                        table[index].device_id = 0;
-                        table[index].device_object = 0;
-                        table[index].ready = false;
+                        if binding.instance < table.len()
+                            && table[binding.instance].device_object == dev
+                        {
+                            table[binding.instance].device_id = 0;
+                            table[binding.instance].device_object = 0;
+                            table[binding.instance].ready = false;
+                        }
                     }
                     Err(nt_status::NtStatus::DELETE_PENDING) => return,
                     Err(_) => return,
@@ -1841,6 +1847,29 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let f: extern "win64" fn(u64) = core::mem::transmute(unload as *const ());
         f(req.drv);
         return (0, 0);
+    }
+    if major == FSD_DISPATCH_ADD_DEVICE {
+        let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
+        if add_device == 0 {
+            return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
+        }
+        let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
+            0,
+            0,
+            DeviceType::UNKNOWN.0,
+            pool_alloc,
+            pool_free,
+        ) {
+            Ok(projection) => projection,
+            Err(status) => return (status, 0),
+        };
+        let pdo = projection.device_object();
+        write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, pdo);
+        write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
+        let add: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
+        let status = add(req.drv, pdo);
+        let fdo = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+        return (status, fdo);
     }
     let mj_base = req.drv + 0x70;
     let handler = read_volatile((mj_base + major * 8) as *const u64);
@@ -3107,6 +3136,10 @@ impl DriverDispatchBackend for HostedDriverBackend {
             dispatch_irp_for_instance(
                 self.instance,
                 irp.major as u64,
+                hosted_device_binding_by_device_id(irp.device_id.raw())
+                    .map(|binding| binding.device_object)
+                    .or_else(|| instance(self.instance).map(|inst| inst.device_object))
+                    .unwrap_or(0),
                 fsctl,
                 irp.user_data,
                 &input,
@@ -3372,16 +3405,16 @@ fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_st
     let Some(name) = captured_nt_path(&dc.device_name_utf16, dc.device_name_len) else {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     };
-    io_manager_mut()
-        .create_device(
-            DriverId(driver_id),
-            Some(&name),
-            DeviceType::UNKNOWN,
-            DeviceCharacteristics::empty(),
-            DeviceFlags::BUFFERED_IO,
-            0,
-        )
-        .map(|device_id| device_id.raw())
+    let device_id = io_manager_mut().create_device(
+        DriverId(driver_id),
+        Some(&name),
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::BUFFERED_IO,
+        0,
+    )?;
+    register_hosted_device_binding(driver_id, device_id.raw(), dc.instance, dc.devobj);
+    Ok(device_id.raw())
 }
 
 fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtStatus> {
@@ -3397,6 +3430,96 @@ fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtSt
 
 fn destroy_registered_driver(driver_id: u64) {
     let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
+}
+
+#[derive(Clone, Copy)]
+struct HostedDeviceBinding {
+    driver_id: u64,
+    device_id: u64,
+    instance: usize,
+    device_object: u64,
+    used: bool,
+}
+
+const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
+    driver_id: 0,
+    device_id: 0,
+    instance: 0,
+    device_object: 0,
+    used: false,
+};
+
+const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
+static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
+    [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
+
+fn register_hosted_device_binding(
+    driver_id: u64,
+    device_id: u64,
+    instance: usize,
+    device_object: u64,
+) {
+    if device_id == 0 || device_object == 0 {
+        return;
+    }
+    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    if let Some(slot) = bindings
+        .iter_mut()
+        .find(|slot| slot.used && slot.device_id == device_id)
+    {
+        *slot = HostedDeviceBinding {
+            driver_id,
+            device_id,
+            instance,
+            device_object,
+            used: true,
+        };
+        return;
+    }
+    if let Some(slot) = bindings.iter_mut().find(|slot| !slot.used) {
+        *slot = HostedDeviceBinding {
+            driver_id,
+            device_id,
+            instance,
+            device_object,
+            used: true,
+        };
+    }
+}
+
+fn hosted_device_binding_by_device_id(device_id: u64) -> Option<HostedDeviceBinding> {
+    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    bindings
+        .iter()
+        .copied()
+        .find(|slot| slot.used && slot.device_id == device_id)
+}
+
+fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDeviceBinding> {
+    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    bindings
+        .iter()
+        .copied()
+        .find(|slot| slot.used && slot.device_object == device_object)
+}
+
+fn clear_hosted_device_binding_by_device_id(device_id: u64) {
+    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    if let Some(slot) = bindings
+        .iter_mut()
+        .find(|slot| slot.used && slot.device_id == device_id)
+    {
+        *slot = EMPTY_HOSTED_DEVICE_BINDING;
+    }
+}
+
+fn clear_hosted_device_bindings_for_instance(instance: usize) {
+    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    for slot in bindings.iter_mut() {
+        if slot.used && slot.instance == instance {
+            *slot = EMPTY_HOSTED_DEVICE_BINDING;
+        }
+    }
 }
 
 pub(crate) fn destroy_io_driver(driver_id: u64) {
@@ -3487,6 +3610,7 @@ pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
 }
 
 fn clear_instance(i: usize) {
+    clear_hosted_device_bindings_for_instance(i);
     let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
     if i < t.len() {
         t[i] = EMPTY_INSTANCE;
@@ -3609,6 +3733,84 @@ unsafe fn dispatch_driver_unload_for_instance(
     nt_status::NtStatus(pr.status).to_result()
 }
 
+unsafe fn dispatch_add_device_for_instance(
+    index: usize,
+    inst: DriverInstance,
+) -> Result<u64, nt_status::NtStatus> {
+    if inst.driver_object == 0 || inst.add_device == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_ADD_DEVICE);
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        callback_client: None,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(index, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    nt_status::NtStatus(pr.status).to_result()?;
+    let fdo = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    if fdo == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(fdo)
+}
+
+/// Invoke a loaded WDM driver's real `DriverExtension->AddDevice` for one registry-selected devnode
+/// and publish the FDO it creates as an unnamed I/O Manager device owned by that driver.
+pub(crate) unsafe fn call_add_device_for_driver(
+    driver_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let (index, inst) =
+        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let fdo = dispatch_add_device_for_instance(index, inst)?;
+    let device_id = io_manager_mut().create_device(
+        DriverId(driver_id),
+        None,
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::BUFFERED_IO,
+        0,
+    )?;
+    register_hosted_device_binding(driver_id, device_id.raw(), index, fdo);
+
+    let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
+    if index < table.len() && table[index].used {
+        table[index].device_id = device_id.raw();
+        table[index].device_object = fdo;
+        table[index].ready = true;
+    }
+    Ok(device_id.raw())
+}
+
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove
 /// canonical I/O Manager records and Object Manager namespace entries.
 pub(crate) unsafe fn unload_driver_by_name(
@@ -3695,6 +3897,7 @@ pub(crate) unsafe fn npfs_last_file_id() -> u64 {
 unsafe fn dispatch_irp_for_instance(
     inst: usize,
     major: u64,
+    device_object: u64,
     fsctl: u64,
     file_id: u64,
     in_data: &[u8],
@@ -3713,6 +3916,7 @@ unsafe fn dispatch_irp_for_instance(
     for i in 0..inlen {
         write_volatile((arg + i as u64) as *mut u8, in_data[i]);
     }
+    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, major);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, fsctl);
@@ -3835,8 +4039,9 @@ pub(crate) unsafe fn dispatch_irp_to_device(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let (_, inst) = instance_by_device_id(device_id)?;
-    if !inst.ready || inst.driver_id == 0 || inst.device_object == 0 {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)?;
+    if !inst.ready || inst.driver_id == 0 || binding.device_object == 0 {
         return None;
     }
     if io_manager_mut()
