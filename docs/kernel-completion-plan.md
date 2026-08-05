@@ -80,8 +80,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Finish B3 generic hardware grants: move interrupt delivery and DMA/common-buffer ownership behind
-   the same registry-selected hosted-driver resource boundary as MMIO.
+1. Finish B3 generic hardware grants: move DMA/common-buffer ownership behind the same
+   registry-selected hosted-driver resource boundary as MMIO/interrupt grants.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Add a boot proof that the generic registry-selected hosted-driver path reaches equivalent real
@@ -311,3 +311,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the remaining B3 gap before retiring the old NIC proof is real interrupt/DMA
   resource-manager grant state plus a boot proof that the generic registry-selected driver reaches
   the same hardware-backed lifecycle evidence.
+- B3 continued. Hosted device-driver MMIO and interrupt grants now flow through the canonical
+  `nt-resource-manager`: per-devnode resource owners and deterministic resource IDs are registered
+  before `START_DEVICE`, stale no-resource projections are cleared, and post-START `MmMapIoSpace`
+  / `IoConnectInterrupt` evidence is replayed into the resource manager with no success fallback.
+  `nt-resource-manager` now replaces repeated assignments and can revoke all resources/usages for a
+  single driver/device owner. Validation: `cargo test -p nt-resource-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: DMA/common-buffer ownership is still fixture-hosted; the next B3 slice should
+  expose `IoGetDmaAdapter`/common-buffer allocation on the generic hosted-driver path using
+  `nt-dma-manager`, then add the boot evidence needed to retire the bespoke NIC proof.

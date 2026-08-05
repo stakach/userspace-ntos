@@ -18953,6 +18953,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                             nic_bar_base,
                                             4,
                                             grant.assignment.int_vector,
+                                            grant.assignment.int_latched,
                                             grant.assignment.int_affinity,
                                         ) {
                                             Ok(()) => {

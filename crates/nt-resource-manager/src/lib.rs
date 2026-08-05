@@ -165,7 +165,8 @@ impl ResourceManager {
         cache: u32,
         rights: u64,
     ) {
-        self.memory.push(MemoryResource {
+        self.revoke_memory_resource_usage(resource_id);
+        let resource = MemoryResource {
             resource_id,
             owner,
             phys_start,
@@ -174,7 +175,16 @@ impl ResourceManager {
             cache,
             rights,
             revoked: false,
-        });
+        };
+        if let Some(existing) = self
+            .memory
+            .iter_mut()
+            .find(|existing| existing.resource_id == resource_id)
+        {
+            *existing = resource;
+        } else {
+            self.memory.push(resource);
+        }
     }
 
     /// Assign an interrupt resource to `owner`.
@@ -187,7 +197,8 @@ impl ResourceManager {
         affinity: u32,
         mode: u8,
     ) {
-        self.interrupts_res.push(InterruptResource {
+        self.revoke_interrupt_resource_usage(resource_id);
+        let resource = InterruptResource {
             resource_id,
             owner,
             vector,
@@ -195,7 +206,32 @@ impl ResourceManager {
             affinity,
             mode,
             revoked: false,
-        });
+        };
+        if let Some(existing) = self
+            .interrupts_res
+            .iter_mut()
+            .find(|existing| existing.resource_id == resource_id)
+        {
+            *existing = resource;
+        } else {
+            self.interrupts_res.push(resource);
+        }
+    }
+
+    fn revoke_memory_resource_usage(&mut self, resource_id: u64) {
+        for mapping in self.mappings.iter_mut() {
+            if mapping.resource_id == resource_id && mapping.valid {
+                mapping.valid = false;
+            }
+        }
+    }
+
+    fn revoke_interrupt_resource_usage(&mut self, resource_id: u64) {
+        for interrupt in self.connected.iter_mut() {
+            if interrupt.resource_id == resource_id && interrupt.connected {
+                interrupt.connected = false;
+            }
+        }
     }
 
     /// Raw + translated resource descriptors assigned to `owner` (spec §10.1/§7.2).
@@ -410,6 +446,41 @@ impl ResourceManager {
             })
     }
 
+    /// Device removal cleanup: revoke every assignment, mapping, and interrupt owned by one
+    /// driver/device pair. Returns `(memory_resources, interrupt_resources, mappings,
+    /// interrupts)`.
+    pub fn revoke_owner(&mut self, owner: ResourceOwner) -> (usize, usize, usize, usize) {
+        let mut memory_resources = 0;
+        for m in self.memory.iter_mut() {
+            if m.owner == owner && !m.revoked {
+                m.revoked = true;
+                memory_resources += 1;
+            }
+        }
+        let mut interrupt_resources = 0;
+        for i in self.interrupts_res.iter_mut() {
+            if i.owner == owner && !i.revoked {
+                i.revoked = true;
+                interrupt_resources += 1;
+            }
+        }
+        let mut mappings = 0;
+        for m in self.mappings.iter_mut() {
+            if m.owner == owner && m.valid {
+                m.valid = false;
+                mappings += 1;
+            }
+        }
+        let mut interrupts = 0;
+        for c in self.connected.iter_mut() {
+            if c.owner == owner && c.connected {
+                c.connected = false;
+                interrupts += 1;
+            }
+        }
+        (memory_resources, interrupt_resources, mappings, interrupts)
+    }
+
     /// Driver Host fault / unload cleanup (spec §15.1): revoke every mapping and
     /// disconnect every interrupt owned by `driver_host_id`. Returns
     /// `(mappings_revoked, interrupts_disconnected)`.
@@ -512,6 +583,87 @@ mod tests {
         assert_eq!(
             rm.connect_interrupt(other, 200, 0, 0),
             Err(HalError::WrongOwner)
+        );
+    }
+
+    #[test]
+    fn reassigned_memory_resource_revokes_stale_mapping() {
+        let (mut rm, old_owner) = rm();
+        let mapping = rm.map_io_space(old_owner, 0x1000_0000, 0x1000, 0).unwrap();
+        let new_owner = ResourceOwner::new(3, 30);
+
+        rm.assign_memory(
+            new_owner,
+            100,
+            0x2000_0000,
+            0x3000_0000,
+            0x1000,
+            nt_hal_abi::MM_NON_CACHED,
+            RIGHT_READ | RIGHT_WRITE,
+        );
+
+        assert!(!rm.mapping_valid(mapping.mapping_id));
+        assert_eq!(
+            rm.unmap_io_space(old_owner, mapping.mapping_id),
+            Err(HalError::StaleId)
+        );
+        assert_eq!(
+            rm.map_io_space(old_owner, 0x2000_0000, 0x1000, 0),
+            Err(HalError::WrongOwner)
+        );
+
+        let new_mapping = rm.map_io_space(new_owner, 0x2000_0000, 0x1000, 0).unwrap();
+        assert_eq!(new_mapping.translated_start, 0x3000_0000);
+    }
+
+    #[test]
+    fn reassigned_interrupt_resource_disconnects_stale_isr() {
+        let (mut rm, old_owner) = rm();
+        let old_interrupt = rm.connect_interrupt(old_owner, 200, 0xAA, 0xBB).unwrap();
+        let new_owner = ResourceOwner::new(4, 40);
+
+        rm.assign_interrupt(
+            new_owner,
+            200,
+            7,
+            7,
+            1,
+            nt_hal_abi::INT_MODE_LEVEL_SENSITIVE,
+        );
+
+        assert!(rm.inject_interrupt(old_interrupt).is_none());
+        assert_eq!(
+            rm.disconnect_interrupt(old_owner, old_interrupt),
+            Err(HalError::StaleId)
+        );
+        assert_eq!(
+            rm.connect_interrupt(old_owner, 200, 0, 0),
+            Err(HalError::WrongOwner)
+        );
+
+        let new_interrupt = rm.connect_interrupt(new_owner, 200, 0xCC, 0xDD).unwrap();
+        let tokens = rm.inject_interrupt(new_interrupt).unwrap();
+        assert_eq!(tokens.vector, 7);
+        assert_eq!(tokens.service_routine_token, 0xCC);
+    }
+
+    #[test]
+    fn revoke_owner_revokes_assignments_and_usage() {
+        let (mut rm, owner) = rm();
+        let mapping = rm.map_io_space(owner, 0x1000_0000, 0x1000, 0).unwrap();
+        let interrupt = rm.connect_interrupt(owner, 200, 0xAA, 0xBB).unwrap();
+
+        assert_eq!(rm.revoke_owner(owner), (1, 1, 1, 1));
+
+        assert!(!rm.mapping_valid(mapping.mapping_id));
+        assert!(rm.inject_interrupt(interrupt).is_none());
+        assert_eq!(
+            rm.map_io_space(owner, 0x1000_0000, 0x1000, 0),
+            Err(HalError::Revoked)
+        );
+        assert_eq!(
+            rm.connect_interrupt(owner, 200, 0, 0),
+            Err(HalError::Revoked)
         );
     }
 

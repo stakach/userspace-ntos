@@ -57,6 +57,9 @@ nt-io-completion = { path = "../../crates/nt-io-completion" }
 nt-video-miniport = { path = "../../crates/nt-video-miniport" }
 # Real NT CM_RESOURCE_LIST encoding — the resources PnP hands a driver at START.
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
+# Canonical HAL/PnP resource ownership for hosted MMIO and interrupt grants.
+nt-hal-abi = { path = "../../crates/nt-hal-abi" }
+nt-resource-manager = { path = "../../crates/nt-resource-manager" }
 # Root-bus PDO identity/state for registry-selected devnodes.
 nt-root-bus = { path = "../../crates/nt-root-bus" }
 # PnP resource-assignment policy — PCI enum + BAR-size probe + CM_RESOURCE_LIST build. The

@@ -11,8 +11,8 @@
 //! POLICY CLASSES (see `project_driver_model.md`):
 //!   * [`DriverClass::Fsd`]    — file-system drivers (npfs, fastfat, ntfs): image + heap/pool + stack
 //!     + IPC-buf + fault EP + a shared handoff page; NO device caps.
-//!   * [`DriverClass::Device`] — hardware drivers (NIC/AHCI/GPU): the device-cap section is populated
-//!     by `nt-pnp` (MMIO BARs / IRQ / DMA). SEAM ONLY here (out of scope for this increment).
+//!   * [`DriverClass::Device`] — hardware drivers (NIC/AHCI/GPU): PnP selects devnodes/resources,
+//!     then the executive grants the hosted driver exactly those MMIO/interrupt/DMA authorities.
 //!   * [`DriverClass::Filter`]  — FS/bus filter drivers: the SAME IRP substrate + caps as `Fsd`.
 //!   * [`DriverClass::GuiSyscallServer`] — win32k: a unique privileged class (kept bespoke — its
 //!     Syscall substrate + paint-loop protocol are NOT routed through the IRP builder here).
@@ -39,6 +39,7 @@ use nt_io_manager::{
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
+use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 
@@ -3776,6 +3777,26 @@ const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
 static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
     [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
+static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
+
+const HOSTED_MMIO_RESOURCE_KIND: u64 = 1;
+const HOSTED_INTERRUPT_RESOURCE_KIND: u64 = 2;
+
+fn hosted_resource_id(device_id: u64, kind: u64) -> Option<u64> {
+    device_id.checked_mul(0x100)?.checked_add(kind)
+}
+
+fn hosted_mmio_resource_id(device_id: u64) -> Option<u64> {
+    hosted_resource_id(device_id, HOSTED_MMIO_RESOURCE_KIND)
+}
+
+fn hosted_interrupt_resource_id(device_id: u64) -> Option<u64> {
+    hosted_resource_id(device_id, HOSTED_INTERRUPT_RESOURCE_KIND)
+}
+
+fn hosted_resource_owner(binding: HostedDeviceBinding) -> ResourceOwner {
+    ResourceOwner::new(binding.driver_id, binding.device_id)
+}
 
 unsafe fn hosted_root_bus_mut() -> &'static mut nt_root_bus::RootBus {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_BUS);
@@ -3783,6 +3804,43 @@ unsafe fn hosted_root_bus_mut() -> &'static mut nt_root_bus::RootBus {
         *slot = Some(nt_root_bus::RootBus::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_RESOURCE_MANAGER);
+    if slot.is_none() {
+        *slot = Some(ResourceManager::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn hosted_hal_status(error: HalError) -> nt_status::NtStatus {
+    match error {
+        HalError::WrongOwner | HalError::AccessDenied => nt_status::NtStatus::ACCESS_DENIED,
+        HalError::NotAssigned
+        | HalError::OutOfRange
+        | HalError::Revoked
+        | HalError::StaleId
+        | HalError::AlreadyConnected => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+    }
+}
+
+unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) {
+    let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
+}
+
+unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
+    revoke_hosted_device_resources(binding);
+    write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
 }
 
 unsafe fn register_hosted_root_pdo(
@@ -3872,6 +3930,9 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
         .iter_mut()
         .find(|slot| slot.used && slot.device_id == device_id)
     {
+        unsafe {
+            revoke_hosted_device_resources(*slot);
+        }
         *slot = EMPTY_HOSTED_DEVICE_BINDING;
     }
 }
@@ -3880,6 +3941,9 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) {
     let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
     for slot in bindings.iter_mut() {
         if slot.used && slot.instance == instance {
+            unsafe {
+                revoke_hosted_device_resources(*slot);
+            }
             *slot = EMPTY_HOSTED_DEVICE_BINDING;
         }
     }
@@ -4212,6 +4276,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     mmio_frame_base: u64,
     mmio_pages: u64,
     interrupt_vector: u32,
+    interrupt_latched: bool,
     interrupt_affinity: u64,
 ) -> Result<(), nt_status::NtStatus> {
     if mmio_phys == 0
@@ -4220,6 +4285,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || mmio_frame_base == 0
         || mmio_pages == 0
         || interrupt_vector == 0
+        || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -4227,6 +4293,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let owner = hosted_resource_owner(binding);
+    let mmio_resource_id =
+        hosted_mmio_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let interrupt_resource_id =
+        hosted_interrupt_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    clear_hosted_resource_projection(binding, inst.exec_shared_va);
     let mapped_len = mmio_len.min(mmio_pages.saturating_mul(0x1000));
     ensure_paging(mmio_va, inst.pml4);
     let mut page = 0u64;
@@ -4242,6 +4314,29 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         }
         page += 1;
     }
+
+    let rm = hosted_resource_manager_mut();
+    rm.assign_memory(
+        owner,
+        mmio_resource_id,
+        mmio_phys,
+        mmio_va,
+        mapped_len,
+        nt_hal_abi::MM_NON_CACHED,
+        nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
+    );
+    rm.assign_interrupt(
+        owner,
+        interrupt_resource_id,
+        interrupt_vector,
+        interrupt_vector as u8,
+        interrupt_affinity as u32,
+        if interrupt_latched {
+            nt_hal_abi::INT_MODE_LATCHED
+        } else {
+            nt_hal_abi::INT_MODE_LEVEL_SENSITIVE
+        },
+    );
 
     let sh = inst.exec_shared_va;
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
@@ -4263,6 +4358,59 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     Ok(())
 }
 
+unsafe fn record_hosted_resource_usage(
+    binding: HostedDeviceBinding,
+    sh: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let owner = hosted_resource_owner(binding);
+    let grant_phys = read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64);
+    let grant_len = read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64);
+    let grant_va = read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64);
+    let mapped_phys = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64);
+    let mapped_len = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64);
+    if mapped_phys != 0 || mapped_len != 0 {
+        if grant_phys == 0 || grant_len == 0 || grant_va == 0 || mapped_len == 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let mapped_offset = mapped_phys
+            .checked_sub(grant_phys)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if mapped_offset > grant_len || mapped_len > grant_len - mapped_offset {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let mapped = hosted_resource_manager_mut()
+            .map_io_space(owner, mapped_phys, mapped_len, nt_hal_abi::MM_NON_CACHED)
+            .map_err(hosted_hal_status)?;
+        if mapped.resource_id
+            != hosted_mmio_resource_id(binding.device_id)
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+            || mapped.translated_start != grant_va + mapped_offset
+            || mapped.length != mapped_len
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    }
+
+    let interrupt_object = read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
+    let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
+    let service_context = read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64);
+    if interrupt_object != 0 || service_routine != 0 || service_context != 0 {
+        if interrupt_object == 0 || service_routine == 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        let connected = hosted_resource_manager_mut()
+            .connect_interrupt(owner, interrupt_id, service_routine, service_context)
+            .map_err(hosted_hal_status)?;
+        if connected == 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    }
+
+    Ok(())
+}
+
 /// Send `IRP_MN_START_DEVICE` to a hosted FDO. `resource_list` is the caller-selected
 /// `CM_RESOURCE_LIST` byte image; an empty slice represents a no-resource devnode.
 pub(crate) unsafe fn start_hosted_device(
@@ -4277,6 +4425,9 @@ pub(crate) unsafe fn start_hosted_device(
         return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
     }
     let sh = inst.exec_shared_va;
+    if resource_list.is_empty() {
+        clear_hosted_resource_projection(binding, sh);
+    }
     write_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64, u64::MAX);
     write_volatile(
         (sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
@@ -4295,6 +4446,7 @@ pub(crate) unsafe fn start_hosted_device(
     )
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     nt_status::NtStatus(status).to_result()?;
+    record_hosted_resource_usage(binding, sh)?;
 
     let forwarded_minor = read_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64);
     let forwarded_status = read_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32);
