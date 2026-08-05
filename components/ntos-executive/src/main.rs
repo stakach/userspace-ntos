@@ -18921,7 +18921,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             {
                 if spec.class == driver_launch::DriverClass::Device {
                     for devnode in &spec.devnodes {
-                        match driver_launch::call_add_device_for_driver(dc.driver_id) {
+                        match driver_launch::call_add_device_for_driver(
+                            dc.driver_id,
+                            &devnode.instance_id,
+                            &devnode.hardware_ids,
+                            &devnode.compatible_ids,
+                        ) {
                             Ok(device_id) => {
                                 print_str(b"[driver-launch] AddDevice service=");
                                 print_str(spec.service_name.as_bytes());

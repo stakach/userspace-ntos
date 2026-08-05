@@ -80,12 +80,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Finish B3 root-bus PDO identity/state: hosted AddDevice still receives a structural PDO
-   projection, while the kernel needs a devnode-backed PDO object that can own forwarded PnP state.
+1. Finish B3 generic hardware grants: move interrupt delivery and DMA/common-buffer ownership behind
+   the same registry-selected hosted-driver resource boundary as MMIO.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-3. Retire the old bespoke NIC driver proof once the generic registry-selected hosted-driver path
-   proves equivalent real MMIO/interrupt/DMA evidence.
+3. Add a boot proof that the generic registry-selected hosted-driver path reaches equivalent real
+   MMIO/interrupt/DMA evidence, then retire the old bespoke NIC driver proof.
 4. Audit remaining static driver-object construction sites that are not service-key-derived,
    especially video and object-server tests, and classify whether they are fixtures or real debt.
 5. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
@@ -301,3 +301,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: B3 still needs devnode-backed root-bus PDO state and generic interrupt/DMA
   resource-manager grants before the old bespoke NIC driver proof can be removed.
+- B3 continued. Hosted AddDevice now registers the component-local PDO with the executive's
+  `nt-root-bus` table using the imported `Enum` instance path, hardware IDs, and compatible IDs.
+  Lower-stack `IoCallDriver` records forwarded PnP minors in the shared frame, and successful hosted
+  START applies the forwarded minor to root-bus PDO lifecycle state instead of leaving the PDO as a
+  stateless structural placeholder. `nt-root-bus` also has a host-tested split helper for
+  `Enum\<DeviceID>\<InstanceID>`. Validation: `cargo test -p nt-root-bus` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the remaining B3 gap before retiring the old NIC proof is real interrupt/DMA
+  resource-manager grant state plus a boot proof that the generic registry-selected driver reaches
+  the same hardware-backed lifecycle evidence.

@@ -232,6 +232,18 @@ impl RootBus {
     }
 }
 
+/// Split an imported `Enum` instance path into the bus-reported `DeviceID` and local
+/// `BusQueryInstanceID`.
+///
+/// For PCI, registry paths look like `PCI\VEN_8086&DEV_100E\3&11583659&0&18`; the bus reports
+/// `PCI\VEN_8086&DEV_100E` as the device ID and `3&11583659&0&18` as the instance ID.
+pub fn split_enum_instance_path(path: &str) -> (&str, &str) {
+    match path.rfind('\\') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (path, ""),
+    }
+}
+
 /// A single NUL-terminated wide string.
 fn wide_z(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
@@ -349,5 +361,21 @@ mod tests {
         // surprise removal quiesces.
         assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_SURPRISE_REMOVAL), 0);
         assert!(!b.pdo_started(0xFED0_0000));
+    }
+
+    #[test]
+    fn splits_enum_instance_path_for_bus_query_ids() {
+        assert_eq!(
+            split_enum_instance_path(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"),
+            (r"PCI\VEN_8086&DEV_100E", r"3&11583659&0&18")
+        );
+        assert_eq!(
+            split_enum_instance_path(r"ROOT\DEVICE\0001"),
+            (r"ROOT\DEVICE", "0001")
+        );
+        assert_eq!(
+            split_enum_instance_path("LEGACY_DEVICE"),
+            ("LEGACY_DEVICE", "")
+        );
     }
 }

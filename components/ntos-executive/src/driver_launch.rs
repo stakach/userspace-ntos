@@ -182,6 +182,8 @@ pub const SH_RESOURCE_MMIO_MAPPED_LEN: u64 = 0x3D0; // out: last MmMapIoSpace le
 pub const SH_RESOURCE_INTERRUPT_OBJECT: u64 = 0x3D8; // out: PKINTERRUPT projection
 pub const SH_RESOURCE_INTERRUPT_ROUTINE: u64 = 0x3E0; // out: connected ISR routine
 pub const SH_RESOURCE_INTERRUPT_CONTEXT: u64 = 0x3E8; // out: connected ISR context
+pub const SH_ROOT_PDO_FORWARDED_MINOR: u64 = 0x3F0; // out: lower PDO PnP minor forwarded
+pub const SH_ROOT_PDO_FORWARDED_STATUS: u64 = 0x3F8; // out: lower PDO completion status
 
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
@@ -1223,11 +1225,22 @@ extern "win64" fn s_io_skip_current_irp_stack_location(_irp: u64) {}
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let expected_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let status = if expected_pdo == 0 || device == expected_pdo {
+        let minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        let status = if expected_pdo == 0 {
+            0
+        } else if device == expected_pdo {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
+                minor,
+            );
             0
         } else {
             0xC000_0010u32 as i32 // STATUS_INVALID_DEVICE_REQUEST
         };
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
+            status,
+        );
         if irp != 0 {
             write_unaligned((irp + 0x30) as *mut i32, status);
         }
@@ -3762,6 +3775,43 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
 const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
 static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
     [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
+static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
+
+unsafe fn hosted_root_bus_mut() -> &'static mut nt_root_bus::RootBus {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_BUS);
+    if slot.is_none() {
+        *slot = Some(nt_root_bus::RootBus::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn register_hosted_root_pdo(
+    pdo_object: u64,
+    instance_path: &str,
+    hardware_ids: &[String],
+    compatible_ids: &[String],
+) {
+    if pdo_object == 0 {
+        return;
+    }
+    let bus = hosted_root_bus_mut();
+    if bus.pdo(pdo_object).is_some() {
+        return;
+    }
+    let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
+    let mut hardware_refs: Vec<&str> = hardware_ids.iter().map(|id| id.as_str()).collect();
+    if hardware_refs.is_empty() {
+        hardware_refs.push(device_id);
+    }
+    let compatible_refs: Vec<&str> = compatible_ids.iter().map(|id| id.as_str()).collect();
+    bus.create_pdo(
+        pdo_object,
+        device_id,
+        &hardware_refs,
+        &compatible_refs,
+        instance_id,
+    );
+}
 
 fn register_hosted_device_binding(
     driver_id: u64,
@@ -4110,10 +4160,19 @@ unsafe fn dispatch_add_device_for_instance(
 /// and publish the FDO it creates as an unnamed I/O Manager device owned by that driver.
 pub(crate) unsafe fn call_add_device_for_driver(
     driver_id: u64,
+    instance_path: &str,
+    hardware_ids: &[String],
+    compatible_ids: &[String],
 ) -> Result<u64, nt_status::NtStatus> {
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     let add_device = dispatch_add_device_for_instance(index, inst)?;
+    register_hosted_root_pdo(
+        add_device.pdo_object,
+        instance_path,
+        hardware_ids,
+        compatible_ids,
+    );
     let device_id = io_manager_mut().create_device(
         DriverId(driver_id),
         None,
@@ -4217,6 +4276,12 @@ pub(crate) unsafe fn start_hosted_device(
     if !inst.ready {
         return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
     }
+    let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64, u64::MAX);
+    write_volatile(
+        (sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
+        0xC000_0010u32 as i32,
+    );
     let mut out = [];
     let (status, _) = dispatch_irp_for_instance(
         binding.instance,
@@ -4229,7 +4294,16 @@ pub(crate) unsafe fn start_hosted_device(
         &mut out,
     )
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    nt_status::NtStatus(status).to_result()
+    nt_status::NtStatus(status).to_result()?;
+
+    let forwarded_minor = read_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64);
+    let forwarded_status = read_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32);
+    if forwarded_minor <= u8::MAX as u64 && forwarded_status == 0 {
+        let root_status =
+            hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, forwarded_minor as u8);
+        nt_status::NtStatus(root_status).to_result()?;
+    }
+    Ok(())
 }
 
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove
