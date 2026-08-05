@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-05
+Last updated: 2026-08-06
 
 ## Objective
 
@@ -141,3 +141,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo test -p nt-config-manager`. Review adjustment: the executive still needs to consume this
   full ordered candidate list for boot/system driver bring-up rather than explicitly asking for
   NPFS as a proof-only service.
+
+### 2026-08-06
+
+- B2 continued. `nt-hive-regf` now imports `ControlSetXXX\Control\ServiceGroupOrder` alongside
+  `Services` for boot-driver selection snapshots, and the executive's real SYSTEM-hive
+  `ConfigManager` view uses that broader import. Validation: `cargo test -p nt-hive-regf`. Review
+  adjustment: the ordered metadata is now available from real REGF hives; the next B2 slice should
+  replace the remaining NPFS-named launch proof with an ordered boot/system launch plan.

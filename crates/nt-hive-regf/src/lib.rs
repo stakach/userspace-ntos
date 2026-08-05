@@ -24,7 +24,10 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use nt_config_manager::{ConfigManager, Registry, RegistryKeyId, RegistryValueType, SERVICES_PATH};
+use nt_config_manager::{
+    ConfigManager, Registry, RegistryKeyId, RegistryValueType, SERVICES_PATH,
+    SERVICE_GROUP_ORDER_PATH,
+};
 
 const HBIN_BASE: usize = 0x1000;
 
@@ -387,6 +390,29 @@ impl<'a> RegfHive<'a> {
     }
 }
 
+/// Import counts for a control-set snapshot loaded into Configuration Manager state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlSetImportCounts {
+    pub services: usize,
+    pub service_group_order_values: usize,
+}
+
+/// Import the control-set state needed to select boot/system drivers from a read-only REGF hive.
+pub fn import_control_set_boot_config_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> ControlSetImportCounts {
+    ControlSetImportCounts {
+        services: import_control_set_services_into_config_manager(hive, cm, control_set),
+        service_group_order_values: import_control_set_service_group_order_into_config_manager(
+            hive,
+            cm,
+            control_set,
+        ),
+    }
+}
+
 /// Import `ControlSetXXX\Services` from a read-only REGF hive into
 /// `\Registry\Machine\System\CurrentControlSet\Services`.
 pub fn import_control_set_services_into_config_manager(
@@ -407,6 +433,24 @@ pub fn import_control_set_services_into_config_manager(
         import_regf_key(hive, src_service, cm.registry_mut(), dst_service);
     }
     count
+}
+
+/// Import `ControlSetXXX\Control\ServiceGroupOrder` from a read-only REGF hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder`.
+pub fn import_control_set_service_group_order_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_path = String::from(control_set);
+    src_path.push_str("\\Control\\ServiceGroupOrder");
+    let Some(src_key) = hive.open_key(&src_path) else {
+        return 0;
+    };
+    let value_count = hive.values(src_key).len();
+    let dst_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+    import_regf_key(hive, src_key, cm.registry_mut(), dst_key);
+    value_count
 }
 
 fn import_regf_key(hive: &RegfHive<'_>, src: KeyRef, dst: &mut Registry, dst_key: RegistryKeyId) {
@@ -545,11 +589,14 @@ mod tests {
         const SERVICES: u32 = 0x180;
         const NPFS: u32 = 0x240;
         const PARAMETERS: u32 = 0x300;
+        const CONTROL: u32 = 0x880;
+        const SERVICE_GROUP_ORDER: u32 = 0x900;
 
         const ROOT_LIST: u32 = 0x380;
         const CS_LIST: u32 = 0x3c0;
         const SERVICES_LIST: u32 = 0x400;
         const NPFS_LIST: u32 = 0x440;
+        const CONTROL_LIST: u32 = 0x980;
 
         const NPFS_VALUE_LIST: u32 = 0x480;
         const VK_IMAGE: u32 = 0x500;
@@ -560,6 +607,9 @@ mod tests {
 
         const PARAM_VALUE_LIST: u32 = 0x780;
         const VK_ANSWER: u32 = 0x800;
+        const SGO_VALUE_LIST: u32 = 0x9c0;
+        const VK_SGO_LIST: u32 = 0xa00;
+        const SGO_LIST_DATA: u32 = 0xa80;
 
         let mut data = vec![0u8; 0x3000];
         data[..4].copy_from_slice(b"regf");
@@ -570,15 +620,24 @@ mod tests {
         write_nk(&mut data, SERVICES, CONTROL_SET, b"Services");
         write_nk(&mut data, NPFS, SERVICES, b"Npfs");
         write_nk(&mut data, PARAMETERS, NPFS, b"Parameters");
+        write_nk(&mut data, CONTROL, CONTROL_SET, b"Control");
+        write_nk(
+            &mut data,
+            SERVICE_GROUP_ORDER,
+            CONTROL,
+            b"ServiceGroupOrder",
+        );
 
         write_subkey_list(&mut data, ROOT_LIST, &[CONTROL_SET]);
-        write_subkey_list(&mut data, CS_LIST, &[SERVICES]);
+        write_subkey_list(&mut data, CS_LIST, &[SERVICES, CONTROL]);
         write_subkey_list(&mut data, SERVICES_LIST, &[NPFS]);
         write_subkey_list(&mut data, NPFS_LIST, &[PARAMETERS]);
+        write_subkey_list(&mut data, CONTROL_LIST, &[SERVICE_GROUP_ORDER]);
         set_nk_subkeys(&mut data, ROOT, ROOT_LIST);
         set_nk_subkeys(&mut data, CONTROL_SET, CS_LIST);
         set_nk_subkeys(&mut data, SERVICES, SERVICES_LIST);
         set_nk_subkeys(&mut data, NPFS, NPFS_LIST);
+        set_nk_subkeys(&mut data, CONTROL, CONTROL_LIST);
 
         write_value_list(
             &mut data,
@@ -617,6 +676,24 @@ mod tests {
         write_value_list(&mut data, PARAM_VALUE_LIST, &[VK_ANSWER]);
         set_nk_values(&mut data, PARAMETERS, PARAM_VALUE_LIST, 1);
         write_vk_inline_dword(&mut data, VK_ANSWER, b"Answer", 42);
+
+        write_value_list(&mut data, SGO_VALUE_LIST, &[VK_SGO_LIST]);
+        set_nk_values(&mut data, SERVICE_GROUP_ORDER, SGO_VALUE_LIST, 1);
+        let group_order =
+            nt_config_manager::encode_multi_sz(&["FSFilter Infrastructure", "File System"]);
+        write_data_cell(&mut data, SGO_LIST_DATA, &group_order);
+        write_vk_data(
+            &mut data,
+            VK_SGO_LIST,
+            b"List",
+            RegistryValueType::MultiSz as u32,
+            SGO_LIST_DATA,
+        );
+        write_u32(
+            &mut data,
+            HBIN_BASE + VK_SGO_LIST as usize + 4 + 0x04,
+            group_order.len() as u32,
+        );
 
         data
     }
@@ -685,6 +762,31 @@ mod tests {
             .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
             .and_then(|key| cm.registry().query_dword(key, "Answer"));
         assert_eq!(answer, Some(42));
+    }
+
+    #[test]
+    fn imports_boot_config_into_config_manager() {
+        let data = services_test_hive();
+        let hive = RegfHive::new(&data).expect("valid test hive");
+        let mut cm = ConfigManager::new();
+        let counts =
+            import_control_set_boot_config_into_config_manager(&hive, &mut cm, "ControlSet001");
+
+        assert_eq!(
+            counts,
+            ControlSetImportCounts {
+                services: 1,
+                service_group_order_values: 1,
+            }
+        );
+        assert_eq!(
+            cm.service_group_order(),
+            vec![
+                String::from("FSFilter Infrastructure"),
+                String::from("File System"),
+            ]
+        );
+        assert_eq!(cm.boot_system_driver_candidates()[0].name, "Npfs");
     }
 
     #[test]

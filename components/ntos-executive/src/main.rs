@@ -11441,12 +11441,12 @@ fn config_hive_boot_system_driver_launch_spec(
 fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let hive = system_hive_regf()?;
     let mut cm = nt_config_manager::ConfigManager::new();
-    if nt_hive_regf::import_control_set_services_into_config_manager(
+    let counts = nt_hive_regf::import_control_set_boot_config_into_config_manager(
         &hive,
         &mut cm,
         nt_hive_core::CURRENT_CONTROL_SET_TARGET,
-    ) == 0
-    {
+    );
+    if counts.services == 0 {
         return None;
     }
     Some(cm)
