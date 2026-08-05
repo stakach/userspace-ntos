@@ -14,15 +14,19 @@ metadata only — no handles, IRPs, or driver pointers.
     + `set_dword`/`set_qword`/`set_string` + `query_dword`/`query_qword`/`query_string`,
     `delete_value`, `enum_values`. Strings stored as UTF-16LE + NUL (spec §8.4).
 - `ConfigManager`: the registry + higher-level records.
-  - Services (§9): `register_service` (→ `Services\<Name>` + `Parameters` + ImagePath/Start/
-    ErrorControl/Class), `service_key_path` (DriverEntry RegistryPath, case-preserved),
-    `service_parameters_key`, `set_service_parameter` (fixture loading).
-  - Devnodes (§10): `register_devnode` (→ `Enum\<InstanceId>` + Service/PdoName),
-    `devnodes_for_service` (PnP enumeration input).
+  - Services (§9): `register_service` / `register_typed_service` (→ `Services\<Name>` +
+    `Parameters` + typed ImagePath/Type/Start/ErrorControl/Class metadata),
+    `boot_system_driver_candidates`, `boot_system_pnp_driver_candidates`, `service_key_path`
+    (DriverEntry RegistryPath, case-preserved), `service_parameters_key`,
+    `set_service_parameter`.
+  - Devnodes (§10): `register_devnode` and `index_registry_devnodes` (→
+    `Enum\<InstanceId>` + Service/PdoName/HardwareID/CompatibleIDs),
+    `devnodes_for_service` / `service_has_devnodes` (PnP enumeration input).
   - Device interfaces (§11): `register_interface` (→ `Control\DeviceClasses\<Guid>` + symbolic
     link `\??\<guid>#<instance>#<ref>`), `set_interface_state`, `interfaces_by_guid` (enabled-only).
-- 8 unit tests incl. the §21 fixture (service Parameters Answer=42/Greeting, devnode enumeration,
-  interface enable/disable). Driver-facing Zw*/WdfRegistry* exports + isolated SURT service:
+- Unit tests cover service metadata selection/order, registry-imported devnodes, service-bound PnP
+  driver selection, the §21 fixture (service Parameters Answer=42/Greeting), devnode enumeration,
+  and interface enable/disable. Driver-facing Zw*/WdfRegistry* exports + isolated SURT service:
   pending a registry-using driver artifact.
 
 ## Configuration Manager component (implemented, Milestones 17.1-17.2 — `configuration-manager`)

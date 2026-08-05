@@ -369,6 +369,18 @@ impl ConfigManager {
         out
     }
 
+    /// Boot/system device-class drivers selected by service metadata and bound to at least one
+    /// imported `Enum` devnode.
+    pub fn boot_system_pnp_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.boot_system_driver_candidates()
+            .into_iter()
+            .filter(|service| {
+                service.driver_service_class() == Some(DriverServiceClass::Device)
+                    && self.service_has_devnodes(&service.name)
+            })
+            .collect()
+    }
+
     /// Registry-declared Win32 services that SCM should auto-start after it owns policy.
     pub fn auto_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_AUTO_START], SERVICE_WIN32_TYPE_MASK)
@@ -638,6 +650,13 @@ impl ConfigManager {
                     .is_some_and(|s| s.eq_ignore_ascii_case(service))
             })
             .collect()
+    }
+    pub fn service_has_devnodes(&self, service: &str) -> bool {
+        self.devnodes.iter().any(|d| {
+            d.service
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(service))
+        })
     }
     pub fn devnode_count(&self) -> usize {
         self.devnodes.len()
@@ -1145,6 +1164,54 @@ mod tests {
                 String::from("UnknownGroup")
             ]
         );
+    }
+
+    #[test]
+    fn boot_system_pnp_driver_candidates_require_enum_binding() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "BoundDevice",
+            r"system32\drivers\bound.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_typed_service(
+            "UnboundDevice",
+            r"system32\drivers\unbound.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_typed_service(
+            "FileSystemDriver",
+            r"system32\drivers\fs.sys",
+            SERVICE_FILE_SYSTEM_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_devnode(
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            Some("BoundDevice"),
+            Some(r"\Device\NTPNP_PCI0001"),
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[],
+        );
+
+        assert!(cm.service_has_devnodes("bounddevice"));
+        assert!(!cm.service_has_devnodes("UnboundDevice"));
+        let names: Vec<String> = cm
+            .boot_system_pnp_driver_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(names, alloc::vec![String::from("BoundDevice")]);
     }
 
     #[test]

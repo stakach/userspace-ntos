@@ -11417,12 +11417,18 @@ fn driver_launch_spec_from_service_metadata(
     Some((path_len, class))
 }
 
-fn current_driver_host_can_boot_launch(service: &nt_config_manager::ServiceMetadata) -> bool {
-    service.driver_service_class() == Some(DriverServiceClass::FileSystem)
-        && service
+fn current_driver_host_can_boot_launch(
+    cm: &nt_config_manager::ConfigManager,
+    service: &nt_config_manager::ServiceMetadata,
+) -> bool {
+    match service.driver_service_class() {
+        Some(DriverServiceClass::FileSystem) => service
             .load_order_group
             .as_deref()
-            .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP))
+            .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
+        Some(DriverServiceClass::Device) => cm.service_has_devnodes(&service.name),
+        None => false,
+    }
 }
 
 fn owned_driver_launch_spec_from_service_metadata(
@@ -11495,7 +11501,7 @@ fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<DriverServiceLaunch
     };
     cm.boot_system_driver_candidates()
         .into_iter()
-        .filter(current_driver_host_can_boot_launch)
+        .filter(|service| current_driver_host_can_boot_launch(&cm, service))
         .filter_map(|service| {
             owned_driver_launch_spec_from_service_metadata(service, SERVICE_SYSTEM_START)
         })
@@ -18857,9 +18863,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
 
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
-    // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed to the FSD load-order
-    // group this hosted-driver substrate can currently execute. The named-pipe provider is
-    // discovered by the DEVICE_OBJECT it publishes, not by a compiled-in service or image name.
+    // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
+    // services use the persistent IRP host directly, while device-class services must be bound by
+    // imported Enum devnodes before they enter the boot plan. The named-pipe provider is discovered
+    // by the DEVICE_OBJECT it publishes, not by a compiled-in service or image name.
     if let Some(fs) = exec_fs() {
         let mut named_pipe_provider = None;
         for spec in system_hive_boot_driver_launch_specs() {

@@ -80,8 +80,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue B3 by feeding registry-indexed devnodes into the boot device-driver launch plan and
-   lifting the current FSD-only launch filter for service-bound device drivers.
+1. Continue B3 by carrying selected `Enum` devnode descriptors/resources into hosted device-driver
+   Start/AddDevice, then retire production callers of the legacy MMIO fixture helper.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -221,3 +221,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   adjustment: remaining B3 debt is now the executive boot plan filter: registry-indexed devnodes need
   to drive service-bound device-driver bring-up, after which the MMIO fixture helper can be made
   test-only or removed from production components.
+- B3 continued. `nt-config-manager` now has a host-tested
+  `boot_system_pnp_driver_candidates()` selector: boot/system device-class services are selected only
+  when imported `Enum` state binds at least one devnode to the service. The executive boot-driver plan
+  now uses that same CM authority inline: registry `File System` services still launch through the
+  persistent IRP host, and device-class services enter the plan only through `Enum` service binding.
+  Validation: `cargo test -p nt-config-manager` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should carry the selected devnode descriptors/resources into
+  hosted device-driver start/AddDevice, then retire production uses of the legacy MMIO fixture helper.
