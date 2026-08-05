@@ -3976,6 +3976,17 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let (setwndproc_client, setwndproc_replay) = win32k_subsystem::explorer_setwndproc_proofs();
     let (api0_redirects, callback_failures, dead_callback_failures, nccreate_false) =
         win32k_glue::explorer_user_callback_proofs();
+    let begin_paints = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
+    let end_paints = EXPLORER_END_PAINTS.load(Ordering::Relaxed);
+    let message_calls = EXPLORER_MESSAGE_CALLS.load(Ordering::Relaxed);
+    let update_calls = EXPLORER_UPDATE_REGION_CALLS.load(Ordering::Relaxed);
+    let direct_draws = EXPLORER_DIRECT_GDI_DRAW_CALLS.load(Ordering::Relaxed);
+    let direct_draw_returns = EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed);
+    let ext_text_outs = EXPLORER_EXT_TEXT_OUTS.load(Ordering::Relaxed);
+    let gdi_objects = EXPLORER_GDI_OBJECT_CALLS.load(Ordering::Relaxed);
+    let gdi_batch_flushes = EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
+    let gdi_batch_records = EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed);
+    let gdi_batch_max_offset = EXPLORER_GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     let process_self_term = explorer_bit != 0
         && (PM_TERMINATE_PROCESS_NO_REPLY_PIS.load(Ordering::Relaxed) & explorer_bit) != 0;
     print_str(b"[explorer-image] opens=");
@@ -4039,6 +4050,32 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_str(b"/0x");
     print_hex(font_failures as u32);
     print_str(b"\n");
+    print_str(b"[explorer-paint] begin/end=");
+    print_u64(begin_paints);
+    print_str(b"/");
+    print_u64(end_paints);
+    print_str(b" message-call=");
+    print_u64(message_calls);
+    print_str(b" update-region=");
+    print_u64(update_calls);
+    print_str(b" direct-gdi/returns=");
+    print_u64(direct_draws);
+    print_str(b"/");
+    print_u64(direct_draw_returns);
+    print_str(b" ext-text-out=");
+    print_u64(ext_text_outs);
+    print_str(b" gdi-objects=");
+    print_u64(gdi_objects);
+    print_str(b" batch-flush/records=");
+    print_u64(gdi_batch_flushes);
+    print_str(b"/");
+    print_u64(gdi_batch_records);
+    print_str(b" batch-max-Offset=0x");
+    print_hex(gdi_batch_max_offset as u32);
+    print_str(b"\n");
+    let fb_readback = unsafe { explorer_framebuffer_final_readback() };
+    let fb_span_x = fb_readback.span_x();
+    let fb_span_y = fb_readback.span_y();
     check(
         b"exec_explorer_process_spawned",
         opened >= 1
@@ -4098,6 +4135,187 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
                 == EXPLORER_SHELL_COM_REQUIRED_MASK,
         passed,
     );
+    check(
+        b"exec_explorer_shell_chrome_painted",
+        spawned == 1
+            && begin_paints >= 1
+            && end_paints >= begin_paints
+            && direct_draw_returns >= 1
+            && gdi_batch_records >= 1
+            && fb_readback.available
+            && fb_readback.height >= 16
+            && fb_readback.non_bg >= fb_readback.width * 8
+            && fb_span_x >= fb_readback.width / 2
+            && fb_span_y >= 8
+            && fb_readback.unique_non_bg >= 8,
+        passed,
+    );
+}
+
+#[derive(Clone, Copy)]
+struct ExplorerFramebufferReadback {
+    available: bool,
+    width: u64,
+    height: u64,
+    non_bg: u64,
+    min_x: u64,
+    min_y: u64,
+    max_x: u64,
+    max_y: u64,
+    unique_non_bg: u64,
+}
+
+impl ExplorerFramebufferReadback {
+    const fn unavailable(width: u64, height: u64) -> Self {
+        Self {
+            available: false,
+            width,
+            height,
+            non_bg: 0,
+            min_x: 0,
+            min_y: 0,
+            max_x: 0,
+            max_y: 0,
+            unique_non_bg: 0,
+        }
+    }
+
+    fn span_x(self) -> u64 {
+        if self.available && self.non_bg != 0 {
+            self.max_x - self.min_x + 1
+        } else {
+            0
+        }
+    }
+
+    fn span_y(self) -> u64 {
+        if self.available && self.non_bg != 0 {
+            self.max_y - self.min_y + 1
+        } else {
+            0
+        }
+    }
+}
+
+unsafe fn explorer_framebuffer_final_readback() -> ExplorerFramebufferReadback {
+    let width = FB_WIDTH.load(Ordering::Relaxed);
+    let height = FB_HEIGHT.load(Ordering::Relaxed);
+    let scanline = FB_SCANLINE.load(Ordering::Relaxed);
+    if width == 0 || height == 0 || scanline == 0 {
+        print_str(b"[explorer-fb] final readback unavailable width=");
+        print_u64(width);
+        print_str(b" height=");
+        print_u64(height);
+        print_str(b" scanline=");
+        print_u64(scanline);
+        print_str(b"\n");
+        return ExplorerFramebufferReadback::unavailable(width, height);
+    }
+
+    let stride_pixels = scanline / 4;
+    let fb = FB_VADDR as *const u32;
+    let mut non_bg = 0u64;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0u64;
+    let mut max_y = 0u64;
+    let mut sample_x = 0u64;
+    let mut sample_y = 0u64;
+    let mut sample_px = 0u32;
+    let mut unique = [0u32; 32];
+    let mut unique_len = 0usize;
+    let mut unique_saturated = false;
+
+    let mut y = 0u64;
+    while y < height {
+        let row = fb.add((y * stride_pixels) as usize);
+        let mut x = 0u64;
+        while x < width {
+            let px = core::ptr::read_volatile(row.add(x as usize));
+            if px != FB_DESKTOP_BG {
+                if non_bg == 0 {
+                    sample_x = x;
+                    sample_y = y;
+                    sample_px = px;
+                }
+                non_bg += 1;
+                if x < min_x {
+                    min_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
+                let mut seen = false;
+                let mut i = 0usize;
+                while i < unique_len {
+                    if unique[i] == px {
+                        seen = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !seen {
+                    if unique_len < unique.len() {
+                        unique[unique_len] = px;
+                        unique_len += 1;
+                    } else {
+                        unique_saturated = true;
+                    }
+                }
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+
+    print_str(b"[explorer-fb] final non-bg pixels=");
+    print_u64(non_bg);
+    print_str(b" of ");
+    print_u64(width * height);
+    print_str(b" bg=0x");
+    print_hex(FB_DESKTOP_BG);
+    if non_bg == 0 {
+        print_str(b" bounds=none\n");
+    } else {
+        print_str(b" bounds=");
+        print_u64(min_x);
+        print_str(b",");
+        print_u64(min_y);
+        print_str(b"..");
+        print_u64(max_x);
+        print_str(b",");
+        print_u64(max_y);
+        print_str(b" sample=");
+        print_u64(sample_x);
+        print_str(b",");
+        print_u64(sample_y);
+        print_str(b"=0x");
+        print_hex(sample_px);
+        print_str(b" unique-non-bg>=");
+        print_u64(unique_len as u64);
+        print_str(if unique_saturated {
+            b" saturated\n".as_slice()
+        } else {
+            b"\n".as_slice()
+        });
+    }
+    ExplorerFramebufferReadback {
+        available: true,
+        width,
+        height,
+        non_bg,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        unique_non_bg: unique_len as u64,
+    }
 }
 
 /// ═══ THE PROFILE HAS A REAL `ntuser.dat` — the setup step the LiveCD skips ══════════════════════
@@ -7161,6 +7379,17 @@ pub(crate) static GDI_BATCH_TEB_TAIL_WRITE_WINDOWS: AtomicU64 = AtomicU64::new(0
 /// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
 /// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_BEGIN_PAINTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_END_PAINTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_MESSAGE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_UPDATE_REGION_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_DIRECT_GDI_DRAW_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_DIRECT_GDI_DRAW_RETURNS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_EXT_TEXT_OUTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_GDI_OBJECT_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_GDI_BATCH_RECORDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXPLORER_GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// `KeGdiFlushUserBatch` — run at the win32k system-call entry for hosted client `client`, exactly
 /// where `KiSystemCallHandler` runs it. The executive reads the live TEB only to decide whether
@@ -7186,6 +7415,14 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     let previous = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     if offset as u64 > previous {
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
+    }
+    if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
+        EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
+        let explorer_previous = EXPLORER_GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
+        if offset as u64 > explorer_previous {
+            EXPLORER_GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
+        }
     }
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
     GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);

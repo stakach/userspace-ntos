@@ -71,10 +71,29 @@ const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
+const NTGDI_BIT_BLT_SSN: u64 = 0x1008;
+const NTUSER_INVALIDATE_RECT_SSN: u64 = 0x1004;
+const NTUSER_REDRAW_WINDOW_SSN: u64 = 0x1012;
 const NTUSER_BEGIN_PAINT_SSN: u64 = 0x1016;
 const NTUSER_END_PAINT_SSN: u64 = 0x1018;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
+const NTUSER_EXCLUDE_UPDATE_RGN_SSN: u64 = 0x104f;
+const NTUSER_GET_UPDATE_RECT_SSN: u64 = 0x1053;
 const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
+const NTGDI_STRETCH_BLT_SSN: u64 = 0x1030;
+const NTGDI_LINE_TO_SSN: u64 = 0x1040;
+const NTGDI_CREATE_COMPATIBLE_BITMAP_SSN: u64 = 0x104a;
+const NTGDI_CREATE_COMPATIBLE_DC_SSN: u64 = 0x1054;
+const NTGDI_PAT_BLT_SSN: u64 = 0x1059;
+const NTGDI_CREATE_BITMAP_SSN: u64 = 0x106c;
+const NTGDI_POLY_PAT_BLT_SSN: u64 = 0x106f;
+const NTGDI_ALPHA_BLEND_SSN: u64 = 0x107d;
+const NTGDI_STRETCH_DIBITS_INTERNAL_SSN: u64 = 0x1082;
+const NTUSER_FILL_WINDOW_SSN: u64 = 0x108a;
+const NTUSER_GET_UPDATE_RGN_SSN: u64 = 0x1087;
+const NTGDI_RECTANGLE_SSN: u64 = 0x1091;
+const NTGDI_CREATE_DIB_SECTION_SSN: u64 = 0x109b;
+const NTGDI_CREATE_DIBITMAP_INTERNAL_SSN: u64 = 0x10a0;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
 const ETO_PDY: u64 = 0x02000;
@@ -7800,6 +7819,55 @@ pub(crate) unsafe fn service_sec_image(
                         current_tid,
                         modal_message_buffer,
                     );
+                let explorer_direct_gdi_draw = explorer_gui_client
+                    && matches!(
+                        m0,
+                        NTGDI_BIT_BLT_SSN
+                            | NTGDI_STRETCH_BLT_SSN
+                            | NTGDI_LINE_TO_SSN
+                            | NTGDI_PAT_BLT_SSN
+                            | NTGDI_POLY_PAT_BLT_SSN
+                            | NTGDI_ALPHA_BLEND_SSN
+                            | NTGDI_STRETCH_DIBITS_INTERNAL_SSN
+                            | NTUSER_FILL_WINDOW_SSN
+                            | NTGDI_RECTANGLE_SSN
+                            | nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
+                    );
+                if explorer_gui_client {
+                    if explorer_direct_gdi_draw {
+                        EXPLORER_DIRECT_GDI_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
+                        if m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN {
+                            EXPLORER_EXT_TEXT_OUTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    match m0 {
+                        NTUSER_BEGIN_PAINT_SSN => {
+                            EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        NTUSER_END_PAINT_SSN => {
+                            EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        NTUSER_MESSAGE_CALL_SSN => {
+                            EXPLORER_MESSAGE_CALLS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        NTUSER_INVALIDATE_RECT_SSN
+                        | NTUSER_REDRAW_WINDOW_SSN
+                        | NTUSER_EXCLUDE_UPDATE_RGN_SSN
+                        | NTUSER_GET_UPDATE_RECT_SSN
+                        | NTUSER_GET_UPDATE_RGN_SSN
+                        | NTUSER_FILL_WINDOW_SSN => {
+                            EXPLORER_UPDATE_REGION_CALLS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        NTGDI_CREATE_COMPATIBLE_BITMAP_SSN
+                        | NTGDI_CREATE_COMPATIBLE_DC_SSN
+                        | NTGDI_CREATE_BITMAP_SSN
+                        | NTGDI_CREATE_DIB_SECTION_SSN
+                        | NTGDI_CREATE_DIBITMAP_INTERNAL_SSN => {
+                            EXPLORER_GDI_OBJECT_CALLS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
                 if dialog_modal_dispatch {
                     print_str(b"[dialog-pump] routing real modal SSN=");
                     print_hex(m0 as u32);
@@ -11080,6 +11148,9 @@ pub(crate) unsafe fn service_sec_image(
                         [a0, a1, a2, a3],
                         client,
                     );
+                    if explorer_direct_gdi_draw && r.1 {
+                        EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed);
+                    }
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
                     // invariants the client's own CRT depends on, so the frontier has a number.

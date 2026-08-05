@@ -86,12 +86,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` G1: Keep generic sections, hosted-worker lifetime, and thread mechanism resources dynamic
   enough for genuine `userinit.exe` and `explorer.exe` launch without section or win32k pool
   exhaustion.
-- `[~]` G2: Trace explorer shell-window paint from USER invalidation through real WndProc, GDI batch
+- `[x]` G2: Trace explorer shell-window paint from USER invalidation through real WndProc, GDI batch
   execution, surface dirtying, and framebuffer presentation until non-background shell chrome pixels
   are proven.
-- `[ ]` G3: Replace any remaining shell-paint instrumentation or modeled presentation helpers with
-  real window/surface ownership.
-- `[ ]` G4: Add a stable framebuffer proof for explorer shell chrome, distinct from desktop
+- `[~]` G3: Audit and reduce temporary shell-paint instrumentation now that the real framebuffer
+  proof exists; keep only narrow counters that guard actual USER/GDI/surface boundaries, and replace
+  any remaining modeled presentation helpers with real window/surface ownership.
+- `[x]` G4: Add a stable framebuffer proof for explorer shell chrome, distinct from desktop
   background and cursor artifacts.
 
 ## Review Log
@@ -1918,3 +1919,22 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   framebuffer proof still reports only desktop background (`non-bg 0`), and the remaining known
   failing gates are DBGK callback selftests, user-callback drain/dead-client harness checks,
   nested win32k transport drain, and VM pool headroom.
+- G2/G4 complete. Explorer shell chrome is now proven through real USER/GDI execution and a stable
+  full-framebuffer readback rather than screenshot-only inspection. The explorer path records
+  `NtUserBeginPaint`/`NtUserEndPaint`, message calls, update-region calls, direct GDI draw returns,
+  GDI object creation, and `KeGdiFlushUserBatch` records for the dynamic explorer client; the final
+  gate requires those draw/batch signals plus a wide, multi-color non-background framebuffer region
+  distinct from the desktop fill and cursor. Validation: `rustfmt
+  components/ntos-executive/src/main.rs components/ntos-executive/src/service_sec_image.rs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `cd rust-micro && ./scripts/build_kernel.sh extern-rootserver`, and graphical boot
+  `desktop-render-r85-explorer-shell-chrome-gate-20260805-204308` passed to the microtest sentinel
+  with `277/285` executive checks. Evidence from the run: explorer paint begin/end `14/14`,
+  message-call `147`, update-region `58`, direct-gdi/returns `54/54`, GDI objects `107`, batch
+  flush/records `100/100`, max batch offset `0x62`, framebuffer `28672` non-background pixels over
+  bounds `0,740..1023,767`, and `unique-non-bg>=32 saturated`; `exec_explorer_shell_chrome_painted`
+  passed. Review adjustment: G3 remains for trimming trace-only shell-paint counters and auditing
+  presentation ownership. The next functional debt is reply-cap/wait parking pressure plus the
+  nested user-callback/dead-client transport drain and DBGK selftest failures; shell paint no longer
+  needs a modeled framebuffer path.
