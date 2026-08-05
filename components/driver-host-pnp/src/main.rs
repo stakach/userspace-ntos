@@ -40,7 +40,7 @@ use nt_pnp_abi::{
     IRP_MN_QUERY_REMOVE_DEVICE, IRP_MN_QUERY_STOP_DEVICE, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE,
     IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL,
 };
-use nt_pnp_manager::PnpManager;
+use nt_pnp_manager::{PnpManager, ResourceAssignment, NO_RESOURCES};
 use nt_resource_manager::{ResourceManager, ResourceOwner};
 use nt_root_bus::{BusQueryId, RootBus};
 use nt_sim_device::SimDevice;
@@ -87,6 +87,17 @@ const CLASS_GUID: &str = "{4d36e97d-e325-11ce-bfc1-08002be10318}";
 /// The `object_id` the PnP Manager + root bus use for the primary devnode's PDO.
 const PDO_OBJECT_ID: u64 = 0xFED0_0000;
 
+const fn mmio_resources(mem_start: u64, vector: u32) -> ResourceAssignment {
+    ResourceAssignment {
+        mem_start,
+        mem_length: 0x1000,
+        int_vector: vector,
+        int_level: vector,
+        int_affinity: 1,
+        int_latched: false,
+    }
+}
+
 /// A root-enumerated fixture devnode (a child of the synthetic ROOT bus).
 struct Fixture {
     instance_path: &'static str,
@@ -96,6 +107,7 @@ struct Fixture {
     instance_id: &'static str,
     image_path: &'static str,
     pdo_object_id: u64,
+    resources: ResourceAssignment,
 }
 
 /// The device tree the ROOT bus enumerates. `FIXTURES[0]` (PnpMmioInterruptTest) is the one whose
@@ -110,6 +122,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: INSTANCE_ID,
         image_path: r"\SystemRoot\system32\drivers\PnpMmioInterruptTest.sys",
         pdo_object_id: PDO_OBJECT_ID,
+        resources: mmio_resources(0x1000_0000, 5),
     },
     Fixture {
         instance_path: r"ROOT\USERSPACE_NTOS_POWER\0001",
@@ -119,6 +132,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\PowerPnpMmioTest.sys",
         pdo_object_id: 0xFED0_1000,
+        resources: mmio_resources(0x2000_0000, 6),
     },
     Fixture {
         instance_path: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST\0001",
@@ -128,6 +142,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\KmdfInterfaceRegistryTest.sys",
         pdo_object_id: 0xFED0_2000,
+        resources: NO_RESOURCES,
     },
     Fixture {
         instance_path: r"ROOT\USERSPACE_NTOS_DMA\0001",
@@ -137,6 +152,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\DmaPnpPowerTest.sys",
         pdo_object_id: 0xFED0_3000,
+        resources: NO_RESOURCES,
     },
     Fixture {
         instance_path: r"ROOT\KMDF_LOADER_COMPAT_TEST\0001",
@@ -146,6 +162,7 @@ const FIXTURES: &[Fixture] = &[
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\KmdfLoaderCompatTest.sys",
         pdo_object_id: 0xFED0_4000,
+        resources: NO_RESOURCES,
     },
 ];
 
@@ -848,35 +865,10 @@ unsafe fn build_resource_list(devnode: u64) -> u64 {
     buf
 }
 
-/// Build a translated `CM_RESOURCE_LIST` with explicit memory + interrupt resources (for a second
-/// device whose resources must not collide with the first).
-unsafe fn build_resource_list_explicit(mem_start: u64, mem_length: u32, vector: u32) -> u64 {
-    let buf = alloc_blob();
-    let slice = core::slice::from_raw_parts_mut(buf as *mut u8, 64);
-    let _ = nt_cm_resources::build_memory_interrupt_list(
-        slice,
-        0,
-        MemoryDescriptor {
-            start: mem_start,
-            length: mem_length,
-            flags: 0,
-            share: nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-        },
-        InterruptDescriptor {
-            level: vector,
-            vector,
-            affinity: 1,
-            flags: nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
-            share: nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-        },
-    );
-    buf
-}
-
 /// Load + PnP-bind a second real driver in this host: map its image at `base` (device slot 1), run
-/// DriverEntry, call `DriverExtension->AddDevice` with its PDO, assign distinct resources, and send
-/// `IRP_MN_START_DEVICE` through the stack. Returns whether it reached Started.
-unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64, mem_base: u64, vector: u32) -> bool {
+/// DriverEntry, call `DriverExtension->AddDevice` with its PDO, assign its devnode resources, and
+/// send `IRP_MN_START_DEVICE` through the stack. Returns whether it reached Started.
+unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
     CURRENT.store(1, Ordering::Relaxed);
     let d = dh();
     d.pdo_object_id = fx.pdo_object_id;
@@ -956,20 +948,31 @@ unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64, mem_base: u6
     let _ = pnp().set_fdo(pnp_devnode, fdo);
     let _ = pnp().transition(pnp_devnode, DeviceState::DeviceStackBuilt);
 
-    // Assign distinct resources, then START through the stack.
+    // Assign resources selected for this devnode, then START through the stack.
+    let res = match pnp().resources(pnp_devnode) {
+        Some(r) => r,
+        None => return false,
+    };
     rm().assign_memory(
         owner(),
         MEM_RESOURCE_ID + 1,
-        mem_base,
-        mem_base,
-        0x1000,
+        res.mem_start,
+        res.mem_start,
+        res.mem_length as u64,
         nt_hal_abi::MM_NON_CACHED,
         nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
     );
-    rm().assign_interrupt(owner(), INT_RESOURCE_ID + 1, vector, vector as u8, 1, 0);
+    rm().assign_interrupt(
+        owner(),
+        INT_RESOURCE_ID + 1,
+        res.int_vector,
+        res.int_level as u8,
+        res.int_affinity as u32,
+        0,
+    );
     let _ = pnp().transition(pnp_devnode, DeviceState::ResourcesAssigned);
-    let translated = build_resource_list_explicit(mem_base, 0x1000, vector);
-    let raw = build_resource_list_explicit(mem_base, 0x1000, vector);
+    let translated = build_resource_list(pnp_devnode);
+    let raw = build_resource_list(pnp_devnode);
     let _ = pnp().transition(pnp_devnode, DeviceState::StartIrpSent);
     let start_status = dispatch_pnp(driver_object, fdo, IRP_MN_START_DEVICE, raw, translated);
     let started = start_status == 0
@@ -1202,11 +1205,13 @@ unsafe fn run() {
     trace(b"pnp_query_relations (BusRelations)");
     print_str(b"  [device-tree] \\Device\\RootBus\n");
     let mut resolved = 0usize;
+    let mut pnp_bound = 0usize;
     let mut bindable = 0usize;
     let mut pnp_devnodes: Vec<u64> = Vec::new();
     for (fx, &dn) in FIXTURES.iter().zip(cfg_devnodes.iter()) {
         // pnp_service_select: each child's driver is named by its devnode Service value.
-        let svc_ok = cfg().devnode_service(dn) == Some(fx.service);
+        let selected_service = cfg().devnode_service(dn).map(str::to_string);
+        let svc_ok = selected_service.as_deref() == Some(fx.service);
         if svc_ok {
             resolved += 1;
         }
@@ -1214,8 +1219,19 @@ unsafe fn run() {
         if has_driver {
             bindable += 1;
         }
-        // Give every child a PnP Manager state entry (starts Enumerated).
-        let pdn = pnp().create_mmio_fixture_devnode(fx.pdo_object_id);
+        // Give every child a PnP Manager state entry (starts Enumerated) from the registry-selected
+        // instance/service binding and resource assignment.
+        let pdn = pnp().create_service_bound_devnode(
+            fx.instance_path,
+            selected_service.as_deref(),
+            fx.pdo_object_id,
+            fx.resources,
+        );
+        if pnp().instance_id(pdn) == Some(fx.instance_path)
+            && pnp().service(pdn) == Some(fx.service)
+        {
+            pnp_bound += 1;
+        }
         pnp_devnodes.push(pdn);
         print_str(b"    - ");
         print_str(fx.instance_path.as_bytes());
@@ -1226,6 +1242,7 @@ unsafe fn run() {
         print_str(if has_driver { b"  [bind]\n" } else { b"\n" });
     }
     check(b"device_tree_services_resolved", resolved == FIXTURES.len());
+    check(b"pnp_devnodes_service_bound", pnp_bound == FIXTURES.len());
     check(b"device_tree_has_bindable_driver", bindable >= 1);
     check(
         b"device_tree_all_children_enumerated",
@@ -1240,6 +1257,11 @@ unsafe fn run() {
     check(
         b"service_selected_from_devnode",
         selected.as_deref() == Some(SERVICE_NAME),
+    );
+    let selected_pnp_devnodes = pnp().devnodes_for_service(SERVICE_NAME);
+    check(
+        b"pnp_devnodes_indexed_by_service",
+        selected_pnp_devnodes.len() == 1 && selected_pnp_devnodes[0] == pnp_devnodes[0],
     );
     let image = match selected.as_deref().and_then(load_service_image) {
         Some(img) => img,
@@ -1389,7 +1411,14 @@ unsafe fn run() {
         nt_hal_abi::MM_NON_CACHED,
         nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
     );
-    rm().assign_interrupt(owner(), INT_RESOURCE_ID, INT_VECTOR, 5, 1, 0);
+    rm().assign_interrupt(
+        owner(),
+        INT_RESOURCE_ID,
+        res.int_vector,
+        res.int_level as u8,
+        res.int_affinity as u32,
+        0,
+    );
     let _ = pnp().transition(devnode, DeviceState::ResourcesAssigned);
     sim(); // ensure sim exists; ID register seeded on creation
     core::ptr::write_volatile(sim().mmio_ptr() as *mut u32, 0x4d4d_494f); // seed ID reg
@@ -1419,13 +1448,7 @@ unsafe fn run() {
     // A distinct image mapped at its own base (device slot 1), distinct resources (MMIO 0x20000000,
     // vector 6), bound through the same PnP path -> two real drivers Started in one host.
     trace(b"pnp_second_driver_bind (PowerPnpMmioTest)");
-    let second_started = bind_secondary(
-        &FIXTURES[1],
-        pnp_devnodes[1],
-        SECOND_CODE_VADDR,
-        0x2000_0000,
-        6,
-    );
+    let second_started = bind_secondary(&FIXTURES[1], pnp_devnodes[1], SECOND_CODE_VADDR);
     check(b"second_driver_bound_and_started", second_started);
 
     // --- Bind a KMDF driver (a second driver FAMILY) in this same WDM host -----------------------

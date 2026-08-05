@@ -1,8 +1,8 @@
 //! # `nt-pnp-manager` — the PnP Manager core
 //!
 //! The devnode table + the v0.1 device-lifecycle state machine (spec: NT PnP
-//! Manager, Milestone 12, §8), driven by static fixtures (§9). It validates every
-//! state transition, tracks the PDO/FDO/driver bindings and the raw/translated
+//! Manager, Milestone 12, §8). It validates every state transition, tracks
+//! service-bound device identity, PDO/FDO/driver bindings, and raw/translated
 //! resource assignment, and rejects stale devnode IDs after removal. `no_std` +
 //! `alloc`. It holds no driver pointers — only IDs + resource values (§7.3).
 
@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 pub use nt_pnp_abi::DeviceState;
@@ -25,6 +26,26 @@ pub struct ResourceAssignment {
     pub int_latched: bool,
 }
 
+/// Resource assignment for devices that do not need hardware resources.
+pub const NO_RESOURCES: ResourceAssignment = ResourceAssignment {
+    mem_start: 0,
+    mem_length: 0,
+    int_vector: 0,
+    int_level: 0,
+    int_affinity: 0,
+    int_latched: false,
+};
+
+/// The legacy MMIO interrupt fixture resources used by older hosted-driver proofs.
+pub const MMIO_INTERRUPT_TEST_RESOURCES: ResourceAssignment = ResourceAssignment {
+    mem_start: 0x1000_0000,
+    mem_length: 0x1000,
+    int_vector: 5,
+    int_level: 5,
+    int_affinity: 1,
+    int_latched: false,
+};
+
 /// Why a PnP operation was rejected (spec §8.3, §25).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PnpError {
@@ -37,6 +58,8 @@ pub enum PnpError {
 struct Devnode {
     id: u64,
     generation: u64,
+    instance_id: Option<String>,
+    service: Option<String>,
     state: DeviceState,
     pdo_object_id: u64,
     fdo_object_id: u64,
@@ -73,7 +96,7 @@ pub fn can_transition(from: DeviceState, to: DeviceState) -> bool {
     )
 }
 
-/// The PnP Manager: a devnode table over static fixtures.
+/// The PnP Manager: a service-bound devnode table and lifecycle state machine.
 #[derive(Default)]
 pub struct PnpManager {
     devnodes: Vec<Devnode>,
@@ -97,10 +120,13 @@ impl PnpManager {
         self.devnodes.iter_mut().find(|d| d.id == id)
     }
 
-    /// Enumerate the `MmioInterruptTest` fixture device (spec §9): create a devnode
-    /// in state `Enumerated` with the fixture's memory (`0x1000_0000`) + interrupt
-    /// (vector 5) resources. Returns its devnode ID.
-    pub fn create_mmio_fixture_devnode(&mut self, pdo_object_id: u64) -> u64 {
+    fn push_devnode(
+        &mut self,
+        instance_id: Option<&str>,
+        service: Option<&str>,
+        pdo_object_id: u64,
+        resources: ResourceAssignment,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let generation = self.next_gen;
@@ -108,46 +134,53 @@ impl PnpManager {
         self.devnodes.push(Devnode {
             id,
             generation,
+            instance_id: instance_id.map(ToString::to_string),
+            service: service.map(ToString::to_string),
             state: DeviceState::Enumerated,
             pdo_object_id,
             fdo_object_id: 0,
             driver_id: 0,
-            resources: ResourceAssignment {
-                mem_start: 0x1000_0000,
-                mem_length: 0x1000,
-                int_vector: 5,
-                int_level: 5,
-                int_affinity: 1,
-                int_latched: false,
-            },
+            resources,
         });
         id
+    }
+
+    /// Enumerate a registry/service-bound devnode in state `Enumerated`.
+    ///
+    /// The Configuration Manager owns `Enum\<InstanceId>` parsing and service binding. The PnP
+    /// Manager records the already-resolved identity plus resource assignment and owns only the
+    /// lifecycle state.
+    pub fn create_service_bound_devnode(
+        &mut self,
+        instance_id: &str,
+        service: Option<&str>,
+        pdo_object_id: u64,
+        resources: ResourceAssignment,
+    ) -> u64 {
+        self.push_devnode(Some(instance_id), service, pdo_object_id, resources)
+    }
+
+    /// Enumerate a service-bound devnode with no assigned hardware resources.
+    pub fn create_service_bound_devnode_without_resources(
+        &mut self,
+        instance_id: &str,
+        service: Option<&str>,
+        pdo_object_id: u64,
+    ) -> u64 {
+        self.create_service_bound_devnode(instance_id, service, pdo_object_id, NO_RESOURCES)
+    }
+
+    /// Enumerate the `MmioInterruptTest` fixture device (spec §9): create a devnode
+    /// in state `Enumerated` with the fixture's memory (`0x1000_0000`) + interrupt
+    /// (vector 5) resources. Returns its devnode ID.
+    pub fn create_mmio_fixture_devnode(&mut self, pdo_object_id: u64) -> u64 {
+        self.push_devnode(None, None, pdo_object_id, MMIO_INTERRUPT_TEST_RESOURCES)
     }
 
     /// Enumerate a devnode with no assigned resources (a device whose function driver needs no
     /// hardware — e.g. a registry/interface KMDF device). Created in state `Enumerated`.
     pub fn create_devnode(&mut self, pdo_object_id: u64) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        let generation = self.next_gen;
-        self.next_gen += 1;
-        self.devnodes.push(Devnode {
-            id,
-            generation,
-            state: DeviceState::Enumerated,
-            pdo_object_id,
-            fdo_object_id: 0,
-            driver_id: 0,
-            resources: ResourceAssignment {
-                mem_start: 0,
-                mem_length: 0,
-                int_vector: 0,
-                int_level: 0,
-                int_affinity: 0,
-                int_latched: false,
-            },
-        });
-        id
+        self.push_devnode(None, None, pdo_object_id, NO_RESOURCES)
     }
 
     pub fn state(&self, id: u64) -> Option<DeviceState> {
@@ -156,6 +189,26 @@ impl PnpManager {
 
     pub fn generation(&self, id: u64) -> Option<u64> {
         self.find(id).map(|d| d.generation)
+    }
+
+    pub fn instance_id(&self, id: u64) -> Option<&str> {
+        self.find(id).and_then(|d| d.instance_id.as_deref())
+    }
+
+    pub fn service(&self, id: u64) -> Option<&str> {
+        self.find(id).and_then(|d| d.service.as_deref())
+    }
+
+    pub fn devnodes_for_service(&self, service: &str) -> Vec<u64> {
+        self.devnodes
+            .iter()
+            .filter(|d| {
+                d.service
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(service))
+            })
+            .map(|d| d.id)
+            .collect()
     }
 
     pub fn resources(&self, id: u64) -> Option<ResourceAssignment> {
@@ -207,6 +260,7 @@ impl PnpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use DeviceState::*;
 
     #[test]
@@ -215,9 +269,58 @@ mod tests {
         let id = p.create_mmio_fixture_devnode(0xBD0);
         assert_eq!(p.state(id), Some(Enumerated));
         assert_eq!(p.pdo(id), Some(0xBD0));
+        assert_eq!(p.instance_id(id), None);
+        assert_eq!(p.service(id), None);
         let r = p.resources(id).unwrap();
         assert_eq!(r.mem_start, 0x1000_0000);
         assert_eq!(r.int_vector, 5);
+    }
+
+    #[test]
+    fn service_bound_devnode_tracks_registry_identity() {
+        let mut p = PnpManager::new();
+        let resources = ResourceAssignment {
+            mem_start: 0x2000_0000,
+            mem_length: 0x2000,
+            int_vector: 9,
+            int_level: 9,
+            int_affinity: 3,
+            int_latched: true,
+        };
+
+        let id = p.create_service_bound_devnode(
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            Some("E1000"),
+            0x1000,
+            resources,
+        );
+
+        assert_eq!(p.state(id), Some(Enumerated));
+        assert_eq!(
+            p.instance_id(id),
+            Some(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18")
+        );
+        assert_eq!(p.service(id), Some("E1000"));
+        assert_eq!(p.pdo(id), Some(0x1000));
+        assert_eq!(p.resources(id), Some(resources));
+        assert_eq!(p.devnodes_for_service("e1000"), vec![id]);
+    }
+
+    #[test]
+    fn service_bound_devnode_without_resources_is_enumerated() {
+        let mut p = PnpManager::new();
+        let id = p.create_service_bound_devnode_without_resources(
+            r"ROOT\KMDF_INTERFACE_REGISTRY_TEST\0001",
+            Some("KmdfInterfaceRegistryTest"),
+            0x3000,
+        );
+
+        assert_eq!(p.state(id), Some(Enumerated));
+        assert_eq!(p.resources(id), Some(NO_RESOURCES));
+        assert_eq!(
+            p.devnodes_for_service("KmdfInterfaceRegistryTest"),
+            vec![id]
+        );
     }
 
     #[test]

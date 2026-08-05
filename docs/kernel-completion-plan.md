@@ -80,8 +80,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Start B3 inventory for registry `Enum`/`Services` binding and the hosted device-driver substrate
-   needed to lift the current FSD-only boot-driver filter.
+1. Continue B3 by replacing the remaining isolated `pnp-svc` fixture devnode protocol with
+   descriptor/resource-driven devnode creation, then feed registry-indexed devnodes into the boot
+   device-driver launch plan.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -202,3 +203,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the next B3 slice should feed these registry-indexed devnodes into the PnP
   Manager's lifecycle model, replacing static fixture devnode creation with service-bound devnode
   creation and preserving the kernel/policy split.
+- B3 continued. `nt-pnp-manager` now models service-bound devnodes directly: callers pass the
+  Configuration Manager-selected `Enum\<InstanceId>`, optional service, PDO object id, and resource
+  assignment, while PnP owns only lifecycle/resource state. The existing `driver-host-pnp` proof now
+  creates PnP lifecycle entries from its CM-materialized root-enumerated devnodes and uses each
+  devnode's assigned resources for START instead of the MMIO fixture constructor. Validation:
+  `cargo test -p nt-pnp-manager` and
+  `cargo check --manifest-path components/driver-host-pnp/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the old fixture constructor still exists for `driver-host-power`,
+  `driver-host-dma`, and isolated `pnp-svc`; the next B3 slice should move `pnp-svc` to
+  descriptor/resource payloads and then retire or test-scope the compatibility helper.

@@ -1,6 +1,6 @@
 [package]
 name = "nt-pnp-manager"
-description = "Core NT PnP Manager state machine: the devnode table, the v0.1 device lifecycle state machine with validated transitions, static device fixtures, and raw/translated resource assignments. no_std + alloc."
+description = "Core NT PnP Manager state machine: service-bound devnodes, the v0.1 device lifecycle state machine with validated transitions, and raw/translated resource assignments. no_std + alloc."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

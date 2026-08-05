@@ -18,24 +18,28 @@ MMIO + connects the interrupt; `IRP_MN_REMOVE_DEVICE` disconnects/unmaps/detache
 
 ## PnP Manager core (implemented, Milestone 12.3 — `nt-pnp-manager`)
 
-- `PnpManager`: a devnode table over static fixtures; no driver pointers, only IDs +
-  resource values. `create_mmio_fixture_devnode` enumerates the `MmioInterruptTest`
-  fixture (memory `0x1000_0000`/`0x1000`, interrupt vector 5) in state `Enumerated`.
+- `PnpManager`: a service-bound devnode table; no driver pointers, only instance/service
+  identity, PDO/FDO/driver IDs, and resource values. `create_service_bound_devnode`
+  accepts the Configuration Manager-selected `Enum\<InstanceId>` + `Service` binding
+  and starts the lifecycle in state `Enumerated`. `create_mmio_fixture_devnode` remains
+  only as a compatibility helper for older hosted proofs.
 - `can_transition(from, to)` encodes the §8.2 state machine; `transition` validates
   it (invalid → `InvalidTransition`) and rejects a `Removed` devnode (`StaleId`). No
   `START` before AddDevice; no duplicate `START` without a Stop; `Failed` from any
   active state.
 - `mapping_allowed(id)` is true only in `Started` (spec §15.2 resource gating);
-  `is_live` false after `Removed`. `set_fdo`/`set_driver`/`resources`/`pdo`/`fdo`
-  accessors. 5 unit tests (fixture, full start lifecycle, invalid transitions, no
-  duplicate start, remove-then-stale).
+  `is_live` false after `Removed`. `instance_id`/`service`/`devnodes_for_service`,
+  `set_fdo`/`set_driver`/`resources`/`pdo`/`fdo` accessors. 7 unit tests cover
+  fixture compatibility, service-bound identity, no-resource devnodes, lifecycle,
+  invalid transitions, duplicate start rejection, and stale removed IDs.
 
 ## Full lifecycle in QEMU (implemented, Milestones 12.4-12.8 — `driver-host-pnp`)
 
 The `driver-host-pnp` component orchestrates the real `PnpMmioInterruptTest.sys`
 lifecycle against an in-process HAL + PnP Manager. Verified in QEMU (17/17):
-DriverEntry sets AddDevice + PnP dispatch → PnP Manager enumerates the fixture devnode
-+ creates the PDO → AddDevice builds the FDO→PDO stack → an IOCTL before START fails
+DriverEntry sets AddDevice + PnP dispatch → Configuration Manager selects the
+devnode's service from `Enum`, PnP Manager records the service-bound devnode + PDO →
+AddDevice builds the FDO→PDO stack → an IOCTL before START fails
 `STATUS_DEVICE_NOT_READY` → START_DEVICE delivers a translated CM_RESOURCE_LIST; the
 driver parses it, maps MMIO + connects the interrupt, devnode → Started → GET_ID works,
 a pended WAIT_FOR_INTERRUPT is completed by an injected interrupt (count = 1) →
