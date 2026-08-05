@@ -47,7 +47,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### B. Driver Stack Bring-Up From Service Metadata
 
-- `[~]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
+- `[x]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
   launch on one service-key to driver-object path.
 - `[x]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
@@ -80,10 +80,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Create this plan and keep it current while working.
-2. Start A1/A2 in `nt-config-manager`: typed service metadata and host tests.
-3. Review the executive's current service/driver launch readers against the new metadata API.
-4. Commit after the host-tested metadata slice is green.
+1. Start B4 by replacing fixture-specific driver proof paths with lifecycle checks that consume
+   `DriverServiceLaunchSpec` records.
+2. Start B3 inventory for registry `Enum`/`Services` binding and the hosted device-driver substrate
+   needed to lift the current FSD-only boot-driver filter.
+3. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
+   the kernel should only expose generic process/section/token/thread primitives.
+4. Audit remaining static driver-object construction sites that are not service-key-derived,
+   especially video and object-server tests, and classify whether they are fixtures or real debt.
 
 ## Review Log
 
@@ -164,3 +168,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: finish B1 by routing SCM driver start/stop onto the same spec and making unload
   policy share service metadata rather than only the derived object path.
+- B1 complete. `nt-config-manager` now owns the NT service-key to driver-object path rule:
+  driver `ObjectName` wins when present, filesystem/recognizer services derive `\FileSystem\<Name>`,
+  and device/kernel services derive `\Driver\<Name>`. The executive consumes that single resolver
+  for generated-hive driver proof launch, ordered SYSTEM-hive boot FSD launch, `NtLoadDriver`, and
+  `NtUnloadDriver`; the old local `\Driver\<Service>` builder was removed. ReactOS SCM driver
+  start/stop was reviewed and confirmed to enter the kernel through `NtLoadDriver`/`NtUnloadDriver`,
+  so no extra SCM-specific kernel hook is required. Validation: `cargo test -p nt-config-manager`
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B4 should now turn the existing named driver proof into generic lifecycle
+  gates, while B3 owns expanding beyond the current registry `File System` group filter.

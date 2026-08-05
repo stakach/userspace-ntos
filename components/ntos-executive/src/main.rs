@@ -11386,6 +11386,7 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
 
 struct ConfigHiveDriverLaunchSpec {
     service_name: alloc::string::String,
+    driver_object_path: alloc::string::String,
     image_path_len: usize,
     class: driver_launch::DriverClass,
 }
@@ -11424,12 +11425,6 @@ fn current_driver_host_can_boot_launch(service: &nt_config_manager::ServiceMetad
             .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP))
 }
 
-pub(crate) fn driver_object_path_from_service_name(service_name: &str) -> alloc::string::String {
-    let mut path = alloc::string::String::from("\\Driver\\");
-    path.push_str(service_name);
-    path
-}
-
 fn owned_driver_launch_spec_from_service_metadata(
     service: nt_config_manager::ServiceMetadata,
     max_start: u32,
@@ -11437,8 +11432,8 @@ fn owned_driver_launch_spec_from_service_metadata(
     let mut image_path = [0u8; 180];
     let (image_path_len, class) =
         driver_launch_spec_from_service_metadata(&service, &mut image_path, max_start)?;
+    let driver_object_path = service.driver_object_path()?;
     let service_name = service.name;
-    let driver_object_path = driver_object_path_from_service_name(&service_name);
     Some(DriverServiceLaunchSpec {
         service_name,
         driver_object_path,
@@ -11471,8 +11466,10 @@ fn config_hive_boot_system_driver_launch_spec(
     let service = cm.boot_system_driver_candidates().into_iter().next()?;
     let (image_path_len, class) =
         driver_launch_spec_from_service_metadata(&service, out_path, SERVICE_SYSTEM_START)?;
+    let driver_object_path = service.driver_object_path()?;
     Some(ConfigHiveDriverLaunchSpec {
         service_name: service.name,
+        driver_object_path,
         image_path_len,
         class,
     })
@@ -11512,6 +11509,19 @@ pub(crate) fn system_hive_driver_service_launch_spec(
     let cm = system_hive_config_manager()?;
     let service = cm.service_metadata(service_name)?;
     owned_driver_launch_spec_from_service_metadata(service, max_start)
+}
+
+pub(crate) fn system_hive_driver_service_object_path(
+    service_name: &str,
+    max_start: u32,
+) -> Option<alloc::string::String> {
+    let cm = system_hive_config_manager()?;
+    let service = cm.service_metadata(service_name)?;
+    let start_value = service.start_type?;
+    if start_value > max_start || start_value >= SERVICE_DISABLED {
+        return None;
+    };
+    service.driver_object_path()
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {
@@ -19423,18 +19433,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut proof_driver_path = [0u8; 128];
         let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&mut proof_driver_path);
         if let Some(proof_driver_spec) = proof_driver_spec {
-            let mut proof_driver_object = alloc::string::String::from("\\Driver\\");
-            proof_driver_object.push_str(&proof_driver_spec.service_name);
             print_str(b"[driver-launch] launching service ");
             print_str(proof_driver_spec.service_name.as_bytes());
             print_str(b" from config hive path=");
             print_str(&proof_driver_path[..proof_driver_spec.image_path_len]);
+            print_str(b" object=");
+            print_str(proof_driver_spec.driver_object_path.as_bytes());
             print_str(b"\n");
             if let Some(dc) = load_driver(
                 &fs,
                 &proof_driver_path[..proof_driver_spec.image_path_len],
                 proof_driver_spec.class,
-                &proof_driver_object,
+                &proof_driver_spec.driver_object_path,
             ) {
                 // This minimal FSD fills its MajorFunction[] table but creates NO control
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.

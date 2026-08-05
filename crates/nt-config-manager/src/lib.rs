@@ -79,7 +79,7 @@ pub enum DriverServiceClass {
 }
 
 pub fn driver_service_class_from_type(service_type: u32) -> Option<DriverServiceClass> {
-    if service_type & SERVICE_FILE_SYSTEM_DRIVER != 0 {
+    if service_type & (SERVICE_FILE_SYSTEM_DRIVER | SERVICE_RECOGNIZER_DRIVER) != 0 {
         Some(DriverServiceClass::FileSystem)
     } else if service_type & SERVICE_DRIVER_TYPE_MASK != 0 {
         Some(DriverServiceClass::Device)
@@ -128,6 +128,25 @@ impl ServiceMetadata {
 
     pub fn driver_service_class(&self) -> Option<DriverServiceClass> {
         driver_service_class_from_type(self.service_type?)
+    }
+
+    /// Driver object path implied by this service key.
+    ///
+    /// This mirrors the NT I/O manager's service-key rule: a driver service's `ObjectName`, when
+    /// present, names the driver object directly; otherwise filesystem and recognizer drivers live
+    /// under `\FileSystem`, and kernel/device drivers live under `\Driver`.
+    pub fn driver_object_path(&self) -> Option<String> {
+        let class = self.driver_service_class()?;
+        if let Some(object_name) = self.object_name.as_deref().filter(|name| !name.is_empty()) {
+            return Some(object_name.into());
+        }
+
+        let mut path = match class {
+            DriverServiceClass::FileSystem => String::from(r"\FileSystem\"),
+            DriverServiceClass::Device => String::from(r"\Driver\"),
+        };
+        path.push_str(&self.name);
+        Some(path)
     }
 }
 
@@ -788,6 +807,7 @@ mod tests {
         assert!(svc.is_win32_service());
         assert!(!svc.is_driver());
         assert_eq!(svc.driver_service_class(), None);
+        assert_eq!(svc.driver_object_path(), None);
         assert!(svc.has_launch_image());
     }
 
@@ -844,6 +864,10 @@ mod tests {
             driver_service_class_from_type(SERVICE_KERNEL_DRIVER),
             Some(DriverServiceClass::Device)
         );
+        assert_eq!(
+            driver_service_class_from_type(SERVICE_RECOGNIZER_DRIVER),
+            Some(DriverServiceClass::FileSystem)
+        );
 
         let all_auto = cm.service_candidates_by_start_and_type(
             &[SERVICE_AUTO_START],
@@ -851,6 +875,70 @@ mod tests {
         );
         assert_eq!(all_auto.len(), 1);
         assert_eq!(all_auto[0].name, "RpcSs");
+    }
+
+    #[test]
+    fn driver_object_path_follows_nt_service_key_rules() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "Npfs",
+            r"system32\drivers\npfs.sys",
+            SERVICE_FILE_SYSTEM_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        cm.register_typed_service(
+            "Disk",
+            r"system32\drivers\disk.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_typed_service(
+            "FsRec",
+            r"system32\drivers\fs_rec.sys",
+            SERVICE_RECOGNIZER_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_typed_service(
+            "Custom",
+            r"system32\drivers\custom.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        let custom_key = cm.service_metadata("Custom").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(custom_key, "ObjectName", r"\Driver\VendorCustom");
+
+        assert_eq!(
+            cm.service_metadata("Npfs").unwrap().driver_object_path().as_deref(),
+            Some(r"\FileSystem\Npfs")
+        );
+        assert_eq!(
+            cm.service_metadata("Disk").unwrap().driver_object_path().as_deref(),
+            Some(r"\Driver\Disk")
+        );
+        assert_eq!(
+            cm.service_metadata("FsRec").unwrap().driver_object_path().as_deref(),
+            Some(r"\FileSystem\FsRec")
+        );
+        assert_eq!(
+            cm.service_metadata("Custom")
+                .unwrap()
+                .driver_object_path()
+                .as_deref(),
+            Some(r"\Driver\VendorCustom")
+        );
     }
 
     #[test]

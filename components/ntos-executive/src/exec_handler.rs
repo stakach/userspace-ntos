@@ -1747,6 +1747,7 @@ impl ExecNtHandler {
 
     unsafe fn nt_unload_driver(&mut self, service_name_ustr: u64) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
         if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
             return STATUS_PRIVILEGE_NOT_HELD;
@@ -1759,7 +1760,12 @@ impl ExecNtHandler {
             Ok(service) => service,
             Err(status) => return status,
         };
-        let driver_object_path = driver_object_path_from_service_name(&service);
+        let Some(driver_object_path) = system_hive_driver_service_object_path(
+            &service,
+            nt_config_manager::SERVICE_DEMAND_START,
+        ) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
         match driver_launch::unload_driver_by_name(&driver_object_path) {
             Ok(()) => 0,
             Err(status) => status.raw() as u32,
