@@ -564,13 +564,14 @@ not globals) — so closing G2 is mostly de-singletoning `load_driver`, not the 
 
 ### 5.7 Proof obligation
 
-Reuse is proven when a SECOND, DIFFERENT IRP driver loads through the unified harness with ONLY a
-`DriverSpec` (no bespoke code) and services an IRP end-to-end — e.g. a minimal synthetic FSD/filter
-fixture staged by path, spawned by `load_driver(path, Fsd)`, that registers `IRP_MJ_CREATE`/
-`IRP_MJ_DEVICE_CONTROL` and round-trips one IRP via `component_pump`. A counted spec
-(`exec_second_irp_driver_via_harness`) asserts it entered DriverEntry, built its MajorFunction table in
-its OWN isolated VSpace (distinct PML4 from npfs), and completed an IRP — all with zero driver-specific
-executive code. This directly exercises G1+G2+G3.
+Reuse is proven when a service-selected IRP driver loads through the unified harness with only
+registry service metadata and services an IRP end-to-end. The current minimal FSD fixture is staged
+by the generated SYSTEM hive, selected as a boot/system driver, spawned by `load_driver(path, Fsd)`,
+registers `IRP_MJ_CREATE`/`IRP_MJ_DEVICE_CONTROL`, round-trips one IRP via `component_pump`, and
+then unloads through `DriverUnload`. Counted specs assert it entered DriverEntry, built its
+MajorFunction table in its own isolated VSpace, published and removed its driver object route, and
+completed dispatch/unload with zero driver-specific executive code. This directly exercises
+G1+G2+G3.
 
 ---
 
@@ -592,9 +593,11 @@ stage a `.sys` + declare a `DriverSpec { path, class }` and it runs on the SAME 
 bespoke code. `DriverClass` → caps/regions via `caps_and_layout_for` (the ONLY per-class code): `Fsd`
 (default IRP server), `Filter` + `Device` (future-wiring seams, `#[allow(dead_code)]`), and
 `GuiSyscallServer` (win32k's unique privileged class — kept its Syscall substrate, not routed
-through the IRP builder). Reuse is proven by `exec_second_irp_driver_via_harness` (a 2nd by-path IRP
-driver, `IrpFsdTest.sys`, in its OWN isolated PML4). Family B (driver-host + KMDF fixtures) stays on
-its thin one-shot `run_once` shape — a test-lifecycle fixture, NOT a general driver path.
+through the IRP builder). Reuse is proven by `exec_driver_lifecycle_dispatch_via_harness` and
+`exec_driver_lifecycle_unload_teardown`: a service-selected by-path IRP driver runs in its own
+isolated PML4, dispatches through the shared harness, and tears down through the canonical
+I/O/Object Manager path. Family B (driver-host + KMDF fixtures) stays on its thin one-shot
+`run_once` shape — a test-lifecycle fixture, NOT a general driver path.
 
 **Isolated vs. deliberately in-executive.**
 * ISOLATED as their own seL4 components (own VSpace/CSpace/TCB): the four SURT-brokered managers —

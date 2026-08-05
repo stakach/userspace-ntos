@@ -1750,8 +1750,9 @@ pub fn fsd_export_addr(name: &str) -> u64 {
 /// @0x30, DriverUnload @0x68, MajorFunction @0x70). The bespoke inline
 /// `dispatch_loop`/`send_done`/`recv_req` are retired
 /// in favour of the harness's shared implementation (one [`call_on`] per dispatch). This is the
-/// component-side leg of the FSD's migration onto the unified harness (Phase B, Step 2). Both the
-/// npfs instance and the 2nd `IrpFsdTest.sys` instance share this entry, so BOTH now run on the harness.
+/// component-side leg of the FSD's migration onto the unified harness (Phase B, Step 2). The
+/// named-pipe provider and each service-selected FSD instance share this entry, so all of them run
+/// on the harness.
 /// Runs in the isolated component's VSpace (executive image mapped RWX-shared).
 #[no_mangle]
 #[link_section = ".text.fsd_component_entry"]

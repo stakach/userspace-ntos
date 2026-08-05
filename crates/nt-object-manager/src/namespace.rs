@@ -23,8 +23,8 @@ const DIRECTORY_TYPE_NAME: &str = "Directory";
 /// The built-in SymbolicLink object type name.
 const SYMLINK_TYPE_NAME: &str = "SymbolicLink";
 
-/// The MVP root directories created at bootstrap (spec §9.1).
-const ROOT_DIRECTORIES: &[&str] = &["Device", "Driver", "??", "BaseNamedObjects"];
+/// The core root directories created at bootstrap (spec §9.1).
+const ROOT_DIRECTORIES: &[&str] = &["Device", "Driver", "FileSystem", "??", "BaseNamedObjects"];
 
 /// Maximum symbolic-link expansions during one lookup (spec §9.3), to bound loops.
 const SYMLINK_LIMIT: u32 = 32;
@@ -89,8 +89,8 @@ impl ObjectManager {
         self.root.clone()
     }
 
-    /// Create the root namespace: `\` (permanent) plus the MVP directories
-    /// `\Device`, `\Driver`, `\??`, `\BaseNamedObjects`. Idempotent.
+    /// Create the root namespace: `\` (permanent) plus the core NT directories used by Object and
+    /// I/O Manager bootstrap. Idempotent.
     pub fn bootstrap_namespace(&mut self) -> Result<(), NtStatus> {
         if self.root.is_some() {
             return Ok(());
@@ -99,8 +99,15 @@ impl ObjectManager {
         let root = self.create_object(dir_ty, ObjectBody::Directory(DirectoryBody::default()))?;
         root.set_permanent(true);
         self.root = Some(root.clone());
+        let mut filesystem = None;
         for name in ROOT_DIRECTORIES {
-            self.create_directory(&root, &UnicodeString::from_str(name), true)?;
+            let dir = self.create_directory(&root, &UnicodeString::from_str(name), true)?;
+            if *name == "FileSystem" {
+                filesystem = Some(dir);
+            }
+        }
+        if let Some(filesystem) = filesystem {
+            self.create_directory(&filesystem, &UnicodeString::from_str("Filters"), true)?;
         }
         Ok(())
     }

@@ -53,7 +53,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   driver lists.
 - `[ ]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
   drivers create device objects/interfaces through I/O Manager mechanisms.
-- `[ ]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
+- `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
 ### C. Memory Manager And VAD Correctness
@@ -80,14 +80,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Start B4 by replacing fixture-specific driver proof paths with lifecycle checks that consume
-   `DriverServiceLaunchSpec` records.
-2. Start B3 inventory for registry `Enum`/`Services` binding and the hosted device-driver substrate
+1. Start B3 inventory for registry `Enum`/`Services` binding and the hosted device-driver substrate
    needed to lift the current FSD-only boot-driver filter.
-3. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
+2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-4. Audit remaining static driver-object construction sites that are not service-key-derived,
+3. Audit remaining static driver-object construction sites that are not service-key-derived,
    especially video and object-server tests, and classify whether they are fixtures or real debt.
+4. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
+   the seeded Configuration Manager authority.
 
 ## Review Log
 
@@ -178,3 +178,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: B4 should now turn the existing named driver proof into generic lifecycle
   gates, while B3 owns expanding beyond the current registry `File System` group filter.
+- B4 complete. The service-selected driver proof now validates the full generic lifecycle: registry
+  service metadata selects the driver, `load_driver` runs `DriverEntry`, the driver object route is
+  published through the Object/I/O Manager path, IRP dispatch runs through the shared harness, a real
+  `DriverUnload` is invoked, and the I/O route, Object Manager path, and live instance are gone after
+  unload. The synthetic `IrpFsdTest.sys` fixture now installs a no-op `DriverUnload` so the proof
+  exercises the same stop/unload path that `NtUnloadDriver`/SCM stop use. Plan review found and
+  fixed the matching namespace prerequisite: Object Manager bootstrap now creates `\FileSystem` and
+  `\FileSystem\Filters`, so filesystem driver objects can be created under the NT FSD namespace
+  rather than relying on `\Driver`. Validation: `cargo test -p nt-object-manager`,
+  `cargo test -p nt-driver-test-fixtures`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3 is now the main driver-stack gap. The current boot/system plan is still
+  filtered to the registry `File System` load group because hosted device/bus/filter bring-up needs
+  devnode-to-service binding and PnP-owned device creation.

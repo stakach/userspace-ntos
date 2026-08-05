@@ -15479,15 +15479,7 @@ fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     driver_object_path: &str,
     passed: &mut u64,
 ) {
-    let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
-    let driver_info = object_client.query_object(driver_object_path, true).ok();
-    let driver_bound = driver_info.is_some_and(|info| {
-        info.route_kind == 1
-            && info.owner_component == owner_component
-            && info.owner_local_id == dc.driver_id
-            && driver_launch::driver_object_id(dc.driver_id) == info.object_id.0
-    });
-    let driver_ok = driver_bound && dc.drvobj != 0;
+    let driver_ok = driver_object_route_registered(object_client, dc, driver_object_path);
     check(b"npfs_driver_object_registered", driver_ok, passed);
 
     let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
@@ -15499,13 +15491,29 @@ fn publish_npfs_io_objects<B: nt_object_client::Backend>(
             let info = object_client.query_object(path, true).ok();
             info.is_some_and(|info| {
                 info.route_kind == 2
-                    && info.owner_component == owner_component
+                    && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
                     && info.owner_local_id == dc.device_id
                     && info.object_id.0 == object_id
             })
         }
     });
     check(b"npfs_device_object_registered", device_ok, passed);
+}
+
+fn driver_object_route_registered<B: nt_object_client::Backend>(
+    object_client: &mut ObjectClient<B>,
+    dc: &driver_launch::DriverComponent,
+    driver_object_path: &str,
+) -> bool {
+    let owner_component = driver_launch::IO_MANAGER_COMPONENT_ID;
+    let driver_info = object_client.query_object(driver_object_path, true).ok();
+    let driver_bound = driver_info.is_some_and(|info| {
+        info.route_kind == 1
+            && info.owner_component == owner_component
+            && info.owner_local_id == dc.driver_id
+            && driver_launch::driver_object_id(dc.driver_id) == info.object_id.0
+    });
+    driver_bound && dc.drvobj != 0
 }
 
 fn park() -> ! {
@@ -19426,10 +19434,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[driver-launch] no boot/system service published \\Device\\NamedPipe\n");
         }
 
-        // --- G3: second boot/system service through the same general driver path. The proof fixture
-        // service is declared in the generated SYSTEM.DAT hive; the executive imports the service
-        // subtree into Config Manager metadata, then selects the boot/system driver candidate from
-        // that dynamic service list instead of probing a compiled-in service identity.
+        // --- G3: service-selected driver lifecycle through the same general driver path. The
+        // generated SYSTEM.DAT hive declares a boot/system service; the executive imports the
+        // service subtree into Config Manager metadata, selects the boot/system driver candidate,
+        // then proves load -> DriverEntry -> dispatch -> unload -> object teardown without probing a
+        // compiled-in service identity.
         let mut proof_driver_path = [0u8; 128];
         let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&mut proof_driver_path);
         if let Some(proof_driver_spec) = proof_driver_spec {
@@ -19450,9 +19459,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
                 let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
                 driver_launch::register_driver_ready(dc.driver_id, irp_ready);
+                let driver_object_registered = driver_object_route_registered(
+                    &mut c,
+                    &dc,
+                    &proof_driver_spec.driver_object_path,
+                );
+                check(
+                    b"exec_driver_lifecycle_object_registered",
+                    driver_object_registered,
+                    &mut passed,
+                );
 
-                // Isolation: the 2nd driver runs in its OWN VSpace — a PML4 distinct from npfs's
-                // named-pipe driver AND the executive's.
+                // Isolation: the service-selected driver runs in its OWN VSpace — a PML4 distinct
+                // from the named-pipe provider AND the executive's.
                 let npfs_pml4 = driver_launch::npfs_pml4();
                 let proof_pml4 = driver_launch::driver_pml4(dc.driver_id);
                 let distinct_pml4 = proof_pml4 != 0
@@ -19460,9 +19479,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     && proof_pml4 != npfs_pml4;
 
                 // IRP round-trip through the SHARED component_pump: dispatch IRP_MJ_CREATE (major 0)
-                // through the 2nd driver's canonical route id; its handler sets STATUS_SUCCESS +
-                // Information = 0x5A5A. Prove the completion propagated back through the shared
-                // dispatch engine without exposing the component instance as the public route.
+                // through the service-selected driver's canonical route id; its handler sets
+                // STATUS_SUCCESS + Information = 0x5A5A. Prove the completion propagated back
+                // through the shared dispatch engine without exposing the component instance as the
+                // public route.
                 let mut out = [0u8; 16];
                 // ★★ NEGATIVE-CONTROL INJECTION (Phase 4): make a BOUND-NOTIFICATION delivery land
                 // on this dispatch's pump recv, deliberately. See `inject_bound_notification_tick`.
@@ -19486,7 +19506,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 retract_bound_notification_tick();
                 let mut irp_ok = false;
                 if let Some((st, info)) = rt {
-                    print_str(b"[driver-launch] 2nd-driver driver-id=");
+                    print_str(b"[driver-launch] lifecycle driver-id=");
                     print_u64(dc.driver_id);
                     print_str(b" IRP_MJ_CREATE -> status=0x");
                     print_hex(st as u32);
@@ -19499,11 +19519,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
 
                 check(
-                    b"exec_second_irp_driver_via_harness",
+                    b"exec_driver_lifecycle_dispatch_via_harness",
                     (dc.verdict & V_ENTERED) != 0
                         && (dc.verdict & V_MJ) != 0
                         && distinct_pml4
                         && irp_ready
+                        && driver_object_registered
                         && irp_ok,
                     &mut passed,
                 );
@@ -19526,9 +19547,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 //
                 // THE INJECTION IS THE NEGATIVE CONTROL. It mints a notification badged
                 // `DELAY_TIMER_BADGE`, binds it to the root TCB, signals it, and THEN runs the real
-                // 2nd-driver IRP dispatch above — so the delivery lands on that dispatch's very
-                // first `pump_recv`, which is precisely the shape that walled npfs. Two things must
-                // both hold, and neither can hold without the screening:
+                // service-selected IRP dispatch above — so the delivery lands on that dispatch's
+                // very first `pump_recv`, which is precisely the shape that walled npfs. Two things
+                // must both hold, and neither can hold without the screening:
                 //   * the pump SAW it (`PUMP_TIMER_TICKS_ABSORBED` moved) — otherwise the injection
                 //     did not reproduce the condition and the spec would be vacuous;
                 //   * the dispatch nevertheless COMPLETED with the driver's own answer
@@ -19538,8 +19559,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // disabled, this boot reproduces the original signature EXACTLY — `[pump] WALL
                 // label=0 ip=0x771` → `[fsd-svc] IRP fault wall inst=1 -> instance RETIRED` — and
                 // BOTH `exec_pump_screens_bound_notification` (absorbed=0, completed=0) and
-                // `exec_second_irp_driver_via_harness` FAIL (gate 234 → 231/99, 3 FAILs). So the
-                // injection reproduces the real defect, and the spec is not vacuous.
+                // `exec_driver_lifecycle_dispatch_via_harness` fail. So the injection reproduces
+                // the real defect, and the spec is not vacuous.
                 print_str(b"[pump-ntfn] injected bound-notification tick: armed=");
                 print_u64(tick_armed as u64);
                 print_str(b" absorbed-by-pump=");
@@ -19552,9 +19573,45 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     tick_armed && tick_absorbed >= 1 && irp_ok,
                     &mut passed,
                 );
+
+                let lifecycle_driver_id = dc.driver_id;
+                let unload_entry_present = dc.driver_unload != 0;
+                let unload_status =
+                    driver_launch::unload_driver_by_name(&proof_driver_spec.driver_object_path);
+                let unload_ok = unload_status.is_ok();
+                let route_removed =
+                    driver_launch::driver_id_by_name(&proof_driver_spec.driver_object_path)
+                        .is_none();
+                let object_removed = c
+                    .query_object(&proof_driver_spec.driver_object_path, true)
+                    .is_err();
+                let instance_removed = driver_launch::driver_pml4(lifecycle_driver_id) == 0;
+                print_str(b"[driver-launch] lifecycle unload service=");
+                print_str(proof_driver_spec.service_name.as_bytes());
+                print_str(b" status=0x");
+                print_hex(match unload_status {
+                    Ok(()) => 0,
+                    Err(status) => status.raw() as u32,
+                });
+                print_str(b" route_removed=");
+                print_u64(route_removed as u64);
+                print_str(b" object_removed=");
+                print_u64(object_removed as u64);
+                print_str(b" instance_removed=");
+                print_u64(instance_removed as u64);
+                print_str(b"\n");
+                check(
+                    b"exec_driver_lifecycle_unload_teardown",
+                    unload_entry_present
+                        && unload_ok
+                        && route_removed
+                        && object_removed
+                        && instance_removed,
+                    &mut passed,
+                );
             } else {
                 print_str(
-                    b"[driver-launch] config-hive driver launch returned None (not staged / load failed)\n",
+                    b"[driver-launch] service-selected driver launch returned None (not staged / load failed)\n",
                 );
             }
         } else {
@@ -20929,10 +20986,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- PROOF the FSD (all instances) GENUINELY runs on the SHARED HARNESS. `component_pump`
     // increments `HARNESS_IRP_DISPATCHES` per serviced IRP dispatch (kind=Irp). By this point the
-    // whole live FSD data-plane has flowed through it: BOTH DriverEntry inits (npfs + IrpFsdTest) +
-    // the 2nd-driver IRP_MJ_CREATE round-trip + every npfs pipe create/read/write/flush IRP. If the
-    // FSD were NOT wired through `component_pump` (the pre-harness bespoke inline loop), this counter
-    // would be 0 and this spec FAILS — that is the durable, non-green-alone proof the wiring is real.
+    // whole live FSD data-plane has flowed through it: both DriverEntry init pumps, the
+    // service-selected lifecycle driver's create/unload round-trips, and every named-pipe
+    // create/read/write/flush IRP. If the FSD were NOT wired through `component_pump` (the
+    // pre-harness bespoke inline loop), this counter would be 0 and this spec FAILS — that is the
+    // durable, non-green-alone proof the wiring is real.
     let harness_irp = spawn_hosts::harness_dispatches(spawn_hosts::ReqKind::Irp);
     print_str(b"[harness] IRP dispatches serviced through component_pump: ");
     print_u64(harness_irp);
@@ -20979,16 +21037,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // structural — there is no code path left to turn off. Probe (3) is the honest substitute: it
     // falsifies the kernel-level premise the structure rests on, rather than a flag of ours.
     // NOTE: `call_requests` is legitimately 2 LOWER than `call_dispatches` — the two
-    // `InitialAction::RecvFirst` DriverEntry-init pumps (npfs + IrpFsdTest) complete a dispatch
-    // without ever issuing a request reply, because the component's ready Call IS the completion.
+    // `InitialAction::RecvFirst` DriverEntry-init pumps complete a dispatch without ever issuing a
+    // request reply, because the component's ready Call IS the completion.
     let call_requests = spawn_hosts::pump_call_requests(spawn_hosts::ReqKind::Irp);
     let call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Irp);
     let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
     // (3) The unbound-reply probe. `REPLY_FSD_SLOT` is sized at MAX_DRIVER_INSTANCES but only the
-    // launched instances (npfs = 0, IrpFsdTest = 1) ever bind one, so the last slot is a retyped,
-    // never-bound reply object — exactly the "component is known runnable / not blocked in a Call"
-    // condition. This reply MUST fail loudly and MUST NOT block.
+    // launched named-pipe provider and lifecycle-driver instances bind one, so the last slot is a
+    // retyped, never-bound reply object — exactly the "component is known runnable / not blocked in a
+    // Call" condition. This reply MUST fail loudly and MUST NOT block.
     let spare_reply = fsd_reply_slot(driver_launch::MAX_DRIVER_INSTANCES - 1);
     let unbound_label = if spare_reply != 0 {
         reply_on(spare_reply, 0, 0, 0, 0, 0)

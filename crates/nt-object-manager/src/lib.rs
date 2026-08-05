@@ -610,11 +610,18 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_creates_root_and_mvp_dirs() {
+    fn bootstrap_creates_root_and_core_dirs() {
         let om = bootstrapped();
         let root = om.lookup_path(&path("\\"), CI).unwrap();
         assert!(root.is_permanent());
-        for p in ["\\Device", "\\Driver", "\\??", "\\BaseNamedObjects"] {
+        for p in [
+            "\\Device",
+            "\\Driver",
+            "\\FileSystem",
+            "\\FileSystem\\Filters",
+            "\\??",
+            "\\BaseNamedObjects",
+        ] {
             let d = om.lookup_path(&path(p), CI).unwrap();
             assert!(d.is_permanent());
         }

@@ -348,7 +348,7 @@ fault from a callback.
 |---|---|---|---|
 | `REPLY_MAIN` + `WAIT_REPLY_POOL[1..]` | executive main service loop | the hosted **client** thread (csrss/winlogon/…) whose syscall or fault is in flight | unchanged by this migration |
 | `REPLY_W32` → **`R_win32k`** | executive | the win32k component TCB, in whatever Call it is currently blocked in (dispatch-done / callback / fault) | the whole nested tree |
-| **new** `R_fsd[inst]`, one per FSD instance (npfs + `IrpFsdTest`) | executive | that FSD component TCB | one dispatch |
+| **new** `R_fsd[inst]`, one per FSD instance | executive | that FSD component TCB | one dispatch |
 
 No pooling, no rotation, no stack. `MAX_REPLIES = 384`; we add exactly 2.
 
@@ -532,7 +532,7 @@ passes `Legacy`. Phase 2 deletes the enum and both arms.
 Chosen first because it is non-nested, has two independent instances, and is protected by
 `exec_npfs_concurrent_irp_read_and_write`, `exec_npfs_file_object_lifetime`,
 `exec_npfs_write_split_across_pending_read`, `exec_npfs_flush_pending`,
-`exec_fsd_on_shared_harness`, and `exec_second_irp_driver_via_harness`.
+`exec_fsd_on_shared_harness`, and `exec_driver_lifecycle_dispatch_via_harness`.
 
 **Changes**
 1. `component_main` (`spawn_hosts.rs:1115–1145`): `send_done_on` + `recv_req_on` → one `call_on`.
@@ -558,8 +558,9 @@ Chosen first because it is non-nested, has two independent instances, and is pro
      structural statement "the wake cannot block" — the exact property defect 3 lacks.
 
 **Must stay green:** all five npfs specs, `exec_fsd_on_shared_harness` (≥8),
-`exec_second_irp_driver_via_harness`, `exec_kebugcheck_bound_and_reported`, the desktop paint, gate
-count (231 − `exec_component_dispatch_in_phase` + `exec_irp_transport_call_bound` = 231).
+`exec_driver_lifecycle_dispatch_via_harness`, `exec_driver_lifecycle_unload_teardown`,
+`exec_kebugcheck_bound_and_reported`, the desktop paint, gate count
+(231 − `exec_component_dispatch_in_phase` + `exec_irp_transport_call_bound` = 231).
 
 **Expected mid-phase breakage:** win32k, because step 1 changes shared `component_main` while
 win32k's rendezvous still speaks the old protocol. **Mitigation:** do steps 1+2 and the win32k
@@ -766,12 +767,12 @@ line stays masked until that Ack, so at most one tick is outstanding.
 
 Proven live and route-independently by **`exec_pump_screens_bound_notification`**: an injection
 (`inject_bound_notification_tick`) mints a notification badged `DELAY_TIMER_BADGE`, binds it to the
-root TCB, signals it, and then runs the REAL 2nd-driver IRP dispatch, so the delivery lands on that
-dispatch's first `pump_recv`. The spec asserts the pump SAW it (`absorbed >= 1`, else the injection
-would be vacuous) AND the dispatch still returned the driver's own answer (`status 0`,
-`Information 0x5A5A`). **Bypass experiment** (screen disabled, one boot): reproduces the original
-signature exactly — `[pump] WALL label=0 ip=0x771` → `instance RETIRED` — and both that spec and
-`exec_second_irp_driver_via_harness` FAIL (234 → 231/99, 3 FAILs).
+root TCB, signals it, and then runs the real service-selected lifecycle-driver IRP dispatch, so the
+delivery lands on that dispatch's first `pump_recv`. The spec asserts the pump SAW it
+(`absorbed >= 1`, else the injection would be vacuous) AND the dispatch still returned the driver's
+own answer (`status 0`, `Information 0x5A5A`). **Bypass experiment** (screen disabled, one boot):
+reproduces the original signature exactly — `[pump] WALL label=0 ip=0x771` → `instance RETIRED` —
+and both that spec and `exec_driver_lifecycle_dispatch_via_harness` fail.
 
 **(b) Pipe parking was per-CONNECTION, not per-DIRECTION. Fixed, host-tested, GATED OFF.**
 

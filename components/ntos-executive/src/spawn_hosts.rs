@@ -680,8 +680,9 @@ unsafe fn win32k_wall_diag(ch: &PumpChannel, label: u64, m0: u64, m1: u64, m2: u
 /// PROOF-OF-WIRING counters: `component_pump` increments these per SERVICED dispatch, tagged by
 /// `ReqKind`. They are the durable evidence that a component's live traffic actually flows through
 /// the SHARED harness pump (not the retired bespoke inline loop). The `exec_fsd_on_shared_harness`
-/// gate spec asserts `HARNESS_IRP_DISPATCHES >= N` for the real npfs data-plane + 2nd-driver IRPs —
-/// if the FSD were NOT routed through `component_pump`, this counter would stay 0 and the spec FAILS.
+/// gate spec asserts `HARNESS_IRP_DISPATCHES >= N` for the real named-pipe data-plane plus
+/// service-selected lifecycle-driver IRPs. If FSD dispatch were not routed through
+/// `component_pump`, this counter would stay 0 and the spec FAILS.
 pub(crate) static HARNESS_IRP_DISPATCHES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub(crate) static HARNESS_SYSCALL_DISPATCHES: core::sync::atomic::AtomicU64 =
