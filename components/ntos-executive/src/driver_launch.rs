@@ -35,9 +35,9 @@ use nt_io_manager::{
     InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
     ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
     WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
-    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
-    WDM_X64_IRP_SIZE,
+    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
@@ -167,6 +167,7 @@ pub const SH_DRIVER_UNLOAD: u64 = 0x38; // out: DriverObject->DriverUnload after
 pub const SH_DEVICE_NAME_LEN: u64 = 0x80; // out: IoCreateDevice DeviceName bytes (u16)
 pub const SH_SYMLINK_LINK_LEN: u64 = 0x82; // out: IoCreateSymbolicLink LinkName bytes (u16)
 pub const SH_SYMLINK_TARGET_LEN: u64 = 0x84; // out: IoCreateSymbolicLink DeviceName bytes (u16)
+pub const SH_ADD_DEVICE: u64 = 0x88; // out: DriverExtension->AddDevice after DriverEntry (u64)
 pub const SH_DEVICE_NAME_BUF: u64 = 0x90; // out: UTF-16LE path capture
 pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
@@ -180,6 +181,8 @@ pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
+
+const WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET: u64 = 0x08;
 
 // --- verdict bits ----------------------------------------------------------------------------
 
@@ -1790,12 +1793,22 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
 unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
     let mj_create = read_unaligned((drv + 0x70) as *const u64);
     let driver_unload = read_unaligned((drv + WDM_X64_DRIVER_UNLOAD_OFFSET as u64) as *const u64);
+    let driver_extension =
+        read_unaligned((drv + WDM_X64_DRIVER_EXTENSION_OFFSET as u64) as *const u64);
+    let add_device = if driver_extension == 0 {
+        0
+    } else {
+        read_unaligned(
+            (driver_extension + WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET) as *const u64,
+        )
+    };
     let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
     write_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *mut u64, drv);
     write_volatile(
         (FSD_SHARED_VADDR + SH_DRIVER_UNLOAD) as *mut u64,
         driver_unload,
     );
+    write_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *mut u64, add_device);
     // Pool high-water (diagnostic; not read by the executive — parity with the old inline entry).
     let pool_used = read_volatile(FSD_POOL_VADDR as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
@@ -1806,6 +1819,11 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
     print_str(b" mj_create=0x");
     print_hex((mj_create >> 32) as u32);
     print_hex(mj_create as u32);
+    if add_device != 0 {
+        print_str(b" add_device=0x");
+        print_hex((add_device >> 32) as u32);
+        print_hex(add_device as u32);
+    }
     print_str(b"\n");
 }
 
@@ -2247,6 +2265,8 @@ pub(crate) struct DriverComponent {
     pub fault_ep: u64,
     /// The component-local DRIVER_OBJECT projection built for this driver.
     pub drvobj: u64,
+    /// The DriverExtension->AddDevice pointer captured after DriverEntry, if any.
+    pub add_device: u64,
     /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
     pub devobj: u64,
     /// The DriverObject->DriverUnload pointer captured after DriverEntry.
@@ -2631,6 +2651,7 @@ pub(crate) unsafe fn load_driver(
     print_str(b"\n");
     write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
+    write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -2688,6 +2709,7 @@ pub(crate) unsafe fn load_driver(
     let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     let driver_unload = read_volatile((win.shared_va + SH_DRIVER_UNLOAD) as *const u64);
+    let add_device = read_volatile((win.shared_va + SH_ADD_DEVICE) as *const u64);
     let (device_name_len, device_name_utf16) =
         read_shared_path_capture(win.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
     let (symlink_link_len, symlink_link_utf16) =
@@ -2735,6 +2757,7 @@ pub(crate) unsafe fn load_driver(
         pml4,
         fault_ep,
         drvobj,
+        add_device,
         devobj,
         driver_unload,
         device_name_len,
@@ -3401,6 +3424,7 @@ pub(crate) struct DriverInstance {
     pub driver_object: u64,
     pub device_object: u64,
     pub driver_unload: u64,
+    pub add_device: u64,
     pub ready: bool,
     pub used: bool,
 }
@@ -3417,6 +3441,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     driver_object: 0,
     device_object: 0,
     driver_unload: 0,
+    add_device: 0,
     ready: false,
     used: false,
 };
@@ -3444,6 +3469,7 @@ fn register_instance(dc: &DriverComponent) {
             driver_object: dc.drvobj,
             device_object: dc.devobj,
             driver_unload: dc.driver_unload,
+            add_device: dc.add_device,
             // Default readiness = npfs's historic rule (parked + a control device object). A
             // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
             // is marked ready explicitly by the caller via `register_instance_ready`.
@@ -3487,6 +3513,13 @@ pub(crate) fn register_driver_ready(driver_id: u64, ready: bool) {
 pub(crate) fn driver_pml4(driver_id: u64) -> u64 {
     instance_by_driver_id(driver_id)
         .map(|(_, d)| d.pml4)
+        .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+pub(crate) fn driver_add_device(driver_id: u64) -> u64 {
+    instance_by_driver_id(driver_id)
+        .map(|(_, d)| d.add_device)
         .unwrap_or(0)
 }
 

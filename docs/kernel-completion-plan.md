@@ -248,3 +248,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: the next B3 slice should consume these descriptors by invoking AddDevice and
   StartDevice through the hosted driver path once device resources are assigned.
+- B3 continued. Hosted driver launch now captures `DriverExtension->AddDevice` after `DriverEntry`
+  and preserves it in the live driver instance table. This gives the executive a real per-driver
+  AddDevice entrypoint for the registry-selected devnodes now carried in `DriverServiceLaunchSpec`;
+  it does not yet invoke AddDevice or project the PDO/start IRP. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next B3 slice should add an executive dispatch path for AddDevice, backed by
+  service-bound PDO projection and a subsequent `IRP_MN_START_DEVICE` dispatch with assigned
+  resources.
