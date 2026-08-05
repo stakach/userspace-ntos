@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nt-config-manager = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

@@ -119,3 +119,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: real `REGF` SYSTEM hive import is still needed so `Npfs` and demand
   `NtLoadDriver` service reads can use the same live CM metadata path.
+- A3 continued. `nt-hive-regf` now preserves original-case subkey enumeration and imports real
+  `REGF` `ControlSetXXX\Services` trees into `ConfigManager`, including nested service keys and
+  typed values. The executive's real SYSTEM hive driver lookup now imports services and reads
+  `ServiceMetadata` for both the existing NPFS boot proof and dynamic `NtLoadDriver` demand-start
+  requests; the old local raw `ImagePath`/`Type`/`Start` parser was removed. Validation:
+  `cargo test -p nt-hive-regf` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: A3 still needs the actual SCM service-start request path to choose Win32
+  service process creation from `ServiceMetadata`, and B2 should replace the NPFS-specific boot
+  proof with ordered boot/system driver enumeration.

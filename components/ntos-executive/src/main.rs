@@ -79,9 +79,7 @@ use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
-use nt_config_manager::{
-    driver_service_class_from_type, DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START,
-};
+use nt_config_manager::{DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START};
 use nt_hive_core::apply_ccs_alias;
 use nt_hive_regf::{KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
@@ -11310,13 +11308,6 @@ fn registry_utf16_ascii(data: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut tmp = [0u8; 160];
-    let n = registry_utf16_ascii(data, &mut tmp)?;
-
-    normalize_registry_ascii_path(&tmp[..n], out)
-}
-
 fn registry_ascii_path(path: &str, out: &mut [u8]) -> Option<usize> {
     let mut tmp = [0u8; 160];
     let mut n = 0usize;
@@ -11393,25 +11384,6 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
     RegfHive::new(bytes)
 }
 
-fn driver_launch_spec_from_registry_values(
-    image_path_data: &[u8],
-    type_value: u32,
-    start_value: u32,
-    out_path: &mut [u8],
-    max_start: u32,
-) -> Option<(usize, driver_launch::DriverClass)> {
-    // Callers choose the maximum accepted NT service start policy for their route.
-    if start_value > max_start || start_value >= SERVICE_DISABLED {
-        return None;
-    };
-    let class = match driver_service_class_from_type(type_value)? {
-        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
-        DriverServiceClass::Device => driver_launch::DriverClass::Device,
-    };
-    let path_len = registry_utf16_ascii_path(image_path_data, out_path)?;
-    Some((path_len, class))
-}
-
 struct ConfigHiveDriverLaunchSpec {
     service_name: alloc::string::String,
     image_path_len: usize,
@@ -11466,34 +11438,28 @@ fn config_hive_boot_system_driver_launch_spec(
     })
 }
 
+fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
+    let hive = system_hive_regf()?;
+    let mut cm = nt_config_manager::ConfigManager::new();
+    if nt_hive_regf::import_control_set_services_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    ) == 0
+    {
+        return None;
+    }
+    Some(cm)
+}
+
 fn system_hive_driver_launch_spec(
     service_name: &str,
     out_path: &mut [u8],
     max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
-    let hive = system_hive_regf()?;
-    let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
-    key_path.push_str(service_name);
-    let key = hive.open_key(&key_path)?;
-    let (image_type, image_path) = hive.value(key, "ImagePath")?;
-    if image_type != nt_hive_core::RegistryValueType::Sz as u32
-        && image_type != nt_hive_core::RegistryValueType::ExpandSz as u32
-    {
-        return None;
-    }
-    let type_value = hive
-        .value(key, "Type")
-        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    let start_value = hive
-        .value(key, "Start")
-        .and_then(|(_, data)| registry_dword_from_bytes(&data))?;
-    driver_launch_spec_from_registry_values(
-        &image_path,
-        type_value,
-        start_value,
-        out_path,
-        max_start,
-    )
+    let cm = system_hive_config_manager()?;
+    let service = cm.service_metadata(service_name)?;
+    driver_launch_spec_from_service_metadata(&service, out_path, max_start)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {

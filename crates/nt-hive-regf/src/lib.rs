@@ -24,6 +24,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use nt_config_manager::{ConfigManager, Registry, RegistryKeyId, RegistryValueType, SERVICES_PATH};
 
 const HBIN_BASE: usize = 0x1000;
 
@@ -165,6 +166,15 @@ impl<'a> RegfHive<'a> {
 
     /// Iterate the immediate subkeys of `nk` as `(folded_name, nk_offset)`.
     pub fn subkeys(&self, nk: KeyRef) -> Vec<(String, KeyRef)> {
+        self.subkeys_named(nk, false)
+    }
+
+    /// Iterate the immediate subkeys of `nk` as `(original_case_name, nk_offset)`.
+    pub fn subkeys_raw(&self, nk: KeyRef) -> Vec<(String, KeyRef)> {
+        self.subkeys_named(nk, true)
+    }
+
+    fn subkeys_named(&self, nk: KeyRef, raw_names: bool) -> Vec<(String, KeyRef)> {
         let mut out = Vec::new();
         let body = match self.cell_body(nk) {
             Some(b) => b,
@@ -174,13 +184,19 @@ impl<'a> RegfHive<'a> {
             Some(o) if o != 0 && o != u32::MAX => o,
             _ => return out,
         };
-        self.collect_subkeys(list_off, &mut out, 0);
+        self.collect_subkeys(list_off, &mut out, 0, raw_names);
         out
     }
 
     /// Walk a subkey-list cell (lf/lh/li/ri), pushing `(name, nk_off)`. `ri` recurses into its
     /// sub-lists; `depth` guards against a malformed cyclic hive.
-    fn collect_subkeys(&self, list_off: u32, out: &mut Vec<(String, KeyRef)>, depth: u32) {
+    fn collect_subkeys(
+        &self,
+        list_off: u32,
+        out: &mut Vec<(String, KeyRef)>,
+        depth: u32,
+        raw_names: bool,
+    ) {
         if depth > 8 {
             return;
         }
@@ -201,7 +217,12 @@ impl<'a> RegfHive<'a> {
                 // count × (u32 nk_offset, u32 hint), starting @0x04.
                 for i in 0..count {
                     if let Some(off) = u32le(b, 0x04 + i * 8) {
-                        if let Some(name) = self.key_name_folded(off) {
+                        let name = if raw_names {
+                            self.key_name_raw(off)
+                        } else {
+                            self.key_name_folded(off)
+                        };
+                        if let Some(name) = name {
                             out.push((name, off));
                         }
                     }
@@ -211,7 +232,12 @@ impl<'a> RegfHive<'a> {
                 // count × u32 nk_offset.
                 for i in 0..count {
                     if let Some(off) = u32le(b, 0x04 + i * 4) {
-                        if let Some(name) = self.key_name_folded(off) {
+                        let name = if raw_names {
+                            self.key_name_raw(off)
+                        } else {
+                            self.key_name_folded(off)
+                        };
+                        if let Some(name) = name {
                             out.push((name, off));
                         }
                     }
@@ -221,7 +247,7 @@ impl<'a> RegfHive<'a> {
                 // count × u32 offset-to-another-subkey-list.
                 for i in 0..count {
                     if let Some(sub) = u32le(b, 0x04 + i * 4) {
-                        self.collect_subkeys(sub, out, depth + 1);
+                        self.collect_subkeys(sub, out, depth + 1, raw_names);
                     }
                 }
             }
@@ -361,6 +387,41 @@ impl<'a> RegfHive<'a> {
     }
 }
 
+/// Import `ControlSetXXX\Services` from a read-only REGF hive into
+/// `\Registry\Machine\System\CurrentControlSet\Services`.
+pub fn import_control_set_services_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_services_path = String::from(control_set);
+    src_services_path.push_str("\\Services");
+    let Some(src_services) = hive.open_key(&src_services_path) else {
+        return 0;
+    };
+    let dst_services = cm.registry_mut().create_key(SERVICES_PATH);
+    let service_names = hive.subkeys_raw(src_services);
+    let count = service_names.len();
+    for (name, src_service) in service_names {
+        let dst_service = cm.registry_mut().create_subkey(dst_services, &name);
+        import_regf_key(hive, src_service, cm.registry_mut(), dst_service);
+    }
+    count
+}
+
+fn import_regf_key(hive: &RegfHive<'_>, src: KeyRef, dst: &mut Registry, dst_key: RegistryKeyId) {
+    let mut index = 0usize;
+    while let Some((value_name, raw_type, data)) = hive.value_by_index(src, index) {
+        let value_type = RegistryValueType::from_u32(raw_type).unwrap_or(RegistryValueType::Binary);
+        let _ = dst.set_value(dst_key, &value_name, value_type, data);
+        index += 1;
+    }
+    for (child_name, src_child) in hive.subkeys_raw(src) {
+        let dst_child = dst.create_subkey(dst_key, &child_name);
+        import_regf_key(hive, src_child, dst, dst_child);
+    }
+}
+
 /// Fold a path component for case-insensitive comparison.
 fn fold(s: &str) -> String {
     let mut out = String::new();
@@ -395,6 +456,76 @@ mod tests {
         data[body + 0x4c..body + 0x4c + name.len()].copy_from_slice(name);
     }
 
+    fn write_subkey_list(data: &mut [u8], cell: u32, children: &[u32]) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x40i32).to_le_bytes());
+        let body = offset + 4;
+        data[body..body + 2].copy_from_slice(b"lf");
+        write_u16(data, body + 0x02, children.len() as u16);
+        for (i, child) in children.iter().enumerate() {
+            write_u32(data, body + 0x04 + i * 8, *child);
+        }
+    }
+
+    fn set_nk_subkeys(data: &mut [u8], cell: u32, list: u32) {
+        let body = HBIN_BASE + cell as usize + 4;
+        write_u32(data, body + 0x1c, list);
+    }
+
+    fn set_nk_values(data: &mut [u8], cell: u32, list: u32, count: usize) {
+        let body = HBIN_BASE + cell as usize + 4;
+        write_u32(data, body + 0x24, count as u32);
+        write_u32(data, body + 0x28, list);
+    }
+
+    fn write_value_list(data: &mut [u8], cell: u32, values: &[u32]) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x40i32).to_le_bytes());
+        let body = offset + 4;
+        for (i, value) in values.iter().enumerate() {
+            write_u32(data, body + i * 4, *value);
+        }
+    }
+
+    fn write_data_cell(data: &mut [u8], cell: u32, bytes: &[u8]) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
+        data[offset + 4..offset + 4 + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn write_vk_data(data: &mut [u8], cell: u32, name: &[u8], value_type: u32, data_cell: u32) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
+        let body = offset + 4;
+        data[body..body + 2].copy_from_slice(b"vk");
+        write_u16(data, body + 0x02, name.len() as u16);
+        data[body + 0x14..body + 0x14 + name.len()].copy_from_slice(name);
+        write_u32(data, body + 0x08, data_cell);
+        write_u32(data, body + 0x0c, value_type);
+        write_u16(data, body + 0x10, 1); // compressed ASCII value name
+    }
+
+    fn write_vk_inline_dword(data: &mut [u8], cell: u32, name: &[u8], value: u32) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
+        let body = offset + 4;
+        data[body..body + 2].copy_from_slice(b"vk");
+        write_u16(data, body + 0x02, name.len() as u16);
+        write_u32(data, body + 0x04, 0x8000_0004);
+        write_u32(data, body + 0x08, value);
+        write_u32(data, body + 0x0c, RegistryValueType::Dword as u32);
+        write_u16(data, body + 0x10, 1); // compressed ASCII value name
+        data[body + 0x14..body + 0x14 + name.len()].copy_from_slice(name);
+    }
+
+    fn utf16le_sz(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for unit in s.encode_utf16().chain(core::iter::once(0)) {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
     fn path_test_hive() -> Vec<u8> {
         const ROOT: u32 = 0x20;
         const CHILD: u32 = 0xa0;
@@ -405,6 +536,88 @@ mod tests {
         write_nk(&mut data, ROOT, u32::MAX, b"SYSTEM");
         write_nk(&mut data, CHILD, ROOT, b"ControlSet001");
         write_nk(&mut data, GRANDCHILD, CHILD, b"Control");
+        data
+    }
+
+    fn services_test_hive() -> Vec<u8> {
+        const ROOT: u32 = 0x20;
+        const CONTROL_SET: u32 = 0x100;
+        const SERVICES: u32 = 0x180;
+        const NPFS: u32 = 0x240;
+        const PARAMETERS: u32 = 0x300;
+
+        const ROOT_LIST: u32 = 0x380;
+        const CS_LIST: u32 = 0x3c0;
+        const SERVICES_LIST: u32 = 0x400;
+        const NPFS_LIST: u32 = 0x440;
+
+        const NPFS_VALUE_LIST: u32 = 0x480;
+        const VK_IMAGE: u32 = 0x500;
+        const VK_TYPE: u32 = 0x580;
+        const VK_START: u32 = 0x600;
+        const VK_ERROR: u32 = 0x680;
+        const IMAGE_DATA: u32 = 0x700;
+
+        const PARAM_VALUE_LIST: u32 = 0x780;
+        const VK_ANSWER: u32 = 0x800;
+
+        let mut data = vec![0u8; 0x3000];
+        data[..4].copy_from_slice(b"regf");
+        write_u32(&mut data, 0x24, ROOT);
+
+        write_nk(&mut data, ROOT, u32::MAX, b"SYSTEM");
+        write_nk(&mut data, CONTROL_SET, ROOT, b"ControlSet001");
+        write_nk(&mut data, SERVICES, CONTROL_SET, b"Services");
+        write_nk(&mut data, NPFS, SERVICES, b"Npfs");
+        write_nk(&mut data, PARAMETERS, NPFS, b"Parameters");
+
+        write_subkey_list(&mut data, ROOT_LIST, &[CONTROL_SET]);
+        write_subkey_list(&mut data, CS_LIST, &[SERVICES]);
+        write_subkey_list(&mut data, SERVICES_LIST, &[NPFS]);
+        write_subkey_list(&mut data, NPFS_LIST, &[PARAMETERS]);
+        set_nk_subkeys(&mut data, ROOT, ROOT_LIST);
+        set_nk_subkeys(&mut data, CONTROL_SET, CS_LIST);
+        set_nk_subkeys(&mut data, SERVICES, SERVICES_LIST);
+        set_nk_subkeys(&mut data, NPFS, NPFS_LIST);
+
+        write_value_list(
+            &mut data,
+            NPFS_VALUE_LIST,
+            &[VK_IMAGE, VK_TYPE, VK_START, VK_ERROR],
+        );
+        set_nk_values(&mut data, NPFS, NPFS_VALUE_LIST, 4);
+        let image = utf16le_sz(r"system32\drivers\npfs.sys");
+        write_data_cell(&mut data, IMAGE_DATA, &image);
+        write_vk_data(
+            &mut data,
+            VK_IMAGE,
+            b"ImagePath",
+            RegistryValueType::ExpandSz as u32,
+            IMAGE_DATA,
+        );
+        write_u32(
+            &mut data,
+            HBIN_BASE + VK_IMAGE as usize + 4 + 0x04,
+            image.len() as u32,
+        );
+        write_vk_inline_dword(
+            &mut data,
+            VK_TYPE,
+            b"Type",
+            nt_config_manager::SERVICE_FILE_SYSTEM_DRIVER,
+        );
+        write_vk_inline_dword(
+            &mut data,
+            VK_START,
+            b"Start",
+            nt_config_manager::SERVICE_SYSTEM_START,
+        );
+        write_vk_inline_dword(&mut data, VK_ERROR, b"ErrorControl", 1);
+
+        write_value_list(&mut data, PARAM_VALUE_LIST, &[VK_ANSWER]);
+        set_nk_values(&mut data, PARAMETERS, PARAM_VALUE_LIST, 1);
+        write_vk_inline_dword(&mut data, VK_ANSWER, b"Answer", 42);
+
         data
     }
 
@@ -426,6 +639,52 @@ mod tests {
         write_u32(&mut data, HBIN_BASE + 0xa0 + 4 + 0x10, 0x120);
         let hive = RegfHive::new(&data).expect("valid test hive");
         assert_eq!(hive.key_path(0x120), None);
+    }
+
+    #[test]
+    fn imports_services_into_config_manager() {
+        let data = services_test_hive();
+        let hive = RegfHive::new(&data).expect("valid test hive");
+        let services = hive
+            .open_key(r"ControlSet001\Services")
+            .expect("services key");
+        assert_eq!(
+            hive.subkeys(services)
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("npfs")
+        );
+        assert_eq!(
+            hive.subkeys_raw(services)
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("Npfs")
+        );
+
+        let mut cm = ConfigManager::new();
+        assert_eq!(
+            import_control_set_services_into_config_manager(&hive, &mut cm, "ControlSet001"),
+            1
+        );
+        let svc = cm.service_metadata("npfs").expect("imported service");
+        assert_eq!(svc.name, "Npfs");
+        assert_eq!(
+            svc.image_path.as_deref(),
+            Some(r"system32\drivers\npfs.sys")
+        );
+        assert_eq!(
+            svc.driver_service_class(),
+            Some(nt_config_manager::DriverServiceClass::FileSystem)
+        );
+        let drivers = cm.boot_system_driver_candidates();
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0].name, "Npfs");
+
+        let answer = cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
+            .and_then(|key| cm.registry().query_dword(key, "Answer"));
+        assert_eq!(answer, Some(42));
     }
 
     #[test]
