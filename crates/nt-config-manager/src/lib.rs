@@ -30,6 +30,8 @@ pub const SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Ser
 pub const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 pub const DEVICE_CLASSES_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\DeviceClasses";
+pub const SERVICE_GROUP_ORDER_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder";
 
 pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
 pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
@@ -339,15 +341,28 @@ impl ConfigManager {
 
     /// Registry-declared drivers eligible for kernel boot/system driver bring-up.
     pub fn boot_system_driver_candidates(&self) -> Vec<ServiceMetadata> {
-        self.service_candidates_by_start_and_type(
+        let mut out = self.service_candidates_by_start_and_type(
             &[SERVICE_BOOT_START, SERVICE_SYSTEM_START],
             SERVICE_DRIVER_TYPE_MASK,
-        )
+        );
+        let group_order = self.service_group_order();
+        sort_service_metadata_with_group_order(&mut out, &group_order);
+        out
     }
 
     /// Registry-declared Win32 services that SCM should auto-start after it owns policy.
     pub fn auto_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_AUTO_START], SERVICE_WIN32_TYPE_MASK)
+    }
+
+    /// The `Control\ServiceGroupOrder\List` load-order group sequence.
+    pub fn service_group_order(&self) -> Vec<String> {
+        let Some(key) = self.registry.open_key(SERVICE_GROUP_ORDER_PATH) else {
+            return Vec::new();
+        };
+        self.registry
+            .query_multi_string(key, "List")
+            .unwrap_or_default()
     }
 
     fn service_metadata_from_key(&self, name: &str, service_key: RegistryKeyId) -> ServiceMetadata {
@@ -621,6 +636,39 @@ fn sort_service_metadata(services: &mut [ServiceMetadata]) {
     });
 }
 
+fn sort_service_metadata_with_group_order(
+    services: &mut [ServiceMetadata],
+    group_order: &[String],
+) {
+    services.sort_by(|a, b| {
+        a.start_type
+            .cmp(&b.start_type)
+            .then_with(|| {
+                group_order_rank(a.load_order_group.as_deref(), group_order).cmp(&group_order_rank(
+                    b.load_order_group.as_deref(),
+                    group_order,
+                ))
+            })
+            .then_with(|| a.load_order_group.cmp(&b.load_order_group))
+            .then_with(|| a.tag.cmp(&b.tag))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+    });
+}
+
+fn group_order_rank(group: Option<&str>, group_order: &[String]) -> usize {
+    group
+        .and_then(|group| {
+            group_order
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(group))
+        })
+        .unwrap_or(group_order.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +851,98 @@ mod tests {
         );
         assert_eq!(all_auto.len(), 1);
         assert_eq!(all_auto[0].name, "RpcSs");
+    }
+
+    #[test]
+    fn boot_system_driver_candidates_follow_service_group_order() {
+        fn set_group_tag(cm: &mut ConfigManager, service: &str, group: Option<&str>, tag: u32) {
+            let key = cm.service_metadata(service).unwrap().service_key;
+            if let Some(group) = group {
+                cm.registry_mut().set_string(key, "Group", group);
+            }
+            cm.registry_mut().set_dword(key, "Tag", tag);
+        }
+
+        let mut cm = ConfigManager::new();
+        let group_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+        cm.registry_mut().set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["FSFilter Infrastructure", "File System"]),
+        );
+        cm.register_typed_service(
+            "FileSystemDriver",
+            r"system32\drivers\fs.sys",
+            SERVICE_FILE_SYSTEM_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        set_group_tag(&mut cm, "FileSystemDriver", Some("File System"), 1);
+        cm.register_typed_service(
+            "FilterAlpha",
+            r"system32\drivers\filter-a.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        set_group_tag(&mut cm, "FilterAlpha", Some("FSFilter Infrastructure"), 20);
+        cm.register_typed_service(
+            "FilterBeta",
+            r"system32\drivers\filter-b.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        set_group_tag(&mut cm, "FilterBeta", Some("FSFilter Infrastructure"), 10);
+        cm.register_typed_service(
+            "UnknownGroup",
+            r"system32\drivers\unknown.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        set_group_tag(&mut cm, "UnknownGroup", Some("Unknown"), 0);
+        cm.register_typed_service(
+            "BootDevice",
+            r"system32\drivers\boot.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+
+        assert_eq!(
+            cm.service_group_order(),
+            alloc::vec![
+                String::from("FSFilter Infrastructure"),
+                String::from("File System")
+            ]
+        );
+        let names: Vec<String> = cm
+            .boot_system_driver_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(
+            names,
+            alloc::vec![
+                String::from("BootDevice"),
+                String::from("FilterBeta"),
+                String::from("FilterAlpha"),
+                String::from("FileSystemDriver"),
+                String::from("UnknownGroup")
+            ]
+        );
     }
 
     #[test]

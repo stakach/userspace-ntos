@@ -49,7 +49,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 - `[ ]` B1: Unify `NtLoadDriver`/`NtUnloadDriver`, SCM driver start/stop, and boot/system driver
   launch on one service-key to driver-object path.
-- `[ ]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
+- `[~]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
 - `[ ]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
   drivers create device objects/interfaces through I/O Manager mechanisms.
@@ -136,3 +136,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and `cargo test -p nt-config-server`. Review adjustment: the executive still has to pass imported
   boot hive state into the isolated CM service, or retire the parallel executive-local registry read
   path behind that service.
+- B2 started. `nt-config-manager` now reads `Control\ServiceGroupOrder\List` and orders boot/system
+  driver candidates by `Start`, service group order, `Tag`, and name. Validation:
+  `cargo test -p nt-config-manager`. Review adjustment: the executive still needs to consume this
+  full ordered candidate list for boot/system driver bring-up rather than explicitly asking for
+  NPFS as a proof-only service.
