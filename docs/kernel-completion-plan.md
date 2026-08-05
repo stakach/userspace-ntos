@@ -80,8 +80,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue B3 by carrying selected `Enum` devnode descriptors/resources into hosted device-driver
-   Start/AddDevice, then retire production callers of the legacy MMIO fixture helper.
+1. Continue B3 by carrying selected `Enum` devnode descriptors/resources from the executive boot
+   plan into hosted device-driver Start/AddDevice.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -230,3 +230,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: the next B3 slice should carry the selected devnode descriptors/resources into
   hosted device-driver start/AddDevice, then retire production uses of the legacy MMIO fixture helper.
+- B3 continued. Production hosted-driver proofs no longer call fixture devnode constructors:
+  `driver-host-power`, `driver-host-dma`, and `driver-host-direg` all create service-bound PnP
+  devnodes with explicit resources or `NO_RESOURCES`, and the public `nt-pnp-manager` fixture
+  constructors were removed. Validation: `cargo test -p nt-pnp-manager`,
+  `cargo check --manifest-path components/driver-host-power/Cargo.toml --target x86_64-unknown-none`,
+  `cargo check --manifest-path components/driver-host-dma/Cargo.toml --target x86_64-unknown-none`,
+  and `cargo check --manifest-path components/driver-host-direg/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3's remaining integration work is executive-owned AddDevice/StartDevice for
+  registry-selected devnodes, not local component fixture cleanup.

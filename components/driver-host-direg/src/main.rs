@@ -36,7 +36,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use nt_config_manager::DevPropKey;
 use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
-use nt_pnp_manager::PnpManager;
+use nt_pnp_manager::{PnpManager, NO_RESOURCES};
 use nt_root_bus::{BusQueryId, RootBus};
 use nt_wdf_object::WdfHandle;
 use nt_wdf_request::RequestBuffers;
@@ -472,7 +472,12 @@ unsafe fn run() {
     );
 
     // --- Enumerate: the root bus creates the PDO + answers the bus queries ---------
-    let devnode_pnp = pnp().create_devnode(PDO_OBJECT_ID);
+    let devnode_pnp = pnp().create_service_bound_devnode(
+        DEVNODE_INSTANCE,
+        Some(SERVICE_NAME),
+        PDO_OBJECT_ID,
+        NO_RESOURCES,
+    );
     root_bus().create_pdo(
         PDO_OBJECT_ID,
         DEVICE_ID,

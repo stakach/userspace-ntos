@@ -21,8 +21,7 @@ MMIO + connects the interrupt; `IRP_MN_REMOVE_DEVICE` disconnects/unmaps/detache
 - `PnpManager`: a service-bound devnode table; no driver pointers, only instance/service
   identity, PDO/FDO/driver IDs, and resource values. `create_service_bound_devnode`
   accepts the Configuration Manager-selected `Enum\<InstanceId>` + `Service` binding
-  and starts the lifecycle in state `Enumerated`. `create_mmio_fixture_devnode` remains
-  only as a compatibility helper for older hosted proofs.
+  and starts the lifecycle in state `Enumerated`.
 - `can_transition(from, to)` encodes the §8.2 state machine; `transition` validates
   it (invalid → `InvalidTransition`) and rejects a `Removed` devnode (`StaleId`). No
   `START` before AddDevice; no duplicate `START` without a Stop; `Failed` from any
@@ -30,8 +29,8 @@ MMIO + connects the interrupt; `IRP_MN_REMOVE_DEVICE` disconnects/unmaps/detache
 - `mapping_allowed(id)` is true only in `Started` (spec §15.2 resource gating);
   `is_live` false after `Removed`. `instance_id`/`service`/`devnodes_for_service`,
   `set_fdo`/`set_driver`/`resources`/`pdo`/`fdo` accessors. 7 unit tests cover
-  fixture compatibility, service-bound identity, no-resource devnodes, lifecycle,
-  invalid transitions, duplicate start rejection, and stale removed IDs.
+  service-bound resource identity, no-resource devnodes, lifecycle, invalid transitions,
+  duplicate start rejection, and stale removed IDs.
 
 ## Full lifecycle in QEMU (implemented, Milestones 12.4-12.8 — `driver-host-pnp`)
 

@@ -36,8 +36,9 @@ pub const NO_RESOURCES: ResourceAssignment = ResourceAssignment {
     int_latched: false,
 };
 
-/// The legacy MMIO interrupt fixture resources used by older hosted-driver proofs.
-pub const MMIO_INTERRUPT_TEST_RESOURCES: ResourceAssignment = ResourceAssignment {
+/// The MMIO interrupt resource shape used by unit tests.
+#[cfg(test)]
+const MMIO_INTERRUPT_TEST_RESOURCES: ResourceAssignment = ResourceAssignment {
     mem_start: 0x1000_0000,
     mem_length: 0x1000,
     int_vector: 5,
@@ -170,19 +171,6 @@ impl PnpManager {
         self.create_service_bound_devnode(instance_id, service, pdo_object_id, NO_RESOURCES)
     }
 
-    /// Enumerate the `MmioInterruptTest` fixture device (spec §9): create a devnode
-    /// in state `Enumerated` with the fixture's memory (`0x1000_0000`) + interrupt
-    /// (vector 5) resources. Returns its devnode ID.
-    pub fn create_mmio_fixture_devnode(&mut self, pdo_object_id: u64) -> u64 {
-        self.push_devnode(None, None, pdo_object_id, MMIO_INTERRUPT_TEST_RESOURCES)
-    }
-
-    /// Enumerate a devnode with no assigned resources (a device whose function driver needs no
-    /// hardware — e.g. a registry/interface KMDF device). Created in state `Enumerated`.
-    pub fn create_devnode(&mut self, pdo_object_id: u64) -> u64 {
-        self.push_devnode(None, None, pdo_object_id, NO_RESOURCES)
-    }
-
     pub fn state(&self, id: u64) -> Option<DeviceState> {
         self.find(id).map(|d| d.state)
     }
@@ -263,14 +251,23 @@ mod tests {
     use alloc::vec;
     use DeviceState::*;
 
+    fn create_mmio_test_devnode(p: &mut PnpManager, pdo_object_id: u64) -> u64 {
+        p.create_service_bound_devnode(
+            r"ROOT\MMIO_INTERRUPT_TEST\0000",
+            Some("MmioInterruptTest"),
+            pdo_object_id,
+            MMIO_INTERRUPT_TEST_RESOURCES,
+        )
+    }
+
     #[test]
-    fn fixture_creates_enumerated_devnode_with_resources() {
+    fn service_bound_mmio_devnode_is_enumerated_with_resources() {
         let mut p = PnpManager::new();
-        let id = p.create_mmio_fixture_devnode(0xBD0);
+        let id = create_mmio_test_devnode(&mut p, 0xBD0);
         assert_eq!(p.state(id), Some(Enumerated));
         assert_eq!(p.pdo(id), Some(0xBD0));
-        assert_eq!(p.instance_id(id), None);
-        assert_eq!(p.service(id), None);
+        assert_eq!(p.instance_id(id), Some(r"ROOT\MMIO_INTERRUPT_TEST\0000"));
+        assert_eq!(p.service(id), Some("MmioInterruptTest"));
         let r = p.resources(id).unwrap();
         assert_eq!(r.mem_start, 0x1000_0000);
         assert_eq!(r.int_vector, 5);
@@ -326,7 +323,7 @@ mod tests {
     #[test]
     fn full_start_lifecycle() {
         let mut p = PnpManager::new();
-        let id = p.create_mmio_fixture_devnode(0);
+        let id = create_mmio_test_devnode(&mut p, 0);
         for s in [
             DriverLoaded,
             AddDeviceCalled,
@@ -344,7 +341,7 @@ mod tests {
     #[test]
     fn invalid_transitions_rejected() {
         let mut p = PnpManager::new();
-        let id = p.create_mmio_fixture_devnode(0);
+        let id = create_mmio_test_devnode(&mut p, 0);
         // No START before AddDevice.
         assert_eq!(
             p.transition(id, StartIrpSent),
@@ -356,7 +353,7 @@ mod tests {
     #[test]
     fn no_duplicate_start() {
         let mut p = PnpManager::new();
-        let id = p.create_mmio_fixture_devnode(0);
+        let id = create_mmio_test_devnode(&mut p, 0);
         for s in [
             DriverLoaded,
             AddDeviceCalled,
@@ -377,7 +374,7 @@ mod tests {
     #[test]
     fn remove_then_stale() {
         let mut p = PnpManager::new();
-        let id = p.create_mmio_fixture_devnode(0);
+        let id = create_mmio_test_devnode(&mut p, 0);
         for s in [
             DriverLoaded,
             AddDeviceCalled,

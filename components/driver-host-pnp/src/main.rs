@@ -77,7 +77,7 @@ const KMDF_CFG_CHECK_RVA: u64 = 0x3060;
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
-// --- the primary fixture devnode this host actually binds (its driver is in the store) ----
+// --- the primary root-enumerated devnode this host actually binds (its driver is in the store) ---
 const SERVICE_NAME: &str = "PnpMmioInterruptTest";
 const DEVICE_ID: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO";
 const COMPATIBLE_ID: &str = r"ROOT\USERSPACE_NTOS_TEST_DEVICE";
@@ -98,7 +98,7 @@ const fn mmio_resources(mem_start: u64, vector: u32) -> ResourceAssignment {
     }
 }
 
-/// A root-enumerated fixture devnode (a child of the synthetic ROOT bus).
+/// A root-enumerated devnode (a child of the synthetic ROOT bus).
 struct Fixture {
     instance_path: &'static str,
     service: &'static str,

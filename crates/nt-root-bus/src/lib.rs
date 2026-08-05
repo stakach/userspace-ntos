@@ -1,9 +1,9 @@
 //! # `nt-root-bus` — the synthetic root/PDO bus
 //!
 //! In v0.1 the enumerator for the userspace-ntos device tree is a native Rust component, not a
-//! loaded `.sys` bus driver. For each fixture devnode the root bus creates a **physical device
-//! object** (PDO) and answers the bus queries the PnP Manager issues before a function driver is
-//! bound: `IRP_MN_QUERY_ID` (the device / hardware / compatible / instance IDs) and
+//! loaded `.sys` bus driver. For each root-enumerated devnode the root bus creates a **physical
+//! device object** (PDO) and answers the bus queries the PnP Manager issues before a function driver
+//! is bound: `IRP_MN_QUERY_ID` (the device / hardware / compatible / instance IDs) and
 //! `IRP_MN_QUERY_CAPABILITIES` (a `DEVICE_CAPABILITIES` block).
 //!
 //! IDs are returned as the wide (UTF-16) buffers a PnP `QUERY_ID` produces: a single

@@ -31,7 +31,7 @@ use nt_dma_manager::{DmaManager, DmaOwner};
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
 use nt_mdl::MdlRegistry;
 use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
-use nt_pnp_manager::PnpManager;
+use nt_pnp_manager::{PnpManager, ResourceAssignment};
 use nt_power_manager::PowerManager;
 use nt_power_types::{
     DevicePowerState, IRP_MJ_POWER, IRP_MN_QUERY_POWER, IRP_MN_SET_POWER, PARAM_POWER_STATE_OFFSET,
@@ -50,9 +50,19 @@ const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
 const DRIVER_HOST_ID: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
+const SERVICE_NAME: &str = "DmaPnpPowerTest";
+const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_DMA\0001";
 const INT_VECTOR: u32 = 5;
 const INT_RESOURCE_ID: u64 = 200;
 const MEM_RESOURCE_ID: u64 = 100;
+const DEVNODE_RESOURCES: ResourceAssignment = ResourceAssignment {
+    mem_start: 0x1000_0000,
+    mem_length: 0x1000,
+    int_vector: INT_VECTOR,
+    int_level: INT_VECTOR,
+    int_affinity: 1,
+    int_latched: false,
+};
 
 // DmaPnpPowerTest.sys register bank + commands (§14.2/§14.3).
 const DMA_REG_STATUS: u64 = 0x08;
@@ -1069,10 +1079,15 @@ unsafe fn run() {
     check(b"add_device_present", add_device != 0);
     check(b"pnp_dispatch_present", pnp_dispatch != 0);
 
-    // --- PnP Manager: enumerate the fixture devnode + create the PDO ---------
+    // --- PnP Manager: enumerate the service-bound devnode + create the PDO ---------
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3); // Type = IO_TYPE_DEVICE
-    let devnode = pnp().create_mmio_fixture_devnode(pdo);
+    let devnode = pnp().create_service_bound_devnode(
+        INSTANCE_PATH,
+        Some(SERVICE_NAME),
+        pdo,
+        DEVNODE_RESOURCES,
+    );
     let _ = pnp().transition(devnode, DeviceState::DriverLoaded);
 
     // AddDevice(DriverObject, PDO) → driver creates the FDO + attaches.
@@ -1107,7 +1122,14 @@ unsafe fn run() {
         nt_hal_abi::MM_NON_CACHED,
         nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
     );
-    rm().assign_interrupt(owner(), INT_RESOURCE_ID, INT_VECTOR, 5, 1, 0);
+    rm().assign_interrupt(
+        owner(),
+        INT_RESOURCE_ID,
+        res.int_vector,
+        res.int_level as u8,
+        res.int_affinity as u32,
+        0,
+    );
     let _ = pnp().transition(devnode, DeviceState::ResourcesAssigned);
     sim(); // ensure sim exists; ID register seeded on creation
     core::ptr::write_volatile(sim().mmio_ptr() as *mut u32, DMA_ID_VALUE); // seed ID reg "DMA1"
