@@ -118,6 +118,22 @@ impl MutantStore {
         Ok(previous)
     }
 
+    pub fn abandon_thread(&mut self, thread: u64) -> usize {
+        if thread == 0 {
+            return 0;
+        }
+        let mut abandoned = 0usize;
+        for mutant in &mut self.mutants {
+            if mutant.owner_thread == thread {
+                mutant.owner_thread = 0;
+                mutant.recursion = 0;
+                mutant.abandoned = true;
+                abandoned += 1;
+            }
+        }
+        abandoned
+    }
+
     pub fn remove(&mut self, identity: u64) -> bool {
         let Some(index) = self
             .mutants
@@ -163,6 +179,19 @@ mod tests {
         assert!(!store.ready_for(9, 22));
         assert_eq!(store.release(9, 21), Ok(0));
         assert!(store.ready_for(9, 22));
+    }
+
+    #[test]
+    fn abandoning_owner_thread_signals_all_owned_mutants() {
+        let mut store = MutantStore::new();
+        store.initialize(10, Some(44));
+        store.initialize(11, Some(44));
+        store.initialize(12, Some(45));
+        assert_eq!(store.abandon_thread(44), 2);
+        assert!(store.ready_for(10, 46));
+        assert!(store.ready_for(11, 46));
+        assert!(!store.ready_for(12, 46));
+        assert_eq!(store.abandon_thread(44), 0);
     }
 
     #[test]

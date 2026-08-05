@@ -1938,3 +1938,34 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   presentation ownership. The next functional debt is reply-cap/wait parking pressure plus the
   nested user-callback/dead-client transport drain and DBGK selftest failures; shell paint no longer
   needs a modeled framebuffer path.
+- G3/C cleanup continued. Removed the old service-level fake mutant ladder and immediate wait
+  fallback: `NtCreateMutant`, `NtOpenMutant`, and `NtReleaseMutant` now route through the native
+  service table, mutants participate in dispatcher waits, wrong-owner release returns
+  `STATUS_MUTANT_NOT_OWNED`, and thread termination abandons owned mutants before wake dispatch.
+  Also widened the inline object namespace for long `BaseNamedObjects` names and added session/BNO
+  symlink resolution so CSR/userenv object paths resolve dynamically instead of by compatibility
+  identity. CSR shared heap/static pages are now registered with the client XAS mirror and the
+  returned `PORT_VIEW`/`CSR_API_CONNECTINFO` are written through the current process address-space
+  path. The shell-paint proof was tightened by deleting trace-only explorer counters and requiring a
+  real GDI batch flush for `exec_explorer_shell_chrome_painted`.
+- G3 validation follow-up. Graphical run
+  `desktop-render-r99-overlay-scratch-20260805-221743` showed the user-profile source was present
+  but the boot stopped in `userenv` profile load: `::Profiles` materialised with 45 directories, 32
+  files, and a 139264 byte regf `Default User\ntuser.dat`, then winlogon faulted after
+  `NtCreateFile` on the writable profile path. Root cause was the lazy writable-volume mount being
+  reached from a non-mutating probe after the dirty marking was narrowed; the service loop reset the
+  bump heap while the mounted `FileSystem` and materialised profile tree still owned allocations
+  above the mark. The fix is a one-shot mount/materialisation dirty bit consumed by the existing
+  writable-filesystem heap pin, while attribute/read/query buffers remain transient and overlay
+  writes use a fixed 64 KiB scratch buffer.
+- G3 validation complete. Graphical run `desktop-render-r100-mount-dirty-20260805-222253` passed to
+  the microtest sentinel with `283/285` executive checks and a real desktop screenshot at
+  `.tmp/desktop-render-r100-mount-dirty-20260805-222253.png` showing the taskbar and clock. Evidence:
+  `C:\Profiles` collision was honest, `C:\Profiles\Administrator` and copied subdirectories/files
+  were created, `Administrator\ntuser.dat` was copied byte-exact from `Default User\ntuser.dat`,
+  `NtLoadKey` mounted the copied 139264 byte hive twice with five root subkeys, `userinit.exe` and
+  `explorer.exe` launched dynamically, `KeGdiFlushUserBatch` had 251 flushes and zero failures, and
+  explorer shell chrome produced 27375 non-background framebuffer pixels over `0,384..1023,767`.
+  The remaining red gates are the existing `exec_user_callback_dead_client_unwind` and
+  `exec_win32k_transport_call_nested` harness drains; profile load, userinit, explorer, and visible
+  shell chrome are back on the genuine path.

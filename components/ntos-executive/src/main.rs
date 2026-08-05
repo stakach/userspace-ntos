@@ -3978,12 +3978,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         win32k_glue::explorer_user_callback_proofs();
     let begin_paints = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
     let end_paints = EXPLORER_END_PAINTS.load(Ordering::Relaxed);
-    let message_calls = EXPLORER_MESSAGE_CALLS.load(Ordering::Relaxed);
-    let update_calls = EXPLORER_UPDATE_REGION_CALLS.load(Ordering::Relaxed);
-    let direct_draws = EXPLORER_DIRECT_GDI_DRAW_CALLS.load(Ordering::Relaxed);
     let direct_draw_returns = EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed);
-    let ext_text_outs = EXPLORER_EXT_TEXT_OUTS.load(Ordering::Relaxed);
-    let gdi_objects = EXPLORER_GDI_OBJECT_CALLS.load(Ordering::Relaxed);
     let gdi_batch_flushes = EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
     let gdi_batch_records = EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed);
     let gdi_batch_max_offset = EXPLORER_GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
@@ -4054,18 +4049,8 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_u64(begin_paints);
     print_str(b"/");
     print_u64(end_paints);
-    print_str(b" message-call=");
-    print_u64(message_calls);
-    print_str(b" update-region=");
-    print_u64(update_calls);
-    print_str(b" direct-gdi/returns=");
-    print_u64(direct_draws);
-    print_str(b"/");
+    print_str(b" direct-gdi-returns=");
     print_u64(direct_draw_returns);
-    print_str(b" ext-text-out=");
-    print_u64(ext_text_outs);
-    print_str(b" gdi-objects=");
-    print_u64(gdi_objects);
     print_str(b" batch-flush/records=");
     print_u64(gdi_batch_flushes);
     print_str(b"/");
@@ -4141,6 +4126,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
             && begin_paints >= 1
             && end_paints >= begin_paints
             && direct_draw_returns >= 1
+            && gdi_batch_flushes >= 1
             && gdi_batch_records >= 1
             && fb_readback.available
             && fb_readback.height >= 16
@@ -7381,12 +7367,7 @@ pub(crate) static GDI_BATCH_TEB_TAIL_WRITE_WINDOWS: AtomicU64 = AtomicU64::new(0
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_BEGIN_PAINTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_END_PAINTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_MESSAGE_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_UPDATE_REGION_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_DIRECT_GDI_DRAW_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_DIRECT_GDI_DRAW_RETURNS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_EXT_TEXT_OUTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static EXPLORER_GDI_OBJECT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_RECORDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -10398,6 +10379,14 @@ unsafe fn terminate_hosted_thread_mechanism(
     wait_cancel_thread(tid);
     keyed_wait_cancel_thread(tid);
     pipe_io_cancel_thread(tid);
+    let abandoned_mutants = handler.abandon_mutants_for_thread(tid);
+    if abandoned_mutants != 0 {
+        print_str(b"[thread-term] abandoned mutants tid=");
+        print_u64(tid);
+        print_str(b" count=");
+        print_u64(abandoned_mutants);
+        print_str(b"\n");
+    }
     let tcb = match handler.hosted_thread_tcb(tid) {
         Some(tcb) if tcb > 1 => tcb,
         None => return false,
@@ -12166,8 +12155,6 @@ static NT_FLUSH_BUFFERS_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_FLUSH_BUFFERS_FILE_PENDING_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
-static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
 const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
@@ -12193,40 +12180,55 @@ const OBJ_KIND_EVENT: u8 = 2;
 const OBJ_KIND_SEMAPHORE: u8 = 3;
 const OBJ_KIND_MUTANT: u8 = 4;
 const OBJ_KIND_LPC_PORT: u8 = 5;
+const OBJ_NAME_CAP: usize = 128;
+const OBJ_PARENT_ROOT: usize = usize::MAX;
+const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
 
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
 /// allocation, so the backing `Vec` (pre-reserved below the per-syscall heap mark) never
-/// reallocates and survives the bump-heap reset. `target` is link-only data; `payload` carries
-/// backing object identity for kinds whose state lives outside the namespace, such as LPC listen
-/// port handles.
+/// reallocates and survives the bump-heap reset. NT object leaf names are allowed to be long enough
+/// for BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data;
+/// `payload` carries backing object identity for kinds whose state lives outside the namespace, such
+/// as LPC listen port handles.
 #[derive(Clone, Copy)]
 struct ObjEntry {
-    name: [u8; 40], // leaf name, lowercased ASCII (len in name_len)
+    name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
-    parent: u8, // index of the parent directory; 0xFF = the root itself
+    parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
     kind: u8,
-    target: [u8; 40], // symbolic-link target (kind == 1)
+    target: [u8; OBJ_NAME_CAP], // symbolic-link target (kind == 1)
     target_len: u8,
     payload: u64,
 }
 impl ObjEntry {
-    fn dir(name: &[u8], parent: u8) -> Self {
+    fn dir(name: &[u8], parent: usize) -> Self {
         let mut e = ObjEntry {
-            name: [0; 40],
+            name: [0; OBJ_NAME_CAP],
             name_len: 0,
             parent,
             kind: OBJ_KIND_DIRECTORY,
-            target: [0; 40],
+            target: [0; OBJ_NAME_CAP],
             target_len: 0,
             payload: 0,
         };
-        let n = name.len().min(40);
+        let n = name.len().min(OBJ_NAME_CAP);
         e.name[..n].copy_from_slice(&name[..n]);
         e.name_len = n as u8;
         e
     }
+    fn symlink(name: &[u8], parent: usize, target: &[u8]) -> Self {
+        let mut e = ObjEntry::dir(name, parent);
+        e.kind = OBJ_KIND_SYMBOLIC_LINK;
+        let n = target.len().min(OBJ_NAME_CAP);
+        e.target[..n].copy_from_slice(&target[..n]);
+        e.target_len = n as u8;
+        e
+    }
     fn name(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
+    }
+    fn target(&self) -> &[u8] {
+        &self.target[..self.target_len as usize]
     }
 }
 
@@ -13363,10 +13365,9 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtReleaseSemaphore,
                 SSN_NT_RELEASE_SEMAPHORE as u32,
             ),
-            // Keep create/release on the legacy immediate-sync ladder for now: the boot path still
-            // depends on its fake-handle timing. NtOpenMutant is routed so explorer no longer parks
-            // on SSN 126 while full owner-aware mutant waits are staged behind crate tests.
+            (NativeService::NtCreateMutant, SSN_NT_CREATE_MUTANT as u32),
             (NativeService::NtOpenMutant, SSN_NT_OPEN_MUTANT as u32),
+            (NativeService::NtReleaseMutant, SSN_NT_RELEASE_MUTANT as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
             (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),
             (

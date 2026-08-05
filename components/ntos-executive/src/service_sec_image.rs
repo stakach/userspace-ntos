@@ -11,7 +11,6 @@ static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
-static EXPLORER_PAINT_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_PARKED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_WOKEN: AtomicU64 = AtomicU64::new(0);
@@ -72,28 +71,18 @@ const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
 const NTGDI_BIT_BLT_SSN: u64 = 0x1008;
-const NTUSER_INVALIDATE_RECT_SSN: u64 = 0x1004;
-const NTUSER_REDRAW_WINDOW_SSN: u64 = 0x1012;
 const NTUSER_BEGIN_PAINT_SSN: u64 = 0x1016;
 const NTUSER_END_PAINT_SSN: u64 = 0x1018;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
-const NTUSER_EXCLUDE_UPDATE_RGN_SSN: u64 = 0x104f;
-const NTUSER_GET_UPDATE_RECT_SSN: u64 = 0x1053;
 const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
 const NTGDI_STRETCH_BLT_SSN: u64 = 0x1030;
 const NTGDI_LINE_TO_SSN: u64 = 0x1040;
-const NTGDI_CREATE_COMPATIBLE_BITMAP_SSN: u64 = 0x104a;
-const NTGDI_CREATE_COMPATIBLE_DC_SSN: u64 = 0x1054;
 const NTGDI_PAT_BLT_SSN: u64 = 0x1059;
-const NTGDI_CREATE_BITMAP_SSN: u64 = 0x106c;
 const NTGDI_POLY_PAT_BLT_SSN: u64 = 0x106f;
 const NTGDI_ALPHA_BLEND_SSN: u64 = 0x107d;
 const NTGDI_STRETCH_DIBITS_INTERNAL_SSN: u64 = 0x1082;
 const NTUSER_FILL_WINDOW_SSN: u64 = 0x108a;
-const NTUSER_GET_UPDATE_RGN_SSN: u64 = 0x1087;
 const NTGDI_RECTANGLE_SSN: u64 = 0x1091;
-const NTGDI_CREATE_DIB_SECTION_SSN: u64 = 0x109b;
-const NTGDI_CREATE_DIBITMAP_INTERNAL_SSN: u64 = 0x10a0;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
 const ETO_PDY: u64 = 0x02000;
@@ -6176,41 +6165,6 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex_u64(resume_ip);
                         print_str(b"\n");
                     }
-                    if matches!(
-                        m0,
-                        0x1004
-                            | 0x1007
-                            | 0x1016
-                            | 0x1018
-                            | 0x1035
-                            | 0x1042
-                            | 0x104a
-                            | 0x1054
-                            | 0x1059
-                            | 0x106c
-                            | 0x10de
-                    ) {
-                        let n = EXPLORER_PAINT_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
-                        if n < 128 {
-                            print_str(b"[explorer-paint-ssn] #");
-                            print_u64(n);
-                            print_str(b" badge=");
-                            print_u64(badge);
-                            print_str(b" tid=");
-                            print_u64(current_tid);
-                            print_str(b" handler-tid=");
-                            print_u64(nt_handler.current_tid);
-                            print_str(b" ssn=0x");
-                            print_hex_u64(m0);
-                            print_str(b" depth=");
-                            print_u64(active_depth as u64);
-                            print_str(b"/");
-                            print_u64(continuation_depth as u64);
-                            print_str(b" sp=0x");
-                            print_hex_u64(sp);
-                            print_str(b"\n");
-                        }
-                    }
                 }
             }
             if syscall_is_explorer && m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE {
@@ -6990,7 +6944,7 @@ pub(crate) unsafe fn service_sec_image(
                 // reset. Exactly the `overlay_dirty` contract, for the file system instead of the
                 // registry; bounded (the profile tree is a handful of nodes) and only on the
                 // iterations that actually touched the volume.
-                if nt_handler.writable_fs_dirty {
+                if nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty() {
                     nt_handler.writable_fs_dirty = false;
                     heap_mark = allocator::mark();
                 }
@@ -7540,27 +7494,6 @@ pub(crate) unsafe fn service_sec_image(
                 // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
                 // our diagnostic path.)
                 result = 0; // STATUS_SUCCESS
-            } else if m0 == 45 {
-                // NtCreateMutant(MutantHandle=R10, DesiredAccess=RDX, ObjectAttributes=R8,
-                // InitialOwner=R9). rpcrt4's ncacn_np server init (StartRpcServer) creates sync
-                // mutants. Mint a fake handle so the caller can later wait/release it; no real mutant
-                // is modeled (the wait/release paths below are no-ops). Additive.
-                let out = get_recv_mr(9); // R10 = *MutantHandle
-                if out != 0 {
-                    let value = FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed);
-                    let _ = client_write_u64_mapped(
-                        pi as u64,
-                        out,
-                        value,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
-                }
-                result = 0;
-            } else if m0 == 196 {
-                // NtReleaseMutant(196) — legacy modeled object.
-                result = 0;
             } else if m0 == 280 && badge != 0 {
                 // ★ NtWaitForMultipleObjects(ObjectCount=R10, HandleArray=RDX, WaitType=R8,
                 // Alertable=R9, *TimeOut=[sp+0x28]) — REAL array-wait with reply-cap parking (Part 1 of
@@ -7631,21 +7564,6 @@ pub(crate) unsafe fn service_sec_image(
                                     all_signalled = false;
                                 }
                                 continue;
-                            }
-                            Err(_) if nt_handler.is_legacy_opaque_handle(h) => {
-                                if trace < 32 {
-                                    print_str(b"[event] wait-item k=");
-                                    print_u64(k as u64);
-                                    print_str(b" h=0x");
-                                    print_hex_u64(h);
-                                    print_str(b" -> legacy\n");
-                                }
-                                // Compatibility sync handles are modeled as permanently signaled.
-                                // Preserve their original array position for WaitAny.
-                                if any_signalled_idx < 0 {
-                                    any_signalled_idx = k as i64;
-                                }
-                                wait_identities[k] = 0x8000_0000_0000_0000 | h;
                             }
                             Err(status) => {
                                 if trace < 32 {
@@ -7834,36 +7752,12 @@ pub(crate) unsafe fn service_sec_image(
                             | nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
                     );
                 if explorer_gui_client {
-                    if explorer_direct_gdi_draw {
-                        EXPLORER_DIRECT_GDI_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
-                        if m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN {
-                            EXPLORER_EXT_TEXT_OUTS.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
                     match m0 {
                         NTUSER_BEGIN_PAINT_SSN => {
                             EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
                         }
                         NTUSER_END_PAINT_SSN => {
                             EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        NTUSER_MESSAGE_CALL_SSN => {
-                            EXPLORER_MESSAGE_CALLS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        NTUSER_INVALIDATE_RECT_SSN
-                        | NTUSER_REDRAW_WINDOW_SSN
-                        | NTUSER_EXCLUDE_UPDATE_RGN_SSN
-                        | NTUSER_GET_UPDATE_RECT_SSN
-                        | NTUSER_GET_UPDATE_RGN_SSN
-                        | NTUSER_FILL_WINDOW_SSN => {
-                            EXPLORER_UPDATE_REGION_CALLS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        NTGDI_CREATE_COMPATIBLE_BITMAP_SSN
-                        | NTGDI_CREATE_COMPATIBLE_DC_SSN
-                        | NTGDI_CREATE_BITMAP_SSN
-                        | NTGDI_CREATE_DIB_SECTION_SSN
-                        | NTGDI_CREATE_DIBITMAP_INTERNAL_SSN => {
-                            EXPLORER_GDI_OBJECT_CALLS.fetch_add(1, Ordering::Relaxed);
                         }
                         _ => {}
                     }

@@ -182,6 +182,7 @@ pub(crate) static PROFILE_SOURCE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// The mounted writable volume. `None` until the first path resolves into it (the volume is
 /// created lazily so a boot that never writes pays nothing).
 static mut EXEC_WRITABLE_FS: Option<nt_fs::FileSystem> = None;
+static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Statistics — every one of these is a REAL operation that went through the `Zw*` surface.
 pub(crate) static OVERLAY_CREATES: AtomicU64 = AtomicU64::new(0);
@@ -278,6 +279,7 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
         if PROVISION_DEFAULT_USER_PROFILE {
             provision_staged_profiles(fs);
         }
+        WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
     }
     slot.as_mut()
 }
@@ -285,6 +287,11 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
 /// Whether the volume has been mounted (i.e. something actually resolved into it).
 pub(crate) unsafe fn writable_fs_mounted() -> bool {
     (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
+}
+
+/// Consume the one-shot dirty bit set by the lazy writable-volume mount/materialisation.
+pub(crate) fn take_mount_dirty() -> bool {
+    WRITABLE_FS_MOUNT_DIRTY.swap(false, Ordering::AcqRel)
 }
 
 /// The volume's own NT path for a canonical volume-relative path. The writable volume is rooted at

@@ -8,6 +8,8 @@ use crate::*;
 use nt_io_abi::major;
 
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
+// The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
+static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
@@ -311,7 +313,7 @@ unsafe fn publish_time_zone(
 #[inline(never)]
 fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     let mut v = alloc::vec::Vec::with_capacity(192);
-    v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
+    v.push(ObjEntry::dir(b"", OBJ_PARENT_ROOT)); // 0 = root "\"
     for d in [
         b"??".as_slice(),
         b"device",
@@ -332,7 +334,27 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"windows")
         .expect("pre-created Windows object directory");
-    v.push(ObjEntry::dir(b"windowstations", windows as u8));
+    v.push(ObjEntry::dir(b"windowstations", windows));
+    let bno = v
+        .iter()
+        .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")
+        .expect("pre-created BaseNamedObjects directory");
+    let sessions = v
+        .iter()
+        .position(|entry| entry.parent == 0 && entry.name() == b"sessions")
+        .expect("pre-created Sessions object directory");
+    v.push(ObjEntry::dir(b"bnolinks", sessions));
+    let session0 = v.len();
+    v.push(ObjEntry::dir(b"0", sessions));
+    v.push(ObjEntry::symlink(
+        b"basenamedobjects",
+        session0,
+        b"\\basenamedobjects",
+    ));
+    v.push(ObjEntry::symlink(b"global", bno, b"\\basenamedobjects"));
+    v.push(ObjEntry::symlink(b"local", bno, b"\\basenamedobjects"));
+    v.push(ObjEntry::symlink(b"session", bno, b"\\sessions\\bnolinks"));
+    v.push(ObjEntry::dir(b"restricted", bno));
     v
 }
 
@@ -3926,11 +3948,16 @@ impl ExecNtHandler {
             Err(STATUS_OBJECT_TYPE_MISMATCH) => {
                 match self.semaphore_index_for_handle(handle, required_access) {
                     Ok(index) => Ok(WaitObject::dispatcher(index)),
-                    // Mutants are named/openable real objects now, but the executive wait path still
-                    // treats them as compatibility-immediate sync handles. Parking a mutant before
-                    // the scheduler models owner handoff regresses winlogon's profile/shell startup.
                     Err(STATUS_OBJECT_TYPE_MISMATCH) => {
-                        self.process_thread_or_win32k_event_wait_object(handle, required_access)
+                        match self.mutant_index_for_handle(handle, required_access) {
+                            Ok(index) => Ok(WaitObject::dispatcher(index)),
+                            Err(STATUS_OBJECT_TYPE_MISMATCH) => self
+                                .process_thread_or_win32k_event_wait_object(
+                                    handle,
+                                    required_access,
+                                ),
+                            Err(status) => Err(status),
+                        }
                     }
                     Err(status) => Err(status),
                 }
@@ -4081,16 +4108,14 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
-            return false;
-        };
-        matches!(
-            self.pm.lookup_handle(pid, handle as nt_process::Handle),
-            Some(nt_process::HandleObject::Opaque(tag))
-                if tag == 0 || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
-        )
+    pub(crate) unsafe fn abandon_mutants_for_thread(&mut self, tid: u64) -> u64 {
+        let abandoned = self.mutants.abandon_thread(tid) as u64;
+        if abandoned != 0 {
+            let _ = wait_wake_dispatcher_set(self);
+        }
+        abandoned
     }
+
     pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let handle = self
@@ -6031,10 +6056,10 @@ impl ExecNtHandler {
             chain[count] = i;
             count += 1;
             let parent = self.obj_ns[i].parent;
-            cur = if parent == 0xFF {
+            cur = if parent == OBJ_PARENT_ROOT {
                 None
             } else {
-                Some(parent as usize)
+                Some(parent)
             };
         }
         if out.is_empty() {
@@ -6045,7 +6070,7 @@ impl ExecNtHandler {
         n += 1;
         for pos in (0..count).rev() {
             let entry = &self.obj_ns[chain[pos]];
-            if entry.parent == 0xFF {
+            if entry.parent == OBJ_PARENT_ROOT {
                 continue;
             }
             if n > 1 {
@@ -8458,6 +8483,49 @@ impl ExecNtHandler {
         Ok((root, attributes, Some(name)))
     }
 
+    unsafe fn read_named_object_path_attributes(
+        &self,
+        oa_va: u64,
+    ) -> Result<(u64, u32, alloc::vec::Vec<u8>), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        if oa_va == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let (root, attributes, name16) = self.read_event_object_attributes(oa_va)?;
+        let Some(name16) = name16 else {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        };
+        let path = Self::event_object_path(&name16)?;
+        Ok((root, attributes, path))
+    }
+
+    unsafe fn read_unicode_string16(&self, ustr_va: u64) -> Result<alloc::vec::Vec<u16>, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        if ustr_va == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut ustr = [0u8; 16];
+        if !self.xas_read(ustr_va, &mut ustr) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let length = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
+        let maximum = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
+        let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
+        if length & 1 != 0 || length > maximum || length > 2048 || (length != 0 && buffer == 0) {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let mut bytes = alloc::vec![0u8; length];
+        if length != 0 && !self.xas_read(buffer, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect())
+    }
+
     fn event_root_index(&self, root: u64) -> Result<usize, u32> {
         if root == 0 {
             return Ok(0);
@@ -8488,7 +8556,7 @@ impl ExecNtHandler {
         if path.first() == Some(&b'\\') {
             components.next();
         }
-        if components.any(|component| component.is_empty() || component.len() > 40) {
+        if components.any(|component| component.is_empty() || component.len() > OBJ_NAME_CAP) {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
         Ok(path)
@@ -8945,7 +9013,8 @@ impl ExecNtHandler {
     ///  - `ConnectionInfo` (CSR_API_CONNECTINFO) SharedSectionBase/Heap, SharedStaticServerData (→ an
     ///    array whose [BASESRV=1] slot points at a BASE_STATIC_SERVER_DATA with valid Windows dirs),
     ///    and ServerProcessId.
-    /// All out-params are client STACK locals (ConnectionInfo/LpcWrite) reached via the mirror; the
+    /// Output parameters are ordinary client locals (ConnectionInfo/LpcWrite); write them through the
+    /// current hosted process address-space path so stack, heap, and demand-filled pages all work. The
     /// backing regions are mapped into the client's own VSpace (lazily, once). Returns STATUS_SUCCESS.
     pub(crate) unsafe fn csr_client_connect(
         &mut self,
@@ -9030,7 +9099,9 @@ impl ExecNtHandler {
             // LpcWrite heap view: 16 committed RW frames (kernel32 RtlCreateHeaps over ViewBase).
             for i in 0..16u64 {
                 let f = alloc_frame();
-                let _ = page_map(copy_cap(f), WINLOGON_CSR_HEAP_VA + i * 0x1000, RW_NX, pml4);
+                let page = WINLOGON_CSR_HEAP_VA + i * 0x1000;
+                let _ = page_map(copy_cap(f), page, RW_NX, pml4);
+                csrss_frame_put(self.pi as u64, page, f);
             }
             // Static server data (4 frames): fill via the exec scratch alias, then map into THIS
             // process, then UNMAP the scratch alias so the next process reuses the same scratch VAs.
@@ -9083,12 +9154,9 @@ impl ExecNtHandler {
                     write_wstr(sc + 0x020, "C:\\Windows\\System32");
                     write_wstr(sc + 0x060, "\\BaseNamedObjects");
                 }
-                let _ = page_map(
-                    copy_cap(f),
-                    WINLOGON_CSR_STATIC_VA + i * 0x1000,
-                    RW_NX,
-                    pml4,
-                );
+                let page = WINLOGON_CSR_STATIC_VA + i * 0x1000;
+                let _ = page_map(copy_cap(f), page, RW_NX, pml4);
+                csrss_frame_put(self.pi as u64, page, f);
                 // Release the scratch alias mapping of `f` (the target copy_cap is a distinct cap →
                 // unaffected) so the next process's fill can remap the same scratch VA.
                 let _ = page_unmap(f);
@@ -9099,17 +9167,27 @@ impl ExecNtHandler {
         // (3) Fill the client PORT_VIEW (LpcWrite): ViewBase/ViewRemoteBase (delta 0 → capture pointers
         // are client pointers, which the direct message plane reads via the mirror) + ViewSize.
         if clientview_ptr != 0 {
-            smss_stack_write(clientview_ptr + 0x18, 0x1_0000); // ViewSize = 64 KiB
-            smss_stack_write(clientview_ptr + 0x20, WINLOGON_CSR_HEAP_VA); // ViewBase
-            smss_stack_write(clientview_ptr + 0x28, WINLOGON_CSR_HEAP_VA); // ViewRemoteBase
+            if !self.xas_write_u64(clientview_ptr + 0x18, 0x1_0000) // ViewSize = 64 KiB
+                || !self.xas_write_u64(clientview_ptr + 0x20, WINLOGON_CSR_HEAP_VA) // ViewBase
+                || !self.xas_write_u64(clientview_ptr + 0x28, WINLOGON_CSR_HEAP_VA)
+            // ViewRemoteBase
+            {
+                return 0xC000_0005;
+            }
         }
         // (4) Fill CSR_API_CONNECTINFO: kernel32 copies these into the PEB (ReadOnlySharedMemoryBase/
         // Heap, ReadOnlyStaticServerData) + records ServerProcessId.
         if conninfo_ptr != 0 {
-            smss_stack_write(conninfo_ptr + 0x08, WINLOGON_CSR_HEAP_VA); // SharedSectionBase
-            smss_stack_write(conninfo_ptr + 0x10, WINLOGON_CSR_STATIC_VA); // SharedStaticServerData
-            smss_stack_write(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA); // SharedSectionHeap
-            smss_stack_write(conninfo_ptr + 0x30, 8); // ServerProcessId (csrss — plausible)
+            if !self.xas_write_u64(conninfo_ptr + 0x08, WINLOGON_CSR_HEAP_VA) // SharedSectionBase
+                || !self.xas_write_u64(conninfo_ptr + 0x10, WINLOGON_CSR_STATIC_VA)
+                // SharedStaticServerData
+                || !self.xas_write_u64(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA)
+                // SharedSectionHeap
+                || !self.xas_write_u64(conninfo_ptr + 0x30, 8)
+            // ServerProcessId (csrss — plausible)
+            {
+                return 0xC000_0005;
+            }
         }
         // (5) *PortHandle = &CsrApiPort (an ntdll .data global). The loop writes the real client
         // communication-port handle after `csr_rendezvous` completes the pending connection.
@@ -9143,31 +9221,84 @@ impl ExecNtHandler {
         }
         n
     }
+    fn object_path_components(path: &[u8]) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        path.split(|&c| c == b'\\')
+            .filter(|component| !component.is_empty())
+            .map(|component| {
+                component
+                    .iter()
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Resolve an object path to an `obj_ns` index. A path starting with `\` walks from the root;
     /// otherwise it is relative to `root_idx` (an already-open directory, e.g. an OA RootDirectory).
-    /// Empty leading components (from the leading `\`) are skipped.
-    pub(crate) fn obj_resolve(&self, path: &[u8], root_idx: usize) -> Option<usize> {
+    /// Intermediate symbolic links are followed; the final link is followed unless `follow_final_link`
+    /// is false, matching OBJ_OPENLINK for NtOpenSymbolicLinkObject.
+    fn obj_resolve_ex(
+        &self,
+        path: &[u8],
+        root_idx: usize,
+        follow_final_link: bool,
+    ) -> Option<usize> {
+        const SYMLINK_LIMIT: u32 = 32;
+        let mut components = Self::object_path_components(path);
         let mut cur = if path.first() == Some(&b'\\') {
             0
         } else {
             root_idx
         };
-        for comp in path.split(|&c| c == b'\\') {
-            if comp.is_empty() {
-                continue;
-            }
-            if self.obj_ns.get(cur)?.kind != 0 {
+        let mut index = 0usize;
+        let mut hops = 0u32;
+
+        while index < components.len() {
+            if self.obj_ns.get(cur)?.kind != OBJ_KIND_DIRECTORY {
                 return None;
             }
-            cur = self.obj_child(cur, comp)?;
+            let child = self.obj_child(cur, &components[index])?;
+            let entry = self.obj_ns.get(child)?;
+            let final_component = index + 1 == components.len();
+            if entry.kind == OBJ_KIND_SYMBOLIC_LINK && (!final_component || follow_final_link) {
+                hops += 1;
+                if hops > SYMLINK_LIMIT {
+                    return None;
+                }
+                let target = entry.target();
+                let target_absolute = target.first() == Some(&b'\\');
+                let mut rebuilt = Self::object_path_components(target);
+                rebuilt.extend(components[index + 1..].iter().cloned());
+                components = rebuilt;
+                cur = if target_absolute {
+                    0
+                } else if entry.parent == OBJ_PARENT_ROOT {
+                    0
+                } else {
+                    entry.parent
+                };
+                index = 0;
+                continue;
+            }
+            cur = child;
+            index += 1;
         }
         Some(cur)
+    }
+
+    /// Resolve an object path to an `obj_ns` index, following the final symbolic link.
+    pub(crate) fn obj_resolve(&self, path: &[u8], root_idx: usize) -> Option<usize> {
+        self.obj_resolve_ex(path, root_idx, true)
+    }
+
+    fn obj_resolve_open_link(&self, path: &[u8], root_idx: usize) -> Option<usize> {
+        self.obj_resolve_ex(path, root_idx, false)
     }
     /// Find a direct child of directory `parent` whose (folded) name matches `leaf`.
     pub(crate) fn obj_child(&self, parent: usize, leaf: &[u8]) -> Option<usize> {
         self.obj_ns
             .iter()
-            .position(|e| e.parent as usize == parent && e.name() == leaf)
+            .position(|e| e.parent == parent && e.name() == leaf)
     }
     /// Insert a child (dir or symlink) under `parent`, or return the existing one (OPENIF/name
     /// collision → reuse). Returns the index, or None if the table is at capacity.
@@ -9184,10 +9315,10 @@ impl ExecNtHandler {
         if self.obj_ns.len() >= self.obj_ns.capacity() {
             return None;
         }
-        let mut e = ObjEntry::dir(leaf, parent as u8);
+        let mut e = ObjEntry::dir(leaf, parent);
         e.kind = kind;
         if kind == OBJ_KIND_SYMBOLIC_LINK {
-            let t = target.len().min(40);
+            let t = target.len().min(OBJ_NAME_CAP);
             e.target[..t].copy_from_slice(&target[..t]);
             e.target_len = t as u8;
         }
@@ -9206,7 +9337,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn lpc_port_handle_for_name16(&self, name16: &[u16]) -> Option<u64> {
-        let mut nbuf = [0u8; 40];
+        let mut nbuf = [0u8; OBJ_NAME_CAP];
         let nlen = Self::fold_name(name16, &mut nbuf);
         if nlen == 0 {
             return None;
@@ -9228,7 +9359,7 @@ impl ExecNtHandler {
         if handle == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
-        let mut nbuf = [0u8; 40];
+        let mut nbuf = [0u8; OBJ_NAME_CAP];
         let nlen = Self::fold_name(name16, &mut nbuf);
         if nlen == 0 {
             return Err(STATUS_OBJECT_NAME_INVALID);
@@ -9270,7 +9401,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut e = ObjEntry::dir(&name, 250);
+        let mut e = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
         e.kind = OBJ_KIND_EVENT;
         self.obj_ns.push(e);
         let index = self.obj_ns.len() - 1;
@@ -9301,7 +9432,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut entry = ObjEntry::dir(&name, 250);
+        let mut entry = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
         entry.kind = OBJ_KIND_SEMAPHORE;
         self.obj_ns.push(entry);
         let index = self.obj_ns.len() - 1;
@@ -9328,7 +9459,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut entry = ObjEntry::dir(&name, 250);
+        let mut entry = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
         entry.kind = OBJ_KIND_MUTANT;
         self.obj_ns.push(entry);
         let index = self.obj_ns.len() - 1;
@@ -12578,7 +12709,8 @@ impl ExecNtHandler {
                                 return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                             }
                             SERVICES_NAMED_EVENTS.fetch_add(1, Ordering::Relaxed);
-                            if existed { 0x4000_0000 } else { 0 } // STATUS_OBJECT_NAME_EXISTS : SUCCESS
+                            let status = if existed { 0x4000_0000 } else { 0 };
+                            status // STATUS_OBJECT_NAME_EXISTS : SUCCESS
                         }
                         None => {
                             0xC000_009A
@@ -13119,10 +13251,7 @@ impl ExecNtHandler {
                 let previous = match self.mutants.release(index as u64, self.current_tid) {
                     Ok(previous) => previous,
                     Err(nt_kernel_exec::MutantError::NotFound) => return 0xC000_0008,
-                    // Older boot scaffolding modeled mutant release as success for any live handle.
-                    // Keep that tolerance in the executive until mutant waits participate in real
-                    // owner transfer; strict store semantics are covered in nt-kernel-exec tests.
-                    Err(nt_kernel_exec::MutantError::NotOwned) => 0,
+                    Err(nt_kernel_exec::MutantError::NotOwned) => return 0xC000_0046,
                 };
                 unsafe {
                     wait_wake_dispatcher_set(self);
@@ -13737,9 +13866,8 @@ impl ExecNtHandler {
             //   • unsignaled → request a PARK (wait_park_event = encoded WaitObject); the service
             //                  loop stashes this caller's reply cap keyed by that object and continues
             //                  receiving. The matching state transition wakes it.
-            // Any OTHER handle (fake sync handles from rpcrt4 mutants/csrsrv worker events, smss's
-            // subsystem event, etc.) has no live signaler → immediate STATUS_WAIT_0 (KEPT — documented:
-            // parking one of those would hang since nothing sets it). csrss (pi==1) stays immediate.
+            // Any other handle fails visibly; waitable dispatcher, process/thread, and win32k event
+            // handles must resolve through `wait_object_for_handle`.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
                 match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
@@ -13780,7 +13908,6 @@ impl ExecNtHandler {
                         print_str(b") UNSIGNALLED -> PARK caller (reply-cap park)\n");
                         0x102 // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
                     }
-                    Err(_status) if self.is_legacy_opaque_handle(handle) => 0,
                     Err(status) => status,
                 }
             }
@@ -13789,29 +13916,47 @@ impl ExecNtHandler {
             NativeService::NtOpenDirectoryObject | NativeService::NtCreateDirectoryObject => unsafe {
                 let out = args[0]; // R10 = *Handle
                 let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = Self::fold_name(&name16, &mut nbuf);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
-                };
-                let idx = if ctx.service == NativeService::NtCreateDirectoryObject {
-                    self.obj_create(&nbuf[..nlen], root_idx, 0, &[])
-                } else {
-                    self.obj_resolve(&nbuf[..nlen], root_idx)
-                };
-                match idx {
-                    Some(i) => {
-                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
-                        0
-                    }
-                    None => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa) {
+                    Ok(values) => values,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let index = if ctx.service == NativeService::NtCreateDirectoryObject {
+                    match self.obj_resolve(path, root_idx) {
+                        Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => index,
+                        Some(_) => {
+                            return 0xC000_0024;
+                        } // STATUS_OBJECT_TYPE_MISMATCH
+                        None => match self.obj_create(path, root_idx, OBJ_KIND_DIRECTORY, &[]) {
+                            Some(index) => index,
+                            None => return 0xC000_003A, // STATUS_OBJECT_PATH_NOT_FOUND
+                        },
+                    }
+                } else {
+                    let Some(index) = self.obj_resolve(path, root_idx) else {
+                        return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                    };
+                    if self.obj_ns[index].kind != OBJ_KIND_DIRECTORY {
+                        return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                    }
+                    index
+                };
+                if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                    return 0xC000_0005;
+                }
+                0
             },
             // NtQueryDirectoryObject(DirectoryHandle[R10]=args[0], Buffer[RDX]=args[1],
             // Length[R8]=args[2], ReturnSingleEntry[R9]=args[3], RestartScan[sp+0x28],
@@ -13850,7 +13995,7 @@ impl ExecNtHandler {
                 // Collect this directory's children (by insertion index) beyond `start`.
                 let mut children: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
                 for (i, e) in self.obj_ns.iter().enumerate() {
-                    if e.parent as usize == dir_idx && i != dir_idx {
+                    if e.parent == dir_idx && i != dir_idx {
                         children.push(i);
                     }
                 }
@@ -13969,14 +14114,28 @@ impl ExecNtHandler {
                 let out = args[0];
                 let oa = args[2];
                 let tgt = args[3]; // R9 = PUNICODE_STRING target
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = Self::fold_name(&name16, &mut nbuf);
-                let target16 = smss_read_ustr(tgt);
-                let mut tbuf = [0u8; 40]; // keep the target's case (a device path)
+                if out == 0 {
+                    return 0xC000_0005;
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002;
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa) {
+                    Ok(values) => values,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let target16 = match self.read_unicode_string16(tgt) {
+                    Ok(target) => target,
+                    Err(status) => return status,
+                };
+                let mut tbuf = [0u8; OBJ_NAME_CAP]; // keep the target's case (a device path)
                 let mut tl = 0;
                 for &w in &target16 {
                     if tl >= tbuf.len() {
@@ -13985,17 +14144,24 @@ impl ExecNtHandler {
                     tbuf[tl] = w as u8;
                     tl += 1;
                 }
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
-                };
-                match self.obj_create(&nbuf[..nlen], root_idx, 1, &tbuf[..tl]) {
-                    Some(i) => {
-                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
+                match self.obj_resolve_open_link(path, root_idx) {
+                    Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
+                        if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                            return 0xC000_0005;
+                        }
                         0
                     }
-                    None => 0xC0000034,
+                    Some(_) => 0xC000_0024,
+                    None => match self.obj_create(path, root_idx, OBJ_KIND_SYMBOLIC_LINK, &tbuf[..tl])
+                    {
+                        Some(index) => {
+                            if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                                return 0xC000_0005;
+                            }
+                            0
+                        }
+                        None => 0xC000_003A,
+                    },
                 }
             },
             // NtOpenSymbolicLinkObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
@@ -14003,20 +14169,28 @@ impl ExecNtHandler {
             NativeService::NtOpenSymbolicLinkObject => unsafe {
                 let out = args[0];
                 let oa = args[2];
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = Self::fold_name(&name16, &mut nbuf);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
+                if out == 0 {
+                    return 0xC000_0005;
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002;
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa) {
+                    Ok(values) => values,
+                    Err(status) => return status,
                 };
-                match self.obj_resolve(&nbuf[..nlen], root_idx) {
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                match self.obj_resolve_open_link(path, root_idx) {
                     Some(i) if self.obj_ns[i].kind == 1 => {
-                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
+                        if !self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64) {
+                            return 0xC000_0005;
+                        }
                         0
                     }
                     _ => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
@@ -14564,7 +14738,6 @@ impl ExecNtHandler {
                 // whether the user's hive already exists, and how `CreateDirectoryPath` probes.
                 // A miss here is a REAL miss (the file is not on the volume), never a fake EXISTS.
                 if let Some(relative) = crate::writable_fs::writable_path(&name16) {
-                    self.writable_fs_dirty = true;
                     return match crate::writable_fs::query_attributes(&relative) {
                         Some(info)
                             if self.write_file_basic_attributes(args[1], info.attributes) =>
@@ -14979,7 +15152,6 @@ impl ExecNtHandler {
                     // disposition, `FILE_DIRECTORY_FILE`, and `FileAttributes` are passed straight
                     // through to a REAL file system: a create that cannot be satisfied still fails
                     // with the correct NTSTATUS, and no handle is fabricated.
-                    self.writable_fs_dirty = true;
                     let (st, file_id, information) = crate::writable_fs::create(
                         &relative,
                         args[1] as u32,
@@ -14990,6 +15162,9 @@ impl ExecNtHandler {
                     );
                     status = st;
                     info = information;
+                    if file_id.is_some() {
+                        self.writable_fs_dirty = true;
+                    }
                     if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64 {
                             crate::writable_fs::note_directory_create(self.pi, &relative, true);
@@ -15116,16 +15291,30 @@ impl ExecNtHandler {
                 // on `NtReadFile`). It gets a copy-chunk-sized staging bound instead — exactly the
                 // 64 KiB buffer `kernel32!CopyLoop` allocates.
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
-                let write_capacity = if self.overlay_file_id_for(fh).is_some() {
+                let overlay_file = self.overlay_file_id_for(fh);
+                let write_capacity = if overlay_file.is_some() {
                     OVERLAY_IO_CAP
                 } else {
                     transport_capacity
                 };
-                let mut payload = alloc::vec![0u8; len.min(write_capacity)];
-                let payload_ok = len == 0
-                    || (buffer != 0
-                        && len <= write_capacity
-                        && self.xas_read(buffer, &mut payload));
+                let mut payload = if overlay_file.is_some() {
+                    alloc::vec::Vec::new()
+                } else {
+                    alloc::vec![0u8; len.min(write_capacity)]
+                };
+                let payload_ok = if len == 0 {
+                    true
+                } else if buffer == 0 || len > write_capacity {
+                    false
+                } else if overlay_file.is_some() {
+                    let scratch = core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                        OVERLAY_IO_CAP,
+                    );
+                    self.xas_read(buffer, &mut scratch[..len])
+                } else {
+                    self.xas_read(buffer, &mut payload)
+                };
 
                 let completion_event = self.validate_io_event(event);
                 let mut information = 0u64;
@@ -15157,16 +15346,21 @@ impl ExecNtHandler {
                         }
                         Err(status) => status,
                     }
-                } else if let Some(file_id) = self.overlay_file_id_for(fh) {
+                } else if let Some(file_id) = overlay_file {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
                     // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
                     // advances the file object's own position, exactly like an FSD.
-                    self.writable_fs_dirty = true;
                     let explicit = (byte_offset != 0 && offset_ok)
                         .then_some(offset_value)
                         .filter(|value| *value != u64::MAX);
-                    let (status, written) =
-                        crate::writable_fs::write(file_id, explicit, &payload[..len]);
+                    let scratch = core::slice::from_raw_parts(
+                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                        len,
+                    );
+                    let (status, written) = crate::writable_fs::write(file_id, explicit, scratch);
+                    if status == nt_fs::STATUS_SUCCESS {
+                        self.writable_fs_dirty = true;
+                    }
                     information = written as u64;
                     status
                 } else {
@@ -15400,7 +15594,15 @@ impl ExecNtHandler {
                     print_u64(payload_ok as u64);
                     print_str(b" prefix=");
                     if payload_ok {
-                        for &byte in payload.iter().take(16) {
+                        let prefix = if overlay_file.is_some() {
+                            core::slice::from_raw_parts(
+                                core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                                len.min(16),
+                            )
+                        } else {
+                            &payload[..payload.len().min(16)]
+                        };
+                        for &byte in prefix {
                             print_hex(byte as u32);
                             debug_put_char(b' ');
                         }
@@ -15522,7 +15724,6 @@ impl ExecNtHandler {
                     }
                 } else if let Some(file_id) = self.overlay_file_id_for(fh) {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
-                    self.writable_fs_dirty = true;
                     let mut explicit = None;
                     let mut bad_offset = false;
                     if byte_offset != 0 {
@@ -16093,7 +16294,6 @@ impl ExecNtHandler {
                 // why this is placed BEFORE all of them. `NtOpenFile` is `NtCreateFile` with
                 // disposition FILE_OPEN, so a missing path misses honestly.
                 if let Some(relative) = crate::writable_fs::writable_path(&name16) {
-                    self.writable_fs_dirty = true;
                     let (mut status, file_id, information) = crate::writable_fs::create(
                         &relative,
                         args[1] as u32,                      // DesiredAccess (RDX)
@@ -16104,6 +16304,7 @@ impl ExecNtHandler {
                     );
                     let mut opened_handle = 0u64;
                     if let Some(file_id) = file_id {
+                        self.writable_fs_dirty = true;
                         match self.mint_overlay_file_handle(file_id, args[1] as u32) {
                             Some(handle) => {
                                 opened_handle = handle;
@@ -17314,6 +17515,14 @@ impl ExecNtHandler {
                 };
                 if let Err(status) = outcome {
                     return status;
+                }
+                let abandoned_mutants = unsafe { self.abandon_mutants_for_thread(target as u64) };
+                if abandoned_mutants != 0 {
+                    print_str(b"[thread-term] abandoned mutants tid=");
+                    print_u64(target as u64);
+                    print_str(b" count=");
+                    print_u64(abandoned_mutants);
+                    print_str(b"\n");
                 }
                 if self.pm.is_process_signaled(target_pid) {
                     self.release_process_handles(target_pid);
