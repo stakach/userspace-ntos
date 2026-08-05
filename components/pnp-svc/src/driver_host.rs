@@ -2,16 +2,16 @@
 //! the in-process HAL (Resource Manager + simulated device) + the kernel runtime,
 //! and drives the PnP lifecycle — calling `AddDevice`, sending the `START_DEVICE` /
 //! `REMOVE_DEVICE` IRPs locally (driver callbacks run here), while reporting each
-//! state transition + querying the fixture resources from the **isolated PnP
+//! state transition + querying devnode resources from the **isolated PnP
 //! Manager** over SURT. Reports the verdict on the RESULT endpoint.
 
 use alloc::boxed::Box;
 use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
 use nt_pnp_abi::{
-    IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE, PNP_OP_CALL_ADD_DEVICE,
-    PNP_OP_CREATE_DEVNODE, PNP_OP_LOAD_DRIVER, PNP_OP_QUERY_DEVNODE, PNP_OP_REMOVE_DEVICE,
-    PNP_OP_START_DEVICE,
+    PnpCreateDevnodeReq, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE,
+    PNP_OP_CALL_ADD_DEVICE, PNP_OP_CREATE_DEVNODE, PNP_OP_LOAD_DRIVER, PNP_OP_QUERY_DEVNODE,
+    PNP_OP_REMOVE_DEVICE, PNP_OP_START_DEVICE,
 };
 use nt_pe_loader::{ImportRef, PeFile};
 use nt_resource_manager::{ResourceManager, ResourceOwner};
@@ -23,7 +23,8 @@ use surt_sel4::{drain_blocking, Sel4Notify};
 use crate::{
     ep_send_one, print_str, yield_now, CODE_FRAMES, CODE_VADDR, COMP_RING_VADDR, CT_CODE_BASE,
     CT_N_COMP, CT_N_SUB, CT_PML4, CT_RESULT, DEVICE_OBJECT_ID, DRIVER_HOST_ID, ENV, INT_RESOURCE_ID,
-    INT_VECTOR, MEM_RESOURCE_ID, REP_DATA_VADDR, RING_LEN, STATE_VADDR, SUB_RING_VADDR,
+    INT_VECTOR, MEM_RESOURCE_ID, REP_DATA_VADDR, REQ_DATA_VADDR, RING_LEN, STATE_VADDR,
+    SUB_RING_VADDR,
 };
 
 static PNP_SYS: &[u8] =
@@ -34,8 +35,12 @@ pub const CHECKS: u64 = 13;
 
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
 /// `DeviceState::Removed as u32`.
 const STATE_REMOVED: u64 = 12;
+const SERVICE_NAME: &str = "PnpMmioInterruptTest";
+const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001";
+const SECOND_INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO\0002";
 
 struct HostState {
     rt: KernelExecRuntime<FakeClock>,
@@ -81,11 +86,12 @@ fn alloc_blob() -> u64 {
 }
 
 /// One PnP request over SURT → `(status, detail0)`.
-unsafe fn pnp_call(opcode: u16, arg0: u64) -> (i32, u64) {
+unsafe fn pnp_call_with_len(opcode: u16, arg0: u64, len: u32) -> (i32, u64) {
     let id = st().next_id;
     st().next_id += 1;
     let sqe = SurtSqe {
         opcode,
+        len,
         request_id: id,
         arg0,
         ..Default::default()
@@ -108,6 +114,31 @@ unsafe fn pnp_call(opcode: u16, arg0: u64) -> (i32, u64) {
         }
     });
     (status, d0)
+}
+
+unsafe fn pnp_call(opcode: u16, arg0: u64) -> (i32, u64) {
+    pnp_call_with_len(opcode, arg0, 0)
+}
+
+unsafe fn create_devnode(pdo_object_id: u64, instance_id: &str) -> (i32, u64) {
+    let req = &mut *(REQ_DATA_VADDR as *mut PnpCreateDevnodeReq);
+    *req = PnpCreateDevnodeReq::new(
+        pdo_object_id,
+        0x1000_0000,
+        0x1000,
+        INT_VECTOR,
+        INT_VECTOR,
+        1,
+        false,
+    );
+    if !req.set_instance_id(instance_id) || !req.set_service(SERVICE_NAME) {
+        return (STATUS_UNSUCCESSFUL, 0);
+    }
+    pnp_call_with_len(
+        PNP_OP_CREATE_DEVNODE,
+        0,
+        core::mem::size_of::<PnpCreateDevnodeReq>() as u32,
+    )
 }
 
 // --- compatibility exports --------------------------------------------------
@@ -587,10 +618,10 @@ pub unsafe extern "C" fn driver_host_entry() -> ! {
     };
     check(b"driver_entry_success", add_device != 0, &mut passed);
 
-    // --- PnP Manager (isolated): enumerate the fixture devnode + query resources.
+    // --- PnP Manager (isolated): enumerate the described devnode + query resources.
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3);
-    let (cst, devnode) = pnp_call(PNP_OP_CREATE_DEVNODE, pdo);
+    let (cst, devnode) = create_devnode(pdo, INSTANCE_PATH);
     check(b"pnp_create_devnode", cst == 0 && devnode != 0, &mut passed);
 
     let (qst, _state) = pnp_call(PNP_OP_QUERY_DEVNODE, devnode);
@@ -608,7 +639,7 @@ pub unsafe extern "C" fn driver_host_entry() -> ! {
 
     // Negative: an out-of-order START (before AddDevice) is rejected by the isolated
     // PnP Manager (a second devnode kept clean for the real flow).
-    let (_c2, dn2) = pnp_call(PNP_OP_CREATE_DEVNODE, pdo);
+    let (_c2, dn2) = create_devnode(pdo, SECOND_INSTANCE_PATH);
     let (bad, _s) = pnp_call(PNP_OP_START_DEVICE, dn2);
     check(b"pnp_invalid_transition_rejected", bad != 0, &mut passed);
 

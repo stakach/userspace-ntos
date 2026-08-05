@@ -52,18 +52,20 @@ mechanics.
 The `pnp-svc` broker spawns **two fully-isolated seL4 components** (own CSpace +
 VSpace): a Driver Host (loads `PnpMmioInterruptTest.sys`, hosts the in-process HAL —
 Resource Manager + simulated device + kernel runtime, all on its RW state page) and a
-PnP Manager (owns the canonical devnode table + state machine + fixture resources).
+PnP Manager (owns the canonical service-bound devnode table, resource assignments, and
+state machine).
 The Driver Host drives the lifecycle locally — driver callbacks (AddDevice, PnP
 dispatch, ISR/DPC) must run in its address space — and reports each transition +
 queries resources over a SURT ring pair; the isolated PnP Manager validates every
 transition and never touches driver code (spec §7.5).
 
-- PnP requests ride the `SurtSqe` (opcode + `arg0` = devnode ID); the resource
-  payload is written to a shared frame on `PNP_OP_QUERY_DEVNODE`. Opcodes drive a
-  lifecycle phase's transitions: `CREATE_DEVNODE` → devnode ID; `LOAD_DRIVER`,
-  `CALL_ADD_DEVICE` (→ DeviceStackBuilt), `START_DEVICE` (→ Started), `REMOVE_DEVICE`
-  (→ Removed) each apply an ordered transition chain, failing the request on the first
-  invalid step.
+- PnP requests ride the `SurtSqe`; `PNP_OP_CREATE_DEVNODE` carries a
+  `PnpCreateDevnodeReq` in the shared request frame with `Enum\<InstanceId>`,
+  `Service`, PDO id, and resource assignment. The resource payload is written to a
+  shared reply frame on `PNP_OP_QUERY_DEVNODE`. Lifecycle opcodes still use `arg0` =
+  devnode ID: `LOAD_DRIVER`, `CALL_ADD_DEVICE` (→ DeviceStackBuilt), `START_DEVICE`
+  (→ Started), `REMOVE_DEVICE` (→ Removed) each apply an ordered transition chain,
+  failing the request on the first invalid step.
 - Verified in QEMU (14/14) across the boundary: create devnode + query resources →
   **an out-of-order START on a second devnode is rejected by the isolated manager** →
   AddDevice (local) + transition → pre-start IOCTL `STATUS_DEVICE_NOT_READY` →

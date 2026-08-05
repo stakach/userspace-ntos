@@ -1,21 +1,21 @@
-//! The isolated PnP Manager child: owns the canonical devnode table + v0.1 state
-//! machine + fixture resources, served over SURT. It validates every state
-//! transition the Driver Host reports and never touches driver code (spec §7.5).
+//! The isolated PnP Manager child: owns the canonical service-bound devnode table,
+//! resource assignments, and v0.1 state machine, served over SURT. It validates every
+//! state transition the Driver Host reports and never touches driver code (spec §7.5).
 //! Each lifecycle opcode drives the internal transitions for that phase; an
 //! out-of-order request fails the transition validation.
 
 use nt_pnp_abi::{
-    DeviceState, PNP_OP_CALL_ADD_DEVICE, PNP_OP_CREATE_DEVNODE, PNP_OP_LOAD_DRIVER,
-    PNP_OP_QUERY_DEVNODE, PNP_OP_REMOVE_DEVICE, PNP_OP_START_DEVICE,
+    DeviceState, PnpCreateDevnodeReq, PNP_OP_CALL_ADD_DEVICE, PNP_OP_CREATE_DEVNODE,
+    PNP_OP_LOAD_DRIVER, PNP_OP_QUERY_DEVNODE, PNP_OP_REMOVE_DEVICE, PNP_OP_START_DEVICE,
 };
-use nt_pnp_manager::PnpManager;
+use nt_pnp_manager::{PnpManager, ResourceAssignment};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
 
 use crate::{
-    yield_now, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, ENV, REP_DATA_VADDR, RING_LEN, STATE_VADDR,
-    SUB_RING_VADDR,
+    yield_now, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, ENV, REP_DATA_VADDR, REQ_DATA_VADDR,
+    RING_LEN, STATE_VADDR, SUB_RING_VADDR,
 };
 
 fn pnp() -> &'static mut PnpManager {
@@ -40,7 +40,33 @@ unsafe fn serve(sqe: &SurtSqe) -> (i32, u64) {
     let fail = 0xC000_0001u32 as i32;
     match sqe.opcode {
         x if x == PNP_OP_CREATE_DEVNODE => {
-            let id = pnp().create_mmio_fixture_devnode(sqe.arg0);
+            if sqe.len as usize != core::mem::size_of::<PnpCreateDevnodeReq>() {
+                return (fail, 0);
+            }
+            let req = &*(REQ_DATA_VADDR as *const PnpCreateDevnodeReq);
+            if req.abi_size as usize != core::mem::size_of::<PnpCreateDevnodeReq>() {
+                return (fail, 0);
+            }
+            let Some(instance_id) = req.instance_id() else {
+                return (fail, 0);
+            };
+            if instance_id.is_empty() {
+                return (fail, 0);
+            }
+            let resources = ResourceAssignment {
+                mem_start: req.mem_start,
+                mem_length: req.mem_length,
+                int_vector: req.int_vector,
+                int_level: req.int_level,
+                int_affinity: req.int_affinity,
+                int_latched: req.int_latched != 0,
+            };
+            let id = pnp().create_service_bound_devnode(
+                instance_id,
+                req.service(),
+                req.pdo_object_id,
+                resources,
+            );
             (0, id)
         }
         x if x == PNP_OP_QUERY_DEVNODE => match pnp().resources(sqe.arg0) {

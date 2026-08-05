@@ -80,9 +80,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue B3 by replacing the remaining isolated `pnp-svc` fixture devnode protocol with
-   descriptor/resource-driven devnode creation, then feed registry-indexed devnodes into the boot
-   device-driver launch plan.
+1. Continue B3 by feeding registry-indexed devnodes into the boot device-driver launch plan and
+   lifting the current FSD-only launch filter for service-bound device drivers.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -213,3 +212,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the old fixture constructor still exists for `driver-host-power`,
   `driver-host-dma`, and isolated `pnp-svc`; the next B3 slice should move `pnp-svc` to
   descriptor/resource payloads and then retire or test-scope the compatibility helper.
+- B3 continued. The isolated `pnp-svc` SURT path now creates devnodes from a fixed
+  `PnpCreateDevnodeReq` shared-frame payload containing `Enum\<InstanceId>`, service, PDO id, and
+  resource assignment. The PnP manager child validates that payload and calls the same
+  `create_service_bound_devnode` API as the in-process PnP proof; query still returns the PnP-owned
+  resources from the canonical devnode table. Validation: `cargo test -p nt-pnp-abi` and
+  `cargo check --manifest-path components/pnp-svc/Cargo.toml --target x86_64-unknown-none`. Review
+  adjustment: remaining B3 debt is now the executive boot plan filter: registry-indexed devnodes need
+  to drive service-bound device-driver bring-up, after which the MMIO fixture helper can be made
+  test-only or removed from production components.

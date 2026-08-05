@@ -1,8 +1,9 @@
 # The PnP Manager isolated over SURT: a broker spawns a Driver Host child (loads
 # PnpMmioInterruptTest.sys, hosts the in-process HAL) and a PnP Manager child (owns
-# the canonical devnode state machine + fixture resources). The Driver Host drives
-# the AddDevice/START/REMOVE lifecycle and reports transitions over SURT, which the
-# isolated PnP Manager validates. (Milestone 12 — PnP service isolation.)
+# the canonical service-bound devnode table, resources, and lifecycle state machine).
+# The Driver Host drives AddDevice/START/REMOVE locally and reports transitions over
+# SURT, which the isolated PnP Manager validates. (Milestone 12 — PnP service
+# isolation.)
 [workspace]
 
 [package]

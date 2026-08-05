@@ -3,12 +3,12 @@
 //! A broker root task spawns two fully-isolated children:
 //!   * a **Driver Host** that loads the real `PnpMmioInterruptTest.sys` and hosts the
 //!     in-process HAL (Resource Manager + simulated device) + the kernel runtime;
-//!   * a **PnP Manager** that owns the canonical devnode table + state machine +
-//!     fixture resources.
+//!   * a **PnP Manager** that owns the canonical service-bound devnode table, resource
+//!     assignments, and lifecycle state machine.
 //!
 //! The Driver Host drives the AddDevice / START_DEVICE / REMOVE_DEVICE lifecycle
 //! locally (driver callbacks must run in its address space) and reports each state
-//! transition + queries the fixture resources over a SURT ring pair; the isolated
+//! transition + queries devnode resources over a SURT ring pair; the isolated
 //! PnP Manager validates every transition and never touches driver code.
 
 #![no_std]
@@ -50,6 +50,7 @@ pub static ENV: KernelEnv = KernelEnv;
 pub const IMAGE_BASE: u64 = 0x0000_0100_0040_0000;
 pub const SUB_RING_VADDR: u64 = 0x0000_0100_0050_0000;
 pub const COMP_RING_VADDR: u64 = 0x0000_0100_0051_0000;
+/// Shared payload frame — the Driver Host writes create-devnode descriptors here.
 pub const REQ_DATA_VADDR: u64 = 0x0000_0100_0052_0000;
 /// Shared payload frame — the PnP Manager writes queried resources here.
 pub const REP_DATA_VADDR: u64 = 0x0000_0100_0053_0000;
@@ -61,7 +62,7 @@ pub const SCRATCH_VADDR: u64 = 0x0000_0100_005F_C000;
 pub const CODE_VADDR: u64 = 0x0000_0001_4000_0000;
 pub const CODE_FRAMES: u64 = 8;
 
-/// Fixture identity, agreed by both children.
+/// Hosted proof identity, agreed by both children.
 pub const DRIVER_HOST_ID: u64 = 1;
 pub const DEVICE_OBJECT_ID: u64 = 10;
 pub const INT_RESOURCE_ID: u64 = 200;
@@ -296,7 +297,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         f_rep,
         true,
     );
-    // PnP Manager (server): owns the devnode table + fixture resources.
+    // PnP Manager (server): owns the devnode table + resource assignments.
     spawn_component(
         pnp_manager::pnp_manager_entry,
         &[(CT_N_SUB, n_sub_c), (CT_N_COMP, n_comp_c)],

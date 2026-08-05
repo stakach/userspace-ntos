@@ -78,6 +78,112 @@ pub struct PnpDevnodeReq {
     pub reserved2: u32,
 }
 
+pub const PNP_DEVNODE_NAME_MAX: usize = 160;
+
+/// `PNP_OP_CREATE_DEVNODE` payload carried in the request shared-data frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PnpCreateDevnodeReq {
+    pub abi_size: u16,
+    pub flags: u16,
+    pub instance_id_len: u16,
+    pub service_len: u16,
+    pub pdo_object_id: u64,
+    pub mem_start: u64,
+    pub mem_length: u32,
+    pub int_vector: u32,
+    pub int_level: u32,
+    pub int_affinity: u64,
+    pub int_latched: u8,
+    pub reserved: [u8; 7],
+    pub instance_id: [u8; PNP_DEVNODE_NAME_MAX],
+    pub service: [u8; PNP_DEVNODE_NAME_MAX],
+}
+
+impl PnpCreateDevnodeReq {
+    pub fn new(
+        pdo_object_id: u64,
+        mem_start: u64,
+        mem_length: u32,
+        int_vector: u32,
+        int_level: u32,
+        int_affinity: u64,
+        int_latched: bool,
+    ) -> Self {
+        Self {
+            abi_size: core::mem::size_of::<Self>() as u16,
+            pdo_object_id,
+            mem_start,
+            mem_length,
+            int_vector,
+            int_level,
+            int_affinity,
+            int_latched: int_latched as u8,
+            ..Default::default()
+        }
+    }
+
+    pub fn set_instance_id(&mut self, value: &str) -> bool {
+        if value.len() > PNP_DEVNODE_NAME_MAX || value.len() > u16::MAX as usize {
+            return false;
+        }
+        self.instance_id = [0; PNP_DEVNODE_NAME_MAX];
+        self.instance_id[..value.len()].copy_from_slice(value.as_bytes());
+        self.instance_id_len = value.len() as u16;
+        true
+    }
+
+    pub fn set_service(&mut self, value: &str) -> bool {
+        if value.len() > PNP_DEVNODE_NAME_MAX || value.len() > u16::MAX as usize {
+            return false;
+        }
+        self.service = [0; PNP_DEVNODE_NAME_MAX];
+        self.service[..value.len()].copy_from_slice(value.as_bytes());
+        self.service_len = value.len() as u16;
+        true
+    }
+
+    pub fn instance_id(&self) -> Option<&str> {
+        let len = self.instance_id_len as usize;
+        if len > PNP_DEVNODE_NAME_MAX {
+            return None;
+        }
+        core::str::from_utf8(&self.instance_id[..len]).ok()
+    }
+
+    pub fn service(&self) -> Option<&str> {
+        let len = self.service_len as usize;
+        if len > PNP_DEVNODE_NAME_MAX {
+            return None;
+        }
+        if len == 0 {
+            return None;
+        }
+        core::str::from_utf8(&self.service[..len]).ok()
+    }
+}
+
+impl Default for PnpCreateDevnodeReq {
+    fn default() -> Self {
+        Self {
+            abi_size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            instance_id_len: 0,
+            service_len: 0,
+            pdo_object_id: 0,
+            mem_start: 0,
+            mem_length: 0,
+            int_vector: 0,
+            int_level: 0,
+            int_affinity: 0,
+            int_latched: 0,
+            reserved: [0; 7],
+            instance_id: [0; PNP_DEVNODE_NAME_MAX],
+            service: [0; PNP_DEVNODE_NAME_MAX],
+        }
+    }
+}
+
 /// `PNP_OP_START_DEVICE` / `PNP_OP_REMOVE_DEVICE` etc. request.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -131,6 +237,25 @@ mod tests {
         assert_eq!(offset_of!(PnpDevnodeInfo, state), 16);
         assert_eq!(offset_of!(PnpDevnodeInfo, pdo_object_id), 24);
         assert_eq!(offset_of!(PnpDevnodeInfo, fdo_object_id), 32);
+    }
+
+    #[test]
+    fn create_devnode_req_layout_and_strings() {
+        assert_eq!(align_of::<PnpCreateDevnodeReq>(), 8);
+        assert_eq!(offset_of!(PnpCreateDevnodeReq, pdo_object_id), 8);
+        assert_eq!(offset_of!(PnpCreateDevnodeReq, mem_start), 16);
+        assert_eq!(offset_of!(PnpCreateDevnodeReq, instance_id), 56);
+
+        let mut req = PnpCreateDevnodeReq::new(0x1234, 0x1000_0000, 0x1000, 5, 5, 1, false);
+        assert!(req.set_instance_id(r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001"));
+        assert!(req.set_service("PnpMmioInterruptTest"));
+        assert_eq!(
+            req.instance_id(),
+            Some(r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001")
+        );
+        assert_eq!(req.service(), Some("PnpMmioInterruptTest"));
+        assert_eq!(req.pdo_object_id, 0x1234);
+        assert_eq!(req.mem_start, 0x1000_0000);
     }
 
     #[test]
