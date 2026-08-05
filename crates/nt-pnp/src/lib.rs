@@ -258,6 +258,191 @@ pub fn find_device_for_class(devices: &[PciDevice], class: DriverClass) -> Optio
     devices.iter().find(|d| bind_driver(d) == Some(class))
 }
 
+/// A parsed PCI registry ID constraint, such as `PCI\VEN_8086&DEV_100E` or `PCI\CC_020000`.
+///
+/// Windows stores these strings under `Enum\PCI\...\HardwareID` and `CompatibleIDs`, ordered from
+/// most to least specific. The PnP manager uses them to match an enumerated bus function to the
+/// service selected by INF/registry state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciIdPattern {
+    pub vendor: Option<u16>,
+    pub device: Option<u16>,
+    /// Class code parsed from `CC_...`. `class_digits` records whether the ID constrains the full
+    /// 24-bit class/progif (`6`), base+subclass (`4`), or only base class (`2`).
+    pub class: Option<u32>,
+    pub class_digits: u8,
+}
+
+fn eq_ascii_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn starts_with_pci_prefix(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() >= 4
+        && eq_ascii_ignore_case(&bytes[..3], b"PCI")
+        && matches!(bytes[3], b'\\' | b'/' | b'#')
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_hex_fixed(bytes: &[u8], pos: usize, digits: usize) -> Option<u32> {
+    if pos + digits > bytes.len() {
+        return None;
+    }
+    let mut value = 0u32;
+    for &b in &bytes[pos..pos + digits] {
+        value = (value << 4) | hex_nibble(b)? as u32;
+    }
+    Some(value)
+}
+
+fn find_hex_field(bytes: &[u8], prefix: &[u8], digits: usize) -> Option<u32> {
+    let needed = prefix.len() + digits;
+    if bytes.len() < needed {
+        return None;
+    }
+    let end = bytes.len() - needed;
+    let mut pos = 0usize;
+    while pos <= end {
+        if eq_ascii_ignore_case(&bytes[pos..pos + prefix.len()], prefix) {
+            return parse_hex_fixed(bytes, pos + prefix.len(), digits);
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn find_class_field(bytes: &[u8]) -> (Option<u32>, u8) {
+    let mut cc_pos = None;
+    let mut pos = 0usize;
+    while pos + 3 <= bytes.len() {
+        if eq_ascii_ignore_case(&bytes[pos..pos + 3], b"CC_") {
+            cc_pos = Some(pos);
+            break;
+        }
+        pos += 1;
+    }
+    let Some(cc_pos) = cc_pos else {
+        return (None, 0);
+    };
+    let value_pos = cc_pos + 3;
+    if let Some(value) = parse_hex_fixed(bytes, value_pos, 6) {
+        (Some(value), 6)
+    } else if let Some(value) = parse_hex_fixed(bytes, value_pos, 4) {
+        (Some(value), 4)
+    } else if let Some(value) = parse_hex_fixed(bytes, value_pos, 2) {
+        (Some(value), 2)
+    } else {
+        (None, 0)
+    }
+}
+
+/// Parse a PCI hardware/compatible/device-instance ID into match constraints.
+///
+/// This accepts the common NT forms:
+/// `PCI\VEN_vvvv&DEV_dddd...`, `PCI\VEN_vvvv`, `PCI\VEN_vvvv&CC_ccccpp`,
+/// `PCI\CC_ccccpp`, and the equivalent critical-device-database `PCI#...` prefix.
+pub fn parse_pci_id_pattern(id: &str) -> Option<PciIdPattern> {
+    if !starts_with_pci_prefix(id) {
+        return None;
+    }
+    let bytes = id.as_bytes();
+    let vendor = find_hex_field(bytes, b"VEN_", 4).map(|v| v as u16);
+    let device = find_hex_field(bytes, b"DEV_", 4).map(|v| v as u16);
+    let (class, class_digits) = find_class_field(bytes);
+    if vendor.is_none() && device.is_none() && class.is_none() {
+        return None;
+    }
+    Some(PciIdPattern {
+        vendor,
+        device,
+        class,
+        class_digits,
+    })
+}
+
+impl PciIdPattern {
+    /// Whether this registry ID constraint matches the enumerated PCI function.
+    pub fn matches(&self, device: &PciDevice) -> bool {
+        if self.vendor.is_some_and(|vendor| vendor != device.vendor) {
+            return false;
+        }
+        if self.device.is_some_and(|dev| dev != device.device) {
+            return false;
+        }
+        if let Some(class) = self.class {
+            match self.class_digits {
+                6 => {
+                    if device.class != class {
+                        return false;
+                    }
+                }
+                4 => {
+                    if (device.class >> 8) != class {
+                        return false;
+                    }
+                }
+                2 => {
+                    if (device.class >> 16) != class {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+fn find_device_for_id_pattern<'a>(
+    devices: &'a [PciDevice],
+    id: &str,
+) -> Option<&'a PciDevice> {
+    let pattern = parse_pci_id_pattern(id)?;
+    devices.iter().find(|device| pattern.matches(device))
+}
+
+/// Resolve a registry-imported PCI devnode to the enumerated PCI function it represents.
+///
+/// Match order mirrors NT's ID ranking for this boundary: hardware IDs first, then the `Enum\PCI`
+/// instance path as a specific fallback, then compatible IDs from most to least specific.
+pub fn find_pci_device_for_devnode<'a, H, C>(
+    devices: &'a [PciDevice],
+    instance_id: &str,
+    hardware_ids: &[H],
+    compatible_ids: &[C],
+) -> Option<&'a PciDevice>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
+    for id in hardware_ids {
+        if let Some(device) = find_device_for_id_pattern(devices, id.as_ref()) {
+            return Some(device);
+        }
+    }
+    if let Some(device) = find_device_for_id_pattern(devices, instance_id) {
+        return Some(device);
+    }
+    for id in compatible_ids {
+        if let Some(device) = find_device_for_id_pattern(devices, id.as_ref()) {
+            return Some(device);
+        }
+    }
+    None
+}
+
 /// The resource assignment PnP produces for a device: which MMIO window + interrupt (+ optional
 /// DMA common-buffer) the driver is granted. This is the abstract grant the executive turns into
 /// minted caps; [`assignment_to_cm_list`] encodes it as the `CM_RESOURCE_LIST` the driver reads.
@@ -441,6 +626,127 @@ mod tests {
         let nic = find_device_for_class(&devs, DriverClass::Network).unwrap();
         assert_eq!(nic.device, 0x100E);
         assert!(find_device_for_class(&devs, DriverClass::Storage).is_none());
+    }
+
+    #[test]
+    fn parses_pci_registry_id_patterns() {
+        assert_eq!(
+            parse_pci_id_pattern(r"PCI\VEN_8086&DEV_100E&SUBSYS_00008086&REV_02"),
+            Some(PciIdPattern {
+                vendor: Some(0x8086),
+                device: Some(0x100E),
+                class: None,
+                class_digits: 0,
+            })
+        );
+        assert_eq!(
+            parse_pci_id_pattern(r"pci\ven_8086&cc_020000"),
+            Some(PciIdPattern {
+                vendor: Some(0x8086),
+                device: None,
+                class: Some(0x020000),
+                class_digits: 6,
+            })
+        );
+        assert_eq!(
+            parse_pci_id_pattern(r"PCI#CC_0200"),
+            Some(PciIdPattern {
+                vendor: None,
+                device: None,
+                class: Some(0x0200),
+                class_digits: 4,
+            })
+        );
+        assert!(parse_pci_id_pattern(r"ROOT\USERSPLACE_NTOS_INTERFACE_TEST").is_none());
+    }
+
+    #[test]
+    fn matches_pci_devnode_by_hardware_id_before_broad_compatible_id() {
+        let devices = vec![
+            PciDevice {
+                bus: 0,
+                dev: 0,
+                func: 0,
+                vendor: 0x8086,
+                device: 0x29C0,
+                class: 0x060000,
+                irq_line: 0,
+                irq_pin: 0,
+                bars: vec![],
+            },
+            PciDevice {
+                bus: 0,
+                dev: 3,
+                func: 0,
+                vendor: 0x8086,
+                device: 0x100E,
+                class: 0x020000,
+                irq_line: 11,
+                irq_pin: 1,
+                bars: vec![Bar {
+                    index: 0,
+                    is_io: false,
+                    is_64bit: false,
+                    base: 0xFEBC_0000,
+                    size: 0x2_0000,
+                }],
+            },
+        ];
+        let dev = find_pci_device_for_devnode(
+            &devices,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[r"PCI\VEN_8086"],
+        )
+        .unwrap();
+        assert_eq!(dev.dev, 3);
+        assert_eq!(dev.device, 0x100E);
+    }
+
+    #[test]
+    fn matches_pci_devnode_from_instance_path_when_id_lists_are_empty() {
+        let m = nic_mock();
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
+        let dev = find_pci_device_for_devnode(
+            &devs,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            &[] as &[&str],
+            &[] as &[&str],
+        )
+        .unwrap();
+        assert_eq!(dev.vendor, 0x8086);
+        assert_eq!(dev.device, 0x100E);
+    }
+
+    #[test]
+    fn matches_pci_devnode_by_compatible_class_id() {
+        let m = nic_mock();
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
+        let dev = find_pci_device_for_devnode(
+            &devs,
+            r"PCI\VEN_DEAD&DEV_BEEF\0000",
+            &[] as &[&str],
+            &[r"PCI\CC_020000"],
+        )
+        .unwrap();
+        assert_eq!(dev.class, 0x020000);
+
+        let dev = find_pci_device_for_devnode(
+            &devs,
+            r"PCI\VEN_DEAD&DEV_BEEF\0000",
+            &[] as &[&str],
+            &[r"PCI\CC_0200"],
+        )
+        .unwrap();
+        assert_eq!(dev.class, 0x020000);
     }
 
     #[test]

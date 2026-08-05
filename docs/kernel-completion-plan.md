@@ -284,3 +284,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: B3 still needs real root-bus PDO objects/state and assigned hardware resource
   lists; after that, bind `MmMapIoSpace`/`IoConnectInterrupt` to resource-manager grants and retire
   the old bespoke NIC driver proof.
+- B3 continued. `nt-pnp` now parses registry PCI IDs (`PCI\VEN_...&DEV_...`, `PCI\CC_...`, and
+  `PCI#...`) and resolves imported `Enum` devnodes to enumerated PCI functions by hardware IDs,
+  instance path fallback, and compatible IDs. This keeps PCI identity matching host-testable and out
+  of the executive. Validation: `cargo test -p nt-pnp`. Review adjustment: the next B3 slice should
+  use this matcher in the executive boot plan to assign per-devnode `CM_RESOURCE_LIST`s, map the
+  matching BAR into the hosted component, and bind `MmMapIoSpace`/`IoConnectInterrupt` to the grant.
