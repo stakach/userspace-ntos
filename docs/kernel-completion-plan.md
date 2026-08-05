@@ -275,3 +275,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: B3 still needs resource assignment from devnode/bus state, root-bus PDO
   identity/forwarding, and the device-driver ntoskrnl exports (`IoCallDriver`, `MmMapIoSpace`,
   `IoConnectInterrupt`) before hardware-backed StartDevice can replace the old NIC proof.
+- B3 continued. Hosted AddDevice now preserves both sides of the WDM stack (`PDO` and `FDO`), PnP
+  lifecycle IRPs no longer fabricate a `FILE_OBJECT`, and PnP dispatch reserves a lower
+  `IO_STACK_LOCATION` for forwarding. The shared ntoskrnl import registry now binds stack-location
+  helpers plus `IoCallDriver`/`IofCallDriver`/`PoCallDriver`, with forwarded IRPs completing only
+  when the target matches the PDO carried from AddDevice. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: B3 still needs real root-bus PDO objects/state and assigned hardware resource
+  lists; after that, bind `MmMapIoSpace`/`IoConnectInterrupt` to resource-manager grants and retire
+  the old bespoke NIC driver proof.

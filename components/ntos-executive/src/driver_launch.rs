@@ -1166,6 +1166,72 @@ extern "win64" fn s_io_detach_device(lower: u64) {
     }
 }
 
+unsafe fn irp_current_stack_location(irp: u64) -> u64 {
+    if irp == 0 {
+        0
+    } else {
+        read_unaligned((irp + 0xb8) as *const u64)
+    }
+}
+
+unsafe fn irp_next_stack_location(irp: u64) -> u64 {
+    irp_current_stack_location(irp).saturating_sub(WDM_X64_IO_STACK_LOCATION_SIZE as u64)
+}
+
+/// `PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP)`.
+extern "win64" fn s_io_get_current_irp_stack_location(irp: u64) -> u64 {
+    unsafe { irp_current_stack_location(irp) }
+}
+
+/// `PIO_STACK_LOCATION IoGetNextIrpStackLocation(PIRP)`.
+extern "win64" fn s_io_get_next_irp_stack_location(irp: u64) -> u64 {
+    unsafe { irp_next_stack_location(irp) }
+}
+
+/// `void IoCopyCurrentIrpStackLocationToNext(PIRP)`.
+extern "win64" fn s_io_copy_current_irp_stack_location_to_next(irp: u64) {
+    unsafe {
+        let current = irp_current_stack_location(irp);
+        let next = irp_next_stack_location(irp);
+        if current == 0 || next == 0 {
+            return;
+        }
+        let mut off = 0u64;
+        while off < WDM_X64_IO_STACK_LOCATION_SIZE as u64 {
+            let byte = read_unaligned((current + off) as *const u8);
+            write_unaligned((next + off) as *mut u8, byte);
+            off += 1;
+        }
+    }
+}
+
+/// `void IoSkipCurrentIrpStackLocation(PIRP)`.
+extern "win64" fn s_io_skip_current_irp_stack_location(_irp: u64) {}
+
+/// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
+extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
+    unsafe {
+        let expected_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let status = if expected_pdo == 0 || device == expected_pdo {
+            0
+        } else {
+            0xC000_0010u32 as i32 // STATUS_INVALID_DEVICE_REQUEST
+        };
+        if irp != 0 {
+            write_unaligned((irp + 0x30) as *mut i32, status);
+        }
+        status
+    }
+}
+
+/// `NTSTATUS PoCallDriver(PDEVICE_OBJECT, PIRP)`.
+extern "win64" fn s_po_call_driver(device: u64, irp: u64) -> i32 {
+    s_iof_call_driver(device, irp)
+}
+
+/// `void PoStartNextPowerIrp(PIRP)`.
+extern "win64" fn s_po_start_next_power_irp(_irp: u64) {}
+
 /// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
 /// link so the executive can publish it through the kernel object namespace after DriverEntry.
 extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
@@ -1604,6 +1670,38 @@ fn register_fsd_trampolines() {
         s_io_detach_device as *const () as usize as u64,
     );
     reg.bind(
+        "IoGetCurrentIrpStackLocation",
+        s_io_get_current_irp_stack_location as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetNextIrpStackLocation",
+        s_io_get_next_irp_stack_location as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCopyCurrentIrpStackLocationToNext",
+        s_io_copy_current_irp_stack_location_to_next as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSkipCurrentIrpStackLocation",
+        s_io_skip_current_irp_stack_location as *const () as usize as u64,
+    );
+    reg.bind(
+        "IofCallDriver",
+        s_iof_call_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCallDriver",
+        s_iof_call_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoCallDriver",
+        s_po_call_driver as *const () as usize as u64,
+    );
+    reg.bind(
+        "PoStartNextPowerIrp",
+        s_po_start_next_power_irp as *const () as usize as u64,
+    );
+    reg.bind(
         "IoCreateSymbolicLink",
         s_io_create_symbolic_link as usize as u64,
     );
@@ -1937,28 +2035,33 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let fsctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
 
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+    let uses_file_object = major != IRP_MJ_PNP;
 
     // ★ Audit the CCB's data queues (and the FILE_OBJECTs npfs holds) BEFORE handing it an IRP.
     // npfs' own ASSERTs over these invariants are compiled out of the release binary, and a broken
     // one is a call-free infinite spin inside `NpGetNextRealDataQueueEntry` that freezes the whole
     // boot. See [`audit_ccb`].
-    audit_ccb(file_id);
+    if uses_file_object {
+        audit_ccb(file_id);
+    }
 
     // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
     // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
     // and writes through that pointer on disconnect), so it must NOT be rebuilt/freed per request.
-    let existing = if crate::FSD_FILE_OBJECT_PER_OPEN {
+    let existing = if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN {
         fo_lookup(file_id)
     } else {
         0
     };
-    let owns_fo = existing == 0;
-    let fo = if owns_fo {
+    let owns_fo = uses_file_object && existing == 0;
+    let fo = if !uses_file_object {
+        0
+    } else if owns_fo {
         pool_alloc(WDM_X64_FILE_OBJECT_SIZE as u64)
     } else {
         existing
     };
-    if fo == 0 {
+    if uses_file_object && fo == 0 {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     if owns_fo {
@@ -1978,7 +2081,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             pool_free(fo);
             return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
         }
-    } else {
+    } else if uses_file_object {
         // The open's FILE_OBJECT: npfs owns its contents (FsContext/FsContext2/Flags/PrivateCacheMap
         // were set by `NpSetFileObject` at create time and must persist). Leave them alone.
         FSD_FO_REUSED.fetch_add(1, Ordering::Relaxed);
@@ -2007,7 +2110,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // Create/CreatePipe: SecurityContext@+0x08, Options@+0x10, ShareAccess@+0x1a, Parameters@+0x20.
     // Read/Write: Length@+0x08. SetFile: Length@+0x08, FileInformationClass@+0x10.
     // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18.
-    let iosl = pool_alloc(WDM_X64_IO_STACK_LOCATION_SIZE as u64);
+    let iosl_len = if major == IRP_MJ_PNP {
+        WDM_X64_IO_STACK_LOCATION_SIZE as u64 * 2
+    } else {
+        WDM_X64_IO_STACK_LOCATION_SIZE as u64
+    };
+    let iosl = pool_alloc(iosl_len);
     if iosl == 0 {
         pool_free(data);
         if owns_fo {
@@ -2015,6 +2123,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
+    let current_iosl = if major == IRP_MJ_PNP {
+        iosl + WDM_X64_IO_STACK_LOCATION_SIZE as u64
+    } else {
+        iosl
+    };
     let mut pnp_resource_list = 0u64;
     let stack_parameters = match major {
         0 | 1 => {
@@ -2108,7 +2221,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         _ => WdmIoStackParameters::None,
     };
     let iosl_bytes =
-        core::slice::from_raw_parts_mut(iosl as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE);
+        core::slice::from_raw_parts_mut(current_iosl as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE);
     if write_wdm_io_stack_location(
         iosl_bytes,
         WdmIoStackLocationInit {
@@ -2152,7 +2265,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         WdmIrpInit {
             system_buffer: data,
             user_buffer: data,
-            current_stack_location: iosl,
+            current_stack_location: current_iosl,
         },
     )
     .is_err()
@@ -2195,17 +2308,22 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     } else {
         ret
     };
-    // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
-    let fsctx = read_unaligned((fo + 0x18) as *const u64);
+    // FsContext lands in the FILE_OBJECT; report it as the opaque file id for future file I/O.
+    // PnP lifecycle IRPs carry no FILE_OBJECT, so keep SH_REQ_FILEID as the lower PDO token.
+    let fsctx = if uses_file_object {
+        read_unaligned((fo + 0x18) as *const u64)
+    } else {
+        file_id
+    };
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
     // A freshly-created open: bind THIS FILE_OBJECT to the context npfs just handed back, so every
     // later IRP on that open reuses it (and npfs' stored `Ccb->FileObject[end]` stays valid).
     let mut fo_registered = false;
-    if crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
+    if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
         fo_registered = fo_register(fsctx, fo);
     }
     // CLEANUP / CLOSE end the open — this is where a FILE_OBJECT legitimately dies.
-    if major == IRP_MJ_CLEANUP || major == IRP_MJ_CLOSE {
+    if uses_file_object && (major == IRP_MJ_CLEANUP || major == IRP_MJ_CLOSE) {
         fo_release(file_id);
         fo_registered = false;
     }
@@ -3455,7 +3573,7 @@ fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_st
         DeviceFlags::BUFFERED_IO,
         0,
     )?;
-    register_hosted_device_binding(driver_id, device_id.raw(), dc.instance, dc.devobj);
+    register_hosted_device_binding(driver_id, device_id.raw(), dc.instance, dc.devobj, 0);
     Ok(device_id.raw())
 }
 
@@ -3480,6 +3598,7 @@ struct HostedDeviceBinding {
     device_id: u64,
     instance: usize,
     device_object: u64,
+    pdo_object: u64,
     used: bool,
 }
 
@@ -3488,6 +3607,7 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     device_id: 0,
     instance: 0,
     device_object: 0,
+    pdo_object: 0,
     used: false,
 };
 
@@ -3500,6 +3620,7 @@ fn register_hosted_device_binding(
     device_id: u64,
     instance: usize,
     device_object: u64,
+    pdo_object: u64,
 ) {
     if device_id == 0 || device_object == 0 {
         return;
@@ -3514,6 +3635,7 @@ fn register_hosted_device_binding(
             device_id,
             instance,
             device_object,
+            pdo_object,
             used: true,
         };
         return;
@@ -3524,6 +3646,7 @@ fn register_hosted_device_binding(
             device_id,
             instance,
             device_object,
+            pdo_object,
             used: true,
         };
     }
@@ -3775,10 +3898,15 @@ unsafe fn dispatch_driver_unload_for_instance(
     nt_status::NtStatus(pr.status).to_result()
 }
 
+struct AddDeviceDispatchResult {
+    pdo_object: u64,
+    fdo_object: u64,
+}
+
 unsafe fn dispatch_add_device_for_instance(
     index: usize,
     inst: DriverInstance,
-) -> Result<u64, nt_status::NtStatus> {
+) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
     if inst.driver_object == 0 || inst.add_device == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -3819,11 +3947,15 @@ unsafe fn dispatch_add_device_for_instance(
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     nt_status::NtStatus(pr.status).to_result()?;
-    let fdo = read_volatile((sh + SH_REQ_INFO) as *const u64);
-    if fdo == 0 {
+    let fdo_object = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    let pdo_object = read_volatile((sh + SH_REQ_FILEID) as *const u64);
+    if fdo_object == 0 || pdo_object == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    Ok(fdo)
+    Ok(AddDeviceDispatchResult {
+        pdo_object,
+        fdo_object,
+    })
 }
 
 /// Invoke a loaded WDM driver's real `DriverExtension->AddDevice` for one registry-selected devnode
@@ -3833,7 +3965,7 @@ pub(crate) unsafe fn call_add_device_for_driver(
 ) -> Result<u64, nt_status::NtStatus> {
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    let fdo = dispatch_add_device_for_instance(index, inst)?;
+    let add_device = dispatch_add_device_for_instance(index, inst)?;
     let device_id = io_manager_mut().create_device(
         DriverId(driver_id),
         None,
@@ -3842,12 +3974,18 @@ pub(crate) unsafe fn call_add_device_for_driver(
         DeviceFlags::BUFFERED_IO,
         0,
     )?;
-    register_hosted_device_binding(driver_id, device_id.raw(), index, fdo);
+    register_hosted_device_binding(
+        driver_id,
+        device_id.raw(),
+        index,
+        add_device.fdo_object,
+        add_device.pdo_object,
+    );
 
     let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
     if index < table.len() && table[index].used {
         table[index].device_id = device_id.raw();
-        table[index].device_object = fdo;
+        table[index].device_object = add_device.fdo_object;
         table[index].ready = true;
     }
     Ok(device_id.raw())
@@ -3873,7 +4011,7 @@ pub(crate) unsafe fn start_hosted_device(
         IRP_MN_START_DEVICE,
         binding.device_object,
         0,
-        0,
+        binding.pdo_object,
         resource_list,
         &mut out,
     )
