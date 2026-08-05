@@ -79,6 +79,10 @@ impl RegistryValue {
         )
         .then(|| decode_utf16le(&self.data))
     }
+    /// Interpret as a `REG_MULTI_SZ` (UTF-16LE string list), stripping the final empty string.
+    pub fn as_multi_string(&self) -> Option<Vec<String>> {
+        (self.value_type == RegistryValueType::MultiSz).then(|| decode_multi_utf16le(&self.data))
+    }
 }
 
 /// Encode `s` as UTF-16LE + a NUL terminator (the registry `REG_SZ` on-disk form).
@@ -86,6 +90,19 @@ pub fn encode_sz(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2 + 2);
     for u in s.encode_utf16() {
         out.extend_from_slice(&u.to_le_bytes());
+    }
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// Encode strings as UTF-16LE `REG_MULTI_SZ` data with a double-NUL terminator.
+pub fn encode_multi_sz(strings: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for s in strings {
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
     }
     out.extend_from_slice(&[0, 0]);
     out
@@ -100,6 +117,36 @@ pub(crate) fn decode_utf16le(bytes: &[u8]) -> String {
     char::decode_utf16(units)
         .map(|r| r.unwrap_or('\u{FFFD}'))
         .collect()
+}
+
+fn decode_multi_utf16le(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for u in bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    {
+        if u == 0 {
+            if cur.is_empty() {
+                break;
+            }
+            out.push(
+                char::decode_utf16(cur.drain(..))
+                    .map(|r| r.unwrap_or('\u{FFFD}'))
+                    .collect(),
+            );
+        } else {
+            cur.push(u);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(
+            char::decode_utf16(cur)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect(),
+        );
+    }
+    out
 }
 
 /// Case-insensitive registry name key (ASCII fold — registry names are ASCII in practice).
@@ -323,6 +370,9 @@ impl Registry {
     pub fn query_string(&self, key: RegistryKeyId, name: &str) -> Option<String> {
         self.query_value(key, name)?.as_string()
     }
+    pub fn query_multi_string(&self, key: RegistryKeyId, name: &str) -> Option<Vec<String>> {
+        self.query_value(key, name)?.as_multi_string()
+    }
 
     /// `ZwDeleteValueKey`.
     pub fn delete_value(&mut self, key: RegistryKeyId, name: &str) -> bool {
@@ -428,9 +478,19 @@ mod tests {
         r.set_dword(k, "D", 0xDEAD_BEEF);
         r.set_qword(k, "Q", 0x1122_3344_5566_7788);
         r.set_string(k, "S", "hello");
+        r.set_value(
+            k,
+            "M",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["RpcSs", "EventLog"]),
+        );
         assert_eq!(r.query_dword(k, "d"), Some(0xDEAD_BEEF)); // case-insensitive value name
         assert_eq!(r.query_qword(k, "Q"), Some(0x1122_3344_5566_7788));
         assert_eq!(r.query_string(k, "S").as_deref(), Some("hello"));
+        assert_eq!(
+            r.query_multi_string(k, "M"),
+            Some(alloc::vec![String::from("RpcSs"), String::from("EventLog")])
+        );
         // Overwrite + delete.
         r.set_dword(k, "D", 1);
         assert_eq!(r.query_dword(k, "D"), Some(1));

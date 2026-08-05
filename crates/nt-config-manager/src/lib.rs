@@ -22,12 +22,34 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub use property::{device_property, devprop_type, DevPropKey, PropertyBag, PropertyValue};
-pub use registry::{encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType};
+pub use registry::{
+    encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType,
+};
 
 pub const SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
 pub const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 pub const DEVICE_CLASSES_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\DeviceClasses";
+
+pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
+pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
+pub const SERVICE_ADAPTER: u32 = 0x0000_0004;
+pub const SERVICE_RECOGNIZER_DRIVER: u32 = 0x0000_0008;
+pub const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
+pub const SERVICE_WIN32_SHARE_PROCESS: u32 = 0x0000_0020;
+pub const SERVICE_INTERACTIVE_PROCESS: u32 = 0x0000_0100;
+
+pub const SERVICE_DRIVER_TYPE_MASK: u32 = SERVICE_KERNEL_DRIVER
+    | SERVICE_FILE_SYSTEM_DRIVER
+    | SERVICE_ADAPTER
+    | SERVICE_RECOGNIZER_DRIVER;
+pub const SERVICE_WIN32_TYPE_MASK: u32 = SERVICE_WIN32_OWN_PROCESS | SERVICE_WIN32_SHARE_PROCESS;
+
+pub const SERVICE_BOOT_START: u32 = 0;
+pub const SERVICE_SYSTEM_START: u32 = 1;
+pub const SERVICE_AUTO_START: u32 = 2;
+pub const SERVICE_DEMAND_START: u32 = 3;
+pub const SERVICE_DISABLED: u32 = 4;
 
 pub type ServiceId = u64;
 pub type DevnodeId = u64;
@@ -45,6 +67,46 @@ pub struct ServiceRecord {
     pub class_guid: Option<String>,
     pub start_type: u32,
     pub error_control: u32,
+}
+
+/// Typed view of a `Services\<Name>` key.
+///
+/// This is read from the registry tree instead of the in-memory service index so imported hives
+/// and runtime registry mutations remain authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceMetadata {
+    pub name: String,
+    pub service_key: RegistryKeyId,
+    pub parameters_key: Option<RegistryKeyId>,
+    pub image_path: Option<String>,
+    pub service_type: Option<u32>,
+    pub start_type: Option<u32>,
+    pub error_control: Option<u32>,
+    pub load_order_group: Option<String>,
+    pub tag: Option<u32>,
+    pub dependencies: Vec<String>,
+    pub display_name: Option<String>,
+    pub object_name: Option<String>,
+}
+
+impl ServiceMetadata {
+    pub fn is_driver(&self) -> bool {
+        self.service_type
+            .is_some_and(|ty| ty & SERVICE_DRIVER_TYPE_MASK != 0)
+    }
+
+    pub fn is_win32_service(&self) -> bool {
+        self.service_type
+            .is_some_and(|ty| ty & SERVICE_WIN32_TYPE_MASK != 0)
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.start_type == Some(SERVICE_DISABLED)
+    }
+
+    pub fn has_launch_image(&self) -> bool {
+        self.image_path.as_ref().is_some_and(|p| !p.is_empty())
+    }
 }
 
 /// A device node (devnode) record (spec §10.1).
@@ -127,10 +189,34 @@ impl ConfigManager {
         start_type: u32,
         error_control: u32,
     ) -> ServiceId {
+        self.register_typed_service(
+            name,
+            image_path,
+            SERVICE_KERNEL_DRIVER,
+            class,
+            class_guid,
+            start_type,
+            error_control,
+        )
+    }
+
+    /// Register a service with an explicit NT `Type` value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_typed_service(
+        &mut self,
+        name: &str,
+        image_path: &str,
+        service_type: u32,
+        class: Option<&str>,
+        class_guid: Option<&str>,
+        start_type: u32,
+        error_control: u32,
+    ) -> ServiceId {
         let service_key = self.registry.create_key(&service_path(name));
         let parameters_key = self.registry.create_subkey(service_key, "Parameters");
         self.registry
             .set_string(service_key, "ImagePath", image_path);
+        self.registry.set_dword(service_key, "Type", service_type);
         self.registry.set_dword(service_key, "Start", start_type);
         self.registry
             .set_dword(service_key, "ErrorControl", error_control);
@@ -182,6 +268,86 @@ impl ConfigManager {
             return false;
         };
         self.registry.set_value(key, value_name, value_type, data)
+    }
+
+    /// Read a typed service view from the live registry tree.
+    pub fn service_metadata(&self, name: &str) -> Option<ServiceMetadata> {
+        let service_key = self.registry.open_key(&service_path(name))?;
+        let name = self
+            .registry
+            .key_path(service_key)
+            .and_then(|p| p.rsplit('\\').next().map(String::from))
+            .unwrap_or_else(|| name.into());
+        Some(self.service_metadata_from_key(&name, service_key))
+    }
+
+    /// Enumerate typed service views from `CurrentControlSet\Services`.
+    pub fn service_metadata_list(&self) -> Vec<ServiceMetadata> {
+        let Some(services_key) = self.registry.open_key(SERVICES_PATH) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for name in self.registry.enum_subkeys(services_key) {
+            if let Some(service_key) = self.registry.open_subkey(services_key, &name) {
+                out.push(self.service_metadata_from_key(&name, service_key));
+            }
+        }
+        sort_service_metadata(&mut out);
+        out
+    }
+
+    /// Generic service selection from registry metadata. Callers own policy; this only filters on
+    /// explicit `Start` values, explicit `Type` bits, and a non-empty `ImagePath`.
+    pub fn service_candidates_by_start_and_type(
+        &self,
+        start_types: &[u32],
+        type_mask: u32,
+    ) -> Vec<ServiceMetadata> {
+        let mut out: Vec<ServiceMetadata> = self
+            .service_metadata_list()
+            .into_iter()
+            .filter(|s| {
+                s.has_launch_image()
+                    && s.start_type
+                        .is_some_and(|start| start_types.contains(&start))
+                    && s.service_type.is_some_and(|ty| ty & type_mask != 0)
+            })
+            .collect();
+        sort_service_metadata(&mut out);
+        out
+    }
+
+    /// Registry-declared drivers eligible for kernel boot/system driver bring-up.
+    pub fn boot_system_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.service_candidates_by_start_and_type(
+            &[SERVICE_BOOT_START, SERVICE_SYSTEM_START],
+            SERVICE_DRIVER_TYPE_MASK,
+        )
+    }
+
+    /// Registry-declared Win32 services that SCM should auto-start after it owns policy.
+    pub fn auto_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
+        self.service_candidates_by_start_and_type(&[SERVICE_AUTO_START], SERVICE_WIN32_TYPE_MASK)
+    }
+
+    fn service_metadata_from_key(&self, name: &str, service_key: RegistryKeyId) -> ServiceMetadata {
+        ServiceMetadata {
+            name: name.into(),
+            service_key,
+            parameters_key: self.registry.open_subkey(service_key, "Parameters"),
+            image_path: self.registry.query_string(service_key, "ImagePath"),
+            service_type: self.registry.query_dword(service_key, "Type"),
+            start_type: self.registry.query_dword(service_key, "Start"),
+            error_control: self.registry.query_dword(service_key, "ErrorControl"),
+            load_order_group: self.registry.query_string(service_key, "Group"),
+            tag: self.registry.query_dword(service_key, "Tag"),
+            dependencies: self
+                .registry
+                .query_multi_string(service_key, "DependOnService")
+                .unwrap_or_default(),
+            display_name: self.registry.query_string(service_key, "DisplayName"),
+            object_name: self.registry.query_string(service_key, "ObjectName"),
+        }
     }
 
     /// Set a DWORD on a service's own key (e.g. `Start`, `CrashCount`) — used by the
@@ -421,6 +587,20 @@ fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
     s
 }
 
+fn sort_service_metadata(services: &mut [ServiceMetadata]) {
+    services.sort_by(|a, b| {
+        a.start_type
+            .cmp(&b.start_type)
+            .then_with(|| a.load_order_group.cmp(&b.load_order_group))
+            .then_with(|| a.tag.cmp(&b.tag))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +635,10 @@ mod tests {
                 r"\Registry\Machine\System\CurrentControlSet\Services\KmdfInterfaceRegistryTest",
             )
             .unwrap();
+        assert_eq!(
+            cm.registry().query_dword(key, "Type"),
+            Some(SERVICE_KERNEL_DRIVER)
+        );
         assert_eq!(cm.registry().query_dword(key, "Start"), Some(3));
         assert_eq!(
             cm.registry().query_string(key, "ImagePath").as_deref(),
@@ -486,6 +670,110 @@ mod tests {
             cm.service_key_path("kmdfinterfaceregistrytest").as_deref(),
             Some(r"\Registry\Machine\System\CurrentControlSet\Services\KmdfInterfaceRegistryTest")
         );
+    }
+
+    #[test]
+    fn service_metadata_reads_registry_values() {
+        let mut cm = ConfigManager::new();
+        let key = cm
+            .registry_mut()
+            .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs");
+        cm.registry_mut().set_string(
+            key,
+            "ImagePath",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+        );
+        cm.registry_mut()
+            .set_dword(key, "Type", SERVICE_WIN32_SHARE_PROCESS);
+        cm.registry_mut()
+            .set_dword(key, "Start", SERVICE_AUTO_START);
+        cm.registry_mut().set_dword(key, "ErrorControl", 1);
+        cm.registry_mut().set_string(key, "Group", "Network");
+        cm.registry_mut().set_dword(key, "Tag", 7);
+        cm.registry_mut()
+            .set_string(key, "DisplayName", "Remote Procedure Call");
+        cm.registry_mut()
+            .set_string(key, "ObjectName", "LocalSystem");
+        cm.registry_mut().set_value(
+            key,
+            "DependOnService",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["DcomLaunch", "RpcEptMapper"]),
+        );
+        let params = cm.registry_mut().create_subkey(key, "Parameters");
+
+        let svc = cm.service_metadata("rpcss").unwrap();
+        assert_eq!(svc.name, "RpcSs");
+        assert_eq!(svc.service_key, key);
+        assert_eq!(svc.parameters_key, Some(params));
+        assert_eq!(svc.service_type, Some(SERVICE_WIN32_SHARE_PROCESS));
+        assert_eq!(svc.start_type, Some(SERVICE_AUTO_START));
+        assert_eq!(svc.error_control, Some(1));
+        assert_eq!(svc.load_order_group.as_deref(), Some("Network"));
+        assert_eq!(svc.tag, Some(7));
+        assert_eq!(svc.display_name.as_deref(), Some("Remote Procedure Call"));
+        assert_eq!(svc.object_name.as_deref(), Some("LocalSystem"));
+        assert_eq!(
+            svc.dependencies,
+            alloc::vec![String::from("DcomLaunch"), String::from("RpcEptMapper")]
+        );
+        assert!(svc.is_win32_service());
+        assert!(!svc.is_driver());
+        assert!(svc.has_launch_image());
+    }
+
+    #[test]
+    fn service_candidates_are_selected_from_registry_metadata() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "RpcSs",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "Npfs",
+            r"system32\drivers\npfs.sys",
+            SERVICE_FILE_SYSTEM_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        cm.register_typed_service(
+            "DisabledSvc",
+            r"%SystemRoot%\system32\disabled.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_DISABLED,
+            1,
+        );
+        let malformed = cm
+            .registry_mut()
+            .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\NoImage");
+        cm.registry_mut()
+            .set_dword(malformed, "Type", SERVICE_WIN32_OWN_PROCESS);
+        cm.registry_mut()
+            .set_dword(malformed, "Start", SERVICE_AUTO_START);
+
+        let auto = cm.auto_start_win32_service_candidates();
+        assert_eq!(auto.len(), 1);
+        assert_eq!(auto[0].name, "RpcSs");
+
+        let drivers = cm.boot_system_driver_candidates();
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0].name, "Npfs");
+
+        let all_auto = cm.service_candidates_by_start_and_type(
+            &[SERVICE_AUTO_START],
+            SERVICE_WIN32_TYPE_MASK | SERVICE_DRIVER_TYPE_MASK,
+        );
+        assert_eq!(all_auto.len(), 1);
+        assert_eq!(all_auto[0].name, "RpcSs");
     }
 
     #[test]
