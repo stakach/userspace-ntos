@@ -1912,8 +1912,7 @@ pub(crate) fn event_body_for_client_handle(handle: u64) -> Option<u64> {
 }
 
 pub(crate) fn event_body_ready(body: u64) -> bool {
-    body != 0
-        && unsafe { nt_kernel_exec::kevent::kevent_read_state(body as *const u8) }
+    body != 0 && unsafe { nt_kernel_exec::kevent::kevent_read_state(body as *const u8) }
 }
 
 pub(crate) fn event_body_consume(body: u64) -> bool {
@@ -3270,6 +3269,7 @@ static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PENDING_OB_UNCACHED_WINSTA: AtomicU64 = AtomicU64::new(0);
@@ -3437,6 +3437,115 @@ unsafe fn current_w32thread() -> u64 {
         .unwrap_or(0)
 }
 
+fn print_win32k_hex64(value: u64) {
+    print_hex((value >> 32) as u32);
+    print_hex(value as u32);
+}
+
+unsafe fn read_u64_field_if_present(base: u64, offset: u64) -> u64 {
+    if base == 0 {
+        0
+    } else {
+        read_volatile((base + offset) as *const u64)
+    }
+}
+
+/// Wall-only context diagnostic for ReactOS win32k failures that depend on the current-thread object.
+/// `UserRefObjectCo` / `UserDerefObjectCo` use `PsGetCurrentThreadWin32Thread()->ReferencesList`;
+/// when that list is unexpectedly empty, the important state is which ETHREAD/THREADINFO win32k saw
+/// at the exact fault, not whichever client request the executive handles next.
+pub(crate) unsafe fn trace_win32k_wall_context() {
+    let n = WIN32K_WALL_CONTEXT_TRACES.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 {
+        return;
+    }
+    let pi = WIN32K_CURRENT_CLIENT_PI.load(Ordering::Relaxed);
+    let pid = WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed);
+    let tid = WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed);
+    let eprocess = current_eprocess();
+    let ethread = current_ethread();
+    let w32process = current_w32process();
+    let w32thread = current_w32thread();
+    let slot_process = read_volatile(SLOT_W32PROCESS as *const u64);
+    let slot_thread = read_volatile(SLOT_W32THREAD as *const u64);
+    let kpcr_teb = read_volatile((WIN32K_KPCR_VA + 0x30) as *const u64);
+    let kpcr_process = read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64);
+    let kpcr_thread = read_volatile((WIN32K_KPCR_VA + 0x188) as *const u64);
+    let kthread_w32thread = read_u64_field_if_present(ethread, KTHREAD_WIN32THREAD_OFF);
+    let refs = read_u64_field_if_present(w32thread, 0x2f8);
+    let locks = if w32thread == 0 {
+        0
+    } else {
+        read_volatile((w32thread + 0x344) as *const u32) as u64
+    };
+    print_str(b"[w32ctx-wall] #");
+    print_u64(n);
+    print_str(b" current pi=");
+    print_u64(pi);
+    print_str(b" pid=");
+    print_u64(pid);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" eprocess=0x");
+    print_win32k_hex64(eprocess);
+    print_str(b" ethread=0x");
+    print_win32k_hex64(ethread);
+    print_str(b" ppi=0x");
+    print_win32k_hex64(w32process);
+    print_str(b" pti=0x");
+    print_win32k_hex64(w32thread);
+    print_str(b"\n");
+    print_str(b"[w32ctx-wall] slots ppi=0x");
+    print_win32k_hex64(slot_process);
+    print_str(b" pti=0x");
+    print_win32k_hex64(slot_thread);
+    print_str(b" kpcr-teb=0x");
+    print_win32k_hex64(kpcr_teb);
+    print_str(b" kpcr-process=0x");
+    print_win32k_hex64(kpcr_process);
+    print_str(b" kpcr-thread=0x");
+    print_win32k_hex64(kpcr_thread);
+    print_str(b" kth-pti=0x");
+    print_win32k_hex64(kthread_w32thread);
+    print_str(b" refs=0x");
+    print_win32k_hex64(refs);
+    print_str(b" locks=");
+    print_u64(locks);
+    print_str(b"\n");
+
+    let mut printed = 0usize;
+    for index in 0..WIN32K_GUI_THREAD_CAP {
+        let row_tid = WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed);
+        if row_tid == 0 || WIN32K_THREAD_CTX_PIS[index].load(Ordering::Relaxed) != pi {
+            continue;
+        }
+        let row_pid = WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
+        let row_ethread = WIN32K_THREAD_CTX_ETHREAD[index].load(Ordering::Relaxed);
+        let row_w32thread = WIN32K_THREAD_CTX_W32THREAD[index].load(Ordering::Relaxed);
+        let row_refs = read_u64_field_if_present(row_w32thread, 0x2f8);
+        let row_kthread_w32thread = read_u64_field_if_present(row_ethread, KTHREAD_WIN32THREAD_OFF);
+        print_str(b"[w32ctx-wall] table idx=");
+        print_u64(index as u64);
+        print_str(b" pid=");
+        print_u64(row_pid);
+        print_str(b" tid=");
+        print_u64(row_tid);
+        print_str(b" ethread=0x");
+        print_win32k_hex64(row_ethread);
+        print_str(b" pti=0x");
+        print_win32k_hex64(row_w32thread);
+        print_str(b" kth-pti=0x");
+        print_win32k_hex64(row_kthread_w32thread);
+        print_str(b" refs=0x");
+        print_win32k_hex64(row_refs);
+        print_str(b"\n");
+        printed += 1;
+        if printed >= 12 {
+            break;
+        }
+    }
+}
+
 unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
     if process_id == 0 {
         return current_eprocess();
@@ -3589,28 +3698,60 @@ struct Win32kCallbackRequestContext {
     process_role: u64,
 }
 
-unsafe fn current_user_callback_request_context() -> Option<Win32kCallbackRequestContext> {
-    let sh = WIN32K_SHARED_VADDR;
-    let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
-    let pid = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
-    let tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
-    if pi == 0 || pi > u32::MAX as u64 || pid == 0 || tid == 0 {
+unsafe fn callback_request_context_for_request(
+    request: &nt_user_callback::CallbackHeader,
+) -> Option<Win32kCallbackRequestContext> {
+    if request.client_pi == 0 || request.client_tid == 0 {
         return None;
     }
+    let thread_index = thread_context_index_for_tid(request.client_tid)?;
+    let pid = WIN32K_THREAD_CTX_PIDS[thread_index].load(Ordering::Relaxed);
+    if pid == 0 {
+        return None;
+    }
+    let process_index = process_context_index_for_pid(pid)?;
+    if WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed) != request.client_pi as u64
+        || WIN32K_THREAD_CTX_PIS[thread_index].load(Ordering::Relaxed) != request.client_pi as u64
+    {
+        return None;
+    }
+
+    let sh = WIN32K_SHARED_VADDR;
+    let sh_pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let sh_pid = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
+    let sh_tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    let sh_matches_request =
+        sh_pi == request.client_pi as u64 && sh_pid == pid && sh_tid == request.client_tid;
+    let role_matches_process = sh_pi == request.client_pi as u64 && sh_pid == pid;
+    let table_teb = WIN32K_THREAD_CTX_TEB[thread_index].load(Ordering::Relaxed);
+    let supplied_eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
+    let supplied_ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+
     Some(Win32kCallbackRequestContext {
-        pi: pi as u32,
+        pi: request.client_pi,
         pid,
-        tid,
-        client_teb: read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64),
-        supplied_eprocess: read_volatile((sh + SH_REQ_EPROCESS) as *const u64),
-        supplied_ethread: read_volatile((sh + SH_REQ_ETHREAD) as *const u64),
-        process_role: read_volatile((sh + SH_REQ_PROCESS_ROLE) as *const u64),
+        tid: request.client_tid,
+        client_teb: if sh_matches_request {
+            let sh_teb = read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64);
+            if sh_teb != 0 {
+                sh_teb
+            } else {
+                table_teb
+            }
+        } else {
+            table_teb
+        },
+        supplied_eprocess,
+        supplied_ethread,
+        process_role: if role_matches_process {
+            read_volatile((sh + SH_REQ_PROCESS_ROLE) as *const u64)
+        } else {
+            HOSTED_PROCESS_ROLE_NONE
+        },
     })
 }
 
-unsafe fn restore_user_callback_request_context(
-    context: Win32kCallbackRequestContext,
-) -> bool {
+unsafe fn restore_user_callback_request_context(context: Win32kCallbackRequestContext) -> bool {
     restore_current_context_for_user_callback_resume_inner(
         context.pi,
         context.pid,
@@ -3619,7 +3760,7 @@ unsafe fn restore_user_callback_request_context(
         context.supplied_eprocess,
         context.supplied_ethread,
         context.process_role,
-        false,
+        true,
         false,
     )
 }
@@ -5453,7 +5594,6 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             return 0xC000_0023u32 as i32;
         }
 
-        let callback_request_context = current_user_callback_request_context();
         let frame =
             (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
         let mut header = read_volatile(core::ptr::addr_of!((*frame).header));
@@ -5487,6 +5627,9 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         }
         write_volatile(core::ptr::addr_of_mut!((*frame).header), header);
         let request = header;
+        let Some(callback_request_context) = callback_request_context_for_request(&request) else {
+            return 0xC000_000Du32 as i32;
+        };
 
         // ★ THE NESTING SEAM, on the `Call` transport (`docs/transport-migration.md` §3.4).
         //
@@ -5509,26 +5652,16 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             let (_label, tag, _, _, _) = crate::driver_launch::call_on(out);
             match tag {
                 W32_USER_CALLBACK_RESUME_LABEL => {
-                    let client_pi =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
-                    let process_id =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
-                    let thread_id =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_THREAD_ID) as *const u64);
-                    let supplied_eprocess =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
-                    let supplied_ethread =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
-                    let process_role =
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
-                    if !restore_current_context_for_user_callback_resume(
-                        client_pi as u32,
-                        process_id,
-                        thread_id,
-                        read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64),
-                        supplied_eprocess,
-                        supplied_ethread,
-                        process_role,
+                    if !restore_current_context_for_user_callback_resume_inner(
+                        callback_request_context.pi,
+                        callback_request_context.pid,
+                        callback_request_context.tid,
+                        callback_request_context.client_teb,
+                        callback_request_context.supplied_eprocess,
+                        callback_request_context.supplied_ethread,
+                        callback_request_context.process_role,
+                        true,
+                        true,
                     ) {
                         return 0xC000_000Du32 as i32;
                     }
@@ -5539,10 +5672,8 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                         sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
                         drv: 0,
                     });
-                    if let Some(context) = callback_request_context {
-                        if !restore_user_callback_request_context(context) {
-                            return 0xC000_000Du32 as i32;
-                        }
+                    if !restore_user_callback_request_context(callback_request_context) {
+                        return 0xC000_000Du32 as i32;
                     }
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
@@ -5556,10 +5687,8 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         if nt_user_callback::validate_reply(&request, &reply).is_err() {
             return 0xC000_0001u32 as i32;
         }
-        if let Some(context) = callback_request_context {
-            if !restore_user_callback_request_context(context) {
-                return 0xC000_000Du32 as i32;
-            }
+        if !restore_user_callback_request_context(callback_request_context) {
+            return 0xC000_000Du32 as i32;
         }
 
         let buf = core::ptr::addr_of!((*frame).payload) as u64;

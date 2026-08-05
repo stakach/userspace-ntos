@@ -91,6 +91,13 @@ pub(crate) struct CompletedUserCallback {
     pub outer_dispatch: Option<CompletedWin32kDispatch>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum UserCallbackReturnReadiness {
+    Missing,
+    Ready,
+    Deferred,
+}
+
 /// The win32k dispatch currently being serviced. The dispatch a SUSPENDED callback belongs to is
 /// carried by that callback's own frame ([`nt_user_callback::ActiveCallbackFrame::dispatch_context`])
 /// — it used to live in a glue-side array indexed in lockstep with the callback stack, which is only
@@ -359,6 +366,33 @@ pub(crate) fn user_callback_stack_depths() -> (usize, usize) {
     }
 }
 
+pub(crate) unsafe fn active_user_callback_global_top_identity() -> Option<(u32, u64, u64)> {
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    let request = active.top()?.request();
+    Some((request.client_pi, request.client_badge, request.client_tid))
+}
+
+pub(crate) unsafe fn user_callback_return_readiness(
+    client_pi: u32,
+    client_badge: u64,
+    client_tid: u64,
+) -> UserCallbackReturnReadiness {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client_pi, client_tid, client_badge);
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    let Some(frame) = active.top_for(&identity) else {
+        return UserCallbackReturnReadiness::Missing;
+    };
+    if !frame.is_redirected() {
+        return UserCallbackReturnReadiness::Missing;
+    }
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(frame.request());
+    match active.is_global_top(correlation) {
+        Ok(true) => UserCallbackReturnReadiness::Ready,
+        Ok(false) => UserCallbackReturnReadiness::Deferred,
+        Err(_) => UserCallbackReturnReadiness::Missing,
+    }
+}
+
 /// `(re-asserts, repairs)` of the callback-window bridge invariant — see
 /// [`reassert_top_client_callback_window`]. `repairs > 0` means a foreign writer really had clobbered
 /// the client's `CLIENTINFO.CallbackWnd`.
@@ -613,7 +647,9 @@ fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
     }
     if callback_client_is_explorer(client) {
         match client.role {
-            Some(HostedThreadRole::Main) if client.top_badge != 0 && client.badge == client.top_badge => {
+            Some(HostedThreadRole::Main)
+                if client.top_badge != 0 && client.badge == client.top_badge =>
+            {
                 let alias = crate::env_scratch_base_for_pi(pi);
                 (alias != 0).then_some(alias)
             }
@@ -2531,6 +2567,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+    if active.is_global_top(correlation) != Ok(true) {
+        return None;
+    }
     let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
     if result_length > request.output_capacity as u64
         || (result_length != 0 && result_pointer == 0)
@@ -4254,12 +4293,15 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
     print_hex((registers[6] >> 32) as u32);
     print_hex(registers[6] as u32);
     print_str(b"\n");
+    win32k_subsystem::trace_win32k_wall_context();
     // RAW stack window from fault rsp: each qword annotated with its win32k RVA if it lands in the
-    // image (a return address). RtlpCheckListEntry (0x24c50) did `sub rsp,0x28`, so its own return
-    // address is at [rsp+0x28] = the exact InsertXxxList wrapper caller — read that precisely.
-    if start >= sbase && start + 0x120 <= stack_top {
+    // image (a return address). Keep the scan bounded; this path only runs after the component has
+    // already walled, and the first few caller RVAs are the useful signal.
+    if start >= sbase && start < stack_top {
+        let scan_len = (stack_top - start).min(0x500);
         let mut off = 0u64;
-        while off < 0x120 {
+        let mut printed = 0u32;
+        while off < scan_len && printed < 24 {
             let va = start + off;
             let v = core::ptr::read_volatile((mirror + (va - sbase)) as *const u64);
             if v >= lo && v < hi {
@@ -4268,6 +4310,7 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
                 print_str(b"] rva=0x");
                 print_hex(v.wrapping_sub(code_va) as u32);
                 print_str(b"\n");
+                printed += 1;
             }
             off += 8;
         }

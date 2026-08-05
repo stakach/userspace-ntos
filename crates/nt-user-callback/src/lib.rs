@@ -1465,6 +1465,16 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(index)
     }
 
+    /// Does this correlation name the physical top of the interleaved callback array?
+    ///
+    /// A callback return can be logically valid for its own client thread while another thread's
+    /// callback frame sits above it. That is safe for purely model-level stack mutation, but a
+    /// userspace-hosted kernel component with one reply binding can only resume the global top.
+    pub fn is_global_top(&self, correlation: CallbackCorrelation) -> Result<bool, ValidationError> {
+        let index = self.correlated_index(&correlation)?;
+        Ok(index + 1 == self.len)
+    }
+
     pub fn push(
         &mut self,
         request: CallbackHeader,
@@ -2970,6 +2980,8 @@ mod tests {
             .unwrap();
         stack.record_redirect(ca, [7; 20], 0xdead).unwrap();
         stack.record_redirect(cb, [9; 20], 0xbeef).unwrap();
+        assert_eq!(stack.is_global_top(ca), Ok(false));
+        assert_eq!(stack.is_global_top(cb), Ok(true));
         // A returns FIRST, from underneath B's frame.
         let popped_a = stack.pop(ca).unwrap();
         assert_eq!(popped_a.client_tcb(), 0xaaa0);

@@ -11,6 +11,12 @@ static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_PAINT_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_DEFERRED_RETURNS_PARKED: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_DEFERRED_RETURNS_WOKEN: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_DEFERRED_RETURNS_FULL: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_DEFERRED_RETURNS_TRACE: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CONTEXT_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +32,7 @@ static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEFER_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +94,274 @@ const GET_ICON_INFO_FAIL_MISSING_SP: u64 = 1;
 const GET_ICON_INFO_FAIL_STACK_TAIL: u64 = 2;
 const GET_ICON_INFO_FAIL_DESC_COPY: u64 = 3;
 const CBM_INIT: u64 = 0x04;
+const CURSORDATA_BYTES: usize = 0x88;
+const CURSORDATA_FLAGS_OFF: usize = 0x14;
+const CURSORDATA_CPCUR_OFF: usize = 0x5c;
+const CURSORDATA_CICUR_OFF: usize = 0x60;
+const CURSORDATA_ASPCUR_OFF: usize = 0x68;
+const CURSORDATA_AICUR_OFF: usize = 0x70;
+const CURSORDATA_AJIFRATE_OFF: usize = 0x78;
+const CURSORF_ACON: u32 = 0x0008;
+const CURSORDATA_ACON_LIMIT: u32 = 1000;
+const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH;
+
+#[derive(Clone, Copy)]
+struct DeferredCallbackReturn {
+    used: bool,
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    result_pointer: u64,
+    result_length: u64,
+    callback_status: u64,
+    reply_cap: u64,
+}
+
+impl DeferredCallbackReturn {
+    const EMPTY: Self = Self {
+        used: false,
+        pi: 0,
+        badge: 0,
+        tid: 0,
+        result_pointer: 0,
+        result_length: 0,
+        callback_status: 0,
+        reply_cap: 0,
+    };
+
+    const fn matches_identity(self, pi: u32, badge: u64, tid: u64) -> bool {
+        self.used && self.pi == pi && self.badge == badge && self.tid == tid
+    }
+}
+
+static mut DEFERRED_CALLBACK_RETURNS: [DeferredCallbackReturn; DEFERRED_CALLBACK_RETURN_N] =
+    [DeferredCallbackReturn::EMPTY; DEFERRED_CALLBACK_RETURN_N];
+
+unsafe fn reset_deferred_user_callback_returns() {
+    let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
+    for index in 0..DEFERRED_CALLBACK_RETURN_N {
+        table[index] = DeferredCallbackReturn::EMPTY;
+    }
+}
+
+/// Steal the reply object bound to the caller currently being serviced and rotate a fresh pool
+/// object into `REPLY_MAIN_SLOT`, matching the wait/pipe/LSA park model.
+unsafe fn steal_main_reply() -> Option<u64> {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return None;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    for index in 0..WAIT_REPLY_POOL_N {
+        if used & (1u64 << index) != 0 {
+            continue;
+        }
+        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+        if cap != 0 {
+            WAIT_REPLY_POOL_USED.fetch_or(1u64 << index, Ordering::Relaxed);
+            REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
+            return Some(stolen);
+        }
+    }
+    None
+}
+
+unsafe fn defer_user_callback_return(
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    result_pointer: u64,
+    result_length: u64,
+    callback_status: u64,
+) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
+    let Some(slot) = (0..DEFERRED_CALLBACK_RETURN_N).find(|&index| !table[index].used) else {
+        USER_CALLBACK_DEFERRED_RETURNS_FULL.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let Some(reply_cap) = steal_main_reply() else {
+        USER_CALLBACK_DEFERRED_RETURNS_FULL.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    table[slot] = DeferredCallbackReturn {
+        used: true,
+        pi,
+        badge,
+        tid,
+        result_pointer,
+        result_length,
+        callback_status,
+        reply_cap,
+    };
+    let count = USER_CALLBACK_DEFERRED_RETURNS_PARKED.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = USER_CALLBACK_DEFERRED_RETURNS_TRACE.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+        print_str(b"[user-callback] deferred out-of-order NtCallbackReturn #");
+        print_u64(count);
+        print_str(b" pi=");
+        print_u64(pi as u64);
+        print_str(b" badge=");
+        print_u64(badge);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" result=0x");
+        print_hex_u64(result_pointer);
+        print_str(b" len=0x");
+        print_hex_u64(result_length);
+        print_str(b" status=0x");
+        print_hex(callback_status as u32);
+        print_str(b" depth=");
+        print_u64(active_depth as u64);
+        print_str(b"/");
+        print_u64(continuation_depth as u64);
+        print_str(b"\n");
+    }
+    true
+}
+
+unsafe fn take_deferred_user_callback_return_for_top() -> Option<DeferredCallbackReturn> {
+    let (pi, badge, tid) = win32k_glue::active_user_callback_global_top_identity()?;
+    if win32k_glue::user_callback_return_readiness(pi, badge, tid)
+        != win32k_glue::UserCallbackReturnReadiness::Ready
+    {
+        return None;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
+    for index in 0..DEFERRED_CALLBACK_RETURN_N {
+        if table[index].matches_identity(pi, badge, tid) {
+            let item = table[index];
+            table[index] = DeferredCallbackReturn::EMPTY;
+            return Some(item);
+        }
+    }
+    None
+}
+
+unsafe fn process_completed_user_callback_outer_dispatch(
+    completion_pi: usize,
+    completion_pml4: u64,
+    completion_badge: u64,
+    completion_tid: u64,
+    dispatch: win32k_glue::CompletedWin32kDispatch,
+    completion_filled_pages: &mut [u64; 512],
+    completion_faults: usize,
+    completion_scratch_base: u64,
+) -> bool {
+    if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && dispatch.status == 0 {
+        if complete_ntuser_process_connect_copyout(
+            completion_pi,
+            completion_pml4,
+            dispatch.args[1],
+            dispatch.args[2],
+            completion_filled_pages,
+            completion_faults,
+            completion_scratch_base,
+        ) {
+            W32_CONNECTED_MASK.fetch_or(1u64 << completion_pi, Ordering::Relaxed);
+        } else {
+            return false;
+        }
+    }
+    if completion_pi == 2 {
+        observe_winlogon_completed_dispatch(
+            dispatch,
+            completion_filled_pages,
+            completion_faults,
+            completion_scratch_base,
+        );
+        observe_completed_dialog_modal_dispatch(dispatch, completion_badge, completion_tid);
+    }
+    true
+}
+
+unsafe fn drain_deferred_user_callback_returns(
+    current_pi: usize,
+    current_faults: usize,
+    procs: &mut [ProcExec; MAX_PI],
+    pfilled: &mut [[u64; 512]; MAX_PI],
+    current_filled_pages: &mut [u64; 512],
+) {
+    while let Some(deferred) = take_deferred_user_callback_return_for_top() {
+        let completion = win32k_glue::complete_controlled_user_callback(
+            deferred.pi,
+            deferred.badge,
+            deferred.tid,
+            deferred.result_pointer,
+            deferred.result_length,
+            deferred.callback_status,
+        );
+        let mut effects_ok = true;
+        if let Some(completion) = completion {
+            if let Some(dispatch) = completion.outer_dispatch {
+                let completion_pi = deferred.pi as usize;
+                effects_ok = completion_pi < MAX_PI;
+                if effects_ok {
+                    let completion_pml4 = procs[completion_pi].pml4;
+                    let completion_scratch_base = procs[completion_pi].scratch_base;
+                    let completion_faults = if completion_pi == current_pi {
+                        current_faults
+                    } else {
+                        procs[completion_pi].faults as usize
+                    };
+                    effects_ok = if completion_pi == current_pi {
+                        process_completed_user_callback_outer_dispatch(
+                            completion_pi,
+                            completion_pml4,
+                            deferred.badge,
+                            deferred.tid,
+                            dispatch,
+                            current_filled_pages,
+                            completion_faults,
+                            completion_scratch_base,
+                        )
+                    } else {
+                        process_completed_user_callback_outer_dispatch(
+                            completion_pi,
+                            completion_pml4,
+                            deferred.badge,
+                            deferred.tid,
+                            dispatch,
+                            &mut pfilled[completion_pi],
+                            completion_faults,
+                            completion_scratch_base,
+                        )
+                    };
+                }
+            }
+        } else {
+            effects_ok = false;
+        }
+        if !effects_ok {
+            print_str(b"[user-callback] deferred NtCallbackReturn drain completed with failed side effect pi=");
+            print_u64(deferred.pi as u64);
+            print_str(b" badge=");
+            print_u64(deferred.badge);
+            print_str(b" tid=");
+            print_u64(deferred.tid);
+            print_str(b"\n");
+        }
+        client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
+        release_reply_pool_cap(deferred.reply_cap);
+        let n = USER_CALLBACK_DEFERRED_RETURNS_WOKEN.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+            print_str(b"[user-callback] drained deferred NtCallbackReturn #");
+            print_u64(n + 1);
+            print_str(b" pi=");
+            print_u64(deferred.pi as u64);
+            print_str(b" badge=");
+            print_u64(deferred.badge);
+            print_str(b" tid=");
+            print_u64(deferred.tid);
+            print_str(b" depth=");
+            print_u64(active_depth as u64);
+            print_str(b"/");
+            print_u64(continuation_depth as u64);
+            print_str(b"\n");
+        }
+    }
+}
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     value.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -355,14 +630,7 @@ unsafe fn sync_win32k_context_to_process_manager(
         print_str(b"\n");
         return;
     }
-    if expected.tid != 0 && tid != expected.tid {
-        print_str(b"[win32k-context] ERROR: published TID mismatch expected=");
-        print_u64(expected.tid);
-        print_str(b" actual=");
-        print_u64(tid);
-        print_str(b"\n");
-        return;
-    }
+
     if pid != 0 && pid <= nt_process::ProcessId::MAX as u64 {
         let pid = pid as nt_process::ProcessId;
         if published.eprocess != 0 {
@@ -376,6 +644,44 @@ unsafe fn sync_win32k_context_to_process_manager(
     }
     if tid != 0 && tid <= nt_process::ThreadId::MAX as u64 {
         let tid = tid as nt_process::ThreadId;
+        if pid != 0 {
+            let Some(client_id) = nt_handler.pm.client_id(tid) else {
+                let n = WIN32K_CONTEXT_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    print_str(b"[win32k-context] ERROR: published TID unknown tid=");
+                    print_u64(tid as u64);
+                    print_str(b" pid=");
+                    print_u64(pid);
+                    print_str(b"\n");
+                }
+                return;
+            };
+            if client_id.unique_process as u64 != pid {
+                let n = WIN32K_CONTEXT_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    print_str(b"[win32k-context] ERROR: published TID belongs to pid=");
+                    print_u64(client_id.unique_process as u64);
+                    print_str(b" expected-pid=");
+                    print_u64(pid);
+                    print_str(b" tid=");
+                    print_u64(tid as u64);
+                    print_str(b"\n");
+                }
+                return;
+            }
+        }
+        if expected.tid != 0 && tid as u64 != expected.tid {
+            let n = WIN32K_CONTEXT_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                print_str(b"[win32k-context] imported published thread expected-tid=");
+                print_u64(expected.tid);
+                print_str(b" actual-tid=");
+                print_u64(tid as u64);
+                print_str(b" pid=");
+                print_u64(pid);
+                print_str(b"\n");
+            }
+        }
         if published.ethread != 0 {
             let _ = nt_handler
                 .pm
@@ -1021,10 +1327,9 @@ fn hosted_gui_thread_teb_alias_for(
         if tp_pi != pi || current_tid == 0 {
             return None;
         }
-        return (nt_handler.hosted_thread_tid_for_role(
-            pi,
-            HostedThreadRole::TpWorker { slot: tp_slot },
-        ) == Some(current_tid))
+        return (nt_handler
+            .hosted_thread_tid_for_role(pi, HostedThreadRole::TpWorker { slot: tp_slot })
+            == Some(current_tid))
         .then_some(tp_worker_teb_mirror_va(pi, tp_slot));
     }
     let Some(main_tid) = nt_handler.pm_main_tid_for_pi(pi) else {
@@ -2511,6 +2816,238 @@ unsafe fn capture_cursor_set_data_key(
     )
 }
 
+unsafe fn stage_optional_cursor_string_arg(
+    pi: u64,
+    descriptor: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    if descriptor == 0 {
+        return Some(0);
+    }
+    try_capture_client_string_arg(
+        pi,
+        descriptor,
+        false,
+        false,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
+    .map(|capture| capture.desc)
+}
+
+/// Capture `NtUserSetCursorIconData`'s pointer graph before isolated win32k probes it. ReactOS first
+/// copies the top-level `CURSORDATA`, then, for animated cursors, copies `aspcur`, `aicur`, and
+/// `ajifRate` into kernel memory and rewrites the three pointers. The isolated provider needs the
+/// same ownership boundary because the original pointers are process-private client VAs.
+unsafe fn stage_cursor_icon_data_args(
+    pi: u64,
+    hcursor: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    cursor_data: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<(u64, u64, u64)> {
+    let staged_module = stage_optional_cursor_string_arg(
+        pi,
+        module_descriptor,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+    let staged_resource = stage_optional_cursor_string_arg(
+        pi,
+        resource_descriptor,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )?;
+
+    let mut data = [0u8; CURSORDATA_BYTES];
+    if cursor_data == 0
+        || !img_spawn::client_copyin_mapped(
+            pi,
+            cursor_data,
+            &mut data,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
+    {
+        return None;
+    }
+
+    let flags = u32::from_le_bytes(
+        data[CURSORDATA_FLAGS_OFF..CURSORDATA_FLAGS_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let rt = u16::from_le_bytes(data[0x10..0x12].try_into().unwrap());
+    let cpcur = u32::from_le_bytes(
+        data[CURSORDATA_CPCUR_OFF..CURSORDATA_CPCUR_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let cicur = u32::from_le_bytes(
+        data[CURSORDATA_CICUR_OFF..CURSORDATA_CICUR_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
+    let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+    core::ptr::write_bytes(base as *mut u8, 0, WIN32K_STRETCH_DIBITS_STAGE_BYTES);
+    core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
+
+    let trace = SET_CURSOR_ICON_DATA_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+    if trace < 96 {
+        print_str(b"[w32marshal] NtUserSetCursorIconData pi=");
+        print_u64(pi);
+        print_str(b" hcursor=0x");
+        print_hex_u64(hcursor);
+        print_str(b" rt=");
+        print_u64(rt as u64);
+        print_str(b" flags=0x");
+        print_hex_u64(flags as u64);
+        print_str(b" cpcur=");
+        print_u64(cpcur as u64);
+        print_str(b" cicur=");
+        print_u64(cicur as u64);
+    }
+
+    if flags & CURSORF_ACON == 0 {
+        core::ptr::write_unaligned((base + CURSORDATA_ASPCUR_OFF as u64) as *mut u64, 0);
+        core::ptr::write_unaligned((base + CURSORDATA_AICUR_OFF as u64) as *mut u64, 0);
+        core::ptr::write_unaligned((base + CURSORDATA_AJIFRATE_OFF as u64) as *mut u64, 0);
+        if trace < 96 {
+            print_str(b" staged=0x");
+            print_hex_u64(base);
+            print_str(b" standard\n");
+        }
+        return Some((staged_module, staged_resource, base));
+    }
+
+    if cpcur == 0 || cicur == 0 || cpcur > CURSORDATA_ACON_LIMIT || cicur > CURSORDATA_ACON_LIMIT {
+        if trace < 96 {
+            print_str(b" range-fail\n");
+        }
+        return None;
+    }
+    let aspcur_client = u64::from_le_bytes(
+        data[CURSORDATA_ASPCUR_OFF..CURSORDATA_ASPCUR_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let aicur_client = u64::from_le_bytes(
+        data[CURSORDATA_AICUR_OFF..CURSORDATA_AICUR_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let ajif_rate_client = u64::from_le_bytes(
+        data[CURSORDATA_AJIFRATE_OFF..CURSORDATA_AJIFRATE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    if aspcur_client == 0 || aicur_client == 0 || ajif_rate_client == 0 {
+        if trace < 96 {
+            print_str(b" null-acon-pointers aspcur=0x");
+            print_hex_u64(aspcur_client);
+            print_str(b" aicur=0x");
+            print_hex_u64(aicur_client);
+            print_str(b" ajif=0x");
+            print_hex_u64(ajif_rate_client);
+            print_str(b"\n");
+        }
+        return None;
+    }
+
+    let mut offset = align_up_u64(CURSORDATA_BYTES as u64, 8)?;
+    let aspcur_bytes = (cpcur as u64).checked_mul(CURSORDATA_BYTES as u64)?;
+    let aicur_bytes = (cicur as u64).checked_mul(4)?;
+    let ajif_rate_bytes = (cicur as u64).checked_mul(4)?;
+
+    let staged_aspcur = base + offset;
+    offset = align_up_u64(offset.checked_add(aspcur_bytes)?, 8)?;
+    let staged_aicur = base + offset;
+    offset = align_up_u64(offset.checked_add(aicur_bytes)?, 4)?;
+    let staged_ajif_rate = base + offset;
+    offset = align_up_u64(offset.checked_add(ajif_rate_bytes)?, 4)?;
+    if offset > cap {
+        if trace < 96 {
+            print_str(b" cap-fail bytes=");
+            print_u64(offset);
+            print_str(b"\n");
+        }
+        return None;
+    }
+
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        aspcur_client,
+        core::slice::from_raw_parts_mut(staged_aspcur as *mut u8, aspcur_bytes as usize),
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) || !img_spawn::client_copyin_mapped(
+        pi,
+        aicur_client,
+        core::slice::from_raw_parts_mut(staged_aicur as *mut u8, aicur_bytes as usize),
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) || !img_spawn::client_copyin_mapped(
+        pi,
+        ajif_rate_client,
+        core::slice::from_raw_parts_mut(staged_ajif_rate as *mut u8, ajif_rate_bytes as usize),
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        if trace < 96 {
+            print_str(b" copy-fail aspcur=0x");
+            print_hex_u64(aspcur_client);
+            print_str(b" aicur=0x");
+            print_hex_u64(aicur_client);
+            print_str(b" ajif=0x");
+            print_hex_u64(ajif_rate_client);
+            print_str(b"\n");
+        }
+        return None;
+    }
+
+    core::ptr::write_unaligned(
+        (base + CURSORDATA_ASPCUR_OFF as u64) as *mut u64,
+        staged_aspcur,
+    );
+    core::ptr::write_unaligned(
+        (base + CURSORDATA_AICUR_OFF as u64) as *mut u64,
+        staged_aicur,
+    );
+    core::ptr::write_unaligned(
+        (base + CURSORDATA_AJIFRATE_OFF as u64) as *mut u64,
+        staged_ajif_rate,
+    );
+
+    if trace < 96 {
+        print_str(b" aspcur=0x");
+        print_hex_u64(aspcur_client);
+        print_str(b" aicur=0x");
+        print_hex_u64(aicur_client);
+        print_str(b" ajif=0x");
+        print_hex_u64(ajif_rate_client);
+        print_str(b" staged=0x");
+        print_hex_u64(base);
+        print_str(b" bytes=");
+        print_u64(offset);
+        print_str(b"\n");
+    }
+
+    Some((staged_module, staged_resource, base))
+}
+
 unsafe fn capture_class_name_identity(
     pi: u64,
     descriptor: u64,
@@ -2633,6 +3170,7 @@ pub(crate) unsafe fn service_sec_image(
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
 ) -> (u64, u64, u64, u64, u64, u64) {
     loader_trace_clear();
+    reset_deferred_user_callback_returns();
     let img_end = PE_LOAD_BASE + image_extent(pe);
     let (nt_base, nt_end) = match ntdll {
         Some((b, npe)) => (b, b + image_extent(npe)),
@@ -2992,6 +3530,13 @@ pub(crate) unsafe fn service_sec_image(
             // forever = boot wedge, no gate, no measurement). No-op when the process held no
             // callbacks. See win32k_glue::unwind_dead_client_user_callbacks.
             let _ = win32k_glue::unwind_dead_client_user_callbacks(__pi as u32);
+            drain_deferred_user_callback_returns(
+                __pi,
+                faults as usize,
+                procs,
+                pfilled,
+                filled_pages,
+            );
             // QUIESCE: no live top-level process can still make forward progress → nothing left to
             // serve. `wait_parked` counts too (matching every other quiesce site): a crash-park plus
             // all-others-cooperatively-waiting leaves NO runnable signaler, so the next `recv` would
@@ -5294,7 +5839,7 @@ pub(crate) unsafe fn service_sec_image(
                 let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
                 if active_depth != 0 {
                     let n = EXPLORER_CALLBACK_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
-                    if n < 96 {
+                    if n < 256 {
                         print_str(b"[explorer-cb-ssn] #");
                         print_u64(n);
                         print_str(b" badge=");
@@ -5320,6 +5865,41 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" resume-ip=0x");
                         print_hex_u64(resume_ip);
                         print_str(b"\n");
+                    }
+                    if matches!(
+                        m0,
+                        0x1004
+                            | 0x1007
+                            | 0x1016
+                            | 0x1018
+                            | 0x1035
+                            | 0x1042
+                            | 0x104a
+                            | 0x1054
+                            | 0x1059
+                            | 0x106c
+                            | 0x10de
+                    ) {
+                        let n = EXPLORER_PAINT_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 128 {
+                            print_str(b"[explorer-paint-ssn] #");
+                            print_u64(n);
+                            print_str(b" badge=");
+                            print_u64(badge);
+                            print_str(b" tid=");
+                            print_u64(current_tid);
+                            print_str(b" handler-tid=");
+                            print_u64(nt_handler.current_tid);
+                            print_str(b" ssn=0x");
+                            print_hex_u64(m0);
+                            print_str(b" depth=");
+                            print_u64(active_depth as u64);
+                            print_str(b"/");
+                            print_u64(continuation_depth as u64);
+                            print_str(b" sp=0x");
+                            print_hex_u64(sp);
+                            print_str(b"\n");
+                        }
                     }
                 }
             }
@@ -5350,61 +5930,96 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             if m0 == 22 {
-                if let Some(completion) = win32k_glue::complete_controlled_user_callback(
-                    pi as u32,
-                    badge,
-                    current_tid,
-                    get_recv_mr(9),
-                    m3,
-                    get_recv_mr(7),
-                ) {
-                    if let Some(dispatch) = completion.outer_dispatch {
-                        if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE
-                            && dispatch.status == 0
-                        {
-                            if complete_ntuser_process_connect_copyout(
-                                pi,
-                                pml4,
-                                dispatch.args[1],
-                                dispatch.args[2],
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            ) {
-                                W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
-                            } else {
-                                park_and_log!(
-                                    pi,
-                                    b"userconnect-copyout",
-                                    dispatch.ssn,
-                                    dispatch.args[1]
-                                );
-                            }
+                match win32k_glue::user_callback_return_readiness(pi as u32, badge, current_tid) {
+                    win32k_glue::UserCallbackReturnReadiness::Deferred => {
+                        if defer_user_callback_return(
+                            pi as u32,
+                            badge,
+                            current_tid,
+                            get_recv_mr(9),
+                            m3,
+                            get_recv_mr(7),
+                        ) {
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
                         }
-                        if pi == 2 {
-                            observe_winlogon_completed_dispatch(
-                                dispatch,
-                                filled_pages,
+                        print_str(
+                            b"[user-callback] unable to defer out-of-order NtCallbackReturn -> STATUS_INSUFFICIENT_RESOURCES\n",
+                        );
+                        let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        client_reply_on(reply_main, 18, 0xC000_009A, m1, 0, m3);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    win32k_glue::UserCallbackReturnReadiness::Ready => {
+                        if let Some(completion) = win32k_glue::complete_controlled_user_callback(
+                            pi as u32,
+                            badge,
+                            current_tid,
+                            get_recv_mr(9),
+                            m3,
+                            get_recv_mr(7),
+                        ) {
+                            if let Some(dispatch) = completion.outer_dispatch {
+                                if !process_completed_user_callback_outer_dispatch(
+                                    pi,
+                                    pml4,
+                                    badge,
+                                    current_tid,
+                                    dispatch,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    park_and_log!(
+                                        pi,
+                                        b"userconnect-copyout",
+                                        dispatch.ssn,
+                                        dispatch.args[1]
+                                    );
+                                }
+                            }
+                            drain_deferred_user_callback_returns(
+                                pi,
                                 faults as usize,
-                                scratch_base,
+                                procs,
+                                pfilled,
+                                filled_pages,
                             );
-                            observe_completed_dialog_modal_dispatch(dispatch, badge, current_tid);
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            client_reply_on(reply_main, 0, 0, 0, 0, 0);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
                         }
                     }
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
-                    pfilled[pi] = *filled_pages;
-                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                    client_reply_on(reply_main, 0, 0, 0, 0, 0);
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
-                    badge = nb;
-                    mi = nmi;
-                    m0 = nm0;
-                    m1 = nm1;
-                    m2 = nm2;
-                    m3 = nm3;
-                    continue;
+                    win32k_glue::UserCallbackReturnReadiness::Missing => {}
                 }
             }
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
@@ -6948,7 +7563,7 @@ pub(crate) unsafe fn service_sec_image(
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
-                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .thread_teb(current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     let route =
@@ -6956,9 +7571,9 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             pi,
                             badge,
-                            nt_handler.current_tid,
-                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                            nt_handler.hosted_thread_role(current_tid),
                             client_teb,
                             peb_mirror,
                             scratch_base,
@@ -7007,7 +7622,7 @@ pub(crate) unsafe fn service_sec_image(
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
-                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .thread_teb(current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     // The caller's own NtUserGetMessage(MSG* [R10], HWND [RDX], min [R8], max [R9]);
@@ -7017,9 +7632,9 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler,
                         pi,
                         badge,
-                        nt_handler.current_tid,
-                        hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                        nt_handler.hosted_thread_role(nt_handler.current_tid),
+                        current_tid,
+                        hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                        nt_handler.hosted_thread_role(current_tid),
                         client_teb,
                         peb_mirror,
                         scratch_base,
@@ -7409,6 +8024,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut get_atom_name_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
                 let mut find_cursor_icon_probe_failed = false;
+                let mut set_cursor_icon_data_probe_failed = false;
                 if m0 == 0x103d {
                     // NtUserFindExistingCursorIcon probes two client UNICODE_STRING descriptors and
                     // a FINDEXISTINGCURICONPARAM. The resource string can be MAKEINTRESOURCE, in
@@ -8404,7 +9020,9 @@ pub(crate) unsafe fn service_sec_image(
                             let dx_units = if fu_options & ETO_PDY != 0 { 2 } else { 1 };
                             let string_bytes = count.checked_mul(2);
                             let dx_bytes = if unsafe_dx != 0 && count != 0 {
-                                count.checked_mul(4).and_then(|bytes| bytes.checked_mul(dx_units))
+                                count
+                                    .checked_mul(4)
+                                    .and_then(|bytes| bytes.checked_mul(dx_units))
                             } else {
                                 Some(0)
                             };
@@ -8451,11 +9069,7 @@ pub(crate) unsafe fn service_sec_image(
                                     ext_text_out_probe_failed = true;
                                 } else {
                                     if offset != 0 {
-                                        core::ptr::write_bytes(
-                                            base as *mut u8,
-                                            0,
-                                            offset as usize,
-                                        );
+                                        core::ptr::write_bytes(base as *mut u8, 0, offset as usize);
                                     }
                                     let rect_ok = unsafe_rect == 0 || {
                                         prefill_client_copyin_dll_range_pages(
@@ -9309,6 +9923,30 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
+                } else if m0 == 0x10a8 {
+                    // NtUserSetCursorIconData probes/captures a pointer-rich CURSORDATA graph before
+                    // installing cursor/icon frames. Stage that graph into provider-owned shared memory
+                    // so animated cursor setup cannot leave win32k with client-private aspcur/aicur
+                    // pointers that later fault during WM_PAINT icon drawing.
+                    match stage_cursor_icon_data_args(
+                        pi as u64,
+                        d_a0,
+                        d_a1,
+                        d_a2,
+                        d_a3,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        Some((module, resource, data)) => {
+                            d_a1 = module;
+                            d_a2 = resource;
+                            d_a3 = data;
+                        }
+                        None => {
+                            set_cursor_icon_data_probe_failed = true;
+                        }
+                    }
                 }
                 if m0 == 0x10b4 {
                     if let Some((class_arg, menu_arg)) = capture_register_class_graph(
@@ -9672,6 +10310,22 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> NULL\n");
                     }
                     (0, true)
+                } else if set_cursor_icon_data_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserSetCursorIconData input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hcursor=0x");
+                        print_hex_u64(a0);
+                        print_str(b" module=0x");
+                        print_hex_u64(a1);
+                        print_str(b" resource=0x");
+                        print_hex_u64(a2);
+                        print_str(b" data=0x");
+                        print_hex_u64(a3);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if get_icon_info_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -9919,7 +10573,7 @@ pub(crate) unsafe fn service_sec_image(
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
-                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .thread_teb(current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     if pi >= 1 && m0 == 0x1077 && a3 != 0 {
@@ -9957,9 +10611,9 @@ pub(crate) unsafe fn service_sec_image(
                         && create_dibitmap_stack_arg_count == create_dibitmap_stack_args.len();
                     let stretch_dibits_staged_stack = m0 == 0x1082
                         && stretch_dibits_stack_arg_count == stretch_dibits_stack_args.len();
-                    let ext_text_out_staged_stack =
-                        m0 == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
-                            && ext_text_out_stack_arg_count == ext_text_out_stack_args.len();
+                    let ext_text_out_staged_stack = m0
+                        == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
+                        && ext_text_out_stack_arg_count == ext_text_out_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
                     let char_width_staged_stack =
@@ -9974,8 +10628,7 @@ pub(crate) unsafe fn service_sec_image(
                     let message_call_staged_stack = m0 == NTUSER_MESSAGE_CALL_SSN
                         && message_call_stack_arg_count == message_call_stack_args.len();
                     let defer_window_pos_staged_stack = m0 == NTUSER_DEFER_WINDOW_POS_SSN
-                        && defer_window_pos_stack_arg_count
-                            == defer_window_pos_stack_args.len();
+                        && defer_window_pos_stack_arg_count == defer_window_pos_stack_args.len();
                     // Keep the original SP in the dispatch context for callback/completion
                     // observers. win32k_dispatch_wide still sends SH_REQ_CALLER_SP=0 when
                     // stack_args is non-empty, so the component consumes only the staged tail.
@@ -10017,9 +10670,9 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler,
                         pi,
                         badge,
-                        nt_handler.current_tid,
-                        hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                        nt_handler.hosted_thread_role(nt_handler.current_tid),
+                        current_tid,
+                        hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                        nt_handler.hosted_thread_role(current_tid),
                         client_teb,
                         peb_mirror,
                         scratch_base,
@@ -10426,7 +11079,7 @@ pub(crate) unsafe fn service_sec_image(
                     let peb_mirror = hosted_peb_mirror_for_pi(pi);
                     let client_teb = nt_handler
                         .pm
-                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .thread_teb(current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
                     redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
@@ -10434,9 +11087,9 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             pi,
                             badge,
-                            nt_handler.current_tid,
-                            hosted_thread_tcb_or_zero(&nt_handler, nt_handler.current_tid),
-                            nt_handler.hosted_thread_role(nt_handler.current_tid),
+                            current_tid,
+                            hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                            nt_handler.hosted_thread_role(current_tid),
                             client_teb,
                             peb_mirror,
                             scratch_base,
@@ -15664,23 +16317,7 @@ static LSA_CLI_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// object into `REPLY_MAIN_SLOT` — the SAME mechanism `wait_park_multi` / `pipe_wait_park` /
 /// `dbgk_reporter_park` use. `None` ⇒ the pool is exhausted (caller must not park).
 unsafe fn lsa_steal_main_reply() -> Option<u64> {
-    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if stolen == 0 {
-        return None;
-    }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    for index in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << index) != 0 {
-            continue;
-        }
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        if cap != 0 {
-            WAIT_REPLY_POOL_USED.fetch_or(1u64 << index, Ordering::Relaxed);
-            REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
-            return Some(stolen);
-        }
-    }
-    None
+    steal_main_reply()
 }
 
 /// Resume a thread blocked on a stolen reply cap: restore its native-syscall resume context
