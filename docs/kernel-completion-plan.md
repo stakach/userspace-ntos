@@ -111,3 +111,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: next A3 slice should move the actual early-boot hive import toward
   `ConfigManager::service_metadata_list()` or an equivalent snapshot-backed live CM view so the
   executive stops naming individual services while selecting driver candidates.
+- A3 continued. `nt-hive-core` now imports `ControlSetXXX\Services` into a `ConfigManager`
+  registry subtree, preserving values and nested service keys. The generated config-hive driver
+  proof uses that import plus `boot_system_driver_candidates()` to select its second driver and
+  derives `\Driver\<ServiceName>` from the selected service metadata; it no longer probes
+  `IrpFsdTest` by name. Validation: `cargo test -p nt-hive-core` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: real `REGF` SYSTEM hive import is still needed so `Npfs` and demand
+  `NtLoadDriver` service reads can use the same live CM metadata path.

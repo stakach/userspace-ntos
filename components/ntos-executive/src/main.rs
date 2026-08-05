@@ -11314,7 +11314,30 @@ fn registry_utf16_ascii_path(data: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut tmp = [0u8; 160];
     let n = registry_utf16_ascii(data, &mut tmp)?;
 
-    let mut s = &tmp[..n];
+    normalize_registry_ascii_path(&tmp[..n], out)
+}
+
+fn registry_ascii_path(path: &str, out: &mut [u8]) -> Option<usize> {
+    let mut tmp = [0u8; 160];
+    let mut n = 0usize;
+    for mut b in path.bytes() {
+        if b > 0x7f || n >= tmp.len() {
+            return None;
+        }
+        if b == b'/' {
+            b = b'\\';
+        }
+        tmp[n] = b.to_ascii_lowercase();
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    normalize_registry_ascii_path(&tmp[..n], out)
+}
+
+fn normalize_registry_ascii_path(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut s = path;
     if s.starts_with(b"\\??\\") {
         s = &s[4..];
     }
@@ -11389,10 +11412,32 @@ fn driver_launch_spec_from_registry_values(
     Some((path_len, class))
 }
 
-fn config_hive_driver_launch_spec(
-    service_name: &str,
+struct ConfigHiveDriverLaunchSpec {
+    service_name: alloc::string::String,
+    image_path_len: usize,
+    class: driver_launch::DriverClass,
+}
+
+fn driver_launch_spec_from_service_metadata(
+    service: &nt_config_manager::ServiceMetadata,
     out_path: &mut [u8],
+    max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
+    let start_value = service.start_type?;
+    if start_value > max_start || start_value >= SERVICE_DISABLED {
+        return None;
+    };
+    let class = match service.driver_service_class()? {
+        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
+        DriverServiceClass::Device => driver_launch::DriverClass::Device,
+    };
+    let path_len = registry_ascii_path(service.image_path.as_deref()?, out_path)?;
+    Some((path_len, class))
+}
+
+fn config_hive_boot_system_driver_launch_spec(
+    out_path: &mut [u8],
+) -> Option<ConfigHiveDriverLaunchSpec> {
     let hive_size =
         unsafe { core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) } as usize;
     if hive_size == 0 || hive_size > 0x0f00 {
@@ -11402,25 +11447,23 @@ fn config_hive_driver_launch_spec(
         core::slice::from_raw_parts((STORAGE_SHARED_VADDR + 0x100) as *const u8, hive_size)
     };
     let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
-    let mut key_path = alloc::string::String::from("ControlSet001\\Services\\");
-    key_path.push_str(service_name);
-    let key = hive.open_key(&key_path)?;
-    let (image_type, image_path) = hive.query_value(key, "ImagePath")?;
-    if !matches!(
-        image_type,
-        nt_hive_core::RegistryValueType::Sz | nt_hive_core::RegistryValueType::ExpandSz
-    ) {
+    let mut cm = nt_config_manager::ConfigManager::new();
+    if nt_hive_core::import_control_set_services_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    ) == 0
+    {
         return None;
     }
-    let type_value = hive.query_dword(key, "Type")?;
-    let start_value = hive.query_dword(key, "Start")?;
-    driver_launch_spec_from_registry_values(
-        image_path,
-        type_value,
-        start_value,
-        out_path,
-        SERVICE_SYSTEM_START,
-    )
+    let service = cm.boot_system_driver_candidates().into_iter().next()?;
+    let (image_path_len, class) =
+        driver_launch_spec_from_service_metadata(&service, out_path, SERVICE_SYSTEM_START)?;
+    Some(ConfigHiveDriverLaunchSpec {
+        service_name: service.name,
+        image_path_len,
+        class,
+    })
 }
 
 fn system_hive_driver_launch_spec(
@@ -19388,20 +19431,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
 
         // --- G3: second boot/system service through the same general driver path. The proof fixture
-        // service is declared in the generated SYSTEM.DAT hive, so the executive selects it from
-        // service metadata instead of a compiled-in driver list.
+        // service is declared in the generated SYSTEM.DAT hive; the executive imports the service
+        // subtree into Config Manager metadata, then selects the boot/system driver candidate from
+        // that dynamic service list instead of probing a compiled-in service identity.
         let mut proof_driver_path = [0u8; 128];
-        let proof_driver_spec =
-            config_hive_driver_launch_spec("IrpFsdTest", &mut proof_driver_path);
-        if let Some((proof_driver_path_len, proof_driver_class)) = proof_driver_spec {
-            print_str(b"[driver-launch] launching service IrpFsdTest from config hive path=");
-            print_str(&proof_driver_path[..proof_driver_path_len]);
+        let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&mut proof_driver_path);
+        if let Some(proof_driver_spec) = proof_driver_spec {
+            let mut proof_driver_object = alloc::string::String::from("\\Driver\\");
+            proof_driver_object.push_str(&proof_driver_spec.service_name);
+            print_str(b"[driver-launch] launching service ");
+            print_str(proof_driver_spec.service_name.as_bytes());
+            print_str(b" from config hive path=");
+            print_str(&proof_driver_path[..proof_driver_spec.image_path_len]);
             print_str(b"\n");
             if let Some(dc) = load_driver(
                 &fs,
-                &proof_driver_path[..proof_driver_path_len],
-                proof_driver_class,
-                "\\Driver\\IrpFsdTest",
+                &proof_driver_path[..proof_driver_spec.image_path_len],
+                proof_driver_spec.class,
+                &proof_driver_object,
             ) {
                 // This minimal FSD fills its MajorFunction[] table but creates NO control
                 // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
@@ -19511,13 +19558,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 );
             } else {
                 print_str(
-                    b"[driver-launch] IrpFsdTest launch returned None (not staged / load failed)\n",
+                    b"[driver-launch] config-hive driver launch returned None (not staged / load failed)\n",
                 );
             }
         } else {
-            print_str(
-                b"[driver-launch] IrpFsdTest service has no boot/system ImagePath in config hive\n",
-            );
+            print_str(b"[driver-launch] config hive has no boot/system driver service ImagePath\n");
         }
     }
 

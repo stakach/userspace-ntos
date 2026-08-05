@@ -58,6 +58,56 @@ fn image_roundtrips_registry_tree() {
 }
 
 #[test]
+fn imports_control_set_services_into_config_manager() {
+    let mut h = Hive::new(HiveKind::System);
+    let svc = h.create_key(r"ControlSet001\Services\RpcSs");
+    h.set_value(
+        svc,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"%SystemRoot%\system32\svchost.exe -k rpcss"),
+    );
+    h.set_dword(svc, "Type", nt_config_manager::SERVICE_WIN32_SHARE_PROCESS);
+    h.set_dword(svc, "Start", nt_config_manager::SERVICE_AUTO_START);
+    h.set_dword(svc, "ErrorControl", 1);
+    h.set_value(
+        svc,
+        "DependOnService",
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(&["DcomLaunch", "RpcEptMapper"]),
+    );
+    let params = h.create_key(r"ControlSet001\Services\RpcSs\Parameters");
+    h.set_value(
+        params,
+        "ServiceDll",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"%SystemRoot%\system32\rpcss.dll"),
+    );
+
+    let mut cm = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_services_into_config_manager(&h, &mut cm, "ControlSet001"),
+        1
+    );
+
+    let auto = cm.auto_start_win32_service_candidates();
+    assert_eq!(auto.len(), 1);
+    assert_eq!(auto[0].name, "RpcSs");
+    assert_eq!(
+        auto[0].dependencies,
+        alloc::vec![String::from("DcomLaunch"), String::from("RpcEptMapper")]
+    );
+    let service_dll = cm
+        .registry()
+        .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs\Parameters")
+        .and_then(|key| cm.registry().query_string(key, "ServiceDll"));
+    assert_eq!(
+        service_dll.as_deref(),
+        Some(r"%SystemRoot%\system32\rpcss.dll")
+    );
+}
+
+#[test]
 fn image_checksum_rejects_corruption() {
     let h = Hive::new(HiveKind::System);
     let mut bytes = encode_image(&h);
