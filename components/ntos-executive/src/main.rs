@@ -75,6 +75,7 @@ pub(crate) use driver_launch::*;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
@@ -16841,14 +16842,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     map_own_heap();
 
     // Object Manager: stand it up as an isolated service + drive it as the front-end.
-    let mut c = ObjectClient::new(ObChan(stand_up_service(
+    let c: &'static mut ObjectClient<ObChan<'static>> = Box::leak(Box::new(ObjectClient::new(
+        ObChan(stand_up_service(
         server::server_entry,
         SUB_RING_VADDR,
         COMP_RING_VADDR,
         REQ_DATA_VADDR,
         REP_DATA_VADDR,
+        )),
     )));
-    install_object_manager_client(&mut c);
+    install_object_manager_client(&mut *c);
 
     let mut passed = 0u64;
     check(b"exec_ob_ping", c.ping().is_success(), &mut passed);
@@ -16901,14 +16904,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- Second isolated service: the Configuration Manager (registry) over SURT.
     print_str(b"[ntos-exec] spawning the Configuration Manager as a second isolated service\n");
-    let mut cm = ConfigClient::new(CmChan(stand_up_service(
+    let cm: &'static mut ConfigClient<CmChan<'static>> = Box::leak(Box::new(ConfigClient::new(
+        CmChan(stand_up_service(
         cm_server::cm_server_entry,
         CM_SUB_VADDR,
         CM_COMP_VADDR,
         CM_REQ_VADDR,
         CM_REP_VADDR,
+        )),
     )));
-    install_config_manager_client(&mut cm);
+    install_config_manager_client(&mut *cm);
     let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
     check(b"exec_cm_ping", cm.ping(), &mut passed);
     check(
@@ -17051,7 +17056,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         0xDEAD_FACE_CAFE_F00D,
     );
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
-    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm, user_pml4, ff);
+    let (serviced, verdict) =
+        service_user_syscalls(user_fault_ep, &mut *c, &mut *cm, user_pml4, ff);
     check(
         b"exec_syscall_frontend_serviced",
         serviced >= 10,
@@ -17292,7 +17298,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let pe_fault_c = copy_cap(pe_fault);
             let pe_sysarg = alloc_frame();
             let pe_pml4 = spawn_pe_thread(&mapped, pe_fault_c, pe_sysarg);
-            let (srv, verdict) = service_user_syscalls(pe_fault, &mut c, &mut cm, pe_pml4, 0);
+            let (srv, verdict) = service_user_syscalls(pe_fault, &mut *c, &mut *cm, pe_pml4, 0);
             pe_serviced = srv;
             pe_verdict = verdict;
         }
@@ -18721,7 +18727,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ld_sysarg = alloc_frame();
         let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
         let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
-        let (_srv, ld_magic) = service_user_syscalls(ld_fault, &mut c, &mut cm, ld_pml4, ldff);
+        let (_srv, ld_magic) =
+            service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
         let ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         print_str(b"[ntos-exec] loader demand-paged the disk hive: magic=0x");
         print_hex((ld_magic >> 32) as u32);
@@ -19752,7 +19759,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
         }
         if let Some((dc, driver_object_path)) = named_pipe_provider {
-            publish_npfs_io_objects(&mut c, &dc, driver_object_path.as_str(), &mut passed);
+            publish_npfs_io_objects(&mut *c, &dc, driver_object_path.as_str(), &mut passed);
             // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
             check(
                 b"npfs_driver_entry_entered",
@@ -20314,7 +20321,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
                 driver_launch::register_driver_ready(dc.driver_id, irp_ready);
                 let driver_object_registered = driver_object_route_registered(
-                    &mut c,
+                    &mut *c,
                     &dc,
                     &proof_driver_spec.driver_object_path,
                 );

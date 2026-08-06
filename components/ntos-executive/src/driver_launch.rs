@@ -234,6 +234,11 @@ pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
 pub const SH_DMA_ALLOC_RECORD_SLOTS: u64 = 8;
 pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
+pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
+pub const SH_DEVICE_INTERFACE_TARGET_LEN: u64 = 0x782; // out: target DeviceName bytes
+pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
+pub const SH_DEVICE_INTERFACE_LINK_BUF: u64 = 0x790; // out: UTF-16LE path capture
+pub const SH_DEVICE_INTERFACE_TARGET_BUF: u64 = 0x890; // out: UTF-16LE path capture
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -2345,6 +2350,12 @@ unsafe fn clear_shared_path_len(len_off: u64) {
     write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, 0);
 }
 
+unsafe fn clear_shared_device_interface_state_at(sh: u64) {
+    write_volatile((sh + SH_DEVICE_INTERFACE_LINK_LEN) as *mut u16, 0);
+    write_volatile((sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *mut u16, 0);
+    write_volatile((sh + SH_DEVICE_INTERFACE_STATE) as *mut u32, 0);
+}
+
 unsafe fn copy_wstr_to_shared(src: u64, len: u16, len_off: u64, buf_off: u64) {
     let mut off = 0u64;
     while off < len as u64 {
@@ -2353,6 +2364,25 @@ unsafe fn copy_wstr_to_shared(src: u64, len: u16, len_off: u64, buf_off: u64) {
         off += 1;
     }
     write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, len);
+}
+
+unsafe fn copy_ascii_to_shared_utf16<const N: usize>(
+    value: &HostedAscii<N>,
+    len_off: u64,
+    buf_off: u64,
+) -> i32 {
+    let len = value.len.saturating_mul(2);
+    if len > SH_CAPTURED_PATH_BYTES {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let mut i = 0usize;
+    while i < value.len {
+        let out = FSD_SHARED_VADDR + buf_off + (i as u64) * 2;
+        write_volatile(out as *mut u16, value.bytes[i] as u16);
+        i += 1;
+    }
+    write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, len as u16);
+    STATUS_SUCCESS
 }
 
 /// `NTSTATUS IoCreateDevice(PDRIVER_OBJECT, ULONG DeviceExtensionSize, PUNICODE_STRING DeviceName,
@@ -3031,6 +3061,10 @@ extern "win64" fn s_io_register_device_interface(
 
 extern "win64" fn s_io_set_device_interface_state(symbolic_link_name: u64, enable: u8) -> i32 {
     unsafe {
+        clear_shared_device_interface_state_at(FSD_SHARED_VADDR);
+        let Some((link_buf, link_len)) = unicode_string_parts(symbolic_link_name) else {
+            return STATUS_INVALID_PARAMETER;
+        };
         let Some(symbolic_link) =
             unicode_string_to_hosted_ascii::<HOSTED_INTERFACE_LINK_MAX>(symbolic_link_name, false)
         else {
@@ -3047,27 +3081,35 @@ extern "win64" fn s_io_set_device_interface_state(symbolic_link_name: u64, enabl
         else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
+        if (enable != 0) == slot.enabled {
+            return STATUS_SUCCESS;
+        }
+        copy_wstr_to_shared(
+            link_buf,
+            link_len,
+            SH_DEVICE_INTERFACE_LINK_LEN,
+            SH_DEVICE_INTERFACE_LINK_BUF,
+        );
         if enable != 0 {
-            if !slot.enabled {
-                let Some(link_path) = parse_nt_path(slot.symbolic_link.as_str()) else {
-                    return STATUS_INVALID_PARAMETER;
-                };
-                let Some(target_path) = parse_nt_path(slot.target.as_str()) else {
-                    return STATUS_INVALID_PARAMETER;
-                };
-                if let Err(status) = io_manager_mut().create_symbolic_link(&link_path, &target_path)
-                {
-                    return status.raw();
-                }
-                slot.enabled = true;
+            let status = copy_ascii_to_shared_utf16(
+                &slot.target,
+                SH_DEVICE_INTERFACE_TARGET_LEN,
+                SH_DEVICE_INTERFACE_TARGET_BUF,
+            );
+            if status < 0 {
+                clear_shared_device_interface_state_at(FSD_SHARED_VADDR);
+                return status;
             }
-        } else if slot.enabled {
-            let Some(link_path) = parse_nt_path(slot.symbolic_link.as_str()) else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            if let Err(status) = io_manager_mut().delete_symbolic_link(&link_path) {
-                return status.raw();
-            }
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DEVICE_INTERFACE_STATE) as *mut u32,
+                1,
+            );
+            slot.enabled = true;
+        } else {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DEVICE_INTERFACE_STATE) as *mut u32,
+                0,
+            );
             slot.enabled = false;
         }
         STATUS_SUCCESS
@@ -7787,6 +7829,7 @@ unsafe fn load_driver_reserved(
     write_volatile((win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64, support_entry_rva);
     write_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
     write_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
+    clear_shared_device_interface_state_at(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
@@ -8620,6 +8663,32 @@ fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtSt
     io_manager_mut().create_symbolic_link(&link, &target)
 }
 
+unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::NtStatus> {
+    let (link_len, link_utf16) =
+        read_shared_path_capture(sh, SH_DEVICE_INTERFACE_LINK_LEN, SH_DEVICE_INTERFACE_LINK_BUF);
+    if link_len == 0 {
+        return Ok(());
+    }
+    let link =
+        captured_nt_path(&link_utf16, link_len).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let state = read_volatile((sh + SH_DEVICE_INTERFACE_STATE) as *const u32);
+    if state == 0 {
+        match io_manager_mut().delete_symbolic_link(&link) {
+            Ok(()) | Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND) => Ok(()),
+            Err(status) => Err(status),
+        }
+    } else {
+        let (target_len, target_utf16) = read_shared_path_capture(
+            sh,
+            SH_DEVICE_INTERFACE_TARGET_LEN,
+            SH_DEVICE_INTERFACE_TARGET_BUF,
+        );
+        let target = captured_nt_path(&target_utf16, target_len)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        io_manager_mut().create_symbolic_link(&link, &target)
+    }
+}
+
 fn destroy_registered_driver(driver_id: u64) {
     let _ = io_manager_mut().destroy_driver(DriverId(driver_id));
 }
@@ -8862,6 +8931,7 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
+    clear_shared_device_interface_state_at(sh);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
@@ -9914,6 +9984,7 @@ pub(crate) unsafe fn start_hosted_device(
         (sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
         0xC000_0010u32 as i32,
     );
+    clear_shared_device_interface_state_at(sh);
     let mut out = [];
     let (status, _) = dispatch_irp_for_instance(
         binding.instance,
@@ -9928,6 +9999,7 @@ pub(crate) unsafe fn start_hosted_device(
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     record_hosted_resource_usage(binding, sh)?;
     nt_status::NtStatus(status).to_result()?;
+    apply_hosted_device_interface_state(sh)?;
 
     let forwarded_minor = read_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64);
     let forwarded_status = read_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32);

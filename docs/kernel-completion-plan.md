@@ -88,12 +88,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    table while unmapping exec windows before reuse. Boot gates now prove PCI registry selection,
    real `ndis.sys` support `DriverEntry`, `e1000.sys` AddDevice, NT-style PCI config reads, full
    MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
-   per-devnode DMA grant, and cap-backed servicing of inline `out dx,eax` I/O-port faults inside the
-   PnP-granted I/O BAR. Next continue the honest NDIS `IRP_MN_START_DEVICE` path at the new
-   post-I/O-port failure: rootserver `RingChannel::raw` is writing through a null destination at
-   `rip=0x10000455944/cr2=0` during `e1000.sys` start after four serviced port writes. Identify the
-   registry/configuration or NDIS service request that enters that ring path, wire it to real kernel
-   functionality, and keep the generic PCI grant path scalable for multiple devnodes/NICs.
+   per-devnode DMA grant, cap-backed servicing of inline `out dx,eax` I/O-port faults inside the
+   PnP-granted I/O BAR, and executive-side publication of device-interface state requested by
+   `IoSetDeviceInterfaceState`. `E1000` now completes `AddDevice` and `START_DEVICE` with
+   `STATUS_SUCCESS`. Next continue the honest NDIS/e1000 path at the explicit interrupt-delivery
+   frontier: invoking the connected E1000 ISR after start walls inside the hosted component at
+   `label=3 ip=0x0e014abd addr=0x1000f01fd88`. Identify the NDIS interrupt state, adapter mapping,
+   or ISR context contract that is still missing, wire it to real kernel functionality, and keep the
+   generic PCI grant path scalable for multiple devnodes/NICs.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -618,3 +620,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
   port I/O. The next target is the rootserver `RingChannel::raw` null destination fault at
   `rip=0x10000455944/cr2=0` during E1000 `START_DEVICE`, while longer-term multi-NIC support still
   needs dynamic per-devnode hosted instance/resource windows rather than fixed proof arenas.
+- B3 continued. `IoSetDeviceInterfaceState` no longer mutates Object/I/O Manager state from hosted
+  driver import context. The hosted call captures the requested interface link, target, and
+  enable/disable state in the driver's shared frame, and the executive applies the symbolic-link
+  create/delete after the parked `START_DEVICE` dispatch returns. Repeated enable/disable transitions
+  are idempotent at the import boundary, and the executive's Object Manager/Configuration Manager
+  clients are now heap-pinned for the rootserver lifetime instead of leaving raw global pointers to
+  `_start` stack locals. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `.tmp/boot-device-interface-idempotent-20260806.log`. Result: E1000 `AddDevice` and
+  `START_DEVICE` both return `STATUS_SUCCESS`, `exec_generic_pci_io_port_out32` remains green, and
+  the boot reaches genuine explorer shell chrome with `285/292` checks passing. Review adjustment:
+  the rootserver `RingChannel::raw` null-destination wall is gone; the B3 frontier has moved to the
+  explicit E1000 interrupt-delivery proof, which now walls at `label=3 ip=0x0e014abd
+  addr=0x1000f01fd88` after start while ISR/DPC evidence for that PCI device is still absent.
