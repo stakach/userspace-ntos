@@ -80,9 +80,10 @@ pub const FSD_CODE_VA: u64 = 0x0000_0100_0E00_0000;
 pub const FSD_IMAGE_FRAMES: u64 = 64;
 
 /// The FSD pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter @+0, data @
-/// +0x1000). An FSD's DriverEntry + pipe/file-object allocation is modest; 4 MiB in its own 2-PT window.
+/// +0x1000). Hosted FSD/NDIS boot drivers currently fit comfortably inside one mapped 2 MiB window;
+/// keep the allocation honest so unused per-instance frames do not consume root untyped headroom.
 pub const FSD_POOL_VADDR: u64 = 0x0000_0100_0E80_0000;
-pub const FSD_POOL_FRAMES: u64 = 1024; // 4 MiB, pre-mapped
+pub const FSD_POOL_FRAMES: u64 = 512; // 2 MiB, pre-mapped
 
 /// The component's own stack (32 frames = 128 KiB, own PT). An FSD's dispatch call chains
 /// (NpFsdCreate → Np*) are moderately deep.
@@ -8098,7 +8099,7 @@ unsafe fn spawn_fsd_component(
             base_va: FSD_POOL_VADDR,
             count: FSD_POOL_FRAMES,
             rights: Rights::Uniform(RW_NX),
-            pts: 1,
+            pts: pts_for(FSD_POOL_FRAMES),
         },
         // Aux PT window for DATA/SHARED/ARG.
         Region {

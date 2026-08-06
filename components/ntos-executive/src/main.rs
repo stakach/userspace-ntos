@@ -1880,14 +1880,9 @@ const ISR_DONE_BADGE: u64 = 0x80;
 
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
-/// `SysNBRecv` — non-blocking poll of a notification (badge 0 if not signalled).
-const SYS_NB_RECV: i64 = -8;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
-/// `X86IRQIssueIRQHandlerMSI` — issues an IRQ-handler cap for a message-signalled
-/// interrupt (no IOAPIC pin; the device writes the vector to the LAPIC directly).
-const LBL_X86_IRQ_ISSUE_MSI: u64 = 65;
 /// Badge for the IRQ notification, so a delivered interrupt is distinguishable from
 /// "not signalled" (badge 0) when we poll.
 const IRQ_BADGE: u64 = 0x40;
@@ -1904,12 +1899,7 @@ const LBL_IOPORT_OUT32: u64 = 63;
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
-// Intel e1000e interrupt registers (offsets from the NIC BAR base).
-const E1000_ITR: u64 = 0xC4; // Interrupt Throttling (0 = deliver immediately, no postpone)
-const E1000_ICR: u64 = 0xC0; // Interrupt Cause Read (reading clears)
-const E1000_ICS: u64 = 0xC8; // Interrupt Cause Set (writing raises a cause → asserts INTx)
-const E1000_IMS: u64 = 0xD0; // Interrupt Mask Set (enable causes)
-                             // e1000e transmit-DMA registers (offsets from the NIC BAR base).
+// e1000e transmit-DMA registers (offsets from the NIC BAR base).
 const E1000_TCTL: u64 = 0x0400; // Transmit Control (bit0 EN, bit1 PSP)
 const E1000_TDBAL: u64 = 0x3800; // TX descriptor ring base, low 32 (a physical addr)
 const E1000_TDBAH: u64 = 0x3804; // TX descriptor ring base, high 32
@@ -2039,6 +2029,7 @@ static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
 /// demand-page faults during a dispatch. cptr 0 = "not yet retyped" (legacy reply_to fallback).
 static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
+static REPLY_TRANSPORT_PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): ONE dedicated MCS reply object
 /// per launched Family-A IRP driver instance. These back the `Call`(component) ⇄ `reply_on`
@@ -9500,46 +9491,6 @@ unsafe fn lpc_client() -> Option<&'static mut LpcClient<LpcChan<'static>>> {
 // replies register-accurately so the user resumes past the syscall. (Trap/reply
 // mechanics ported from driver-host-ntdll, which services real ntdll.)
 
-/// Receive an UnknownSyscall fault: `(badge, msginfo, mr0..mr3)` = RAX(SSN), RBX,
-/// RCX(=return IP), RDX. Saved regs 4+ land in this thread's IPC buffer.
-/// Issue an MSI IRQ-handler cap for `vector` into `dest_slot` (no IOAPIC pin — the
-/// device delivers by writing the vector to the LAPIC). Same 7-word + extra-cap ABI
-/// as the IOAPIC issue, but label 65; the pin/level/polarity words are ignored.
-unsafe fn msi_issue_irq_handler(dest_slot: u64, vector: u64) {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
-    core::ptr::write_volatile((ipc + 5 * 8) as *mut u64, 0); // mr4 (ignored for MSI)
-    core::ptr::write_volatile((ipc + 6 * 8) as *mut u64, 0); // mr5 (ignored)
-    core::ptr::write_volatile((ipc + 7 * 8) as *mut u64, vector); // mr6 = vector
-    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
-    let msginfo = (LBL_X86_IRQ_ISSUE_MSI << 12) | (1 << 9) | (1 << 7) | 7;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") SLOT_IRQ_CONTROL,
-        in("rsi") msginfo,
-        in("r10") dest_slot, // mr0 = index (dest slot)
-        in("r8") 64u64,      // mr1 = depth
-        in("r9") 0u64,       // mr2 = ioapic id (ignored)
-        in("r15") 0u64,      // mr3 = pin (ignored for MSI)
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// Non-blocking poll of a notification: returns the pending badge (0 if none).
-unsafe fn nb_recv(ntfn: u64) -> u64 {
-    let badge: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_NB_RECV as u64,
-        inout("rdi") ntfn => badge,
-        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    badge
-}
-
 unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
     let badge: u64;
     let msginfo: u64;
@@ -16773,6 +16724,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
     }
+    // Dedicated negative-control reply object for transport gates. It is never registered in a
+    // `recv`, so `reply_on` must fail with seL4_InvalidCapability without blocking.
+    let rprobe = alloc_slot();
+    let e_rprobe = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rprobe);
+    if e_rprobe == 0 {
+        REPLY_TRANSPORT_PROBE_SLOT.store(rprobe, Ordering::Relaxed);
+    }
     // ★ Component-dispatch transport: one DEDICATED reply object per launched IRP-driver instance
     // (see [`REPLY_FSD_SLOT`]). NOT part of WAIT_REPLY_POOL — never stolen, never rotated.
     let mut e_fsd = 0u64;
@@ -16821,6 +16779,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_hex(REPLY_W32_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
     print_hex(e_rw as u32);
+    print_str(b") REPLY_PROBE cptr=0x");
+    print_hex(REPLY_TRANSPORT_PROBE_SLOT.load(Ordering::Relaxed) as u32);
+    print_str(b" (retype e=0x");
+    print_hex(e_rprobe as u32);
     print_str(b") REPLY_FSD[0] cptr=0x");
     print_hex(fsd_reply_slot(0) as u32);
     print_str(b" REPLY_FSD[1] cptr=0x");
@@ -17719,7 +17681,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                       // the handful of locals the deferred hosting block needs to function scope.
     let mut nic_bar_base = 0u64;
     let mut nic_mmio = 0u64;
-    let mut nic_irq_ntfn = 0u64;
     let mut nic_dma_frame = 0u64;
     if found_nic {
         nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
@@ -17749,155 +17710,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &mut passed,
             );
 
-            // --- FULL-DEVICE LOOP: a real NIC interrupt delivered into an isolated
-            // driver host. Issue IOAPIC handlers for the PCI GSIs (the NIC's exact
-            // pin is chipset-routed) bound to a notification, spawn an isolated ISR
-            // host, then trigger a real NIC interrupt via the e1000e ICS register.
-            print_str(b"[ntos-exec] FULL LOOP: real NIC interrupt -> isolated ISR host\n");
-            // Diagnostic: PCI Interrupt Pin (config 0x3D) — 1=INTA .. 4=INTD, 0=no INTx
-            // (MSI-only). Tells us whether INTx routing is even the right mechanism.
-            let int_pin = (pci_read32(pci_io, 0, nic_dev, nic_func, 0x3C) >> 8) & 0xFF;
-            print_str(b"[ntos-exec] NIC Interrupt Pin = ");
-            print_u64(int_pin as u64);
-            print_str(b"\n");
-            nic_irq_ntfn = make_object(OBJ_NOTIFICATION);
-            let nic_irq_badged = alloc_slot();
-            let _ = syscall5(
-                SYS_SEND,
-                CAP_INIT_THREAD_CNODE,
-                LBL_CNODE_MINT << 12,
-                nic_irq_badged,
-                nic_irq_ntfn,
-                IRQ_BADGE,
-            );
-            let result_ntfn = make_object(OBJ_NOTIFICATION);
-            let result_badged = alloc_slot();
-            let _ = syscall5(
-                SYS_SEND,
-                CAP_INIT_THREAD_CNODE,
-                LBL_CNODE_MINT << 12,
-                result_badged,
-                result_ntfn,
-                ISR_DONE_BADGE,
-            );
-            let _ = int_pin;
-            // The isolated ISR host waits on the NIC notification (reuses spawn_isr).
-            let nic_irq_isr = copy_cap(nic_irq_ntfn);
-            spawn_isr(isr::isr_entry, nic_irq_isr, result_badged, 255);
-
-            // Deliver the NIC interrupt via MSI (its INTx isn't routed to the IOAPIC in
-            // this QEMU q35 config; MSI is a memory write to the LAPIC that bypasses the
-            // IOAPIC + chipset entirely). Walk the PCI capability list for the MSI cap
-            // (ID 0x05), program it to deliver our vector to the LAPIC, then enable it.
-            let mut cap = (pci_read32(pci_io, 0, nic_dev, nic_func, 0x34) & 0xFC) as u8;
-            let mut msi_off = 0u8;
-            let mut msix_off = 0u8;
-            for _ in 0..16 {
-                if cap == 0 {
-                    break;
-                }
-                let hdr = pci_read32(pci_io, 0, nic_dev, nic_func, cap);
-                let id = (hdr & 0xFF) as u8;
-                print_str(b"[ntos-exec]   pci cap id=0x");
-                print_hex(id as u32);
-                print_str(b" @ 0x");
-                print_hex(cap as u32);
-                print_str(b"\n");
-                if id == 0x05 {
-                    msi_off = cap;
-                }
-                if id == 0x11 {
-                    msix_off = cap;
-                }
-                cap = ((hdr >> 8) & 0xFC) as u8;
-            }
-            let _ = msix_off;
-            print_str(b"[ntos-exec] NIC MSI capability @ config 0x");
-            print_hex(msi_off as u32);
-            print_str(b"\n");
-            check(b"exec_nic_has_msi_capability", msi_off != 0, &mut passed);
-            let msi_vector = 5u64; // irq index → LAPIC vector 0x25
-            if msi_off != 0 {
-                let msg_ctrl = (pci_read32(pci_io, 0, nic_dev, nic_func, msi_off) >> 16) as u16;
-                let data_off = if (msg_ctrl & 0x80) != 0 {
-                    msi_off + 0xC
-                } else {
-                    msi_off + 8
-                };
-                // Message Address = LAPIC (0xFEE00000, physical dest APIC 0); Message
-                // Data = the CPU vector (irq index + PIC1_VECTOR_BASE → IDT irq stub).
-                pci_write32(pci_io, 0, nic_dev, nic_func, msi_off + 4, 0xFEE0_0000);
-                if (msg_ctrl & 0x80) != 0 {
-                    pci_write32(pci_io, 0, nic_dev, nic_func, msi_off + 8, 0);
-                }
-                pci_write32(
-                    pci_io,
-                    0,
-                    nic_dev,
-                    nic_func,
-                    data_off,
-                    (msi_vector + 0x20) as u32,
-                );
-                // Issue the MSI IRQ-handler cap + bind the NIC notification.
-                let handler = alloc_slot();
-                msi_issue_irq_handler(handler, msi_vector);
-                let _ = irq_handler_set_notification(handler, nic_irq_badged);
-                // Bus Master (Command bit 2) so the NIC can DMA the MSI write; then set
-                // the MSI Enable bit (Message Control bit 0 = dword bit 16).
-                let cmd = pci_read32(pci_io, 0, nic_dev, nic_func, 0x04);
-                pci_write32(pci_io, 0, nic_dev, nic_func, 0x04, cmd | (1 << 2));
-                let ctrl = pci_read32(pci_io, 0, nic_dev, nic_func, msi_off);
-                pci_write32(pci_io, 0, nic_dev, nic_func, msi_off, ctrl | (1 << 16));
-            }
-            // ITR=0 so QEMU's e1000e doesn't postpone the interrupt (throttling).
-            core::ptr::write_volatile((NIC_VADDR + E1000_ITR) as *mut u32, 0);
-            // Enable + raise a real NIC interrupt (e1000e): unmask a cause, then set it.
-            core::ptr::write_volatile((NIC_VADDR + E1000_IMS) as *mut u32, 0x1);
-            core::ptr::write_volatile((NIC_VADDR + E1000_ICS) as *mut u32, 0x1);
-            // Poll the result (bounded, non-blocking so a misroute fails not hangs).
-            // The ISR host is priority 255 (== executive), so yield_now round-robins
-            // to it when the real interrupt makes it runnable.
-            let mut got = 0u64;
-            for _ in 0..2_000_000u64 {
-                let b = nb_recv(result_ntfn);
-                if b != 0 {
-                    got = b;
-                    break;
-                }
-                yield_now();
-            }
-            // Diagnostic: read ICR from the executive. Nonzero ⇒ ICS asserted a real
-            // cause (so the trigger works even if the IOAPIC route missed).
-            let icr = core::ptr::read_volatile((NIC_VADDR + E1000_ICR) as *const u32);
-            print_str(b"[ntos-exec] NIC ISR host badge=");
-            print_u64(got);
-            print_str(b" e1000e ICR=");
-            print_hex(icr);
-            print_str(b"\n");
-            // The NIC raises a REAL interrupt: ICR bit 31 (INT asserted) + our cause.
-            check(
-                b"exec_nic_raised_real_interrupt",
-                (icr & 0x8000_0000) != 0,
-                &mut passed,
-            );
-            // ...and it is delivered via MSI all the way into the isolated ISR host — a
-            // real driver on real hardware taking a real device interrupt, crash-
-            // contained. QEMU's e1000e delivers plain MSI on a legacy cause; the kernel
-            // LAPIC-EOIs so this isn't blocked by the earlier HPET interrupt's ISR bit.
-            check(
-                b"exec_nic_irq_reached_isolated_host",
-                got == ISR_DONE_BADGE,
-                &mut passed,
-            );
-
             // ---- DMA: prove the NIC does REAL DMA to memory the executive allocates.
             // Build a TX descriptor ring + packet buffer in a normal RAM frame, learn its
             // physical address (VT-d translation is off → identity), point the e1000e TX
             // engine at it, kick the tail, and watch the NIC DMA-write the descriptor-DONE
             // bit back. DD=1 ⇒ the NIC DMA-read the ring + buffer and DMA-wrote the status.
             print_str(b"[ntos-exec] DMA: real e1000e TX DMA to an executive-owned frame\n");
-            // Bus Master (Command bit 2) + Memory Space (bit 1) — DMA needs BME (idempotent
-            // with the MSI setup above, but assert it so DMA doesn't depend on that path).
+            // Bus Master (Command bit 2) + Memory Space (bit 1) — DMA needs BME, and the
+            // direct proof asserts it locally instead of depending on any later driver path.
             let cmd = pci_read32(pci_io, 0, nic_dev, nic_func, 0x04);
             pci_write32(
                 pci_io,
@@ -22122,13 +21942,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Irp);
     let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
-    // (3) The unbound-reply probe. `REPLY_FSD_SLOT` is sized at MAX_DRIVER_INSTANCES but only the
-    // launched named-pipe provider and lifecycle-driver instances bind one, so the last slot is a
-    // retyped, never-bound reply object — exactly the "component is known runnable / not blocked in a
-    // Call" condition. This reply MUST fail loudly and MUST NOT block.
-    let spare_reply = fsd_reply_slot(driver_launch::MAX_DRIVER_INSTANCES - 1);
-    let unbound_label = if spare_reply != 0 {
-        reply_on(spare_reply, 0, 0, 0, 0, 0)
+    // (3) The unbound-reply probe. A dedicated reply object is retyped for this proof and never
+    // registered in a `recv`, so it is known unbound even when every dynamic driver-instance slot is
+    // legitimately occupied. This reply MUST fail loudly and MUST NOT block.
+    let probe_reply = REPLY_TRANSPORT_PROBE_SLOT.load(Ordering::Relaxed);
+    let unbound_label = if probe_reply != 0 {
+        reply_on(probe_reply, 0, 0, 0, 0, 0)
     } else {
         0
     };

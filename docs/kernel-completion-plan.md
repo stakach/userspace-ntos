@@ -86,11 +86,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `STATUS_SUCCESS`; the generic grant path proves NT-style PCI config reads, full
    MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
    per-devnode DMA grant, cap-backed inline `out dx,eax` I/O-port service, `IoSetDeviceInterfaceState`
-   publication, connected-ISR dispatch, and KDPC bottom-half delivery. The next B3 targets are cleanup
-   rather than synthetic bring-up: retire or replace the old direct `exec_nic_*` proof gates with
-   generic resource-manager/device-interrupt evidence, fix the remaining transport-accounting gates,
-   restore VM pool headroom, and replace fixed hosted proof arenas with per-devnode dynamic windows so
-   multiple NICs and arbitrary boot PnP drivers can load through the same boundary.
+   publication, connected-ISR dispatch, and KDPC bottom-half delivery. The next B3 target is replacing
+   fixed hosted proof arenas with per-devnode dynamic windows so multiple NICs and arbitrary boot PnP
+   drivers can load through the same boundary.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -650,3 +648,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_nic_has_msi_capability`/`exec_nic_raised_real_interrupt`/
   `exec_nic_irq_reached_isolated_host`, transport-accounting gates
   `exec_irp_transport_call_bound`/`exec_client_reply_bound`, and `exec_vm_pool_headroom`.
+- B3 cleanup continued. The old direct NIC MSI/isolated-ISR proof was retired from the early
+  hardware capstone. The remaining direct NIC checks still prove raw BAR mapping, live MMIO, TX DMA
+  writeback, and VT-d confinement, while interrupt delivery now belongs only to the generic
+  registry-selected hosted-driver/resource-manager gates that already exercise ReactOS `e1000.sys`
+  through `IoConnectInterrupt`, ISR dispatch, and KDPC delivery. The obsolete
+  `exec_nic_has_msi_capability`, `exec_nic_raised_real_interrupt`, and
+  `exec_nic_irq_reached_isolated_host` gates and their hand-programmed MSI helper were removed.
+  Review adjustment: the remaining cleanup targets are transport accounting, VM pool headroom, and
+  dynamic per-devnode hosted resource/window allocation for multi-NIC and arbitrary driver scale.
+- B3 cleanup continued. Transport accounting now uses a dedicated never-bound
+  `REPLY_TRANSPORT_PROBE_SLOT` for the negative control, so the proof no longer depends on a spare
+  dynamic hosted-driver instance slot. The FSD-class hosted-driver pool now matches the one 2 MiB
+  page-table window that was actually mapped for each instance, reclaiming unused root-untyped
+  capacity without changing the effective driver address space. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-fsd-pool-headroom-20260807.log`. Result:
+  `exec_generic_hw_interrupt_delivered`, `exec_generic_hw_dpc_delivered`,
+  `exec_irp_transport_call_bound`, `exec_client_reply_bound`, `exec_vm_pool_headroom`, and
+  `exec_explorer_shell_chrome_painted` all pass; the boot reaches genuine explorer shell chrome with
+  `289/289` checks passing. Review adjustment: B3 cleanup now centers on replacing remaining fixed
+  hosted proof arenas/windows with per-devnode dynamic resource windows for multi-NIC and arbitrary
+  boot-driver scale.
