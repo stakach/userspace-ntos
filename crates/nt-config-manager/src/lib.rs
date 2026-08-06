@@ -79,6 +79,26 @@ pub enum DriverServiceClass {
     FileSystem,
 }
 
+/// Win32 service process model encoded in a service's `Type` bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Win32ServiceProcessKind {
+    Own,
+    Shared,
+}
+
+/// Registry-selected process creation metadata for a Win32 service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Win32ServiceLaunchSpec {
+    pub service_name: String,
+    pub service_key: RegistryKeyId,
+    pub image_path: String,
+    pub process_kind: Win32ServiceProcessKind,
+    pub interactive: bool,
+    pub account_name: Option<String>,
+    pub display_name: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
 pub fn driver_service_class_from_type(service_type: u32) -> Option<DriverServiceClass> {
     if service_type & (SERVICE_FILE_SYSTEM_DRIVER | SERVICE_RECOGNIZER_DRIVER) != 0 {
         Some(DriverServiceClass::FileSystem)
@@ -132,6 +152,37 @@ impl ServiceMetadata {
 
     pub fn has_launch_image(&self) -> bool {
         self.image_path.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
+    pub fn win32_process_kind(&self) -> Option<Win32ServiceProcessKind> {
+        let service_type = self.service_type?;
+        let owns_process = service_type & SERVICE_WIN32_OWN_PROCESS != 0;
+        let shares_process = service_type & SERVICE_WIN32_SHARE_PROCESS != 0;
+        match (owns_process, shares_process) {
+            (true, false) => Some(Win32ServiceProcessKind::Own),
+            (false, true) => Some(Win32ServiceProcessKind::Shared),
+            _ => None,
+        }
+    }
+
+    pub fn win32_launch_spec(&self) -> Option<Win32ServiceLaunchSpec> {
+        if self.is_disabled() {
+            return None;
+        }
+        let process_kind = self.win32_process_kind()?;
+        let image_path = self.image_path.as_deref().filter(|path| !path.is_empty())?;
+        Some(Win32ServiceLaunchSpec {
+            service_name: self.name.clone(),
+            service_key: self.service_key,
+            image_path: image_path.into(),
+            process_kind,
+            interactive: self
+                .service_type
+                .is_some_and(|ty| ty & SERVICE_INTERACTIVE_PROCESS != 0),
+            account_name: self.object_name.clone(),
+            display_name: self.display_name.clone(),
+            dependencies: self.dependencies.clone(),
+        })
     }
 
     pub fn driver_service_class(&self) -> Option<DriverServiceClass> {
@@ -415,9 +466,33 @@ impl ConfigManager {
         self.service_candidates_by_start_and_type(&[SERVICE_AUTO_START], SERVICE_WIN32_TYPE_MASK)
     }
 
+    pub fn auto_start_win32_service_launch_specs(&self) -> Vec<Win32ServiceLaunchSpec> {
+        self.win32_service_launch_specs_by_start(&[SERVICE_AUTO_START])
+    }
+
     /// Registry-declared Win32 services that SCM may demand-start.
     pub fn demand_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_WIN32_TYPE_MASK)
+    }
+
+    pub fn demand_start_win32_service_launch_specs(&self) -> Vec<Win32ServiceLaunchSpec> {
+        self.win32_service_launch_specs_by_start(&[SERVICE_DEMAND_START])
+    }
+
+    /// Registry-declared Win32 service process creation metadata for SCM-owned launch decisions.
+    pub fn win32_service_launch_specs_by_start(
+        &self,
+        start_types: &[u32],
+    ) -> Vec<Win32ServiceLaunchSpec> {
+        self.service_metadata_list()
+            .into_iter()
+            .filter(|service| {
+                service
+                    .start_type
+                    .is_some_and(|start| start_types.contains(&start))
+            })
+            .filter_map(|service| service.win32_launch_spec())
+            .collect()
     }
 
     /// Registry-declared drivers that SCM or `NtLoadDriver` may demand-start.
@@ -1093,6 +1168,121 @@ mod tests {
             demand_drivers[0].driver_service_class(),
             Some(DriverServiceClass::Device)
         );
+    }
+
+    #[test]
+    fn win32_service_launch_specs_follow_registry_metadata() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "RpcSs",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        let rpcss_key = cm.service_metadata("RpcSs").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(rpcss_key, "ObjectName", "LocalSystem");
+        cm.registry_mut()
+            .set_string(rpcss_key, "DisplayName", "Remote Procedure Call");
+        cm.registry_mut().set_value(
+            rpcss_key,
+            "DependOnService",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["DcomLaunch", "RpcEptMapper"]),
+        );
+
+        cm.register_typed_service(
+            "InteractiveOwn",
+            r"%SystemRoot%\system32\interactive.exe",
+            SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        let own_key = cm.service_metadata("InteractiveOwn").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(own_key, "ObjectName", r".\InteractiveUser");
+
+        cm.register_typed_service(
+            "DemandOwn",
+            r"%SystemRoot%\system32\demand.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_typed_service(
+            "Driver",
+            r"system32\drivers\driver.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "DisabledSvc",
+            r"%SystemRoot%\system32\disabled.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_DISABLED,
+            1,
+        );
+        cm.register_typed_service(
+            "Malformed",
+            r"%SystemRoot%\system32\malformed.exe",
+            SERVICE_WIN32_OWN_PROCESS | SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        let no_image = cm
+            .registry_mut()
+            .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\NoImage");
+        cm.registry_mut()
+            .set_dword(no_image, "Type", SERVICE_WIN32_OWN_PROCESS);
+        cm.registry_mut()
+            .set_dword(no_image, "Start", SERVICE_AUTO_START);
+
+        let auto = cm.auto_start_win32_service_launch_specs();
+        assert_eq!(auto.len(), 2);
+        let interactive = auto
+            .iter()
+            .find(|spec| spec.service_name == "InteractiveOwn")
+            .unwrap();
+        assert_eq!(interactive.process_kind, Win32ServiceProcessKind::Own);
+        assert!(interactive.interactive);
+        assert_eq!(
+            interactive.account_name.as_deref(),
+            Some(r".\InteractiveUser")
+        );
+
+        let rpcss = auto
+            .iter()
+            .find(|spec| spec.service_name == "RpcSs")
+            .unwrap();
+        assert_eq!(rpcss.service_key, rpcss_key);
+        assert_eq!(rpcss.process_kind, Win32ServiceProcessKind::Shared);
+        assert!(!rpcss.interactive);
+        assert_eq!(rpcss.account_name.as_deref(), Some("LocalSystem"));
+        assert_eq!(rpcss.display_name.as_deref(), Some("Remote Procedure Call"));
+        assert_eq!(
+            rpcss.dependencies,
+            alloc::vec![String::from("DcomLaunch"), String::from("RpcEptMapper")]
+        );
+
+        let demand = cm.demand_start_win32_service_launch_specs();
+        assert_eq!(demand.len(), 1);
+        assert_eq!(demand[0].service_name, "DemandOwn");
+        assert_eq!(demand[0].process_kind, Win32ServiceProcessKind::Own);
+        assert!(!demand[0].interactive);
     }
 
     #[test]

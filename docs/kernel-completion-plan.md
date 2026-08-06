@@ -108,12 +108,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
    projection helper. Remaining display debt is hosting real videoprt/miniport instead of the
    boot-framebuffer bridge.
-2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
-   the kernel should only expose generic process/section/token/thread primitives.
+2. Continue A3 for Win32 service starts: SCM-owned service metadata now produces typed
+   `Win32ServiceLaunchSpec` records with image path, own/shared process kind, interactive flag,
+   account, display name, and dependencies. The next step is making the actual SCM start path consume
+   those specs and call generic process creation, while driver starts continue through `NtLoadDriver`.
 3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
-   policy from executive start paths once SCM consumes service metadata.
-4. Continue A3/A4 by routing concrete SCM Win32 service start requests through generic process
-   creation metadata instead of adding executive-side service-name policy.
+   policy from executive start paths once SCM consumes the launch specs.
+4. Continue A3/A4 by replacing any hosted executable catalog decisions that still encode service or
+   process role policy with dynamic process/runtime allocation state.
 
 ## Review Log
 
@@ -949,3 +951,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `.tmp/boot-scm-service-selection-20260807.log` with `290/290` checks passing. Review adjustment:
   next work is A3/A4: turn SCM's actual Win32 service start requests into generic process creation
   from `ServiceMetadata`, without putting service-name policy back in the kernel.
+- A3 continued. `nt-config-manager` now exposes a typed `Win32ServiceLaunchSpec` for SCM-owned
+  service process starts. The spec rejects disabled services, missing `ImagePath`, and malformed
+  own+share `Type` combinations, and carries process kind, interactive flag, account name, display
+  name, and dependencies from the registry. The executive's SYSTEM-hive service selection proof now
+  consumes these launch specs instead of copying raw Win32 `ServiceMetadata`, and its Win32 gates
+  prove a typed process model is present for auto-start and demand-start services. Validation:
+  `cargo fmt --all`, `cargo test -p nt-config-manager`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-scm-win32-launch-spec-20260807.log`. Result: auto-start Win32 count 14 first `Browser`
+  `kind=shared`, demand-start Win32 count 8 first `BITS` `kind=shared`,
+  `exec_scm_autostart_win32_launch_spec_from_registry`,
+  `exec_scm_demandstart_win32_launch_spec_from_registry`,
+  `exec_ntloaddriver_demand_driver_selected_from_registry`,
+  `exec_msgina_logon_dialog_painted`, and `exec_explorer_shell_chrome_painted` pass with `290/290`
+  checks passing. Review adjustment: next A3 work is the concrete SCM service-start route:
+  services.exe should use these launch specs to choose `CreateProcessW`/`CreateProcessAsUserW`, while
+  the kernel exposes only generic process, section, token, and thread mechanisms.
