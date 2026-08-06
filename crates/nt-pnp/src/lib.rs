@@ -459,6 +459,69 @@ pub struct ResourceAssignment {
     pub dma_len: u64,
 }
 
+/// A root-bus resource profile describes synthetic hardware enumerated by the native root bus.
+/// The registry devnode still selects the service; this profile only describes the resource shape
+/// the broker can mint for a root-enumerated device ID.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RootBusResourceProfile {
+    pub device_id: &'static str,
+    pub mmio_phys: u64,
+    pub mmio_len: u64,
+}
+
+/// The DMA PnP proof device's root-bus register bank. The test driver reads a 4 KiB MMIO range
+/// starting at this translated physical address and then acquires interrupt + common-buffer DMA
+/// resources through the normal WDM calls.
+pub const ROOT_DMA_TEST_RESOURCE_PROFILE: RootBusResourceProfile = RootBusResourceProfile {
+    device_id: r"ROOT\USERSPACE_NTOS_DMA",
+    mmio_phys: 0x1000_0000,
+    mmio_len: 0x1000,
+};
+
+fn devnode_device_id(instance_id: &str) -> &str {
+    match instance_id.rfind('\\') {
+        Some(pos) => &instance_id[..pos],
+        None => instance_id,
+    }
+}
+
+fn id_matches_profile(id: &str, profile: &RootBusResourceProfile) -> bool {
+    id.eq_ignore_ascii_case(profile.device_id)
+}
+
+/// Assign resources to a root-bus devnode when its instance path or registry IDs match a known
+/// broker-backed profile. This is the root-bus counterpart to PCI BAR assignment: the returned
+/// abstract resource list still has to be minted by the executive before `START_DEVICE`.
+pub fn assign_root_bus_resources(
+    instance_id: &str,
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
+    profile: &RootBusResourceProfile,
+    int_vector: u32,
+    int_latched: bool,
+    int_affinity: u64,
+    dma_len: u64,
+) -> Option<ResourceAssignment> {
+    let matched = id_matches_profile(devnode_device_id(instance_id), profile)
+        || hardware_ids
+            .iter()
+            .any(|id| id_matches_profile(id, profile))
+        || compatible_ids
+            .iter()
+            .any(|id| id_matches_profile(id, profile));
+    if !matched || profile.mmio_phys == 0 || profile.mmio_len == 0 || int_vector == 0 {
+        return None;
+    }
+    Some(ResourceAssignment {
+        mmio_phys: profile.mmio_phys,
+        mmio_len: profile.mmio_len,
+        int_vector,
+        int_latched,
+        int_affinity,
+        dma_len,
+    })
+}
+
 /// Assign resources to a device bound to `class`, from its enumerated BARs + IRQ. `int_vector` is
 /// the translated interrupt vector the executive has arranged for this device (e.g. the MSI vector
 /// it programmed); `dma_len` is the common-buffer size the driver needs (0 for none). Returns
@@ -787,6 +850,42 @@ mod tests {
         assert_eq!(int.vector, 5);
         assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LATCHED);
         assert_eq!(int.affinity, 1);
+    }
+
+    #[test]
+    fn root_bus_dma_profile_matches_registry_ids() {
+        let assignment = assign_root_bus_resources(
+            r"ROOT\USERSPACE_NTOS_DMA\0001",
+            &[r"ROOT\USERSPACE_NTOS_DMA"],
+            &[],
+            &ROOT_DMA_TEST_RESOURCE_PROFILE,
+            5,
+            false,
+            1,
+            0x1000,
+        )
+        .expect("root-bus DMA resources");
+        assert_eq!(assignment.mmio_phys, 0x1000_0000);
+        assert_eq!(assignment.mmio_len, 0x1000);
+        assert_eq!(assignment.int_vector, 5);
+        assert!(!assignment.int_latched);
+        assert_eq!(assignment.int_affinity, 1);
+        assert_eq!(assignment.dma_len, 0x1000);
+    }
+
+    #[test]
+    fn root_bus_profile_rejects_unmatched_devnode() {
+        assert!(assign_root_bus_resources(
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[],
+            &ROOT_DMA_TEST_RESOURCE_PROFILE,
+            5,
+            false,
+            1,
+            0x1000,
+        )
+        .is_none());
     }
 
     #[test]

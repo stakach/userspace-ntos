@@ -1313,6 +1313,26 @@ mod tests {
         client
     }
 
+    #[test]
+    fn io_manager_deletes_symbolic_link_through_port() {
+        let mut om = IoManager::new(MockObjectPort::new());
+        let _client = setup_device(&mut om);
+
+        assert!(om
+            .port_mut()
+            .open_device_object(&path("\\??\\Test0"))
+            .is_ok());
+        assert!(om.delete_symbolic_link(&path("\\??\\Test0")).is_ok());
+        assert_eq!(
+            om.port_mut().open_device_object(&path("\\??\\Test0")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            om.delete_symbolic_link(&path("\\??\\Test0")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
     fn open_read(
         om: &mut IoManager<MockObjectPort>,
         client: ClientId,
@@ -2114,6 +2134,8 @@ mod tests {
             WdmIrpInit {
                 system_buffer: 0x1111,
                 user_buffer: 0x2222,
+                stack_count: 1,
+                current_location: 1,
                 current_stack_location: 0x3333,
             },
         )

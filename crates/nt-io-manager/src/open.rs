@@ -236,6 +236,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.port.create_symbolic_link(link, target)
     }
 
+    /// Delete a symbolic link through the Object Manager (spec §11.4).
+    pub fn delete_symbolic_link(&mut self, link: &NtPath) -> Result<(), NtStatus> {
+        self.port.delete_symbolic_link(link)
+    }
+
     /// Open (create) a file on a device `path` (spec §12.3). Returns the Object
     /// Manager file handle on success; on any failure the File object + IRP are
     /// cleaned up. v0.1 completes creates synchronously.

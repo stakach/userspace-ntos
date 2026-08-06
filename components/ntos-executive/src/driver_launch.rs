@@ -28,18 +28,20 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
+use nt_kernel_exec::{kevent, EventKind};
 use nt_io_abi::major;
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
     DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext,
-    DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId,
-    InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
-    ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
-    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    DispatchOutcome, DispatchTarget, DriverBackendId, DriverDispatchBackend, DriverId,
+    DriverPeerId, FileId, InformationParameters, IoManager, IoParameters, IrpId, IrpProjection,
+    MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit,
+    WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
+use nt_mdl::MdlRegistry;
 use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
@@ -854,15 +856,17 @@ pub(crate) static FSD_BUGCHECK_P4: AtomicU64 = AtomicU64::new(0);
 /// which is the only side that knows which component it just drove).
 pub(crate) static FSD_BUGCHECK_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-/// The dispatch escape buffer: `[0]` = the saved `rsp` inside [`fsd_guarded_call`], `[1]` = the
-/// resume address (non-zero == ARMED), `[2]` = set by the longjmp path so the caller can tell a
-/// bugchecked dispatch from a normal return.
+/// The dispatch escape buffer: `[0]` = the callee-saved pop-base inside [`fsd_guarded_call`],
+/// `[1]` = the resume address (non-zero == ARMED), `[2]` = set by the longjmp path so the caller can
+/// tell a bugchecked dispatch from a normal return.
 static mut BUGCHECK_JB: [u64; 3] = [0; 3];
 
 // The setjmp/longjmp pair. Written in assembly on purpose: the escape abandons npfs' frames, so no
 // Rust value may be live across it. `fsd_guarded_call` saves every Win64 callee-saved GPR, records
-// (rsp, resume-address) in the jump buffer, then calls `handler(devobj, irp)`; both the normal
-// return and the longjmp land on the SAME epilogue, so the register file is restored either way.
+// (pop-base, resume-address) in the jump buffer, then calls `handler(devobj, irp)` with a forced
+// Win64 call frame (`rsp` 16-byte aligned before `call`, plus 32 bytes of shadow space). Both the
+// normal return and the longjmp land on the SAME epilogue, so the register file is restored either
+// way.
 core::arch::global_asm!(
     ".text",
     ".globl fsd_guarded_call",
@@ -875,16 +879,18 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    "sub rsp, 0x28", // 32 B shadow space + 8 B so the callee sees rsp % 16 == 8
+    "mov r15, r9",
     "lea rax, [rip + 9f]",
-    "mov [r9], rsp",
-    "mov [r9 + 8], rax",
+    "mov [r15], rsp",
+    "mov [r15 + 8], rax",
     "mov r10, rcx",
     "mov rcx, rdx",
     "mov rdx, r8",
+    "and rsp, -16",
+    "sub rsp, 0x20",
     "call r10",
-    "9:", // the longjmp lands here with rsp already restored from the buffer
-    "add rsp, 0x28",
+    "9:", // the longjmp lands here and uses the same pop-base restore as a normal return.
+    "mov rsp, [r15]",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -896,6 +902,7 @@ core::arch::global_asm!(
     "ret",
     ".globl fsd_guarded_longjmp",
     "fsd_guarded_longjmp:", // rcx = jump buffer
+    "mov r15, rcx",
     "mov rsp, [rcx]",
     "jmp qword ptr [rcx + 8]",
 );
@@ -1166,10 +1173,7 @@ extern "win64" fn s_io_attach_device_to_device_stack(source: u64, target: u64) -
                 }
             }
             (None, None) => lower,
-            _ => {
-                crate::hosted_driver_projection::detach_hosted_device_projection(lower);
-                0
-            }
+            _ => lower,
         }
     }
 }
@@ -1203,6 +1207,17 @@ unsafe fn irp_next_stack_location(irp: u64) -> u64 {
     irp_current_stack_location(irp).saturating_sub(WDM_X64_IO_STACK_LOCATION_SIZE as u64)
 }
 
+const WDM_X64_IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
+const WDM_X64_IRP_STACK_COUNT_OFFSET: u64 = 0x42;
+const WDM_X64_IRP_IO_STATUS_STATUS_OFFSET: u64 = 0x30;
+const WDM_X64_IO_STACK_MINOR_OFFSET: u64 = 0x01;
+const WDM_X64_IO_STACK_CONTROL_OFFSET: u64 = 0x03;
+const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x20;
+const WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET: u64 = 0x38;
+const WDM_X64_IO_STACK_CONTEXT_OFFSET: u64 = 0x40;
+const WDM_X64_SL_INVOKE_ON_SUCCESS: u8 = 0x40;
+const WDM_X64_SL_INVOKE_ON_ERROR: u8 = 0x80;
+
 /// `PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP)`.
 extern "win64" fn s_io_get_current_irp_stack_location(irp: u64) -> u64 {
     unsafe { irp_current_stack_location(irp) }
@@ -1231,19 +1246,60 @@ extern "win64" fn s_io_copy_current_irp_stack_location_to_next(irp: u64) {
 }
 
 /// `void IoSkipCurrentIrpStackLocation(PIRP)`.
-extern "win64" fn s_io_skip_current_irp_stack_location(_irp: u64) {}
+extern "win64" fn s_io_skip_current_irp_stack_location(irp: u64) {
+    unsafe {
+        if irp == 0 {
+            return;
+        }
+        let current_location =
+            read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            current_location.wrapping_add(1),
+        );
+        let current_stack = irp_current_stack_location(irp);
+        if current_stack != 0 {
+            write_unaligned(
+                (irp + 0xb8) as *mut u64,
+                current_stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64,
+            );
+        }
+    }
+}
 
 /// `NTSTATUS IofCallDriver(PDEVICE_OBJECT, PIRP)`.
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
+        let mut next = 0;
+        let mut forwarded_minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        if irp != 0 {
+            let current_location =
+                read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+            if current_location == 0 {
+                return 0xC000_0010u32 as i32; // STATUS_INVALID_DEVICE_REQUEST
+            }
+            write_unaligned(
+                (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+                current_location - 1,
+            );
+            next = irp_next_stack_location(irp);
+            if next != 0 {
+                write_unaligned((irp + 0xb8) as *mut u64, next);
+                write_unaligned(
+                    (next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64,
+                    device,
+                );
+                forwarded_minor =
+                    read_unaligned((next + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8) as u64;
+            }
+        }
         let expected_pdo = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
         let status = if expected_pdo == 0 {
             0
         } else if device == expected_pdo {
             write_volatile(
                 (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
-                minor,
+                forwarded_minor,
             );
             0
         } else {
@@ -1254,10 +1310,53 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             status,
         );
         if irp != 0 {
-            write_unaligned((irp + 0x30) as *mut i32, status);
+            write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
+            if next != 0 {
+                complete_forwarded_stack_location(irp, next, status);
+            }
         }
         status
     }
+}
+
+unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
+    let completion = read_unaligned(
+        (stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64,
+    );
+    if completion == 0 {
+        return;
+    }
+    let control =
+        read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+    let invoke = if status >= 0 {
+        (control & WDM_X64_SL_INVOKE_ON_SUCCESS) != 0
+    } else {
+        (control & WDM_X64_SL_INVOKE_ON_ERROR) != 0
+    };
+    if !invoke {
+        return;
+    }
+
+    let current_location =
+        read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+    let stack_count = read_unaligned((irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
+    let next_location = current_location.saturating_add(1);
+    let next_stack = stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    write_unaligned(
+        (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        next_location,
+    );
+    write_unaligned((irp + 0xb8) as *mut u64, next_stack);
+
+    let device_object = if next_location <= stack_count {
+        read_unaligned((next_stack + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *const u64)
+    } else {
+        0
+    };
+    let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
+    let routine: extern "win64" fn(u64, u64, u64) -> i32 =
+        core::mem::transmute(completion as *const ());
+    let _ = routine(device_object, irp, context);
 }
 
 /// `NTSTATUS PoCallDriver(PDEVICE_OBJECT, PIRP)`.
@@ -1267,6 +1366,118 @@ extern "win64" fn s_po_call_driver(device: u64, irp: u64) -> i32 {
 
 /// `void PoStartNextPowerIrp(PIRP)`.
 extern "win64" fn s_po_start_next_power_irp(_irp: u64) {}
+
+/// `POWER_STATE PoSetPowerState(PDEVICE_OBJECT, POWER_STATE_TYPE, POWER_STATE)` — record the
+/// device power state the hosted driver reports and return the previous state.
+extern "win64" fn s_po_set_power_state(_device: u64, power_type: u32, state: u32) -> u32 {
+    const POWER_STATE_TYPE_DEVICE: u32 = 1;
+    unsafe {
+        let previous = read_volatile(core::ptr::addr_of!(HOSTED_DRIVER_DEVICE_POWER_STATE));
+        if power_type == POWER_STATE_TYPE_DEVICE {
+            write_volatile(
+                core::ptr::addr_of_mut!(HOSTED_DRIVER_DEVICE_POWER_STATE),
+                state,
+            );
+        }
+        previous
+    }
+}
+
+/// `PMDL IoAllocateMdl(PVOID, ULONG, BOOLEAN, BOOLEAN, PIRP)` — project a single-buffer MDL
+/// while recording the canonical MDL id in the driver-visible `Next` field.
+extern "win64" fn s_io_allocate_mdl(
+    virtual_address: u64,
+    length: u32,
+    _secondary_buffer: u8,
+    _charge_quota: u8,
+    _irp: u64,
+) -> u64 {
+    unsafe {
+        if virtual_address == 0 || length == 0 {
+            return 0;
+        }
+        let mdl = pool_alloc(nt_mdl::MDL_SIZE as u64);
+        if mdl == 0 {
+            return 0;
+        }
+        let id = hosted_mdl_registry_mut().allocate(virtual_address, length);
+        write_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, id);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
+            nt_mdl::MDL_SIZE as i16,
+        );
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
+            virtual_address & !0xFFF,
+        );
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
+            length,
+        );
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
+            (virtual_address & 0xFFF) as u32,
+        );
+        mdl
+    }
+}
+
+/// `VOID IoFreeMdl(PMDL)`.
+extern "win64" fn s_io_free_mdl(mdl: u64) {
+    unsafe {
+        if mdl == 0 {
+            return;
+        }
+        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
+        let _ = hosted_mdl_registry_mut().free(id);
+        pool_free(mdl);
+    }
+}
+
+/// `VOID MmBuildMdlForNonPagedPool(PMDL)` — mark the MDL nonpaged and set `MappedSystemVa`.
+extern "win64" fn s_mm_build_mdl_for_nonpaged_pool(mdl: u64) {
+    unsafe {
+        if mdl == 0 {
+            return;
+        }
+        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
+        let _ = hosted_mdl_registry_mut().build_for_nonpaged(id);
+        let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+            flags | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL | nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
+        );
+        let start = read_unaligned((mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+        let offset = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
+            start + offset as u64,
+        );
+    }
+}
+
+/// `PVOID MmMapLockedPagesSpecifyCache(...)` — return the MDL's existing nonpaged mapping.
+extern "win64" fn s_mm_map_locked_pages_specify_cache(
+    mdl: u64,
+    _access_mode: u8,
+    _cache_type: u32,
+    _requested_address: u64,
+    _bug_check_on_failure: u32,
+    _priority: u32,
+) -> u64 {
+    unsafe {
+        if mdl == 0 {
+            return 0;
+        }
+        let mapped = read_unaligned((mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64);
+        if mapped != 0 {
+            return mapped;
+        }
+        let start = read_unaligned((mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+        let offset = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+        start + offset as u64
+    }
+}
 
 /// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
 /// for a BAR range the executive already granted to this hosted driver. Requests outside the active
@@ -1570,6 +1781,20 @@ extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
     0
 }
 
+/// `NTSTATUS IoDeleteSymbolicLink(PUNICODE_STRING)` — delete the driver-declared link through the
+/// canonical I/O Manager/Object Manager path instead of resolving the import to a no-op.
+extern "win64" fn s_io_delete_symbolic_link(link: u64) -> i32 {
+    unsafe {
+        let Some(path) = unicode_string_nt_path(link) else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        match io_manager_mut().delete_symbolic_link(&path) {
+            Ok(()) => 0,
+            Err(status) => status.raw(),
+        }
+    }
+}
+
 /// `void IoRegisterFileSystem(PDEVICE_OBJECT)`. Record that the FSD registered; no queue to maintain
 /// (the executive routes named-pipe/file paths to the recorded device directly).
 extern "win64" fn s_io_register_file_system(_dev: u64) {
@@ -1864,6 +2089,132 @@ extern "win64" fn s_init_small_struct(p: u64) -> i32 {
     0
 }
 
+/// `void KeInitializeSpinLock(PKSPIN_LOCK)` — a KSPIN_LOCK is pointer-sized storage.
+extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
+    unsafe {
+        if lock != 0 {
+            write_unaligned(lock as *mut u64, 0);
+        }
+    }
+}
+
+/// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)` — single-threaded hosted drivers never spin, but
+/// the lock's driver-visible storage records ownership until release.
+extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
+    unsafe {
+        if lock != 0 {
+            write_unaligned(lock as *mut u64, 1);
+        }
+    }
+    0 // previous IRQL: PASSIVE_LEVEL
+}
+
+/// `void KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
+extern "win64" fn s_ke_release_spin_lock(lock: u64, _old_irql: u8) {
+    unsafe {
+        if lock != 0 {
+            write_unaligned(lock as *mut u64, 0);
+        }
+    }
+}
+
+/// `void KeInitializeEvent(PRKEVENT, EVENT_TYPE, BOOLEAN)`.
+extern "win64" fn s_ke_initialize_event(event: u64, event_type: u32, state: u8) {
+    if event == 0 {
+        return;
+    }
+    let kind = if event_type == 1 {
+        EventKind::Synchronization
+    } else {
+        EventKind::Notification
+    };
+    unsafe {
+        kevent::init_kevent(event as *mut u8, kind, state != 0);
+    }
+}
+
+/// `LONG KeSetEvent(PRKEVENT, KPRIORITY, BOOLEAN)`.
+extern "win64" fn s_ke_set_event(event: u64, _increment: i32, _wait: u8) -> i32 {
+    if event == 0 {
+        return 0;
+    }
+    unsafe { kevent::kevent_set(event as *mut u8) as i32 }
+}
+
+/// `void KeClearEvent(PRKEVENT)`.
+extern "win64" fn s_ke_clear_event(event: u64) {
+    if event != 0 {
+        unsafe {
+            kevent::kevent_clear(event as *mut u8);
+        }
+    }
+}
+
+/// `NTSTATUS KeWaitForSingleObject(...)` for hosted-driver local dispatcher objects. The current
+/// component transport cannot sleep inside an import trampoline, so unsatisfied waits report timeout
+/// instead of fabricating success.
+extern "win64" fn s_ke_wait_for_single_object(
+    object: u64,
+    _wait_reason: u32,
+    _wait_mode: u32,
+    _alertable: u8,
+    _timeout: u64,
+) -> i32 {
+    const STATUS_SUCCESS: i32 = 0;
+    const STATUS_TIMEOUT: i32 = 0x0000_0102;
+    if object == 0 {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    unsafe {
+        if !kevent::kevent_read_state(object as *const u8) {
+            return STATUS_TIMEOUT;
+        }
+        if kevent::kevent_kind(object as *const u8) == EventKind::Synchronization {
+            kevent::kevent_clear(object as *mut u8);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+const KDPC_DEFERRED_ROUTINE_OFFSET: u64 = 0x18;
+const KDPC_DEFERRED_CONTEXT_OFFSET: u64 = 0x20;
+const KDPC_SYSTEM_ARGUMENT1_OFFSET: u64 = 0x28;
+const KDPC_SYSTEM_ARGUMENT2_OFFSET: u64 = 0x30;
+const KDPC_QUEUED_OFFSET: u64 = 0x38;
+const KDPC_SIZE: u64 = 0x40;
+
+/// `void KeInitializeDpc(PRKDPC, PKDEFERRED_ROUTINE, PVOID)`.
+extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: u64) {
+    unsafe {
+        if dpc == 0 {
+            return;
+        }
+        core::ptr::write_bytes(dpc as *mut u8, 0, KDPC_SIZE as usize);
+        write_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *mut u64, routine);
+        write_unaligned(
+            (dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *mut u64,
+            deferred_context,
+        );
+    }
+}
+
+/// `BOOLEAN KeInsertQueueDpc(PRKDPC, PVOID, PVOID)` — queue state is represented in the driver-owned
+/// KDPC projection so duplicate inserts are rejected deterministically.
+extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
+    unsafe {
+        if dpc == 0
+            || read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64) == 0
+            || read_unaligned((dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0
+        {
+            return 0;
+        }
+        write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, arg1);
+        write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, arg2);
+        write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
+    }
+    1
+}
+
 /// `BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE, BOOLEAN Wait)` /
 /// `ExAcquireResourceSharedLite` — uncontended single-threaded host: always granted.
 extern "win64" fn s_acquire_resource(_res: u64, _wait: u64) -> u64 {
@@ -2015,8 +2366,25 @@ fn register_fsd_trampolines() {
         s_po_start_next_power_irp as *const () as usize as u64,
     );
     reg.bind(
+        "PoSetPowerState",
+        s_po_set_power_state as *const () as usize as u64,
+    );
+    reg.bind(
         "IoGetDmaAdapter",
         s_io_get_dma_adapter as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoAllocateMdl",
+        s_io_allocate_mdl as *const () as usize as u64,
+    );
+    reg.bind("IoFreeMdl", s_io_free_mdl as *const () as usize as u64);
+    reg.bind(
+        "MmBuildMdlForNonPagedPool",
+        s_mm_build_mdl_for_nonpaged_pool as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmMapLockedPagesSpecifyCache",
+        s_mm_map_locked_pages_specify_cache as *const () as usize as u64,
     );
     reg.bind(
         "MmMapIoSpace",
@@ -2037,6 +2405,10 @@ fn register_fsd_trampolines() {
     reg.bind(
         "IoCreateSymbolicLink",
         s_io_create_symbolic_link as usize as u64,
+    );
+    reg.bind(
+        "IoDeleteSymbolicLink",
+        s_io_delete_symbolic_link as *const () as usize as u64,
     );
     reg.bind(
         "IoRegisterFileSystem",
@@ -2113,10 +2485,47 @@ fn register_fsd_trampolines() {
         "ExInitializeResourceLite",
         s_init_small_struct as usize as u64,
     );
-    reg.bind("KeInitializeSpinLock", s_init_small_struct as usize as u64);
-    reg.bind("KeInitializeEvent", s_init_small_struct as usize as u64);
+    reg.bind(
+        "KeInitializeSpinLock",
+        s_ke_initialize_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeAcquireSpinLockRaiseToDpc",
+        s_ke_acquire_spin_lock_raise_to_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseSpinLock",
+        s_ke_release_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseSpinLockFromDpcLevel",
+        s_ke_release_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInitializeEvent",
+        s_ke_initialize_event as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeSetEvent",
+        s_ke_set_event as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeClearEvent",
+        s_ke_clear_event as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeWaitForSingleObject",
+        s_ke_wait_for_single_object as *const () as usize as u64,
+    );
     reg.bind("KeInitializeTimer", s_init_small_struct as usize as u64);
-    reg.bind("KeInitializeDpc", s_init_small_struct as usize as u64);
+    reg.bind(
+        "KeInitializeDpc",
+        s_ke_initialize_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInsertQueueDpc",
+        s_ke_insert_queue_dpc as *const () as usize as u64,
+    );
     reg.bind("ExInitializeFastMutex", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeMutex", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeSemaphore", s_init_small_struct as usize as u64);
@@ -2598,6 +3007,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         WdmIrpInit {
             system_buffer: data,
             user_buffer: data,
+            stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
+            current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
             current_stack_location: current_iosl,
         },
     )
@@ -2985,6 +3396,30 @@ unsafe fn load_pe_into(
                 continue;
             }
             p += 1;
+        }
+    }
+
+    // Seed a valid /GS cookie when the image declares one through the PE load-config directory.
+    // MSVC's GsDriverEntry wrapper fastfails with int 0x29 if this is left at the CRT default.
+    let load_config_rva = read_unaligned((opt + 112 + 10 * 8) as *const u32) as u64;
+    let load_config_size = read_unaligned((opt + 112 + 10 * 8 + 4) as *const u32) as u64;
+    if load_config_rva != 0 && load_config_size >= 96 && load_config_rva + 96 <= cap {
+        let cookie_va = read_unaligned((dst_va + load_config_rva + 88) as *const u64);
+        let cookie_rva = if cookie_va >= run_va && cookie_va - run_va <= cap {
+            // The relocation pass above rebases the load-config SecurityCookie VA.
+            Some(cookie_va - run_va)
+        } else if cookie_va >= image_base && cookie_va - image_base <= cap {
+            Some(cookie_va - image_base)
+        } else {
+            None
+        };
+        if let Some(cookie_rva) = cookie_rva {
+            if cookie_rva + 8 <= cap {
+                write_unaligned(
+                    (dst_va + cookie_rva) as *mut u64,
+                    nt_pe_loader::SECURITY_COOKIE_SEED,
+                );
+            }
         }
     }
 
@@ -3472,10 +3907,19 @@ impl ObjectManagerPort for ExecutiveObjectManagerPort {
         name: Option<&NtPath>,
         owner_local_id: u64,
     ) -> Result<ObjectId, nt_status::NtStatus> {
-        let path = Self::ascii_path(name.ok_or(nt_status::NtStatus::INVALID_PARAMETER)?)?;
-        unsafe {
-            crate::object_manager_create_device_path(&path, IO_MANAGER_COMPONENT_ID, owner_local_id)
-                .map(ObjectId)
+        match name {
+            Some(name) => {
+                let path = Self::ascii_path(name)?;
+                unsafe {
+                    crate::object_manager_create_device_path(
+                        &path,
+                        IO_MANAGER_COMPONENT_ID,
+                        owner_local_id,
+                    )
+                    .map(ObjectId)
+                }
+            }
+            None => Ok(ObjectId::NULL),
         }
     }
 
@@ -3586,6 +4030,18 @@ fn captured_nt_path(bytes: &[u8; SH_CAPTURED_PATH_BYTES], len: u16) -> Option<Nt
     NtPath::parse(&units[..len / 2]).ok()
 }
 
+unsafe fn unicode_string_nt_path(us: u64) -> Option<NtPath> {
+    let (buf, len) = unicode_string_parts(us)?;
+    let mut units = [0u16; SH_CAPTURED_PATH_BYTES / 2];
+    let count = len as usize / 2;
+    let mut i = 0usize;
+    while i < count {
+        units[i] = read_unaligned((buf + (i * 2) as u64) as *const u16);
+        i += 1;
+    }
+    NtPath::parse(&units[..count]).ok()
+}
+
 struct HostedDriverBackend {
     instance: usize,
 }
@@ -3653,6 +4109,51 @@ impl DriverDispatchBackend for HostedDriverBackend {
     fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
         Err(nt_status::NtStatus::NOT_SUPPORTED)
     }
+}
+
+struct HostedRootBusBackend;
+
+impl DriverDispatchBackend for HostedRootBusBackend {
+    fn dispatch_irp(
+        &mut self,
+        _ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, nt_status::NtStatus> {
+        if irp.major == major::IRP_MJ_PNP {
+            Ok(DispatchOutcome::Completed {
+                status: nt_status::NtStatus::SUCCESS,
+                information: 0,
+            })
+        } else {
+            Ok(DispatchOutcome::Failed {
+                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            })
+        }
+    }
+
+    fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+        Err(nt_status::NtStatus::NOT_SUPPORTED)
+    }
+}
+
+const HOSTED_ROOT_BUS_DRIVER_PATH: &str = "\\Driver\\RootBus";
+
+fn hosted_root_bus_driver_id() -> Result<DriverId, nt_status::NtStatus> {
+    if let Some(id) = driver_id_by_name(HOSTED_ROOT_BUS_DRIVER_PATH) {
+        return Ok(DriverId(id));
+    }
+    let name =
+        parse_nt_path(HOSTED_ROOT_BUS_DRIVER_PATH).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mut dispatch = MajorFunctionTable::new();
+    dispatch.set(
+        major::IRP_MJ_PNP,
+        DispatchTarget::Kernel(DriverBackendId(0)),
+    );
+    io_manager_mut().create_kernel_driver_with_major_table(
+        &name,
+        Box::new(HostedRootBusBackend),
+        dispatch,
+    )
 }
 
 fn external_major(major: u64) -> Option<u8> {
@@ -3944,6 +4445,19 @@ const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     used: false,
 };
 
+#[derive(Clone, Copy)]
+struct HostedRootPdoBinding {
+    pdo_object: u64,
+    device_id: u64,
+    used: bool,
+}
+
+const EMPTY_HOSTED_ROOT_PDO_BINDING: HostedRootPdoBinding = HostedRootPdoBinding {
+    pdo_object: 0,
+    device_id: 0,
+    used: false,
+};
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostedHardwareEvidence {
     pub resource_mmio_phys: u64,
@@ -3993,9 +4507,13 @@ impl HostedHardwareEvidence {
 const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
 static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
     [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
+static mut HOSTED_ROOT_PDO_BINDINGS: [HostedRootPdoBinding; MAX_HOSTED_DEVICE_BINDINGS] =
+    [EMPTY_HOSTED_ROOT_PDO_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
+static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
+static mut HOSTED_DRIVER_DEVICE_POWER_STATE: u32 = 1; // PowerDeviceD0
 
 const HOSTED_MMIO_RESOURCE_KIND: u64 = 1;
 const HOSTED_INTERRUPT_RESOURCE_KIND: u64 = 2;
@@ -4040,6 +4558,14 @@ unsafe fn hosted_dma_manager_mut() -> &'static mut HostedDmaManager {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DMA_MANAGER);
     if slot.is_none() {
         *slot = Some(HostedDmaManager::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_mdl_registry_mut() -> &'static mut MdlRegistry {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_MDL_REGISTRY);
+    if slot.is_none() {
+        *slot = Some(MdlRegistry::new());
     }
     slot.as_mut().unwrap()
 }
@@ -4093,18 +4619,62 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
 }
 
+fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
+    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_ROOT_PDO_BINDINGS) };
+    bindings
+        .iter()
+        .copied()
+        .find(|slot| slot.used && slot.pdo_object == pdo_object)
+        .map(|slot| slot.device_id)
+}
+
+fn register_hosted_root_pdo_binding(
+    pdo_object: u64,
+    device_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_PDO_BINDINGS) };
+    if let Some(slot) = bindings
+        .iter_mut()
+        .find(|slot| slot.used && slot.pdo_object == pdo_object)
+    {
+        slot.device_id = device_id;
+        return Ok(());
+    }
+    if let Some(slot) = bindings.iter_mut().find(|slot| !slot.used) {
+        *slot = HostedRootPdoBinding {
+            pdo_object,
+            device_id,
+            used: true,
+        };
+        return Ok(());
+    }
+    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+}
+
 unsafe fn register_hosted_root_pdo(
     pdo_object: u64,
     instance_path: &str,
     hardware_ids: &[&str],
     compatible_ids: &[&str],
-) {
+) -> Result<u64, nt_status::NtStatus> {
     if pdo_object == 0 {
-        return;
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    let bus = hosted_root_bus_mut();
-    if bus.pdo(pdo_object).is_some() {
-        return;
+    if let Some(device_id) = hosted_root_pdo_device_id(pdo_object) {
+        return Ok(device_id);
+    }
+    let root_driver_id = hosted_root_bus_driver_id()?;
+    let pdo_device_id = io_manager_mut().create_device(
+        root_driver_id,
+        None,
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::BUFFERED_IO,
+        0,
+    )?;
+    if let Err(status) = register_hosted_root_pdo_binding(pdo_object, pdo_device_id.raw()) {
+        let _ = io_manager_mut().destroy_device(pdo_device_id);
+        return Err(status);
     }
     let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
     let fallback_hardware = [device_id];
@@ -4113,6 +4683,7 @@ unsafe fn register_hosted_root_pdo(
     } else {
         hardware_ids
     };
+    let bus = hosted_root_bus_mut();
     bus.create_pdo(
         pdo_object,
         device_id,
@@ -4120,6 +4691,7 @@ unsafe fn register_hosted_root_pdo(
         compatible_ids,
         instance_id,
     );
+    Ok(pdo_device_id.raw())
 }
 
 fn register_hosted_device_binding(
@@ -4515,12 +5087,12 @@ pub(crate) unsafe fn call_add_device_for_driver(
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     let add_device = dispatch_add_device_for_instance(index, inst)?;
-    register_hosted_root_pdo(
+    let pdo_device_id = register_hosted_root_pdo(
         add_device.pdo_object,
         instance_path,
         hardware_ids,
         compatible_ids,
-    );
+    )?;
     let device_id = io_manager_mut().create_device(
         DriverId(driver_id),
         None,
@@ -4536,6 +5108,7 @@ pub(crate) unsafe fn call_add_device_for_driver(
         add_device.fdo_object,
         add_device.pdo_object,
     );
+    io_manager_mut().attach_device_to_stack(device_id, nt_io_manager::DeviceId(pdo_device_id))?;
 
     let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
     if index < table.len() && table[index].used {
@@ -4820,8 +5393,8 @@ pub(crate) unsafe fn start_hosted_device(
         &mut out,
     )
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    nt_status::NtStatus(status).to_result()?;
     record_hosted_resource_usage(binding, sh)?;
+    nt_status::NtStatus(status).to_result()?;
 
     let forwarded_minor = read_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64);
     let forwarded_status = read_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32);

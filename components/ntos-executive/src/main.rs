@@ -22,8 +22,6 @@ pub use sel4_rt::*;
 mod allocator;
 mod alpc_selftest;
 mod cm_server;
-mod driver_host;
-mod driver_pe;
 mod io_server;
 mod isr;
 mod kmdf_host;
@@ -1841,6 +1839,8 @@ pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 // writes then landed on the STALE frame while the NIC DMA'd from dma_frame's real (zeroed) paddr,
 // so the DD writeback never appeared in the polled frame. A dedicated PT guarantees a free slot.
 pub const DMA_VADDR: u64 = 0x0000_0100_10C0_0000;
+const ROOT_DMA_PROOF_MMIO_SEED_VADDR: u64 = DMA_VADDR + 0x1000;
+const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -8606,6 +8606,65 @@ unsafe fn alloc_frame_r() -> (u64, u64) {
     let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
     (s, e)
 }
+
+unsafe fn alloc_seeded_root_dma_mmio_frame() -> u64 {
+    let (frame, frame_err) = alloc_frame_r();
+    if frame_err != 0 {
+        return 0;
+    }
+    let pt = alloc_slot();
+    let _ = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_X86_PAGE_TABLE,
+        PAGING_BITS,
+        1,
+        pt,
+    );
+    let _ = paging_struct_map_r(
+        pt,
+        LBL_X86_PAGE_TABLE_MAP,
+        ROOT_DMA_PROOF_MMIO_SEED_VADDR,
+        CAP_INIT_THREAD_VSPACE,
+    );
+    if page_map_r(
+        frame,
+        ROOT_DMA_PROOF_MMIO_SEED_VADDR,
+        RW_NX,
+        CAP_INIT_THREAD_VSPACE,
+    ) != 0
+    {
+        return 0;
+    }
+    let mut offset = 0u64;
+    while offset < 0x1000 {
+        core::ptr::write_volatile((ROOT_DMA_PROOF_MMIO_SEED_VADDR + offset) as *mut u8, 0);
+        offset += 1;
+    }
+    core::ptr::write_volatile(
+        ROOT_DMA_PROOF_MMIO_SEED_VADDR as *mut u32,
+        ROOT_DMA_PROOF_ID_VALUE,
+    );
+    frame
+}
+
+unsafe fn ensure_root_dma_resource_frames(mmio_frame: &mut u64, common_frame: &mut u64) -> bool {
+    if *mmio_frame == 0 {
+        let frame = alloc_seeded_root_dma_mmio_frame();
+        if frame == 0 {
+            return false;
+        }
+        *mmio_frame = frame;
+    }
+    if *common_frame == 0 {
+        let (frame, frame_err) = alloc_frame_r();
+        if frame_err != 0 {
+            return false;
+        }
+        *common_frame = frame;
+    }
+    true
+}
+
 unsafe fn make_object(obj: u64) -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
@@ -11617,6 +11676,20 @@ fn driver_service_devnode_specs(
         .collect()
 }
 
+fn driver_service_devnode_specs_from_records(
+    records: alloc::vec::Vec<nt_config_manager::DevnodeRecord>,
+) -> alloc::vec::Vec<DriverServiceDevnodeSpec> {
+    records
+        .into_iter()
+        .map(|devnode| DriverServiceDevnodeSpec {
+            instance_id: devnode.instance_id,
+            pdo_name: devnode.pdo_name,
+            hardware_ids: devnode.hardware_ids,
+            compatible_ids: devnode.compatible_ids,
+        })
+        .collect()
+}
+
 fn copy_inline_string_list<const N: usize>(
     src: &[alloc::string::String],
     dst: &mut [InlineAscii<N>],
@@ -11681,9 +11754,7 @@ fn inline_driver_launch_spec_from_service_metadata(
     Some(spec)
 }
 
-fn config_hive_boot_system_driver_launch_spec(
-    out_path: &mut [u8],
-) -> Option<ConfigHiveDriverLaunchSpec> {
+fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let hive_size =
         unsafe { core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) } as usize;
     if hive_size == 0 || hive_size > 0x0f00 {
@@ -11702,7 +11773,24 @@ fn config_hive_boot_system_driver_launch_spec(
     {
         return None;
     }
-    let service = cm.boot_system_driver_candidates().into_iter().next()?;
+    let _ = nt_hive_core::import_control_set_enum_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    Some(cm)
+}
+
+fn config_hive_boot_system_driver_launch_spec(
+    out_path: &mut [u8],
+) -> Option<ConfigHiveDriverLaunchSpec> {
+    let cm = config_hive_config_manager()?;
+    let service = cm
+        .boot_system_driver_candidates()
+        .into_iter()
+        .find(|service| {
+            service.driver_service_class() == Some(DriverServiceClass::FileSystem)
+        })?;
     let (image_path_len, class) =
         driver_launch_spec_from_service_metadata(&service, out_path, SERVICE_SYSTEM_START)?;
     let driver_object_path = service.driver_object_path()?;
@@ -11712,6 +11800,17 @@ fn config_hive_boot_system_driver_launch_spec(
         image_path_len,
         class,
     })
+}
+
+fn config_hive_boot_system_pnp_driver_launch_spec() -> Option<DriverServiceLaunchSpec> {
+    let cm = config_hive_config_manager()?;
+    let binding = cm.boot_system_pnp_driver_bindings().into_iter().next()?;
+    let devnodes = driver_service_devnode_specs_from_records(binding.devnodes);
+    owned_driver_launch_spec_from_service_metadata(
+        binding.service,
+        SERVICE_SYSTEM_START,
+        devnodes,
+    )
 }
 
 fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
@@ -18247,187 +18346,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
-    // ==== DEFERRED DRIVER-HOST hosting (NIC + KMDF) — driver-model migration ====================
-    // The NIC (PnpMmioInterruptTest.sys) + KMDF (KmdfBasicTest.sys) driver hosts are launched here,
-    // AFTER the FS is mounted, so both `.sys` binaries are loaded BY-PATH from the FS via the general
-    // dynamic path (load_file_to_pool) — NO baked include_bytes!. The raw NIC MMIO/DMA + VT-d specs
-    // ran earlier (they must precede the storage block). The bespoke `spawn_driver_host` /
-    // `spawn_kmdf_host` are gone: their least-privilege ComponentDescriptors are inlined below and
-    // spawned via the generic `spawn_component` engine. Behaviour-preserving (verdict-identical).
+    // ==== DEFERRED KMDF hosting — driver-model migration ========================================
+    // The WDM hardware proof now runs through the registry-selected generic hosted-driver path
+    // below. KMDF still has a dedicated host while WDF framework bring-up remains a separate frontier.
     //
-    // ---- NIC (WDM) real-.sys driver host: DriverEntry → AddDevice → IRP_MN_START_DEVICE.
-    if found_nic && nic_bar_base != 0 {
-        // ---- DRIVER HOST AT START: the executive, acting as the PnP manager + HAL, hands an
-        // ISOLATED driver host a real NT CM_RESOURCE_LIST (MMIO + interrupt) and a VT-d-confined
-        // common DMA buffer, then lets it drive the NIC from its own CSpace/VSpace.
-        print_str(b"[ntos-exec] driver host: START with CM_RESOURCE_LIST + confined DMA buffer\n");
-        let reslist_frame = alloc_slot();
-        let _ = untyped_retype(
-            CAP_INIT_UNTYPED,
-            OBJ_X86_4K_PAGE,
-            PAGING_BITS,
-            1,
-            reslist_frame,
-        );
-        let _ = page_map(reslist_frame, RESLIST_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-        // PnP resource assignment (host-tested `nt-pnp` policy) → the driver-visible CM_RESOURCE_LIST.
-        if let Some(g) = assign_nic(&pci_devices, NIC_MSI_VECTOR as u32, true, 0x1000) {
-            write_cm_resource_list(RESLIST_VADDR, 0, &g.assignment, NIC_VADDR, 0x4000);
-        }
-        core::ptr::write_volatile((RESLIST_VADDR + 0x100) as *mut u64, DMA_VADDR);
-        core::ptr::write_volatile((RESLIST_VADDR + 0x108) as *mut u64, NIC_IOVA);
-        core::ptr::write_volatile((RESLIST_VADDR + 0x110) as *mut u64, 0x1000u64);
-        core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, 0); // clear verdict
-        core::ptr::write_volatile((RESLIST_VADDR + 0x210) as *mut u8, 0); // clear .sys verdict
-                                                                          // Load the REAL .sys driver BY-PATH from the FS, map its image frames RW here,
-                                                                          // parse/map/relocate/patch-IAT to our stubs, then hand the same frames to the host R+X.
-        let mut pe_base = 0u64;
-        for i in 0..driver_pe::PE_FRAMES {
-            let f = alloc_slot();
-            if i == 0 {
-                pe_base = f;
-            }
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-            let _ = page_map(
-                f,
-                driver_pe::CODE_VA + i * 0x1000,
-                RW_NX,
-                CAP_INIT_THREAD_VSPACE,
-            );
-        }
-        let sys_entry = exec_fs()
-            .and_then(|fs| {
-                load_file_to_pool(&fs, b"reactos\\system32\\drivers\\PnpMmioInterruptTest.sys")
-            })
-            .and_then(|(va, sz)| {
-                driver_pe::load_into(core::slice::from_raw_parts(va as *const u8, sz as usize))
-            })
-            .unwrap_or(0);
-        let mut arena_base = 0u64;
-        for i in 0..driver_pe::ARENA_FRAMES {
-            let f = alloc_slot();
-            if i == 0 {
-                arena_base = f;
-            }
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-            let _ = page_map(
-                f,
-                driver_pe::ARENA_VADDR + i * 0x1000,
-                RW_NX,
-                CAP_INIT_THREAD_VSPACE,
-            );
-        }
-        core::ptr::write_volatile((RESLIST_VADDR + 0x300) as *mut u64, sys_entry as u64);
-        core::ptr::write_volatile((RESLIST_VADDR + 0x308) as *mut u64, nic_mmio);
-        print_str(b"[ntos-exec] loaded PnpMmioInterruptTest.sys BY-PATH; DriverEntry rva=");
-        print_hex(sys_entry);
-        print_str(b"\n");
-        let dh_result = make_object(OBJ_NOTIFICATION);
-        let dh_result_badged = alloc_slot();
-        let _ = syscall5(
-            SYS_SEND,
-            CAP_INIT_THREAD_CNODE,
-            LBL_CNODE_MINT << 12,
-            dh_result_badged,
-            dh_result,
-            ISR_DONE_BADGE,
-        );
-        let dh_irq = copy_cap(nic_irq_ntfn);
-        let dh_fault = make_object(OBJ_ENDPOINT);
-        // Inlined descriptor (was spawn_driver_host): the granted device resources — the 4 NIC BAR
-        // pages, the confined DMA buffer, the CM_RESOURCE_LIST frame, the real .sys image (RWX) + its
-        // RW arena — each aliasing the executive's frame. Least privilege via `spawn_component`.
-        {
-            let regions = [
-                Region {
-                    source: FrameSource::Alias(nic_bar_base),
-                    base_va: NIC_VADDR,
-                    count: 4,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-                // DMA_VADDR moved to its own dedicated 2 MiB region (0x10C0_0000) to dodge the
-                // shared-cluster slot collision; give this region its own PT here (pts: 1) since the
-                // driver-host's skeleton no longer covers that VA.
-                Region {
-                    source: FrameSource::Alias(nic_dma_frame),
-                    base_va: DMA_VADDR,
-                    count: 1,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 1,
-                },
-                Region {
-                    source: FrameSource::Alias(reslist_frame),
-                    base_va: RESLIST_VADDR,
-                    count: 1,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-                Region {
-                    source: FrameSource::Alias(pe_base),
-                    base_va: driver_pe::CODE_VA,
-                    count: driver_pe::PE_FRAMES,
-                    rights: Rights::Uniform(3 /* RWX */),
-                    pts: 0,
-                },
-                Region {
-                    source: FrameSource::Alias(arena_base),
-                    base_va: driver_pe::ARENA_VADDR,
-                    count: driver_pe::ARENA_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-            ];
-            let d = ComponentDescriptor {
-                entry: driver_host::driver_host_entry,
-                image_rights: Rights::Uniform(2), // RO
-                map_heap_pt: false,
-                stack_base: STACK_BASE,
-                stack_frames: STACK_FRAMES,
-                stack_dedicated_pt: false,
-                regions: &regions,
-                granted: GrantedCaps {
-                    irq_ntfn: Some(dh_irq),
-                    result_ntfn: Some(dh_result_badged),
-                    fault_ep: Some(dh_fault),
-                },
-                prio: 100,
-                gs_base: None,
-                caps: HostCaps::default(),
-            };
-            let _ = spawn_component(&d);
-        }
-        let _ = dh_fault; // a fault EP so a host fault is contained cleanly, not silent
-        let (_z, dhb, _s, _m) = ep_recv(dh_result);
-        let dh_verdict = core::ptr::read_volatile((RESLIST_VADDR + 0x200) as *const u8);
-        print_str(b"[ntos-exec] driver host signalled badge=");
-        print_u64(dhb);
-        print_str(b" verdict=");
-        print_u64(dh_verdict as u64);
-        print_str(b"\n");
-        check(b"exec_driver_host_drove_nic", dh_verdict == 1, &mut passed);
-        let sys_v = core::ptr::read_volatile((RESLIST_VADDR + 0x210) as *const u8);
-        print_str(b"[ntos-exec] hosted real .sys verdict bits=0x");
-        print_hex(sys_v as u32);
-        print_str(b"\n");
-        check(b"exec_sys_driver_entry_ok", (sys_v & 1) != 0, &mut passed);
-        check(
-            b"exec_sys_adddevice_built_fdo",
-            (sys_v & 2) != 0,
-            &mut passed,
-        );
-        check(
-            b"exec_sys_start_reached_real_nic",
-            (sys_v & 8) != 0,
-            &mut passed,
-        );
-        if (sys_v & 4) == 0 {
-            print_str(b"[ntos-exec]   note: the driver's START handler ran + did real MMIO,\n");
-            print_str(b"[ntos-exec]   then returned a device-specific status (the real device\n");
-            print_str(b"[ntos-exec]   is an e1000e NIC, not this driver's own test device).\n");
-        }
-    }
-
     // ---- KMDF DRIVER HOST: host a real KMDF driver (KmdfBasicTest.sys) through the FULL WDF
     // lifecycle (DriverEntry → WdfDriverCreate → AddDevice → EvtDevicePrepareHardware → D0Entry →
     // IOCTLs → REMOVE) in a SEPARATE isolated host — crash-contained on the microkernel.
@@ -19334,6 +19256,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    let mut root_dma_mmio_frame = 0u64;
+    let mut root_dma_common_frame = 0u64;
+
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
     // services use the persistent IRP host directly, while device-class services must be bound by
@@ -19460,6 +19385,72 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                         print_str(devnode.instance_id.as_bytes());
                                         print_str(b" mmio=0x");
                                         print_hex(grant.assignment.mmio_phys as u32);
+                                        print_str(b"\n");
+                                    }
+                                } else if let Some(grant) = assign_devnode_root_dma_resources(
+                                    devnode.instance_id.as_str(),
+                                    hardware_refs,
+                                    compatible_refs,
+                                    NIC_MSI_VECTOR as u32,
+                                    false,
+                                    0x1000,
+                                    0x1000,
+                                ) {
+                                    if ensure_root_dma_resource_frames(
+                                        &mut root_dma_mmio_frame,
+                                        &mut root_dma_common_frame,
+                                    ) {
+                                        match driver_launch::grant_hosted_device_resources(
+                                            device_id,
+                                            grant.assignment.mmio_phys,
+                                            grant.assignment.mmio_len.min(0x1000),
+                                            NIC_VADDR,
+                                            root_dma_mmio_frame,
+                                            1,
+                                            grant.assignment.int_vector,
+                                            grant.assignment.int_latched,
+                                            grant.assignment.int_affinity,
+                                            DMA_VADDR,
+                                            root_dma_common_frame,
+                                            1,
+                                            NIC_IOVA,
+                                            grant.assignment.dma_len,
+                                        ) {
+                                            Ok(()) => {
+                                                print_str(
+                                                    b"[driver-launch] assigned root-bus resources service=",
+                                                );
+                                                print_str(spec.service_name.as_bytes());
+                                                print_str(b" devnode=");
+                                                print_str(devnode.instance_id.as_bytes());
+                                                print_str(b" mmio=0x");
+                                                print_hex(grant.assignment.mmio_phys as u32);
+                                                print_str(b" len=");
+                                                print_u64(grant.assignment.mmio_len.min(0x1000));
+                                                print_str(b" vector=");
+                                                print_u64(grant.assignment.int_vector as u64);
+                                                print_str(b"\n");
+                                                start_resources = grant.resource_list;
+                                            }
+                                            Err(status) => {
+                                                print_str(
+                                                    b"[driver-launch] root-bus resource grant failed service=",
+                                                );
+                                                print_str(spec.service_name.as_bytes());
+                                                print_str(b" devnode=");
+                                                print_str(devnode.instance_id.as_bytes());
+                                                print_str(b" status=0x");
+                                                print_hex(status.raw() as u32);
+                                                print_str(b"\n");
+                                            }
+                                        }
+                                    } else {
+                                        print_str(
+                                            b"[driver-launch] root-bus resource frames unavailable service=",
+                                        );
+                                        print_str(spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
                                         print_str(b"\n");
                                     }
                                 }
@@ -20290,6 +20281,272 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[driver-launch] config hive has no boot/system driver service ImagePath\n");
         }
     }
+
+    // --- B3: registry-selected device-driver hardware proof. The generated boot hive declares a
+    // boot-start kernel driver plus an Enum devnode; the executive imports that registry state into
+    // Config Manager metadata, selects the service through the generic PnP binding selector, and then
+    // drives the same hosted AddDevice/START/resource-grant path used for real SYSTEM-hive devnodes.
+    let mut generic_hw_registry_selected = false;
+    let mut generic_hw_driver_loaded = false;
+    let mut generic_hw_add_device = false;
+    let mut generic_hw_start_ok = false;
+    let mut generic_hw_granted = false;
+    let mut generic_hw_mmio_mapped = false;
+    let mut generic_hw_interrupt_connected = false;
+    let mut generic_hw_dma_adapter = false;
+    let mut generic_hw_dma_common = false;
+    let mut generic_hw_root_started = false;
+    if let Some(proof_pnp_spec) = config_hive_boot_system_pnp_driver_launch_spec() {
+        generic_hw_registry_selected = !proof_pnp_spec.devnodes.is_empty();
+        print_str(b"[driver-launch] launching PnP service ");
+        print_str(proof_pnp_spec.service_name.as_bytes());
+        print_str(b" from config hive path=");
+        print_str(&proof_pnp_spec.image_path);
+        print_str(b" object=");
+        print_str(proof_pnp_spec.driver_object_path.as_bytes());
+        print_str(b" devnodes=");
+        print_u64(proof_pnp_spec.devnodes.len() as u64);
+        print_str(b"\n");
+
+        if let Some(fs) = exec_fs() {
+            if let Some(dc) = load_driver(
+                &fs,
+                &proof_pnp_spec.image_path,
+                proof_pnp_spec.class,
+                &proof_pnp_spec.driver_object_path,
+            ) {
+                generic_hw_driver_loaded = (dc.verdict & V_ENTERED) != 0 && dc.add_device != 0;
+                for devnode in proof_pnp_spec.devnodes.iter() {
+                let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
+                let mut hardware_count = 0usize;
+                for value in devnode.hardware_ids.iter().take(BOOT_DRIVER_ID_MAX) {
+                    hardware_refs[hardware_count] = value.as_str();
+                    hardware_count += 1;
+                }
+                let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
+                let mut compatible_count = 0usize;
+                for value in devnode.compatible_ids.iter().take(BOOT_DRIVER_ID_MAX) {
+                    compatible_refs[compatible_count] = value.as_str();
+                    compatible_count += 1;
+                }
+                let hardware_refs = &hardware_refs[..hardware_count];
+                let compatible_refs = &compatible_refs[..compatible_count];
+
+                match driver_launch::call_add_device_for_driver(
+                    dc.driver_id,
+                    devnode.instance_id.as_str(),
+                    hardware_refs,
+                    compatible_refs,
+                ) {
+                    Ok(device_id) => {
+                        generic_hw_add_device = true;
+                        print_str(b"[driver-launch] generic hardware AddDevice service=");
+                        print_str(proof_pnp_spec.service_name.as_bytes());
+                        print_str(b" devnode=");
+                        print_str(devnode.instance_id.as_bytes());
+                        print_str(b" device_id=");
+                        print_u64(device_id);
+                        print_str(b"\n");
+
+                        let mut start_resources = alloc::vec::Vec::new();
+                        let mut grant_ok = false;
+                        if let Some(grant) = assign_devnode_pci_resources(
+                            devnode.instance_id.as_str(),
+                            hardware_refs,
+                            compatible_refs,
+                            &pci_devices,
+                            NIC_MSI_VECTOR as u32,
+                            true,
+                            0x1000,
+                            0x4000,
+                        ) {
+                            if nic_bar_base != 0 && grant.assignment.mmio_phys == nic_mmio {
+                                match driver_launch::grant_hosted_device_resources(
+                                    device_id,
+                                    grant.assignment.mmio_phys,
+                                    grant.assignment.mmio_len.min(0x4000),
+                                    NIC_VADDR,
+                                    nic_bar_base,
+                                    4,
+                                    grant.assignment.int_vector,
+                                    grant.assignment.int_latched,
+                                    grant.assignment.int_affinity,
+                                    DMA_VADDR,
+                                    nic_dma_frame,
+                                    1,
+                                    NIC_IOVA,
+                                    grant.assignment.dma_len,
+                                ) {
+                                    Ok(()) => {
+                                        grant_ok = true;
+                                        start_resources = grant.resource_list;
+                                        print_str(
+                                            b"[driver-launch] generic hardware resources service=",
+                                        );
+                                        print_str(proof_pnp_spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" pci=0:");
+                                        print_u64(grant.device.dev as u64);
+                                        print_str(b".");
+                                        print_u64(grant.device.func as u64);
+                                        print_str(b" mmio=0x");
+                                        print_hex(grant.assignment.mmio_phys as u32);
+                                        print_str(b" vector=");
+                                        print_u64(grant.assignment.int_vector as u64);
+                                        print_str(b" dma_len=");
+                                        print_u64(grant.assignment.dma_len);
+                                        print_str(b"\n");
+                                    }
+                                    Err(status) => {
+                                        print_str(
+                                            b"[driver-launch] generic hardware grant failed status=0x",
+                                        );
+                                        print_hex(status.raw() as u32);
+                                        print_str(b"\n");
+                                    }
+                                }
+                            } else {
+                                print_str(b"[driver-launch] generic hardware no mapped BAR grant mmio=0x");
+                                print_hex(grant.assignment.mmio_phys as u32);
+                                print_str(b"\n");
+                            }
+                        } else if let Some(grant) = assign_devnode_root_dma_resources(
+                            devnode.instance_id.as_str(),
+                            hardware_refs,
+                            compatible_refs,
+                            NIC_MSI_VECTOR as u32,
+                            false,
+                            0x1000,
+                            0x1000,
+                        ) {
+                            if ensure_root_dma_resource_frames(
+                                &mut root_dma_mmio_frame,
+                                &mut root_dma_common_frame,
+                            ) {
+                                match driver_launch::grant_hosted_device_resources(
+                                    device_id,
+                                    grant.assignment.mmio_phys,
+                                    grant.assignment.mmio_len.min(0x1000),
+                                    NIC_VADDR,
+                                    root_dma_mmio_frame,
+                                    1,
+                                    grant.assignment.int_vector,
+                                    grant.assignment.int_latched,
+                                    grant.assignment.int_affinity,
+                                    DMA_VADDR,
+                                    root_dma_common_frame,
+                                    1,
+                                    NIC_IOVA,
+                                    grant.assignment.dma_len,
+                                ) {
+                                    Ok(()) => {
+                                        grant_ok = true;
+                                        start_resources = grant.resource_list;
+                                        print_str(
+                                            b"[driver-launch] generic hardware root-bus resources service=",
+                                        );
+                                        print_str(proof_pnp_spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" mmio=0x");
+                                        print_hex(grant.assignment.mmio_phys as u32);
+                                        print_str(b" vector=");
+                                        print_u64(grant.assignment.int_vector as u64);
+                                        print_str(b" dma_len=");
+                                        print_u64(grant.assignment.dma_len);
+                                        print_str(b"\n");
+                                    }
+                                    Err(status) => {
+                                        print_str(
+                                            b"[driver-launch] generic hardware root-bus grant failed status=0x",
+                                        );
+                                        print_hex(status.raw() as u32);
+                                        print_str(b"\n");
+                                    }
+                                }
+                            } else {
+                                print_str(
+                                    b"[driver-launch] generic hardware root-bus resource frames unavailable\n",
+                                );
+                            }
+                        }
+
+                        let start_status = if grant_ok {
+                            driver_launch::start_hosted_device(device_id, &start_resources)
+                        } else {
+                            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                        };
+                        generic_hw_start_ok |= start_status.is_ok();
+                        let start_status_raw = match start_status {
+                            Ok(()) => 0,
+                            Err(status) => status.raw() as u32,
+                        };
+                        if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
+                            if evidence.resource_granted() {
+                                generic_hw_granted = true;
+                                generic_hw_mmio_mapped |= evidence.mmio_mapped();
+                                generic_hw_interrupt_connected |= evidence.interrupt_connected();
+                                generic_hw_dma_adapter |= evidence.dma_adapter_created();
+                                generic_hw_dma_common |= evidence.dma_common_allocated();
+                                generic_hw_root_started |= evidence.root_pdo_started;
+                            }
+                            print_str(b"[driver-launch] generic hardware evidence service=");
+                            print_str(proof_pnp_spec.service_name.as_bytes());
+                            print_str(b" devnode=");
+                            print_str(devnode.instance_id.as_bytes());
+                            print_str(b" start=0x");
+                            print_hex(start_status_raw);
+                            print_str(b" mmio=");
+                            print_u64(evidence.mmio_mapped() as u64);
+                            print_str(b" int=");
+                            print_u64(evidence.interrupt_connected() as u64);
+                            print_str(b" dma_adapter=");
+                            print_u64(evidence.dma_adapter_created() as u64);
+                            print_str(b" dma_common=");
+                            print_u64(evidence.dma_common_allocated() as u64);
+                            print_str(b" root_started=");
+                            print_u64(evidence.root_pdo_started as u64);
+                            print_str(b"\n");
+                        }
+                    }
+                    Err(status) => {
+                        print_str(b"[driver-launch] generic hardware AddDevice failed status=0x");
+                        print_hex(status.raw() as u32);
+                        print_str(b"\n");
+                    }
+                }
+                }
+            } else {
+                print_str(
+                    b"[driver-launch] registry-selected PnP driver launch returned None (not staged / load failed)\n",
+                );
+            }
+        } else {
+            print_str(b"[driver-launch] registry-selected PnP driver proof has no filesystem\n");
+        }
+    } else {
+        print_str(b"[driver-launch] config hive has no boot/system PnP driver binding\n");
+    }
+    check(
+        b"exec_generic_hw_registry_selected",
+        generic_hw_registry_selected && generic_hw_driver_loaded && generic_hw_add_device,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_hw_mmio_interrupt_dma",
+        generic_hw_granted
+            && generic_hw_mmio_mapped
+            && generic_hw_interrupt_connected
+            && generic_hw_dma_adapter
+            && generic_hw_dma_common,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_hw_root_pdo_started",
+        generic_hw_start_ok && generic_hw_root_started,
+        &mut passed,
+    );
 
     // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
     // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL

@@ -80,16 +80,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Add a generic hosted-driver hardware proof: registry-selected driver reaches
-   `MmMapIoSpace`, `IoConnectInterrupt`, `IoGetDmaAdapter`, and common-buffer evidence, then wire
-   real interrupt delivery to the connected ISR token.
+1. Wire real interrupt delivery through the generic hosted-driver resource grant to the connected
+   ISR token, then retire the old bespoke NIC driver proof once the generic path proves equivalent
+   MMIO/interrupt/DMA behavior.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-3. Retire the old bespoke NIC driver proof after the generic registry-selected path proves
-   equivalent real MMIO/interrupt/DMA behavior.
-4. Audit remaining static driver-object construction sites that are not service-key-derived,
+3. Audit remaining static driver-object construction sites that are not service-key-derived,
    especially video and object-server tests, and classify whether they are fixtures or real debt.
-5. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
+4. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
    the seeded Configuration Manager authority.
 
 ## Review Log
@@ -377,3 +375,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_explorer_shell_chrome_painted` and `exec_vm_pool_headroom`. Review adjustment: B3 remains
   active, but the baseline is clean again; resume with a registry-selected device-driver hardware
   proof and turn the generic hardware evidence trace into a gate before retiring the old NIC proof.
+- B3 continued. The generated SYSTEM hive now seeds a root-enumerated
+  `ROOT\USERSPACE_NTOS_DMA\0001` devnode for `DmaPnpPowerTest` instead of binding the proof driver
+  to a real e1000 PCI identity, and `nt-pnp` owns a host-tested root-bus resource profile for that
+  class. The executive grants the registry-selected root devnode a seeded MMIO page, interrupt
+  vector metadata, and a common DMA buffer, then sends the real `IRP_MN_START_DEVICE` through the
+  hosted AddDevice/FDO path. A Win64 dispatch-guard alignment bug exposed by the driver's MSVC
+  `movaps` memset helper was fixed by force-aligning the guarded outbound call frame while preserving
+  bugcheck unwind. Validation: `cargo fmt --all`, `cargo test -p nt-pnp`,
+  `cargo test -p nt-hive-core`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh`. The boot reached genuine explorer shell
+  chrome pixels with `284/286` gates, and the generic hardware gates now pass:
+  `exec_generic_hw_registry_selected`, `exec_generic_hw_mmio_interrupt_dma`, and
+  `exec_generic_hw_root_pdo_started`. Review adjustment: B3's remaining cleanup is to deliver a real
+  interrupt through the connected ISR token on the generic grant and then remove the older bespoke
+  NIC proof machinery.

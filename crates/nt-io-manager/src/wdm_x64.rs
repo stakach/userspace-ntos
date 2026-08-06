@@ -55,6 +55,8 @@ pub struct WdmFileObjectInit {
 pub struct WdmIrpInit {
     pub system_buffer: u64,
     pub user_buffer: u64,
+    pub stack_count: u8,
+    pub current_location: u8,
     pub current_stack_location: u64,
 }
 
@@ -157,8 +159,8 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     require(bytes, WDM_X64_IRP_SIZE)?;
     zero(bytes);
     put_u64(bytes, 0x18, init.system_buffer);
-    put_u8(bytes, 0x42, 1);
-    put_u8(bytes, 0x43, 1);
+    put_u8(bytes, 0x42, init.stack_count);
+    put_u8(bytes, 0x43, init.current_location);
     put_u64(bytes, 0x70, init.user_buffer);
     put_u64(bytes, 0xb8, init.current_stack_location);
     Ok(())

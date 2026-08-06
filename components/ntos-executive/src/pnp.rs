@@ -21,8 +21,9 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources, assignment_to_cm_list, enumerate_bus, find_device_for_class, DriverClass,
-    PciDevice, ResourceAssignment, MEMORY_INTERRUPT_LIST_SIZE,
+    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
+    find_device_for_class, DriverClass, PciDevice, ResourceAssignment,
+    ROOT_DMA_TEST_RESOURCE_PROFILE, MEMORY_INTERRUPT_LIST_SIZE,
 };
 
 /// Enumerate PCI bus 0 through `nt-pnp` using the executive's port-I/O config access. The reader
@@ -74,6 +75,12 @@ pub(crate) struct DevnodePciResourceGrant {
     pub resource_list: Vec<u8>,
 }
 
+/// The root-bus profile and translated START resource bytes selected for one registry devnode.
+pub(crate) struct DevnodeRootResourceGrant {
+    pub assignment: ResourceAssignment,
+    pub resource_list: Vec<u8>,
+}
+
 /// Resolve a registry-selected devnode against the enumerated PCI bus and build the physical
 /// `CM_RESOURCE_LIST` that will be passed to the hosted driver's `IRP_MN_START_DEVICE`.
 pub(crate) fn assign_devnode_pci_resources(
@@ -110,6 +117,46 @@ pub(crate) fn assign_devnode_pci_resources(
     resource_list.truncate(n);
     Some(DevnodePciResourceGrant {
         device: device.clone(),
+        assignment,
+        resource_list,
+    })
+}
+
+/// Resolve a registry-selected root-bus devnode against broker-backed resource profiles and build
+/// the physical `CM_RESOURCE_LIST` that will be passed to the hosted driver's START IRP.
+pub(crate) fn assign_devnode_root_dma_resources(
+    instance_id: &str,
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
+    int_vector: u32,
+    int_latched: bool,
+    dma_len: u64,
+    granted_mmio_len: u32,
+) -> Option<DevnodeRootResourceGrant> {
+    let assignment = assign_root_bus_resources(
+        instance_id,
+        hardware_ids,
+        compatible_ids,
+        &ROOT_DMA_TEST_RESOURCE_PROFILE,
+        int_vector,
+        int_latched,
+        /*affinity=*/ 1,
+        dma_len,
+    )?;
+    let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
+    if mmio_len == 0 || mmio_len > u32::MAX as u64 {
+        return None;
+    }
+    let mut resource_list = vec![0u8; MEMORY_INTERRUPT_LIST_SIZE];
+    let n = assignment_to_cm_list(
+        &mut resource_list,
+        0,
+        &assignment,
+        assignment.mmio_phys,
+        mmio_len as u32,
+    )?;
+    resource_list.truncate(n);
+    Some(DevnodeRootResourceGrant {
         assignment,
         resource_list,
     })
