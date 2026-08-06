@@ -1227,6 +1227,15 @@ mod tests {
             1,
         );
         cm.register_typed_service(
+            "SecondBoundDevice",
+            r"system32\drivers\second.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        cm.register_typed_service(
             "FileSystemDriver",
             r"system32\drivers\fs.sys",
             SERVICE_FILE_SYSTEM_DRIVER,
@@ -1242,22 +1251,42 @@ mod tests {
             &[r"PCI\VEN_8086&DEV_100E"],
             &[],
         );
+        cm.register_devnode(
+            r"ROOT\SECOND_BOUND_DEVICE\0000",
+            Some("SecondBoundDevice"),
+            Some(r"\Device\NTPNP_ROOT0002"),
+            &[r"ROOT\SECOND_BOUND_DEVICE"],
+            &[],
+        );
 
         assert!(cm.service_has_devnodes("bounddevice"));
+        assert!(cm.service_has_devnodes("secondbounddevice"));
         assert!(!cm.service_has_devnodes("UnboundDevice"));
         let names: Vec<String> = cm
             .boot_system_pnp_driver_candidates()
             .into_iter()
             .map(|service| service.name)
             .collect();
-        assert_eq!(names, alloc::vec![String::from("BoundDevice")]);
+        assert_eq!(
+            names,
+            alloc::vec![
+                String::from("BoundDevice"),
+                String::from("SecondBoundDevice")
+            ]
+        );
         let bindings = cm.boot_system_pnp_driver_bindings();
-        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].service.name, "BoundDevice");
         assert_eq!(bindings[0].devnodes.len(), 1);
         assert_eq!(
             bindings[0].devnodes[0].instance_id,
             r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"
+        );
+        assert_eq!(bindings[1].service.name, "SecondBoundDevice");
+        assert_eq!(bindings[1].devnodes.len(), 1);
+        assert_eq!(
+            bindings[1].devnodes[0].instance_id,
+            r"ROOT\SECOND_BOUND_DEVICE\0000"
         );
     }
 

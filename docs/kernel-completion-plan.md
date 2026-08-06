@@ -81,8 +81,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ## Immediate Iteration
 
 1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: devnode/driver registry identity now
-   flows toward `DevicePropertyDriverKeyName` and the miniport `Linkage` key; next drive real NDIS
-   support initialization and miniport AddDevice/StartDevice through the generic PCI
+   flows toward `DevicePropertyDriverKeyName` and the miniport `Linkage` key, and the generated-hive
+   PnP proof now consumes every CM-selected binding instead of one `.next()` result. Next drive real
+   NDIS support initialization and miniport AddDevice/StartDevice through the generic PCI
    MMIO/interrupt/DMA grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
@@ -520,3 +521,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   registry selection, MMIO/interrupt/DMA, root-PDO start, ISR delivery, and DPC delivery. Review
   adjustment: B3 remains active until real `ndis.sys` initialization and ReactOS `e1000.sys` miniport
   startup run through the same generic PCI grant, after which the old raw NIC proof can be removed.
+- B3 cleanup continued. The generated-hive PnP hardware proof no longer collapses
+  `boot_system_pnp_driver_bindings()` to a single selected service. It now materializes an inline
+  boot PnP launch plan, copies each selected devnode descriptor into the fixed executive plan buffer,
+  and launches every eligible config-hive binding through the hosted AddDevice/START/resource path.
+  The old owned-vector conversion used only by the single-binding path was removed. Validation:
+  `cargo fmt --all`, `cargo test -p nt-config-manager`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./run.sh` through genuine explorer shell chrome with `286/288` checks passing. The generic
+  hardware gates stayed green for registry selection, MMIO/interrupt/DMA, root-PDO start, ISR
+  delivery, and DPC delivery.
+  Review adjustment: the B3 frontier is still real NDIS/e1000. The proof selector is now dynamic
+  enough to exercise multiple boot/system PnP bindings when the registry supplies them; next work is
+  support-driver/miniport startup and then replacing the old raw NIC proof with PCI-backed generic
+  evidence.
