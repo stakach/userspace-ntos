@@ -9787,7 +9787,9 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         hosted_interrupt_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     clear_hosted_resource_projection(binding, inst.exec_shared_va);
     let mapped_len = mmio_len.min(mmio_pages.saturating_mul(0x1000));
-    ensure_paging(mmio_va, inst.pml4);
+    for window in 0..mmio_pages.div_ceil(512).max(1) {
+        ensure_paging(mmio_va + window * 0x20_0000, inst.pml4);
+    }
     let mut page = 0u64;
     while page < mmio_pages {
         let err = page_map_r(
@@ -9809,7 +9811,9 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         if mapped_dma_len == 0 || dma_len > mapped_dma_len {
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
-        ensure_paging(dma_va, inst.pml4);
+        for window in 0..dma_pages.div_ceil(512).max(1) {
+            ensure_paging(dma_va + window * 0x20_0000, inst.pml4);
+        }
         let mut dma_page = 0u64;
         while dma_page < dma_pages {
             let err = page_map_r(

@@ -81,20 +81,14 @@ pub(crate) struct DevnodeRootResourceGrant {
     pub resource_list: Vec<u8>,
 }
 
-/// Resolve a registry-selected devnode against the enumerated PCI bus and build the physical
-/// `CM_RESOURCE_LIST` that will be passed to the hosted driver's `IRP_MN_START_DEVICE`.
-pub(crate) fn assign_devnode_pci_resources(
-    instance_id: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
-    devices: &[PciDevice],
+/// Build the physical START resources for an already-selected PCI function.
+pub(crate) fn build_devnode_pci_resource_grant(
+    device: &PciDevice,
     int_vector: u32,
     int_latched: bool,
     dma_len: u64,
     granted_mmio_len: u32,
 ) -> Option<DevnodePciResourceGrant> {
-    let device =
-        nt_pnp::find_pci_device_for_devnode(devices, instance_id, hardware_ids, compatible_ids)?;
     let assignment = assign_resources(
         device,
         int_vector,

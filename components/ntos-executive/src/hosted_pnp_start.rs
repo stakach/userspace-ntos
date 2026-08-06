@@ -1,16 +1,92 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use crate::*;
 
 static mut HOSTED_PNP_PCI_DEVICES: Option<Vec<nt_pnp::PciDevice>> = None;
-static HOSTED_PNP_NIC_BAR_BASE: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PNP_NIC_MMIO: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PNP_NIC_DMA_FRAME: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PNP_PCI_WINDOWS: Option<Vec<HostedPnpPciResourceWindow>> = None;
 static mut HOSTED_PNP_ROOT_DMA_MMIO_FRAME: u64 = 0;
 static mut HOSTED_PNP_ROOT_DMA_COMMON_FRAME: u64 = 0;
 
 const STATUS_DEVICE_NOT_READY: nt_status::NtStatus = nt_status::NtStatus(0xC000_00A3u32 as i32);
+const HOSTED_PCI_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
+const HOSTED_PCI_MMIO_VA_BASE: u64 = 0x0000_0100_1600_0000;
+const HOSTED_PCI_DMA_VA_BASE: u64 = 0x0000_0100_1800_0000;
+const HOSTED_PCI_RESOURCE_WINDOW_CAP: u64 = 16;
+
+const _: () = assert!(HOSTED_PCI_MMIO_VA_BASE & 0x1F_FFFF == 0);
+const _: () = assert!(HOSTED_PCI_DMA_VA_BASE & 0x1F_FFFF == 0);
+const _: () = assert!(
+    HOSTED_PCI_MMIO_VA_BASE
+        + HOSTED_PCI_RESOURCE_WINDOW_CAP * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        <= HOSTED_PCI_DMA_VA_BASE
+);
+const _: () = assert!(
+    HOSTED_PCI_DMA_VA_BASE
+        + HOSTED_PCI_RESOURCE_WINDOW_CAP * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        <= crate::allocator::HEAP_BASE as u64
+);
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedPnpPciResourceWindow {
+    pub(crate) bus: u8,
+    pub(crate) dev: u8,
+    pub(crate) func: u8,
+    pub(crate) mmio_phys: u64,
+    pub(crate) mmio_frame_base: u64,
+    pub(crate) mmio_pages: u64,
+    pub(crate) mmio_va: u64,
+    pub(crate) interrupt_vector: u32,
+    pub(crate) interrupt_latched: bool,
+    pub(crate) dma_frame_base: u64,
+    pub(crate) dma_pages: u64,
+    pub(crate) dma_va: u64,
+    pub(crate) dma_logical: u64,
+    pub(crate) dma_len: u64,
+}
+
+impl HostedPnpPciResourceWindow {
+    pub(crate) const fn for_index(
+        index: u64,
+        bus: u8,
+        dev: u8,
+        func: u8,
+        mmio_phys: u64,
+        mmio_frame_base: u64,
+        mmio_pages: u64,
+        interrupt_vector: u32,
+        interrupt_latched: bool,
+        dma_frame_base: u64,
+        dma_pages: u64,
+        dma_logical: u64,
+        dma_len: u64,
+    ) -> Self {
+        Self {
+            bus,
+            dev,
+            func,
+            mmio_phys,
+            mmio_frame_base,
+            mmio_pages,
+            mmio_va: HOSTED_PCI_MMIO_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            interrupt_vector,
+            interrupt_latched,
+            dma_frame_base,
+            dma_pages,
+            dma_va: HOSTED_PCI_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            dma_logical,
+            dma_len,
+        }
+    }
+
+    pub(crate) fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
+        self.bus == device.bus && self.dev == device.dev && self.func == device.func
+    }
+
+    pub(crate) fn granted_mmio_len(&self) -> u32 {
+        self.mmio_pages
+            .saturating_mul(0x1000)
+            .min(u32::MAX as u64) as u32
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostedPnpStartTrace {
@@ -89,9 +165,7 @@ struct HostedPnpDevnodeStart<'a> {
 
 pub(crate) unsafe fn publish_hosted_pnp_resource_context(
     pci_devices: &[nt_pnp::PciDevice],
-    nic_bar_base: u64,
-    nic_mmio: u64,
-    nic_dma_frame: u64,
+    pci_windows: &[HostedPnpPciResourceWindow],
 ) {
     let new_devices = Vec::from(pci_devices);
     let old = core::ptr::replace(
@@ -99,9 +173,12 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
         Some(new_devices),
     );
     drop(old);
-    HOSTED_PNP_NIC_BAR_BASE.store(nic_bar_base, Ordering::Relaxed);
-    HOSTED_PNP_NIC_MMIO.store(nic_mmio, Ordering::Relaxed);
-    HOSTED_PNP_NIC_DMA_FRAME.store(nic_dma_frame, Ordering::Relaxed);
+    let new_windows = Vec::from(pci_windows);
+    let old = core::ptr::replace(
+        core::ptr::addr_of_mut!(HOSTED_PNP_PCI_WINDOWS),
+        Some(new_windows),
+    );
+    drop(old);
 }
 
 pub(crate) unsafe fn start_inline_driver_service_devnodes(
@@ -278,6 +355,9 @@ unsafe fn grant_current_hosted_devnode_resources(
     let devices = (*core::ptr::addr_of!(HOSTED_PNP_PCI_DEVICES))
         .as_ref()
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let pci_windows = (*core::ptr::addr_of!(HOSTED_PNP_PCI_WINDOWS))
+        .as_ref()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
     let mut root_dma_mmio_frame =
         core::ptr::read_volatile(core::ptr::addr_of!(HOSTED_PNP_ROOT_DMA_MMIO_FRAME));
     let mut root_dma_common_frame =
@@ -288,9 +368,7 @@ unsafe fn grant_current_hosted_devnode_resources(
         hardware_refs,
         compatible_refs,
         devices.as_slice(),
-        HOSTED_PNP_NIC_BAR_BASE.load(Ordering::Relaxed),
-        HOSTED_PNP_NIC_MMIO.load(Ordering::Relaxed),
-        HOSTED_PNP_NIC_DMA_FRAME.load(Ordering::Relaxed),
+        pci_windows.as_slice(),
         &mut root_dma_mmio_frame,
         &mut root_dma_common_frame,
     );

@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 ## Objective
 
@@ -82,13 +82,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 1. Continue B3 cleanup after the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive
    state carries the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and
-   explicit `Linkage\Export`; `E1000` now completes `AddDevice` and `START_DEVICE` with
+   explicit `Linkage\Export`; `E1000` completes `AddDevice` and `START_DEVICE` with
    `STATUS_SUCCESS`; the generic grant path proves NT-style PCI config reads, full
    MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
    per-devnode DMA grant, cap-backed inline `out dx,eax` I/O-port service, `IoSetDeviceInterfaceState`
-   publication, connected-ISR dispatch, and KDPC bottom-half delivery. The next B3 target is replacing
-   fixed hosted proof arenas with per-devnode dynamic windows so multiple NICs and arbitrary boot PnP
-   drivers can load through the same boundary.
+   publication, connected-ISR dispatch, and KDPC bottom-half delivery. Hosted PCI resource grants now
+   use bus/dev/function keyed per-devnode component windows instead of NIC-named globals. The next B3
+   target is expanding window/resource publication beyond the currently pre-claimed E1000 hardware
+   grant and retiring the remaining root-bus proof VAs so arbitrary boot PnP drivers ride the same
+   dynamic boundary.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -672,3 +674,25 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `289/289` checks passing. Review adjustment: B3 cleanup now centers on replacing remaining fixed
   hosted proof arenas/windows with per-devnode dynamic resource windows for multi-NIC and arbitrary
   boot-driver scale.
+
+### 2026-08-07
+
+- B3 cleanup continued. Hosted PnP resource publication now carries a vector of
+  `HostedPnpPciResourceWindow` records keyed by PCI bus/dev/function, with separate per-window
+  component MMIO and DMA VAs. The grant path first resolves the registry-selected devnode against the
+  enumerated PCI bus, then matches the corresponding published window before assigning resource
+  lists, mapping BAR/DMA frames, and registering resource-manager/DMA-manager ownership. The old
+  `HOSTED_PNP_NIC_*` globals and the combined PCI-match/resource-assignment helper were removed, and
+  hosted resource mapping now creates every page-table leaf required by a multi-2MiB MMIO or DMA
+  grant. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-hosted-pci-windows-20260807.log`. Result:
+  `E1000` receives PCI resources (`mmio_len=131072`, `io_len=64`, `dma_len=270336`), starts through
+  the generic path, and keeps MMIO, I/O-port, DMA, ISR, and DPC evidence green; the boot reaches
+  genuine explorer shell chrome with `289/289` checks passing. Review adjustment: this removes the
+  NIC-named hosted resource context, but the publisher still exposes only the pre-claimed E1000
+  hardware grant and root-bus proof resources still use fixed VAs. The next B3 cleanup should make
+  resource publication originate from the registry-selected devnode set/resource broker for every
+  eligible PCI function, then replace the fixed root-bus proof windows with the same allocator.

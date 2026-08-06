@@ -1247,9 +1247,8 @@ pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
 pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
-/// Where the executive maps the full real PCI NIC BAR. This lives in the free dedicated 2 MiB
-/// device window above `DMA_VADDR`, not in the AHCI/storage cluster, because ReactOS `e1000.sys`
-/// requires the complete 128 KiB MMIO resource during NDIS miniport initialization.
+/// Where the executive maps the full real PCI NIC BAR for the raw hardware proof and KMDF fixture.
+/// Hosted PnP drivers get per-device component windows published through `HostedPnpPciResourceWindow`.
 pub const NIC_VADDR: u64 = 0x0000_0100_10D0_0000;
 pub const NIC_BAR_PAGES: u64 = 32;
 pub const NIC_DMA_PAGES: u64 = 66;
@@ -8772,27 +8771,36 @@ unsafe fn grant_hosted_devnode_resources(
     hardware_refs: &[&str],
     compatible_refs: &[&str],
     pci_devices: &[nt_pnp::PciDevice],
-    nic_bar_base: u64,
-    nic_mmio: u64,
-    nic_dma_frame: u64,
+    pci_windows: &[HostedPnpPciResourceWindow],
     root_dma_mmio_frame: &mut u64,
     root_dma_common_frame: &mut u64,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
-    if let Some(grant) = assign_devnode_pci_resources(
+    if let Some(device) = nt_pnp::find_pci_device_for_devnode(
+        pci_devices,
         instance_id,
         hardware_refs,
         compatible_refs,
-        pci_devices,
-        NIC_MSI_VECTOR as u32,
-        true,
-        NIC_DMA_LEN,
-        (NIC_BAR_PAGES * 0x1000) as u32,
     ) {
-        if nic_bar_base == 0 || grant.assignment.mmio_phys != nic_mmio || nic_dma_frame == 0 {
+        let Some(window) = pci_windows.iter().find(|window| window.matches(device)) else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        let Some(grant) = build_devnode_pci_resource_grant(
+            device,
+            window.interrupt_vector,
+            window.interrupt_latched,
+            window.dma_len,
+            window.granted_mmio_len(),
+        ) else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        if grant.assignment.mmio_phys != window.mmio_phys
+            || window.mmio_frame_base == 0
+            || window.dma_frame_base == 0
+        {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let mmio_len = grant.assignment.mmio_len;
-        if mmio_len == 0 || mmio_len > NIC_BAR_PAGES * 0x1000 {
+        if mmio_len == 0 || mmio_len > window.mmio_pages * 0x1000 {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         driver_launch::grant_hosted_device_resources(
@@ -8811,16 +8819,16 @@ unsafe fn grant_hosted_devnode_resources(
             mmio_len,
             grant.assignment.io_port_base,
             grant.assignment.io_port_len,
-            NIC_VADDR,
-            nic_bar_base,
-            NIC_BAR_PAGES,
+            window.mmio_va,
+            window.mmio_frame_base,
+            window.mmio_pages,
             grant.assignment.int_vector,
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
-            DMA_VADDR,
-            nic_dma_frame,
-            NIC_DMA_PAGES,
-            NIC_IOVA,
+            window.dma_va,
+            window.dma_frame_base,
+            window.dma_pages,
+            window.dma_logical,
             grant.assignment.dma_len,
         )?;
         return Ok(Some(HostedDevnodeGrant {
@@ -17906,7 +17914,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    publish_hosted_pnp_resource_context(&pci_devices, nic_bar_base, nic_mmio, nic_dma_frame);
+    let mut hosted_pci_windows = Vec::new();
+    if nic_bar_base != 0 && nic_dma_frame != 0 {
+        hosted_pci_windows.push(HostedPnpPciResourceWindow::for_index(
+            hosted_pci_windows.len() as u64,
+            0,
+            nic_dev,
+            nic_func,
+            nic_mmio,
+            nic_bar_base,
+            NIC_BAR_PAGES,
+            NIC_MSI_VECTOR as u32,
+            true,
+            nic_dma_frame,
+            NIC_DMA_PAGES,
+            NIC_IOVA,
+            NIC_DMA_LEN,
+        ));
+    }
+    publish_hosted_pnp_resource_context(&pci_devices, hosted_pci_windows.as_slice());
 
     // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
     // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
