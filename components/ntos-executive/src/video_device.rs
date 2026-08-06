@@ -14,11 +14,10 @@ use core::ptr::{read_unaligned, write_unaligned};
 
 use nt_io_abi::major;
 use nt_io_manager::{
-    write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object, DeviceCharacteristics,
-    DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DriverDispatchBackend, IoParameters,
-    IrpId, IrpProjection, WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
-    WDM_X64_FILE_OBJECT_SIZE,
+    write_wdm_file_object, write_wdm_open_device_projection, DeviceCharacteristics, DeviceFlags,
+    DeviceType, DispatchContext, DispatchOutcome, DriverDispatchBackend, IoParameters, IrpId,
+    IrpProjection, WdmFileObjectInit, WdmOpenDeviceProjectionInit, WDM_X64_DEVICE_OBJECT_SIZE,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use nt_video_miniport::{
@@ -207,42 +206,17 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
         return false;
     }
 
-    // Minimal x64 IO object bodies. win32k needs stable identities, DEVICE_OBJECT.DriverObject, the
-    // DriverObject.DeviceObject head link, and the FILE_OBJECT.DeviceObject back-link.
-    if write_wdm_driver_object(
+    // win32k needs projected, dereferenceable WDM bodies for the I/O Manager route identities.
+    if write_wdm_open_device_projection(
         core::slice::from_raw_parts_mut(driver as *mut u8, driver_len),
-        WdmDriverObjectInit {
-            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
-            device_object: device,
-            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
-            driver_unload: 0,
-        },
-    )
-    .is_err()
-    {
-        return false;
-    }
-    if write_wdm_device_object(
         core::slice::from_raw_parts_mut(device as *mut u8, WDM_X64_DEVICE_OBJECT_SIZE),
-        WdmDeviceObjectInit {
-            driver_object: driver,
-            next_device: 0,
-            device_extension: 0,
-            device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
-        },
-    )
-    .is_err()
-    {
-        return false;
-    }
-    if write_wdm_file_object(
         core::slice::from_raw_parts_mut(file as *mut u8, WDM_X64_FILE_OBJECT_SIZE),
-        WdmFileObjectInit {
+        WdmOpenDeviceProjectionInit {
+            driver_object: driver,
+            driver_extension: driver + WDM_X64_DRIVER_OBJECT_SIZE as u64,
             device_object: device,
-            fs_context: 0,
-            file_name_len: 0,
-            file_name_max_len: 0,
-            file_name_buffer: 0,
+            file_object_context: 0,
+            device_type: nt_video_miniport::FILE_DEVICE_VIDEO,
         },
     )
     .is_err()

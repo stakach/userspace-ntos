@@ -102,12 +102,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    queue now publishes arena-derived capacity instead of using a fixed inline queue, and the old raw
    e1000 TX liveness proof has been retired. Pre-storage PCI setup now registers a generic hosted PCI
    BAR/common-buffer/IOMMU grant without hand-programming NIC TX registers, and later registry-selected
-   discovery reuses or creates those grants for selected PCI devnodes. Remaining B3 cleanup is the
-   static driver-object construction audit below.
+   discovery reuses or creates those grants for selected PCI devnodes. The remaining driver-object
+   audit found no object-service driver construction, kept hosted-driver/win32k `DRIVER_OBJECT`
+   allocation classified as the generic compatibility harness that calls real `DriverEntry`, and moved
+   boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
+   projection helper. Remaining display debt is hosting real videoprt/miniport instead of the
+   boot-framebuffer bridge.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
-3. Audit remaining static driver-object construction sites that are not service-key-derived,
-   especially video and object-server tests, and classify whether they are fixtures or real debt.
+3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
+   policy from executive start paths once SCM consumes service metadata.
 4. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
    the seeded Configuration Manager authority.
 
@@ -918,3 +922,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_explorer_shell_chrome_painted` pass with `287/287` checks passing. Review adjustment: B3 raw
   NIC proof cleanup is closed; next B3 work is auditing remaining static driver-object construction
   sites and deciding which are fixtures versus real dynamic-boundary debt.
+- B3 static driver-object audit closed for the current frontier. The object-service components do not
+  construct WDM driver objects. Hosted FSD/win32k `DRIVER_OBJECT` allocation is the generic
+  compatibility harness used to call the real image `DriverEntry`, not launch policy. The only
+  remaining non-hosted projection was boot-video `Video0`; its projected driver/device/file WDM
+  bodies now use `nt-io-manager::write_wdm_open_device_projection`, with a host test proving the
+  driver/device/file back-links and object types. Validation: `cargo fmt --all` and
+  `cargo test -p nt-io-manager`. Review adjustment: current B3 cleanup is closed; the remaining real
+  display debt is future videoprt/miniport hosting, while the immediate kernel-completion work should
+  return to A3/A4 SCM-owned Win32 service starts and A5 service-selection gates.

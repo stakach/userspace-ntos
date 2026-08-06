@@ -67,8 +67,9 @@ pub use pipe::{
 pub use store::{GenStore, IoId};
 pub use wdm_x64::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object,
-    write_wdm_io_stack_location, write_wdm_irp, WdmDeviceObjectInit, WdmDriverObjectInit,
-    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit, WdmLayoutError,
+    write_wdm_io_stack_location, write_wdm_irp, write_wdm_open_device_projection,
+    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit,
+    WdmIoStackParameters, WdmIrpInit, WdmLayoutError, WdmOpenDeviceProjectionInit,
     WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE,
@@ -2124,6 +2125,44 @@ mod tests {
         assert_eq!(le_u16(&file, 0x58), 12);
         assert_eq!(le_u16(&file, 0x5a), 14);
         assert_eq!(le_u64(&file, 0x60), 0x6666);
+    }
+
+    #[test]
+    fn wdm_x64_open_device_projection_wires_backlinks() {
+        let mut driver = [0xCC; WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE];
+        let mut device = [0xCC; WDM_X64_DEVICE_OBJECT_SIZE];
+        let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
+
+        write_wdm_open_device_projection(
+            &mut driver,
+            &mut device,
+            &mut file,
+            WdmOpenDeviceProjectionInit {
+                driver_object: 0x1000,
+                driver_extension: 0x1150,
+                device_object: 0x2000,
+                file_object_context: 0x77,
+                device_type: 0x23,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(le_u16(&driver, 0x00), WDM_X64_IO_TYPE_DRIVER as u16);
+        assert_eq!(le_u16(&driver, 0x02), WDM_X64_DRIVER_OBJECT_SIZE as u16);
+        assert_eq!(le_u64(&driver, 0x08), 0x2000);
+        assert_eq!(le_u64(&driver, WDM_X64_DRIVER_EXTENSION_OFFSET), 0x1150);
+        assert_eq!(le_u64(&driver, WDM_X64_DRIVER_UNLOAD_OFFSET), 0);
+
+        assert_eq!(le_u16(&device, 0x00), WDM_X64_IO_TYPE_DEVICE as u16);
+        assert_eq!(le_u64(&device, 0x08), 0x1000);
+        assert_eq!(le_u64(&device, 0x10), 0);
+        assert_eq!(le_u32(&device, 0x48), 0x23);
+
+        assert_eq!(le_u16(&file, 0x00), WDM_X64_IO_TYPE_FILE as u16);
+        assert_eq!(le_u64(&file, 0x08), 0x2000);
+        assert_eq!(le_u64(&file, 0x18), 0x77);
+        assert_eq!(le_u16(&file, 0x58), 0);
+        assert_eq!(le_u16(&file, 0x5a), 0);
     }
 
     #[test]

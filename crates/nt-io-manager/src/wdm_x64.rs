@@ -52,6 +52,15 @@ pub struct WdmFileObjectInit {
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WdmOpenDeviceProjectionInit {
+    pub driver_object: u64,
+    pub driver_extension: u64,
+    pub device_object: u64,
+    pub file_object_context: u64,
+    pub device_type: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmIrpInit {
     pub system_buffer: u64,
     pub user_buffer: u64,
@@ -153,6 +162,42 @@ pub fn write_wdm_file_object(
     put_u16(bytes, 0x5a, init.file_name_max_len);
     put_u64(bytes, 0x60, init.file_name_buffer);
     Ok(())
+}
+
+pub fn write_wdm_open_device_projection(
+    driver_bytes: &mut [u8],
+    device_bytes: &mut [u8],
+    file_bytes: &mut [u8],
+    init: WdmOpenDeviceProjectionInit,
+) -> Result<(), WdmLayoutError> {
+    write_wdm_driver_object(
+        driver_bytes,
+        WdmDriverObjectInit {
+            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+            device_object: init.device_object,
+            driver_extension: init.driver_extension,
+            driver_unload: 0,
+        },
+    )?;
+    write_wdm_device_object(
+        device_bytes,
+        WdmDeviceObjectInit {
+            driver_object: init.driver_object,
+            next_device: 0,
+            device_extension: 0,
+            device_type: init.device_type,
+        },
+    )?;
+    write_wdm_file_object(
+        file_bytes,
+        WdmFileObjectInit {
+            device_object: init.device_object,
+            fs_context: init.file_object_context,
+            file_name_len: 0,
+            file_name_max_len: 0,
+            file_name_buffer: 0,
+        },
+    )
 }
 
 pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayoutError> {
