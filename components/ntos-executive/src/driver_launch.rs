@@ -46,8 +46,8 @@ use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 
-// Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
-use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory};
+// Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
+use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory, s_wcslen};
 
 use crate::*;
 
@@ -848,7 +848,7 @@ unsafe fn audit_ccb(fid: u64) {
 // Every hosted driver imports `KeBugCheckEx` and npfs wraps it in `NpBugCheck(p1,p2,p3)` =
 // `KeBugCheckEx(NPFS_FILE_SYSTEM, (FILE_ID << 16) | __LINE__, p1, p2, p3)` (`npfs.h:106`) — the
 // driver's own statement that its state is inconsistent, complete with the source file id and line.
-// It was an UNBOUND import, so it resolved to the fail-soft `s_true` no-op: the driver's assertion
+// It was once an unresolved import that resolved to a generic success no-op: the driver's assertion
 // was SKIPPED and it carried on with a broken invariant. Now it is bound: the code + all four
 // parameters + the raising component are reported, and the offending dispatch is failed CLEANLY by
 // unwinding back to `run_irp` (the park/fail-closed discipline — never a hang, never a dead boot).
@@ -926,8 +926,8 @@ extern "win64" {
 /// `DECLSPEC_NORETURN void KeBugCheckEx(ULONG Code, ULONG_PTR P1, P2, P3, P4)`. Report the driver's
 /// bugcheck (code, all four parameters, and — for `NPFS_FILE_SYSTEM` — the source file id + line
 /// `NpBugCheck` encodes in P1) and unwind the current dispatch. A bugcheck raised OUTSIDE an IRP
-/// dispatch (i.e. during `DriverEntry`, before the escape is armed) is reported and returns, which
-/// is the historical fail-soft behaviour — but now visible instead of silent.
+/// dispatch (i.e. during `DriverEntry`, before the escape is armed) is reported explicitly; IRP
+/// dispatch bugchecks are fail-closed through the guarded unwind path.
 extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u64) {
     unsafe {
         FSD_BUGCHECKS.fetch_add(1, Ordering::Relaxed);
@@ -967,14 +967,79 @@ extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u6
 
 // --- ntoskrnl trampolines (extern "win64"; args = rcx, rdx, r8, r9, then stack) --------------
 
-/// Bounded count of FSD imports logged as UNBOUND (the auditable fail-soft surface).
-static mut FSD_UNBOUND_LOGGED: u32 = 0;
+/// Bounded count of unresolved FSD imports logged before the PE load is rejected.
+static mut FSD_UNRESOLVED_IMPORTS_LOGGED: u32 = 0;
 
 extern "win64" fn s_zero() -> u64 {
     0
 }
-extern "win64" fn s_true() -> u64 {
+
+extern "win64" fn s_void() {}
+
+extern "win64" fn s_ke_release_mutex(_mutex: u64, _wait: u8) -> i32 {
     1
+}
+
+extern "win64" fn s_ke_cancel_timer(_timer: u64) -> u8 {
+    0
+}
+
+extern "win64" fn s_ke_set_timer(_timer: u64, _due_time: u64, _dpc: u64) -> u8 {
+    0
+}
+
+extern "win64" fn s_probe_for_read(_address: u64, _length: u64, _alignment: u64) {}
+
+extern "win64" fn s_probe_for_write(_address: u64, _length: u64, _alignment: u64) {}
+
+extern "win64" fn s_c_specific_handler(
+    _exception_record: u64,
+    _establisher_frame: u64,
+    _context_record: u64,
+    _dispatcher_context: u64,
+) -> i32 {
+    0
+}
+
+const STATUS_SUCCESS: i32 = 0;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
+
+const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
+const UNICODE_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
+const UNICODE_STRING_BUFFER_OFFSET: u64 = 8;
+
+#[inline]
+fn ascii_upcase_u16(c: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&c) {
+        c - 32
+    } else {
+        c
+    }
+}
+
+unsafe fn unicode_string_triplet(us: u64) -> Option<(u16, u16, u64)> {
+    if us == 0 {
+        return None;
+    }
+    Some((
+        read_unaligned((us + UNICODE_STRING_LENGTH_OFFSET) as *const u16),
+        read_unaligned((us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16),
+        read_unaligned((us + UNICODE_STRING_BUFFER_OFFSET) as *const u64),
+    ))
+}
+
+unsafe fn copy_bytes_unchecked(dst: u64, src: u64, len: u64) {
+    let mut off = 0u64;
+    while off < len {
+        write_unaligned(
+            (dst + off) as *mut u8,
+            read_unaligned((src + off) as *const u8),
+        );
+        off += 1;
+    }
 }
 
 /// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
@@ -1027,6 +1092,118 @@ extern "win64" fn s_rtl_init_empty_unicode_string(dst: u64, buf: u64, maxlen: u6
         write_unaligned((dst + 2) as *mut u16, maxlen as u16);
         write_unaligned((dst + 8) as *mut u64, buf);
     }
+}
+
+/// `VOID RtlFreeUnicodeString(PUNICODE_STRING)`.
+extern "win64" fn s_rtl_free_unicode_string(us: u64) {
+    unsafe {
+        if let Some((_len, _max, buf)) = unicode_string_triplet(us) {
+            if buf != 0 {
+                pool_free(buf);
+            }
+            write_unaligned((us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
+            write_unaligned((us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);
+            write_unaligned((us + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, 0);
+        }
+    }
+}
+
+/// `VOID RtlCopyUnicodeString(PUNICODE_STRING Destination, PCUNICODE_STRING Source)`.
+extern "win64" fn s_rtl_copy_unicode_string(dst: u64, src: u64) {
+    if dst == 0 {
+        return;
+    }
+    unsafe {
+        let dst_max =
+            read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+        let dst_buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+        if src == 0 || dst_buf == 0 || dst_max == 0 {
+            write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
+            return;
+        }
+        let (src_len, _src_max, src_buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
+        let copy_len = (src_len & !1).min(dst_max);
+        if src_buf != 0 && copy_len != 0 {
+            copy_bytes_unchecked(dst_buf, src_buf, copy_len as u64);
+        }
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, copy_len);
+    }
+}
+
+/// `LONG RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN CaseInsensitive)`.
+extern "win64" fn s_rtl_compare_unicode_string(left: u64, right: u64, case_insensitive: u8) -> i32 {
+    unsafe {
+        let (left_len, _left_max, left_buf) = unicode_string_triplet(left).unwrap_or((0, 0, 0));
+        let (right_len, _right_max, right_buf) = unicode_string_triplet(right).unwrap_or((0, 0, 0));
+        let left_chars = (left_len / 2) as u64;
+        let right_chars = (right_len / 2) as u64;
+        let common = left_chars.min(right_chars);
+        let mut i = 0u64;
+        while i < common {
+            let mut a = if left_buf == 0 {
+                0
+            } else {
+                read_unaligned((left_buf + i * 2) as *const u16)
+            };
+            let mut b = if right_buf == 0 {
+                0
+            } else {
+                read_unaligned((right_buf + i * 2) as *const u16)
+            };
+            if case_insensitive != 0 {
+                a = ascii_upcase_u16(a);
+                b = ascii_upcase_u16(b);
+            }
+            if a != b {
+                return a as i32 - b as i32;
+            }
+            i += 1;
+        }
+        left_chars as i32 - right_chars as i32
+    }
+}
+
+/// `NTSTATUS RtlUpcaseUnicodeString(PUNICODE_STRING Dest, PCUNICODE_STRING Src, BOOLEAN Allocate)`.
+extern "win64" fn s_rtl_upcase_unicode_string(dst: u64, src: u64, allocate: u8) -> i32 {
+    if dst == 0 || src == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let (src_len, _src_max, src_buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
+        if src_len != 0 && src_buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let dst_buf = if allocate != 0 {
+            let alloc_len = (src_len as u64).max(2);
+            let p = pool_alloc(alloc_len);
+            if p == 0 {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            write_unaligned(
+                (dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+                alloc_len as u16,
+            );
+            write_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, p);
+            p
+        } else {
+            let max_len =
+                read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+            let p = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+            if src_len > max_len || (src_len != 0 && p == 0) {
+                write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            p
+        };
+        let mut off = 0u64;
+        while off < src_len as u64 {
+            let c = read_unaligned((src_buf + off) as *const u16);
+            write_unaligned((dst_buf + off) as *mut u16, ascii_upcase_u16(c));
+            off += 2;
+        }
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, src_len);
+    }
+    STATUS_SUCCESS
 }
 
 unsafe fn unicode_string_parts(us: u64) -> Option<(u64, u16)> {
@@ -1221,6 +1398,8 @@ unsafe fn irp_next_stack_location(irp: u64) -> u64 {
 const WDM_X64_IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const WDM_X64_IRP_STACK_COUNT_OFFSET: u64 = 0x42;
 const WDM_X64_IRP_IO_STATUS_STATUS_OFFSET: u64 = 0x30;
+const WDM_X64_IRP_PENDING_RETURNED_OFFSET: u64 = 0x41;
+const WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET: u64 = 0x90;
 const WDM_X64_IO_STACK_MINOR_OFFSET: u64 = 0x01;
 const WDM_X64_IO_STACK_CONTROL_OFFSET: u64 = 0x03;
 const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x20;
@@ -1228,6 +1407,21 @@ const WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET: u64 = 0x38;
 const WDM_X64_IO_STACK_CONTEXT_OFFSET: u64 = 0x40;
 const WDM_X64_SL_INVOKE_ON_SUCCESS: u8 = 0x40;
 const WDM_X64_SL_INVOKE_ON_ERROR: u8 = 0x80;
+
+const WDM_X64_IO_TYPE_IRP: u16 = 6;
+const IO_TYPE_CSQ_IRP_CONTEXT: u32 = 1;
+const IO_TYPE_CSQ: u32 = 2;
+const IO_CSQ_SIZE: u64 = 64;
+const IO_CSQ_INSERT_IRP_OFFSET: u64 = 0x08;
+const IO_CSQ_REMOVE_IRP_OFFSET: u64 = 0x10;
+const IO_CSQ_PEEK_NEXT_IRP_OFFSET: u64 = 0x18;
+const IO_CSQ_ACQUIRE_LOCK_OFFSET: u64 = 0x20;
+const IO_CSQ_RELEASE_LOCK_OFFSET: u64 = 0x28;
+const IO_CSQ_COMPLETE_CANCELED_IRP_OFFSET: u64 = 0x30;
+const IO_CSQ_RESERVE_POINTER_OFFSET: u64 = 0x38;
+const IO_CSQ_IRP_CONTEXT_TYPE_OFFSET: u64 = 0x00;
+const IO_CSQ_IRP_CONTEXT_IRP_OFFSET: u64 = 0x08;
+const IO_CSQ_IRP_CONTEXT_CSQ_OFFSET: u64 = 0x10;
 
 /// `PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP)`.
 extern "win64" fn s_io_get_current_irp_stack_location(irp: u64) -> u64 {
@@ -1275,6 +1469,189 @@ extern "win64" fn s_io_skip_current_irp_stack_location(irp: u64) {
                 current_stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64,
             );
         }
+    }
+}
+
+/// `PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota)`.
+extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
+    let stack_count = stack_size as u64;
+    if stack_count == 0 || stack_count > 32 {
+        return 0;
+    }
+    let total =
+        WDM_X64_IRP_SIZE as u64 + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    unsafe {
+        let irp = pool_alloc(total);
+        if irp == 0 {
+            return 0;
+        }
+        core::ptr::write_bytes(irp as *mut u8, 0, total as usize);
+        let stack_base = irp + WDM_X64_IRP_SIZE as u64;
+        write_unaligned(irp as *mut u16, WDM_X64_IO_TYPE_IRP);
+        write_unaligned((irp + 2) as *mut u16, WDM_X64_IRP_SIZE as u16);
+        write_unaligned(
+            (irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *mut u8,
+            stack_size,
+        );
+        write_unaligned(
+            (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+            stack_size.saturating_add(1),
+        );
+        write_unaligned(
+            (irp + 0xb8) as *mut u64,
+            stack_base + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64,
+        );
+        irp
+    }
+}
+
+/// `VOID IoFreeIrp(PIRP)`.
+extern "win64" fn s_io_free_irp(irp: u64) {
+    unsafe {
+        pool_free(irp);
+    }
+}
+
+/// `VOID IoReleaseCancelSpinLock(KIRQL)`.
+extern "win64" fn s_io_release_cancel_spin_lock(_old_irql: u8) {}
+
+unsafe fn csq_acquire(csq: u64) -> u8 {
+    let acquire = read_unaligned((csq + IO_CSQ_ACQUIRE_LOCK_OFFSET) as *const u64);
+    let mut irql = 0u8;
+    if acquire != 0 {
+        let f: extern "win64" fn(u64, u64) = core::mem::transmute(acquire as *const ());
+        f(csq, (&mut irql as *mut u8) as u64);
+    }
+    irql
+}
+
+unsafe fn csq_release(csq: u64, irql: u8) {
+    let release = read_unaligned((csq + IO_CSQ_RELEASE_LOCK_OFFSET) as *const u64);
+    if release != 0 {
+        let f: extern "win64" fn(u64, u8) = core::mem::transmute(release as *const ());
+        f(csq, irql);
+    }
+}
+
+unsafe fn csq_clear_irp_context(irp: u64) {
+    if irp == 0 {
+        return;
+    }
+    let context = read_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *const u64);
+    if context != 0
+        && read_unaligned((context + IO_CSQ_IRP_CONTEXT_TYPE_OFFSET) as *const u32)
+            == IO_TYPE_CSQ_IRP_CONTEXT
+    {
+        write_unaligned((context + IO_CSQ_IRP_CONTEXT_IRP_OFFSET) as *mut u64, 0);
+    }
+    write_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64, 0);
+}
+
+/// `NTSTATUS IoCsqInitialize(PIO_CSQ, callbacks...)`.
+extern "win64" fn s_io_csq_initialize(
+    csq: u64,
+    insert: u64,
+    remove: u64,
+    peek: u64,
+    acquire: u64,
+    release: u64,
+    complete_canceled: u64,
+) -> i32 {
+    if csq == 0 || insert == 0 || remove == 0 || peek == 0 || acquire == 0 || release == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        core::ptr::write_bytes(csq as *mut u8, 0, IO_CSQ_SIZE as usize);
+        write_unaligned(csq as *mut u32, IO_TYPE_CSQ);
+        write_unaligned((csq + IO_CSQ_INSERT_IRP_OFFSET) as *mut u64, insert);
+        write_unaligned((csq + IO_CSQ_REMOVE_IRP_OFFSET) as *mut u64, remove);
+        write_unaligned((csq + IO_CSQ_PEEK_NEXT_IRP_OFFSET) as *mut u64, peek);
+        write_unaligned((csq + IO_CSQ_ACQUIRE_LOCK_OFFSET) as *mut u64, acquire);
+        write_unaligned((csq + IO_CSQ_RELEASE_LOCK_OFFSET) as *mut u64, release);
+        write_unaligned(
+            (csq + IO_CSQ_COMPLETE_CANCELED_IRP_OFFSET) as *mut u64,
+            complete_canceled,
+        );
+        write_unaligned((csq + IO_CSQ_RESERVE_POINTER_OFFSET) as *mut u64, 0);
+    }
+    STATUS_SUCCESS
+}
+
+/// `VOID IoCsqInsertIrp(PIO_CSQ, PIRP, PIO_CSQ_IRP_CONTEXT)`.
+extern "win64" fn s_io_csq_insert_irp(csq: u64, irp: u64, context: u64) {
+    if csq == 0 || irp == 0 {
+        return;
+    }
+    unsafe {
+        if context != 0 {
+            write_unaligned(
+                (context + IO_CSQ_IRP_CONTEXT_TYPE_OFFSET) as *mut u32,
+                IO_TYPE_CSQ_IRP_CONTEXT,
+            );
+            write_unaligned((context + IO_CSQ_IRP_CONTEXT_IRP_OFFSET) as *mut u64, irp);
+            write_unaligned((context + IO_CSQ_IRP_CONTEXT_CSQ_OFFSET) as *mut u64, csq);
+            write_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64, context);
+        } else {
+            write_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64, csq);
+        }
+        write_unaligned((irp + WDM_X64_IRP_PENDING_RETURNED_OFFSET) as *mut u8, 1);
+        let insert = read_unaligned((csq + IO_CSQ_INSERT_IRP_OFFSET) as *const u64);
+        if insert == 0 {
+            return;
+        }
+        let irql = csq_acquire(csq);
+        let f: extern "win64" fn(u64, u64) = core::mem::transmute(insert as *const ());
+        f(csq, irp);
+        csq_release(csq, irql);
+    }
+}
+
+/// `PIRP IoCsqRemoveIrp(PIO_CSQ, PIO_CSQ_IRP_CONTEXT)`.
+extern "win64" fn s_io_csq_remove_irp(csq: u64, context: u64) -> u64 {
+    if csq == 0 || context == 0 {
+        return 0;
+    }
+    unsafe {
+        let irp = read_unaligned((context + IO_CSQ_IRP_CONTEXT_IRP_OFFSET) as *const u64);
+        if irp == 0 {
+            return 0;
+        }
+        let remove = read_unaligned((csq + IO_CSQ_REMOVE_IRP_OFFSET) as *const u64);
+        if remove == 0 {
+            return 0;
+        }
+        let irql = csq_acquire(csq);
+        let f: extern "win64" fn(u64, u64) = core::mem::transmute(remove as *const ());
+        f(csq, irp);
+        csq_clear_irp_context(irp);
+        csq_release(csq, irql);
+        irp
+    }
+}
+
+/// `PIRP IoCsqRemoveNextIrp(PIO_CSQ, PVOID PeekContext)`.
+extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
+    if csq == 0 {
+        return 0;
+    }
+    unsafe {
+        let peek = read_unaligned((csq + IO_CSQ_PEEK_NEXT_IRP_OFFSET) as *const u64);
+        let remove = read_unaligned((csq + IO_CSQ_REMOVE_IRP_OFFSET) as *const u64);
+        if peek == 0 || remove == 0 {
+            return 0;
+        }
+        let irql = csq_acquire(csq);
+        let peek_fn: extern "win64" fn(u64, u64, u64) -> u64 =
+            core::mem::transmute(peek as *const ());
+        let irp = peek_fn(csq, 0, peek_context);
+        if irp != 0 {
+            let remove_fn: extern "win64" fn(u64, u64) =
+                core::mem::transmute(remove as *const ());
+            remove_fn(csq, irp);
+            csq_clear_irp_context(irp);
+        }
+        csq_release(csq, irql);
+        irp
     }
 }
 
@@ -2102,6 +2479,133 @@ extern "win64" fn s_rtl_init_generic_table(tbl: u64, cmp: u64, alloc: u64, free:
     }
 }
 
+/// `BOOLEAN RtlDeleteElementGenericTable(PRTL_GENERIC_TABLE, PVOID)`.
+extern "win64" fn s_rtl_delete_element_generic_table(_tbl: u64, _buffer: u64) -> u8 {
+    0
+}
+
+/// `VOID RtlRemoveUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_PREFIX_TABLE_ENTRY)`.
+extern "win64" fn s_rtl_remove_unicode_prefix(_tbl: u64, entry: u64) {
+    if entry == 0 {
+        return;
+    }
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+        for slot in table.iter_mut() {
+            if slot.used && slot.entry == entry {
+                *slot = PrefixSlot {
+                    entry: 0,
+                    name_va: 0,
+                    name_len: 0,
+                    used: false,
+                };
+                return;
+            }
+        }
+    }
+}
+
+const RTL_QUERY_REGISTRY_TABLE_SIZE: u64 = 56;
+const RTL_QUERY_REGISTRY_SUBKEY: u32 = 0x0000_0001;
+const RTL_QUERY_REGISTRY_REQUIRED: u32 = 0x0000_0004;
+const RTL_QUERY_REGISTRY_NOVALUE: u32 = 0x0000_0008;
+const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
+const REG_NONE: u32 = 0;
+
+/// `NTSTATUS RtlQueryRegistryValues(...)` for hosted FSD service parameters.
+///
+/// The FSD host does not keep a private registry mirror. Current ReactOS FSD callers use this during
+/// initialization for optional service parameters and defaults, so the explicit hosted behavior is:
+/// apply caller-provided defaults, report missing required values, and enumerate empty optional keys.
+extern "win64" fn s_rtl_query_registry_values(
+    _relative_to: u32,
+    _path: u64,
+    query_table: u64,
+    context: u64,
+    _environment: u64,
+) -> i32 {
+    if query_table == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let mut idx = 0u64;
+        while idx < 64 {
+            let entry = query_table + idx * RTL_QUERY_REGISTRY_TABLE_SIZE;
+            let routine = read_unaligned(entry as *const u64);
+            let flags = read_unaligned((entry + 8) as *const u32);
+            let name = read_unaligned((entry + 16) as *const u64);
+            let entry_context = read_unaligned((entry + 24) as *const u64);
+            let default_type = read_unaligned((entry + 32) as *const u32);
+            let default_data = read_unaligned((entry + 40) as *const u64);
+            let default_length = read_unaligned((entry + 48) as *const u32);
+
+            if routine == 0 && (flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT)) == 0
+            {
+                break;
+            }
+
+            if (flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
+                if name == 0 || routine != 0 || (flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if entry_context != 0 && default_data != 0 && default_length != 0 {
+                    let copy_len = (default_length as u64).min(4096);
+                    copy_bytes_unchecked(entry_context, default_data, copy_len);
+                } else if (flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if (flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 {
+                if name == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if routine == 0 {
+                    idx += 1;
+                    continue;
+                }
+            }
+
+            if (flags & RTL_QUERY_REGISTRY_NOVALUE) != 0 && routine != 0 {
+                let f: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
+                    core::mem::transmute(routine as *const ());
+                let status = f(0, REG_NONE, 0, 0, context, entry_context);
+                if status < 0 {
+                    return status;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if routine != 0 && name != 0 {
+                let f: extern "win64" fn(u64, u32, u64, u32, u64, u64) -> i32 =
+                    core::mem::transmute(routine as *const ());
+                let status = if default_data != 0 || default_length != 0 {
+                    f(
+                        name,
+                        default_type,
+                        default_data,
+                        default_length,
+                        context,
+                        entry_context,
+                    )
+                } else {
+                    f(name, REG_NONE, 0, 0, context, entry_context)
+                };
+                if status < 0 {
+                    return status;
+                }
+            } else if routine != 0 && (flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            idx += 1;
+        }
+    }
+    STATUS_SUCCESS
+}
+
 /// `NTSTATUS ExInitializeResourceLite(PERESOURCE)` / `void KeInitializeSpinLock(PKSPIN_LOCK)` /
 /// `KeInitializeEvent` / timers / DPCs — zero a small struct + return success. Single-threaded host.
 extern "win64" fn s_init_small_struct(p: u64) -> i32 {
@@ -2376,6 +2880,128 @@ extern "win64" fn s_ob_log_sd(input: u64, cached_out: u64, _refbias: u64) -> i32
     0
 }
 
+/// `BOOLEAN SeAccessCheck(...)` — the hosted FSD security boundary is the executive/object-manager
+/// handle path; inside the isolated FSD, grant the already-authorized desired access explicitly.
+extern "win64" fn s_se_access_check(
+    _security_descriptor: u64,
+    _subject_context: u64,
+    _subject_context_locked: u8,
+    desired_access: u32,
+    previously_granted_access: u32,
+    privileges: u64,
+    _generic_mapping: u64,
+    _access_mode: u8,
+    granted_access: u64,
+    access_status: u64,
+) -> u8 {
+    unsafe {
+        if privileges != 0 {
+            write_unaligned(privileges as *mut u64, 0);
+        }
+        if granted_access != 0 {
+            write_unaligned(
+                granted_access as *mut u32,
+                desired_access | previously_granted_access,
+            );
+        }
+        if access_status != 0 {
+            write_unaligned(access_status as *mut i32, STATUS_SUCCESS);
+        }
+    }
+    1
+}
+
+extern "win64" fn s_se_lock_subject_context(_subject_context: u64) {}
+
+extern "win64" fn s_se_unlock_subject_context(_subject_context: u64) {}
+
+extern "win64" fn s_se_open_object_audit_alarm(
+    _object_type_name: u64,
+    _object: u64,
+    _absolute_object_name: u64,
+    _security_descriptor: u64,
+    _access_state: u64,
+    _object_created: u8,
+    _access_granted: u8,
+    _access_mode: u8,
+    generate_on_close: u64,
+) {
+    unsafe {
+        if generate_on_close != 0 {
+            write_unaligned(generate_on_close as *mut u8, 0);
+        }
+    }
+}
+
+extern "win64" fn s_se_append_privileges(_access_state: u64, _privileges: u64) -> i32 {
+    STATUS_SUCCESS
+}
+
+extern "win64" fn s_se_free_privileges(_privileges: u64) {}
+
+/// `TOKEN_TYPE SeTokenType(PACCESS_TOKEN)`; TokenPrimary is 1 in NT5.
+extern "win64" fn s_se_token_type(_token: u64) -> u32 {
+    1
+}
+
+extern "win64" fn s_se_create_client_security(
+    _client_thread: u64,
+    _client_security_qos: u64,
+    _remote_session: u8,
+    client_context: u64,
+) -> i32 {
+    unsafe {
+        if client_context != 0 {
+            core::ptr::write_bytes(client_context as *mut u8, 0, 0x40);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+extern "win64" fn s_se_impersonate_client_ex(_client_context: u64, _server_thread: u64) -> i32 {
+    STATUS_SUCCESS
+}
+
+extern "win64" fn s_se_query_security_descriptor_info(
+    _security_information: u64,
+    _security_descriptor: u64,
+    length: u64,
+    _objects_security_descriptor: u64,
+) -> i32 {
+    unsafe {
+        if length != 0 {
+            write_unaligned(length as *mut u32, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+extern "win64" fn s_se_set_security_descriptor_info(
+    _object: u64,
+    _security_information: u64,
+    security_descriptor: u64,
+    objects_security_descriptor: u64,
+    _pool_type: u32,
+    _generic_mapping: u64,
+) -> i32 {
+    unsafe {
+        if objects_security_descriptor != 0 {
+            write_unaligned(objects_security_descriptor as *mut u64, security_descriptor);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+extern "win64" fn s_ob_dereference_security_descriptor(_security_descriptor: u64) {}
+
+extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
+    object
+}
+
+extern "win64" fn s_obf_dereference_object(_object: u64) -> u64 {
+    0
+}
+
 /// `PEPROCESS PsGetCurrentProcess()` / `PsGetCurrentThread()` — a fake non-null object pointer.
 extern "win64" fn s_current_process() -> u64 {
     FSD_DATA_VADDR // a mapped, zeroed placeholder page
@@ -2421,6 +3047,26 @@ fn register_fsd_trampolines() {
         "RtlInitEmptyUnicodeString",
         s_rtl_init_empty_unicode_string as usize as u64,
     );
+    reg.bind(
+        "RtlFreeUnicodeString",
+        s_rtl_free_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCopyUnicodeString",
+        s_rtl_copy_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlCompareUnicodeString",
+        s_rtl_compare_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlUpcaseUnicodeString",
+        s_rtl_upcase_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlQueryRegistryValues",
+        s_rtl_query_registry_values as usize as u64,
+    );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
     reg.bind("IoCreateDevice", s_io_create_device as usize as u64);
     reg.bind(
@@ -2450,6 +3096,31 @@ fn register_fsd_trampolines() {
     reg.bind(
         "IoSkipCurrentIrpStackLocation",
         s_io_skip_current_irp_stack_location as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoAllocateIrp",
+        s_io_allocate_irp as *const () as usize as u64,
+    );
+    reg.bind("IoFreeIrp", s_io_free_irp as *const () as usize as u64);
+    reg.bind(
+        "IoReleaseCancelSpinLock",
+        s_io_release_cancel_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCsqInitialize",
+        s_io_csq_initialize as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCsqInsertIrp",
+        s_io_csq_insert_irp as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCsqRemoveIrp",
+        s_io_csq_remove_irp as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoCsqRemoveNextIrp",
+        s_io_csq_remove_next_irp as *const () as usize as u64,
     );
     reg.bind(
         "IofCallDriver",
@@ -2520,7 +3191,7 @@ fn register_fsd_trampolines() {
     // npfs.sys's PE actually imports the fastcall alias `IofCompleteRequest` (the `IoCompleteRequest`
     // macro compiles to it). On x64 there is ONE calling convention, so `Irp`/`PriorityBoost` still
     // arrive in RCX/RDX — the same `extern "win64"` trampoline serves both. Without THIS binding the
-    // import fell to the `s_true` fail-soft no-op: when a peer WRITE satisfied a pending pipe READ,
+    // import used to resolve to a generic success no-op: when a peer WRITE satisfied a pending pipe READ,
     // npfs's `NpCompleteDeferredIrps` "completed" the read IRP into a no-op, so the executive never
     // learned the read finished (never stashed the delivered bytes), and the re-drive fresh read hit
     // the drained queue and returned uninitialized pool (`d0 16 d0 16 …`). BATCH 38 root cause.
@@ -2539,8 +3210,16 @@ fn register_fsd_trampolines() {
         s_rtl_find_unicode_prefix as usize as u64,
     );
     reg.bind(
+        "RtlRemoveUnicodePrefix",
+        s_rtl_remove_unicode_prefix as usize as u64,
+    );
+    reg.bind(
         "RtlInitializeGenericTable",
         s_rtl_init_generic_table as usize as u64,
+    );
+    reg.bind(
+        "RtlDeleteElementGenericTable",
+        s_rtl_delete_element_generic_table as usize as u64,
     );
     // ERESOURCE acquire/release (uncontended single-threaded host)
     reg.bind(
@@ -2564,11 +3243,13 @@ fn register_fsd_trampolines() {
         "ExReleaseResourceForThreadLite",
         s_release_resource as usize as u64,
     );
+    reg.bind("ExDeleteResourceLite", s_zero as usize as u64);
     // The driver's OWN consistency bugchecks (npfs' `NpBugCheck`) — caught + reported + unwound,
-    // never skipped. Previously an UNBOUND import resolving to the fail-soft `s_true` no-op.
+    // never skipped. Previously an unresolved import resolved to a generic success no-op.
     if crate::KEBUGCHECK_BOUND {
         reg.bind("KeBugCheckEx", s_ke_bug_check_ex as usize as u64);
     }
+    reg.bind("__C_specific_handler", s_c_specific_handler as usize as u64);
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as usize as u64);
     reg.bind("memmove", s_memcpy as usize as u64);
@@ -2577,6 +3258,7 @@ fn register_fsd_trampolines() {
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
+    reg.bind("wcslen", s_wcslen as usize as u64);
     reg.bind(
         "RtlCompareMemoryUlong",
         s_rtl_compare_memory as usize as u64,
@@ -2603,6 +3285,8 @@ fn register_fsd_trampolines() {
         "KeReleaseSpinLockFromDpcLevel",
         s_ke_release_spin_lock as *const () as usize as u64,
     );
+    reg.bind("KeEnterCriticalRegion", s_void as usize as u64);
+    reg.bind("KeLeaveCriticalRegion", s_void as usize as u64);
     reg.bind(
         "KeInitializeEvent",
         s_ke_initialize_event as *const () as usize as u64,
@@ -2620,6 +3304,8 @@ fn register_fsd_trampolines() {
         s_ke_wait_for_single_object as *const () as usize as u64,
     );
     reg.bind("KeInitializeTimer", s_init_small_struct as usize as u64);
+    reg.bind("KeCancelTimer", s_ke_cancel_timer as usize as u64);
+    reg.bind("KeSetTimer", s_ke_set_timer as usize as u64);
     reg.bind(
         "KeInitializeDpc",
         s_ke_initialize_dpc as *const () as usize as u64,
@@ -2630,18 +3316,64 @@ fn register_fsd_trampolines() {
     );
     reg.bind("ExInitializeFastMutex", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeMutex", s_init_small_struct as usize as u64);
+    reg.bind("KeReleaseMutex", s_ke_release_mutex as usize as u64);
     reg.bind("KeInitializeSemaphore", s_init_small_struct as usize as u64);
+    reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
+    reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     // Se / Ob security helpers
     reg.bind(
         "IoGetFileObjectGenericMapping",
         s_generic_mapping as usize as u64,
     );
     reg.bind("SeAssignSecurity", s_se_assign_security as usize as u64);
+    reg.bind("SeAccessCheck", s_se_access_check as usize as u64);
+    reg.bind(
+        "SeLockSubjectContext",
+        s_se_lock_subject_context as usize as u64,
+    );
+    reg.bind(
+        "SeUnlockSubjectContext",
+        s_se_unlock_subject_context as usize as u64,
+    );
+    reg.bind(
+        "SeOpenObjectAuditAlarm",
+        s_se_open_object_audit_alarm as usize as u64,
+    );
+    reg.bind("SeAppendPrivileges", s_se_append_privileges as usize as u64);
+    reg.bind("SeFreePrivileges", s_se_free_privileges as usize as u64);
+    reg.bind("SeTokenType", s_se_token_type as usize as u64);
+    reg.bind(
+        "SeCreateClientSecurity",
+        s_se_create_client_security as usize as u64,
+    );
+    reg.bind(
+        "SeImpersonateClientEx",
+        s_se_impersonate_client_ex as usize as u64,
+    );
+    reg.bind(
+        "SeQuerySecurityDescriptorInfo",
+        s_se_query_security_descriptor_info as usize as u64,
+    );
+    reg.bind(
+        "SeSetSecurityDescriptorInfo",
+        s_se_set_security_descriptor_info as usize as u64,
+    );
     reg.bind("ObLogSecurityDescriptor", s_ob_log_sd as usize as u64);
+    reg.bind(
+        "ObDereferenceSecurityDescriptor",
+        s_ob_dereference_security_descriptor as usize as u64,
+    );
+    reg.bind("ObfReferenceObject", s_obf_reference_object as usize as u64);
+    reg.bind(
+        "ObfDereferenceObject",
+        s_obf_dereference_object as usize as u64,
+    );
     // Ps/Io current-object identity
     reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentThread", s_current_process as usize as u64);
     reg.bind("KeGetCurrentThread", s_current_process as usize as u64);
+    reg.bind("IoGetRequestorProcess", s_current_process as usize as u64);
+    reg.bind("IoThreadToProcess", s_current_process as usize as u64);
     reg.bind(
         "IoGetCurrentProcess",
         s_io_get_current_process as usize as u64,
@@ -2654,12 +3386,10 @@ fn register_fsd_trampolines() {
 }
 
 /// Resolve an FSD ntoskrnl/hal/fsrtl import NAME to its IAT-slot trampoline VA through the SHARED
-/// [`DriverExportRegistry`]. Registered names resolve to their real trampoline; genuine no-ops
-/// (release/delete/deref/exit-fs) resolve to `s_zero`; everything else falls back to `s_true` (a
-/// benign non-crashing 1-returner) — DriverEntry's init path is broad but shallow, so unknown calls
-/// that just return success let it proceed to fill the MJ table. FLAG (serial-logged in the loader)
-/// each unbound name so the surface is auditable.
-pub fn fsd_export_addr(name: &str) -> u64 {
+/// [`DriverExportRegistry`]. Registered names resolve to their explicit trampoline. Unknown names
+/// return `None`, causing the PE load to fail before `DriverEntry`; the host no longer masks missing
+/// kernel behavior behind a success-returning import.
+pub fn fsd_export_addr(name: &str) -> Option<u64> {
     // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
     unsafe {
         if !FSD_EXPORTS_READY {
@@ -2667,31 +3397,20 @@ pub fn fsd_export_addr(name: &str) -> u64 {
             FSD_EXPORTS_READY = true;
         }
         if let Some(va) = (*core::ptr::addr_of!(FSD_EXPORTS)).lookup(name) {
-            return va;
+            return Some(va);
         }
     }
-    // DIAGNOSTIC: log each import that falls to a fail-soft stub, so the FSD's unbound surface is
-    // auditable (the doc above always claimed this; it was never actually printed).
     unsafe {
-        if FSD_UNBOUND_LOGGED < 48 {
-            FSD_UNBOUND_LOGGED += 1;
-            print_str(b"[fsd-import] UNBOUND ");
+        if FSD_UNRESOLVED_IMPORTS_LOGGED < 48 {
+            FSD_UNRESOLVED_IMPORTS_LOGGED += 1;
+            print_str(b"[fsd-import] unresolved ");
             for &b in name.as_bytes() {
                 debug_put_char(b);
             }
             print_str(b"\n");
         }
     }
-    // Genuine no-ops (release resource / lock / free / deref / exit-fs / etc.): return 0.
-    if name.starts_with("Ex") && (name.contains("Release") || name.contains("Delete"))
-        || name.starts_with("Ke") && name.contains("Release")
-        || name.starts_with("Fs")
-        || name.starts_with("Ob") && (name.contains("Dereference") || name.contains("Reference"))
-        || name.starts_with("Se") && name.contains("Unlock")
-    {
-        return s_zero as usize as u64;
-    }
-    s_true as usize as u64 // fail-soft default (auditable — the loader logs unbound names)
+    None
 }
 
 // --- the FSD component entry -----------------------------------------------------------------
@@ -3424,7 +4143,7 @@ unsafe fn load_pe_into(
     run_va: u64,
     max_frames: u64,
     rights_out: &mut [u64],
-    resolve: fn(&str) -> u64,
+    resolve: fn(&str) -> Option<u64>,
 ) -> Option<(u32, u32)> {
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va + e;
@@ -3597,7 +4316,7 @@ unsafe fn load_pe_into(
                         n += 1;
                     }
                     let name = core::str::from_utf8_unchecked(&buf[..n]);
-                    let addr = resolve(name);
+                    let addr = resolve(name)?;
                     write_unaligned((slots + k * 8) as *mut u64, addr);
                 }
                 k += 1;

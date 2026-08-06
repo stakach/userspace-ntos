@@ -80,9 +80,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Wire real interrupt delivery through the generic hosted-driver resource grant to the connected
-   ISR token, then retire the old bespoke NIC driver proof once the generic path proves equivalent
-   MMIO/interrupt/DMA behavior.
+1. Move PCI-backed hosted device proof onto the generic grant boundary: either add a real
+   PCI-capable WDM fixture that consumes the e1000 BAR honestly, or advance enough NDIS/ReactOS
+   driver support for `e1000.sys` to bind through the same dynamic resource path.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -436,3 +436,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   register banks (`MMIO`/`DMA1`), and ReactOS `e1000.sys` requires the NDIS frontier. The next useful
   B3 work is either a real PCI-capable hosted test driver that consumes the e1000 BAR honestly, or
   enough NDIS/ReactOS driver support to let `e1000.sys` bind through the same generic grant helper.
+- B3 cleanup continued. The hosted FSD PE import resolver no longer has a generic success fallback:
+  unknown imports now log `[fsd-import] unresolved <name>` and fail image loading before
+  `DriverEntry`. The old prefix-matched no-op machinery was replaced with exact bindings for the
+  ReactOS `npfs.sys`/`msfs.sys` surface, including Unicode string helpers, optional registry query
+  defaults, security/object helpers, cancel-safe queue callbacks, dynamic IRP allocation, timers,
+  probes, and cleanup routines. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` through genuine explorer shell chrome with
+  `286/288` checks passing; the only failing checks remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
+  adjustment: with the hosted FSD fallback removed, resume B3 at the PCI/NDIS equivalence frontier
+  before deleting the old bespoke NIC proof.
