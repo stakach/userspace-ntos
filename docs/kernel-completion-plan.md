@@ -92,10 +92,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    launch plans, and the PCI broker discovers grant material for every registry-selected eligible
    PCI function. Existing `E1000` PCI grant registration, DMA grant allocation, and IOMMU mapping now
    flow through generic broker helpers that derive BAR size and DMA domain/request identity from the
-   enumerated PCI device. The raw direct TX proof remains only as a hardware liveness proof before
-   VT-d mapping. The next B3 target is replacing bounded hosted window/instance/allocation-record
-   tables where they block arbitrary multi-driver scale, then retiring the direct raw proof once
-   generic PCI evidence fully covers it.
+   enumerated PCI device. Hosted PCI/root resource publication now allocates component resource VAs
+   from the real hosted-driver VA arena and reports VA exhaustion instead of using fixed PCI/root
+   window caps. The raw direct TX proof remains only as a hardware liveness proof before VT-d
+   mapping. The next B3 target is replacing bounded hosted driver instance and shared-frame
+   allocation-record tables where they block arbitrary multi-driver scale, then retiring the direct
+   raw proof once generic PCI evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -790,3 +792,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   shell chrome remain green with `294/294` checks passing. Review adjustment: B3 cleanup now moves
   to bounded hosted window/instance/allocation-record scaling and then removing the direct raw proof
   once generic PCI evidence fully replaces it.
+- B3 cleanup continued. The fixed hosted PCI/root resource-window caps were removed from the
+  publication path. `HostedPnpResourceVaAllocator` now hands out component MMIO/DMA VAs from the
+  hosted-driver resource arena, root proof seed aliases from the actual executive seed scratch
+  arena, and root DMA logical addresses independently; publication reports `pci-va-exhausted` or
+  `root-va-exhausted` only when those real arenas run out. PCI grant discovery no longer rejects
+  selected devices because of the old window cap. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-hosted-resource-windows-20260807.log`. Result: hosted PCI grant discovery
+  reports `selected=1 existing=1 claimed=0 missing-mmio=0 missing-int=0 claim-failures=0`,
+  resource publication reports
+  `pci-selected=1 pci-published=1 pci-missing-grants=0 pci-va-exhausted=0 root-selected=1
+  root-published=1 root-missing-grants=0 root-va-exhausted=0`, ReactOS `E1000` and
+  `DmaPnpPowerTest` both receive generic resources, the generic MMIO/interrupt/DMA/ISR/DPC gates
+  stay green, and explorer shell chrome remains green with `294/294` checks passing. Review
+  adjustment: remaining B3 scaling debt is now the hosted driver instance table, shared-frame DMA
+  allocation-record capacity, and any other launch-state caps that prevent arbitrary driver count.

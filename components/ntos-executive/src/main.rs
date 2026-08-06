@@ -11954,7 +11954,6 @@ struct HostedPciGrantDiscoveryReport {
     missing_memory_bar: u64,
     missing_interrupt: u64,
     claim_failures: u64,
-    cap_exhausted: bool,
 }
 
 fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
@@ -12140,10 +12139,6 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.existing_grants += 1;
                     continue;
                 }
-                if grants.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
-                    report.cap_exhausted = true;
-                    continue;
-                }
                 let Some(mem_bar) = device.first_memory_bar() else {
                     report.missing_memory_bar += 1;
                     continue;
@@ -12182,11 +12177,11 @@ struct HostedPciWindowPublishReport {
     selected_devnodes: u64,
     published_windows: u64,
     missing_grants: u64,
-    cap_exhausted: bool,
+    pci_va_exhausted: bool,
     selected_root_devnodes: u64,
     published_root_windows: u64,
     missing_root_grants: u64,
-    root_cap_exhausted: bool,
+    root_va_exhausted: bool,
 }
 
 unsafe fn publish_hosted_pnp_context_for_launch_plans(
@@ -12197,6 +12192,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     let mut report = HostedPciWindowPublishReport::default();
     let mut windows: Vec<HostedPnpPciResourceWindow> = Vec::new();
     let mut root_windows: Vec<HostedPnpRootResourceWindow> = Vec::new();
+    let mut resource_vas = HostedPnpResourceVaAllocator::default();
     for plan in plans {
         for spec in plan.as_slice() {
             for devnode in &spec.devnodes[..spec.devnode_count] {
@@ -12229,25 +12225,43 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         report.missing_grants += 1;
                         continue;
                     }
-                    if windows.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
-                        report.cap_exhausted = true;
+                    let needs_dma = grant.dma_frame_base != 0
+                        || grant.dma_pages != 0
+                        || grant.dma_logical != 0
+                        || grant.dma_len != 0;
+                    let Some(mmio_va) = resource_vas.allocate_component_window() else {
+                        report.pci_va_exhausted = true;
                         continue;
-                    }
-                    windows.push(HostedPnpPciResourceWindow::for_index(
-                        windows.len() as u64,
+                    };
+                    let dma_va = if needs_dma {
+                        let Some(dma_va) = resource_vas.allocate_component_window() else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        dma_va
+                    } else {
+                        0
+                    };
+                    let Some(window) = HostedPnpPciResourceWindow::new(
                         device.bus,
                         device.dev,
                         device.func,
                         grant.mmio_phys,
                         grant.mmio_frame_base,
                         grant.mmio_pages,
+                        mmio_va,
                         grant.interrupt_vector,
                         grant.interrupt_latched,
                         grant.dma_frame_base,
                         grant.dma_pages,
+                        dma_va,
                         grant.dma_logical,
                         grant.dma_len,
-                    ));
+                    ) else {
+                        report.missing_grants += 1;
+                        continue;
+                    };
+                    windows.push(window);
                     continue;
                 }
 
@@ -12265,30 +12279,42 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                 {
                     continue;
                 }
-                if root_windows.len() >= HOSTED_ROOT_RESOURCE_WINDOW_CAP {
-                    report.root_cap_exhausted = true;
+                let Some((mmio_va, dma_va)) = resource_vas.allocate_component_window_pair() else {
+                    report.root_va_exhausted = true;
                     continue;
-                }
-                let seed_va = HostedPnpRootResourceWindow::seed_va_for_index(
-                    root_windows.len() as u64,
-                );
+                };
+                let Some(seed_va) = resource_vas.allocate_root_seed_window() else {
+                    report.root_va_exhausted = true;
+                    continue;
+                };
+                let Some(dma_logical) = resource_vas.allocate_root_dma_logical() else {
+                    report.root_va_exhausted = true;
+                    continue;
+                };
                 let mmio_frame = alloc_seeded_root_dma_mmio_frame(seed_va);
                 let (dma_frame, dma_frame_err) = alloc_frame_r();
                 if mmio_frame == 0 || dma_frame_err != 0 {
                     report.missing_root_grants += 1;
                     continue;
                 }
-                root_windows.push(HostedPnpRootResourceWindow::for_index(
-                    root_windows.len() as u64,
+                let Some(window) = HostedPnpRootResourceWindow::new(
                     profile,
                     mmio_frame,
                     profile.mmio_len.div_ceil(0x1000).max(1),
+                    mmio_va,
+                    seed_va,
                     ROOT_DMA_PROOF_INTERRUPT_VECTOR,
                     false,
                     dma_frame,
                     1,
+                    dma_va,
+                    dma_logical,
                     0x1000,
-                ));
+                ) else {
+                    report.missing_root_grants += 1;
+                    continue;
+                };
+                root_windows.push(window);
             }
         }
     }
@@ -20014,8 +20040,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_grant_discovery.missing_interrupt);
     print_str(b" claim-failures=");
     print_u64(hosted_pci_grant_discovery.claim_failures);
-    print_str(b" cap-exhausted=");
-    print_u64(hosted_pci_grant_discovery.cap_exhausted as u64);
     print_str(b"\n");
     check(
         b"exec_hosted_pci_grants_discovered_from_registry",
@@ -20024,8 +20048,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 + hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.missing_memory_bar == 0
             && hosted_pci_grant_discovery.missing_interrupt == 0
-            && hosted_pci_grant_discovery.claim_failures == 0
-            && !hosted_pci_grant_discovery.cap_exhausted,
+            && hosted_pci_grant_discovery.claim_failures == 0,
         &mut passed,
     );
     let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
@@ -20039,22 +20062,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_window_publish.published_windows);
     print_str(b" pci-missing-grants=");
     print_u64(hosted_pci_window_publish.missing_grants);
-    print_str(b" pci-cap-exhausted=");
-    print_u64(hosted_pci_window_publish.cap_exhausted as u64);
+    print_str(b" pci-va-exhausted=");
+    print_u64(hosted_pci_window_publish.pci_va_exhausted as u64);
     print_str(b" root-selected=");
     print_u64(hosted_pci_window_publish.selected_root_devnodes);
     print_str(b" root-published=");
     print_u64(hosted_pci_window_publish.published_root_windows);
     print_str(b" root-missing-grants=");
     print_u64(hosted_pci_window_publish.missing_root_grants);
-    print_str(b" root-cap-exhausted=");
-    print_u64(hosted_pci_window_publish.root_cap_exhausted as u64);
+    print_str(b" root-va-exhausted=");
+    print_u64(hosted_pci_window_publish.root_va_exhausted as u64);
     print_str(b"\n");
     check(
         b"exec_hosted_pci_windows_selected_from_registry",
         hosted_pci_window_publish.published_windows != 0
             && hosted_pci_window_publish.missing_grants == 0
-            && !hosted_pci_window_publish.cap_exhausted,
+            && !hosted_pci_window_publish.pci_va_exhausted,
         &mut passed,
     );
     check(
@@ -20062,7 +20085,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         hosted_pci_window_publish.selected_root_devnodes == 0
             || (hosted_pci_window_publish.published_root_windows != 0
                 && hosted_pci_window_publish.missing_root_grants == 0
-                && !hosted_pci_window_publish.root_cap_exhausted),
+                && !hosted_pci_window_publish.root_va_exhausted),
         &mut passed,
     );
 

@@ -6,46 +6,81 @@ static mut HOSTED_PNP_PCI_WINDOWS: Option<Vec<HostedPnpPciResourceWindow>> = Non
 static mut HOSTED_PNP_ROOT_WINDOWS: Option<Vec<HostedPnpRootResourceWindow>> = None;
 
 const STATUS_DEVICE_NOT_READY: nt_status::NtStatus = nt_status::NtStatus(0xC000_00A3u32 as i32);
-const HOSTED_PCI_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
-const HOSTED_PCI_MMIO_VA_BASE: u64 = 0x0000_0100_1600_0000;
-const HOSTED_PCI_DMA_VA_BASE: u64 = 0x0000_0100_1800_0000;
-pub(crate) const HOSTED_PCI_RESOURCE_WINDOW_CAP: usize = 16;
-pub(crate) const HOSTED_ROOT_RESOURCE_WINDOW_CAP: usize = 8;
-const HOSTED_ROOT_MMIO_VA_BASE: u64 = HOSTED_PCI_DMA_VA_BASE
-    + (HOSTED_PCI_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE;
-const HOSTED_ROOT_DMA_VA_BASE: u64 = HOSTED_ROOT_MMIO_VA_BASE
-    + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE;
+const HOSTED_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
+const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = 0x0000_0100_1600_0000;
+const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u64;
 const HOSTED_ROOT_SEED_VA_BASE: u64 = 0x0000_0100_1100_0000;
+const HOSTED_ROOT_SEED_VA_LIMIT: u64 = 0x0000_0100_1200_0000;
 const HOSTED_ROOT_DMA_LOGICAL_BASE: u64 = 0x0010_0000;
 
-const _: () = assert!(HOSTED_PCI_MMIO_VA_BASE & 0x1F_FFFF == 0);
-const _: () = assert!(HOSTED_PCI_DMA_VA_BASE & 0x1F_FFFF == 0);
+const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(
-    HOSTED_PCI_MMIO_VA_BASE
-        + (HOSTED_PCI_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-        <= HOSTED_PCI_DMA_VA_BASE
-);
-const _: () = assert!(
-    HOSTED_PCI_DMA_VA_BASE
-        + (HOSTED_PCI_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-        <= HOSTED_ROOT_MMIO_VA_BASE
-);
-const _: () = assert!(
-    HOSTED_ROOT_MMIO_VA_BASE
-        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-        <= HOSTED_ROOT_DMA_VA_BASE
-);
-const _: () = assert!(
-    HOSTED_ROOT_DMA_VA_BASE
-        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-        <= crate::allocator::HEAP_BASE as u64
+    HOSTED_RESOURCE_COMPONENT_VA_BASE + HOSTED_RESOURCE_WINDOW_STRIDE
+        <= HOSTED_RESOURCE_COMPONENT_VA_LIMIT
 );
 const _: () = assert!(HOSTED_ROOT_SEED_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(
-    HOSTED_ROOT_SEED_VA_BASE
-        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-        <= 0x0000_0100_1200_0000
+    HOSTED_ROOT_SEED_VA_BASE + HOSTED_RESOURCE_WINDOW_STRIDE <= HOSTED_ROOT_SEED_VA_LIMIT
 );
+
+#[derive(Default)]
+pub(crate) struct HostedPnpResourceVaAllocator {
+    component_slots: u64,
+    root_seed_slots: u64,
+    root_dma_logical_slots: u64,
+}
+
+impl HostedPnpResourceVaAllocator {
+    pub(crate) fn allocate_component_window(&mut self) -> Option<u64> {
+        let va = hosted_window_slot_va(
+            HOSTED_RESOURCE_COMPONENT_VA_BASE,
+            HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
+            self.component_slots,
+        )?;
+        self.component_slots = self.component_slots.checked_add(1)?;
+        Some(va)
+    }
+
+    pub(crate) fn allocate_component_window_pair(&mut self) -> Option<(u64, u64)> {
+        let first = hosted_window_slot_va(
+            HOSTED_RESOURCE_COMPONENT_VA_BASE,
+            HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
+            self.component_slots,
+        )?;
+        let second = hosted_window_slot_va(
+            HOSTED_RESOURCE_COMPONENT_VA_BASE,
+            HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
+            self.component_slots.checked_add(1)?,
+        )?;
+        self.component_slots = self.component_slots.checked_add(2)?;
+        Some((first, second))
+    }
+
+    pub(crate) fn allocate_root_seed_window(&mut self) -> Option<u64> {
+        let va = hosted_window_slot_va(
+            HOSTED_ROOT_SEED_VA_BASE,
+            HOSTED_ROOT_SEED_VA_LIMIT,
+            self.root_seed_slots,
+        )?;
+        self.root_seed_slots = self.root_seed_slots.checked_add(1)?;
+        Some(va)
+    }
+
+    pub(crate) fn allocate_root_dma_logical(&mut self) -> Option<u64> {
+        let logical = HOSTED_ROOT_DMA_LOGICAL_BASE.checked_add(
+            self.root_dma_logical_slots
+                .checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)?,
+        )?;
+        self.root_dma_logical_slots = self.root_dma_logical_slots.checked_add(1)?;
+        Some(logical)
+    }
+}
+
+fn hosted_window_slot_va(base: u64, limit: u64, slot: u64) -> Option<u64> {
+    let va = base.checked_add(slot.checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)?)?;
+    let end = va.checked_add(HOSTED_RESOURCE_WINDOW_STRIDE)?;
+    (end <= limit).then_some(va)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedPnpPciResourceWindow {
@@ -66,41 +101,54 @@ pub(crate) struct HostedPnpPciResourceWindow {
 }
 
 impl HostedPnpPciResourceWindow {
-    pub(crate) const fn for_index(
-        index: u64,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         bus: u8,
         dev: u8,
         func: u8,
         mmio_phys: u64,
         mmio_frame_base: u64,
         mmio_pages: u64,
+        mmio_va: u64,
         interrupt_vector: u32,
         interrupt_latched: bool,
         dma_frame_base: u64,
         dma_pages: u64,
+        dma_va: u64,
         dma_logical: u64,
         dma_len: u64,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if mmio_va == 0 {
+            return None;
+        }
+        let has_dma =
+            dma_frame_base != 0 || dma_pages != 0 || dma_va != 0 || dma_logical != 0 || dma_len != 0;
+        if (!has_dma && dma_va != 0)
+            || (has_dma
+                && (dma_frame_base == 0
+                    || dma_pages == 0
+                    || dma_va == 0
+                    || dma_logical == 0
+                    || dma_len == 0))
+        {
+            return None;
+        }
+        Some(Self {
             bus,
             dev,
             func,
             mmio_phys,
             mmio_frame_base,
             mmio_pages,
-            mmio_va: HOSTED_PCI_MMIO_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            mmio_va,
             interrupt_vector,
             interrupt_latched,
             dma_frame_base,
             dma_pages,
-            dma_va: if dma_frame_base == 0 && dma_pages == 0 && dma_logical == 0 && dma_len == 0 {
-                0
-            } else {
-                HOSTED_PCI_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
-            },
+            dma_va,
             dma_logical,
             dma_len,
-        }
+        })
     }
 
     pub(crate) fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
@@ -146,36 +194,39 @@ pub(crate) struct HostedPnpRootResourceWindow {
 }
 
 impl HostedPnpRootResourceWindow {
-    pub(crate) fn for_index(
-        index: u64,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         profile: &'static nt_pnp::RootBusResourceProfile,
         mmio_frame_base: u64,
         mmio_pages: u64,
+        mmio_va: u64,
+        mmio_seed_va: u64,
         interrupt_vector: u32,
         interrupt_latched: bool,
         dma_frame_base: u64,
         dma_pages: u64,
+        dma_va: u64,
+        dma_logical: u64,
         dma_len: u64,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if mmio_va == 0 || mmio_seed_va == 0 || dma_va == 0 || dma_logical == 0 {
+            return None;
+        }
+        Some(Self {
             device_id: profile.device_id,
             mmio_phys: profile.mmio_phys,
             mmio_frame_base,
             mmio_pages,
-            mmio_va: HOSTED_ROOT_MMIO_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
-            mmio_seed_va: Self::seed_va_for_index(index),
+            mmio_va,
+            mmio_seed_va,
             interrupt_vector,
             interrupt_latched,
             dma_frame_base,
             dma_pages,
-            dma_va: HOSTED_ROOT_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
-            dma_logical: HOSTED_ROOT_DMA_LOGICAL_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            dma_va,
+            dma_logical,
             dma_len,
-        }
-    }
-
-    pub(crate) const fn seed_va_for_index(index: u64) -> u64 {
-        HOSTED_ROOT_SEED_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        })
     }
 
     pub(crate) fn matches_profile(&self, profile: &nt_pnp::RootBusResourceProfile) -> bool {
