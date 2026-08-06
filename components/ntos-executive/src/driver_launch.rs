@@ -3060,6 +3060,33 @@ extern "win64" fn s_dbg_print() -> i32 {
 static mut FSD_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut FSD_EXPORTS_READY: bool = false;
 
+const HOSTED_DEP_PROVIDER_MAX: usize = 64;
+const HOSTED_DEP_PATH_MAX: usize = 96;
+const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = b"reactos\\system32\\drivers\\";
+const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
+const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
+
+#[derive(Clone, Copy)]
+struct LoadedDependencyImage {
+    present: bool,
+    exec_va: u64,
+    run_va: u64,
+    image_len: u32,
+}
+
+impl LoadedDependencyImage {
+    const fn empty() -> LoadedDependencyImage {
+        LoadedDependencyImage {
+            present: false,
+            exec_va: 0,
+            run_va: 0,
+            image_len: 0,
+        }
+    }
+}
+
+static mut NDIS_DEP_IMAGE: LoadedDependencyImage = LoadedDependencyImage::empty();
+
 /// Bind the FSD ntoskrnl trampolines into [`FSD_EXPORTS`]. Idempotent (`bind` updates in place).
 fn register_fsd_trampolines() {
     // SAFETY: single-threaded executive; the registry is only touched here + in fsd_export_addr.
@@ -3431,6 +3458,14 @@ fn hosted_kernel_provider_dll(dll: &str) -> bool {
         || ascii_eq_ignore_case(dll, "hal")
 }
 
+fn hosted_ndis_provider_dll(dll: &str) -> bool {
+    ascii_eq_ignore_case(dll, "ndis.sys") || ascii_eq_ignore_case(dll, "ndis")
+}
+
+fn hosted_dependency_provider_dll(dll: &str) -> bool {
+    hosted_ndis_provider_dll(dll)
+}
+
 unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
     if DRIVER_UNRESOLVED_IMPORTS_LOGGED < 48 {
         DRIVER_UNRESOLVED_IMPORTS_LOGGED += 1;
@@ -3451,6 +3486,15 @@ unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
 /// are accepted here; dependency images such as `ndis.sys` must be mapped and resolved as real images.
 /// Unknown provider DLLs or names return `None`, causing the PE load to fail before `DriverEntry`.
 pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
+    if hosted_ndis_provider_dll(dll) {
+        unsafe {
+            if let Some(addr) = lookup_ndis_dependency_export(name) {
+                return Some(addr);
+            }
+            log_unresolved_driver_import(dll, name);
+        }
+        return None;
+    }
     if !hosted_kernel_provider_dll(dll) {
         unsafe {
             log_unresolved_driver_import(dll, name);
@@ -4223,6 +4267,296 @@ unsafe fn read_pe_ascii<'a>(
     None
 }
 
+#[derive(Clone, Copy)]
+struct RawPeLayout {
+    src_va: u64,
+    src_size: u64,
+    opt: u64,
+    sec_table: u64,
+    num_sections: u64,
+    size_of_headers: u64,
+}
+
+unsafe fn raw_u16(src_va: u64, src_size: u64, off: u64) -> Option<u16> {
+    if off > src_size.saturating_sub(2) {
+        return None;
+    }
+    Some(read_unaligned((src_va + off) as *const u16))
+}
+
+unsafe fn raw_u32(src_va: u64, src_size: u64, off: u64) -> Option<u32> {
+    if off > src_size.saturating_sub(4) {
+        return None;
+    }
+    Some(read_unaligned((src_va + off) as *const u32))
+}
+
+unsafe fn raw_pe_layout(src_va: u64, src_size: u32) -> Option<RawPeLayout> {
+    let src_size = src_size as u64;
+    let e = raw_u32(src_va, src_size, 0x3c)? as u64;
+    if raw_u32(src_va, src_size, e)? != 0x0000_4550 {
+        return None;
+    }
+    let file_hdr = e.checked_add(4)?;
+    let num_sections = raw_u16(src_va, src_size, file_hdr.checked_add(2)?)? as u64;
+    let size_opt_hdr = raw_u16(src_va, src_size, file_hdr.checked_add(16)?)? as u64;
+    let opt = file_hdr.checked_add(20)?;
+    let magic = raw_u16(src_va, src_size, opt)?;
+    if magic != 0x20b {
+        return None;
+    }
+    let sec_table = opt.checked_add(size_opt_hdr)?;
+    if sec_table.checked_add(num_sections.checked_mul(40)?)? > src_size {
+        return None;
+    }
+    Some(RawPeLayout {
+        src_va,
+        src_size,
+        opt,
+        sec_table,
+        num_sections,
+        size_of_headers: raw_u32(src_va, src_size, opt.checked_add(60)?)? as u64,
+    })
+}
+
+unsafe fn raw_pe_rva_to_file(layout: &RawPeLayout, rva: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    if rva < layout.size_of_headers && len <= layout.size_of_headers.saturating_sub(rva) {
+        if len <= layout.src_size.saturating_sub(rva) {
+            return Some(rva);
+        }
+        return None;
+    }
+    let mut i = 0u64;
+    while i < layout.num_sections {
+        let sh = layout.sec_table.checked_add(i.checked_mul(40)?)?;
+        let vsize = raw_u32(layout.src_va, layout.src_size, sh.checked_add(8)?)? as u64;
+        let va = raw_u32(layout.src_va, layout.src_size, sh.checked_add(12)?)? as u64;
+        let raw_size = raw_u32(layout.src_va, layout.src_size, sh.checked_add(16)?)? as u64;
+        let raw_ptr = raw_u32(layout.src_va, layout.src_size, sh.checked_add(20)?)? as u64;
+        let span = vsize.max(raw_size);
+        if rva >= va && rva - va < span {
+            let delta = rva - va;
+            if delta > raw_size.saturating_sub(len) {
+                return None;
+            }
+            let off = raw_ptr.checked_add(delta)?;
+            if len <= layout.src_size.saturating_sub(off) {
+                return Some(off);
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn read_raw_ascii<'a>(
+    src_va: u64,
+    src_size: u64,
+    off: u64,
+    buf: &'a mut [u8],
+) -> Option<&'a str> {
+    if off >= src_size || buf.is_empty() {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < buf.len() {
+        let cur = off.checked_add(n as u64)?;
+        if cur >= src_size {
+            return None;
+        }
+        let c = read_volatile((src_va + cur) as *const u8);
+        if c == 0 {
+            if n == 0 {
+                return None;
+            }
+            return Some(core::str::from_utf8_unchecked(&buf[..n]));
+        }
+        if !(0x20..=0x7e).contains(&c) {
+            return None;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    None
+}
+
+unsafe fn raw_pe_size_of_image(src_va: u64, src_size: u32) -> Option<u32> {
+    let layout = raw_pe_layout(src_va, src_size)?;
+    raw_u32(layout.src_va, layout.src_size, layout.opt.checked_add(56)?)
+}
+
+unsafe fn raw_pe_find_hosted_dependency<'a>(
+    src_va: u64,
+    src_size: u32,
+    out: &'a mut [u8],
+) -> Option<&'a str> {
+    let layout = raw_pe_layout(src_va, src_size)?;
+    let imp_rva = raw_u32(
+        layout.src_va,
+        layout.src_size,
+        layout.opt.checked_add(112 + 8)?,
+    )? as u64;
+    if imp_rva == 0 {
+        return None;
+    }
+    let mut desc_rva = imp_rva;
+    let mut count = 0u32;
+    while count < MAX_RAW_IMPORT_DESCRIPTORS {
+        let desc = raw_pe_rva_to_file(&layout, desc_rva, 20)?;
+        let original_first_thunk = raw_u32(layout.src_va, layout.src_size, desc)?;
+        let name_rva = raw_u32(layout.src_va, layout.src_size, desc.checked_add(12)?)? as u64;
+        let first_thunk = raw_u32(layout.src_va, layout.src_size, desc.checked_add(16)?)?;
+        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+            return None;
+        }
+        let name_off = raw_pe_rva_to_file(&layout, name_rva, 1)?;
+        let mut dll_buf = [0u8; HOSTED_DEP_PROVIDER_MAX];
+        let dll = read_raw_ascii(layout.src_va, layout.src_size, name_off, &mut dll_buf)?;
+        if !hosted_kernel_provider_dll(dll) && hosted_dependency_provider_dll(dll) {
+            if dll.len() > out.len() {
+                return None;
+            }
+            let mut i = 0usize;
+            while i < dll.len() {
+                out[i] = dll.as_bytes()[i];
+                i += 1;
+            }
+            return Some(core::str::from_utf8_unchecked(&out[..dll.len()]));
+        }
+        desc_rva = desc_rva.checked_add(20)?;
+        count += 1;
+    }
+    None
+}
+
+fn align_up_4k(v: u64) -> Option<u64> {
+    v.checked_add(0xfff).map(|x| x & !0xfff)
+}
+
+fn hosted_dependency_path(provider: &str, out: &mut [u8]) -> Option<usize> {
+    let provider_bytes = provider.as_bytes();
+    if provider_bytes.len() <= 4 {
+        return None;
+    }
+    let ext = &provider_bytes[provider_bytes.len() - 4..];
+    if ext[0] != b'.'
+        || ascii_upcase_u8(ext[1]) != b'S'
+        || ascii_upcase_u8(ext[2]) != b'Y'
+        || ascii_upcase_u8(ext[3]) != b'S'
+    {
+        return None;
+    }
+    let total = HOSTED_DRIVER_DEP_PATH_PREFIX
+        .len()
+        .checked_add(provider_bytes.len())?;
+    if total > out.len() {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < HOSTED_DRIVER_DEP_PATH_PREFIX.len() {
+        out[n] = HOSTED_DRIVER_DEP_PATH_PREFIX[n];
+        n += 1;
+    }
+    for &b in provider_bytes {
+        if b > 0x7f || b == b'\\' || b == b'/' || b == b':' {
+            return None;
+        }
+        out[n] = if b.is_ascii_uppercase() { b + 32 } else { b };
+        n += 1;
+    }
+    Some(n)
+}
+
+unsafe fn loaded_pe_u16(image_va: u64, cap: u64, rva: u64) -> Option<u16> {
+    if rva > cap.saturating_sub(2) {
+        return None;
+    }
+    Some(read_unaligned((image_va + rva) as *const u16))
+}
+
+unsafe fn loaded_pe_u32(image_va: u64, cap: u64, rva: u64) -> Option<u32> {
+    if rva > cap.saturating_sub(4) {
+        return None;
+    }
+    Some(read_unaligned((image_va + rva) as *const u32))
+}
+
+unsafe fn lookup_loaded_pe_export(
+    image_va: u64,
+    run_va: u64,
+    image_len: u32,
+    export_name: &str,
+) -> Option<u64> {
+    let cap = image_len as u64;
+    let e = loaded_pe_u32(image_va, cap, 0x3c)? as u64;
+    if loaded_pe_u32(image_va, cap, e)? != 0x0000_4550 {
+        return None;
+    }
+    let opt = e.checked_add(24)?;
+    let export_rva = loaded_pe_u32(image_va, cap, opt.checked_add(112)?)? as u64;
+    let export_size = loaded_pe_u32(image_va, cap, opt.checked_add(112 + 4)?)? as u64;
+    if export_rva == 0 || export_size == 0 || export_rva > cap.saturating_sub(40) {
+        return None;
+    }
+    let number_of_functions = loaded_pe_u32(image_va, cap, export_rva.checked_add(20)?)? as u64;
+    let number_of_names = loaded_pe_u32(image_va, cap, export_rva.checked_add(24)?)?;
+    if number_of_names > MAX_LOADED_EXPORT_NAMES {
+        return None;
+    }
+    let address_of_functions = loaded_pe_u32(image_va, cap, export_rva.checked_add(28)?)? as u64;
+    let address_of_names = loaded_pe_u32(image_va, cap, export_rva.checked_add(32)?)? as u64;
+    let address_of_ordinals = loaded_pe_u32(image_va, cap, export_rva.checked_add(36)?)? as u64;
+    let mut i = 0u32;
+    while i < number_of_names {
+        let name_rva = loaded_pe_u32(
+            image_va,
+            cap,
+            address_of_names.checked_add((i as u64).checked_mul(4)?)?,
+        )? as u64;
+        let mut name_buf = [0u8; 128];
+        let name = read_pe_ascii(image_va, cap, name_rva, 0, &mut name_buf)?;
+        if name == export_name {
+            let ordinal_index = loaded_pe_u16(
+                image_va,
+                cap,
+                address_of_ordinals.checked_add((i as u64).checked_mul(2)?)?,
+            )? as u64;
+            if ordinal_index >= number_of_functions {
+                return None;
+            }
+            let func_rva = loaded_pe_u32(
+                image_va,
+                cap,
+                address_of_functions.checked_add(ordinal_index.checked_mul(4)?)?,
+            )? as u64;
+            if func_rva >= export_rva && func_rva < export_rva.saturating_add(export_size) {
+                print_str(b"[driver-import] forwarder export unsupported ");
+                print_str(export_name.as_bytes());
+                print_str(b"\n");
+                return None;
+            }
+            if func_rva >= cap {
+                return None;
+            }
+            return Some(run_va + func_rva);
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn lookup_ndis_dependency_export(name: &str) -> Option<u64> {
+    let dep = NDIS_DEP_IMAGE;
+    if !dep.present {
+        return None;
+    }
+    lookup_loaded_pe_export(dep.exec_va, dep.run_va, dep.image_len, name)
+}
+
 /// Parse a driver PE at `src_va` (raw file bytes), copy its sections into `dst_va` (frames pre-mapped
 /// RW in BOTH the executive and the component), apply DIR64 relocations for the load at `dst_va`, and
 /// patch the IAT resolving each provider DLL + import name through `resolve`. Records per-frame W^X rights into
@@ -4446,6 +4780,79 @@ pub(crate) const MAX_DRIVER_INSTANCES: usize = 4;
 static mut FSD_RIGHTS: [[u64; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES] =
     [[RW_NX; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES];
 
+unsafe fn load_hosted_dependency_images(
+    fs: &Fat32,
+    primary_src_va: u64,
+    primary_src_size: u32,
+    code_va: u64,
+    run_va: u64,
+    img_frames: u64,
+    rights: &mut [u64],
+) -> Option<()> {
+    NDIS_DEP_IMAGE = LoadedDependencyImage::empty();
+
+    let mut provider_buf = [0u8; HOSTED_DEP_PROVIDER_MAX];
+    let Some(provider) =
+        raw_pe_find_hosted_dependency(primary_src_va, primary_src_size, &mut provider_buf)
+    else {
+        return Some(());
+    };
+    let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
+    let dep_offset = align_up_4k(primary_image_len)?;
+    let dep_frame_offset = dep_offset / 0x1000;
+    if dep_frame_offset >= img_frames {
+        print_str(b"[driver-launch] dependency image window exhausted before ");
+        print_str(provider.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
+    let dep_frames = img_frames - dep_frame_offset;
+    let dep_rights = &mut rights[dep_frame_offset as usize..];
+    let mut dep_path = [0u8; HOSTED_DEP_PATH_MAX];
+    let dep_path_len = hosted_dependency_path(provider, &mut dep_path)?;
+    print_str(b"[driver-launch] dependency ");
+    print_str(provider.as_bytes());
+    print_str(b" -> ");
+    print_str(&dep_path[..dep_path_len]);
+    print_str(b" offset=0x");
+    print_hex(dep_offset as u32);
+    print_str(b"\n");
+
+    let (dep_src_va, dep_src_size) = load_file_to_pool(fs, &dep_path[..dep_path_len])?;
+    let dep_exec_va = code_va + dep_offset;
+    let dep_run_va = run_va + dep_offset;
+    let (dep_entry_rva, dep_image_len) = load_pe_into(
+        dep_src_va,
+        dep_exec_va,
+        dep_run_va,
+        dep_frames,
+        dep_rights,
+        fsd_export_addr,
+    )?;
+    if dep_image_len as u64 > dep_frames * 0x1000 {
+        return None;
+    }
+    if hosted_ndis_provider_dll(provider) {
+        NDIS_DEP_IMAGE = LoadedDependencyImage {
+            present: true,
+            exec_va: dep_exec_va,
+            run_va: dep_run_va,
+            image_len: dep_image_len,
+        };
+    }
+    let _ = register_system_module(&dep_path[..dep_path_len], dep_exec_va, dep_image_len);
+    print_str(b"[driver-launch] dependency loaded ");
+    print_str(provider.as_bytes());
+    print_str(b" size=");
+    print_u64(dep_src_size as u64);
+    print_str(b" image=0x");
+    print_hex(dep_image_len);
+    print_str(b" entry=0x");
+    print_hex(dep_entry_rva);
+    print_str(b"\n");
+    Some(())
+}
+
 /// Next free instance slot. Slots are retired on unload, but the bump id is not reused yet because
 /// the seL4 cap/window reclamation work is intentionally separate from the NT lifetime contract.
 static DRIVER_NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
@@ -4573,6 +4980,7 @@ pub(crate) unsafe fn load_driver(
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
     let rights = &mut (*core::ptr::addr_of_mut!(FSD_RIGHTS))[instance];
+    load_hosted_dependency_images(fs, src_va, src_size, code_va, run_va, img_frames, rights)?;
     let (entry_rva, image_len) =
         load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
     let _ = register_system_module(path, code_va, image_len);

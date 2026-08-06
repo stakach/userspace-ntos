@@ -461,3 +461,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
   adjustment: next B3 work should load and resolve real dependency images such as `ndis.sys` (or add an
   honest PCI WDM fixture) before retiring the bespoke NIC proof.
+- B3 cleanup continued. Hosted driver launch now discovers real dependency provider DLLs from raw
+  import descriptors without heap allocation, maps `ndis.sys` into the same hosted image window after
+  the primary image, and resolves `ndis.sys!symbol` from that loaded support image's export directory.
+  The executive trampoline registry remains limited to the kernel providers (`ntoskrnl.exe` and
+  `hal.dll`); `ndis.sys` is a real PE image, not an executive shim. The support image is not yet run
+  through its own driver initialization, so loading ReactOS `e1000.sys` will now get as far as the
+  real `ndis.sys` import surface and still fail truthfully on missing NT/HAL exports until those core
+  imports are implemented. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` through genuine explorer shell chrome with
+  `286/288` checks passing; the only failing checks remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
+  adjustment: next B3 work should implement the real NT/HAL import surface required by ReactOS
+  `ndis.sys`, then initialize the NDIS support driver before binding `e1000.sys` through generic PCI
+  grants.
