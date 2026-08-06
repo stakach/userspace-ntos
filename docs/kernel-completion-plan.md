@@ -97,10 +97,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    window caps. Hosted driver instance, reply-cap, and executive alias bookkeeping now grows on
    demand; per-instance executive VAs come from a checked high arena with on-demand PD/PT coverage.
    Hosted common-buffer allocation records now use the per-instance shared arena capacity instead of
-   a fixed eight-record table. The raw direct TX proof remains only as a hardware liveness proof
-   before VT-d mapping. The next B3 target is replacing remaining hosted launch-state caps such as
-   hosted device/root-PDO bindings and registry-identity slots, then retiring the direct raw proof once
-   generic PCI evidence fully covers it.
+   a fixed eight-record table, and hosted device bindings, root-PDO bindings, and registry identities
+   now grow on demand while reusing teardown holes. The raw direct TX proof remains only as a hardware
+   liveness proof before VT-d mapping. The next B3 target is replacing remaining small launch-state
+   caps such as driver registry handles, hosted interface registrations, driver-object extensions if
+   real drivers need more, and DPC queue policy; then retire the direct raw proof once generic PCI
+   evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -842,3 +844,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
   hosted device/root-PDO binding tables, hosted registry identity slots, and any small shared queues
   that block real multi-device drivers; then remove direct raw NIC proof once generic PCI evidence
   fully replaces it.
+- B3 cleanup continued. Hosted device bindings, root-PDO bindings, and hosted registry identity state
+  are no longer fixed 16-slot arrays. The launch path now uses growable `Vec`-backed state, reuses
+  holes on teardown, widens hosted registry identity IDs to `usize`, and preserves existing lookup and
+  update semantics for AddDevice, PDO, and linkage-registry correlation. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-hosted-bindings-20260807.log`. Result: `DmaPnpPowerTest` and ReactOS `E1000`
+  generic hardware evidence stayed green, `exec_generic_hw_mmio_interrupt_dma`,
+  `exec_generic_pci_registry_selected`, `exec_generic_pci_support_driver_entry`,
+  `exec_generic_pci_add_device_reached`, `exec_generic_pci_io_port_out32`,
+  `exec_fsd_on_shared_harness`, `exec_msgina_logon_dialog_painted`, and
+  `exec_explorer_shell_chrome_painted` pass with `294/294` checks passing. Review adjustment:
+  remaining B3 launch scaling debt is now driver registry handle slots, hosted interface
+  registration slots, driver object extension slots if real drivers need more, and the small DPC queue
+  policy; after those, retire the direct raw NIC proof.

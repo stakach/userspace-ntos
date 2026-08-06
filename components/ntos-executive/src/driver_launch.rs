@@ -1101,8 +1101,8 @@ const HOSTED_REGISTRY_PATH_MAX: usize = 192;
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
 const HOSTED_INTERFACE_REGISTRATION_SLOTS: usize = 16;
-const HOSTED_REGISTRY_IDENTITY_SLOTS: usize = 16;
-const INVALID_HOSTED_REGISTRY_IDENTITY_ID: u8 = u8::MAX;
+type HostedRegistryIdentityId = usize;
+const INVALID_HOSTED_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId = usize::MAX;
 
 #[derive(Clone, Copy)]
 struct DriverObjectExtensionSlot {
@@ -1263,10 +1263,9 @@ const EMPTY_DRIVER_REGISTRY_HANDLE_SLOT: DriverRegistryHandleSlot = DriverRegist
 static mut DRIVER_REGISTRY_HANDLES: Option<
     Box<[DriverRegistryHandleSlot; DRIVER_REGISTRY_HANDLE_SLOTS]>,
 > = None;
-static mut HOSTED_REGISTRY_IDENTITIES: Option<
-    Box<[HostedRegistryIdentitySlot; HOSTED_REGISTRY_IDENTITY_SLOTS]>,
-> = None;
-static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: u8 = INVALID_HOSTED_REGISTRY_IDENTITY_ID;
+static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
+static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
+    INVALID_HOSTED_REGISTRY_IDENTITY_ID;
 static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<
     Box<[HostedDeviceInterfaceRegistration; HOSTED_INTERFACE_REGISTRATION_SLOTS]>,
 > = None;
@@ -2561,20 +2560,21 @@ unsafe fn driver_registry_handles_mut(
     slot.as_mut().unwrap()
 }
 
-unsafe fn hosted_registry_identities_mut(
-) -> &'static mut [HostedRegistryIdentitySlot; HOSTED_REGISTRY_IDENTITY_SLOTS] {
+unsafe fn hosted_registry_identities_mut() -> &'static mut Vec<HostedRegistryIdentitySlot> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_REGISTRY_IDENTITIES);
     if slot.is_none() {
-        *slot = Some(Box::new(
-            [EMPTY_HOSTED_REGISTRY_IDENTITY_SLOT; HOSTED_REGISTRY_IDENTITY_SLOTS],
-        ));
+        *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_registry_identities() -> Option<&'static Vec<HostedRegistryIdentitySlot>> {
+    (*core::ptr::addr_of!(HOSTED_REGISTRY_IDENTITIES)).as_ref()
+}
+
 unsafe fn allocate_hosted_registry_identity(
     identity: HostedDriverRegistryIdentity,
-) -> Result<u8, nt_status::NtStatus> {
+) -> Result<HostedRegistryIdentityId, nt_status::NtStatus> {
     let table = hosted_registry_identities_mut();
     for (idx, slot) in table.iter_mut().enumerate() {
         if !slot.used {
@@ -2583,39 +2583,45 @@ unsafe fn allocate_hosted_registry_identity(
                 ref_count: 1,
                 used: true,
             };
-            return u8::try_from(idx).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            return Ok(idx);
         }
     }
-    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+    let idx = table.len();
+    table.push(HostedRegistryIdentitySlot {
+        identity,
+        ref_count: 1,
+        used: true,
+    });
+    Ok(idx)
 }
 
-unsafe fn hosted_registry_identity(identity_id: u8) -> Option<HostedDriverRegistryIdentity> {
+unsafe fn hosted_registry_identity(
+    identity_id: HostedRegistryIdentityId,
+) -> Option<HostedDriverRegistryIdentity> {
     if identity_id == INVALID_HOSTED_REGISTRY_IDENTITY_ID {
         return None;
     }
-    let table = (*core::ptr::addr_of!(HOSTED_REGISTRY_IDENTITIES)).as_ref()?;
-    let idx = identity_id as usize;
-    if idx < table.len() && table[idx].used {
-        Some(table[idx].identity)
+    let table = hosted_registry_identities()?;
+    if identity_id < table.len() && table[identity_id].used {
+        Some(table[identity_id].identity)
     } else {
         None
     }
 }
 
-unsafe fn release_hosted_registry_identity(identity_id: u8) {
+unsafe fn release_hosted_registry_identity(identity_id: HostedRegistryIdentityId) {
     if identity_id == INVALID_HOSTED_REGISTRY_IDENTITY_ID {
         return;
     }
     let Some(table) = (*core::ptr::addr_of_mut!(HOSTED_REGISTRY_IDENTITIES)).as_mut() else {
         return;
     };
-    let idx = identity_id as usize;
-    if idx >= table.len() || !table[idx].used || table[idx].ref_count == 0 {
+    if identity_id >= table.len() || !table[identity_id].used || table[identity_id].ref_count == 0 {
         return;
     }
-    table[idx].ref_count -= 1;
-    if table[idx].ref_count == 0 {
-        table[idx] = EMPTY_HOSTED_REGISTRY_IDENTITY_SLOT;
+    table[identity_id].ref_count -= 1;
+    if table[identity_id].ref_count == 0 {
+        table[identity_id] = EMPTY_HOSTED_REGISTRY_IDENTITY_SLOT;
     }
 }
 
@@ -2806,7 +2812,9 @@ unsafe fn hosted_registry_identity_by_pdo_object(
     }
 }
 
-unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<u8> {
+unsafe fn hosted_registry_identity_id_by_pdo_object(
+    pdo: u64,
+) -> Option<HostedRegistryIdentityId> {
     if pdo == 0 {
         return None;
     }
@@ -2842,16 +2850,17 @@ unsafe fn hosted_registry_identity_by_linkage_path<const N: usize>(
             return Some(inflight);
         }
     }
-    let bindings = &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS);
-    for binding in bindings.iter().copied() {
-        if !binding.used {
-            continue;
-        }
-        if let Some(identity) = hosted_registry_identity(binding.registry_identity_id) {
-            if identity.has_linkage_export()
-                && hosted_linkage_path_matches(path, &identity.driver_key_name)
-            {
-                return Some(identity);
+    if let Some(bindings) = hosted_device_bindings() {
+        for binding in bindings.iter().copied() {
+            if !binding.used {
+                continue;
+            }
+            if let Some(identity) = hosted_registry_identity(binding.registry_identity_id) {
+                if identity.has_linkage_export()
+                    && hosted_linkage_path_matches(path, &identity.driver_key_name)
+                {
+                    return Some(identity);
+                }
             }
         }
     }
@@ -8834,7 +8843,7 @@ struct HostedDeviceBinding {
     instance: usize,
     device_object: u64,
     pdo_object: u64,
-    registry_identity_id: u8,
+    registry_identity_id: HostedRegistryIdentityId,
     used: bool,
 }
 
@@ -8854,12 +8863,6 @@ struct HostedRootPdoBinding {
     device_id: u64,
     used: bool,
 }
-
-const EMPTY_HOSTED_ROOT_PDO_BINDING: HostedRootPdoBinding = HostedRootPdoBinding {
-    pdo_object: 0,
-    device_id: 0,
-    used: false,
-};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostedHardwareEvidence {
@@ -8941,11 +8944,8 @@ pub(crate) struct HostedInterruptDelivery {
     pub claimed: bool,
 }
 
-const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
-static mut HOSTED_DEVICE_BINDINGS: [HostedDeviceBinding; MAX_HOSTED_DEVICE_BINDINGS] =
-    [EMPTY_HOSTED_DEVICE_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
-static mut HOSTED_ROOT_PDO_BINDINGS: [HostedRootPdoBinding; MAX_HOSTED_DEVICE_BINDINGS] =
-    [EMPTY_HOSTED_ROOT_PDO_BINDING; MAX_HOSTED_DEVICE_BINDINGS];
+static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
+static mut HOSTED_ROOT_PDO_BINDINGS: Option<Vec<HostedRootPdoBinding>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
@@ -8973,6 +8973,30 @@ fn hosted_resource_owner(binding: HostedDeviceBinding) -> ResourceOwner {
 
 fn hosted_dma_owner(binding: HostedDeviceBinding) -> DmaOwner {
     DmaOwner::new(binding.driver_id, binding.device_id)
+}
+
+unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_device_bindings() -> Option<&'static Vec<HostedDeviceBinding>> {
+    (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS)).as_ref()
+}
+
+unsafe fn hosted_root_pdo_bindings_mut() -> &'static mut Vec<HostedRootPdoBinding> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_PDO_BINDINGS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_root_pdo_bindings() -> Option<&'static Vec<HostedRootPdoBinding>> {
+    (*core::ptr::addr_of!(HOSTED_ROOT_PDO_BINDINGS)).as_ref()
 }
 
 unsafe fn hosted_root_bus_mut() -> &'static mut nt_root_bus::RootBus {
@@ -9081,7 +9105,7 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
 }
 
 fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
-    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_ROOT_PDO_BINDINGS) };
+    let bindings = unsafe { hosted_root_pdo_bindings()? };
     bindings
         .iter()
         .copied()
@@ -9093,7 +9117,7 @@ fn register_hosted_root_pdo_binding(
     pdo_object: u64,
     device_id: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_ROOT_PDO_BINDINGS) };
+    let bindings = unsafe { hosted_root_pdo_bindings_mut() };
     if let Some(slot) = bindings
         .iter_mut()
         .find(|slot| slot.used && slot.pdo_object == pdo_object)
@@ -9109,7 +9133,12 @@ fn register_hosted_root_pdo_binding(
         };
         return Ok(());
     }
-    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+    bindings.push(HostedRootPdoBinding {
+        pdo_object,
+        device_id,
+        used: true,
+    });
+    Ok(())
 }
 
 unsafe fn register_hosted_root_pdo(
@@ -9161,12 +9190,12 @@ fn register_hosted_device_binding(
     instance: usize,
     device_object: u64,
     pdo_object: u64,
-    registry_identity_id: u8,
+    registry_identity_id: HostedRegistryIdentityId,
 ) -> Result<(), nt_status::NtStatus> {
     if device_id == 0 || device_object == 0 {
         return Ok(());
     }
-    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    let bindings = unsafe { hosted_device_bindings_mut() };
     if let Some(slot) = bindings
         .iter_mut()
         .find(|slot| slot.used && slot.device_id == device_id)
@@ -9200,11 +9229,20 @@ fn register_hosted_device_binding(
         };
         return Ok(());
     }
-    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+    bindings.push(HostedDeviceBinding {
+        driver_id,
+        device_id,
+        instance,
+        device_object,
+        pdo_object,
+        registry_identity_id,
+        used: true,
+    });
+    Ok(())
 }
 
 fn hosted_device_binding_by_device_id(device_id: u64) -> Option<HostedDeviceBinding> {
-    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    let bindings = unsafe { hosted_device_bindings()? };
     bindings
         .iter()
         .copied()
@@ -9212,7 +9250,7 @@ fn hosted_device_binding_by_device_id(device_id: u64) -> Option<HostedDeviceBind
 }
 
 fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDeviceBinding> {
-    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    let bindings = unsafe { hosted_device_bindings()? };
     bindings
         .iter()
         .copied()
@@ -9220,7 +9258,7 @@ fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDe
 }
 
 fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBinding> {
-    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    let bindings = unsafe { hosted_device_bindings()? };
     bindings
         .iter()
         .copied()
@@ -9278,7 +9316,10 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
 }
 
 fn clear_hosted_device_binding_by_device_id(device_id: u64) {
-    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    let Some(bindings) = (unsafe { (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS)).as_mut() })
+    else {
+        return;
+    };
     if let Some(slot) = bindings
         .iter_mut()
         .find(|slot| slot.used && slot.device_id == device_id)
@@ -9293,7 +9334,10 @@ fn clear_hosted_device_binding_by_device_id(device_id: u64) {
 }
 
 fn clear_hosted_device_bindings_for_instance(instance: usize) {
-    let bindings = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS) };
+    let Some(bindings) = (unsafe { (*core::ptr::addr_of_mut!(HOSTED_DEVICE_BINDINGS)).as_mut() })
+    else {
+        return;
+    };
     for slot in bindings.iter_mut() {
         if slot.used && slot.instance == instance {
             let identity_id = slot.registry_identity_id;
