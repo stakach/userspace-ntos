@@ -10,7 +10,6 @@ use nt_status::NtStatus;
 use nt_types::ClientId;
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
-use crate::driver::DispatchTarget;
 use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
@@ -138,15 +137,16 @@ impl<P> IoManager<P> {
             .ok_or(NtStatus::INVALID_PARAMETER)?
             .dispatch
             .get(major_fn);
-        let idx = match target {
-            DispatchTarget::Mock(id) => id.0 as usize,
-            DispatchTarget::Kernel(id) => id.0 as usize,
-            DispatchTarget::DriverPeer(id) => id.0 as usize,
-            DispatchTarget::Unsupported => {
-                return Ok(DispatchOutcome::Failed {
-                    status: NtStatus::INVALID_DEVICE_REQUEST,
-                });
-            }
+        let idx = if let Some(id) = target.mock_id() {
+            id.0 as usize
+        } else if let Some(id) = target.kernel_id() {
+            id.0 as usize
+        } else if let Some(id) = target.driver_peer_id() {
+            id.0 as usize
+        } else {
+            return Ok(DispatchOutcome::Failed {
+                status: NtStatus::INVALID_DEVICE_REQUEST,
+            });
         };
         let proj = IrpProjection::from_record(self.irp(irp_id).expect("checked above"));
         let backend = self

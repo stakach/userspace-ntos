@@ -1184,6 +1184,23 @@ impl ActiveCallbackClient {
         }
     }
 
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.client_tcb = 0;
+        self.client_runtime_role = 0;
+        self.client_process_role = 0;
+        self.client_top_badge = 0;
+        self.client_pid = 0;
+        self.client_teb = 0;
+        self.client_peb_mirror = 0;
+        self.client_scratch_base = 0;
+        self.client_eprocess = 0;
+        self.client_ethread = 0;
+        self.client_token_authentication_id = 0;
+        self.client_token_user_sid.fill(0);
+        self.client_token_user_sid_len = 0;
+    }
+
     pub const fn client_tcb(&self) -> u64 {
         self.client_tcb
     }
@@ -1293,6 +1310,35 @@ impl ActiveCallbackFrame {
             dispatch_context: DispatchContext::EMPTY,
             bridged_window: [0; 3],
         }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.request.magic = CALLBACK_MAGIC;
+        self.request.version = CALLBACK_VERSION;
+        self.request.kind = CALLBACK_KIND_USER_MODE;
+        self.request.state = CallbackState::Idle as u32;
+        self.request.api_index = 0;
+        self.request.input_length = 0;
+        self.request.output_capacity = 0;
+        self.request.output_length = 0;
+        self.request.status = 0;
+        self.request.client_pi = 0;
+        self.request.callback_id = 0;
+        self.request.payload_reference_offset = NO_PAYLOAD_REFERENCE;
+        self.request.dispatch_id = 0;
+        self.request.client_tid = 0;
+        self.request.client_badge = 0;
+        self.client.clear();
+        self.saved_user_context.fill(0);
+        self.outer_resume_ip = 0;
+        self.redirected = false;
+        self.callback_window = None;
+        self.dispatch_context.dispatch_id = 0;
+        self.dispatch_context.ssn = 0;
+        self.dispatch_context.args.fill(0);
+        self.dispatch_context.caller_sp = 0;
+        self.bridged_window.fill(0);
     }
 
     pub const fn request(&self) -> &CallbackHeader {
@@ -1625,14 +1671,14 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             slot += 1;
         }
         self.len -= 1;
-        self.frames[self.len] = ActiveCallbackFrame::empty();
+        self.frames[self.len].clear();
         frame
     }
 
     pub fn discard_top(&mut self) -> Option<ActiveCallbackFrame> {
         let index = self.len.checked_sub(1)?;
         let frame = self.frames[index];
-        self.frames[index] = ActiveCallbackFrame::empty();
+        self.frames[index].clear();
         self.len = index;
         Some(frame)
     }

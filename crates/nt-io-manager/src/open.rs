@@ -74,16 +74,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         backend: Box<dyn DriverDispatchBackend>,
         peer: bool,
     ) -> Result<DriverId, NtStatus> {
-        let mut table = MajorFunctionTable::new();
-        for m in SUPPORTED_MAJORS {
-            let target = if peer {
-                DispatchTarget::DriverPeer(DriverPeerId(0))
-            } else {
-                DispatchTarget::Mock(MockDispatchId(0))
-            };
-            table.set(m, target);
-        }
-        self.install_driver_with_table(name, backend, peer, table)
+        let kind = if peer {
+            DriverInstallKind::Peer
+        } else {
+            DriverInstallKind::Mock
+        };
+        self.install_driver_with_majors_kind(name, backend, kind, &SUPPORTED_MAJORS)
     }
 
     /// Create a kernel-owned in-process driver using an explicit major-function table.
@@ -94,6 +90,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
         table: MajorFunctionTable,
     ) -> Result<DriverId, NtStatus> {
         self.install_driver_with_table_kind(name, backend, DriverInstallKind::Kernel, table)
+    }
+
+    /// Create a kernel-owned in-process driver with only the listed major functions supported.
+    pub fn create_kernel_driver_with_majors(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        majors: &[u8],
+    ) -> Result<DriverId, NtStatus> {
+        self.install_driver_with_majors_kind(name, backend, DriverInstallKind::Kernel, majors)
     }
 
     /// Create an isolated driver peer using an explicit major-function table.
@@ -139,11 +145,41 @@ impl<P: ObjectManagerPort> IoManager<P> {
             DriverInstallKind::Peer => DispatchTarget::DriverPeer(DriverPeerId(idx as u64)),
         };
         table.retarget(target);
-        let driver_id = self.register_driver(DriverRecord::new(
+        self.install_driver_record_with_dispatch(
+            name,
+            DriverBackendId(idx as u64),
+            MajorFunctionTable::boxed_from(table),
+        )
+    }
+
+    fn install_driver_with_majors_kind(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        kind: DriverInstallKind,
+        majors: &[u8],
+    ) -> Result<DriverId, NtStatus> {
+        let idx = self.register_backend(backend);
+        let target = match kind {
+            DriverInstallKind::Mock => DispatchTarget::Mock(MockDispatchId(idx as u64)),
+            DriverInstallKind::Kernel => DispatchTarget::Kernel(DriverBackendId(idx as u64)),
+            DriverInstallKind::Peer => DispatchTarget::DriverPeer(DriverPeerId(idx as u64)),
+        };
+        let table = MajorFunctionTable::boxed_with_majors(majors, target);
+        self.install_driver_record_with_dispatch(name, DriverBackendId(idx as u64), table)
+    }
+
+    fn install_driver_record_with_dispatch(
+        &mut self,
+        name: &NtPath,
+        backend: DriverBackendId,
+        dispatch: Box<MajorFunctionTable>,
+    ) -> Result<DriverId, NtStatus> {
+        let driver_id = self.register_driver(DriverRecord::new_boxed(
             ObjectId::NULL,
             name.clone(),
-            DriverBackendId(idx as u64),
-            table,
+            backend,
+            dispatch,
         ));
         match self.port.create_driver_object(name, driver_id.raw()) {
             Ok(obj) => {

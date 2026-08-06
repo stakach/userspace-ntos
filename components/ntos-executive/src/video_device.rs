@@ -9,17 +9,16 @@
 //! values without crossing into executive-only service-ring clients.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{read_unaligned, write_unaligned};
 
 use nt_io_abi::major;
 use nt_io_manager::{
     write_wdm_device_object, write_wdm_driver_object, write_wdm_file_object, DeviceCharacteristics,
-    DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DispatchTarget, DriverBackendId,
-    DriverDispatchBackend, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
-    WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit, WDM_X64_DEVICE_OBJECT_SIZE,
-    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE,
+    DeviceFlags, DeviceType, DispatchContext, DispatchOutcome, DriverDispatchBackend, IoParameters,
+    IrpId, IrpProjection, WdmDeviceObjectInit, WdmDriverObjectInit, WdmFileObjectInit,
+    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_OBJECT_SIZE,
+    WDM_X64_FILE_OBJECT_SIZE,
 };
 use nt_status::NtStatus;
 use nt_video_miniport::{
@@ -29,6 +28,16 @@ use nt_video_miniport::{
 pub(crate) use nt_video_miniport::VideoModeSpec;
 
 const VIDEO_DRIVER_NAME_CAP: usize = 32;
+const VIDEO_DRIVER_OBJECT_PATH_PREFIX: &[u8] = b"\\Driver\\";
+const VIDEO_DRIVER_OBJECT_PATH_CAP: usize =
+    VIDEO_DRIVER_OBJECT_PATH_PREFIX.len() + VIDEO_DRIVER_NAME_CAP;
+const VIDEO_SUPPORTED_MAJORS: [u8; 5] = [
+    major::IRP_MJ_CREATE,
+    major::IRP_MJ_CLEANUP,
+    major::IRP_MJ_CLOSE,
+    major::IRP_MJ_DEVICE_CONTROL,
+    major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+];
 const VIDEO_SERVICE_PATH_CAP: usize = 128;
 const VIDEO_DEVICE_PATH_STR: &str = "\\Device\\Video0";
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
@@ -56,6 +65,8 @@ pub(crate) struct VideoDeviceRegistration<'a> {
 static mut VIDEO_DRIVER_OBJECT: u64 = 0;
 static mut VIDEO_DEVICE_OBJECT: u64 = 0;
 static mut VIDEO_FILE_OBJECT: u64 = 0;
+static mut VIDEO_DRIVER_OBJECT_PATH: [u8; VIDEO_DRIVER_OBJECT_PATH_CAP] =
+    [0; VIDEO_DRIVER_OBJECT_PATH_CAP];
 static mut VIDEO_DRIVER_NAME: [u8; VIDEO_DRIVER_NAME_CAP] = [0; VIDEO_DRIVER_NAME_CAP];
 static mut VIDEO_DRIVER_NAME_LEN: u8 = 0;
 static mut VIDEO_SERVICE_PATH: [u8; VIDEO_SERVICE_PATH_CAP] = [0; VIDEO_SERVICE_PATH_CAP];
@@ -69,6 +80,7 @@ static mut VIDEO_FILE_ID: u64 = 0;
 static mut VIDEO_FILE_OBJECT_ID: u64 = 0;
 static mut VIDEO_DEVICE_READY: bool = false;
 
+#[inline(never)]
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     reg: &VideoDeviceRegistration<'_>,
 ) -> bool {
@@ -79,19 +91,12 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     {
         return false;
     }
-    let Ok(miniport) = BootFramebufferMiniport::new(
-        FramebufferMapping {
-            virtual_address: reg.framebuffer_va,
-            size_bytes: reg.framebuffer_size,
-        },
-        reg.mode,
-    ) else {
-        return false;
-    };
     if !ensure_video_objects(reg.allocate_projection) {
         return false;
     }
-    VIDEO_MINIPORT = Some(miniport);
+    if !install_video_miniport(reg.framebuffer_va, reg.framebuffer_size, reg.mode) {
+        return false;
+    }
     if !ensure_video_io_route(reg.driver_name) {
         VIDEO_MINIPORT = None;
         return false;
@@ -102,6 +107,29 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         return false;
     }
 
+    copy_video_registration_metadata(reg);
+    VIDEO_DEVICE_READY = true;
+    true
+}
+
+#[inline(never)]
+unsafe fn install_video_miniport(framebuffer_va: u64, framebuffer_size: u64, mode: VideoModeSpec) -> bool {
+    VIDEO_MINIPORT = None;
+    let Ok(miniport) = BootFramebufferMiniport::new(
+        FramebufferMapping {
+            virtual_address: framebuffer_va,
+            size_bytes: framebuffer_size,
+        },
+        mode,
+    ) else {
+        return false;
+    };
+    VIDEO_MINIPORT = Some(miniport);
+    true
+}
+
+#[inline(never)]
+unsafe fn copy_video_registration_metadata(reg: &VideoDeviceRegistration<'_>) {
     let driver_name = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_NAME);
     driver_name.fill(0);
     driver_name[..reg.driver_name.len()].copy_from_slice(reg.driver_name);
@@ -110,8 +138,6 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     path.fill(0);
     path[..reg.service_registry_path.len()].copy_from_slice(reg.service_registry_path);
     VIDEO_SERVICE_PATH_LEN = reg.service_registry_path.len() as u8;
-    VIDEO_DEVICE_READY = true;
-    true
 }
 
 pub(crate) fn video_device_map_ready() -> bool {
@@ -168,6 +194,7 @@ pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
     }
 }
 
+#[inline(never)]
 unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bool {
     if VIDEO_DRIVER_OBJECT != 0 && VIDEO_DEVICE_OBJECT != 0 && VIDEO_FILE_OBJECT != 0 {
         return true;
@@ -228,6 +255,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
     true
 }
 
+#[inline(never)]
 unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
     if VIDEO_FILE_OBJECT == 0 || VIDEO_DEVICE_OBJECT == 0 {
         return false;
@@ -245,85 +273,133 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
     .is_ok()
 }
 
-fn video_driver_object_path(driver_name: &[u8]) -> Option<String> {
+#[inline(never)]
+unsafe fn video_driver_object_path(driver_name: &[u8]) -> Option<&'static str> {
     if !ascii_component_is_safe(driver_name) {
         return None;
     }
-    let mut path = String::from("\\Driver\\");
-    for &b in driver_name {
-        path.push(b as char);
+    let Some(len) = VIDEO_DRIVER_OBJECT_PATH_PREFIX
+        .len()
+        .checked_add(driver_name.len())
+    else {
+        return None;
+    };
+    if len > VIDEO_DRIVER_OBJECT_PATH_CAP {
+        return None;
     }
-    Some(path)
+    let path = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_OBJECT_PATH);
+    path.fill(0);
+    path[..VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()]
+        .copy_from_slice(VIDEO_DRIVER_OBJECT_PATH_PREFIX);
+    path[VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()..len].copy_from_slice(driver_name);
+    let bytes: &'static [u8] =
+        core::slice::from_raw_parts(core::ptr::addr_of!(VIDEO_DRIVER_OBJECT_PATH) as *const u8, len);
+    Some(core::str::from_utf8_unchecked(bytes))
 }
 
-fn video_dispatch_table() -> MajorFunctionTable {
-    let target = DispatchTarget::Kernel(DriverBackendId(0));
-    let mut table = MajorFunctionTable::new();
-    table.set(major::IRP_MJ_CREATE, target);
-    table.set(major::IRP_MJ_CLEANUP, target);
-    table.set(major::IRP_MJ_CLOSE, target);
-    table.set(major::IRP_MJ_DEVICE_CONTROL, target);
-    table.set(major::IRP_MJ_INTERNAL_DEVICE_CONTROL, target);
-    table
-}
-
+#[inline(never)]
 unsafe fn ensure_video_io_route(driver_name: &[u8]) -> bool {
-    if VIDEO_DRIVER_ID != 0
+    if video_io_route_ids_present() {
+        return true;
+    }
+    let Some(driver_id) = register_video_driver_route(driver_name) else {
+        return false;
+    };
+    let Some((device_id, device_object_id)) = register_video_device_route(driver_id) else {
+        crate::driver_launch::destroy_io_driver(driver_id);
+        return false;
+    };
+    let Some((file_handle, file_id, file_object_id)) = open_video_device_route(device_id) else {
+        teardown_video_driver_route(driver_id);
+        return false;
+    };
+    if !rewrite_video_file_projection(file_id) {
+        let _ = crate::driver_launch::close_io_handle(file_handle);
+        teardown_video_driver_route(driver_id);
+        return false;
+    }
+    commit_video_io_route(
+        driver_id,
+        device_id,
+        device_object_id,
+        file_handle,
+        file_id,
+        file_object_id,
+    );
+    true
+}
+
+#[inline(never)]
+unsafe fn video_io_route_ids_present() -> bool {
+    VIDEO_DRIVER_ID != 0
         && VIDEO_DEVICE_ID != 0
         && VIDEO_DEVICE_OBJECT_ID != 0
         && VIDEO_FILE_HANDLE != 0
         && VIDEO_FILE_ID != 0
         && VIDEO_FILE_OBJECT_ID != 0
-    {
-        return true;
-    }
-    let Some(driver_path) = video_driver_object_path(driver_name) else {
-        return false;
-    };
-    let driver_id = match crate::driver_launch::register_kernel_io_driver_with_major_table(
-        &driver_path,
+}
+
+#[inline(never)]
+unsafe fn register_video_driver_route(driver_name: &[u8]) -> Option<u64> {
+    let driver_path = video_driver_object_path(driver_name)?;
+    crate::driver_launch::register_kernel_io_driver_with_majors(
+        driver_path,
         Box::new(BootVideoDriverBackend),
-        video_dispatch_table(),
-    ) {
-        Ok(driver_id) => driver_id,
-        Err(_) => return false,
-    };
-    let (device_id, device_object_id) = match crate::driver_launch::register_kernel_io_device(
+        &VIDEO_SUPPORTED_MAJORS,
+    )
+    .ok()
+}
+
+#[inline(never)]
+unsafe fn register_video_device_route(driver_id: u64) -> Option<(u64, u64)> {
+    crate::driver_launch::register_kernel_io_device(
         driver_id,
         VIDEO_DEVICE_PATH_STR,
         DeviceType(nt_video_miniport::FILE_DEVICE_VIDEO),
         DeviceCharacteristics::empty(),
         DeviceFlags::BUFFERED_IO,
         0,
-    ) {
-        Ok(route) => route,
-        Err(_) => {
-            crate::driver_launch::destroy_io_driver(driver_id);
-            return false;
-        }
-    };
-    let (file_handle, file_id, opened_device_id, file_object_id) =
-        match crate::driver_launch::open_io_device(
+    )
+    .ok()
+}
+
+#[inline(never)]
+unsafe fn open_video_device_route(device_id: u64) -> Option<(u64, u64, u64)> {
+    let Ok((file_handle, file_id, opened_device_id, file_object_id)) =
+        crate::driver_launch::open_io_device(
             VIDEO_DEVICE_PATH_STR,
             nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
-        ) {
-            Ok(open) => open,
-            Err(_) => {
-                crate::driver_launch::destroy_io_driver(driver_id);
-                return false;
-            }
-        };
-    if opened_device_id != device_id || !rewrite_video_file_projection(file_id) {
-        crate::driver_launch::destroy_io_driver(driver_id);
-        return false;
+        )
+    else {
+        return None;
+    };
+    if opened_device_id != device_id {
+        let _ = crate::driver_launch::close_io_handle(file_handle);
+        return None;
     }
+    Some((file_handle, file_id, file_object_id))
+}
+
+#[inline(never)]
+unsafe fn commit_video_io_route(
+    driver_id: u64,
+    device_id: u64,
+    device_object_id: u64,
+    file_handle: u64,
+    file_id: u64,
+    file_object_id: u64,
+) {
     VIDEO_DRIVER_ID = driver_id;
     VIDEO_DEVICE_ID = device_id;
     VIDEO_DEVICE_OBJECT_ID = device_object_id;
     VIDEO_FILE_HANDLE = file_handle;
     VIDEO_FILE_ID = file_id;
     VIDEO_FILE_OBJECT_ID = file_object_id;
-    true
+}
+
+#[inline(never)]
+unsafe fn teardown_video_driver_route(driver_id: u64) {
+    crate::driver_launch::destroy_io_driver(driver_id);
 }
 
 unsafe fn video_io_route_ready() -> bool {
@@ -513,6 +589,7 @@ fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+#[inline(never)]
 unsafe fn publish_video_device_map(service_registry_path: &[u8]) -> bool {
     let Some(service_path_data) = utf16le_nul_from_ascii(service_registry_path) else {
         return false;

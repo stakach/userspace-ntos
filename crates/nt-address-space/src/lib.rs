@@ -314,30 +314,6 @@ impl<const N: usize> VmRegionMap<N> {
         Ok(())
     }
 
-    fn insert_normalized(&mut self, extent: VmExtent) -> Result<(), u32> {
-        for current in self.extents.iter_mut().flatten() {
-            if current.allocation_base == extent.allocation_base
-                && current.protection == extent.protection
-                && current.state == extent.state
-            {
-                if current.end() == extent.base {
-                    current.size += extent.size;
-                    self.normalize();
-                    return Ok(());
-                }
-                if extent.end() == current.base {
-                    current.base = extent.base;
-                    current.size += extent.size;
-                    self.normalize();
-                    return Ok(());
-                }
-            }
-        }
-        self.insert(extent)?;
-        self.normalize();
-        Ok(())
-    }
-
     fn normalize(&mut self) {
         for left in 0..N {
             for right in left + 1..N {
@@ -376,6 +352,31 @@ impl<const N: usize> VmRegionMap<N> {
             write += 1;
         }
         self.extents[write..].fill(None);
+    }
+
+    fn push_normalized_extent(extents: &mut Vec<VmExtent>, extent: VmExtent) -> Result<(), u32> {
+        if let Some(last) = extents.last_mut() {
+            if last.end() == extent.base
+                && last.allocation_base == extent.allocation_base
+                && last.protection == extent.protection
+                && last.state == extent.state
+            {
+                last.size += extent.size;
+                return Ok(());
+            }
+        }
+        if extents.len() == N {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        extents.push(extent);
+        Ok(())
+    }
+
+    fn commit_rewritten_extents(&mut self, extents: Vec<VmExtent>) {
+        self.extents.fill(None);
+        for (slot, extent) in self.extents.iter_mut().zip(extents.into_iter()) {
+            *slot = Some(extent);
+        }
     }
 
     fn find_free_below(&self, size: u64, upper_bound: u64, top_down: bool) -> Option<u64> {
@@ -451,38 +452,49 @@ impl<const N: usize> VmRegionMap<N> {
         end: u64,
         replacement: Option<(VmExtentState, Option<u32>)>,
     ) -> Result<(), u32> {
-        let mut next = Self::new(self.lower_bound, self.upper_bound);
+        let mut next = Vec::new();
+        next.try_reserve_exact(N)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         for extent in self.extents.iter().flatten().copied() {
             if extent.end() <= base || extent.base >= end {
-                next.insert_normalized(extent)?;
+                Self::push_normalized_extent(&mut next, extent)?;
                 continue;
             }
             if extent.base < base {
-                next.insert_normalized(VmExtent {
-                    size: base - extent.base,
-                    ..extent
-                })?;
+                Self::push_normalized_extent(
+                    &mut next,
+                    VmExtent {
+                        size: base - extent.base,
+                        ..extent
+                    },
+                )?;
             }
             if let Some((state, protection)) = replacement {
                 let middle_base = extent.base.max(base);
                 let middle_end = extent.end().min(end);
-                next.insert_normalized(VmExtent {
-                    base: middle_base,
-                    size: middle_end - middle_base,
-                    protection: protection.unwrap_or(extent.protection),
-                    state,
-                    ..extent
-                })?;
+                Self::push_normalized_extent(
+                    &mut next,
+                    VmExtent {
+                        base: middle_base,
+                        size: middle_end - middle_base,
+                        protection: protection.unwrap_or(extent.protection),
+                        state,
+                        ..extent
+                    },
+                )?;
             }
             if extent.end() > end {
-                next.insert_normalized(VmExtent {
-                    base: end,
-                    size: extent.end() - end,
-                    ..extent
-                })?;
+                Self::push_normalized_extent(
+                    &mut next,
+                    VmExtent {
+                        base: end,
+                        size: extent.end() - end,
+                        ..extent
+                    },
+                )?;
             }
         }
-        *self = next;
+        self.commit_rewritten_extents(next);
         Ok(())
     }
 

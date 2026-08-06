@@ -76,6 +76,7 @@ pub(crate) unsafe fn storage_probe(
             ahci_vaddr,
             dma_vaddr,
             dma_paddr,
+            scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
             bps,
             spc,
             fat_start: reserved,

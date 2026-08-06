@@ -80,9 +80,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Complete the NDIS-backed PCI path for ReactOS `e1000.sys`: project devnode/driver registry
-   identity into `DevicePropertyDriverKeyName` and the miniport `Linkage` key, then drive real NDIS
-   AddDevice/StartDevice/miniport initialization through the generic PCI MMIO/interrupt/DMA grant.
+1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: devnode/driver registry identity now
+   flows toward `DevicePropertyDriverKeyName` and the miniport `Linkage` key; next drive real NDIS
+   support initialization and miniport AddDevice/StartDevice through the generic PCI
+   MMIO/interrupt/DMA grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -500,3 +501,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   handle is currently an empty key that returns truthful missing/unsupported statuses. The next B3
   slice should project devnode-backed driver-key registry state, then run the staged boot and convert
   the real NDIS/e1000 startup evidence into gates before removing the old bespoke NIC proof.
+- B3 cleanup continued. Devnode-backed driver registry identity is now carried by Config Manager and
+  the executive boot plan: `ServiceMetadata` includes `ClassGUID`, `DevnodeRecord` includes the
+  imported Enum `Driver` value, and hosted AddDevice receives both so `IoGetDeviceProperty` can
+  answer `DevicePropertyDriverKeyName` and the hosted registry path can expose the miniport
+  `Linkage` key without falling back to an empty registry handle. The staged boot initially exposed a
+  separate rootserver infrastructure limit: the NT executive root task entered the guard page during
+  ReactOS process bring-up after `NtQuerySection(csrss.exe)`. `rust-micro` now sizes the guarded
+  rootserver stack separately for `extern-rootserver` builds and the loader spec asserts the mapped
+  aux page count. Validation: `cargo fmt --all`, `cargo test -p nt-config-manager`,
+  `cargo test -p nt-exe-image`, `cargo test -p nt-io-manager`, `cargo test -p nt-process`,
+  `cargo test -p nt-address-space`, `cargo test -p nt-user-callback`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and headless boot `.tmp/full-boot-larger-rootstack-20260806.log` to genuine explorer shell chrome
+  with `286/288` checks passing. The only failing gates remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound`; the generic hardware gates pass for
+  registry selection, MMIO/interrupt/DMA, root-PDO start, ISR delivery, and DPC delivery. Review
+  adjustment: B3 remains active until real `ndis.sys` initialization and ReactOS `e1000.sys` miniport
+  startup run through the same generic PCI grant, after which the old raw NIC proof can be removed.

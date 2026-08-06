@@ -336,7 +336,7 @@ fn seed_time_zone(hive: Option<&RegfHive<'_>>) -> nt_kernel_exec::timezone::Time
 }
 
 fn effective_time_zone(
-    information: nt_kernel_exec::timezone::TimeZoneInformation,
+    information: &nt_kernel_exec::timezone::TimeZoneInformation,
     current_time: u64,
 ) -> nt_kernel_exec::timezone::EffectiveTimeZone {
     information.effective_at(current_time as i64).unwrap_or(
@@ -348,7 +348,7 @@ fn effective_time_zone(
 }
 
 unsafe fn publish_time_zone(
-    information: nt_kernel_exec::timezone::TimeZoneInformation,
+    information: &nt_kernel_exec::timezone::TimeZoneInformation,
     current_time: u64,
 ) {
     let effective = effective_time_zone(information, current_time);
@@ -371,7 +371,7 @@ unsafe fn publish_time_zone(
 #[inline(never)]
 fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     let mut v = alloc::vec::Vec::with_capacity(192);
-    v.push(ObjEntry::dir(b"", OBJ_PARENT_ROOT)); // 0 = root "\"
+    ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT).expect("object namespace root"); // 0 = root "\"
     for d in [
         b"??".as_slice(),
         b"device",
@@ -386,13 +386,14 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"filesystem",
         b"security",
     ] {
-        v.push(ObjEntry::dir(d, 0));
+        ObjEntry::push_dir(&mut v, d, 0).expect("initial object directory");
     }
     let windows = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"windows")
         .expect("pre-created Windows object directory");
-    v.push(ObjEntry::dir(b"windowstations", windows));
+    ObjEntry::push_dir(&mut v, b"windowstations", windows)
+        .expect("initial WindowStations directory");
     let bno = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"basenamedobjects")
@@ -401,18 +402,23 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"sessions")
         .expect("pre-created Sessions object directory");
-    v.push(ObjEntry::dir(b"bnolinks", sessions));
+    ObjEntry::push_dir(&mut v, b"bnolinks", sessions).expect("initial BnoLinks directory");
     let session0 = v.len();
-    v.push(ObjEntry::dir(b"0", sessions));
-    v.push(ObjEntry::symlink(
+    ObjEntry::push_dir(&mut v, b"0", sessions).expect("initial Session 0 directory");
+    ObjEntry::push_symlink(
+        &mut v,
         b"basenamedobjects",
         session0,
         b"\\basenamedobjects",
-    ));
-    v.push(ObjEntry::symlink(b"global", bno, b"\\basenamedobjects"));
-    v.push(ObjEntry::symlink(b"local", bno, b"\\basenamedobjects"));
-    v.push(ObjEntry::symlink(b"session", bno, b"\\sessions\\bnolinks"));
-    v.push(ObjEntry::dir(b"restricted", bno));
+    )
+    .expect("initial BaseNamedObjects link");
+    ObjEntry::push_symlink(&mut v, b"global", bno, b"\\basenamedobjects")
+        .expect("initial Global link");
+    ObjEntry::push_symlink(&mut v, b"local", bno, b"\\basenamedobjects")
+        .expect("initial Local link");
+    ObjEntry::push_symlink(&mut v, b"session", bno, b"\\sessions\\bnolinks")
+        .expect("initial Session link");
+    ObjEntry::push_dir(&mut v, b"restricted", bno).expect("initial Restricted directory");
     v
 }
 
@@ -590,7 +596,7 @@ impl ExecNtHandler {
             print_str(b")\n");
         }
         let time_zone_information = seed_time_zone(hive.as_ref());
-        unsafe { publish_time_zone(time_zone_information, nt_system_time_100ns()) };
+        unsafe { publish_time_zone(&time_zone_information, nt_system_time_100ns()) };
         let BootstrapProcessManagerSeed {
             pm,
             pids: bootstrap_pids,
@@ -9405,18 +9411,7 @@ impl ExecNtHandler {
         if let Some(i) = self.obj_child(parent, leaf) {
             return Some(i);
         }
-        if self.obj_ns.len() >= self.obj_ns.capacity() {
-            return None;
-        }
-        let mut e = ObjEntry::dir(leaf, parent);
-        e.kind = kind;
-        if kind == OBJ_KIND_SYMBOLIC_LINK {
-            let t = target.len().min(OBJ_NAME_CAP);
-            e.target[..t].copy_from_slice(&target[..t]);
-            e.target_len = t as u8;
-        }
-        self.obj_ns.push(e);
-        Some(self.obj_ns.len() - 1)
+        ObjEntry::push_kind(&mut self.obj_ns, leaf, parent, kind, target)
     }
 
     pub(crate) fn lpc_port_handle_by_ascii(&self, path: &[u8]) -> Option<u64> {
@@ -9494,10 +9489,8 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut e = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
-        e.kind = OBJ_KIND_EVENT;
-        self.obj_ns.push(e);
-        let index = self.obj_ns.len() - 1;
+        let index =
+            ObjEntry::push_kind(&mut self.obj_ns, &name, OBJ_PARENT_ANONYMOUS, OBJ_KIND_EVENT, &[])?;
         self.events.initialize(
             index as u64,
             if auto_reset {
@@ -9525,10 +9518,13 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut entry = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
-        entry.kind = OBJ_KIND_SEMAPHORE;
-        self.obj_ns.push(entry);
-        let index = self.obj_ns.len() - 1;
+        let index = ObjEntry::push_kind(
+            &mut self.obj_ns,
+            &name,
+            OBJ_PARENT_ANONYMOUS,
+            OBJ_KIND_SEMAPHORE,
+            &[],
+        )?;
         if self
             .semaphores
             .initialize(index as u64, initial, maximum)
@@ -9552,10 +9548,13 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let mut entry = ObjEntry::dir(&name, OBJ_PARENT_ANONYMOUS);
-        entry.kind = OBJ_KIND_MUTANT;
-        self.obj_ns.push(entry);
-        let index = self.obj_ns.len() - 1;
+        let index = ObjEntry::push_kind(
+            &mut self.obj_ns,
+            &name,
+            OBJ_PARENT_ANONYMOUS,
+            OBJ_KIND_MUTANT,
+            &[],
+        )?;
         self.mutants.initialize(index as u64, initial_owner);
         Some(index)
     }
@@ -12103,13 +12102,13 @@ impl ExecNtHandler {
                     SystemInformationKind::TimeOfDay => {
                         let current_time = nt_system_time_100ns();
                         let effective =
-                            effective_time_zone(self.time_zone_information, current_time);
+                            effective_time_zone(&self.time_zone_information, current_time);
                         if SYSTEM_TIME_ZONE_BIAS_100NS.load(Ordering::Relaxed)
                             != effective.bias_100ns as u64
                             || SYSTEM_TIME_ZONE_ID.load(Ordering::Relaxed) != effective.id
                         {
                             unsafe {
-                                publish_time_zone(self.time_zone_information, current_time)
+                                publish_time_zone(&self.time_zone_information, current_time)
                             };
                         }
                         let output = SystemTimeOfDayInformation {
@@ -14250,7 +14249,7 @@ impl ExecNtHandler {
                 self.time_zone_information = information;
                 // The hosted clock is already UTC-backed, so changing timezone metadata does not
                 // retime a local CMOS clock. Publish the new bias/id to every KUSER page instead.
-                unsafe { publish_time_zone(information, nt_system_time_100ns()) };
+                unsafe { publish_time_zone(&self.time_zone_information, nt_system_time_100ns()) };
                 0
             },
             NativeService::NtFreeVirtualMemory => unsafe { self.nt_free_virtual_memory(args) },

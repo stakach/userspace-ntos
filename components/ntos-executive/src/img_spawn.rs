@@ -1040,6 +1040,7 @@ pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// Translate a SEC_IMAGE process VA to its executive mirror VA (stack or heap window), or None if
 /// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
 /// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
+#[inline(always)]
 pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
     let end = va.checked_add(len)?;
     let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
@@ -1197,6 +1198,7 @@ pub(crate) unsafe fn scratch_for(
 /// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases, the
 /// client-frame table, and explicit copy-in prefetches. The walk is read-only, bounded by `dst`,
 /// handles cross-page ranges, and never faults in a new page.
+#[inline(always)]
 pub(crate) unsafe fn client_copyin_mapped(
     pi: u64,
     va: u64,
@@ -1210,6 +1212,7 @@ pub(crate) unsafe fn client_copyin_mapped(
 
 /// Explicit-process variant used by `NtRead/WriteVirtualMemory`. `allow_active_mirrors` must be
 /// false for a remote process because hosted processes reuse identical stack/heap/image VAs.
+#[inline(always)]
 pub(crate) unsafe fn client_copyin_process_mapped(
     pi: u64,
     va: u64,
@@ -1302,6 +1305,7 @@ pub(crate) unsafe fn client_copyin_process_mapped(
     true
 }
 
+#[inline(always)]
 pub(crate) unsafe fn client_read_u64_mapped(
     pi: u64,
     va: u64,

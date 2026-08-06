@@ -6389,6 +6389,138 @@ unsafe fn image_c_string_len(base: u64, rva: u64, image_bytes: u64, limit: usize
     None
 }
 
+unsafe fn image_c_string_has_prefix_ignore_case(
+    base: u64,
+    rva: u64,
+    image_bytes: u64,
+    limit: usize,
+    prefix: &[u8],
+) -> bool {
+    let Some(len) = image_c_string_len(base, rva, image_bytes, limit) else {
+        return false;
+    };
+    if len < prefix.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() {
+        if read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase() != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+unsafe fn image_c_string_eq_ignore_case(
+    base: u64,
+    rva: u64,
+    image_bytes: u64,
+    limit: usize,
+    expected: &[u8],
+) -> bool {
+    let Some(len) = image_c_string_len(base, rva, image_bytes, limit) else {
+        return false;
+    };
+    if len != expected.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < expected.len() {
+        if read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase() != expected[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+unsafe fn image_c_string_is_safe(base: u64, rva: u64, len: usize) -> bool {
+    if len == 0 || len > 31 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < len {
+        let b = read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase();
+        let ok = b.is_ascii_lowercase()
+            || b.is_ascii_digit()
+            || b == b'_'
+            || b == b'-'
+            || b == b'.';
+        if !ok {
+            return false;
+        }
+        if i > 0 {
+            let prev = read_volatile((base + rva + (i - 1) as u64) as *const u8);
+            if prev == b'.' && b == b'.' {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+fn import_dll_name_is_safe(dll: &[u8]) -> bool {
+    !dll.is_empty()
+        && dll.len() <= 31
+        && dll.iter().copied().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+        && !dll.windows(2).any(|w| w == b"..")
+}
+
+unsafe fn image_c_string_is_native_import(base: u64, rva: u64, len: usize) -> bool {
+    if len >= 9 {
+        let mut ntos = true;
+        let mut i = 0usize;
+        while i < 9 {
+            if read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase()
+                != b"ntoskrnl."[i]
+            {
+                ntos = false;
+                break;
+            }
+            i += 1;
+        }
+        if ntos {
+            return true;
+        }
+    }
+    if len >= 4 {
+        let mut hal = true;
+        let mut i = 0usize;
+        while i < 4 {
+            if read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase()
+                != b"hal."[i]
+            {
+                hal = false;
+                break;
+            }
+            i += 1;
+        }
+        if hal {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn pe_c_string_eq_slice(ptr: u64, expected: &[u8]) -> bool {
+    let mut k = 0usize;
+    loop {
+        let c = read_volatile((ptr + k as u64) as *const u8);
+        let want = if k < expected.len() { expected[k] } else { 0 };
+        if c != want {
+            return false;
+        }
+        if c == 0 {
+            return true;
+        }
+        k += 1;
+    }
+}
+
 /// Runs in the EXECUTIVE. `src_va`/`src_size` name the raw win32k.sys staged in WIN32KBUF; the
 /// image frames are mapped RW at [`WIN32K_CODE_VA`] and the DATA region at [`WIN32K_DATA_VADDR`].
 /// Copy the sections into their virtual offsets, apply DIR64 relocs, initialise the data-export
@@ -8233,21 +8365,7 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
     for i in 0..nnames {
         let nr = read_unaligned((names + i * 4) as *const u32) as u64;
         let np = base + nr;
-        let mut eq = true;
-        let mut k = 0usize;
-        loop {
-            let c = read_volatile((np + k as u64) as *const u8);
-            let want = if k < name.len() { name[k] } else { 0 };
-            if c != want {
-                eq = false;
-                break;
-            }
-            if c == 0 {
-                break;
-            }
-            k += 1;
-        }
-        if eq {
+        if pe_c_string_eq_slice(np, name) {
             let ord = read_unaligned((ords + i * 2) as *const u16) as u64;
             let far = read_unaligned((funcs + ord * 4) as *const u32) as u64;
             if far >= exp_rva && far < exp_rva + exp_sz {
@@ -8257,37 +8375,48 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
                 //                         exports that forward to ntoskrnl, e.g. EngMultiByteToUnicodeN
                 //                         -> RtlMultiByteToUnicodeN, EngBugCheckEx -> KeBugCheckEx).
                 let s = base + far;
-                let mut dll = [0u8; 16];
-                let mut dl = 0usize;
-                let mut dot = 0u64;
-                loop {
-                    let c = read_volatile((s + dot) as *const u8);
-                    if c == 0 || c == b'.' {
-                        break;
-                    }
-                    if dl < 15 {
-                        dll[dl] = c.to_ascii_lowercase();
-                        dl += 1;
-                    }
-                    dot += 1;
-                }
-                let mut fb = [0u8; 64];
-                let mut fl = 0usize;
-                while fl < 63 {
-                    let c = read_volatile((s + dot + 1 + fl as u64) as *const u8);
+                let forwarder_cap = exp_sz - (far - exp_rva);
+                let mut dot = 0usize;
+                let mut has_dot = false;
+                while dot < forwarder_cap as usize {
+                    let c = read_volatile((s + dot as u64) as *const u8);
                     if c == 0 {
                         break;
                     }
-                    fb[fl] = c;
+                    if c == b'.' {
+                        has_dot = true;
+                        break;
+                    }
+                    dot += 1;
+                }
+                if !has_dot || dot + 1 >= forwarder_cap as usize {
+                    return 0;
+                }
+                let func_ptr = s + dot as u64 + 1;
+                let mut fl = 0usize;
+                while dot + 1 + fl < forwarder_cap as usize {
+                    let c = read_volatile((func_ptr + fl as u64) as *const u8);
+                    if c == 0 {
+                        break;
+                    }
                     fl += 1;
                 }
-                fb[fl] = 0;
-                let is_win32k = dl >= 6 && &dll[..6] == b"win32k";
+                if fl == 0 || dot + 1 + fl >= forwarder_cap as usize {
+                    return 0;
+                }
+                let func = core::slice::from_raw_parts(func_ptr as *const u8, fl);
+                let is_win32k = dot >= 6
+                    && read_volatile(s as *const u8).to_ascii_lowercase() == b'w'
+                    && read_volatile((s + 1) as *const u8).to_ascii_lowercase() == b'i'
+                    && read_volatile((s + 2) as *const u8).to_ascii_lowercase() == b'n'
+                    && read_volatile((s + 3) as *const u8).to_ascii_lowercase() == b'3'
+                    && read_volatile((s + 4) as *const u8).to_ascii_lowercase() == b'2'
+                    && read_volatile((s + 5) as *const u8).to_ascii_lowercase() == b'k';
                 if is_win32k {
-                    return pe_export_lookup(WIN32K_CODE_VA, &fb[..fl + 1]);
+                    return pe_export_lookup(WIN32K_CODE_VA, func);
                 }
                 // ntoskrnl / hal forwarder → trampoline.
-                let name = core::str::from_utf8_unchecked(&fb[..fl]);
+                let name = core::str::from_utf8_unchecked(func);
                 return export_addr(name);
             }
             return base + far;
@@ -8404,21 +8533,12 @@ pub unsafe fn load_driver_into(
             if ilt == 0 && iat == 0 {
                 break;
             }
-            // read DLL name → is it dxgthk?
-            let mut dllbuf = [0u8; 32];
-            let mut dn = 0usize;
-            if dll_name_rva != 0 {
-                let cstr_len = image_c_string_len(dst_va, dll_name_rva, cap, 31)?;
-                while dn < cstr_len {
-                    let c = read_volatile((dst_va + dll_name_rva + dn as u64) as *const u8);
-                    dllbuf[dn] = c.to_ascii_lowercase();
-                    dn += 1;
-                }
-            }
-            let is_dxgthk = dn >= 6 && &dllbuf[..6] == b"dxgthk";
+            let is_dxgthk = dll_name_rva != 0
+                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"dxgthk");
             // ftfd.dll imports its 8 Eng*/Rtl thunks from win32k.sys — resolve against win32k's
             // own export table (real Eng* code + forwarders to ntoskrnl handled by pe_export_lookup).
-            let is_win32k = dn >= 6 && &dllbuf[..6] == b"win32k";
+            let is_win32k = dll_name_rva != 0
+                && image_c_string_has_prefix_ignore_case(dst_va, dll_name_rva, cap, 31, b"win32k");
             let thunk_rva = if ilt != 0 { ilt } else { iat };
             if !image_rva_span_ok(thunk_rva, 8, cap) || !image_rva_span_ok(iat, 8, cap) {
                 return None;
@@ -8440,24 +8560,15 @@ pub unsafe fn load_driver_into(
                         return None;
                     }
                     let name_ptr = dst_va + name_rva + 2;
-                    let mut buf = [0u8; 64];
-                    let mut n = 0usize;
                     let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
-                    while n < cstr_len {
-                        let c = read_volatile((name_ptr + n as u64) as *const u8);
-                        buf[n] = c;
-                        n += 1;
-                    }
+                    let import_name =
+                        core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
                     let addr = if is_dxgthk && dxgthk_base != 0 {
-                        let mut nb = [0u8; 65];
-                        nb[..n].copy_from_slice(&buf[..n]);
-                        pe_export_lookup(dxgthk_base, &nb[..n + 1])
+                        pe_export_lookup(dxgthk_base, import_name)
                     } else if is_win32k {
-                        let mut nb = [0u8; 65];
-                        nb[..n].copy_from_slice(&buf[..n]);
-                        pe_export_lookup(WIN32K_CODE_VA, &nb[..n + 1])
+                        pe_export_lookup(WIN32K_CODE_VA, import_name)
                     } else {
-                        let name = core::str::from_utf8_unchecked(&buf[..n]);
+                        let name = core::str::from_utf8_unchecked(import_name);
                         export_addr(name)
                     };
                     write_unaligned((slots + k * 8) as *mut u64, addr);
@@ -8491,49 +8602,6 @@ pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
     );
 }
 
-fn import_dll_name_is_native(dll: &[u8]) -> bool {
-    (dll.len() >= 9 && &dll[..9] == b"ntoskrnl.") || (dll.len() >= 4 && &dll[..4] == b"hal.")
-}
-
-fn import_dll_name_is_safe(dll: &[u8]) -> bool {
-    !dll.is_empty()
-        && dll.len() <= 31
-        && dll.iter().copied().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
-        })
-        && !dll.windows(2).any(|w| w == b"..")
-}
-
-fn import_dll_name_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
-}
-
-unsafe fn read_import_dll_name(desc: u64, out: &mut [u8]) -> Option<usize> {
-    let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
-    if dll_name_rva == 0 || out.is_empty() {
-        return None;
-    }
-    let cstr_len = image_c_string_len(WIN32K_CODE_VA, dll_name_rva, WIN32K_IMAGE_BYTES, out.len())?;
-    let mut n = 0usize;
-    while n < cstr_len {
-        let c = read_volatile((WIN32K_CODE_VA + dll_name_rva + n as u64) as *const u8);
-        out[n] = c.to_ascii_lowercase();
-        n += 1;
-    }
-    if !import_dll_name_is_safe(&out[..n]) {
-        return None;
-    }
-    Some(n)
-}
-
 /// Return the Nth non-native static dependency imported by win32k. Native imports (`ntoskrnl.*` and
 /// `hal.*`) are bound by the normal trampoline registry during `load_into`; every other DLL must be
 /// backed by a real System32 image before win32k can call it.
@@ -8559,18 +8627,28 @@ pub unsafe fn win32k_static_import_dependency(index: usize, out: &mut [u8]) -> O
         if ilt == 0 && iat == 0 {
             break;
         }
-        let mut dllbuf = [0u8; 32];
-        if let Some(dn) = read_import_dll_name(desc, &mut dllbuf) {
-            let dll = &dllbuf[..dn];
-            if !import_dll_name_is_native(dll) {
-                if seen == index {
-                    if dn > out.len() {
-                        return None;
+        let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
+        if dll_name_rva != 0 {
+            if let Some(dn) = image_c_string_len(code_va, dll_name_rva, WIN32K_IMAGE_BYTES, 31) {
+                if image_c_string_is_safe(code_va, dll_name_rva, dn)
+                    && !image_c_string_is_native_import(code_va, dll_name_rva, dn)
+                {
+                    if seen == index {
+                        if dn > out.len() {
+                            return None;
+                        }
+                        let mut n = 0usize;
+                        while n < dn {
+                            out[n] = read_volatile(
+                                (code_va + dll_name_rva + n as u64) as *const u8
+                            )
+                            .to_ascii_lowercase();
+                            n += 1;
+                        }
+                        return Some(dn);
                     }
-                    out[..dn].copy_from_slice(dll);
-                    return Some(dn);
+                    seen += 1;
                 }
-                seen += 1;
             }
         }
         desc_rva += 20;
@@ -8608,13 +8686,15 @@ pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 
         if ilt == 0 && iat == 0 {
             break;
         }
-        let mut dllbuf = [0u8; 32];
-        let dn = if dll_name_rva != 0 {
-            read_import_dll_name(desc, &mut dllbuf).unwrap_or(0)
-        } else {
-            0
-        };
-        if dn != 0 && import_dll_name_eq(&dllbuf[..dn], dll_name) {
+        if dll_name_rva != 0
+            && image_c_string_eq_ignore_case(
+                code_va,
+                dll_name_rva,
+                WIN32K_IMAGE_BYTES,
+                31,
+                dll_name,
+            )
+        {
             let thunk_rva = if ilt != 0 { ilt } else { iat };
             if !image_rva_span_ok(thunk_rva, 8, WIN32K_IMAGE_BYTES)
                 || !image_rva_span_ok(iat, 8, WIN32K_IMAGE_BYTES)
@@ -8637,19 +8717,14 @@ pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 
                         return patched;
                     }
                     let name_ptr = code_va + name_rva + 2;
-                    let mut buf = [0u8; 65];
-                    let mut n = 0usize;
                     let Some(cstr_len) =
                         image_c_string_len(code_va, name_rva + 2, WIN32K_IMAGE_BYTES, 63)
                     else {
                         return patched;
                     };
-                    while n < cstr_len {
-                        let c = read_volatile((name_ptr + n as u64) as *const u8);
-                        buf[n] = c;
-                        n += 1;
-                    }
-                    let addr = pe_export_lookup(dll_base, &buf[..n + 1]);
+                    let import_name =
+                        core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
+                    let addr = pe_export_lookup(dll_base, import_name);
                     if addr != 0 {
                         write_unaligned((slots + k * 8) as *mut u64, addr);
                         patched += 1;

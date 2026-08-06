@@ -12,7 +12,6 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -115,6 +114,102 @@ pub type ThreadId = u32;
 pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
+
+struct IdTable<T> {
+    entries: Vec<(u32, T)>,
+}
+
+impl<T> Default for IdTable<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> IdTable<T> {
+    fn position(&self, key: u32) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by_key(&key, |(candidate, _)| *candidate)
+    }
+
+    fn insert(&mut self, key: u32, value: T) -> Option<T> {
+        match self.position(key) {
+            Ok(index) => Some(core::mem::replace(&mut self.entries[index].1, value)),
+            Err(index) => {
+                self.entries.insert(index, (key, value));
+                None
+            }
+        }
+    }
+
+    fn get(&self, key: &u32) -> Option<&T> {
+        self.position(*key).ok().map(|index| &self.entries[index].1)
+    }
+
+    fn get_mut(&mut self, key: &u32) -> Option<&mut T> {
+        self.position(*key)
+            .ok()
+            .map(|index| &mut self.entries[index].1)
+    }
+
+    fn contains_key(&self, key: &u32) -> bool {
+        self.position(*key).is_ok()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &T)> {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+}
+
+pub struct ThreadIdSet {
+    entries: Vec<ThreadId>,
+}
+
+impl Default for ThreadIdSet {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl ThreadIdSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, tid: ThreadId) -> bool {
+        match self.entries.binary_search(&tid) {
+            Ok(_) => false,
+            Err(index) => {
+                self.entries.insert(index, tid);
+                true
+            }
+        }
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'_, ThreadId> {
+        self.entries.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ThreadIdSet {
+    type Item = &'a ThreadId;
+    type IntoIter = core::slice::Iter<'a, ThreadId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
 
 /// A `CLIENT_ID` (spec §7.3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -317,7 +412,7 @@ pub struct NtProcess {
     pub image_file_name: String,
     pub address_space_id: AddressSpaceId,
     pub image_section: Option<SectionId>,
-    pub threads: BTreeSet<ThreadId>,
+    pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
@@ -490,7 +585,7 @@ pub struct NtThread {
     /// `ThreadHideFromDebugger`, set-only-to-true through the native API.
     hide_from_debugger: bool,
     thread_name_len: u16,
-    thread_name: [u16; THREAD_NAME_MAX_UNITS],
+    thread_name: Vec<u16>,
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -522,8 +617,8 @@ pub struct Win32Callouts {
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
 #[derive(Default)]
 pub struct ProcessManager {
-    processes: BTreeMap<ProcessId, NtProcess>,
-    threads: BTreeMap<ThreadId, NtThread>,
+    processes: IdTable<NtProcess>,
+    threads: IdTable<NtThread>,
     sections: Vec<Option<ImageSection>>,
     next_pid: u32,
     next_tid: u32,
@@ -650,7 +745,7 @@ impl ProcessManager {
                 image_file_name: image_file_name.into(),
                 address_space_id: asid,
                 image_section,
-                threads: BTreeSet::new(),
+                threads: ThreadIdSet::new(),
                 main_thread: None,
                 state,
                 exit_status: None,
@@ -928,7 +1023,7 @@ impl ProcessManager {
                 disable_boost: false,
                 hide_from_debugger: false,
                 thread_name_len: 0,
-                thread_name: [0; THREAD_NAME_MAX_UNITS],
+                thread_name: alloc::vec![0; THREAD_NAME_MAX_UNITS],
             },
         );
         // Dbgk event source: a thread create in a debugged process reports DbgKmCreateThreadApi —

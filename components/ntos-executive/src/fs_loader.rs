@@ -5,6 +5,18 @@
 #![allow(clippy::all)]
 use crate::*;
 
+struct DirFindLfnScratch {
+    short: [u8; 11],
+    want: [u8; 256],
+    lfn: [u8; 260],
+}
+
+const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
+const _: () = assert!(
+    FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 <= 0x1000
+);
+
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
 pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
     ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64);
@@ -203,9 +215,10 @@ pub(crate) unsafe fn dir_find_lfn(
     dir_cluster: u32,
     comp: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    let short = name_to_83(comp);
+    let DirFindLfnScratch { short, want, lfn } =
+        &mut *(fs.scratch_vaddr as *mut DirFindLfnScratch);
+    name_to_83_into(comp, short);
     // Lowercase the target (ASCII) once.
-    let mut want = [0u8; 256];
     let want_len = if comp.len() < 256 { comp.len() } else { 256 };
     let mut i = 0;
     while i < want_len {
@@ -228,8 +241,7 @@ pub(crate) unsafe fn dir_find_lfn(
         }
     }
     let fits_83 = dots <= 1 && base_len >= 1 && base_len <= 8 && ext_len <= 3;
-    let lfn_off: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
-    let mut lfn = [0u8; 260]; // reassembled long name (lowercased ASCII)
+    lfn.fill(0); // reassembled long name (lowercased ASCII)
     let mut term: Option<usize> = None; // index of the 0x0000 terminator, if seen
     let mut hi_ord = 0usize;
     let mut have_lfn = false;
@@ -261,7 +273,7 @@ pub(crate) unsafe fn dir_find_lfn(
                         let base = (ord - 1) * 13;
                         let mut k = 0;
                         while k < 13 {
-                            let o = lfn_off[k];
+                            let o = LFN_OFFSETS[k];
                             let lo = *ent.add(o);
                             let hi = *ent.add(o + 1);
                             let idx = base + k;
@@ -344,8 +356,8 @@ pub(crate) unsafe fn dir_find_lfn(
 /// names (`reactos`, `system32`, `ntdll.dll`, …) all have clean 8.3 aliases — verified: mcopy
 /// stores the uppercased 8.3 short entry (`REACTOS`, `SYSTEM32`, `NTDLL   DLL`) alongside an
 /// LFN, and `dir_find` matches the short entry (skipping LFN fragments). No `~1` mangling.
-pub(crate) fn name_to_83(comp: &[u8]) -> [u8; 11] {
-    let mut out = [b' '; 11];
+fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
+    out.fill(b' ');
     let upper = |c: u8| if c.is_ascii_lowercase() { c - 32 } else { c };
     // Locate the extension separator = the last '.' that isn't the first char.
     let mut dot: Option<usize> = None;
@@ -370,7 +382,6 @@ pub(crate) fn name_to_83(comp: &[u8]) -> [u8; 11] {
         out[8 + k] = upper(comp[ext_start + k]);
         k += 1;
     }
-    out
 }
 
 /// Resolve a `\`- or `/`-separated PATH (e.g. `b"reactos\\system32\\ntdll.dll"`) from the
@@ -688,6 +699,7 @@ pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64
             ahci_vaddr,
             dma_vaddr,
             dma_paddr,
+            scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
             bps,
             spc,
             fat_start: reserved,

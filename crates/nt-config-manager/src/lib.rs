@@ -102,6 +102,7 @@ pub struct ServiceMetadata {
     pub start_type: Option<u32>,
     pub error_control: Option<u32>,
     pub load_order_group: Option<String>,
+    pub class_guid: Option<String>,
     pub tag: Option<u32>,
     pub dependencies: Vec<String>,
     pub display_name: Option<String>,
@@ -163,6 +164,7 @@ pub struct DevnodeRecord {
     pub instance_id: String,
     pub service: Option<String>,
     pub pdo_name: Option<String>,
+    pub driver_key: Option<String>,
     pub hardware_ids: Vec<String>,
     pub compatible_ids: Vec<String>,
     pub enum_key: RegistryKeyId,
@@ -432,6 +434,7 @@ impl ConfigManager {
             start_type: self.registry.query_dword(service_key, "Start"),
             error_control: self.registry.query_dword(service_key, "ErrorControl"),
             load_order_group: self.registry.query_string(service_key, "Group"),
+            class_guid: self.registry.query_string(service_key, "ClassGUID"),
             tag: self.registry.query_dword(service_key, "Tag"),
             dependencies: self
                 .registry
@@ -498,6 +501,7 @@ impl ConfigManager {
             instance_id: instance_id.into(),
             service: service.map(Into::into),
             pdo_name: pdo_name.map(Into::into),
+            driver_key: None,
             hardware_ids: hardware_ids.iter().map(|s| (*s).into()).collect(),
             compatible_ids: compatible_ids.iter().map(|s| (*s).into()).collect(),
             enum_key,
@@ -565,6 +569,7 @@ impl ConfigManager {
         }
         let service = self.registry.query_string(enum_key, "Service");
         let pdo_name = self.registry.query_string(enum_key, "PdoName");
+        let driver_key = self.registry.query_string(enum_key, "Driver");
         let hardware_ids = self
             .registry
             .query_multi_string(enum_key, "HardwareID")
@@ -575,6 +580,7 @@ impl ConfigManager {
             .unwrap_or_default();
         if service.is_none()
             && pdo_name.is_none()
+            && driver_key.is_none()
             && hardware_ids.is_empty()
             && compatible_ids.is_empty()
         {
@@ -587,6 +593,7 @@ impl ConfigManager {
             instance_id: instance_id.into(),
             service,
             pdo_name,
+            driver_key,
             hardware_ids,
             compatible_ids,
             enum_key,
@@ -926,6 +933,8 @@ mod tests {
             .set_dword(key, "Start", SERVICE_AUTO_START);
         cm.registry_mut().set_dword(key, "ErrorControl", 1);
         cm.registry_mut().set_string(key, "Group", "Network");
+        cm.registry_mut()
+            .set_string(key, "ClassGUID", "{4D36E972-E325-11CE-BFC1-08002BE10318}");
         cm.registry_mut().set_dword(key, "Tag", 7);
         cm.registry_mut()
             .set_string(key, "DisplayName", "Remote Procedure Call");
@@ -947,6 +956,10 @@ mod tests {
         assert_eq!(svc.start_type, Some(SERVICE_AUTO_START));
         assert_eq!(svc.error_control, Some(1));
         assert_eq!(svc.load_order_group.as_deref(), Some("Network"));
+        assert_eq!(
+            svc.class_guid.as_deref(),
+            Some("{4D36E972-E325-11CE-BFC1-08002BE10318}")
+        );
         assert_eq!(svc.tag, Some(7));
         assert_eq!(svc.display_name.as_deref(), Some("Remote Procedure Call"));
         assert_eq!(svc.object_name.as_deref(), Some("LocalSystem"));
@@ -1312,6 +1325,11 @@ mod tests {
         cm.registry_mut().set_string(key, "Service", "E1000");
         cm.registry_mut()
             .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
+        cm.registry_mut().set_string(
+            key,
+            "Driver",
+            r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000",
+        );
         cm.registry_mut().set_value(
             key,
             "HardwareID",
@@ -1338,6 +1356,10 @@ mod tests {
         assert_eq!(dn.enum_key, key);
         assert_eq!(dn.service.as_deref(), Some("E1000"));
         assert_eq!(dn.pdo_name.as_deref(), Some(r"\Device\NTPNP_PCI0001"));
+        assert_eq!(
+            dn.driver_key.as_deref(),
+            Some(r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000")
+        );
         assert_eq!(
             dn.hardware_ids,
             alloc::vec![

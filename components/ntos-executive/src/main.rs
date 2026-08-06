@@ -11607,6 +11607,7 @@ struct ConfigHiveDriverLaunchSpec {
 #[allow(dead_code)]
 pub(crate) struct DriverServiceLaunchSpec {
     pub(crate) service_name: alloc::string::String,
+    pub(crate) class_guid: Option<alloc::string::String>,
     pub(crate) driver_object_path: alloc::string::String,
     pub(crate) image_path: alloc::vec::Vec<u8>,
     pub(crate) class: driver_launch::DriverClass,
@@ -11618,6 +11619,7 @@ pub(crate) struct DriverServiceLaunchSpec {
 pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) instance_id: alloc::string::String,
     pub(crate) pdo_name: Option<alloc::string::String>,
+    pub(crate) driver_key: Option<alloc::string::String>,
     pub(crate) hardware_ids: alloc::vec::Vec<alloc::string::String>,
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
@@ -11626,6 +11628,7 @@ const BOOT_DRIVER_PLAN_MAX: usize = 8;
 const BOOT_DRIVER_DEVNODE_MAX: usize = 2;
 const BOOT_DRIVER_ID_MAX: usize = 4;
 const BOOT_DRIVER_SERVICE_NAME_MAX: usize = 64;
+const BOOT_DRIVER_CLASS_GUID_MAX: usize = 48;
 const BOOT_DRIVER_OBJECT_PATH_MAX: usize = 96;
 const BOOT_DRIVER_IMAGE_PATH_MAX: usize = 180;
 const BOOT_DRIVER_DEVNODE_PATH_MAX: usize = 128;
@@ -11672,6 +11675,8 @@ struct InlineDriverDevnodeSpec {
     instance_id: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
     pdo_name: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
     pdo_name_present: bool,
+    driver_key: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    driver_key_present: bool,
     hardware_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
     hardware_id_count: usize,
     compatible_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
@@ -11684,6 +11689,8 @@ impl InlineDriverDevnodeSpec {
             instance_id: InlineAscii::empty(),
             pdo_name: InlineAscii::empty(),
             pdo_name_present: false,
+            driver_key: InlineAscii::empty(),
+            driver_key_present: false,
             hardware_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
             hardware_id_count: 0,
             compatible_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
@@ -11713,6 +11720,8 @@ impl InlineDriverDevnodeSpec {
 #[derive(Clone, Copy)]
 struct InlineDriverLaunchSpec {
     service_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    class_guid: InlineAscii<BOOT_DRIVER_CLASS_GUID_MAX>,
+    class_guid_present: bool,
     driver_object_path: InlineAscii<BOOT_DRIVER_OBJECT_PATH_MAX>,
     image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     class: driver_launch::DriverClass,
@@ -11724,6 +11733,8 @@ impl InlineDriverLaunchSpec {
     const fn empty() -> Self {
         Self {
             service_name: InlineAscii::empty(),
+            class_guid: InlineAscii::empty(),
+            class_guid_present: false,
             driver_object_path: InlineAscii::empty(),
             image_path: InlineAscii::empty(),
             class: driver_launch::DriverClass::Fsd,
@@ -11806,8 +11817,10 @@ fn owned_driver_launch_spec_from_service_metadata(
         driver_launch_spec_from_service_metadata(&service, &mut image_path, max_start)?;
     let driver_object_path = service.driver_object_path()?;
     let service_name = service.name;
+    let class_guid = service.class_guid;
     Some(DriverServiceLaunchSpec {
         service_name,
+        class_guid,
         driver_object_path,
         image_path: alloc::vec::Vec::from(&image_path[..image_path_len]),
         class,
@@ -11824,6 +11837,7 @@ fn driver_service_devnode_specs(
         .map(|devnode| DriverServiceDevnodeSpec {
             instance_id: devnode.instance_id.clone(),
             pdo_name: devnode.pdo_name.clone(),
+            driver_key: devnode.driver_key.clone(),
             hardware_ids: devnode.hardware_ids.clone(),
             compatible_ids: devnode.compatible_ids.clone(),
         })
@@ -11838,6 +11852,7 @@ fn driver_service_devnode_specs_from_records(
         .map(|devnode| DriverServiceDevnodeSpec {
             instance_id: devnode.instance_id,
             pdo_name: devnode.pdo_name,
+            driver_key: devnode.driver_key,
             hardware_ids: devnode.hardware_ids,
             compatible_ids: devnode.compatible_ids,
         })
@@ -11877,6 +11892,12 @@ fn fill_inline_devnodes(
         if let Some(pdo_name) = devnode.pdo_name.as_deref() {
             dst.pdo_name_present = dst.pdo_name.set_str(pdo_name);
         }
+        if let Some(driver_key) = devnode.driver_key.as_deref() {
+            if !dst.driver_key.set_str(driver_key) {
+                continue;
+            }
+            dst.driver_key_present = true;
+        }
         dst.hardware_id_count =
             copy_inline_string_list(&devnode.hardware_ids, &mut dst.hardware_ids);
         dst.compatible_id_count =
@@ -11902,6 +11923,12 @@ fn inline_driver_launch_spec_from_service_metadata(
         || !spec.image_path.set_bytes(&image_path[..image_path_len])
     {
         return None;
+    }
+    if let Some(class_guid) = service.class_guid.as_deref() {
+        if !spec.class_guid.set_str(class_guid) {
+            return None;
+        }
+        spec.class_guid_present = true;
     }
     spec.class = class;
     spec.devnode_count = fill_inline_devnodes(cm, &service.name, &mut spec.devnodes);
@@ -12134,7 +12161,7 @@ struct SystemHiveDisplayDriverSpec {
 }
 
 impl SystemHiveDisplayDriverSpec {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             service_name: [0; DISPLAY_SERVICE_NAME_CAP],
             service_name_len: 0,
@@ -12176,6 +12203,10 @@ impl SystemHiveDisplayDriverSpec {
         &self.service_name[..self.service_name_len]
     }
 }
+
+static mut SYSTEM_HIVE_DISPLAY_DRIVER_SPEC: SystemHiveDisplayDriverSpec =
+    SystemHiveDisplayDriverSpec::empty();
+static SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY: AtomicU64 = AtomicU64::new(0);
 
 fn registry_copy_ascii_lower_str(s: &str, out: &mut [u8]) -> Option<usize> {
     if s.is_empty() || s.len() > out.len() {
@@ -12239,7 +12270,10 @@ fn registry_display_driver_leaf(installed_driver: &[u8], out: &mut [u8]) -> Opti
     Some(n)
 }
 
-fn system_hive_display_driver_spec() -> Option<SystemHiveDisplayDriverSpec> {
+fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverSpec> {
+    if SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY.load(Ordering::Relaxed) != 0 {
+        return Some(unsafe { &*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) });
+    }
     let hive = system_hive_regf()?;
     let services = hive.open_key("ControlSet001\\Services")?;
     for (service_name, service_key) in hive.subkeys(services) {
@@ -12259,7 +12293,8 @@ fn system_hive_display_driver_spec() -> Option<SystemHiveDisplayDriverSpec> {
             continue;
         };
 
-        let mut spec = SystemHiveDisplayDriverSpec::empty();
+        let spec = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) };
+        *spec = SystemHiveDisplayDriverSpec::empty();
         let Some(service_name_len) =
             registry_copy_ascii_lower_str(&service_name, &mut spec.service_name)
         else {
@@ -12302,7 +12337,8 @@ fn system_hive_display_driver_spec() -> Option<SystemHiveDisplayDriverSpec> {
         spec.display_driver_leaf_len = display_leaf_len;
         spec.device_description_len = description_len;
         spec.vga_compatible = vga_compatible;
-        return Some(spec);
+        SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY.store(1, Ordering::Relaxed);
+        return Some(unsafe { &*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) });
     }
     None
 }
@@ -12769,29 +12805,54 @@ struct ObjEntry {
     payload: u64,
 }
 impl ObjEntry {
-    fn dir(name: &[u8], parent: usize) -> Self {
-        let mut e = ObjEntry {
-            name: [0; OBJ_NAME_CAP],
-            name_len: 0,
-            parent,
-            kind: OBJ_KIND_DIRECTORY,
-            target: [0; OBJ_NAME_CAP],
-            target_len: 0,
-            payload: 0,
-        };
+    fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
+        if entries.len() >= entries.capacity() {
+            return None;
+        }
+        let index = entries.len();
+        let slot = entries.spare_capacity_mut().first_mut()?.as_mut_ptr();
+        unsafe {
+            core::ptr::write_bytes(slot as *mut u8, 0, core::mem::size_of::<Self>());
+            entries.set_len(index + 1);
+        }
+        Some(index)
+    }
+
+    fn push_kind(
+        entries: &mut alloc::vec::Vec<Self>,
+        name: &[u8],
+        parent: usize,
+        kind: u8,
+        target: &[u8],
+    ) -> Option<usize> {
+        let index = Self::push_zeroed(entries)?;
+        let entry = &mut entries[index];
+        entry.parent = parent;
+        entry.kind = kind;
         let n = name.len().min(OBJ_NAME_CAP);
-        e.name[..n].copy_from_slice(&name[..n]);
-        e.name_len = n as u8;
-        e
+        entry.name[..n].copy_from_slice(&name[..n]);
+        entry.name_len = n as u8;
+        if kind == OBJ_KIND_SYMBOLIC_LINK {
+            let n = target.len().min(OBJ_NAME_CAP);
+            entry.target[..n].copy_from_slice(&target[..n]);
+            entry.target_len = n as u8;
+        }
+        Some(index)
     }
-    fn symlink(name: &[u8], parent: usize, target: &[u8]) -> Self {
-        let mut e = ObjEntry::dir(name, parent);
-        e.kind = OBJ_KIND_SYMBOLIC_LINK;
-        let n = target.len().min(OBJ_NAME_CAP);
-        e.target[..n].copy_from_slice(&target[..n]);
-        e.target_len = n as u8;
-        e
+
+    fn push_dir(entries: &mut alloc::vec::Vec<Self>, name: &[u8], parent: usize) -> Option<usize> {
+        Self::push_kind(entries, name, parent, OBJ_KIND_DIRECTORY, &[])
     }
+
+    fn push_symlink(
+        entries: &mut alloc::vec::Vec<Self>,
+        name: &[u8],
+        parent: usize,
+        target: &[u8],
+    ) -> Option<usize> {
+        Self::push_kind(entries, name, parent, OBJ_KIND_SYMBOLIC_LINK, target)
+    }
+
     fn name(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
     }
@@ -16490,6 +16551,7 @@ struct Fat32 {
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
+    scratch_vaddr: u64,
     bps: u32,        // bytes per sector
     spc: u32,        // sectors per cluster
     fat_start: u32,  // first FAT sector
@@ -17145,10 +17207,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let si_fault_c = copy_cap(si_fault);
         let smss_image = smss_bootstrap_image();
         reset_hosted_process_runtimes();
-        register_hosted_process_runtime_for_image(smss_image.as_ref())
+        register_hosted_process_runtime_for_image(smss_image)
             .expect("SMSS runtime layout must register before SEC_IMAGE demo spawn");
         let spawn = spawn_hosted_sec_image_for_image(
-            smss_image.as_ref(),
+            smss_image,
             &pe,
             si_fault_c,
             0,
@@ -19288,11 +19350,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // Scan the ACTIVE stack only (from the fault-time RSP up to stack_top), so the
                     // return addresses are the real call chain (deepest first) — no stale frames.
                     let rsp = tcb_read_rsp(WIN32K_TCB.load(Ordering::Relaxed));
-                    let stack_top = STACK_BASE + sf * 0x1000;
-                    let start = if rsp >= STACK_BASE && rsp < stack_top {
+                    let stack_base = win32k_subsystem::WIN32K_STACK_VADDR;
+                    let stack_top = stack_base + sf * 0x1000;
+                    let start = if rsp >= stack_base && rsp < stack_top {
                         rsp
                     } else {
-                        STACK_BASE
+                        stack_base
                     };
                     print_str(b"[win32k-svc] stack backtrace from rsp=0x");
                     print_hex((rsp >> 32) as u32);
@@ -19304,7 +19367,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let mut va = start;
                     while va < stack_top && n < 20 {
                         let v =
-                            core::ptr::read_volatile((mirror + (va - STACK_BASE)) as *const u64);
+                            core::ptr::read_volatile((mirror + (va - stack_base)) as *const u64);
                         if v >= lo && v < hi {
                             print_str(b"  rva=0x");
                             print_hex(v.wrapping_sub(code_va) as u32);
@@ -19456,8 +19519,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
                         let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
                         let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
+                        let class_guid = if spec.class_guid_present {
+                            Some(spec.class_guid.as_str())
+                        } else {
+                            None
+                        };
+                        let driver_key = if devnode.driver_key_present {
+                            Some(devnode.driver_key.as_str())
+                        } else {
+                            None
+                        };
                         match driver_launch::call_add_device_for_driver(
                             dc.driver_id,
+                            spec.service_name.as_str(),
+                            class_guid,
+                            driver_key,
                             devnode.instance_id.as_str(),
                             hardware_refs,
                             compatible_refs,
@@ -20386,6 +20462,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
                 match driver_launch::call_add_device_for_driver(
                     dc.driver_id,
+                    proof_pnp_spec.service_name.as_str(),
+                    proof_pnp_spec.class_guid.as_deref(),
+                    devnode.driver_key.as_deref(),
                     devnode.instance_id.as_str(),
                     hardware_refs,
                     compatible_refs,
@@ -20778,10 +20857,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let smss_image = smss_bootstrap_image();
                     reset_hosted_process_runtimes();
-                    register_hosted_process_runtime_for_image(smss_image.as_ref())
+                    register_hosted_process_runtime_for_image(smss_image)
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
                     let spawn = spawn_hosted_sec_image_for_image(
-                        smss_image.as_ref(),
+                        smss_image,
                         &pe,
                         si_fault_c,
                         NTDLL_BASE,

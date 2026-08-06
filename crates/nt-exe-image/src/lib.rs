@@ -297,13 +297,19 @@ impl<const N: usize> FixedBytes<N> {
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self, HostedImageRegistrationError> {
+        let mut fixed = Self::empty();
+        fixed.set_from_slice(bytes)?;
+        Ok(fixed)
+    }
+
+    fn set_from_slice(&mut self, bytes: &[u8]) -> Result<(), HostedImageRegistrationError> {
         if bytes.len() > N || bytes.len() > u16::MAX as usize {
             return Err(HostedImageRegistrationError::FieldTooLong);
         }
-        let mut fixed = Self::empty();
-        fixed.bytes[..bytes.len()].copy_from_slice(bytes);
-        fixed.len = bytes.len() as u16;
-        Ok(fixed)
+        self.bytes = [0; N];
+        self.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.len = bytes.len() as u16;
+        Ok(())
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -329,6 +335,20 @@ pub struct OwnedHostedProcessImage {
 }
 
 impl OwnedHostedProcessImage {
+    const fn empty() -> Self {
+        Self {
+            pi: 0,
+            top_badge: 0,
+            leaf: FixedBytes::empty(),
+            process_name: FixedBytes::empty(),
+            role: HostedProcessRole::NativeSession,
+            nt_image_path: FixedBytes::empty(),
+            command_line: FixedBytes::empty(),
+            image_root: HostedImageRoot::System32,
+            probe_fragment: FixedBytes::empty(),
+        }
+    }
+
     pub fn new(
         pi: usize,
         top_badge: u64,
@@ -340,22 +360,39 @@ impl OwnedHostedProcessImage {
         image_root: HostedImageRoot,
         probe_fragment: &[u8],
     ) -> Result<Self, HostedImageRegistrationError> {
-        let image = Self {
+        let process_name = core::str::from_utf8(process_name)
+            .map_err(|_| HostedImageRegistrationError::InvalidProcessName)?;
+        let mut image = Self::empty();
+        image.copy_from_ref(HostedProcessImageRef {
             pi,
             top_badge,
-            leaf: FixedBytes::from_slice(leaf)?,
-            process_name: FixedBytes::from_slice(process_name)?,
+            leaf,
+            process_name,
             role,
-            nt_image_path: FixedBytes::from_slice(nt_image_path)?,
-            command_line: FixedBytes::from_slice(command_line)?,
+            nt_image_path,
+            command_line,
             image_root,
-            probe_fragment: FixedBytes::from_slice(probe_fragment)?,
-        };
-        if core::str::from_utf8(image.process_name.as_slice()).is_err() {
-            return Err(HostedImageRegistrationError::InvalidProcessName);
-        }
-        validate_hosted_image_ref(image.as_ref())?;
+            probe_fragment,
+        })?;
         Ok(image)
+    }
+
+    fn copy_from_ref(
+        &mut self,
+        image: HostedProcessImageRef<'_>,
+    ) -> Result<(), HostedImageRegistrationError> {
+        validate_hosted_image_ref(image)?;
+        self.pi = image.pi;
+        self.top_badge = image.top_badge;
+        self.leaf.set_from_slice(image.leaf)?;
+        self.process_name
+            .set_from_slice(image.process_name.as_bytes())?;
+        self.role = image.role;
+        self.nt_image_path.set_from_slice(image.nt_image_path)?;
+        self.command_line.set_from_slice(image.command_line)?;
+        self.image_root = image.image_root;
+        self.probe_fragment.set_from_slice(image.probe_fragment)?;
+        Ok(())
     }
 
     pub fn as_ref(&self) -> HostedProcessImageRef<'_> {
@@ -363,14 +400,19 @@ impl OwnedHostedProcessImage {
             pi: self.pi,
             top_badge: self.top_badge,
             leaf: self.leaf.as_slice(),
-            process_name: core::str::from_utf8(self.process_name.as_slice())
-                .expect("owned hosted process image process name is validated UTF-8"),
+            process_name: self.process_name_str(),
             role: self.role,
             nt_image_path: self.nt_image_path.as_slice(),
             command_line: self.command_line.as_slice(),
             image_root: self.image_root,
             probe_fragment: self.probe_fragment.as_slice(),
         }
+    }
+
+    fn process_name_str(&self) -> &str {
+        // SAFETY: `process_name` is private and only populated through `copy_from_ref`, which
+        // receives a Rust `&str`, or `empty`, which stores an empty byte string.
+        unsafe { core::str::from_utf8_unchecked(self.process_name.as_slice()) }
     }
 
     pub fn leaf(&self) -> &[u8] {
@@ -392,7 +434,8 @@ impl OwnedHostedProcessImage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedHostedImageCatalog<const N: usize> {
-    entries: [Option<OwnedHostedProcessImage>; N],
+    entries: [OwnedHostedProcessImage; N],
+    used: [bool; N],
 }
 
 impl<const N: usize> Default for OwnedHostedImageCatalog<N> {
@@ -403,7 +446,14 @@ impl<const N: usize> Default for OwnedHostedImageCatalog<N> {
 
 impl<const N: usize> OwnedHostedImageCatalog<N> {
     pub const fn new() -> Self {
-        Self { entries: [None; N] }
+        Self {
+            entries: [OwnedHostedProcessImage::empty(); N],
+            used: [false; N],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.used.fill(false);
     }
 
     pub fn register(
@@ -421,11 +471,12 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             return Err(HostedImageRegistrationError::DuplicateLeaf);
         }
         let index = self
-            .entries
+            .used
             .iter()
-            .position(Option::is_none)
+            .position(|used| !*used)
             .ok_or(HostedImageRegistrationError::Full)?;
-        self.entries[index] = Some(image);
+        self.entries[index] = image;
+        self.used[index] = true;
         Ok(index)
     }
 
@@ -433,27 +484,36 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         &mut self,
         image: HostedProcessImageRef<'_>,
     ) -> Result<usize, HostedImageRegistrationError> {
-        self.register(OwnedHostedProcessImage::new(
-            image.pi,
-            image.top_badge,
-            image.leaf,
-            image.process_name.as_bytes(),
-            image.role,
-            image.nt_image_path,
-            image.command_line,
-            image.image_root,
-            image.probe_fragment,
-        )?)
+        validate_hosted_image_ref(image)?;
+        if self.get_by_pi(image.pi).is_some() {
+            return Err(HostedImageRegistrationError::DuplicatePi);
+        }
+        if self.get_by_top_badge(image.top_badge).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateTopBadge);
+        }
+        if self.get_by_leaf(image.leaf).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateLeaf);
+        }
+        let index = self
+            .used
+            .iter()
+            .position(|used| !*used)
+            .ok_or(HostedImageRegistrationError::Full)?;
+        self.entries[index].copy_from_ref(image)?;
+        self.used[index] = true;
+        Ok(index)
     }
 
     pub fn count(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.is_some()).count()
+        self.used.iter().filter(|used| **used).count()
     }
 
     pub fn mask(&self) -> u64 {
         self.entries
             .iter()
-            .filter_map(|entry| entry.map(|image| image.pi))
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image.pi)
             .filter(|&pi| pi < 64)
             .fold(0, |mask, pi| mask | (1u64 << pi))
     }
@@ -461,19 +521,28 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
     pub fn get_by_pi(&self, pi: usize) -> Option<HostedProcessImageRef<'_>> {
         self.entries
             .iter()
-            .flatten()
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
             .find(|image| image.pi == pi)
             .map(OwnedHostedProcessImage::as_ref)
     }
 
     pub fn get_owned_by_pi(&self, pi: usize) -> Option<&OwnedHostedProcessImage> {
-        self.entries.iter().flatten().find(|image| image.pi == pi)
+        self.entries
+            .iter()
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
+            .find(|image| image.pi == pi)
     }
 
     pub fn get_by_leaf(&self, leaf: &[u8]) -> Option<HostedProcessImageRef<'_>> {
         self.entries
             .iter()
-            .flatten()
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
             .find(|image| eq_ascii_case(image.leaf(), leaf))
             .map(OwnedHostedProcessImage::as_ref)
     }
@@ -485,7 +554,9 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
     pub fn get_by_top_badge(&self, top_badge: u64) -> Option<HostedProcessImageRef<'_>> {
         self.entries
             .iter()
-            .flatten()
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
             .find(|image| image.top_badge == top_badge)
             .map(OwnedHostedProcessImage::as_ref)
     }
@@ -524,7 +595,9 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         }
         self.entries
             .iter()
-            .flatten()
+            .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
             .filter(|image| !image.probe_fragment().is_empty())
             .find(|image| contains_ascii_case(folded_path, image.probe_fragment()))
             .map(OwnedHostedProcessImage::as_ref)

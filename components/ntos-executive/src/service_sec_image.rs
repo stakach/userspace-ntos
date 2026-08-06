@@ -552,9 +552,9 @@ unsafe fn reset_service_exe_images_work() -> &'static mut nt_exe_image::ImageTab
 #[inline(never)]
 unsafe fn reset_service_exe_image_catalog_work(
 ) -> &'static mut nt_exe_image::OwnedHostedImageCatalog<8> {
-    let slot = core::ptr::addr_of_mut!(SERVICE_EXE_IMAGE_CATALOG_WORK);
-    core::ptr::write(slot, nt_exe_image::OwnedHostedImageCatalog::new());
-    &mut *slot
+    let catalog = &mut *core::ptr::addr_of_mut!(SERVICE_EXE_IMAGE_CATALOG_WORK);
+    catalog.clear();
+    catalog
 }
 
 #[inline(never)]
@@ -743,7 +743,7 @@ fn register_loaded_hosted_bootstrap_pe(
     pool_va: u64,
 ) {
     loaded_images
-        .register_if_loaded(spec.image.as_ref(), pe, pool_va)
+        .register_if_loaded(spec.image, pe, pool_va)
         .expect("loaded hosted executable PE metadata must register once");
 }
 
@@ -2911,44 +2911,6 @@ unsafe fn capture_cursor_identity_key(
         CapturedCursorString::Text(len) => CursorResource::name(&resource_name[..len])?,
     };
     CursorLookupKey::new(&module[..module_len], resource, icon_kind)
-}
-
-/// Probe and capture the complete three-argument lookup key before crossing into win32k. The size
-/// fields are intentionally ignored because ReactOS uses only module, resource, and bIcon when it
-/// searches the per-process and global cursor lists. Preserve the raw BOOL because win32k compares
-/// it directly with its canonical 0/1 object type.
-unsafe fn capture_cursor_lookup_key(
-    pi: u64,
-    module_descriptor: u64,
-    resource_descriptor: u64,
-    parameter: u64,
-    filled_pages: &[u64],
-    nfilled: usize,
-    scratch_base: u64,
-) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
-    let mut params = [0u8; 12];
-    if parameter == 0
-        || !img_spawn::client_copyin_mapped(
-            pi,
-            parameter,
-            &mut params,
-            filled_pages,
-            nfilled,
-            scratch_base,
-        )
-    {
-        return None;
-    }
-    let icon_kind = u32::from_le_bytes(params[0..4].try_into().unwrap());
-    capture_cursor_identity_key(
-        pi,
-        module_descriptor,
-        resource_descriptor,
-        icon_kind,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    )
 }
 
 unsafe fn stage_cursor_lookup_args(
@@ -10290,15 +10252,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 let cursor_identity_key = if m0 == 0x103d {
-                    capture_cursor_lookup_key(
-                        pi as u64,
-                        a0,
-                        a1,
-                        a2,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    )
+                    None
                 } else if m0 == 0x10a8 {
                     capture_cursor_set_data_key(
                         pi as u64,

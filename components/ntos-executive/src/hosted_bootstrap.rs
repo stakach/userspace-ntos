@@ -11,7 +11,7 @@ use crate::register_hosted_process_runtime_for_image;
 pub(crate) struct HostedBootstrapLoadSpec {
     pub(crate) disk_path: &'static [u8],
     pub(crate) stem: &'static [u8],
-    pub(crate) image: nt_exe_image::OwnedHostedProcessImage,
+    pub(crate) image: nt_exe_image::HostedProcessImageRef<'static>,
 }
 
 #[derive(Clone, Copy)]
@@ -28,19 +28,19 @@ struct HostedBootstrapManifestEntry {
 }
 
 impl HostedBootstrapManifestEntry {
-    fn image(self, pi: usize) -> nt_exe_image::OwnedHostedProcessImage {
-        nt_exe_image::OwnedHostedProcessImage::new(
+    fn image(self, pi: usize) -> nt_exe_image::HostedProcessImageRef<'static> {
+        nt_exe_image::HostedProcessImageRef {
             pi,
-            self.top_badge,
-            self.leaf,
-            self.leaf,
-            self.role,
-            self.nt_image_path,
-            self.command_line,
-            self.image_root,
-            self.probe_fragment,
-        )
-        .expect("hosted bootstrap image manifest entry is static and validated")
+            top_badge: self.top_badge,
+            leaf: self.leaf,
+            process_name: core::str::from_utf8(self.leaf)
+                .expect("hosted bootstrap image manifest leaf is ASCII"),
+            role: self.role,
+            nt_image_path: self.nt_image_path,
+            command_line: self.command_line,
+            image_root: self.image_root,
+            probe_fragment: self.probe_fragment,
+        }
     }
 
     fn load_spec(self, pi: usize) -> HostedBootstrapLoadSpec {
@@ -135,7 +135,7 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
 
 pub(crate) const HOSTED_BOOTSTRAP_LOAD_COUNT: usize = HOSTED_BOOTSTRAP_MANIFEST.len();
 
-pub(crate) fn smss_bootstrap_image() -> nt_exe_image::OwnedHostedProcessImage {
+pub(crate) fn smss_bootstrap_image() -> nt_exe_image::HostedProcessImageRef<'static> {
     SMSS_BOOTSTRAP_MANIFEST.image(0)
 }
 
@@ -148,12 +148,12 @@ pub(crate) fn hosted_bootstrap_load_spec(index: usize) -> Option<HostedBootstrap
 
 pub(crate) fn register_loaded_hosted_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
-    image: nt_exe_image::OwnedHostedProcessImage,
+    image: nt_exe_image::HostedProcessImageRef<'_>,
     loaded: bool,
 ) -> Result<(), nt_exe_image::HostedImageRegistrationError> {
     if loaded {
-        catalog.register(image)?;
-        register_hosted_process_runtime_for_image(image.as_ref())
+        catalog.register_ref(image)?;
+        register_hosted_process_runtime_for_image(image)
             .expect("hosted process runtime layout must register once when image is loaded");
     }
     Ok(())

@@ -813,9 +813,18 @@ const REQUEST_TAG_LEN: u64 = 1;
 
 /// Answer the component's outstanding `Call` on this channel's reply object, recording the
 /// invocation label. Non-blocking by construction (`decode_reply` wakes the bound caller or fails).
+#[inline(never)]
 unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
     let e = crate::reply_on(ch.reply_cap, msginfo, r0, 0, 0, 0);
-    if e != 0 && PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
+    if e != 0 {
+        pump_note_reply_error(ch, e);
+    }
+    e
+}
+
+#[inline(never)]
+unsafe fn pump_note_reply_error(ch: &PumpChannel, e: u64) {
+    if PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
         crate::print_str(b"[pump] reply_on error label=");
         crate::print_u64(e);
         crate::print_str(b" cap=0x");
@@ -824,7 +833,126 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
             b" -> the reply object was NOT bound (component was not blocked in a Call)\n",
         );
     }
-    e
+}
+
+#[derive(Clone, Copy)]
+struct PumpMessage {
+    mi: u64,
+    m0: u64,
+    m1: u64,
+    m2: u64,
+    m3: u64,
+}
+
+impl PumpMessage {
+    #[inline]
+    fn label(self) -> u64 {
+        self.mi >> 12
+    }
+}
+
+macro_rules! pump_recv_into {
+    ($ch:expr, $msg:ident) => {{
+        loop {
+            let badge: u64;
+            let mi: u64;
+            let m0: u64;
+            let m1: u64;
+            let m2: u64;
+            let m3: u64;
+            core::arch::asm!(
+                "syscall",
+                in("rdx") crate::SYS_RECV as u64,
+                inout("rdi") $ch.fault_ep => badge,
+                lateout("rsi") mi,
+                lateout("r10") m0,
+                lateout("r8") m1,
+                lateout("r9") m2,
+                lateout("r15") m3,
+                in("r12") $ch.reply_cap,
+                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+                options(nostack),
+            );
+            if crate::EXEC_DEADMAN_WATCHDOG {
+                if badge == crate::DELAY_TIMER_BADGE {
+                    crate::watchdog_on_tick();
+                } else {
+                    crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if badge == crate::DELAY_TIMER_BADGE {
+                crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+                crate::watchdog_nested_rearm();
+                let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    crate::print_str(
+                        b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
+                    );
+                }
+                continue;
+            }
+            $msg = PumpMessage { mi, m0, m1, m2, m3 };
+            break;
+        }
+    }};
+}
+
+macro_rules! pump_reply_recv_into {
+    ($ch:expr, $msg:ident, $len:expr, $r0:expr) => {{
+        let reply_len = $len as u64;
+        let reply_r0 = $r0 as u64;
+        let reply_label: u64;
+        core::arch::asm!(
+            "syscall",
+            inout("rdx") crate::SYS_CALL as u64 => _,
+            inout("rdi") $ch.reply_cap => _,
+            inout("rsi") reply_len => reply_label,
+            inout("r10") reply_r0 => _,
+            inout("r8") 0u64 => _,
+            inout("r9") 0u64 => _,
+            inout("r15") 0u64 => _,
+            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        let reply_error = reply_label >> 12;
+        if reply_error != 0 {
+            pump_note_reply_error($ch, reply_error);
+        }
+        pump_recv_into!($ch, $msg);
+    }};
+}
+
+#[derive(Clone, Copy)]
+struct PumpLoopOutcome {
+    completed: bool,
+    callback_suspended: bool,
+    wall_ip: u64,
+    wall_addr: u64,
+    wall_label: u64,
+    faults: u64,
+    demand: u64,
+}
+
+impl PumpLoopOutcome {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            completed: false,
+            callback_suspended: false,
+            wall_ip: 0,
+            wall_addr: 0,
+            wall_label: 0,
+            faults: 0,
+            demand: 0,
+        }
+    }
+
+    #[inline]
+    fn wall(&mut self, ip: u64, addr: u64, label: u64) {
+        self.wall_ip = ip;
+        self.wall_addr = addr;
+        self.wall_label = label;
+    }
 }
 
 /// Receive the component's next message. The recv REGISTERS the channel's reply object in r12, so
@@ -845,12 +973,37 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
 /// So: recognise the tick, count it for the main service loop (`DELAY_TIMER_TICKS_PENDING`) and go
 /// back to receiving. The watchdog re-arm path Acks nested deliveries; the service loop then services
 /// the coalesced timer state once while accounting for every pump-absorbed tick.
-#[inline]
-unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
+#[inline(never)]
+unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
     loop {
         // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
         // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
-        let (badge, mi, m0, m1, m2, m3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+        let badge: u64;
+        let mi: u64;
+        let m0: u64;
+        let m1: u64;
+        let m2: u64;
+        let m3: u64;
+        core::arch::asm!(
+            "syscall",
+            in("rdx") crate::SYS_RECV as u64,
+            inout("rdi") ch.fault_ep => badge,
+            lateout("rsi") mi,
+            lateout("r10") m0,
+            lateout("r8") m1,
+            lateout("r9") m2,
+            lateout("r15") m3,
+            in("r12") ch.reply_cap,
+            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        if crate::EXEC_DEADMAN_WATCHDOG {
+            if badge == crate::DELAY_TIMER_BADGE {
+                crate::watchdog_on_tick();
+            } else {
+                crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if badge == crate::DELAY_TIMER_BADGE {
             crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
             // The main service loop owns the ordinary re-arm + IRQ Ack, and it cannot run while this
@@ -865,19 +1018,8 @@ unsafe fn pump_recv(ch: &PumpChannel) -> (u64, u64, u64, u64, u64) {
             }
             continue;
         }
-        return (mi, m0, m1, m2, m3);
+        return PumpMessage { mi, m0, m1, m2, m3 };
     }
-}
-
-/// Resume the component (a fault reply, or the int-0x2c assert-skip reply) and receive its next
-/// message. `len`/`r0` are the reply message-info and MR0 — the component pump only ever emits
-/// len 0 (VMFault: `apply_fault_reply` restarts unconditionally) and len 1 (int-0x2c
-/// UserException: MR0 = the resume FaultIP). It NEVER emits the len-18 UnknownSyscall shape; those
-/// are client-syscall replies on REPLY_MAIN, a different plane entirely (risk R4).
-#[inline]
-unsafe fn pump_resume_recv(ch: &PumpChannel, len: u64, r0: u64) -> (u64, u64, u64, u64, u64) {
-    pump_reply_on(ch, len, r0);
-    pump_recv(ch)
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
@@ -917,6 +1059,7 @@ pub(crate) unsafe fn component_pump_resume_user_callback(ch: &PumpChannel) -> Pu
     component_pump_inner(ch, true)
 }
 
+#[inline(never)]
 unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> PumpResult {
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
     // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
@@ -937,12 +1080,27 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // ever reaches `decode_reply` (see [`REQUEST_TAG_LEN`]). A fresh dispatch hands over
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
-    let request_tag = if resume_user_callback {
+    let request_tag = pump_request_tag(ch, resume_user_callback);
+    let owns_depth = pump_enter_depth(ch, resume_user_callback);
+    pump_deliver_initial_request(ch, request_tag);
+    let first = pump_recv(ch);
+    let outcome = component_pump_loop(ch, first);
+    pump_leave_depth(owns_depth, outcome.callback_suspended);
+    pump_suspend_walled_component(ch, outcome);
+    pump_result_from_outcome(ch, outcome)
+}
+
+#[inline(never)]
+fn pump_request_tag(ch: &PumpChannel, resume_user_callback: bool) -> u64 {
+    if resume_user_callback {
         crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
     } else {
         ch.dispatch_label
-    };
+    }
+}
 
+#[inline(never)]
+fn pump_enter_depth(ch: &PumpChannel, resume_user_callback: bool) -> bool {
     // Nesting OBSERVABILITY only (no correlation depends on it): a pump that hands over a request
     // owns one outstanding dispatch level; a RESUME pump inherits the level its suspension left
     // outstanding. The `RecvFirst` DriverEntry-init shape owns none (the component's ready Call is a
@@ -954,7 +1112,11 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     } else if owns_depth {
         dispatch_depth_enter();
     }
+    owns_depth
+}
 
+#[inline(never)]
+unsafe fn pump_deliver_initial_request(ch: &PumpChannel, request_tag: u64) {
     // ★ ONE non-blocking reply hands over the request. There is no wake `Send` any more, so there is
     // no window in which the executive can block against a component that is running rather than
     // receiving (defect 3). `RecvFirst` means the component has not yet issued the Call we would be
@@ -964,15 +1126,15 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     {
         PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
     }
-    let (mut mi, mut m0, mut m1, mut _m2, mut m3) = pump_recv(ch);
-    let mut faults = 0u64;
-    let mut demand = 0u64;
-    let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded → a looping assert walls)
-    let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
-    let mut completed = false;
-    let mut callback_suspended = false;
+}
+
+#[inline(never)]
+unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopOutcome {
+    let mut msg = first;
+    let mut outcome = PumpLoopOutcome::new();
+    let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded -> wall).
     loop {
-        let label = mi >> 12;
+        let label = msg.label();
         if label == ch.dispatch_label {
             // ★ There is nothing to check. This message is the return half of the component's OWN
             // `Call`, the kernel bound our reply object to that exact caller when it paired, and the
@@ -980,18 +1142,14 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             // misdirected completion is UNREPRESENTABLE — which is why the sequence handshake and
             // the per-dispatch token stack are gone.
             PUMP_CALL_DISPATCHES[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
-            completed = true;
+            outcome.completed = true;
             break;
         } else if label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL
             && ch.caps.usermode_callback
         {
-            let disposition = ch
-                .callback_client
-                .and_then(|client| crate::win32k_glue::service_user_callback(client));
+            let disposition = pump_service_user_callback(ch);
             let Some(disposition) = disposition else {
-                wall_ip = m0;
-                wall_addr = m1;
-                wall_label = label;
+                outcome.wall(msg.m0, msg.m1, label);
                 break;
             };
             if disposition == crate::win32k_glue::UserCallbackDisposition::SuspendComponent {
@@ -999,283 +1157,273 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 // BOUND to the component's callback `Call` for the whole callback excursion (client
                 // redirect → arbitrarily deep nested dispatches → `NtCallbackReturn`). That kernel
                 // binding IS the "suspended outer dispatch" state; we keep none of our own.
-                callback_suspended = true;
+                outcome.callback_suspended = true;
                 break;
             }
             // Answer the callback in place: the RESUME tag on the component's outstanding Call.
-            let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(
+            pump_reply_recv_into!(
                 ch,
+                msg,
                 REQUEST_TAG_LEN,
-                crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
+                crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
             );
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            _m2 = nm2;
-            m3 = nm3;
             continue;
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = crate::win32k_glue::service_gdi_driver_load();
-            let (nmi, nm0, nm1, nm2, nm3) =
-                pump_resume_recv(ch, REQUEST_TAG_LEN, status as u32 as u64);
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            _m2 = nm2;
-            m3 = nm3;
+            let status = pump_service_gdi_driver_load();
+            pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
         } else if label == 6 {
-            let ip = m0;
-            let addr = m1;
-            faults += 1;
-            let in_image = ch.image_frames != 0
-                && addr >= ch.code_va
-                && addr < ch.code_va + ch.image_frames * 0x1000;
-            if ch.caps.client_attach {
-                // ── win32k demand-fault CLIENT-FRAME-SHARING (relocated VERBATIM from
-                // `win32k_dispatch_wide`; foreign-pointer detection + internal-low zero-fill discrimination).
-                let page = addr & !0xFFF;
-                let foreign = addr < 0x0000_0100_0000_0000
-                    || (addr >= 0x10000
-                        && !in_image
-                        && crate::csrss_frame_get(ch.client_pi, page) != 0);
-                if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
-                    crate::print_str(b"[w32disp] fault #");
-                    crate::print_u64(demand);
-                    crate::print_str(b" ip=0x");
-                    crate::print_hex((ip >> 32) as u32);
-                    crate::print_hex(ip as u32);
-                    crate::print_str(b" RVA=0x");
-                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
-                    crate::print_str(b" addr=0x");
-                    crate::print_hex((addr >> 32) as u32);
-                    crate::print_hex(addr as u32);
-                    if foreign {
-                        crate::print_str(b" (client ptr - sharing csrss frame)");
-                    }
-                    crate::print_str(b"\n");
-                }
-                // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
-                if addr < 0x10000 || in_image || demand >= ch.demand_cap {
-                    crate::win32k_glue::win32k_dispatch_backtrace();
-                    wall_ip = ip;
-                    wall_addr = addr;
-                    wall_label = label;
-                    break;
-                }
-                // ★ THE CLIENT TEB TAIL IS READ-ONLY TO win32k. A WRITE fault (x86 `#PF` error-code
-                // bit 1, delivered as the VMFault `FSR`) on a page that is ALREADY attached can only
-                // be the read-only tail mapping refusing a store — every other attached page is RW.
-                // Answer it with a private copy-on-write shadow instead of the caller's real TEB.
-                if crate::W32_CLIENT_TEB_TAIL_PROTECTED
-                    && (m3 & 0x2) != 0
-                    && crate::win32k_glue::w32_attach_mapped(page)
-                    && crate::is_teb_tail_page(page)
-                {
-                    if crate::win32k_glue::w32_teb_tail_cow(page, ch.client_pi, ch.pml4, ip) {
-                        demand += 1;
-                        let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 0, 0);
-                        mi = nmi;
-                        m0 = nm0;
-                        m1 = nm1;
-                        _m2 = nm2;
-                        m3 = nm3;
-                        continue;
-                    }
-                    crate::win32k_glue::win32k_dispatch_backtrace();
-                    wall_ip = ip;
-                    wall_addr = addr;
-                    wall_label = label;
-                    break;
-                }
-                if foreign {
-                    if !crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4)
-                    {
-                        let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
-                        if win32k_internal_low {
-                            if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
-                                crate::print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
-                                crate::print_hex((page >> 32) as u32);
-                                crate::print_hex(page as u32);
-                                crate::print_str(b" -> zero-fill (blit source buffer)\n");
-                            }
-                            if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
-                                crate::win32k_glue::win32k_dispatch_backtrace();
-                                wall_ip = ip;
-                                wall_addr = addr;
-                                wall_label = label;
-                                break;
-                            }
-                            let f = crate::alloc_frame();
-                            let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
-                            if map != 0 {
-                                crate::print_str(b"[w32disp] zero-fill map failed page=0x");
-                                crate::print_hex((page >> 32) as u32);
-                                crate::print_hex(page as u32);
-                                crate::print_str(b" error=");
-                                crate::print_u64(map);
-                                crate::print_str(b"\n");
-                                let _ = crate::cnode_delete_recycle_r(f);
-                                crate::win32k_glue::win32k_dispatch_backtrace();
-                                wall_ip = ip;
-                                wall_addr = addr;
-                                wall_label = label;
-                                break;
-                            }
-                        } else {
-                            crate::print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
-                            crate::print_hex((page >> 32) as u32);
-                            crate::print_hex(page as u32);
-                            crate::print_str(b" client_pi=");
-                            crate::print_u64(ch.client_pi);
-                            crate::print_str(b"\n");
-                            crate::win32k_glue::win32k_dispatch_backtrace();
-                            wall_ip = ip;
-                            wall_addr = addr;
-                            wall_label = label;
-                            break;
-                        }
-                    }
-                } else {
-                    if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
-                        crate::win32k_glue::win32k_dispatch_backtrace();
-                        wall_ip = ip;
-                        wall_addr = addr;
-                        wall_label = label;
-                        break;
-                    }
-                    let f = crate::alloc_frame();
-                    let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
-                    if map != 0 {
-                        crate::print_str(b"[w32disp] private map failed page=0x");
-                        crate::print_hex((page >> 32) as u32);
-                        crate::print_hex(page as u32);
-                        crate::print_str(b" error=");
-                        crate::print_u64(map);
-                        crate::print_str(b"\n");
-                        let _ = crate::cnode_delete_recycle_r(f);
-                        crate::win32k_glue::win32k_dispatch_backtrace();
-                        wall_ip = ip;
-                        wall_addr = addr;
-                        wall_label = label;
-                        break;
-                    }
-                }
-                demand += 1;
-            } else {
-                // ── FSD / generic demand-map (byte-identical to the old inline loop).
-                if crate::DEBUG_TRACE && ch.trace_faults && faults <= 40 {
-                    crate::print_str(b"[svc] fault #");
-                    crate::print_u64(faults);
-                    crate::print_str(b" ip=0x");
-                    crate::print_hex(ip as u32);
-                    crate::print_str(b" RVA=0x");
-                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
-                    crate::print_str(b" addr=0x");
-                    crate::print_hex((addr >> 32) as u32);
-                    crate::print_hex(addr as u32);
-                    crate::print_str(b"\n");
-                }
-                if addr < 0x10000 || in_image || demand >= ch.demand_cap {
-                    wall_ip = ip;
-                    wall_addr = addr;
-                    wall_label = label;
-                    break;
-                }
-                let page = addr & !0xFFF;
-                if ch.caps.sparse_vspace {
-                    if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
-                        wall_ip = ip;
-                        wall_addr = addr;
-                        wall_label = label;
-                        break;
-                    }
-                } else {
-                    crate::driver_launch::ensure_paging(page, ch.pml4);
-                }
-                let f = crate::alloc_frame();
-                let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
-                if map != 0 {
-                    crate::print_str(b"[svc] private map failed page=0x");
-                    crate::print_hex((page >> 32) as u32);
-                    crate::print_hex(page as u32);
-                    crate::print_str(b" error=");
-                    crate::print_u64(map);
-                    crate::print_str(b"\n");
-                    let _ = crate::cnode_delete_recycle_r(f);
-                    wall_ip = ip;
-                    wall_addr = addr;
-                    wall_label = label;
-                    break;
-                }
-                demand += 1;
+            outcome.faults += 1;
+            if !pump_service_vm_fault(
+                ch,
+                label,
+                msg.m0,
+                msg.m1,
+                msg.m3,
+                outcome.faults,
+                outcome.demand,
+            ) {
+                outcome.wall(msg.m0, msg.m1, label);
+                break;
             }
+            outcome.demand += 1;
             // Resume the server + recv the next fault/DONE: `reply_on(R, len 0)` — a VMFault reply,
             // which `apply_fault_reply` restarts unconditionally (`fault.rs`) — followed by a recv
             // that re-registers `R`. A nested demand fault therefore rides the SAME reply object as
             // the dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
             // REPLY_MAIN binding is untouched) with no second transport to keep gated.
-            let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 0, 0);
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            _m2 = nm2;
-            m3 = nm3;
+            pump_reply_recv_into!(ch, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.assert_skip {
             // ── win32k checked-build int-0x2c ASSERT-SKIP (relocated VERBATIM). Verify CD 2C via the
             // executive's RW view of win32k's image at the same VA, then resume at IP+2 (release-build
             // semantics). Bounded by W32_ASSERT_SKIP_BOUND (a looping assert still walls).
-            let ip = m0;
-            let in_win32k = ip >= ch.code_va && ip < ch.code_va + ch.image_frames * 0x1000;
-            let is_int2c = in_win32k
-                && core::ptr::read_volatile(ip as *const u8) == 0xCD
-                && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
             // Gated on `caps.assert_skip` (win32k only) — NOT on `reply_cap != 0`, which is now
             // mandatory on every channel and would silently widen this arm to the FSD (risk R10).
+            let code_va = core::ptr::read_volatile(core::ptr::addr_of!(ch.code_va));
+            let image_frames = core::ptr::read_volatile(core::ptr::addr_of!(ch.image_frames));
+            let in_win32k = msg.m0 >= code_va && msg.m0 < code_va + image_frames * 0x1000;
+            let is_int2c = in_win32k
+                && core::ptr::read_volatile(msg.m0 as *const u8) == 0xCD
+                && core::ptr::read_volatile((msg.m0 + 1) as *const u8) == 0x2C;
             if is_int2c && skips < W32_ASSERT_SKIP_BOUND {
-                // Verbose grind-era trace: the per-skip int-0x2c diagnostic (bounded to 40). Gated
-                // behind `debug-trace` — pure noise once the boot is stable, not load-bearing.
                 if crate::DEBUG_TRACE && crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40
                 {
                     crate::print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
-                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+                    crate::print_hex(msg.m0.wrapping_sub(code_va) as u32);
                     crate::print_str(b"\n");
                 }
                 skips += 1;
                 // UserException(3) reply: len 1, MR0 = the resume FaultIP (past `CD 2C`). This is
                 // the ONLY non-zero-length reply the component pump ever emits (risk R4).
-                let (nmi, nm0, nm1, nm2, nm3) = pump_resume_recv(ch, 1, ip + 2);
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                _m2 = nm2;
-                m3 = nm3;
+                pump_reply_recv_into!(ch, msg, 1, msg.m0 + 2);
                 continue;
             }
             // Not a skippable int-0x2c — fall through to the wall.
             if ch.caps.client_attach {
-                win32k_wall_diag(ch, label, m0, m1, _m2, m3);
+                win32k_wall_diag(ch, label, msg.m0, msg.m1, msg.m2, msg.m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
-            wall_ip = m0;
-            wall_addr = m1;
-            wall_label = label;
+            outcome.wall(msg.m0, msg.m1, label);
             break;
         } else {
             // Any other fault — a real wall inside the handler.
             if ch.caps.client_attach {
-                win32k_wall_diag(ch, label, m0, m1, _m2, m3);
+                win32k_wall_diag(ch, label, msg.m0, msg.m1, msg.m2, msg.m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
-            wall_ip = m0;
-            wall_addr = m1;
-            wall_label = label;
+            outcome.wall(msg.m0, msg.m1, label);
             break;
         }
     }
+    outcome
+}
+
+#[inline(never)]
+unsafe fn pump_service_user_callback(
+    ch: &PumpChannel,
+) -> Option<crate::win32k_glue::UserCallbackDisposition> {
+    ch.callback_client
+        .and_then(|client| crate::win32k_glue::service_user_callback(client))
+}
+
+#[inline(never)]
+unsafe fn pump_service_gdi_driver_load() -> i32 {
+    crate::win32k_glue::service_gdi_driver_load()
+}
+
+#[inline(never)]
+unsafe fn pump_service_vm_fault(
+    ch: &PumpChannel,
+    label: u64,
+    ip: u64,
+    addr: u64,
+    fsr: u64,
+    faults: u64,
+    demand: u64,
+) -> bool {
+    let in_image =
+        ch.image_frames != 0 && addr >= ch.code_va && addr < ch.code_va + ch.image_frames * 0x1000;
+    if ch.caps.client_attach {
+        pump_service_win32k_fault(ch, ip, addr, fsr, in_image, demand)
+    } else {
+        pump_service_generic_fault(ch, label, ip, addr, in_image, faults, demand)
+    }
+}
+
+#[inline(never)]
+unsafe fn pump_service_win32k_fault(
+    ch: &PumpChannel,
+    ip: u64,
+    addr: u64,
+    fsr: u64,
+    in_image: bool,
+    demand: u64,
+) -> bool {
+    // win32k demand-fault CLIENT-FRAME-SHARING (relocated from `win32k_dispatch_wide`).
+    let page = addr & !0xFFF;
+    let foreign = addr < 0x0000_0100_0000_0000
+        || (addr >= 0x10000 && !in_image && crate::csrss_frame_get(ch.client_pi, page) != 0);
+    if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
+        crate::print_str(b"[w32disp] fault #");
+        crate::print_u64(demand);
+        crate::print_str(b" ip=0x");
+        crate::print_hex((ip >> 32) as u32);
+        crate::print_hex(ip as u32);
+        crate::print_str(b" RVA=0x");
+        crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+        crate::print_str(b" addr=0x");
+        crate::print_hex((addr >> 32) as u32);
+        crate::print_hex(addr as u32);
+        if foreign {
+            crate::print_str(b" (client ptr - sharing csrss frame)");
+        }
+        crate::print_str(b"\n");
+    }
+    // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
+    if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+        crate::win32k_glue::win32k_dispatch_backtrace();
+        return false;
+    }
+    // The client TEB tail is read-only to win32k; service writes with a private COW shadow.
+    if crate::W32_CLIENT_TEB_TAIL_PROTECTED
+        && (fsr & 0x2) != 0
+        && crate::win32k_glue::w32_attach_mapped(page)
+        && crate::is_teb_tail_page(page)
+    {
+        if crate::win32k_glue::w32_teb_tail_cow(page, ch.client_pi, ch.pml4, ip) {
+            return true;
+        }
+        crate::win32k_glue::win32k_dispatch_backtrace();
+        return false;
+    }
+    if foreign {
+        pump_service_win32k_foreign_fault(ch, page, demand)
+    } else {
+        pump_map_win32k_private_page(ch, page)
+    }
+}
+
+#[inline(never)]
+unsafe fn pump_service_win32k_foreign_fault(ch: &PumpChannel, page: u64, demand: u64) -> bool {
+    if crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4) {
+        return true;
+    }
+    let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
+    if win32k_internal_low {
+        if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
+            crate::print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
+            crate::print_hex((page >> 32) as u32);
+            crate::print_hex(page as u32);
+            crate::print_str(b" -> zero-fill (blit source buffer)\n");
+        }
+        return pump_map_win32k_private_page(ch, page);
+    }
+    crate::print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
+    crate::print_hex((page >> 32) as u32);
+    crate::print_hex(page as u32);
+    crate::print_str(b" client_pi=");
+    crate::print_u64(ch.client_pi);
+    crate::print_str(b"\n");
+    crate::win32k_glue::win32k_dispatch_backtrace();
+    false
+}
+
+#[inline(never)]
+unsafe fn pump_map_win32k_private_page(ch: &PumpChannel, page: u64) -> bool {
+    if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
+        crate::win32k_glue::win32k_dispatch_backtrace();
+        return false;
+    }
+    let f = crate::alloc_frame();
+    let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
+    if map == 0 {
+        return true;
+    }
+    crate::print_str(b"[w32disp] private map failed page=0x");
+    crate::print_hex((page >> 32) as u32);
+    crate::print_hex(page as u32);
+    crate::print_str(b" error=");
+    crate::print_u64(map);
+    crate::print_str(b"\n");
+    let _ = crate::cnode_delete_recycle_r(f);
+    crate::win32k_glue::win32k_dispatch_backtrace();
+    false
+}
+
+#[inline(never)]
+unsafe fn pump_service_generic_fault(
+    ch: &PumpChannel,
+    _label: u64,
+    ip: u64,
+    addr: u64,
+    in_image: bool,
+    faults: u64,
+    demand: u64,
+) -> bool {
+    // FSD / generic demand-map (byte-identical to the old inline loop).
+    if crate::DEBUG_TRACE && ch.trace_faults && faults <= 40 {
+        crate::print_str(b"[svc] fault #");
+        crate::print_u64(faults);
+        crate::print_str(b" ip=0x");
+        crate::print_hex(ip as u32);
+        crate::print_str(b" RVA=0x");
+        crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+        crate::print_str(b" addr=0x");
+        crate::print_hex((addr >> 32) as u32);
+        crate::print_hex(addr as u32);
+        crate::print_str(b"\n");
+    }
+    if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+        return false;
+    }
+    let page = addr & !0xFFF;
+    if ch.caps.sparse_vspace {
+        if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {
+            return false;
+        }
+    } else {
+        crate::driver_launch::ensure_paging(page, ch.pml4);
+    }
+    let f = crate::alloc_frame();
+    let map = crate::page_map_r(f, page, crate::RW_NX, ch.pml4);
+    if map == 0 {
+        return true;
+    }
+    crate::print_str(b"[svc] private map failed page=0x");
+    crate::print_hex((page >> 32) as u32);
+    crate::print_hex(page as u32);
+    crate::print_str(b" error=");
+    crate::print_u64(map);
+    crate::print_str(b"\n");
+    let _ = crate::cnode_delete_recycle_r(f);
+    false
+}
+
+#[inline(never)]
+fn pump_leave_depth(owns_depth: bool, callback_suspended: bool) {
     // Retire this level from the depth GAUGE unless it is now suspended inside a usermode callback
     // (in which case it stays outstanding until a resume pump completes it). Observability only.
     if owns_depth {
@@ -1285,6 +1433,10 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             dispatch_depth_leave();
         }
     }
+}
+
+#[inline(never)]
+unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutcome) {
     // ★ RISK R2 — WALL HANDLING UNDER THE `Call` TRANSPORT.
     //
     // A wall means we received a fault we refuse to service. The component is therefore blocked in
@@ -1300,7 +1452,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // pumps it a second time (`dispatch_irp` → `register_instance_ready(inst,false)`;
     // `win32k_dispatch_wide` → `WIN32K_RETIRED`). A walled component is dead, and it now says so.
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
-    if !completed && !callback_suspended {
+    if !outcome.completed && !outcome.callback_suspended {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         let e = if ch.tcb != 0 {
             crate::tcb_suspend_r(ch.tcb)
@@ -1308,19 +1460,23 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             0xFFFF
         };
         crate::print_str(b"[pump] WALL label=");
-        crate::print_u64(wall_label);
+        crate::print_u64(outcome.wall_label);
         crate::print_str(b" ip=0x");
-        crate::print_hex(wall_ip as u32);
+        crate::print_hex(outcome.wall_ip as u32);
         crate::print_str(b" addr=0x");
-        crate::print_hex((wall_addr >> 32) as u32);
-        crate::print_hex(wall_addr as u32);
+        crate::print_hex((outcome.wall_addr >> 32) as u32);
+        crate::print_hex(outcome.wall_addr as u32);
         crate::print_str(b" -> TCB_Suspend(component) e=");
         crate::print_u64(e);
         crate::print_str(
             b" (its reply object stays bound to a thread that will never run again)\n",
         );
     }
-    let (status, result) = if completed {
+}
+
+#[inline(never)]
+unsafe fn pump_result_from_outcome(ch: &PumpChannel, outcome: PumpLoopOutcome) -> PumpResult {
+    let (status, result) = if outcome.completed {
         // Proof-of-wiring: count each serviced dispatch by kind.
         match ch.caps.kind {
             ReqKind::Irp => HARNESS_IRP_DISPATCHES.fetch_add(1, Ordering::Relaxed),
@@ -1338,7 +1494,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 (result as u32 as i32, result)
             }
         }
-    } else if callback_suspended {
+    } else if outcome.callback_suspended {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
     } else {
@@ -1348,13 +1504,13 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     PumpResult {
         status,
         result,
-        completed,
-        callback_suspended,
-        wall_ip,
-        wall_addr,
-        wall_label,
-        faults,
-        demand,
+        completed: outcome.completed,
+        callback_suspended: outcome.callback_suspended,
+        wall_ip: outcome.wall_ip,
+        wall_addr: outcome.wall_addr,
+        wall_label: outcome.wall_label,
+        faults: outcome.faults,
+        demand: outcome.demand,
     }
 }
 
