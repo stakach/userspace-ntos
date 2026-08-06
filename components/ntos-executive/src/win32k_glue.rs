@@ -1790,6 +1790,7 @@ unsafe fn resume_suspended_user_callback_component(
         pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
         shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
         dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
         demand_cap: 8192,
@@ -1811,6 +1812,7 @@ unsafe fn resume_suspended_user_callback_component(
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
+            io_port_faults: false,
         },
     };
     let pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
@@ -4750,6 +4752,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         pml4: host_pml4,
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
         shared_va: sh,
         dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
         // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
@@ -4771,6 +4774,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
+            io_port_faults: false,
         },
     };
     let pr = crate::spawn_hosts::component_pump(&ch);

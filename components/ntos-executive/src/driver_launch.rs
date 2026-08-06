@@ -232,6 +232,8 @@ pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: number of allocation r
 pub const SH_DMA_ALLOC_RECORDS: u64 = 0x6B0; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
 pub const SH_DMA_ALLOC_RECORD_SLOTS: u64 = 8;
+pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
+pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -7813,6 +7815,7 @@ unsafe fn load_driver_reserved(
         pml4,
         code_va: run_va,
         image_frames: img_frames,
+        exec_code_va: code_va,
         shared_va: win.shared_va,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 512,
@@ -8659,6 +8662,9 @@ const EMPTY_HOSTED_ROOT_PDO_BINDING: HostedRootPdoBinding = HostedRootPdoBinding
 pub(crate) struct HostedHardwareEvidence {
     pub resource_mmio_phys: u64,
     pub resource_mmio_len: u64,
+    pub resource_io_port_len: u64,
+    pub resource_io_port_cap: u64,
+    pub io_port_out32_faults: u64,
     pub mmio_mapped_phys: u64,
     pub mmio_mapped_len: u64,
     pub interrupt_vector: u32,
@@ -8688,6 +8694,7 @@ impl HostedHardwareEvidence {
             || self.interrupt_vector != 0
             || self.dma_common_va != 0
             || self.dma_common_logical != 0
+            || self.resource_io_port_len != 0
     }
 
     pub(crate) fn mmio_mapped(self) -> bool {
@@ -8715,6 +8722,12 @@ impl HostedHardwareEvidence {
 
     pub(crate) fn dma_common_allocated(self) -> bool {
         self.dma_allocated_va != 0 && self.dma_allocated_logical != 0 && self.dma_requested_len != 0
+    }
+
+    pub(crate) fn io_port_out32_serviced(self) -> bool {
+        self.resource_io_port_len != 0
+            && self.resource_io_port_cap != 0
+            && self.io_port_out32_faults != 0
     }
 }
 
@@ -8818,6 +8831,10 @@ unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) {
 
 unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
     revoke_hosted_device_resources(binding);
+    let old_ioport_cap = read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    if old_ioport_cap != 0 {
+        let _ = crate::cnode_delete_recycle_r(old_ioport_cap);
+    }
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, 0);
@@ -8843,6 +8860,8 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_PCI_IRQ) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
@@ -9018,6 +9037,11 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
         HostedHardwareEvidence {
             resource_mmio_phys: read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64),
             resource_mmio_len: read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64),
+            resource_io_port_len: read_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *const u64),
+            resource_io_port_cap: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64),
+            io_port_out32_faults: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
+            ),
             mmio_mapped_phys: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
             mmio_mapped_len: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
             interrupt_vector: read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32),
@@ -9342,6 +9366,7 @@ unsafe fn dispatch_driver_unload_for_instance(
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
+        exec_code_va: ExecVaWindow::for_instance(index).code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -9396,6 +9421,7 @@ unsafe fn dispatch_add_device_for_instance(
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
+        exec_code_va: ExecVaWindow::for_instance(index).code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -9580,6 +9606,17 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     if (io_port_base == 0) != (io_port_len == 0) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    let io_port_last = if io_port_len != 0 {
+        let last = io_port_base
+            .checked_add(io_port_len as u64 - 1)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if io_port_base > u16::MAX as u64 || last > u16::MAX as u64 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        last
+    } else {
+        0
+    };
     let has_dma =
         dma_va != 0 || dma_frame_base != 0 || dma_pages != 0 || dma_logical != 0 || dma_len != 0;
     if has_dma
@@ -9669,11 +9706,33 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         },
     );
 
+    let mut io_port_cap = 0u64;
+    if io_port_len != 0 {
+        let Some(cap) = try_alloc_slot() else {
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        };
+        let issue = crate::issue_ioport_cap(cap, io_port_base as u16, io_port_last as u16);
+        if issue != 0 {
+            recycle_deleted_root_slot(cap);
+            print_str(b"[driver-launch] IOPortControl_Issue failed label=");
+            print_u64(issue);
+            print_str(b" range=0x");
+            print_hex(io_port_base as u32);
+            print_str(b"..0x");
+            print_hex(io_port_last as u32);
+            print_str(b"\n");
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        io_port_cap = cap;
+    }
+
     let sh = inst.exec_shared_va;
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
     write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mapped_len);
     write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, io_port_base);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, io_port_len as u64);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, io_port_cap);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, mmio_va);
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
@@ -10062,6 +10121,7 @@ unsafe fn dispatch_irp_for_instance(
         pml4,
         code_va: 0,
         image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
+        exec_code_va: ExecVaWindow::for_instance(inst).code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -10077,6 +10137,7 @@ unsafe fn dispatch_irp_for_instance(
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64) != 0,
             ..crate::spawn_hosts::HostCaps::default()
         },
     };

@@ -16589,41 +16589,6 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
     0
 }
 
-/// Issue an x86 I/O-port cap for the inclusive window `[first, last]` into
-/// `dest_slot` of the executive's root CNode (from the singleton IOPortControl cap).
-/// ABI: mr0=first, mr1=last, mr2=dest_index, mr3=dest_depth, extra cap = dest CNode.
-unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
-    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
-    let msginfo = (LBL_IOPORT_CONTROL_ISSUE << 12) | (1 << 9) | (1 << 7) | 4;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") SLOT_IO_PORT_CONTROL,
-        in("rsi") msginfo,
-        in("r10") first as u64,     // mr0 = first_port
-        in("r8") last as u64,       // mr1 = last_port
-        in("r9") dest_slot,         // mr2 = dest_index
-        in("r15") 64u64,            // mr3 = dest_depth (init CNode guard=0 → depth 64)
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// `out dx, eax` via an I/O-port cap (no reply).
-unsafe fn io_out32(ioport: u64, port: u16, value: u32) {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_SEND as u64,
-        in("rdi") ioport,
-        in("rsi") (LBL_IOPORT_OUT32 << 12) | 2,
-        in("r10") port as u64,      // mr0 = port
-        in("r8") value as u64,      // mr1 = value
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
 /// `in eax, dx` via an I/O-port cap — invoked with SysCall; the read value comes
 /// back as the reply's mr0 (r10).
 /// Invoke `X86Page::GetAddress` on a frame cap and return its physical address. The
@@ -19364,6 +19329,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 pml4: host_pml4,
                 code_va,
                 image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+                exec_code_va: code_va,
                 shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
                 dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
                 demand_cap: 512,
@@ -19696,6 +19662,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_interrupt_connected = false;
         let mut generic_hw_dma_adapter = false;
         let mut generic_hw_dma_common = false;
+        let mut generic_hw_io_out32 = false;
         let mut generic_hw_root_started = false;
         let mut generic_hw_attempted = 0u64;
         let mut generic_hw_started = 0u64;
@@ -19735,6 +19702,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_interrupt_connected |= start_report.interrupt_connected;
                     generic_hw_dma_adapter |= start_report.dma_adapter;
                     generic_hw_dma_common |= start_report.dma_common;
+                    generic_hw_io_out32 |= start_report.io_port_out32;
                     generic_hw_root_started |= start_report.root_started;
                     generic_hw_attempted += start_report.attempted;
                     generic_hw_started += start_report.started;
@@ -19777,6 +19745,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(generic_hw_dma_adapter as u64);
             print_str(b" dma_common=");
             print_u64(generic_hw_dma_common as u64);
+            print_str(b" io_out32=");
+            print_u64(generic_hw_io_out32 as u64);
             print_str(b" root_started=");
             print_u64(generic_hw_root_started as u64);
             print_str(b"\n");
@@ -20519,6 +20489,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dpc_delivered = false;
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
+    let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_selected = 0u64;
     let mut generic_hw_attempted = 0u64;
@@ -20535,6 +20506,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_pci_support_ready = 0u64;
     let mut generic_pci_add_device_count = 0u64;
     let mut generic_pci_started = 0u64;
+    let mut generic_pci_io_out32 = false;
     let mut generic_pci_first_error = 0u32;
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     if !config_pnp_plan.as_slice().is_empty() {
@@ -20589,6 +20561,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         if pci_support_ready {
                             generic_pci_support_ready += start_report.attempted;
                         }
+                        generic_pci_io_out32 |= start_report.io_port_out32;
                         if generic_pci_first_error == 0 && start_report.first_error != 0 {
                             generic_pci_first_error = start_report.first_error;
                         }
@@ -20605,6 +20578,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_dpc_delivered |= start_report.dpc_delivered;
                     generic_hw_dma_adapter |= start_report.dma_adapter;
                     generic_hw_dma_common |= start_report.dma_common;
+                    generic_hw_io_out32 |= start_report.io_port_out32;
                     generic_hw_root_started |= start_report.root_started;
                 } else {
                     print_str(
@@ -20641,12 +20615,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_pci_add_device_count);
         print_str(b" pci_started=");
         print_u64(generic_pci_started);
+        print_str(b" pci_io_out32=");
+        print_u64(generic_pci_io_out32 as u64);
         print_str(b" pci_first_error=0x");
         print_hex(generic_pci_first_error);
         print_str(b" root_attempted=");
         print_u64(generic_root_attempted);
         print_str(b" root_started=");
         print_u64(generic_root_started);
+        print_str(b" io_out32=");
+        print_u64(generic_hw_io_out32 as u64);
         print_str(b"\n");
     }
     check(
@@ -20692,6 +20670,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         generic_pci_add_device
             && generic_pci_selected != 0
             && generic_pci_add_device_count == generic_pci_selected,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pci_io_port_out32",
+        generic_pci_registry_selected && generic_pci_io_out32,
         &mut passed,
     );
     check(

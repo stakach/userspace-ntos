@@ -87,11 +87,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
    and refuses to synthesize missing exports; and hosted driver slots reserve/free from the live
    table while unmapping exec windows before reuse. Boot gates now prove PCI registry selection,
    real `ndis.sys` support `DriverEntry`, `e1000.sys` AddDevice, NT-style PCI config reads, full
-   MMIO/I/O/interrupt resource-list projection, and multiple common-buffer allocations from the
-   per-devnode DMA grant. Next continue the honest NDIS `IRP_MN_START_DEVICE` path at the remaining
-   miniport failure after descriptor/RX allocations: identify the next unimplemented NDIS/HAL
-   behavior needed for `e1000.sys` to connect interrupts and finish hardware start through the
-   generic PCI grant.
+   MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
+   per-devnode DMA grant, and cap-backed servicing of inline `out dx,eax` I/O-port faults inside the
+   PnP-granted I/O BAR. Next continue the honest NDIS `IRP_MN_START_DEVICE` path at the new
+   post-I/O-port failure: rootserver `RingChannel::raw` is writing through a null destination at
+   `rip=0x10000455944/cr2=0` during `e1000.sys` start after four serviced port writes. Identify the
+   registry/configuration or NDIS service request that enters that ring path, wire it to real kernel
+   functionality, and keep the generic PCI grant path scalable for multiple devnodes/NICs.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -601,3 +603,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   slots, and fixed proof BAR/DMA windows are still bounded. The next cleanup should replace those
   fixed hosted arenas with per-devnode dynamic resource/window allocation before multi-NIC support is
   considered complete.
+- B3 continued. Hosted hardware drivers now receive real x86 I/O-port caps for PnP-granted I/O BARs,
+  and the component pump services only validated x86 #GP `out dx,eax` faults against the projected
+  cap, resource range, opcode byte, and thread registers. Multi-instance hosted drivers now carry an
+  executive image alias into the pump for instruction validation, the old send-only port-I/O helpers
+  were replaced by shared error-reporting helpers, and boot evidence/gates now track generic PCI
+  port-write service instead of relying on NIC-specific code. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `.tmp/boot-ioport-out32-20260806.log`. Result: `exec_generic_pci_io_port_out32` passed, E1000
+  evidence reported `io_out32=1 io_out32_count=4`, and the boot reached genuine explorer shell
+  chrome with `285/292` checks passing. Review adjustment: the B3 frontier has moved past inline
+  port I/O. The next target is the rootserver `RingChannel::raw` null destination fault at
+  `rip=0x10000455944/cr2=0` during E1000 `START_DEVICE`, while longer-term multi-NIC support still
+  needs dynamic per-devnode hosted instance/resource windows rather than fixed proof arenas.

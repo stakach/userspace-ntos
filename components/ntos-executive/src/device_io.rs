@@ -1,5 +1,5 @@
 //! `device_io` — the P2 storage/device probe + low-level IO/PCI primitives
-//! (storage_probe, iopt_map, map_io, io_in32, pci_read32/write32).
+//! (storage_probe, iopt_map, map_io, I/O-port caps, io_in32/out32, pci_read32/write32).
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
@@ -669,6 +669,47 @@ pub(crate) unsafe fn map_io(
         inout("rsi") msginfo => reply,
         inout("r10") rights => _,    // mr0 = rights (args.a2)
         inout("r8") io_address => _, // mr1 = io_address (args.a3)
+        lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+/// Issue an x86 I/O-port cap for the inclusive window `[first, last]` into `dest_slot` of the
+/// executive's root CNode. Returns the kernel invocation label (0 = success).
+///
+/// ABI: mr0=first, mr1=last, mr2=dest_index, mr3=dest_depth, extra cap = dest CNode.
+pub(crate) unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) -> u64 {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
+    let msginfo = (LBL_IOPORT_CONTROL_ISSUE << 12) | (1 << 9) | (1 << 7) | 4;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") SLOT_IO_PORT_CONTROL => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") first as u64 => _,
+        inout("r8") last as u64 => _,
+        inout("r9") dest_slot => _,
+        inout("r15") 64u64 => _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+/// `out dx, eax` via an I/O-port cap. Returns the kernel invocation label (0 = success).
+pub(crate) unsafe fn io_out32(ioport: u64, port: u16, value: u32) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") ioport => _,
+        inout("rsi") (LBL_IOPORT_OUT32 << 12) | 2 => reply,
+        inout("r10") port as u64 => _,
+        inout("r8") value as u64 => _,
         lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),

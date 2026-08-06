@@ -131,6 +131,9 @@ pub(crate) struct HostCaps {
     /// [`Self::client_attach`] (which is about SHARING A CLIENT'S FRAMES, not about page tables) —
     /// win32k's DriverEntry-init pump needs the paging discipline WITHOUT the client sharing.
     pub sparse_vspace: bool,
+    /// Hosted hardware drivers: service x86 #GP faults caused by inline I/O-port writes when the
+    /// driver has a PnP-granted I/O-port cap in its shared resource projection.
+    pub io_port_faults: bool,
 }
 
 /// Fully declarative description of an isolated component to spawn. DATA only — the POLICY
@@ -596,6 +599,10 @@ pub(crate) struct PumpChannel {
     /// in-image wall (the per-IRP loop shape, which only walls on the low-address guard).
     pub code_va: u64,
     pub image_frames: u64,
+    /// Executive-side alias for the component image bytes. This differs from [`Self::code_va`] for
+    /// multi-instance hosted drivers, because every component runs at `FSD_CODE_VA` in its own VSpace
+    /// while the executive maps each loaded image at a unique alias.
+    pub exec_code_va: u64,
     /// The `SH_*` shared-frame base for this component.
     pub shared_va: u64,
     /// The DONE / ready label the server Sends when it re-parks (0x771 FSD / 0x770 win32k).
@@ -745,6 +752,8 @@ pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
+/// Hosted hardware-driver inline `out dx,eax` faults serviced through a PnP-granted IOPort cap.
+pub(crate) static HOSTED_IO_PORT_OUT32_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 // ── ★ NESTING OBSERVABILITY (Phase 2). These counters are NOT correlation state — nothing reads
 // them to decide where a message goes. That is the whole point: the 32-deep `DISPATCH_TOKEN_STACK`
@@ -1197,6 +1206,13 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             // REPLY_MAIN binding is untouched) with no second transport to keep gated.
             pump_reply_recv_into!(ch, msg, 0, 0);
             continue;
+        } else if label == 3 && ch.caps.io_port_faults {
+            if let Some(next_ip) = pump_service_io_port_out32_fault(ch, msg.m0, msg.m3) {
+                pump_reply_recv_into!(ch, msg, 1, next_ip);
+                continue;
+            }
+            outcome.wall(msg.m0, msg.m1, label);
+            break;
         } else if label == 3 && ch.caps.assert_skip {
             // ── win32k checked-build int-0x2c ASSERT-SKIP (relocated VERBATIM). Verify CD 2C via the
             // executive's RW view of win32k's image at the same VA, then resume at IP+2 (release-build
@@ -1421,6 +1437,91 @@ unsafe fn pump_service_generic_fault(
     crate::print_str(b"\n");
     let _ = crate::cnode_delete_recycle_r(f);
     false
+}
+
+#[inline(never)]
+unsafe fn pump_service_io_port_out32_fault(
+    ch: &PumpChannel,
+    fault_ip: u64,
+    exception_number: u64,
+) -> Option<u64> {
+    const X86_GP_EXCEPTION: u64 = 13;
+    const OUT_DX_EAX: u8 = 0xEF;
+
+    if exception_number != X86_GP_EXCEPTION || ch.tcb == 0 {
+        return None;
+    }
+
+    let sh = ch.shared_va;
+    let port_cap =
+        core::ptr::read_volatile((sh + crate::driver_launch::SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    let port_base = core::ptr::read_volatile(
+        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_BASE) as *const u64,
+    );
+    let port_len =
+        core::ptr::read_volatile((sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    if port_cap == 0 || port_base == 0 || port_len == 0 || ch.exec_code_va == 0 {
+        return None;
+    }
+
+    let (component_code_va, image_frames) = if ch.code_va != 0 && ch.image_frames != 0 {
+        (ch.code_va, ch.image_frames)
+    } else if ch.caps.kind == ReqKind::Irp {
+        (
+            crate::driver_launch::FSD_CODE_VA,
+            crate::driver_launch::FSD_IMAGE_FRAMES,
+        )
+    } else {
+        return None;
+    };
+    let image_len = image_frames.checked_mul(0x1000)?;
+    if fault_ip < component_code_va || fault_ip >= component_code_va.checked_add(image_len)? {
+        return None;
+    }
+    let offset = fault_ip - component_code_va;
+    let exec_ip = ch.exec_code_va.checked_add(offset)?;
+    if core::ptr::read_volatile(exec_ip as *const u8) != OUT_DX_EAX {
+        return None;
+    }
+
+    let mut regs = [0u64; 20];
+    crate::win32k_glue::tcb_read_regs20(ch.tcb, &mut regs);
+    let port = (regs[6] & 0xFFFF) as u16;
+    let value = regs[3] as u32;
+    let port_u64 = port as u64;
+    let grant_end = port_base.checked_add(port_len)?;
+    if port_u64 < port_base || port_u64.checked_add(4)? > grant_end {
+        return None;
+    }
+
+    let io = crate::io_out32(port_cap, port, value);
+    if io != 0 {
+        crate::print_str(b"[pump] IOPortOut32 failed label=");
+        crate::print_u64(io);
+        crate::print_str(b" port=0x");
+        crate::print_hex(port as u32);
+        crate::print_str(b"\n");
+        return None;
+    }
+
+    let local = core::ptr::read_volatile(
+        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
+    );
+    core::ptr::write_volatile(
+        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64,
+        local.saturating_add(1),
+    );
+    let global = HOSTED_IO_PORT_OUT32_FAULTS.fetch_add(1, Ordering::Relaxed);
+    if crate::DEBUG_TRACE && global < 16 {
+        crate::print_str(b"[pump] serviced IOPortOut32 port=0x");
+        crate::print_hex(port as u32);
+        crate::print_str(b" value=0x");
+        crate::print_hex(value);
+        crate::print_str(b" ip=0x");
+        crate::print_hex(fault_ip as u32);
+        crate::print_str(b"\n");
+    }
+    Some(fault_ip + 1)
 }
 
 #[inline(never)]

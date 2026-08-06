@@ -61,6 +61,7 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dpc_delivered: bool,
     pub(crate) dma_adapter: bool,
     pub(crate) dma_common: bool,
+    pub(crate) io_port_out32: bool,
     pub(crate) root_started: bool,
     pub(crate) attempted: u64,
     pub(crate) add_device_count: u64,
@@ -73,6 +74,7 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dpc_delivered_count: u64,
     pub(crate) dma_adapter_count: u64,
     pub(crate) dma_common_count: u64,
+    pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) first_error: u32,
 }
@@ -366,6 +368,7 @@ fn collect_hardware_evidence(
             report.dpc_delivered |= evidence.dpc_delivered();
             report.dma_adapter |= evidence.dma_adapter_created();
             report.dma_common |= evidence.dma_common_allocated();
+            report.io_port_out32 |= evidence.io_port_out32_serviced();
             report.root_started |= evidence.root_pdo_started;
             if evidence.mmio_mapped() {
                 report.mmio_mapped_count += 1;
@@ -384,6 +387,9 @@ fn collect_hardware_evidence(
             }
             if evidence.dma_common_allocated() {
                 report.dma_common_count += 1;
+            }
+            if evidence.io_port_out32_serviced() {
+                report.io_port_out32_count += 1;
             }
             if evidence.root_pdo_started {
                 report.root_started_count += 1;
@@ -572,6 +578,10 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_common_allocated() as u64);
     print_str(b" dma_len=");
     print_u64(evidence.dma_common_len);
+    print_str(b" io_out32=");
+    print_u64(evidence.io_port_out32_serviced() as u64);
+    print_str(b" io_out32_count=");
+    print_u64(evidence.io_port_out32_faults);
     print_str(b" root_started=");
     print_u64(evidence.root_pdo_started as u64);
     print_str(b"\n");
