@@ -6411,16 +6411,6 @@ fn try_alloc_slot_run(count: u64) -> Option<u64> {
     }
 }
 
-fn alloc_slot_run(count: u64) -> u64 {
-    match try_alloc_slot_run(count) {
-        Some(slot) => slot,
-        None => {
-            print_str(b"[cap] root CSpace exhausted while allocating a slot run\n");
-            park()
-        }
-    }
-}
-
 fn root_slot_bit(slot: u64) -> Option<(usize, u64)> {
     let start = ROOT_CSPACE_START.load(Ordering::Relaxed);
     let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
@@ -11855,6 +11845,36 @@ impl HostedPciDmaGrant {
 }
 
 #[derive(Clone, Copy)]
+struct HostedPciDmaAllocation {
+    grant: HostedPciDmaGrant,
+    cpu_va: u64,
+    physical_base: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HostedPciDmaIommuMap {
+    io_space_cap: u64,
+    mint_err: u64,
+    iopt_err: u64,
+    map_io_err: u64,
+}
+
+impl HostedPciDmaIommuMap {
+    const fn failed() -> Self {
+        Self {
+            io_space_cap: 0,
+            mint_err: 1,
+            iopt_err: 1,
+            map_io_err: 1,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.io_space_cap != 0 && self.mint_err == 0 && self.iopt_err == 0 && self.map_io_err == 0
+    }
+}
+
+#[derive(Clone, Copy)]
 struct HostedPciHardwareGrant {
     bus: u8,
     dev: u8,
@@ -11945,6 +11965,14 @@ fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
     }
 }
 
+fn hosted_pci_request_id(device: &nt_pnp::PciDevice) -> u64 {
+    ((device.bus as u64) << 8) | ((device.dev as u64) << 3) | device.func as u64
+}
+
+fn hosted_pci_dma_domain(device: &nt_pnp::PciDevice) -> u64 {
+    1 + hosted_pci_request_id(device)
+}
+
 fn hosted_pci_device_by_location<'a>(
     devices: &'a [nt_pnp::PciDevice],
     bus: u8,
@@ -11954,6 +11982,129 @@ fn hosted_pci_device_by_location<'a>(
     devices
         .iter()
         .find(|device| device.bus == bus && device.dev == dev && device.func == func)
+}
+
+unsafe fn allocate_hosted_pci_dma_grant(
+    pages: u64,
+    logical: u64,
+    len: u64,
+    cpu_va: u64,
+) -> Option<HostedPciDmaAllocation> {
+    if pages == 0 || len == 0 || len > pages.saturating_mul(0x1000) || logical == 0 {
+        return None;
+    }
+    let frame_base = try_alloc_slot_run(pages)?;
+    let mut page = 0u64;
+    while page < pages {
+        if untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            1,
+            frame_base + page,
+        ) != 0
+        {
+            return None;
+        }
+        page += 1;
+    }
+    let Some(cpu_pt) = try_alloc_slot() else {
+        return None;
+    };
+    if untyped_retype_r(
+        CAP_INIT_UNTYPED,
+        OBJ_X86_PAGE_TABLE,
+        PAGING_BITS,
+        1,
+        cpu_pt,
+    ) != 0
+    {
+        return None;
+    }
+    let _ = paging_struct_map_r(
+        cpu_pt,
+        LBL_X86_PAGE_TABLE_MAP,
+        cpu_va,
+        CAP_INIT_THREAD_VSPACE,
+    );
+    if page_map_r(frame_base, cpu_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        return None;
+    }
+    let physical_base = get_frame_paddr(frame_base);
+    if physical_base == 0 || (physical_base & 0xFFF) != 0 {
+        return None;
+    }
+    Some(HostedPciDmaAllocation {
+        grant: HostedPciDmaGrant::new(frame_base, pages, logical, len),
+        cpu_va,
+        physical_base,
+    })
+}
+
+unsafe fn map_hosted_pci_dma_grant_iova(
+    device: &nt_pnp::PciDevice,
+    grant: HostedPciDmaGrant,
+) -> HostedPciDmaIommuMap {
+    if !grant.valid() {
+        return HostedPciDmaIommuMap::failed();
+    }
+    let Some(io_space_cap) = try_alloc_slot() else {
+        return HostedPciDmaIommuMap::failed();
+    };
+    let domain = hosted_pci_dma_domain(device);
+    let io_badge = (domain << 16) | hosted_pci_request_id(device);
+    let mint_err = cnode_mint_r(CAP_INIT_THREAD_CNODE, io_space_cap, SLOT_IO_SPACE, io_badge);
+    let mut iopt_err = mint_err;
+    if mint_err == 0 {
+        for _ in 0..4 {
+            let Some(iopt) = try_alloc_slot() else {
+                iopt_err = 4;
+                break;
+            };
+            let retype_err = untyped_retype_r(
+                CAP_INIT_UNTYPED,
+                OBJ_X86_IO_PAGE_TABLE,
+                PAGING_BITS,
+                1,
+                iopt,
+            );
+            if retype_err != 0 {
+                iopt_err = retype_err;
+                break;
+            }
+            let map_err = iopt_map(iopt, io_space_cap, grant.logical);
+            if map_err != 0 {
+                iopt_err = map_err;
+            }
+        }
+    }
+    let mut map_io_err = if iopt_err == 0 { 0 } else { iopt_err };
+    if iopt_err == 0 {
+        let mut page = 0u64;
+        while page < grant.pages {
+            let (frame_io, copy_err) = copy_cap_r(grant.frame_base + page);
+            if copy_err != 0 {
+                map_io_err = copy_err;
+                break;
+            }
+            let err = map_io(
+                frame_io,
+                io_space_cap,
+                0x3,
+                grant.logical + page * 0x1000,
+            );
+            if err != 0 {
+                map_io_err = err;
+            }
+            page += 1;
+        }
+    }
+    HostedPciDmaIommuMap {
+        io_space_cap,
+        mint_err,
+        iopt_err,
+        map_io_err,
+    }
 }
 
 unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
@@ -18029,7 +18180,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                       // the handful of locals the deferred hosting block needs to function scope.
     let mut nic_bar_base = 0u64;
     let mut nic_bar_pages = 0u64;
-    let mut nic_dma_frame = 0u64;
+    let mut nic_dma_grant: Option<HostedPciDmaGrant> = None;
     if found_nic {
         if let Some(device) = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func) {
             if let Some(mem_bar) = device.first_memory_bar() {
@@ -18087,177 +18238,149 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 cmd | (1 << 2) | (1 << 1),
             );
 
-            let dma_frame = alloc_slot_run(NIC_DMA_PAGES);
-            nic_dma_frame = dma_frame; // hoist for the deferred (post-FS-mount) driver-host hosting
-            let mut dma_page = 0u64;
-            while dma_page < NIC_DMA_PAGES {
-                let _ = untyped_retype(
-                    CAP_INIT_UNTYPED,
-                    OBJ_X86_4K_PAGE,
-                    PAGING_BITS,
-                    1,
-                    dma_frame + dma_page,
+            if let Some(dma_alloc) =
+                allocate_hosted_pci_dma_grant(NIC_DMA_PAGES, NIC_IOVA, NIC_DMA_LEN, DMA_VADDR)
+            {
+                print_str(b"[ntos-exec] DMA frame paddr=");
+                print_hex((dma_alloc.physical_base >> 32) as u32);
+                print_hex(dma_alloc.physical_base as u32);
+                print_str(b"\n");
+                check(b"exec_frame_get_paddr", true, &mut passed);
+
+                // Frame layout: TX ring at offset 0 (8 legacy descriptors = 128 bytes, meeting
+                // the TDLEN 128-byte-alignment rule; we use descriptor 0), packet at 0x200.
+                const RING_OFF: u64 = 0x0;
+                const PKT_OFF: u64 = 0x200;
+                const PKT_LEN: u16 = 64;
+                for i in 0..PKT_LEN as u64 {
+                    core::ptr::write_volatile((dma_alloc.cpu_va + PKT_OFF + i) as *mut u8, 0xA5);
+                }
+                // Legacy TX descriptor 0 (16 bytes): buffer_addr[0..7], length[8..9], CSO[10],
+                // CMD[11]=EOP|RS, STA[12] (NIC writes DD here), CSS[13], special[14..15].
+                core::ptr::write_volatile(
+                    (dma_alloc.cpu_va + RING_OFF) as *mut u64,
+                    dma_alloc.physical_base + PKT_OFF,
                 );
-                dma_page += 1;
-            }
-            // DMA_VADDR lives in its OWN dedicated 2 MiB region — build its page table so the frame
-            // map lands in a guaranteed-free leaf slot (the old shared-cluster slot was occupied,
-            // making page_map fail with DeleteFirst → CPU wrote a stale frame while the NIC DMA'd a
-            // zeroed one → no DD writeback ever observed).
-            let dma_pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, dma_pt);
-            let _ = paging_struct_map(
-                dma_pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                DMA_VADDR,
-                CAP_INIT_THREAD_VSPACE,
-            );
-            let _ = page_map_r(dma_frame, DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-            let dma_paddr = get_frame_paddr(dma_frame);
-            print_str(b"[ntos-exec] DMA frame paddr=");
-            print_hex((dma_paddr >> 32) as u32);
-            print_hex(dma_paddr as u32);
-            print_str(b"\n");
-            check(
-                b"exec_frame_get_paddr",
-                dma_paddr != 0 && (dma_paddr & 0xFFF) == 0,
-                &mut passed,
-            );
-
-            // Frame layout: TX ring at offset 0 (8 legacy descriptors = 128 bytes, meeting
-            // the TDLEN 128-byte-alignment rule; we use descriptor 0), packet at 0x200.
-            const RING_OFF: u64 = 0x0;
-            const PKT_OFF: u64 = 0x200;
-            const PKT_LEN: u16 = 64;
-            for i in 0..PKT_LEN as u64 {
-                core::ptr::write_volatile((DMA_VADDR + PKT_OFF + i) as *mut u8, 0xA5);
-            }
-            // Legacy TX descriptor 0 (16 bytes): buffer_addr[0..7], length[8..9], CSO[10],
-            // CMD[11]=EOP|RS, STA[12] (NIC writes DD here), CSS[13], special[14..15].
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF) as *mut u64, dma_paddr + PKT_OFF);
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 8) as *mut u16, PKT_LEN);
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 10) as *mut u8, 0); // CSO
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 11) as *mut u8, 0x09); // CMD = EOP | RS
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 12) as *mut u8, 0); // STA (NIC writes DD)
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 13) as *mut u8, 0); // CSS
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 14) as *mut u16, 0); // special
-
-            // Point the TX engine at the ring's PHYSICAL address, enable TX, arm queue 0,
-            // then kick. QEMU's e1000e gates TX on TARC0 bit 10 (E1000_TARC_ENABLE) — not
-            // TXDCTL — so without it a TDT write silently does nothing.
-            let ring_paddr = dma_paddr + RING_OFF;
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAL) as *mut u32, ring_paddr as u32);
-            core::ptr::write_volatile(
-                (NIC_VADDR + E1000_TDBAH) as *mut u32,
-                (ring_paddr >> 32) as u32,
-            );
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDLEN) as *mut u32, 128);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TCTL) as *mut u32, 0x0004_00F3); // EN|PSP|CT|COLD
-            let tarc0 = core::ptr::read_volatile((NIC_VADDR + E1000_TARC0) as *const u32);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TARC0) as *mut u32, tarc0 | (1 << 10));
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1); // hand off descriptor 0
-
-            // Poll the descriptor's STA byte (offset +12) for DD (bit 0) — set by the NIC
-            // via DMA once it has processed the descriptor.
-            let mut dd = 0u8;
-            for _ in 0..2_000_000u64 {
-                dd = core::ptr::read_volatile((DMA_VADDR + RING_OFF + 12) as *const u8);
-                if dd & 0x1 != 0 {
-                    break;
-                }
-                yield_now();
-            }
-            print_str(b"[ntos-exec] TX descriptor STA=0x");
-            print_hex(dd as u32);
-            print_str(b" (DD=1 => NIC DMA-read the ring+buffer and DMA-wrote status)\n");
-            check(b"exec_nic_tx_dma_writeback", dd & 0x1 != 0, &mut passed);
-
-            // ---- DMA Phase 2: CONFINE the NIC's DMA via the VT-d IOMMU. Grant the NIC an
-            // IO address space containing ONLY this frame, reprogram it to address memory
-            // by IOVA (not raw paddr), and prove the DMA still lands — now translated +
-            // confined, so a DMA anywhere else would fault. Building the NIC's first IO
-            // context lazily turns on VT-d translation (kernel side).
-            print_str(b"[ntos-exec] DMA Phase 2: confine NIC DMA via the VT-d IOMMU\n");
-            // Mint a device IO-space cap stamped with the NIC's PCI request-id + a domain.
-            let nic_rid = ((nic_dev as u64) << 3) | (nic_func as u64);
-            let nic_io_badge = (1u64 << 16) | nic_rid;
-            let nic_io_space = alloc_slot();
-            let _ = syscall5(
-                SYS_SEND,
-                CAP_INIT_THREAD_CNODE,
-                LBL_CNODE_MINT << 12,
-                nic_io_space,
-                SLOT_IO_SPACE,
-                nic_io_badge,
-            );
-            // Build the 4-level IO page-table hierarchy toward NIC_IOVA: 4 tables (context
-            // root + 3 intermediate — the walk starts at levels_remaining=3 so MapIO reaches
-            // level 0 only after 4 tables). The first install creates the context + TE.
-            let mut iopt_err = 0u64;
-            for _ in 0..4 {
-                let iopt = alloc_slot();
-                let _ = untyped_retype(
-                    CAP_INIT_UNTYPED,
-                    OBJ_X86_IO_PAGE_TABLE,
-                    PAGING_BITS,
-                    1,
-                    iopt,
+                core::ptr::write_volatile(
+                    (dma_alloc.cpu_va + RING_OFF + 8) as *mut u16,
+                    PKT_LEN,
                 );
-                let e = iopt_map(iopt, nic_io_space, NIC_IOVA);
-                if e != 0 {
-                    iopt_err = e;
-                }
-            }
-            print_str(b"[ntos-exec] IO page-table build err=");
-            print_u64(iopt_err);
-            print_str(b"\n");
-            check(b"exec_nic_iopt_hierarchy_built", iopt_err == 0, &mut passed);
-            // Map the DMA frame (a COPY — the original stays VSpace-mapped for CPU access)
-            // into the NIC's IO space at NIC_IOVA, read+write.
-            let mut map_err = 0u64;
-            let mut dma_page = 0u64;
-            while dma_page < NIC_DMA_PAGES {
-                let dma_frame_io = copy_cap(dma_frame + dma_page);
-                let err = map_io(
-                    dma_frame_io,
-                    nic_io_space,
-                    0x3,
-                    NIC_IOVA + dma_page * 0x1000,
-                );
-                if err != 0 {
-                    map_err = err;
-                }
-                dma_page += 1;
-            }
-            print_str(b"[ntos-exec] map_io err=");
-            print_u64(map_err);
-            print_str(b"\n");
-            check(b"exec_nic_dma_frame_io_mapped", map_err == 0, &mut passed);
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 10) as *mut u8, 0); // CSO
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 11) as *mut u8, 0x09); // CMD = EOP | RS
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 12) as *mut u8, 0); // STA (NIC writes DD)
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 13) as *mut u8, 0); // CSS
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 14) as *mut u16, 0); // special
 
-            // Re-arm a transmit, but now the NIC addresses memory via the IOVA: ring base =
-            // NIC_IOVA, buffer = NIC_IOVA + PKT_OFF. The CPU still reads/writes the
-            // descriptor through the VSpace mapping (DMA_VADDR) — VT-d only gates the device.
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF) as *mut u64, NIC_IOVA + PKT_OFF);
-            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 12) as *mut u8, 0); // clear STA/DD
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAL) as *mut u32, NIC_IOVA as u32);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAH) as *mut u32, 0);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
-            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1);
-            let mut dd2 = 0u8;
-            for _ in 0..2_000_000u64 {
-                dd2 = core::ptr::read_volatile((DMA_VADDR + RING_OFF + 12) as *const u8);
-                if dd2 & 0x1 != 0 {
-                    break;
+                // Point the TX engine at the ring's PHYSICAL address, enable TX, arm queue 0,
+                // then kick. QEMU's e1000e gates TX on TARC0 bit 10 (E1000_TARC_ENABLE) — not
+                // TXDCTL — so without it a TDT write silently does nothing.
+                let ring_paddr = dma_alloc.physical_base + RING_OFF;
+                core::ptr::write_volatile(
+                    (NIC_VADDR + E1000_TDBAL) as *mut u32,
+                    ring_paddr as u32,
+                );
+                core::ptr::write_volatile(
+                    (NIC_VADDR + E1000_TDBAH) as *mut u32,
+                    (ring_paddr >> 32) as u32,
+                );
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDLEN) as *mut u32, 128);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TCTL) as *mut u32, 0x0004_00F3); // EN|PSP|CT|COLD
+                let tarc0 = core::ptr::read_volatile((NIC_VADDR + E1000_TARC0) as *const u32);
+                core::ptr::write_volatile(
+                    (NIC_VADDR + E1000_TARC0) as *mut u32,
+                    tarc0 | (1 << 10),
+                );
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1); // hand off descriptor 0
+
+                // Poll the descriptor's STA byte (offset +12) for DD (bit 0) — set by the NIC
+                // via DMA once it has processed the descriptor.
+                let mut dd = 0u8;
+                for _ in 0..2_000_000u64 {
+                    dd = core::ptr::read_volatile(
+                        (dma_alloc.cpu_va + RING_OFF + 12) as *const u8,
+                    );
+                    if dd & 0x1 != 0 {
+                        break;
+                    }
+                    yield_now();
                 }
-                yield_now();
+                print_str(b"[ntos-exec] TX descriptor STA=0x");
+                print_hex(dd as u32);
+                print_str(b" (DD=1 => NIC DMA-read the ring+buffer and DMA-wrote status)\n");
+                check(b"exec_nic_tx_dma_writeback", dd & 0x1 != 0, &mut passed);
+
+                // ---- DMA Phase 2: CONFINE the NIC's DMA via the VT-d IOMMU. Grant the NIC an
+                // IO address space containing ONLY this frame, reprogram it to address memory
+                // by IOVA (not raw paddr), and prove the DMA still lands — now translated +
+                // confined, so a DMA anywhere else would fault. Building the NIC's first IO
+                // context lazily turns on VT-d translation (kernel side).
+                print_str(b"[ntos-exec] DMA Phase 2: confine NIC DMA via the VT-d IOMMU\n");
+                let dma_iommu = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func)
+                    .map(|device| map_hosted_pci_dma_grant_iova(device, dma_alloc.grant))
+                    .unwrap_or_else(HostedPciDmaIommuMap::failed);
+                print_str(b"[ntos-exec] IO page-table build err=");
+                print_u64(dma_iommu.iopt_err);
+                print_str(b" mint=");
+                print_u64(dma_iommu.mint_err);
+                print_str(b"\n");
+                check(
+                    b"exec_nic_iopt_hierarchy_built",
+                    dma_iommu.mint_err == 0 && dma_iommu.iopt_err == 0,
+                    &mut passed,
+                );
+                print_str(b"[ntos-exec] map_io err=");
+                print_u64(dma_iommu.map_io_err);
+                print_str(b"\n");
+                check(
+                    b"exec_nic_dma_frame_io_mapped",
+                    dma_iommu.map_io_err == 0,
+                    &mut passed,
+                );
+                check(
+                    b"exec_hosted_pci_dma_grant_iommu_brokered",
+                    dma_alloc.grant.valid() && dma_iommu.complete(),
+                    &mut passed,
+                );
+                if dma_iommu.complete() {
+                    nic_dma_grant = Some(dma_alloc.grant);
+                }
+
+                // Re-arm a transmit, but now the NIC addresses memory via the IOVA: ring base =
+                // grant.logical, buffer = grant.logical + PKT_OFF. The CPU still reads/writes the
+                // descriptor through the VSpace mapping (DMA_VADDR) — VT-d only gates the device.
+                core::ptr::write_volatile(
+                    (dma_alloc.cpu_va + RING_OFF) as *mut u64,
+                    dma_alloc.grant.logical + PKT_OFF,
+                );
+                core::ptr::write_volatile((dma_alloc.cpu_va + RING_OFF + 12) as *mut u8, 0); // clear STA/DD
+                core::ptr::write_volatile(
+                    (NIC_VADDR + E1000_TDBAL) as *mut u32,
+                    dma_alloc.grant.logical as u32,
+                );
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDBAH) as *mut u32, 0);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
+                core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1);
+                let mut dd2 = 0u8;
+                for _ in 0..2_000_000u64 {
+                    dd2 = core::ptr::read_volatile(
+                        (dma_alloc.cpu_va + RING_OFF + 12) as *const u8,
+                    );
+                    if dd2 & 0x1 != 0 {
+                        break;
+                    }
+                    yield_now();
+                }
+                print_str(b"[ntos-exec] confined TX descriptor STA=0x");
+                print_hex(dd2 as u32);
+                print_str(b" (DD=1 => NIC DMA went through VT-d: IOVA -> frame)\n");
+                check(b"exec_nic_confined_dma", dd2 & 0x1 != 0, &mut passed);
+            } else {
+                check(b"exec_frame_get_paddr", false, &mut passed);
+                check(b"exec_hosted_pci_dma_grant_iommu_brokered", false, &mut passed);
             }
-            print_str(b"[ntos-exec] confined TX descriptor STA=0x");
-            print_hex(dd2 as u32);
-            print_str(b" (DD=1 => NIC DMA went through VT-d: IOVA -> frame)\n");
-            check(b"exec_nic_confined_dma", dd2 & 0x1 != 0, &mut passed);
             // NOTE: the ISOLATED real-.sys DRIVER-HOST hosting used to run here, but it now loads
             // the driver BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
             // the FS mount (search "DEFERRED DRIVER-HOST"). VT-d + the raw NIC MMIO/DMA specs above
@@ -18268,21 +18391,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut hosted_pci_hardware_grants = Vec::new();
     let mut hosted_pci_existing_grants = 0u64;
     let mut hosted_pci_existing_grant_failures = 0u64;
-    if nic_bar_base != 0 && nic_dma_frame != 0 {
+    if nic_bar_base != 0 {
         let grant = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func).and_then(
             |device| {
+                let dma_grant = nic_dma_grant?;
                 HostedPciHardwareGrant::for_device(
                     device,
                     nic_bar_base,
                     nic_bar_pages,
                     NIC_MSI_VECTOR as u32,
                     true,
-                    Some(HostedPciDmaGrant::new(
-                        nic_dma_frame,
-                        NIC_DMA_PAGES,
-                        NIC_IOVA,
-                        NIC_DMA_LEN,
-                    )),
+                    Some(dma_grant),
                 )
             },
         );
@@ -18345,7 +18464,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA frame there.
             // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
             let ahci_rid = ((storage_dev as u64) << 3) | (storage_func as u64);
-            let ahci_io_badge = (2u64 << 16) | ahci_rid; // domain 2 (the NIC uses domain 1)
+            let ahci_io_badge = (2u64 << 16) | ahci_rid; // storage proof domain
             let ahci_io_space = alloc_slot();
             let _ = syscall5(
                 SYS_SEND,

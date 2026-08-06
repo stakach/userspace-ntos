@@ -90,12 +90,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    Hosted PCI and root-bus resource grants now use selected per-devnode component windows instead
    of NIC-named globals or root-bus proof VAs, publication is selected from the boot/system PnP
    launch plans, and the PCI broker discovers grant material for every registry-selected eligible
-   PCI function. Existing `E1000` PCI grant registration now goes through the same generic
-   `HostedPciHardwareGrant::for_device`/`HostedPciDmaGrant` constructor as discovery and derives
-   BAR size from the enumerated device, but the raw direct proof still performs DMA/IOMMU allocation
-   before handing broker material to hosted PnP. The next B3 target is moving DMA/IOMMU grant
-   construction behind a broker API and replacing bounded hosted window/instance tables where they
-   block arbitrary multi-driver scale.
+   PCI function. Existing `E1000` PCI grant registration, DMA grant allocation, and IOMMU mapping now
+   flow through generic broker helpers that derive BAR size and DMA domain/request identity from the
+   enumerated PCI device. The raw direct TX proof remains only as a hardware liveness proof before
+   VT-d mapping. The next B3 target is replacing bounded hosted window/instance/allocation-record
+   tables where they block arbitrary multi-driver scale, then retiring the direct raw proof once
+   generic PCI evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -771,3 +771,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `293/293` checks passing. Review adjustment: the remaining B3 cleanup is moving DMA/common-buffer
   and IOMMU allocation itself behind the broker boundary, then replacing fixed hosted
   window/instance caps where they block arbitrary multi-driver scale.
+- B3 cleanup continued. E1000 DMA/common-buffer grant allocation and IOMMU setup moved behind
+  generic broker helpers: `allocate_hosted_pci_dma_grant` allocates the cap-backed common-buffer
+  grant, `map_hosted_pci_dma_grant_iova` derives IO-space request/domain identity from the
+  enumerated PCI device and maps the grant into the device IO space, and hosted PnP only receives
+  the existing DMA grant after IOMMU mapping succeeds. The unused raw `alloc_slot_run` helper was
+  removed. The raw direct TX proof still runs before VT-d as a hardware liveness proof, while the
+  brokered boundary is now gated by `exec_hosted_pci_dma_grant_iommu_brokered`. Validation:
+  `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-brokered-pci-dma-grant-20260807.log`.
+  Result: `exec_frame_get_paddr`, `exec_nic_tx_dma_writeback`,
+  `exec_nic_iopt_hierarchy_built`, `exec_nic_dma_frame_io_mapped`,
+  `exec_hosted_pci_dma_grant_iommu_brokered`, and `exec_nic_confined_dma` pass; registry-selected
+  PCI/root window publication, ReactOS `E1000`, `DmaPnpPowerTest`, ISR/DPC evidence, and explorer
+  shell chrome remain green with `294/294` checks passing. Review adjustment: B3 cleanup now moves
+  to bounded hosted window/instance/allocation-record scaling and then removing the direct raw proof
+  once generic PCI evidence fully replaces it.
