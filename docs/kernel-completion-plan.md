@@ -96,10 +96,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    from the real hosted-driver VA arena and reports VA exhaustion instead of using fixed PCI/root
    window caps. Hosted driver instance, reply-cap, and executive alias bookkeeping now grows on
    demand; per-instance executive VAs come from a checked high arena with on-demand PD/PT coverage.
-   The raw direct TX proof remains only as a hardware liveness proof before VT-d mapping. The next B3
-   target is replacing shared-frame DMA allocation-record capacity and any remaining launch-state caps
-   that block arbitrary multi-driver scale, then retiring the direct raw proof once generic PCI
-   evidence fully covers it.
+   Hosted common-buffer allocation records now use the per-instance shared arena capacity instead of
+   a fixed eight-record table. The raw direct TX proof remains only as a hardware liveness proof
+   before VT-d mapping. The next B3 target is replacing remaining hosted launch-state caps such as
+   hosted device/root-PDO bindings and registry-identity slots, then retiring the direct raw proof once
+   generic PCI evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -826,3 +827,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   with `294/294` checks passing. Review adjustment: remaining B3 launch scaling debt is shared-frame
   DMA allocation records and any other fixed launch-state caps; then remove direct raw NIC proof once
   generic PCI evidence fully replaces it.
+- B3 cleanup continued. The hosted common-buffer allocation record list no longer has a fixed
+  eight-record shared-page cap. Each hosted driver now maps the full shared handoff arena up to the
+  ARG window, publishes the derived record capacity in shared metadata, and validates the capacity and
+  high-water mark before replaying allocations into `nt-dma-manager`. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-dma-record-arena-20260807.log`. Result:
+  `exec_hosted_pci_dma_grant_iommu_brokered`, `exec_generic_hw_mmio_interrupt_dma`,
+  `exec_generic_pci_registry_selected`, `exec_generic_pci_support_driver_entry`,
+  `exec_generic_pci_add_device_reached`, `exec_generic_pci_io_port_out32`, and explorer shell chrome
+  stay green with `294/294` checks passing. Review adjustment: remaining B3 launch scaling debt is now
+  hosted device/root-PDO binding tables, hosted registry identity slots, and any small shared queues
+  that block real multi-device drivers; then remove direct raw NIC proof once generic PCI evidence
+  fully replaces it.

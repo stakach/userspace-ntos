@@ -10,7 +10,7 @@
 //!
 //! POLICY CLASSES (see `project_driver_model.md`):
 //!   * [`DriverClass::Fsd`]    — file-system drivers (npfs, fastfat, ntfs): image + heap/pool + stack
-//!     + IPC-buf + fault EP + a shared handoff page; NO device caps.
+//!     + IPC-buf + fault EP + a shared handoff arena; NO device caps.
 //!   * [`DriverClass::Device`] — hardware drivers (NIC/AHCI/GPU): PnP selects devnodes/resources,
 //!     then the executive grants the hosted driver exactly those MMIO/interrupt/DMA authorities.
 //!   * [`DriverClass::Filter`]  — FS/bus filter drivers: the SAME IRP substrate + caps as `Fsd`.
@@ -98,9 +98,13 @@ pub const FSD_DATA_FRAMES: u64 = 4;
 /// The component's GS base — a zeroed KPCR placeholder (an FSD, a kernel driver, may read `gs:[..]`).
 pub const FSD_KPCR_VA: u64 = FSD_DATA_VADDR + 0x1000;
 
-/// Shared handoff page (executive ↔ host): entry rva in, verdict + MajorFunction table + device
-/// object out, then the IRP request/reply fields.
+/// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
+/// object out, then the IRP request/reply fields. The arena extends up to the ARG window so hosted
+/// import shims can publish variable-length state without baking a tiny fixed table into page 0.
 pub const FSD_SHARED_VADDR: u64 = 0x0000_0100_0F38_0000;
+pub const FSD_SHARED_FRAMES: u64 = (FSD_ARG_VADDR - FSD_SHARED_VADDR) / 0x1000;
+const _: () = assert!(FSD_SHARED_FRAMES > 0);
+const _: () = assert!(FSD_SHARED_VADDR + FSD_SHARED_FRAMES * 0x1000 <= FSD_ARG_VADDR);
 
 /// The cross-AS ARG-MARSHAL frame(s): mapped RW in BOTH the executive and the FSD component. The
 /// executive copies an IRP's system-buffer here; the FSD's MajorFunction handler reads/writes it in
@@ -242,10 +246,9 @@ pub const SH_REGISTRY_EXPORT_BUF: u64 = 0x610; // in: ASCII Linkage\Export
 pub const SH_RESOURCE_IO_PORT_BASE: u64 = 0x690; // in: granted PCI I/O port base
 pub const SH_RESOURCE_IO_PORT_LEN: u64 = 0x698; // in: granted PCI I/O port length
 pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
-pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: number of allocation records ever used
-pub const SH_DMA_ALLOC_RECORDS: u64 = 0x6B0; // out: [logical,len,va] allocation records
+pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
+pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
 pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
-pub const SH_DMA_ALLOC_RECORD_SLOTS: u64 = 8;
 pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
 pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
@@ -254,6 +257,10 @@ pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
 pub const SH_DEVICE_INTERFACE_LINK_BUF: u64 = 0x790; // out: UTF-16LE path capture
 pub const SH_DEVICE_INTERFACE_TARGET_BUF: u64 = 0x890; // out: UTF-16LE path capture
 pub const SH_HOSTED_CURRENT_IRQL: u64 = 0x990; // in/out: hosted KIRQL byte for patched CR8 helpers
+pub const SH_DMA_ALLOC_RECORDS: u64 = 0xA00; // out: [logical,len,va] allocation records
+pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
+const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
+const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -4039,17 +4046,38 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 unsafe fn dma_allocation_record(sh: u64, index: u64) -> Option<u64> {
-    if index >= SH_DMA_ALLOC_RECORD_SLOTS {
+    if index >= dma_allocation_record_capacity(sh) {
         return None;
     }
-    Some(sh + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE)
+    let offset = SH_DMA_ALLOC_RECORDS.checked_add(index.checked_mul(SH_DMA_ALLOC_RECORD_SIZE)?)?;
+    if offset.checked_add(SH_DMA_ALLOC_RECORD_SIZE)? > SH_DMA_ALLOC_RECORD_LIMIT {
+        return None;
+    }
+    Some(sh + offset)
+}
+
+const fn dma_allocation_record_arena_capacity() -> u64 {
+    (SH_DMA_ALLOC_RECORD_LIMIT - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE
+}
+
+unsafe fn dma_allocation_record_capacity(sh: u64) -> u64 {
+    let capacity = read_volatile((sh + SH_DMA_ALLOC_RECORD_CAPACITY) as *const u64);
+    if capacity == dma_allocation_record_arena_capacity() {
+        capacity
+    } else {
+        0
+    }
 }
 
 unsafe fn clear_dma_allocation_records(sh: u64) {
     write_volatile((sh + SH_DMA_ALLOC_CURSOR) as *mut u64, 0);
     write_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_DMA_ALLOC_RECORD_CAPACITY) as *mut u64,
+        dma_allocation_record_arena_capacity(),
+    );
     let mut i = 0u64;
-    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+    while i < dma_allocation_record_arena_capacity() {
         if let Some(record) = dma_allocation_record(sh, i) {
             write_volatile(record as *mut u64, 0);
             write_volatile((record + 8) as *mut u64, 0);
@@ -4067,7 +4095,8 @@ unsafe fn dma_allocation_range_overlaps(
 ) -> Option<u64> {
     let end = offset.checked_add(length)?;
     let mut i = 0u64;
-    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+    let capacity = dma_allocation_record_capacity(sh);
+    while i < capacity {
         let record = dma_allocation_record(sh, i)?;
         let logical = read_volatile(record as *const u64);
         let record_len = read_volatile((record + 8) as *const u64);
@@ -4085,7 +4114,8 @@ unsafe fn dma_allocation_range_overlaps(
 
 unsafe fn first_free_dma_allocation_record(sh: u64) -> Option<u64> {
     let mut i = 0u64;
-    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+    let capacity = dma_allocation_record_capacity(sh);
+    while i < capacity {
         let record = dma_allocation_record(sh, i)?;
         if read_volatile((record + 8) as *const u64) == 0 {
             return Some(record);
@@ -4190,7 +4220,8 @@ extern "win64" fn s_dma_free_common_buffer(
     unsafe {
         let logical = logical as u64;
         let mut i = 0u64;
-        while i < SH_DMA_ALLOC_RECORD_SLOTS {
+        let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+        while i < capacity {
             if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
                 let active_logical = read_volatile(record as *const u64);
                 let active_len = read_volatile((record + 8) as *const u64);
@@ -7857,8 +7888,8 @@ unsafe fn load_driver_reserved(
     let run_va = FSD_CODE_VA;
     let img_frames = FSD_IMAGE_FRAMES;
 
-    // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, DATA + SHARED +
-    //    ARG in an aux PT. POOL is host-only.
+    // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, DATA + SHARED
+    //    arena + ARG in an aux PT. POOL is host-only.
     let cpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
     map_instance_exec_pt(instance, cpt, code_va)?;
@@ -7880,7 +7911,10 @@ unsafe fn load_driver_reserved(
     for _ in 1..FSD_DATA_FRAMES {
         let _ = alloc_frame();
     }
-    let shared = alloc_frame();
+    let shared_base = alloc_frame();
+    for _ in 1..FSD_SHARED_FRAMES {
+        let _ = alloc_frame();
+    }
     let arg_base = alloc_frame();
     for _ in 1..FSD_ARG_FRAMES {
         let _ = alloc_frame();
@@ -7892,8 +7926,10 @@ unsafe fn load_driver_reserved(
         let cap = copy_cap(data_base + i);
         map_instance_exec_frame(instance, cap, win.data_va + i * 0x1000, RW_NX)?;
     }
-    let shared_cap = copy_cap(shared);
-    map_instance_exec_frame(instance, shared_cap, win.shared_va, RW_NX)?;
+    for i in 0..FSD_SHARED_FRAMES {
+        let cap = copy_cap(shared_base + i);
+        map_instance_exec_frame(instance, cap, win.shared_va + i * 0x1000, RW_NX)?;
+    }
     for i in 0..FSD_ARG_FRAMES {
         let cap = copy_cap(arg_base + i);
         map_instance_exec_frame(instance, cap, win.arg_va + i * 0x1000, RW_NX)?;
@@ -7920,6 +7956,7 @@ unsafe fn load_driver_reserved(
         (win.shared_va + SH_HOSTED_CURRENT_IRQL) as *mut u8,
         PASSIVE_LEVEL,
     );
+    clear_dma_allocation_records(win.shared_va);
     clear_shared_device_interface_state_at(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);
 
@@ -7929,7 +7966,7 @@ unsafe fn load_driver_reserved(
         code_base,
         pool_base,
         data_base,
-        shared,
+        shared_base,
         arg_base,
         fault_ep,
         &rights[..img_frames as usize],
@@ -8090,8 +8127,8 @@ unsafe fn load_driver_reserved(
     Some(dc)
 }
 
-/// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED/ARG windows, fault
-/// EP — NO device caps. Delegates to the generic [`spawn_component`] engine.
+/// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED arena/ARG windows,
+/// fault EP — NO device caps. Delegates to the generic [`spawn_component`] engine.
 unsafe fn spawn_fsd_component(
     code_base: u64,
     pool_base: u64,
@@ -8136,11 +8173,11 @@ unsafe fn spawn_fsd_component(
             rights: Rights::Uniform(RW_NX),
             pts: 0,
         },
-        // Shared handoff page (aux window).
+        // Shared handoff arena (aux window).
         Region {
             source: FrameSource::Alias(shared),
             base_va: FSD_SHARED_VADDR,
-            count: 1,
+            count: FSD_SHARED_FRAMES,
             rights: Rights::Uniform(RW_NX),
             pts: 0,
         },
@@ -10144,8 +10181,13 @@ unsafe fn record_hosted_resource_usage(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
 
+    let record_capacity = dma_allocation_record_capacity(sh);
+    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     let mut record_index = 0u64;
-    while record_index < SH_DMA_ALLOC_RECORD_SLOTS {
+    while record_index < record_count {
         let Some(record) = dma_allocation_record(sh, record_index) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
@@ -10170,7 +10212,10 @@ unsafe fn record_hosted_resource_usage(
             let va_offset = va
                 .checked_sub(dma_grant_va)
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            if logical_offset != va_offset || logical_offset > dma_grant_len || len > dma_grant_len - logical_offset {
+            if logical_offset != va_offset
+                || logical_offset > dma_grant_len
+                || len > dma_grant_len - logical_offset
+            {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
             hosted_dma_manager_mut()
