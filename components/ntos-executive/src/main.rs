@@ -2030,31 +2030,45 @@ static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_TRANSPORT_PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): ONE dedicated MCS reply object
-/// per launched Family-A IRP driver instance. These back the `Call`(component) ⇄ `reply_on`
+/// per launched Family-A IRP driver instance. These back the `Call`(component) to `reply_on`
 /// (executive) transport that replaces the hand-rolled Send/Recv dispatch pair.
 ///
-/// **One object per component is sufficient at ANY nesting depth**: a component host has one TCB,
-/// so it is blocked in at most one `Call` at a time (dispatch-done / demand-page fault / callback);
-/// the kernel's `replies[i].bound_tcb` IS the correlation state and the "nesting stack" is the
-/// component's own C stack.
-///
-/// ★ R7 — these are DEDICATED. They are never entered into [`WAIT_REPLY_POOL`], never rotated, and
-/// never stolen by `wait_park`/`pipe_wait_park`/`dbgk_reporter_park`/`io_completion_park`, so a park
-/// can never steal a component's binding.
-///
-/// (The plan sized this at 2 — one per live instance. It is sized at
-/// [`driver_launch::MAX_DRIVER_INSTANCES`] instead so that a later service-launched driver cannot
-/// silently leave a component with cptr 0 and therefore no transport at all.)
-static REPLY_FSD_SLOT: [AtomicU64; driver_launch::MAX_DRIVER_INSTANCES] =
-    [const { AtomicU64::new(0) }; driver_launch::MAX_DRIVER_INSTANCES];
+/// One object per component is sufficient at any nesting depth: a component host has one TCB, so it
+/// is blocked in at most one `Call` at a time. These reply objects are dedicated, never entered into
+/// `WAIT_REPLY_POOL`, never rotated, and never stolen by wait/pipe/dbgk/iocp parking.
+static mut REPLY_FSD_SLOTS: Option<Vec<u64>> = None;
 
 /// The dedicated reply object backing driver instance `i`'s dispatch transport (0 = none).
 #[allow(dead_code)] // Phase 0: additive, wired in Phase 1.
 pub(crate) fn fsd_reply_slot(i: usize) -> u64 {
-    REPLY_FSD_SLOT
-        .get(i)
-        .map(|s| s.load(Ordering::Relaxed))
-        .unwrap_or(0)
+    unsafe {
+        (*core::ptr::addr_of!(REPLY_FSD_SLOTS))
+            .as_ref()
+            .and_then(|slots| slots.get(i).copied())
+            .unwrap_or(0)
+    }
+}
+
+unsafe fn fsd_reply_slots_mut() -> &'static mut Vec<u64> {
+    let slot = &mut *core::ptr::addr_of_mut!(REPLY_FSD_SLOTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
+    unsafe {
+        let slots = fsd_reply_slots_mut();
+        while slots.len() <= i {
+            let rf = alloc_slot();
+            if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rf) != 0 || rf == 0 {
+                return 0;
+            }
+            slots.push(rf);
+        }
+        slots[i]
+    }
 }
 
 /// ═══ Checkpoint B: real reply-cap parking for NtWaitForSingleObject on unsignaled events ═══
@@ -8569,7 +8583,7 @@ unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
     );
     reply >> 12
 }
-unsafe fn paging_struct_map_r(paging: u64, label: u64, vaddr: u64, vspace: u64) -> u64 {
+pub(crate) unsafe fn paging_struct_map_r(paging: u64, label: u64, vaddr: u64, vspace: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -17257,17 +17271,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if e_rprobe == 0 {
         REPLY_TRANSPORT_PROBE_SLOT.store(rprobe, Ordering::Relaxed);
     }
-    // ★ Component-dispatch transport: one DEDICATED reply object per launched IRP-driver instance
-    // (see [`REPLY_FSD_SLOT`]). NOT part of WAIT_REPLY_POOL — never stolen, never rotated.
-    let mut e_fsd = 0u64;
-    for i in 0..driver_launch::MAX_DRIVER_INSTANCES {
-        let rf = alloc_slot();
-        let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rf);
-        e_fsd |= e;
-        if e == 0 && rf != 0 {
-            REPLY_FSD_SLOT[i].store(rf, Ordering::Relaxed);
-        }
-    }
+    // Component-dispatch reply caps are allocated on demand by hosted driver launch.
     // Path B: a dedicated fault endpoint + reply object for the real SM-loop thread's rendezvous.
     let sm_ep = make_object(OBJ_ENDPOINT);
     SM_FAULT_EP.store(sm_ep, Ordering::Relaxed);
@@ -17309,13 +17313,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_hex(REPLY_TRANSPORT_PROBE_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
     print_hex(e_rprobe as u32);
-    print_str(b") REPLY_FSD[0] cptr=0x");
-    print_hex(fsd_reply_slot(0) as u32);
-    print_str(b" REPLY_FSD[1] cptr=0x");
-    print_hex(fsd_reply_slot(1) as u32);
-    print_str(b" (retype e=0x");
-    print_hex(e_fsd as u32);
-    print_str(b")\n");
+    print_str(b") REPLY_FSD dynamic=1\n");
 
     print_str(
         b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n",

@@ -94,10 +94,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    flow through generic broker helpers that derive BAR size and DMA domain/request identity from the
    enumerated PCI device. Hosted PCI/root resource publication now allocates component resource VAs
    from the real hosted-driver VA arena and reports VA exhaustion instead of using fixed PCI/root
-   window caps. The raw direct TX proof remains only as a hardware liveness proof before VT-d
-   mapping. The next B3 target is replacing bounded hosted driver instance and shared-frame
-   allocation-record tables where they block arbitrary multi-driver scale, then retiring the direct
-   raw proof once generic PCI evidence fully covers it.
+   window caps. Hosted driver instance, reply-cap, and executive alias bookkeeping now grows on
+   demand; per-instance executive VAs come from a checked high arena with on-demand PD/PT coverage.
+   The raw direct TX proof remains only as a hardware liveness proof before VT-d mapping. The next B3
+   target is replacing shared-frame DMA allocation-record capacity and any remaining launch-state caps
+   that block arbitrary multi-driver scale, then retiring the direct raw proof once generic PCI
+   evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -811,3 +813,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   stay green, and explorer shell chrome remains green with `294/294` checks passing. Review
   adjustment: remaining B3 scaling debt is now the hosted driver instance table, shared-frame DMA
   allocation-record capacity, and any other launch-state caps that prevent arbitrary driver count.
+- B3 cleanup continued. The fixed hosted driver instance table was removed. Live driver state,
+  executive alias cap lists, and FSD reply caps now grow on demand; W^X rights storage is per-loaded
+  image; executive code/aux PT maps are checked; high per-instance VA arena coverage is installed on
+  demand. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-driver-instances-pd-20260807.log`. Result: `Msfs` instance 0, `Npfs` instance 1,
+  `IrpFsdTest` instance 2, `DmaPnpPowerTest` reuses instance 2, and ReactOS `E1000` instance 3; generic
+  PCI/root hardware gates and FSD transport gates stay green; explorer shell chrome remains green
+  with `294/294` checks passing. Review adjustment: remaining B3 launch scaling debt is shared-frame
+  DMA allocation records and any other fixed launch-state caps; then remove direct raw NIC proof once
+  generic PCI evidence fully replaces it.

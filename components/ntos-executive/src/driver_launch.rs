@@ -116,17 +116,23 @@ pub const FSD_ARG_FRAMES: u64 = 4;
 // EXECUTIVE-side mapping window — the executive maps every live instance's aliased CODE/DATA/SHARED/
 // ARG frames into its OWN VSpace to (a) load+relocate the PE and (b) marshal IRPs — so two instances
 // cannot both map at `FSD_CODE_VA`. Instance 0 keeps the fixed FSD VAs EXACTLY (byte-identical);
-// instance N≥1 gets a distinct executive window at `FSD_EXEC_BASE + (N-1)*FSD_EXEC_STRIDE`, well clear
-// of every other executive mapping (past the 48 MiB file pool at 0x100_1500_0000..0x100_1800_0000).
+// instance N≥1 gets a distinct executive window from the checked high arena
+// `FSD_EXEC_BASE..FSD_EXEC_LIMIT`, well clear of the private user/process mirror range. The loader
+// installs executive page-directory coverage for that arena on demand.
 //
 // The PE is RELOCATED for its EXECUTION VA (`FSD_CODE_VA`, same across instances) via `load_pe_into`'s
 // `run_va` — decoupled from the executive load VA — so instance N runs correctly at `FSD_CODE_VA` in
 // its own VSpace while the executive loaded its bytes at a distinct window.
-pub const FSD_EXEC_BASE: u64 = 0x0000_0100_1A00_0000;
+pub const FSD_EXEC_BASE: u64 = 0x0000_0100_5000_0000;
+pub const FSD_EXEC_LIMIT: u64 = 0x0000_0101_5000_0000;
 pub const FSD_EXEC_STRIDE: u64 = 0x0000_0000_0100_0000; // 16 MiB per instance window
+const _: () = assert!(FSD_EXEC_BASE >= crate::PRIVATE_VM_LIMIT);
+const _: () = assert!(FSD_EXEC_BASE & 0x1f_ffff == 0);
+const _: () = assert!(FSD_EXEC_STRIDE & 0x1f_ffff == 0);
+const _: () = assert!(FSD_EXEC_BASE + FSD_EXEC_STRIDE <= FSD_EXEC_LIMIT);
 
 /// The executive-side VA window for launching an instance's frames. Instance 0 == the fixed
-/// historical FSD VAs (behavior-preserving); instance N≥1 == a distinct high window.
+/// historical FSD VAs (behavior-preserving); instance N≥1 == a checked high window.
 #[derive(Clone, Copy)]
 pub(crate) struct ExecVaWindow {
     pub code_va: u64,
@@ -137,25 +143,32 @@ pub(crate) struct ExecVaWindow {
 }
 
 impl ExecVaWindow {
-    pub fn for_instance(instance: usize) -> ExecVaWindow {
+    pub fn try_for_instance(instance: usize) -> Option<ExecVaWindow> {
         if instance == 0 {
-            ExecVaWindow {
+            Some(ExecVaWindow {
                 code_va: FSD_CODE_VA,
                 data_va: FSD_DATA_VADDR,
                 shared_va: FSD_SHARED_VADDR,
                 arg_va: FSD_ARG_VADDR,
                 aux_pt_va: FSD_AUX_PT_VADDR,
-            }
+            })
         } else {
-            let base = FSD_EXEC_BASE + (instance as u64 - 1) * FSD_EXEC_STRIDE;
+            let base = FSD_EXEC_BASE.checked_add(
+                (instance as u64)
+                    .checked_sub(1)?
+                    .checked_mul(FSD_EXEC_STRIDE)?,
+            )?;
+            if base.checked_add(FSD_EXEC_STRIDE)? > FSD_EXEC_LIMIT {
+                return None;
+            }
             // Same RELATIVE offsets as the fixed layout: aux PT (2 MiB) holds DATA/SHARED/ARG.
-            ExecVaWindow {
+            Some(ExecVaWindow {
                 code_va: base,                 // 256 KiB image window (fits in the first 2 MiB PT)
                 data_va: base + 0x0030_0000,   // DATA (4 frames)
                 shared_va: base + 0x0038_0000, // SHARED (1 frame)
                 arg_va: base + 0x003A_0000,    // ARG (4 frames)
                 aux_pt_va: base + 0x0020_0000, // aux PT covering the 2 MiB region holding DATA/SHARED/ARG
-            }
+            })
         }
     }
 }
@@ -2452,7 +2465,7 @@ extern "win64" fn s_io_delete_device(dev: u64) {
                 match io_manager_mut().destroy_device(device_id) {
                     Ok(_) => {
                         clear_hosted_device_binding_by_device_id(binding.device_id);
-                        let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
+                        let table = driver_instances_mut();
                         if binding.instance < table.len()
                             && table[binding.instance].device_object == dev
                         {
@@ -7686,15 +7699,15 @@ unsafe fn load_pe_into(
     Some((entry_rva, size_of_image))
 }
 
-/// The FSD image loaded/mapped rights (W^X), filled by [`load_pe_into`]. ONE array per instance
-/// (a live driver's `Region` holds a `'static` slice, so two coexisting drivers need distinct arrays).
-pub(crate) const MAX_DRIVER_INSTANCES: usize = 4;
-static mut FSD_RIGHTS: [[u64; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES] =
-    [[RW_NX; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES];
-const DRIVER_EXEC_MAPPING_CAPS: usize =
-    FSD_IMAGE_FRAMES as usize + FSD_DATA_FRAMES as usize + 1 + FSD_ARG_FRAMES as usize;
-static mut DRIVER_EXEC_MAPPED_CAPS: [[u64; DRIVER_EXEC_MAPPING_CAPS]; MAX_DRIVER_INSTANCES] =
-    [[0; DRIVER_EXEC_MAPPING_CAPS]; MAX_DRIVER_INSTANCES];
+/// Executive-side frame aliases mapped while launching hosted drivers.
+///
+/// Each driver gets a growable cap list keyed by its live instance index. The previous fixed
+/// matrix made instance count a compile-time policy decision; now the real limits are root CSpace,
+/// untyped memory, and the executive VA window calculation.
+static mut DRIVER_EXEC_MAPPED_CAPS: Option<Vec<Vec<u64>>> = None;
+static mut DRIVER_EXEC_PD_WINDOWS: Option<Vec<u64>> = None;
+const EXEC_PD_SPAN: u64 = 0x4000_0000; // 1 GiB
+const SEL4_DELETE_FIRST: u64 = 8;
 
 unsafe fn load_hosted_dependency_images(
     fs: &Fat32,
@@ -7777,9 +7790,9 @@ unsafe fn load_hosted_dependency_images(
 /// and is NOT routed here — see [`crate::win32k_subsystem`].
 ///
 /// MULTI-INSTANCE: each call reserves the first free instance slot; instance 0 uses the fixed FSD
-/// executive VAs (byte-identical), instance N≥1 a distinct executive window
-/// ([`ExecVaWindow::for_instance`]). The live driver state is recorded in [`DRIVER_INSTANCES`] so
-/// [`dispatch_irp`] can route to any of N drivers by instance index. Adding a boot/system IRP driver
+/// executive VAs (byte-identical), instance N≥1 a distinct executive window from the checked
+/// [`ExecVaWindow`] arena. The live driver state is recorded in [`DRIVER_INSTANCES`] so
+/// [`dispatch_irp`] can route to any loaded driver by instance index. Adding a boot/system IRP driver
 /// means declaring a `Services\<Name>` record with an image path, type, and start policy, then handing
 /// that metadata to this loader.
 ///
@@ -7804,7 +7817,7 @@ pub(crate) unsafe fn load_driver(
     }
 
     let Some(instance) = reserve_instance_slot() else {
-        print_str(b"[driver-launch] instance table full\n");
+        print_str(b"[driver-launch] instance reservation failed\n");
         return None;
     };
 
@@ -7821,7 +7834,12 @@ unsafe fn load_driver_reserved(
     driver_object_path: &str,
     instance: usize,
 ) -> Option<DriverComponent> {
-    let win = ExecVaWindow::for_instance(instance);
+    let Some(win) = ExecVaWindow::try_for_instance(instance) else {
+        print_str(b"[driver-launch] instance VA window exhausted inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+        return None;
+    };
 
     // 1. Load the .sys bytes by-path into the executive's pool.
     let (src_va, src_size) = load_file_to_pool(fs, path)?;
@@ -7843,7 +7861,7 @@ unsafe fn load_driver_reserved(
     //    ARG in an aux PT. POOL is host-only.
     let cpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
-    let _ = paging_struct_map(cpt, LBL_X86_PAGE_TABLE_MAP, code_va, CAP_INIT_THREAD_VSPACE);
+    map_instance_exec_pt(instance, cpt, code_va)?;
     let code_base = alloc_frame();
     for _ in 1..img_frames {
         let _ = alloc_frame();
@@ -7869,12 +7887,7 @@ unsafe fn load_driver_reserved(
     }
     let apt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
-    let _ = paging_struct_map(
-        apt,
-        LBL_X86_PAGE_TABLE_MAP,
-        win.aux_pt_va,
-        CAP_INIT_THREAD_VSPACE,
-    );
+    map_instance_exec_pt(instance, apt, win.aux_pt_va)?;
     for i in 0..FSD_DATA_FRAMES {
         let cap = copy_cap(data_base + i);
         map_instance_exec_frame(instance, cap, win.data_va + i * 0x1000, RW_NX)?;
@@ -7888,7 +7901,7 @@ unsafe fn load_driver_reserved(
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
-    let rights = &mut (*core::ptr::addr_of_mut!(FSD_RIGHTS))[instance];
+    let rights = Box::leak(Box::new([RW_NX; FSD_IMAGE_FRAMES as usize]));
     let support_entry_rva =
         load_hosted_dependency_images(fs, src_va, src_size, code_va, run_va, img_frames, rights)?;
     let (entry_rva, image_len) =
@@ -7923,7 +7936,13 @@ unsafe fn load_driver_reserved(
     );
     // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
     // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
-    let reply_cap = crate::fsd_reply_slot(instance);
+    let reply_cap = crate::ensure_fsd_reply_slot(instance);
+    if reply_cap == 0 {
+        print_str(b"[driver-launch] reply cap allocation failed inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+        return None;
+    }
 
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
@@ -8082,7 +8101,7 @@ unsafe fn spawn_fsd_component(
     fault_ep: u64,
     rights: &[u64],
 ) -> (u64, u64) {
-    // SAFETY: rights lives in FSD_RIGHTS (a 'static); re-borrow as 'static for Rights::PerFrame.
+    // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
         // The npfs PE image, W^X, its own 2 MiB PT.
@@ -9299,49 +9318,170 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 };
 
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
-static mut DRIVER_INSTANCES: [DriverInstance; MAX_DRIVER_INSTANCES] =
-    [EMPTY_INSTANCE; MAX_DRIVER_INSTANCES];
+static mut DRIVER_INSTANCES: Option<Vec<DriverInstance>> = None;
+
+unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn driver_instances() -> Option<&'static Vec<DriverInstance>> {
+    (*core::ptr::addr_of!(DRIVER_INSTANCES)).as_ref()
+}
+
+unsafe fn driver_exec_mapped_caps_mut() -> &'static mut Vec<Vec<u64>> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_EXEC_MAPPED_CAPS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn driver_exec_pd_windows_mut() -> &'static mut Vec<u64> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_EXEC_PD_WINDOWS);
+    if slot.is_none() {
+        let mut windows = Vec::new();
+        windows.push(crate::IMAGE_BASE & !(EXEC_PD_SPAN - 1));
+        *slot = Some(windows);
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn ensure_exec_mapping_slot(instance: usize) -> &'static mut Vec<u64> {
+    let mappings = driver_exec_mapped_caps_mut();
+    while mappings.len() <= instance {
+        mappings.push(Vec::new());
+    }
+    &mut mappings[instance]
+}
 
 fn reserve_instance_slot() -> Option<usize> {
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
-    for (index, slot) in table.iter_mut().enumerate() {
-        if !slot.used {
-            clear_instance_exec_mappings(index);
-            *slot = DriverInstance {
-                used: true,
-                ..EMPTY_INSTANCE
-            };
-            return Some(index);
+    let reusable = unsafe {
+        driver_instances().and_then(|table| {
+            table
+                .iter()
+                .enumerate()
+                .find(|(index, slot)| !slot.used && ExecVaWindow::try_for_instance(*index).is_some())
+                .map(|(index, _)| index)
+        })
+    };
+    if let Some(index) = reusable {
+        clear_instance_exec_mappings(index);
+        let table = unsafe { driver_instances_mut() };
+        table[index] = DriverInstance {
+            used: true,
+            ..EMPTY_INSTANCE
+        };
+        unsafe {
+            ensure_exec_mapping_slot(index);
         }
+        return Some(index);
     }
-    None
+
+    let table = unsafe { driver_instances_mut() };
+    let index = table.len();
+    ExecVaWindow::try_for_instance(index)?;
+    table.push(DriverInstance {
+        used: true,
+        ..EMPTY_INSTANCE
+    });
+    unsafe {
+        ensure_exec_mapping_slot(index);
+    }
+    Some(index)
 }
 
 fn record_instance_exec_mapping(instance: usize, cap: u64) {
-    if cap == 0 || instance >= MAX_DRIVER_INSTANCES {
+    if cap == 0 {
         return;
     }
-    let mappings = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_EXEC_MAPPED_CAPS) };
-    if let Some(slot) = mappings[instance].iter_mut().find(|slot| **slot == 0) {
-        *slot = cap;
-    } else {
-        print_str(b"[driver-launch] exec mapping cap table full inst=");
-        print_u64(instance as u64);
-        print_str(b"\n");
+    unsafe {
+        ensure_exec_mapping_slot(instance).push(cap);
     }
 }
 
 fn clear_instance_exec_mappings(instance: usize) {
-    if instance >= MAX_DRIVER_INSTANCES {
+    let Some(mappings) = (unsafe { (*core::ptr::addr_of_mut!(DRIVER_EXEC_MAPPED_CAPS)).as_mut() })
+    else {
         return;
-    }
-    let mappings = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_EXEC_MAPPED_CAPS) };
-    for cap in mappings[instance].iter_mut() {
-        if *cap != 0 {
-            let _ = unsafe { page_unmap_r(*cap) };
-            *cap = 0;
+    };
+    if let Some(caps) = mappings.get_mut(instance) {
+        for cap in caps.drain(..) {
+            if cap != 0 {
+                let _ = unsafe { page_unmap_r(cap) };
+            }
         }
     }
+}
+
+unsafe fn ensure_instance_exec_pd(instance: usize, vaddr: u64) -> Option<()> {
+    let pd_base = vaddr & !(EXEC_PD_SPAN - 1);
+    if driver_exec_pd_windows_mut()
+        .iter()
+        .any(|base| *base == pd_base)
+    {
+        return Some(());
+    }
+
+    let pd = alloc_slot();
+    let retype = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    if retype != 0 {
+        print_str(b"[driver-launch] exec PD retype failed inst=");
+        print_u64(instance as u64);
+        print_str(b" pd-base=0x");
+        print_hex((pd_base >> 32) as u32);
+        print_hex(pd_base as u32);
+        print_str(b" label=");
+        print_u64(retype);
+        print_str(b"\n");
+        return None;
+    }
+
+    let map = paging_struct_map_r(
+        pd,
+        LBL_X86_PAGE_DIRECTORY_MAP,
+        pd_base,
+        CAP_INIT_THREAD_VSPACE,
+    );
+    if map != 0 && map != SEL4_DELETE_FIRST {
+        print_str(b"[driver-launch] exec PD map failed inst=");
+        print_u64(instance as u64);
+        print_str(b" pd-base=0x");
+        print_hex((pd_base >> 32) as u32);
+        print_hex(pd_base as u32);
+        print_str(b" label=");
+        print_u64(map);
+        print_str(b"\n");
+        return None;
+    }
+
+    driver_exec_pd_windows_mut().push(pd_base);
+    Some(())
+}
+
+unsafe fn map_instance_exec_pt(instance: usize, cap: u64, vaddr: u64) -> Option<()> {
+    ensure_instance_exec_pd(instance, vaddr)?;
+    let label = paging_struct_map_r(
+        cap,
+        LBL_X86_PAGE_TABLE_MAP,
+        vaddr,
+        CAP_INIT_THREAD_VSPACE,
+    );
+    if label != 0 && label != SEL4_DELETE_FIRST {
+        print_str(b"[driver-launch] exec PT map failed inst=");
+        print_u64(instance as u64);
+        print_str(b" va=0x");
+        print_hex((vaddr >> 32) as u32);
+        print_hex(vaddr as u32);
+        print_str(b" label=");
+        print_u64(label);
+        print_str(b"\n");
+        return None;
+    }
+    Some(())
 }
 
 unsafe fn map_instance_exec_frame(
@@ -9371,28 +9511,29 @@ unsafe fn map_instance_exec_frame(
 /// IoCreateDevice may still be ready — see [`register_instance_ready`]).
 fn register_instance(dc: &DriverComponent) {
     // SAFETY: single-threaded executive; the table is written here + read in dispatch_irp.
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
-    if dc.instance < t.len() {
-        t[dc.instance] = DriverInstance {
-            fault_ep: dc.fault_ep,
-            pml4: dc.pml4,
-            exec_shared_va: dc.exec_shared_va,
-            exec_arg_va: dc.exec_arg_va,
-            tcb: dc.tcb,
-            reply_cap: dc.reply_cap,
-            driver_id: dc.driver_id,
-            device_id: dc.device_id,
-            driver_object: dc.drvobj,
-            device_object: dc.devobj,
-            driver_unload: dc.driver_unload,
-            add_device: dc.add_device,
-            // Default readiness = npfs's historic rule (parked + a control device object). A
-            // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
-            // is marked ready explicitly by the caller via `register_instance_ready`.
-            ready: dc.finished && dc.devobj != 0,
-            used: true,
-        };
+    let t = unsafe { driver_instances_mut() };
+    while t.len() <= dc.instance {
+        t.push(EMPTY_INSTANCE);
     }
+    t[dc.instance] = DriverInstance {
+        fault_ep: dc.fault_ep,
+        pml4: dc.pml4,
+        exec_shared_va: dc.exec_shared_va,
+        exec_arg_va: dc.exec_arg_va,
+        tcb: dc.tcb,
+        reply_cap: dc.reply_cap,
+        driver_id: dc.driver_id,
+        device_id: dc.device_id,
+        driver_object: dc.drvobj,
+        device_object: dc.devobj,
+        driver_unload: dc.driver_unload,
+        add_device: dc.add_device,
+        // Default readiness = npfs's historic rule (parked + a control device object). A
+        // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
+        // is marked ready explicitly by the caller via `register_instance_ready`.
+        ready: dc.finished && dc.devobj != 0,
+        used: true,
+    };
 }
 
 pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
@@ -9404,7 +9545,7 @@ pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
 
 fn clear_instance(i: usize) {
     clear_hosted_device_bindings_for_instance(i);
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances_mut() };
     if i < t.len() {
         let sh = t[i].exec_shared_va;
         if sh != 0 {
@@ -9422,7 +9563,7 @@ fn clear_instance(i: usize) {
 /// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
 /// a minimal driver that fills MajorFunction[] but creates no control DEVICE_OBJECT).
 fn register_instance_ready(i: usize, ready: bool) {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances_mut() };
     if i < t.len() && t[i].used {
         t[i].ready = ready;
     }
@@ -9451,7 +9592,7 @@ pub(crate) fn driver_add_device(driver_id: u64) -> u64 {
 
 /// Snapshot of a live instance, or None if `i` isn't launched.
 fn instance(i: usize) -> Option<DriverInstance> {
-    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances()? };
     if i < t.len() && t[i].used {
         Some(t[i])
     } else {
@@ -9460,7 +9601,7 @@ fn instance(i: usize) -> Option<DriverInstance> {
 }
 
 fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
-    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances()? };
     t.iter()
         .copied()
         .enumerate()
@@ -9468,7 +9609,7 @@ fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
 }
 
 fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
-    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances()? };
     t.iter()
         .copied()
         .enumerate()
@@ -9476,7 +9617,7 @@ fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
 }
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {
-    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    let t = unsafe { driver_instances()? };
     t.iter()
         .copied()
         .enumerate()
@@ -9514,7 +9655,9 @@ unsafe fn dispatch_driver_unload_for_instance(
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
-        exec_code_va: ExecVaWindow::for_instance(index).code_va,
+        exec_code_va: ExecVaWindow::try_for_instance(index)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -9569,7 +9712,9 @@ unsafe fn dispatch_add_device_for_instance(
         pml4: inst.pml4,
         code_va: 0,
         image_frames: 0,
-        exec_code_va: ExecVaWindow::for_instance(index).code_va,
+        exec_code_va: ExecVaWindow::try_for_instance(index)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -9707,7 +9852,7 @@ pub(crate) unsafe fn call_add_device_for_driver(
         return Err(status);
     }
 
-    let table = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
+    let table = driver_instances_mut();
     if index < table.len() && table[index].used {
         table[index].device_id = device_id.raw();
         table[index].device_object = add_device.fdo_object;
@@ -10275,7 +10420,7 @@ unsafe fn dispatch_irp_for_instance(
         pml4,
         code_va: 0,
         image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
-        exec_code_va: ExecVaWindow::for_instance(inst).code_va,
+        exec_code_va: ExecVaWindow::try_for_instance(inst)?.code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
