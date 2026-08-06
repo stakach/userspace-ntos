@@ -11839,6 +11839,104 @@ static mut CONFIG_BOOT_PNP_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLau
 
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
 
+#[derive(Clone, Copy)]
+struct HostedPciHardwareGrant {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    mmio_phys: u64,
+    mmio_frame_base: u64,
+    mmio_pages: u64,
+    interrupt_vector: u32,
+    interrupt_latched: bool,
+    dma_frame_base: u64,
+    dma_pages: u64,
+    dma_logical: u64,
+    dma_len: u64,
+}
+
+impl HostedPciHardwareGrant {
+    fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
+        self.bus == device.bus && self.dev == device.dev && self.func == device.func
+    }
+}
+
+#[derive(Default)]
+struct HostedPciWindowPublishReport {
+    selected_devnodes: u64,
+    published_windows: u64,
+    missing_grants: u64,
+    cap_exhausted: bool,
+}
+
+unsafe fn publish_hosted_pnp_context_for_launch_plans(
+    pci_devices: &[nt_pnp::PciDevice],
+    plans: &[&InlineDriverLaunchPlan],
+    grants: &[HostedPciHardwareGrant],
+) -> HostedPciWindowPublishReport {
+    let mut report = HostedPciWindowPublishReport::default();
+    let mut windows: Vec<HostedPnpPciResourceWindow> = Vec::new();
+    for plan in plans {
+        for spec in plan.as_slice() {
+            for devnode in &spec.devnodes[..spec.devnode_count] {
+                let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
+                let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
+                let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
+                let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
+                let Some(device) = nt_pnp::find_pci_device_for_devnode(
+                    pci_devices,
+                    devnode.instance_id.as_str(),
+                    hardware_refs,
+                    compatible_refs,
+                ) else {
+                    continue;
+                };
+                report.selected_devnodes += 1;
+                if windows.iter().any(|window| window.matches(device)) {
+                    continue;
+                }
+                let Some(grant) = grants.iter().find(|grant| grant.matches(device)) else {
+                    report.missing_grants += 1;
+                    continue;
+                };
+                let Some(mem_bar) = device.first_memory_bar() else {
+                    report.missing_grants += 1;
+                    continue;
+                };
+                if grant.mmio_phys != mem_bar.base
+                    || grant.mmio_frame_base == 0
+                    || grant.dma_frame_base == 0
+                {
+                    report.missing_grants += 1;
+                    continue;
+                }
+                if windows.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
+                    report.cap_exhausted = true;
+                    continue;
+                }
+                windows.push(HostedPnpPciResourceWindow::for_index(
+                    windows.len() as u64,
+                    device.bus,
+                    device.dev,
+                    device.func,
+                    grant.mmio_phys,
+                    grant.mmio_frame_base,
+                    grant.mmio_pages,
+                    grant.interrupt_vector,
+                    grant.interrupt_latched,
+                    grant.dma_frame_base,
+                    grant.dma_pages,
+                    grant.dma_logical,
+                    grant.dma_len,
+                ));
+            }
+        }
+    }
+    report.published_windows = windows.len() as u64;
+    publish_hosted_pnp_resource_context(pci_devices, windows.as_slice());
+    report
+}
+
 fn driver_launch_spec_from_service_metadata(
     service: &nt_config_manager::ServiceMetadata,
     out_path: &mut [u8],
@@ -17914,25 +18012,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let mut hosted_pci_windows = Vec::new();
+    let mut hosted_pci_hardware_grants = Vec::new();
     if nic_bar_base != 0 && nic_dma_frame != 0 {
-        hosted_pci_windows.push(HostedPnpPciResourceWindow::for_index(
-            hosted_pci_windows.len() as u64,
-            0,
-            nic_dev,
-            nic_func,
-            nic_mmio,
-            nic_bar_base,
-            NIC_BAR_PAGES,
-            NIC_MSI_VECTOR as u32,
-            true,
-            nic_dma_frame,
-            NIC_DMA_PAGES,
-            NIC_IOVA,
-            NIC_DMA_LEN,
-        ));
+        hosted_pci_hardware_grants.push(HostedPciHardwareGrant {
+            bus: 0,
+            dev: nic_dev,
+            func: nic_func,
+            mmio_phys: nic_mmio,
+            mmio_frame_base: nic_bar_base,
+            mmio_pages: NIC_BAR_PAGES,
+            interrupt_vector: NIC_MSI_VECTOR as u32,
+            interrupt_latched: true,
+            dma_frame_base: nic_dma_frame,
+            dma_pages: NIC_DMA_PAGES,
+            dma_logical: NIC_IOVA,
+            dma_len: NIC_DMA_LEN,
+        });
     }
-    publish_hosted_pnp_resource_context(&pci_devices, hosted_pci_windows.as_slice());
+    publish_hosted_pnp_resource_context(&pci_devices, &[]);
 
     // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
     // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
@@ -19503,6 +19600,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
+    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
+    let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
+        &pci_devices,
+        &[system_boot_driver_plan, config_pnp_plan],
+        hosted_pci_hardware_grants.as_slice(),
+    );
+    print_str(b"[driver-launch] hosted PCI windows selected=");
+    print_u64(hosted_pci_window_publish.selected_devnodes);
+    print_str(b" published=");
+    print_u64(hosted_pci_window_publish.published_windows);
+    print_str(b" missing-grants=");
+    print_u64(hosted_pci_window_publish.missing_grants);
+    print_str(b" cap-exhausted=");
+    print_u64(hosted_pci_window_publish.cap_exhausted as u64);
+    print_str(b"\n");
+    check(
+        b"exec_hosted_pci_windows_selected_from_registry",
+        hosted_pci_window_publish.published_windows != 0
+            && hosted_pci_window_publish.missing_grants == 0
+            && !hosted_pci_window_publish.cap_exhausted,
+        &mut passed,
+    );
+
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
     // services use the persistent IRP host directly, while device-class services must be bound by
@@ -19520,7 +19641,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_attempted = 0u64;
         let mut generic_hw_started = 0u64;
         let mut generic_hw_first_error = 0u32;
-        for spec in system_hive_boot_driver_launch_plan().as_slice() {
+        for spec in system_boot_driver_plan.as_slice() {
             if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
                 print_str(spec.service_name.as_bytes());
@@ -20361,7 +20482,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_pci_started = 0u64;
     let mut generic_pci_io_out32 = false;
     let mut generic_pci_first_error = 0u32;
-    let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     if !config_pnp_plan.as_slice().is_empty() {
         if let Some(fs) = exec_fs() {
             for proof_pnp_spec in config_pnp_plan.as_slice() {
