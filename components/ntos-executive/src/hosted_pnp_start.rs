@@ -93,7 +93,11 @@ impl HostedPnpPciResourceWindow {
             interrupt_latched,
             dma_frame_base,
             dma_pages,
-            dma_va: HOSTED_PCI_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            dma_va: if dma_frame_base == 0 && dma_pages == 0 && dma_logical == 0 && dma_len == 0 {
+                0
+            } else {
+                HOSTED_PCI_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+            },
             dma_logical,
             dma_len,
         }
@@ -107,6 +111,20 @@ impl HostedPnpPciResourceWindow {
         self.mmio_pages
             .saturating_mul(0x1000)
             .min(u32::MAX as u64) as u32
+    }
+
+    pub(crate) fn dma_grant_valid(&self) -> bool {
+        let has_dma = self.dma_va != 0
+            || self.dma_frame_base != 0
+            || self.dma_pages != 0
+            || self.dma_logical != 0
+            || self.dma_len != 0;
+        !has_dma
+            || (self.dma_va != 0
+                && self.dma_frame_base != 0
+                && self.dma_pages != 0
+                && self.dma_logical != 0
+                && self.dma_len != 0)
     }
 }
 

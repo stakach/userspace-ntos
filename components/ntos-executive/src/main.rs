@@ -8767,7 +8767,7 @@ unsafe fn grant_hosted_devnode_resources(
         };
         if grant.assignment.mmio_phys != window.mmio_phys
             || window.mmio_frame_base == 0
-            || window.dma_frame_base == 0
+            || !window.dma_grant_valid()
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -11848,6 +11848,109 @@ impl HostedPciHardwareGrant {
     fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
         self.bus == device.bus && self.dev == device.dev && self.func == device.func
     }
+
+    fn dma_grant_valid(&self) -> bool {
+        let has_dma = self.dma_frame_base != 0
+            || self.dma_pages != 0
+            || self.dma_logical != 0
+            || self.dma_len != 0;
+        !has_dma
+            || (self.dma_frame_base != 0
+                && self.dma_pages != 0
+                && self.dma_logical != 0
+                && self.dma_len != 0)
+    }
+}
+
+#[derive(Default)]
+struct HostedPciGrantDiscoveryReport {
+    selected_devnodes: u64,
+    existing_grants: u64,
+    claimed_grants: u64,
+    missing_memory_bar: u64,
+    missing_interrupt: u64,
+    claim_failures: u64,
+    cap_exhausted: bool,
+}
+
+fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
+    if device.irq_line == 0 || device.irq_line == 0xff {
+        None
+    } else {
+        Some(device.irq_line as u32)
+    }
+}
+
+unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
+    bi: &BootInfo,
+    pci_devices: &[nt_pnp::PciDevice],
+    plans: &[&InlineDriverLaunchPlan],
+    grants: &mut Vec<HostedPciHardwareGrant>,
+) -> HostedPciGrantDiscoveryReport {
+    let mut report = HostedPciGrantDiscoveryReport::default();
+    let mut seen = Vec::new();
+    for plan in plans {
+        for spec in plan.as_slice() {
+            for devnode in &spec.devnodes[..spec.devnode_count] {
+                let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
+                let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
+                let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
+                let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
+                let Some(device) = nt_pnp::find_pci_device_for_devnode(
+                    pci_devices,
+                    devnode.instance_id.as_str(),
+                    hardware_refs,
+                    compatible_refs,
+                ) else {
+                    continue;
+                };
+                let key = (device.bus, device.dev, device.func);
+                if seen.iter().any(|existing| *existing == key) {
+                    continue;
+                }
+                seen.push(key);
+                report.selected_devnodes += 1;
+                if grants.iter().any(|grant| grant.matches(device)) {
+                    report.existing_grants += 1;
+                    continue;
+                }
+                if grants.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
+                    report.cap_exhausted = true;
+                    continue;
+                }
+                let Some(mem_bar) = device.first_memory_bar() else {
+                    report.missing_memory_bar += 1;
+                    continue;
+                };
+                let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) else {
+                    report.missing_interrupt += 1;
+                    continue;
+                };
+                let mmio_pages = mem_bar.size.div_ceil(0x1000).max(1);
+                let mmio_frame_base = claim_device_frame_caps(bi, mem_bar.base, mmio_pages);
+                if mmio_frame_base == 0 {
+                    report.claim_failures += 1;
+                    continue;
+                }
+                grants.push(HostedPciHardwareGrant {
+                    bus: device.bus,
+                    dev: device.dev,
+                    func: device.func,
+                    mmio_phys: mem_bar.base,
+                    mmio_frame_base,
+                    mmio_pages,
+                    interrupt_vector,
+                    interrupt_latched: false,
+                    dma_frame_base: 0,
+                    dma_pages: 0,
+                    dma_logical: 0,
+                    dma_len: 0,
+                });
+                report.claimed_grants += 1;
+            }
+        }
+    }
+    report
 }
 
 #[derive(Default)]
@@ -11897,7 +12000,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     };
                     if grant.mmio_phys != mem_bar.base
                         || grant.mmio_frame_base == 0
-                        || grant.dma_frame_base == 0
+                        || !grant.dma_grant_valid()
                     {
                         report.missing_grants += 1;
                         continue;
@@ -16681,6 +16784,39 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
     0
 }
 
+/// Claim BAR frame caps without mapping them into the executive. The hosted-driver resource broker
+/// copies these caps into the target component and maps them at the per-devnode resource window.
+unsafe fn claim_device_frame_caps(bi: &BootInfo, paddr: u64, n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let count = bi.untyped.end - bi.untyped.start;
+    for i in 0..count {
+        let d = bi.untyped_list[i as usize];
+        if d.is_device == 1 && d.paddr == paddr {
+            let Some(base) = try_alloc_slot_run(n) else {
+                return 0;
+            };
+            let mut page = 0u64;
+            while page < n {
+                let err = untyped_retype(
+                    bi.untyped.start + i,
+                    OBJ_X86_4K_PAGE,
+                    PAGING_BITS,
+                    1,
+                    base + page,
+                );
+                if err != 0 {
+                    return 0;
+                }
+                page += 1;
+            }
+            return base;
+        }
+    }
+    0
+}
+
 /// `in eax, dx` via an I/O-port cap — invoked with SysCall; the read value comes
 /// back as the reply's mr0 (r10).
 /// Invoke `X86Page::GetAddress` on a frame cap and return its physical address. The
@@ -19636,6 +19772,38 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
+    let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
+        bi,
+        &pci_devices,
+        &[system_boot_driver_plan, config_pnp_plan],
+        &mut hosted_pci_hardware_grants,
+    );
+    print_str(b"[driver-launch] hosted PCI grant discovery selected=");
+    print_u64(hosted_pci_grant_discovery.selected_devnodes);
+    print_str(b" existing=");
+    print_u64(hosted_pci_grant_discovery.existing_grants);
+    print_str(b" claimed=");
+    print_u64(hosted_pci_grant_discovery.claimed_grants);
+    print_str(b" missing-mmio=");
+    print_u64(hosted_pci_grant_discovery.missing_memory_bar);
+    print_str(b" missing-int=");
+    print_u64(hosted_pci_grant_discovery.missing_interrupt);
+    print_str(b" claim-failures=");
+    print_u64(hosted_pci_grant_discovery.claim_failures);
+    print_str(b" cap-exhausted=");
+    print_u64(hosted_pci_grant_discovery.cap_exhausted as u64);
+    print_str(b"\n");
+    check(
+        b"exec_hosted_pci_grants_discovered_from_registry",
+        hosted_pci_grant_discovery.selected_devnodes
+            == hosted_pci_grant_discovery.existing_grants
+                + hosted_pci_grant_discovery.claimed_grants
+            && hosted_pci_grant_discovery.missing_memory_bar == 0
+            && hosted_pci_grant_discovery.missing_interrupt == 0
+            && hosted_pci_grant_discovery.claim_failures == 0
+            && !hosted_pci_grant_discovery.cap_exhausted,
+        &mut passed,
+    );
     let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
         &pci_devices,
         &[system_boot_driver_plan, config_pnp_plan],

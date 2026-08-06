@@ -88,10 +88,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    per-devnode DMA grant, cap-backed inline `out dx,eax` I/O-port service,
    `IoSetDeviceInterfaceState` publication, connected-ISR dispatch, and KDPC bottom-half delivery.
    Hosted PCI and root-bus resource grants now use selected per-devnode component windows instead
-   of NIC-named globals or root-bus proof VAs, and publication is selected from the boot/system PnP
-   launch plans. The next B3 target is generalizing broker grant discovery for every eligible PCI
-   function and replacing bounded hosted window/instance tables where they block arbitrary
-   multi-driver scale.
+   of NIC-named globals or root-bus proof VAs, publication is selected from the boot/system PnP
+   launch plans, and the PCI broker discovers grant material for every registry-selected eligible
+   PCI function. The current `E1000` path still enters with an existing raw DMA/IOMMU grant; newly
+   discovered PCI grants are BAR/interrupt-only unless a real DMA grant exists. The next B3 target is
+   moving DMA/IOMMU grant construction behind the same generic broker boundary and replacing bounded
+   hosted window/instance tables where they block arbitrary multi-driver scale.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -734,3 +736,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   hardware-grant discovery enumerate/claim every registry-selected eligible PCI function instead of
   carrying only the raw E1000 claim, then address fixed hosted instance/window caps where they become
   practical blockers.
+- B3 cleanup continued. PCI grant discovery now walks the registry-selected boot/system PnP launch
+  plans before resource-window publication, deduplicates selected bus/dev/function identities, keeps
+  any existing real DMA/IOMMU grant, and can claim cap-only BAR/interrupt grants for selected PCI
+  functions that do not require DMA. PCI resource windows and START validation now treat DMA as
+  optional all-or-none state, so the broker no longer invents synthetic DMA or rejects legitimate
+  BAR/interrupt-only devices. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-pci-grant-discovery-20260807.log`. Result:
+  `exec_hosted_pci_grants_discovered_from_registry` passes with
+  `selected=1 existing=1 claimed=0 missing-mmio=0 missing-int=0 claim-failures=0 cap-exhausted=0`,
+  PCI/root window publication remains clean, ReactOS `E1000` and `DmaPnpPowerTest` still start
+  through the generic hosted PnP path, and the boot reaches genuine explorer shell chrome with
+  `292/292` checks passing. Review adjustment: the next B3 cleanup should move the E1000
+  DMA/common-buffer/IOMMU setup itself out of the raw proof block into generic broker grant
+  construction, then replace fixed hosted instance/window caps with growable or per-launch
+  allocation.
