@@ -123,7 +123,7 @@ fn build_hive() -> Hive {
         devnode,
         "HardwareID",
         RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
+        encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E"]),
     );
     hive.set_value(
         devnode,

@@ -23,7 +23,7 @@ use crate::*;
 use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
     find_device_for_class, DriverClass, PciDevice, ResourceAssignment,
-    ROOT_DMA_TEST_RESOURCE_PROFILE, MEMORY_INTERRUPT_LIST_SIZE,
+    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 /// Enumerate PCI bus 0 through `nt-pnp` using the executive's port-I/O config access. The reader
@@ -106,7 +106,7 @@ pub(crate) fn assign_devnode_pci_resources(
     if mmio_len == 0 || mmio_len > u32::MAX as u64 {
         return None;
     }
-    let mut resource_list = vec![0u8; MEMORY_INTERRUPT_LIST_SIZE];
+    let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut resource_list,
         device.bus as u32,
@@ -147,7 +147,7 @@ pub(crate) fn assign_devnode_root_dma_resources(
     if mmio_len == 0 || mmio_len > u32::MAX as u64 {
         return None;
     }
-    let mut resource_list = vec![0u8; MEMORY_INTERRUPT_LIST_SIZE];
+    let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut resource_list,
         0,
@@ -172,6 +172,6 @@ pub(crate) unsafe fn write_cm_resource_list(
     memory_start: u64,
     mmio_len: u32,
 ) {
-    let buf = core::slice::from_raw_parts_mut(reslist_va as *mut u8, MEMORY_INTERRUPT_LIST_SIZE);
+    let buf = core::slice::from_raw_parts_mut(reslist_va as *mut u8, ASSIGNMENT_CM_LIST_MAX_SIZE);
     let _ = assignment_to_cm_list(buf, bus_number, assign, memory_start, mmio_len);
 }

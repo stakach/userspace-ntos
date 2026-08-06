@@ -232,7 +232,7 @@ impl DmaManager {
         if !dma64 && logical_end > 0x1_0000_0000 {
             return Err(DmaError::OutOfRange);
         }
-        if self.logical_range_in_use(logical_base, length) {
+        if self.logical_range_in_use(owner, logical_base, length) {
             return Err(DmaError::LogicalViolation);
         }
         let id = self.next_cb_id;
@@ -252,11 +252,15 @@ impl DmaManager {
         })
     }
 
-    fn logical_range_in_use(&self, logical_base: u64, length: u64) -> bool {
+    fn logical_range_in_use(&self, owner: DmaOwner, logical_base: u64, length: u64) -> bool {
         let Some(end) = logical_base.checked_add(length) else {
             return true;
         };
-        for cb in self.common_buffers.iter().filter(|c| c.active) {
+        for cb in self
+            .common_buffers
+            .iter()
+            .filter(|c| c.active && c.owner == owner)
+        {
             let Some(cb_end) = cb.logical_base.checked_add(cb.length) else {
                 return true;
             };
@@ -264,7 +268,11 @@ impl DmaManager {
                 return true;
             }
         }
-        for mapping in self.mappings.iter().filter(|m| m.active) {
+        for mapping in self
+            .mappings
+            .iter()
+            .filter(|m| m.active && m.owner == owner)
+        {
             let Some(mapping_end) = mapping.logical_base.checked_add(mapping.length) else {
                 return true;
             };
@@ -283,14 +291,19 @@ impl DmaManager {
         logical_base: u64,
         length: u64,
     ) -> Result<(), DmaError> {
+        let has_other_owner = self
+            .common_buffers
+            .iter()
+            .any(|c| c.logical_base == logical_base && c.active && c.owner != owner);
         let cb = self
             .common_buffers
             .iter_mut()
-            .find(|c| c.logical_base == logical_base && c.active)
-            .ok_or(DmaError::StaleId)?;
-        if cb.owner != owner {
-            return Err(DmaError::WrongOwner);
-        }
+            .find(|c| c.logical_base == logical_base && c.active && c.owner == owner)
+            .ok_or(if has_other_owner {
+                DmaError::WrongOwner
+            } else {
+                DmaError::StaleId
+            })?;
         if cb.length != length {
             return Err(DmaError::OutOfRange);
         }
@@ -298,10 +311,40 @@ impl DmaManager {
         Ok(())
     }
 
-    /// Decode a device logical address to the backing Driver-Host address — the
+    /// Decode an owner-scoped device logical address to the backing Driver-Host address — the
     /// IOMMU-facade lookup a simulated device uses to touch memory (spec §19.2). Only
     /// resolves addresses within a live common buffer or active mapping; a device
     /// cannot reach unowned memory.
+    pub fn decode_owner_logical(
+        &self,
+        owner: DmaOwner,
+        logical: u64,
+        length: u64,
+    ) -> Result<u64, DmaError> {
+        for cb in self
+            .common_buffers
+            .iter()
+            .filter(|c| c.active && c.owner == owner)
+        {
+            if logical >= cb.logical_base && logical + length <= cb.logical_base + cb.length {
+                return Ok(cb.backing_va + (logical - cb.logical_base));
+            }
+        }
+        for m in self
+            .mappings
+            .iter()
+            .filter(|m| m.active && m.owner == owner)
+        {
+            if logical >= m.logical_base && logical + length <= m.logical_base + m.length {
+                return Ok(m.backing_va + (logical - m.logical_base));
+            }
+        }
+        Err(DmaError::LogicalViolation)
+    }
+
+    /// Legacy single-device decode helper. New device simulations should use
+    /// [`Self::decode_owner_logical`] so identical IOVAs in different device domains
+    /// remain unambiguous.
     pub fn decode_logical(&self, logical: u64, length: u64) -> Result<u64, DmaError> {
         for cb in self.common_buffers.iter().filter(|c| c.active) {
             if logical >= cb.logical_base && logical + length <= cb.logical_base + cb.length {
@@ -433,6 +476,29 @@ mod tests {
             d.register_common_buffer_at(owner(), a, 0, 1024, 0x3_0000),
             Err(DmaError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn logical_addresses_are_scoped_to_dma_owner() {
+        let mut d = DmaManager::new();
+        let owner_a = owner();
+        let owner_b = DmaOwner::new(1, 11);
+        let adapter_a = d.register_adapter(owner_a, true, 4096, true);
+        let adapter_b = d.register_adapter(owner_b, true, 4096, true);
+
+        d.register_common_buffer_at(owner_a, adapter_a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+        d.register_common_buffer_at(owner_b, adapter_b, 0x1000, 4096, 0x3_0000)
+            .unwrap();
+
+        assert_eq!(d.decode_owner_logical(owner_a, 0x1080, 4), Ok(0x2_0080));
+        assert_eq!(d.decode_owner_logical(owner_b, 0x1080, 4), Ok(0x3_0080));
+        assert_eq!(
+            d.free_common_buffer(owner_b, 0x1000, 2048),
+            Err(DmaError::OutOfRange)
+        );
+        d.free_common_buffer(owner_b, 0x1000, 4096).unwrap();
+        assert_eq!(d.decode_owner_logical(owner_a, 0x1000, 4), Ok(0x2_0000));
     }
 
     #[test]

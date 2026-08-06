@@ -225,6 +225,13 @@ pub const SH_REGISTRY_EXPORT_LEN: u64 = 0x508; // in: ASCII bytes in Linkage\Exp
 pub const SH_REGISTRY_INSTANCE_BUF: u64 = 0x510; // in: ASCII Enum instance path
 pub const SH_REGISTRY_DRIVER_KEY_BUF: u64 = 0x590; // in: ASCII DevicePropertyDriverKeyName
 pub const SH_REGISTRY_EXPORT_BUF: u64 = 0x610; // in: ASCII Linkage\Export
+pub const SH_RESOURCE_IO_PORT_BASE: u64 = 0x690; // in: granted PCI I/O port base
+pub const SH_RESOURCE_IO_PORT_LEN: u64 = 0x698; // in: granted PCI I/O port length
+pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
+pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: number of allocation records ever used
+pub const SH_DMA_ALLOC_RECORDS: u64 = 0x6B0; // out: [logical,len,va] allocation records
+pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
+pub const SH_DMA_ALLOC_RECORD_SLOTS: u64 = 8;
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -2717,6 +2724,7 @@ unsafe fn hosted_resource_identity_active() -> bool {
     read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64) != 0
         || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32) != 0
         || read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64) != 0
+        || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64) != 0
 }
 
 unsafe fn hosted_pdo_known(pdo: u64) -> bool {
@@ -3957,7 +3965,75 @@ extern "win64" fn s_dma_put_adapter(adapter: u64) {
     }
 }
 
-/// `AllocateCommonBuffer` — return the one common buffer PnP granted to this devnode.
+const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|aligned| aligned & !(alignment - 1))
+}
+
+unsafe fn dma_allocation_record(sh: u64, index: u64) -> Option<u64> {
+    if index >= SH_DMA_ALLOC_RECORD_SLOTS {
+        return None;
+    }
+    Some(sh + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE)
+}
+
+unsafe fn clear_dma_allocation_records(sh: u64) {
+    write_volatile((sh + SH_DMA_ALLOC_CURSOR) as *mut u64, 0);
+    write_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, 0);
+    let mut i = 0u64;
+    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+        if let Some(record) = dma_allocation_record(sh, i) {
+            write_volatile(record as *mut u64, 0);
+            write_volatile((record + 8) as *mut u64, 0);
+            write_volatile((record + 16) as *mut u64, 0);
+        }
+        i += 1;
+    }
+}
+
+unsafe fn dma_allocation_range_overlaps(
+    sh: u64,
+    grant_logical: u64,
+    offset: u64,
+    length: u64,
+) -> Option<u64> {
+    let end = offset.checked_add(length)?;
+    let mut i = 0u64;
+    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+        let record = dma_allocation_record(sh, i)?;
+        let logical = read_volatile(record as *const u64);
+        let record_len = read_volatile((record + 8) as *const u64);
+        if logical != 0 && record_len != 0 {
+            let record_offset = logical.checked_sub(grant_logical)?;
+            let record_end = record_offset.checked_add(record_len)?;
+            if offset < record_end && record_offset < end {
+                return Some(record_end);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn first_free_dma_allocation_record(sh: u64) -> Option<u64> {
+    let mut i = 0u64;
+    while i < SH_DMA_ALLOC_RECORD_SLOTS {
+        let record = dma_allocation_record(sh, i)?;
+        if read_volatile((record + 8) as *const u64) == 0 {
+            return Some(record);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `AllocateCommonBuffer` — allocate a bounded slice from the PnP-granted DMA common-buffer window.
 extern "win64" fn s_dma_allocate_common_buffer(
     adapter: u64,
     length: u32,
@@ -3969,7 +4045,6 @@ extern "win64" fn s_dma_allocate_common_buffer(
         let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
         let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
-        let allocated = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
         let requested = length as u64;
         if adapter == 0
             || adapter != active
@@ -3978,32 +4053,71 @@ extern "win64" fn s_dma_allocate_common_buffer(
             || grant_logical == 0
             || requested == 0
             || requested > grant_len
-            || allocated != 0
         {
             return 0;
         }
 
-        core::ptr::write_bytes(grant_va as *mut u8, 0, requested as usize);
+        let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
+            return 0;
+        };
+        let mut offset = 0u64;
+        loop {
+            let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
+                return 0;
+            };
+            let Some(end) = aligned.checked_add(requested) else {
+                return 0;
+            };
+            if end > grant_len {
+                return 0;
+            }
+            if let Some(next_offset) = dma_allocation_range_overlaps(
+                FSD_SHARED_VADDR,
+                grant_logical,
+                aligned,
+                requested,
+            ) {
+                offset = next_offset;
+                continue;
+            }
+            offset = aligned;
+            break;
+        }
+
+        let va = grant_va + offset;
+        let logical = grant_logical + offset;
+        core::ptr::write_bytes(va as *mut u8, 0, requested as usize);
+        write_volatile(record as *mut u64, logical);
+        write_volatile((record + 8) as *mut u64, requested);
+        write_volatile((record + 16) as *mut u64, va);
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
             requested,
         );
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64,
-            grant_va,
-        );
+        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, va);
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
-            grant_logical,
+            logical,
         );
-        if !logical_out.is_null() {
-            write_unaligned(logical_out, grant_logical as i64);
+        let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+        let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
+            .saturating_add(1);
+        if used > count {
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
         }
-        grant_va
+        let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
+        let end = offset + requested;
+        if end > cursor {
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
+        }
+        if !logical_out.is_null() {
+            write_unaligned(logical_out, logical as i64);
+        }
+        va
     }
 }
 
-/// `FreeCommonBuffer` — release the common-buffer projection if it matches the active grant.
+/// `FreeCommonBuffer` — release the matching common-buffer allocation record.
 extern "win64" fn s_dma_free_common_buffer(
     _adapter: u64,
     length: u32,
@@ -4012,22 +4126,39 @@ extern "win64" fn s_dma_free_common_buffer(
     _cache_enabled: u8,
 ) {
     unsafe {
-        let active_logical =
-            read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
-        let active_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *const u64);
-        let active_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *const u64);
-        if active_logical != 0
-            && logical as u64 == active_logical
-            && virtual_address == active_va
-            && length as u64 == active_len
-        {
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
-                active_logical,
-            );
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+        let logical = logical as u64;
+        let mut i = 0u64;
+        while i < SH_DMA_ALLOC_RECORD_SLOTS {
+            if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+                let active_logical = read_volatile(record as *const u64);
+                let active_len = read_volatile((record + 8) as *const u64);
+                let active_va = read_volatile((record + 16) as *const u64);
+                if active_logical != 0
+                    && logical == active_logical
+                    && virtual_address == active_va
+                    && length as u64 == active_len
+                {
+                    write_volatile(
+                        (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
+                        active_logical,
+                    );
+                    write_volatile(record as *mut u64, 0);
+                    write_volatile((record + 8) as *mut u64, 0);
+                    write_volatile((record + 16) as *mut u64, 0);
+                    if read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64)
+                        == active_logical
+                    {
+                        write_volatile(
+                            (FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
+                            0,
+                        );
+                        write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+                        write_volatile((FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+                    }
+                    return;
+                }
+            }
+            i += 1;
         }
     }
 }
@@ -5331,6 +5462,31 @@ extern "win64" fn s_hal_translate_bus_address(
         }
         let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        let requested_space = if address_space != 0 {
+            read_unaligned(address_space as *const u32)
+        } else {
+            0
+        };
+        if requested_space != 0 {
+            let port_base =
+                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+            let port_len =
+                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+            if port_base == 0
+                || port_len == 0
+                || bus_address < port_base
+                || bus_address >= port_base.saturating_add(port_len)
+            {
+                return 0;
+            }
+            if address_space != 0 {
+                write_unaligned(address_space as *mut u32, 1);
+            }
+            if translated_address != 0 {
+                write_unaligned(translated_address as *mut u64, bus_address);
+            }
+            return 1;
+        }
         if grant_phys == 0
             || grant_len == 0
             || bus_address < grant_phys
@@ -5382,11 +5538,21 @@ extern "win64" fn s_hal_get_interrupt_vector(
     }
 }
 
-unsafe fn hosted_pci_slot_number() -> u32 {
+unsafe fn hosted_pci_device_function() -> (u32, u32, u32) {
     let address = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_ADDRESS) as *const u32);
     let dev = (address >> 16) & 0x1F;
     let func = address & 0x7;
-    (dev << 3) | func
+    (address, dev, func)
+}
+
+unsafe fn hosted_pci_slot_number_matches(slot_number: u32) -> bool {
+    let (address, dev, func) = hosted_pci_device_function();
+    let nt_slot_number = dev | (func << 5);
+    let legacy_devfn_slot_number = (dev << 3) | func;
+    slot_number == nt_slot_number
+        || slot_number == legacy_devfn_slot_number
+        || slot_number == address
+        || (func == 0 && slot_number == dev)
 }
 
 unsafe fn hosted_pci_config_byte(offset: u32) -> u8 {
@@ -5394,12 +5560,22 @@ unsafe fn hosted_pci_config_byte(offset: u32) -> u8 {
         read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
     let class_rev = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_CLASS_REV) as *const u32);
     let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64) as u32;
+    let port_base =
+        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64) as u32;
+    let port_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
     let pci_irq = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_IRQ) as *const u32);
     let value = match offset {
         0x00..=0x03 => vendor_device,
-        0x04..=0x07 => 0x0000_0006, // COMMAND: memory space + bus master enabled, STATUS clear.
+        0x04..=0x07 => {
+            if port_len != 0 {
+                0x0000_0007 // COMMAND: I/O space + memory space + bus master enabled.
+            } else {
+                0x0000_0006 // COMMAND: memory space + bus master enabled, STATUS clear.
+            }
+        }
         0x08..=0x0B => class_rev,
         0x10..=0x13 => grant_phys & 0xFFFF_FFF0,
+        0x14..=0x17 if port_len != 0 => (port_base & 0xFFFF_FFFC) | 1,
         0x2C..=0x2F => 0,
         0x3C..=0x3F => pci_irq,
         _ => 0,
@@ -5424,7 +5600,7 @@ extern "win64" fn s_hal_get_bus_data_by_offset(
             || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
                 != HOSTED_INTERFACE_TYPE_PCIBUS
             || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
-            || slot_number != hosted_pci_slot_number()
+            || !hosted_pci_slot_number_matches(slot_number)
         {
             return 0;
         }
@@ -8665,6 +8841,8 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_PCI_IRQ) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, 0);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
@@ -8676,6 +8854,7 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
+    clear_dma_allocation_records(sh);
 }
 
 fn hosted_root_pdo_device_id(pdo_object: u64) -> Option<u64> {
@@ -9374,6 +9553,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     bus_identity: HostedBusIdentity,
     mmio_phys: u64,
     mmio_len: u64,
+    io_port_base: u64,
+    io_port_len: u32,
     mmio_va: u64,
     mmio_frame_base: u64,
     mmio_pages: u64,
@@ -9394,6 +9575,9 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || interrupt_vector == 0
         || interrupt_affinity > u32::MAX as u64
     {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if (io_port_base == 0) != (io_port_len == 0) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let has_dma =
@@ -9488,6 +9672,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     let sh = inst.exec_shared_va;
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
     write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mapped_len);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, io_port_base);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, io_port_len as u64);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, mmio_va);
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
@@ -9538,6 +9724,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
+    clear_dma_allocation_records(sh);
     Ok(())
 }
 
@@ -9601,31 +9788,46 @@ unsafe fn record_hosted_resource_usage(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
 
-    let dma_requested_len = read_volatile((sh + SH_DMA_REQUESTED_LEN) as *const u64);
-    let dma_allocated_va = read_volatile((sh + SH_DMA_ALLOCATED_VA) as *const u64);
-    let dma_allocated_logical = read_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *const u64);
-    if dma_requested_len != 0 || dma_allocated_va != 0 || dma_allocated_logical != 0 {
-        if dma_adapter_id == 0
-            || dma_adapter_blob == 0
-            || dma_grant_va == 0
-            || dma_grant_len == 0
-            || dma_grant_logical == 0
-            || dma_requested_len == 0
-            || dma_requested_len > dma_grant_len
-            || dma_allocated_va != dma_grant_va
-            || dma_allocated_logical != dma_grant_logical
-        {
+    let mut record_index = 0u64;
+    while record_index < SH_DMA_ALLOC_RECORD_SLOTS {
+        let Some(record) = dma_allocation_record(sh, record_index) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        let logical = read_volatile(record as *const u64);
+        let len = read_volatile((record + 8) as *const u64);
+        let va = read_volatile((record + 16) as *const u64);
+        if logical != 0 || len != 0 || va != 0 {
+            if dma_adapter_id == 0
+                || dma_adapter_blob == 0
+                || dma_grant_va == 0
+                || dma_grant_len == 0
+                || dma_grant_logical == 0
+                || logical < dma_grant_logical
+                || va < dma_grant_va
+                || len == 0
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            let logical_offset = logical
+                .checked_sub(dma_grant_logical)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            let va_offset = va
+                .checked_sub(dma_grant_va)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if logical_offset != va_offset || logical_offset > dma_grant_len || len > dma_grant_len - logical_offset {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            hosted_dma_manager_mut()
+                .register_common_buffer_at(
+                    hosted_dma_owner(binding),
+                    dma_adapter_id,
+                    logical,
+                    len,
+                    va,
+                )
+                .map_err(hosted_dma_status)?;
         }
-        hosted_dma_manager_mut()
-            .register_common_buffer_at(
-                hosted_dma_owner(binding),
-                dma_adapter_id,
-                dma_allocated_logical,
-                dma_requested_len,
-                dma_allocated_va,
-            )
-            .map_err(hosted_dma_status)?;
+        record_index += 1;
     }
 
     Ok(())

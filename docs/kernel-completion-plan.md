@@ -86,10 +86,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    overlaps the import table; hosted registry identity is published through the driver shared frame
    and refuses to synthesize missing exports; and hosted driver slots reserve/free from the live
    table while unmapping exec windows before reuse. Boot gates now prove PCI registry selection,
-   real `ndis.sys` support `DriverEntry`, and `e1000.sys` AddDevice. Next implement the honest
-   NDIS `IRP_MN_START_DEVICE` path: adapter configuration/resource queries, PCI config reads,
-   interface enable, interrupt/DMA bring-up, and miniport initialization through the generic PCI
-   grant.
+   real `ndis.sys` support `DriverEntry`, `e1000.sys` AddDevice, NT-style PCI config reads, full
+   MMIO/I/O/interrupt resource-list projection, and multiple common-buffer allocations from the
+   per-devnode DMA grant. Next continue the honest NDIS `IRP_MN_START_DEVICE` path at the remaining
+   miniport failure after descriptor/RX allocations: identify the next unimplemented NDIS/HAL
+   behavior needed for `e1000.sys` to connect interrupts and finish hardware start through the
+   generic PCI grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -575,3 +577,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_irp_transport_call_bound`/`exec_client_reply_bound` plus `exec_vm_pool_headroom`. Review
   adjustment: B3 remains open at real ReactOS NDIS/e1000 `START_DEVICE`, which currently returns
   `STATUS_INVALID_DEVICE_REQUEST` before MMIO, interrupt, or DMA evidence is produced.
+- B3 continued. The registry-selected ReactOS `e1000.sys` PCI path now receives a full
+  memory+I/O-port+interrupt `CM_RESOURCE_LIST`, accepts NT `PCI_SLOT_NUMBER` config reads through
+  real `ndis.sys`, maps the 128 KiB BAR, registers the 64-byte I/O port BAR, and allocates all three
+  observed common buffers from one per-devnode DMA grant (two 2048-byte descriptor rings plus the
+  262144-byte receive-buffer window). `nt-dma-manager` now scopes logical DMA addresses by
+  `DmaOwner`, so multiple devices may reuse the same logical IOVA in separate domains, and hosted
+  common-buffer evidence records each active allocation rather than one synthetic global result.
+  The NDIS diagnostic interposition used to find the boundary was removed; dependency imports now
+  call the real mapped `ndis.sys` export. Validation: `cargo fmt --all`,
+  `cargo test -p nt-cm-resources`, `cargo test -p nt-pnp`, `cargo test -p nt-dma-manager`,
+  `cargo test -p nt-hive-core`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and headless boot
+  `.tmp/full-boot-e1000-cleaned-counts-20260806.log` through genuine explorer shell chrome with
+  `284/291` checks passing. Generic config-PnP instrumentation is now count-based:
+  `selected=2 attempted=2 add=2 started=1`, with PCI separately reported as
+  `pci_selected=1 pci_attempted=1 pci_support=1 pci_add=1 pci_started=0
+  pci_first_error=0xc0000001`. The remaining B3 frontier is inside real e1000 miniport start after
+  resource and common-buffer setup, before interrupt connection. Review adjustment: do not claim
+  arbitrary NIC/driver scale yet; hosted instance/device tables, shared-frame allocation-record
+  slots, and fixed proof BAR/DMA windows are still bounded. The next cleanup should replace those
+  fixed hosted arenas with per-devnode dynamic resource/window allocation before multi-NIC support is
+  considered complete.

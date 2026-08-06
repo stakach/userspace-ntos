@@ -63,7 +63,17 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_common: bool,
     pub(crate) root_started: bool,
     pub(crate) attempted: u64,
+    pub(crate) add_device_count: u64,
     pub(crate) started: u64,
+    pub(crate) resource_granted_count: u64,
+    pub(crate) mmio_mapped_count: u64,
+    pub(crate) interrupt_connected_count: u64,
+    pub(crate) interrupt_delivered_count: u64,
+    pub(crate) interrupt_acknowledged_count: u64,
+    pub(crate) dpc_delivered_count: u64,
+    pub(crate) dma_adapter_count: u64,
+    pub(crate) dma_common_count: u64,
+    pub(crate) root_started_count: u64,
     pub(crate) first_error: u32,
 }
 
@@ -215,6 +225,7 @@ unsafe fn start_one_devnode(
     ) {
         Ok(device_id) => {
             report.add_device = true;
+            report.add_device_count += 1;
             print_add_device_success(options.trace, service_name, devnode.instance_id, device_id);
             let start_status = match grant_current_hosted_devnode_resources(
                 device_id,
@@ -319,12 +330,15 @@ unsafe fn inject_proof_interrupt(
             match driver_launch::inject_hosted_device_interrupt(device_id) {
                 Ok(delivery) => {
                     let ack = core::ptr::read_volatile(
-                        (ROOT_DMA_PROOF_MMIO_SEED_VADDR + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
-                            as *const u32,
-                    );
-                    report.interrupt_acknowledged |= ack == 1;
-                    print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
-                }
+                (ROOT_DMA_PROOF_MMIO_SEED_VADDR + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
+                    as *const u32,
+            );
+            report.interrupt_acknowledged |= ack == 1;
+            if ack == 1 {
+                report.interrupt_acknowledged_count += 1;
+            }
+            print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
+        }
                 Err(status) => {
                     print_interrupt_delivery_failure(trace, status);
                     remember_error(report, status);
@@ -345,6 +359,7 @@ fn collect_hardware_evidence(
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
         if evidence.resource_granted() {
             report.resource_granted = true;
+            report.resource_granted_count += 1;
             report.mmio_mapped |= evidence.mmio_mapped();
             report.interrupt_connected |= evidence.interrupt_connected();
             report.interrupt_delivered |= evidence.interrupt_delivered();
@@ -352,6 +367,27 @@ fn collect_hardware_evidence(
             report.dma_adapter |= evidence.dma_adapter_created();
             report.dma_common |= evidence.dma_common_allocated();
             report.root_started |= evidence.root_pdo_started;
+            if evidence.mmio_mapped() {
+                report.mmio_mapped_count += 1;
+            }
+            if evidence.interrupt_connected() {
+                report.interrupt_connected_count += 1;
+            }
+            if evidence.interrupt_delivered() {
+                report.interrupt_delivered_count += 1;
+            }
+            if evidence.dpc_delivered() {
+                report.dpc_delivered_count += 1;
+            }
+            if evidence.dma_adapter_created() {
+                report.dma_adapter_count += 1;
+            }
+            if evidence.dma_common_allocated() {
+                report.dma_common_count += 1;
+            }
+            if evidence.root_pdo_started {
+                report.root_started_count += 1;
+            }
         }
         print_hardware_evidence(trace, service_name, instance_id, start_status_raw, evidence);
     }

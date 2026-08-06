@@ -29,9 +29,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub use nt_cm_resources::{
-    InterruptDescriptor, MemoryDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
-    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE,
-    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, MEMORY_INTERRUPT_LIST_SIZE,
+    InterruptDescriptor, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
+    CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_BAR,
+    CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, MEMORY_INTERRUPT_LIST_SIZE,
+    MEMORY_PORT_INTERRUPT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
@@ -107,6 +108,11 @@ impl PciDevice {
     /// The first *present memory* BAR — the device's primary MMIO register file (a NIC's BAR0).
     pub fn first_memory_bar(&self) -> Option<&Bar> {
         self.bars.iter().find(|b| !b.is_io && b.is_present())
+    }
+
+    /// The first *present I/O-space* BAR.
+    pub fn first_io_bar(&self) -> Option<&Bar> {
+        self.bars.iter().find(|b| b.is_io && b.is_present())
     }
 }
 
@@ -449,6 +455,10 @@ pub struct ResourceAssignment {
     pub mmio_phys: u64,
     /// The MMIO window length (rounded up to whole pages by the broker when minting frame caps).
     pub mmio_len: u64,
+    /// The device I/O port base, if the PCI function exposes a port BAR.
+    pub io_port_base: u64,
+    /// The device I/O port range length. `0` means no port resource is granted.
+    pub io_port_len: u32,
     /// The interrupt vector/level assigned to the device (translated form).
     pub int_vector: u32,
     /// True = latched (edge/MSI), false = level-sensitive.
@@ -515,6 +525,8 @@ pub fn assign_root_bus_resources(
     Some(ResourceAssignment {
         mmio_phys: profile.mmio_phys,
         mmio_len: profile.mmio_len,
+        io_port_base: 0,
+        io_port_len: 0,
         int_vector,
         int_latched,
         int_affinity,
@@ -534,10 +546,21 @@ pub fn assign_resources(
     int_affinity: u64,
     dma_len: u64,
 ) -> Option<ResourceAssignment> {
-    let bar = device.first_memory_bar()?;
+    let mem_bar = device.first_memory_bar()?;
+    let (io_port_base, io_port_len) = match device.first_io_bar() {
+        Some(port_bar) => {
+            if port_bar.size > u32::MAX as u64 {
+                return None;
+            }
+            (port_bar.base, port_bar.size as u32)
+        }
+        None => (0, 0),
+    };
     Some(ResourceAssignment {
-        mmio_phys: bar.base,
-        mmio_len: bar.size,
+        mmio_phys: mem_bar.base,
+        mmio_len: mem_bar.size,
+        io_port_base,
+        io_port_len,
         int_vector,
         int_latched,
         int_affinity,
@@ -545,10 +568,14 @@ pub fn assign_resources(
     })
 }
 
-/// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` (memory + interrupt) a WDK driver
-/// reads at `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; callers should
-/// pass the translated physical address for real WDM drivers that call `MmMapIoSpace`.
-/// Writes into `buf` (>= [`MEMORY_INTERRUPT_LIST_SIZE`]); returns the byte length written.
+/// The largest `CM_RESOURCE_LIST` this crate currently emits for one device.
+pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = MEMORY_PORT_INTERRUPT_LIST_SIZE;
+
+/// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
+/// `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; callers should pass the
+/// translated physical address for real WDM drivers that call `MmMapIoSpace`. If the assignment has
+/// an I/O BAR, the list contains memory + port + interrupt; otherwise it contains memory +
+/// interrupt. Returns the byte length written.
 pub fn assignment_to_cm_list(
     buf: &mut [u8],
     bus_number: u32,
@@ -556,27 +583,39 @@ pub fn assignment_to_cm_list(
     memory_start: u64,
     mmio_len: u32,
 ) -> Option<usize> {
-    nt_cm_resources::build_memory_interrupt_list(
-        buf,
-        bus_number,
-        MemoryDescriptor {
-            start: memory_start,
-            length: mmio_len,
-            flags: CM_RESOURCE_MEMORY_READ_WRITE,
-            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    let mem = MemoryDescriptor {
+        start: memory_start,
+        length: mmio_len,
+        flags: CM_RESOURCE_MEMORY_READ_WRITE,
+        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    };
+    let int = InterruptDescriptor {
+        level: assign.int_vector,
+        vector: assign.int_vector,
+        affinity: assign.int_affinity,
+        flags: if assign.int_latched {
+            CM_RESOURCE_INTERRUPT_LATCHED
+        } else {
+            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
         },
-        InterruptDescriptor {
-            level: assign.int_vector,
-            vector: assign.int_vector,
-            affinity: assign.int_affinity,
-            flags: if assign.int_latched {
-                CM_RESOURCE_INTERRUPT_LATCHED
-            } else {
-                CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    };
+    if assign.io_port_len != 0 {
+        nt_cm_resources::build_memory_port_interrupt_list(
+            buf,
+            bus_number,
+            mem,
+            PortDescriptor {
+                start: assign.io_port_base,
+                length: assign.io_port_len,
+                flags: CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
             },
-            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-        },
-    )
+            int,
+        )
+    } else {
+        nt_cm_resources::build_memory_interrupt_list(buf, bus_number, mem, int)
+    }
 }
 
 #[cfg(test)]
@@ -623,24 +662,36 @@ mod tests {
                     self.set(dev, func, off, *mask);
                     return;
                 }
+                if (PCI_CFG_BAR0..PCI_CFG_BAR0 + (PCI_NUM_BARS as u8) * 4).contains(&off)
+                    && (off - PCI_CFG_BAR0) % 4 == 0
+                {
+                    self.set(dev, func, off, 0);
+                    return;
+                }
             }
             self.set(dev, func, off, v);
         }
     }
 
     /// Build a mock with a single NIC at 00:03.0: Intel e1000 (8086:100E), class 0x020000
-    /// (network/ethernet), BAR0 = 32-bit memory @ 0xFEBC_0000 size 128 KiB, IRQ line 11 pin INTA.
+    /// (network/ethernet), BAR0 = 32-bit memory @ 0xFEBC_0000 size 128 KiB, BAR1 = I/O ports
+    /// @ 0xC000 size 64 bytes, IRQ line 11 pin INTA.
     fn nic_mock() -> MockConfig {
         let regs = vec![
             ((3, 0, PCI_CFG_VENDOR_DEVICE), 0x100E_8086),
             ((3, 0, PCI_CFG_CLASS_REV), 0x0200_0000), // class 0x020000 in the high 24 bits
             ((3, 0, PCI_CFG_BAR0), 0xFEBC_0000),      // 32-bit mem BAR base
+            ((3, 0, PCI_CFG_BAR0 + 4), 0xC001),       // I/O BAR base
             ((3, 0, PCI_CFG_INTERRUPT), 0x0000_010B), // pin=INTA(1) line=11(0x0B)
         ];
         MockConfig {
             regs: RefCell::new(regs),
-            // 128 KiB memory BAR => mask 0xFFFE_0000 (size = ~mask+1 = 0x2_0000).
-            bar_masks: vec![((3, 0, PCI_CFG_BAR0), 0xFFFE_0000)],
+            bar_masks: vec![
+                // 128 KiB memory BAR => mask 0xFFFE_0000 (size = ~mask+1 = 0x2_0000).
+                ((3, 0, PCI_CFG_BAR0), 0xFFFE_0000),
+                // 64-byte I/O BAR => mask 0xFFFF_FFC1 after I/O flag bits.
+                ((3, 0, PCI_CFG_BAR0 + 4), 0xFFFF_FFC1),
+            ],
         }
     }
 
@@ -663,6 +714,10 @@ mod tests {
         assert!(!bar.is_io);
         assert_eq!(bar.base, 0xFEBC_0000);
         assert_eq!(bar.size, 0x2_0000); // 128 KiB from the write-all-ones probe
+        let port = nic.first_io_bar().unwrap();
+        assert!(port.is_io);
+        assert_eq!(port.base, 0xC000);
+        assert_eq!(port.size, 0x40);
     }
 
     #[test]
@@ -835,18 +890,24 @@ mod tests {
         let assign = assign_resources(nic, 5, true, 1, 0x1000).unwrap();
         assert_eq!(assign.mmio_phys, 0xFEBC_0000);
         assert_eq!(assign.mmio_len, 0x2_0000);
+        assert_eq!(assign.io_port_base, 0xC000);
+        assert_eq!(assign.io_port_len, 0x40);
         assert_eq!(assign.int_vector, 5);
         assert!(assign.int_latched);
         assert_eq!(assign.dma_len, 0x1000);
 
-        // The resource list names the caller-supplied translated memory address + vector.
-        let mut buf = [0u8; MEMORY_INTERRUPT_LIST_SIZE];
+        // The resource list names the caller-supplied translated memory address, the port BAR, and
+        // the translated vector.
+        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
         let memory_start = 0xFEBC_0000u64;
-        let n = assignment_to_cm_list(&mut buf, 0, &assign, memory_start, 0x4000).unwrap();
-        assert_eq!(n, MEMORY_INTERRUPT_LIST_SIZE);
-        let (mem, int) = nt_cm_resources::decode_memory_interrupt_list(&buf).unwrap();
+        let n = assignment_to_cm_list(&mut buf, 0, &assign, memory_start, 0x2_0000).unwrap();
+        assert_eq!(n, MEMORY_PORT_INTERRUPT_LIST_SIZE);
+        let (mem, port, int) = nt_cm_resources::decode_memory_port_interrupt_list(&buf).unwrap();
         assert_eq!(mem.start, memory_start);
-        assert_eq!(mem.length, 0x4000);
+        assert_eq!(mem.length, 0x2_0000);
+        assert_eq!(port.start, 0xC000);
+        assert_eq!(port.length, 0x40);
+        assert_eq!(port.flags, CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR);
         assert_eq!(int.vector, 5);
         assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LATCHED);
         assert_eq!(int.affinity, 1);
@@ -867,6 +928,8 @@ mod tests {
         .expect("root-bus DMA resources");
         assert_eq!(assignment.mmio_phys, 0x1000_0000);
         assert_eq!(assignment.mmio_len, 0x1000);
+        assert_eq!(assignment.io_port_base, 0);
+        assert_eq!(assignment.io_port_len, 0);
         assert_eq!(assignment.int_vector, 5);
         assert!(!assignment.int_latched);
         assert_eq!(assignment.int_affinity, 1);

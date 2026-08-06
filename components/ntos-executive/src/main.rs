@@ -1246,10 +1246,15 @@ pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
 pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
-/// Where the executive maps a real PCI device's BAR (P1 capstone — the e1000e NIC).
-pub const NIC_VADDR: u64 = 0x0000_0100_105F_0000;
+/// Where the executive maps the full real PCI NIC BAR. This lives in the free dedicated 2 MiB
+/// device window above `DMA_VADDR`, not in the AHCI/storage cluster, because ReactOS `e1000.sys`
+/// requires the complete 128 KiB MMIO resource during NDIS miniport initialization.
+pub const NIC_VADDR: u64 = 0x0000_0100_10D0_0000;
+pub const NIC_BAR_PAGES: u64 = 32;
+pub const NIC_DMA_PAGES: u64 = 66;
+pub const NIC_DMA_LEN: u64 = NIC_DMA_PAGES * 0x1000;
 /// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
-/// the sector data buffer (both just past the NIC's 4-page BAR, before IPCBUF).
+/// the sector data buffer in the storage cluster before IPCBUF.
 pub const AHCI_VADDR: u64 = 0x0000_0100_105F_4000;
 pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// Shared word between the executive (broker) and the isolated storage host: the AHCI's
@@ -1846,6 +1851,7 @@ pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 // writes then landed on the STALE frame while the NIC DMA'd from dma_frame's real (zeroed) paddr,
 // so the DD writeback never appeared in the polled frame. A dedicated PT guarantees a free slot.
 pub const DMA_VADDR: u64 = 0x0000_0100_10C0_0000;
+const _: () = assert!(NIC_DMA_LEN <= 0x20_0000);
 const ROOT_DMA_PROOF_MMIO_SEED_VADDR: u64 = DMA_VADDR + 0x1000;
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
@@ -6383,6 +6389,48 @@ fn alloc_slot() -> u64 {
     }
 }
 
+fn try_alloc_slot_run(count: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
+    let mut current = NEXT_SLOT.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(count)?;
+        if next > end {
+            return None;
+        }
+        match NEXT_SLOT.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                let mut slot = current;
+                while slot < next {
+                    unsafe {
+                        let _ = root_slot_mark_live(slot);
+                    }
+                    slot += 1;
+                }
+                return Some(current);
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn alloc_slot_run(count: u64) -> u64 {
+    match try_alloc_slot_run(count) {
+        Some(slot) => slot,
+        None => {
+            print_str(b"[cap] root CSpace exhausted while allocating a slot run\n");
+            park()
+        }
+    }
+}
+
 fn root_slot_bit(slot: u64) -> Option<(usize, u64)> {
     let start = ROOT_CSPACE_START.load(Ordering::Relaxed);
     let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
@@ -8684,6 +8732,8 @@ struct HostedDevnodeGrant {
     resource_list: alloc::vec::Vec<u8>,
     mmio_phys: u64,
     mmio_len: u64,
+    io_port_base: u64,
+    io_port_len: u32,
     vector: u32,
     dma_len: u64,
 }
@@ -8711,6 +8761,12 @@ fn print_hosted_devnode_grant(service: &[u8], devnode: &[u8], grant: &HostedDevn
     print_hex(grant.mmio_phys as u32);
     print_str(b" len=");
     print_u64(grant.mmio_len);
+    if grant.io_port_len != 0 {
+        print_str(b" io=0x");
+        print_hex(grant.io_port_base as u32);
+        print_str(b" io_len=");
+        print_u64(grant.io_port_len as u64);
+    }
     print_str(b" vector=");
     print_u64(grant.vector as u64);
     print_str(b" dma_len=");
@@ -8737,13 +8793,16 @@ unsafe fn grant_hosted_devnode_resources(
         pci_devices,
         NIC_MSI_VECTOR as u32,
         true,
-        0x1000,
-        0x4000,
+        NIC_DMA_LEN,
+        (NIC_BAR_PAGES * 0x1000) as u32,
     ) {
         if nic_bar_base == 0 || grant.assignment.mmio_phys != nic_mmio || nic_dma_frame == 0 {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let mmio_len = grant.assignment.mmio_len.min(0x4000);
+        let mmio_len = grant.assignment.mmio_len;
+        if mmio_len == 0 || mmio_len > NIC_BAR_PAGES * 0x1000 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
         driver_launch::grant_hosted_device_resources(
             device_id,
             driver_launch::HostedBusIdentity::pci(
@@ -8758,15 +8817,17 @@ unsafe fn grant_hosted_devnode_resources(
             ),
             grant.assignment.mmio_phys,
             mmio_len,
+            grant.assignment.io_port_base,
+            grant.assignment.io_port_len,
             NIC_VADDR,
             nic_bar_base,
-            4,
+            NIC_BAR_PAGES,
             grant.assignment.int_vector,
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
             DMA_VADDR,
             nic_dma_frame,
-            1,
+            NIC_DMA_PAGES,
             NIC_IOVA,
             grant.assignment.dma_len,
         )?;
@@ -8778,6 +8839,8 @@ unsafe fn grant_hosted_devnode_resources(
             resource_list: grant.resource_list,
             mmio_phys: grant.assignment.mmio_phys,
             mmio_len,
+            io_port_base: grant.assignment.io_port_base,
+            io_port_len: grant.assignment.io_port_len,
             vector: grant.assignment.int_vector,
             dma_len: grant.assignment.dma_len,
         }));
@@ -8801,6 +8864,8 @@ unsafe fn grant_hosted_devnode_resources(
             driver_launch::HostedBusIdentity::root_bus(),
             grant.assignment.mmio_phys,
             mmio_len,
+            0,
+            0,
             NIC_VADDR,
             *root_dma_mmio_frame,
             1,
@@ -8818,6 +8883,8 @@ unsafe fn grant_hosted_devnode_resources(
             resource_list: grant.resource_list,
             mmio_phys: grant.assignment.mmio_phys,
             mmio_len,
+            io_port_base: 0,
+            io_port_len: 0,
             vector: grant.assignment.int_vector,
             dma_len: grant.assignment.dma_len,
         }));
@@ -16502,13 +16569,19 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
         if d.is_device == 1 && d.paddr == paddr {
             let mut base = 0u64;
             for p in 0..n {
+                if p == 0 || ((vaddr + p * 0x1000) & 0x1F_FFFF) == 0 {
+                    driver_launch::ensure_paging(vaddr + p * 0x1000, CAP_INIT_THREAD_VSPACE);
+                }
                 let frame = alloc_slot();
                 if p == 0 {
                     base = frame;
                 }
                 let _ =
                     untyped_retype(bi.untyped.start + i, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
-                let _ = page_map(frame, vaddr + p * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let map_err = page_map(frame, vaddr + p * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                if map_err != 0 {
+                    return 0;
+                }
             }
             return base;
         }
@@ -17665,7 +17738,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
-    // --- P1 CAPSTONE: drive the real e1000e NIC. Map its enumerated BAR0 as a
+    // --- P1 CAPSTONE: drive the real Intel e1000-class NIC. Map its enumerated BAR0 as a
     // device frame and read a live device register — a real driver path touching
     // real (QEMU-emulated) network hardware, not a mock.
     let mut kmdf_nic_bar_base = 0u64; // the real NIC BAR caps, handed to the KMDF host below
@@ -17679,21 +17752,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut nic_dma_frame = 0u64;
     if found_nic {
         nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
-        print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000e NIC BAR0 ");
+        print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000 NIC BAR0 ");
         print_hex(nic_mmio as u32);
         print_str(b" (irq ");
         print_u64(nic_irq as u64);
         print_str(b")\n");
-        // Map the first 4 pages (16 KiB) of the BAR: page 0 has CTRL/STATUS/interrupt
-        // regs, page 3 (offset 0x3000) has the TX descriptor registers (0x3800..0x3828).
-        nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
+        // Map the complete BAR. The raw NIC proof only touches the first few pages, but the real
+        // ReactOS miniport validates and maps the full 128 KiB resource.
+        nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, NIC_BAR_PAGES);
         check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
         kmdf_nic_bar_base = nic_bar_base; // hand the real BAR to the KMDF host later
         if nic_bar_base != 0 {
             // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
             let ctrl = core::ptr::read_volatile((NIC_VADDR + 0x00) as *const u32);
             let status = core::ptr::read_volatile((NIC_VADDR + 0x08) as *const u32);
-            print_str(b"[ntos-exec] e1000e CTRL=");
+            print_str(b"[ntos-exec] e1000 CTRL=");
             print_hex(ctrl);
             print_str(b" STATUS=");
             print_hex(status);
@@ -17864,9 +17937,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 cmd | (1 << 2) | (1 << 1),
             );
 
-            let dma_frame = alloc_slot();
+            let dma_frame = alloc_slot_run(NIC_DMA_PAGES);
             nic_dma_frame = dma_frame; // hoist for the deferred (post-FS-mount) driver-host hosting
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
+            let mut dma_page = 0u64;
+            while dma_page < NIC_DMA_PAGES {
+                let _ = untyped_retype(
+                    CAP_INIT_UNTYPED,
+                    OBJ_X86_4K_PAGE,
+                    PAGING_BITS,
+                    1,
+                    dma_frame + dma_page,
+                );
+                dma_page += 1;
+            }
             // DMA_VADDR lives in its OWN dedicated 2 MiB region — build its page table so the frame
             // map lands in a guaranteed-free leaf slot (the old shared-cluster slot was occupied,
             // making page_map fail with DeleteFirst → CPU wrote a stale frame while the NIC DMA'd a
@@ -17983,8 +18066,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"exec_nic_iopt_hierarchy_built", iopt_err == 0, &mut passed);
             // Map the DMA frame (a COPY — the original stays VSpace-mapped for CPU access)
             // into the NIC's IO space at NIC_IOVA, read+write.
-            let dma_frame_io = copy_cap(dma_frame);
-            let map_err = map_io(dma_frame_io, nic_io_space, 0x3, NIC_IOVA);
+            let mut map_err = 0u64;
+            let mut dma_page = 0u64;
+            while dma_page < NIC_DMA_PAGES {
+                let dma_frame_io = copy_cap(dma_frame + dma_page);
+                let err = map_io(
+                    dma_frame_io,
+                    nic_io_space,
+                    0x3,
+                    NIC_IOVA + dma_page * 0x1000,
+                );
+                if err != 0 {
+                    map_err = err;
+                }
+                dma_page += 1;
+            }
             print_str(b"[ntos-exec] map_io err=");
             print_u64(map_err);
             print_str(b"\n");
@@ -18739,7 +18835,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let kmdf_fault = make_object(OBJ_ENDPOINT);
         // Inlined descriptor (was spawn_kmdf_host): image RWX (WDF fn-table/globals live in .bss), a
         // heap (WdfRuntime + Wdf*Create allocate), the KMDF PE (RWX), a shared word, and (optionally)
-        // the real e1000e NIC BAR (4 pages aliased) at NIC_VADDR for MmMapIoSpace. Deep stack.
+        // the real e1000 NIC BAR at NIC_VADDR for MmMapIoSpace. Deep stack.
         {
             let mut regions: [Region; 4] = [
                 Region {
@@ -18775,9 +18871,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 regions[3] = Region {
                     source: FrameSource::Alias(kmdf_nic_bar_base),
                     base_va: NIC_VADDR,
-                    count: 4,
+                    count: NIC_BAR_PAGES,
                     rights: Rights::Uniform(RW_NX),
-                    pts: 0,
+                    pts: pts_for(NIC_BAR_PAGES),
                 };
             }
             let d = ComponentDescriptor {
@@ -19601,6 +19697,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_dma_adapter = false;
         let mut generic_hw_dma_common = false;
         let mut generic_hw_root_started = false;
+        let mut generic_hw_attempted = 0u64;
+        let mut generic_hw_started = 0u64;
+        let mut generic_hw_first_error = 0u32;
         for spec in system_hive_boot_driver_launch_plan().as_slice() {
             if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
@@ -19637,6 +19736,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_dma_adapter |= start_report.dma_adapter;
                     generic_hw_dma_common |= start_report.dma_common;
                     generic_hw_root_started |= start_report.root_started;
+                    generic_hw_attempted += start_report.attempted;
+                    generic_hw_started += start_report.started;
+                    if generic_hw_first_error == 0 && start_report.first_error != 0 {
+                        generic_hw_first_error = start_report.first_error;
+                    }
                 }
                 let device_path =
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
@@ -19659,7 +19763,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
         }
         if generic_hw_granted {
-            print_str(b"[driver-launch] generic hardware summary mmio=");
+            print_str(b"[driver-launch] generic hardware summary attempted=");
+            print_u64(generic_hw_attempted);
+            print_str(b" started=");
+            print_u64(generic_hw_started);
+            print_str(b" first_error=0x");
+            print_hex(generic_hw_first_error);
+            print_str(b" mmio=");
             print_u64(generic_hw_mmio_mapped as u64);
             print_str(b" int=");
             print_u64(generic_hw_interrupt_connected as u64);
@@ -20410,16 +20520,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
     let mut generic_hw_root_started = false;
+    let mut generic_hw_selected = 0u64;
+    let mut generic_hw_attempted = 0u64;
+    let mut generic_hw_add_device_count = 0u64;
+    let mut generic_hw_started = 0u64;
+    let mut generic_hw_first_error = 0u32;
+    let mut generic_root_attempted = 0u64;
+    let mut generic_root_started = 0u64;
     let mut generic_pci_registry_selected = false;
     let mut generic_pci_support_driver_entry = false;
     let mut generic_pci_add_device = false;
+    let mut generic_pci_selected = 0u64;
+    let mut generic_pci_attempted = 0u64;
+    let mut generic_pci_support_ready = 0u64;
+    let mut generic_pci_add_device_count = 0u64;
+    let mut generic_pci_started = 0u64;
+    let mut generic_pci_first_error = 0u32;
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     if !config_pnp_plan.as_slice().is_empty() {
         if let Some(fs) = exec_fs() {
             for proof_pnp_spec in config_pnp_plan.as_slice() {
                 let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(proof_pnp_spec);
+                let spec_devnodes = proof_pnp_spec.devnode_count as u64;
+                generic_hw_selected += spec_devnodes;
                 generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
                 generic_pci_registry_selected |= spec_has_pci_devnode;
+                if spec_has_pci_devnode {
+                    generic_pci_selected += spec_devnodes;
+                }
                 print_str(b"[driver-launch] launching PnP service ");
                 print_str(proof_pnp_spec.service_name.as_bytes());
                 print_str(b" from config hive path=");
@@ -20436,10 +20564,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     proof_pnp_spec.class,
                     proof_pnp_spec.driver_object_path.as_str(),
                 ) {
-                    if spec_has_pci_devnode {
-                        generic_pci_support_driver_entry |= dc.support_status == 0
-                            && (dc.support_verdict & V_SUCCESS) != 0;
-                    }
+                    let pci_support_ready = spec_has_pci_devnode
+                        && dc.support_status == 0
+                        && (dc.support_verdict & V_SUCCESS) != 0;
+                    generic_pci_support_driver_entry |= pci_support_ready;
                     let start_report = start_inline_driver_service_devnodes(
                         &dc,
                         proof_pnp_spec,
@@ -20447,8 +20575,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
                     generic_hw_add_device |= start_report.add_device;
+                    generic_hw_attempted += start_report.attempted;
+                    generic_hw_add_device_count += start_report.add_device_count;
+                    generic_hw_started += start_report.started;
+                    if generic_hw_first_error == 0 && start_report.first_error != 0 {
+                        generic_hw_first_error = start_report.first_error;
+                    }
                     if spec_has_pci_devnode {
                         generic_pci_add_device |= start_report.add_device;
+                        generic_pci_attempted += start_report.attempted;
+                        generic_pci_add_device_count += start_report.add_device_count;
+                        generic_pci_started += start_report.started;
+                        if pci_support_ready {
+                            generic_pci_support_ready += start_report.attempted;
+                        }
+                        if generic_pci_first_error == 0 && start_report.first_error != 0 {
+                            generic_pci_first_error = start_report.first_error;
+                        }
+                    } else {
+                        generic_root_attempted += start_report.attempted;
+                        generic_root_started += start_report.started;
                     }
                     generic_hw_start_ok |= start_report.start_ok;
                     generic_hw_granted |= start_report.resource_granted;
@@ -20474,9 +20620,42 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     } else {
         print_str(b"[driver-launch] config hive has no boot/system PnP driver binding\n");
     }
+    if generic_hw_selected != 0 {
+        print_str(b"[driver-launch] config PnP hardware summary selected=");
+        print_u64(generic_hw_selected);
+        print_str(b" attempted=");
+        print_u64(generic_hw_attempted);
+        print_str(b" add=");
+        print_u64(generic_hw_add_device_count);
+        print_str(b" started=");
+        print_u64(generic_hw_started);
+        print_str(b" first_error=0x");
+        print_hex(generic_hw_first_error);
+        print_str(b" pci_selected=");
+        print_u64(generic_pci_selected);
+        print_str(b" pci_attempted=");
+        print_u64(generic_pci_attempted);
+        print_str(b" pci_support=");
+        print_u64(generic_pci_support_ready);
+        print_str(b" pci_add=");
+        print_u64(generic_pci_add_device_count);
+        print_str(b" pci_started=");
+        print_u64(generic_pci_started);
+        print_str(b" pci_first_error=0x");
+        print_hex(generic_pci_first_error);
+        print_str(b" root_attempted=");
+        print_u64(generic_root_attempted);
+        print_str(b" root_started=");
+        print_u64(generic_root_started);
+        print_str(b"\n");
+    }
     check(
         b"exec_generic_hw_registry_selected",
-        generic_hw_registry_selected && generic_hw_driver_loaded && generic_hw_add_device,
+        generic_hw_registry_selected
+            && generic_hw_driver_loaded
+            && generic_hw_add_device
+            && generic_hw_attempted == generic_hw_selected
+            && generic_hw_add_device_count == generic_hw_selected,
         &mut passed,
     );
     check(
@@ -20490,22 +20669,29 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     );
     check(
         b"exec_generic_hw_root_pdo_started",
-        generic_hw_start_ok && generic_hw_root_started,
+        generic_root_attempted != 0
+            && generic_root_started == generic_root_attempted
+            && generic_hw_start_ok
+            && generic_hw_root_started,
         &mut passed,
     );
     check(
         b"exec_generic_pci_registry_selected",
-        generic_pci_registry_selected,
+        generic_pci_registry_selected && generic_pci_selected != 0,
         &mut passed,
     );
     check(
         b"exec_generic_pci_support_driver_entry",
-        generic_pci_support_driver_entry,
+        generic_pci_support_driver_entry
+            && generic_pci_attempted == generic_pci_selected
+            && generic_pci_support_ready == generic_pci_selected,
         &mut passed,
     );
     check(
         b"exec_generic_pci_add_device_reached",
-        generic_pci_add_device,
+        generic_pci_add_device
+            && generic_pci_selected != 0
+            && generic_pci_add_device_count == generic_pci_selected,
         &mut passed,
     );
     check(
