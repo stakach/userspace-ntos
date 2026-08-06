@@ -426,3 +426,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   connected-ISR execution, and DPC bottom-half execution. The next B3 slice should move the old real
   PCI/NIC hardware proof onto this generic resource boundary, then remove the bespoke NIC proof only
   after equivalent PCI-backed evidence is green.
+- B3 cleanup continued. The SYSTEM-hive boot loop and generated-hive hardware proof now use one
+  hosted-devnode resource grant helper for PCI and root-bus resources. The helper owns the dynamic
+  devnode-to-resource selection, hosted resource-manager/DMA-manager grant, and START resource bytes;
+  callers only decide whether a no-resource devnode may start with an empty list. Grant failures no
+  longer fall through to an empty START list. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the old NIC proof still remains because the available WDM fixtures expect test
+  register banks (`MMIO`/`DMA1`), and ReactOS `e1000.sys` requires the NDIS frontier. The next useful
+  B3 work is either a real PCI-capable hosted test driver that consumes the e1000 BAR honestly, or
+  enough NDIS/ReactOS driver support to let `e1000.sys` bind through the same generic grant helper.

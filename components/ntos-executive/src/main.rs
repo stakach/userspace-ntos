@@ -8667,6 +8667,147 @@ unsafe fn ensure_root_dma_resource_frames(mmio_frame: &mut u64, common_frame: &m
     true
 }
 
+enum HostedDevnodeGrantKind {
+    Pci { dev: u8, func: u8 },
+    RootBus,
+}
+
+struct HostedDevnodeGrant {
+    kind: HostedDevnodeGrantKind,
+    resource_list: alloc::vec::Vec<u8>,
+    mmio_phys: u64,
+    mmio_len: u64,
+    vector: u32,
+    dma_len: u64,
+}
+
+fn print_hosted_devnode_grant(service: &[u8], devnode: &[u8], grant: &HostedDevnodeGrant) {
+    match grant.kind {
+        HostedDevnodeGrantKind::Pci { dev, func } => {
+            print_str(b"[driver-launch] assigned PCI resources service=");
+            print_str(service);
+            print_str(b" devnode=");
+            print_str(devnode);
+            print_str(b" pci=0:");
+            print_u64(dev as u64);
+            print_str(b".");
+            print_u64(func as u64);
+        }
+        HostedDevnodeGrantKind::RootBus => {
+            print_str(b"[driver-launch] assigned root-bus resources service=");
+            print_str(service);
+            print_str(b" devnode=");
+            print_str(devnode);
+        }
+    }
+    print_str(b" mmio=0x");
+    print_hex(grant.mmio_phys as u32);
+    print_str(b" len=");
+    print_u64(grant.mmio_len);
+    print_str(b" vector=");
+    print_u64(grant.vector as u64);
+    print_str(b" dma_len=");
+    print_u64(grant.dma_len);
+    print_str(b"\n");
+}
+
+unsafe fn grant_hosted_devnode_resources(
+    device_id: u64,
+    instance_id: &str,
+    hardware_refs: &[&str],
+    compatible_refs: &[&str],
+    pci_devices: &[nt_pnp::PciDevice],
+    nic_bar_base: u64,
+    nic_mmio: u64,
+    nic_dma_frame: u64,
+    root_dma_mmio_frame: &mut u64,
+    root_dma_common_frame: &mut u64,
+) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    if let Some(grant) = assign_devnode_pci_resources(
+        instance_id,
+        hardware_refs,
+        compatible_refs,
+        pci_devices,
+        NIC_MSI_VECTOR as u32,
+        true,
+        0x1000,
+        0x4000,
+    ) {
+        if nic_bar_base == 0 || grant.assignment.mmio_phys != nic_mmio || nic_dma_frame == 0 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let mmio_len = grant.assignment.mmio_len.min(0x4000);
+        driver_launch::grant_hosted_device_resources(
+            device_id,
+            grant.assignment.mmio_phys,
+            mmio_len,
+            NIC_VADDR,
+            nic_bar_base,
+            4,
+            grant.assignment.int_vector,
+            grant.assignment.int_latched,
+            grant.assignment.int_affinity,
+            DMA_VADDR,
+            nic_dma_frame,
+            1,
+            NIC_IOVA,
+            grant.assignment.dma_len,
+        )?;
+        return Ok(Some(HostedDevnodeGrant {
+            kind: HostedDevnodeGrantKind::Pci {
+                dev: grant.device.dev,
+                func: grant.device.func,
+            },
+            resource_list: grant.resource_list,
+            mmio_phys: grant.assignment.mmio_phys,
+            mmio_len,
+            vector: grant.assignment.int_vector,
+            dma_len: grant.assignment.dma_len,
+        }));
+    }
+
+    if let Some(grant) = assign_devnode_root_dma_resources(
+        instance_id,
+        hardware_refs,
+        compatible_refs,
+        NIC_MSI_VECTOR as u32,
+        false,
+        0x1000,
+        0x1000,
+    ) {
+        if !ensure_root_dma_resource_frames(root_dma_mmio_frame, root_dma_common_frame) {
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        let mmio_len = grant.assignment.mmio_len.min(0x1000);
+        driver_launch::grant_hosted_device_resources(
+            device_id,
+            grant.assignment.mmio_phys,
+            mmio_len,
+            NIC_VADDR,
+            *root_dma_mmio_frame,
+            1,
+            grant.assignment.int_vector,
+            grant.assignment.int_latched,
+            grant.assignment.int_affinity,
+            DMA_VADDR,
+            *root_dma_common_frame,
+            1,
+            NIC_IOVA,
+            grant.assignment.dma_len,
+        )?;
+        return Ok(Some(HostedDevnodeGrant {
+            kind: HostedDevnodeGrantKind::RootBus,
+            resource_list: grant.resource_list,
+            mmio_phys: grant.assignment.mmio_phys,
+            mmio_len,
+            vector: grant.assignment.int_vector,
+            dma_len: grant.assignment.dma_len,
+        }));
+    }
+
+    Ok(None)
+}
+
 unsafe fn make_object(obj: u64) -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
@@ -19318,148 +19459,43 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 print_str(b" device_id=");
                                 print_u64(device_id);
                                 print_str(b"\n");
-                                let mut start_resources = alloc::vec::Vec::new();
-                                if let Some(grant) = assign_devnode_pci_resources(
+                                let resource_grant = grant_hosted_devnode_resources(
+                                    device_id,
                                     devnode.instance_id.as_str(),
                                     hardware_refs,
                                     compatible_refs,
                                     &pci_devices,
-                                    NIC_MSI_VECTOR as u32,
-                                    true,
-                                    0x1000,
-                                    0x4000,
-                                ) {
-                                    if nic_bar_base != 0 && grant.assignment.mmio_phys == nic_mmio {
-                                        match driver_launch::grant_hosted_device_resources(
-                                            device_id,
-                                            grant.assignment.mmio_phys,
-                                            grant.assignment.mmio_len.min(0x4000),
-                                            NIC_VADDR,
-                                            nic_bar_base,
-                                            4,
-                                            grant.assignment.int_vector,
-                                            grant.assignment.int_latched,
-                                            grant.assignment.int_affinity,
-                                            DMA_VADDR,
-                                            nic_dma_frame,
-                                            1,
-                                            NIC_IOVA,
-                                            grant.assignment.dma_len,
-                                        ) {
-                                            Ok(()) => {
-                                                print_str(
-                                                    b"[driver-launch] assigned resources service=",
-                                                );
-                                                print_str(spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" pci=0:");
-                                                print_u64(grant.device.dev as u64);
-                                                print_str(b".");
-                                                print_u64(grant.device.func as u64);
-                                                print_str(b" mmio=0x");
-                                                print_hex(grant.assignment.mmio_phys as u32);
-                                                print_str(b" len=");
-                                                print_u64(grant.assignment.mmio_len.min(0x4000));
-                                                print_str(b" vector=");
-                                                print_u64(grant.assignment.int_vector as u64);
-                                                print_str(b"\n");
-                                                start_resources = grant.resource_list;
-                                            }
-                                            Err(status) => {
-                                                print_str(
-                                                    b"[driver-launch] resource grant failed service=",
-                                                );
-                                                print_str(spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" status=0x");
-                                                print_hex(status.raw() as u32);
-                                                print_str(b"\n");
-                                            }
-                                        }
-                                    } else {
-                                        print_str(
-                                            b"[driver-launch] no mapped BAR grant for service=",
+                                    nic_bar_base,
+                                    nic_mmio,
+                                    nic_dma_frame,
+                                    &mut root_dma_mmio_frame,
+                                    &mut root_dma_common_frame,
+                                );
+                                let start_status = match resource_grant {
+                                    Ok(Some(grant)) => {
+                                        print_hosted_devnode_grant(
+                                            spec.service_name.as_bytes(),
+                                            devnode.instance_id.as_bytes(),
+                                            &grant,
                                         );
+                                        driver_launch::start_hosted_device(
+                                            device_id,
+                                            &grant.resource_list,
+                                        )
+                                    }
+                                    Ok(None) => driver_launch::start_hosted_device(device_id, &[]),
+                                    Err(status) => {
+                                        print_str(b"[driver-launch] resource grant failed service=");
                                         print_str(spec.service_name.as_bytes());
                                         print_str(b" devnode=");
                                         print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" mmio=0x");
-                                        print_hex(grant.assignment.mmio_phys as u32);
+                                        print_str(b" status=0x");
+                                        print_hex(status.raw() as u32);
                                         print_str(b"\n");
+                                        Err(status)
                                     }
-                                } else if let Some(grant) = assign_devnode_root_dma_resources(
-                                    devnode.instance_id.as_str(),
-                                    hardware_refs,
-                                    compatible_refs,
-                                    NIC_MSI_VECTOR as u32,
-                                    false,
-                                    0x1000,
-                                    0x1000,
-                                ) {
-                                    if ensure_root_dma_resource_frames(
-                                        &mut root_dma_mmio_frame,
-                                        &mut root_dma_common_frame,
-                                    ) {
-                                        match driver_launch::grant_hosted_device_resources(
-                                            device_id,
-                                            grant.assignment.mmio_phys,
-                                            grant.assignment.mmio_len.min(0x1000),
-                                            NIC_VADDR,
-                                            root_dma_mmio_frame,
-                                            1,
-                                            grant.assignment.int_vector,
-                                            grant.assignment.int_latched,
-                                            grant.assignment.int_affinity,
-                                            DMA_VADDR,
-                                            root_dma_common_frame,
-                                            1,
-                                            NIC_IOVA,
-                                            grant.assignment.dma_len,
-                                        ) {
-                                            Ok(()) => {
-                                                print_str(
-                                                    b"[driver-launch] assigned root-bus resources service=",
-                                                );
-                                                print_str(spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" mmio=0x");
-                                                print_hex(grant.assignment.mmio_phys as u32);
-                                                print_str(b" len=");
-                                                print_u64(grant.assignment.mmio_len.min(0x1000));
-                                                print_str(b" vector=");
-                                                print_u64(grant.assignment.int_vector as u64);
-                                                print_str(b"\n");
-                                                start_resources = grant.resource_list;
-                                            }
-                                            Err(status) => {
-                                                print_str(
-                                                    b"[driver-launch] root-bus resource grant failed service=",
-                                                );
-                                                print_str(spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" status=0x");
-                                                print_hex(status.raw() as u32);
-                                                print_str(b"\n");
-                                            }
-                                        }
-                                    } else {
-                                        print_str(
-                                            b"[driver-launch] root-bus resource frames unavailable service=",
-                                        );
-                                        print_str(spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b"\n");
-                                    }
-                                }
-                                match driver_launch::start_hosted_device(
-                                    device_id,
-                                    &start_resources,
-                                ) {
+                                };
+                                match start_status {
                                     Ok(()) => {
                                         print_str(b"[driver-launch] StartDevice service=");
                                         print_str(spec.service_name.as_bytes());
@@ -20353,134 +20389,36 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         print_u64(device_id);
                         print_str(b"\n");
 
-                        let mut start_resources = alloc::vec::Vec::new();
-                        let mut grant_ok = false;
-                        if let Some(grant) = assign_devnode_pci_resources(
+                        let resource_grant = grant_hosted_devnode_resources(
+                            device_id,
                             devnode.instance_id.as_str(),
                             hardware_refs,
                             compatible_refs,
                             &pci_devices,
-                            NIC_MSI_VECTOR as u32,
-                            true,
-                            0x1000,
-                            0x4000,
-                        ) {
-                            if nic_bar_base != 0 && grant.assignment.mmio_phys == nic_mmio {
-                                match driver_launch::grant_hosted_device_resources(
-                                    device_id,
-                                    grant.assignment.mmio_phys,
-                                    grant.assignment.mmio_len.min(0x4000),
-                                    NIC_VADDR,
-                                    nic_bar_base,
-                                    4,
-                                    grant.assignment.int_vector,
-                                    grant.assignment.int_latched,
-                                    grant.assignment.int_affinity,
-                                    DMA_VADDR,
-                                    nic_dma_frame,
-                                    1,
-                                    NIC_IOVA,
-                                    grant.assignment.dma_len,
-                                ) {
-                                    Ok(()) => {
-                                        grant_ok = true;
-                                        start_resources = grant.resource_list;
-                                        print_str(
-                                            b"[driver-launch] generic hardware resources service=",
-                                        );
-                                        print_str(proof_pnp_spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" pci=0:");
-                                        print_u64(grant.device.dev as u64);
-                                        print_str(b".");
-                                        print_u64(grant.device.func as u64);
-                                        print_str(b" mmio=0x");
-                                        print_hex(grant.assignment.mmio_phys as u32);
-                                        print_str(b" vector=");
-                                        print_u64(grant.assignment.int_vector as u64);
-                                        print_str(b" dma_len=");
-                                        print_u64(grant.assignment.dma_len);
-                                        print_str(b"\n");
-                                    }
-                                    Err(status) => {
-                                        print_str(
-                                            b"[driver-launch] generic hardware grant failed status=0x",
-                                        );
-                                        print_hex(status.raw() as u32);
-                                        print_str(b"\n");
-                                    }
-                                }
-                            } else {
-                                print_str(b"[driver-launch] generic hardware no mapped BAR grant mmio=0x");
-                                print_hex(grant.assignment.mmio_phys as u32);
-                                print_str(b"\n");
-                            }
-                        } else if let Some(grant) = assign_devnode_root_dma_resources(
-                            devnode.instance_id.as_str(),
-                            hardware_refs,
-                            compatible_refs,
-                            NIC_MSI_VECTOR as u32,
-                            false,
-                            0x1000,
-                            0x1000,
-                        ) {
-                            if ensure_root_dma_resource_frames(
-                                &mut root_dma_mmio_frame,
-                                &mut root_dma_common_frame,
-                            ) {
-                                match driver_launch::grant_hosted_device_resources(
-                                    device_id,
-                                    grant.assignment.mmio_phys,
-                                    grant.assignment.mmio_len.min(0x1000),
-                                    NIC_VADDR,
-                                    root_dma_mmio_frame,
-                                    1,
-                                    grant.assignment.int_vector,
-                                    grant.assignment.int_latched,
-                                    grant.assignment.int_affinity,
-                                    DMA_VADDR,
-                                    root_dma_common_frame,
-                                    1,
-                                    NIC_IOVA,
-                                    grant.assignment.dma_len,
-                                ) {
-                                    Ok(()) => {
-                                        grant_ok = true;
-                                        start_resources = grant.resource_list;
-                                        print_str(
-                                            b"[driver-launch] generic hardware root-bus resources service=",
-                                        );
-                                        print_str(proof_pnp_spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" mmio=0x");
-                                        print_hex(grant.assignment.mmio_phys as u32);
-                                        print_str(b" vector=");
-                                        print_u64(grant.assignment.int_vector as u64);
-                                        print_str(b" dma_len=");
-                                        print_u64(grant.assignment.dma_len);
-                                        print_str(b"\n");
-                                    }
-                                    Err(status) => {
-                                        print_str(
-                                            b"[driver-launch] generic hardware root-bus grant failed status=0x",
-                                        );
-                                        print_hex(status.raw() as u32);
-                                        print_str(b"\n");
-                                    }
-                                }
-                            } else {
-                                print_str(
-                                    b"[driver-launch] generic hardware root-bus resource frames unavailable\n",
+                            nic_bar_base,
+                            nic_mmio,
+                            nic_dma_frame,
+                            &mut root_dma_mmio_frame,
+                            &mut root_dma_common_frame,
+                        );
+                        let start_status = match resource_grant {
+                            Ok(Some(grant)) => {
+                                print_hosted_devnode_grant(
+                                    proof_pnp_spec.service_name.as_bytes(),
+                                    devnode.instance_id.as_bytes(),
+                                    &grant,
                                 );
+                                driver_launch::start_hosted_device(device_id, &grant.resource_list)
                             }
-                        }
-
-                        let start_status = if grant_ok {
-                            driver_launch::start_hosted_device(device_id, &start_resources)
-                        } else {
-                            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                            Ok(None) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+                            Err(status) => {
+                                print_str(
+                                    b"[driver-launch] generic hardware resource grant failed status=0x",
+                                );
+                                print_hex(status.raw() as u32);
+                                print_str(b"\n");
+                                Err(status)
+                            }
                         };
                         let start_ok = start_status.is_ok();
                         generic_hw_start_ok |= start_ok;
