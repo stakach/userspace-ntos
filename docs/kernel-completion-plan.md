@@ -82,9 +82,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: devnode/driver registry identity now
    flows toward `DevicePropertyDriverKeyName` and the miniport `Linkage` key, and the generated-hive
-   PnP proof now consumes every CM-selected binding instead of one `.next()` result. Next drive real
-   NDIS support initialization and miniport AddDevice/StartDevice through the generic PCI
-   MMIO/interrupt/DMA grant.
+   PnP proof now consumes every CM-selected binding instead of one `.next()` result. Boot and
+   demand-start device services now share one AddDevice/StartDevice path backed by the published
+   PCI/root-bus resource context, and unassigned devnode resources fail instead of taking an empty
+   START shortcut. Next drive real NDIS support initialization and miniport adapter resources through
+   that generic grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -536,3 +538,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   enough to exercise multiple boot/system PnP bindings when the registry supplies them; next work is
   support-driver/miniport startup and then replacing the old raw NIC proof with PCI-backed generic
   evidence.
+- B3 cleanup continued. Service-bound devnode start is now factored into `hosted_pnp_start`: the
+  executive publishes the discovered PCI/NIC/root-bus resource context once, boot/system device
+  services and the generated-hive hardware proof call the same AddDevice/resource-grant/StartDevice
+  helper, and `NtLoadDriver` demand-start device services with Enum-bound devnodes use that helper
+  after `DriverEntry`. The previous empty-resource START convenience path was removed; a selected
+  devnode without an assigned resource now reports `STATUS_INVALID_DEVICE_REQUEST` instead of
+  succeeding synthetically. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and `./run.sh` through genuine explorer
+  shell chrome with `286/288` checks passing. The generated-hive hardware gates still pass for
+  registry selection, MMIO/interrupt/DMA, root-PDO start, ISR delivery, and DPC delivery. Review
+  adjustment: continue B3 at the NDIS boundary: support-driver initialization, miniport
+  AddDevice/StartDevice, and adapter resource queries should now ride the generic demand-start PnP
+  path.

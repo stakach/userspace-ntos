@@ -1792,11 +1792,21 @@ impl ExecNtHandler {
         let Some(fs) = exec_fs() else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let Some(_dc) =
+        let Some(dc) =
             driver_launch::load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
         else {
             return STATUS_UNSUCCESSFUL;
         };
+        if spec.class == driver_launch::DriverClass::Device && !spec.devnodes.is_empty() {
+            if let Err(status) = start_owned_driver_service_devnodes(
+                &dc,
+                &spec,
+                HostedPnpStartOptions::demand_start(),
+            ) {
+                let _ = driver_launch::unload_driver_by_name(&spec.driver_object_path);
+                return status.raw() as u32;
+            }
+        }
         0
     }
 

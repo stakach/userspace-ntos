@@ -60,6 +60,8 @@ mod device_io;
 pub(crate) use device_io::*;
 mod pnp;
 pub(crate) use pnp::*;
+mod hosted_pnp_start;
+pub(crate) use hosted_pnp_start::*;
 mod selftests;
 pub(crate) use selftests::*;
 mod img_spawn;
@@ -17965,6 +17967,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    publish_hosted_pnp_resource_context(&pci_devices, nic_bar_base, nic_mmio, nic_dma_frame);
+
     // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
     // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
     // the FS mount (search "DEFERRED DRIVER-HOST").
@@ -19517,9 +19521,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let mut root_dma_mmio_frame = 0u64;
-    let mut root_dma_common_frame = 0u64;
-
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
     // services use the persistent IRP host directly, while device-class services must be bound by
@@ -19558,143 +19559,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 spec.driver_object_path.as_str(),
             ) {
                 if spec.class == driver_launch::DriverClass::Device {
-                    for devnode in &spec.devnodes[..spec.devnode_count] {
-                        let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
-                        let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
-                        let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
-                        let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
-                        let class_guid = if spec.class_guid_present {
-                            Some(spec.class_guid.as_str())
-                        } else {
-                            None
-                        };
-                        let driver_key = if devnode.driver_key_present {
-                            Some(devnode.driver_key.as_str())
-                        } else {
-                            None
-                        };
-                        match driver_launch::call_add_device_for_driver(
-                            dc.driver_id,
-                            spec.service_name.as_str(),
-                            class_guid,
-                            driver_key,
-                            devnode.instance_id.as_str(),
-                            hardware_refs,
-                            compatible_refs,
-                        ) {
-                            Ok(device_id) => {
-                                print_str(b"[driver-launch] AddDevice service=");
-                                print_str(spec.service_name.as_bytes());
-                                print_str(b" devnode=");
-                                print_str(devnode.instance_id.as_bytes());
-                                print_str(b" device_id=");
-                                print_u64(device_id);
-                                print_str(b"\n");
-                                let resource_grant = grant_hosted_devnode_resources(
-                                    device_id,
-                                    devnode.instance_id.as_str(),
-                                    hardware_refs,
-                                    compatible_refs,
-                                    &pci_devices,
-                                    nic_bar_base,
-                                    nic_mmio,
-                                    nic_dma_frame,
-                                    &mut root_dma_mmio_frame,
-                                    &mut root_dma_common_frame,
-                                );
-                                let start_status = match resource_grant {
-                                    Ok(Some(grant)) => {
-                                        print_hosted_devnode_grant(
-                                            spec.service_name.as_bytes(),
-                                            devnode.instance_id.as_bytes(),
-                                            &grant,
-                                        );
-                                        driver_launch::start_hosted_device(
-                                            device_id,
-                                            &grant.resource_list,
-                                        )
-                                    }
-                                    Ok(None) => driver_launch::start_hosted_device(device_id, &[]),
-                                    Err(status) => {
-                                        print_str(b"[driver-launch] resource grant failed service=");
-                                        print_str(spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" status=0x");
-                                        print_hex(status.raw() as u32);
-                                        print_str(b"\n");
-                                        Err(status)
-                                    }
-                                };
-                                match start_status {
-                                    Ok(()) => {
-                                        print_str(b"[driver-launch] StartDevice service=");
-                                        print_str(spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" status=0x00000000\n");
-                                        if let Some(evidence) =
-                                            driver_launch::hosted_hardware_evidence(device_id)
-                                        {
-                                            if evidence.resource_granted() {
-                                                generic_hw_granted = true;
-                                                generic_hw_mmio_mapped |= evidence.mmio_mapped();
-                                                generic_hw_interrupt_connected |=
-                                                    evidence.interrupt_connected();
-                                                generic_hw_dma_adapter |=
-                                                    evidence.dma_adapter_created();
-                                                generic_hw_dma_common |=
-                                                    evidence.dma_common_allocated();
-                                                generic_hw_root_started |=
-                                                    evidence.root_pdo_started;
-                                                print_str(
-                                                    b"[driver-launch] hardware evidence service=",
-                                                );
-                                                print_str(spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" mmio=");
-                                                print_u64(evidence.mmio_mapped() as u64);
-                                                print_str(b" mmio_len=");
-                                                print_u64(evidence.resource_mmio_len);
-                                                print_str(b" int=");
-                                                print_u64(evidence.interrupt_connected() as u64);
-                                                print_str(b" int_ctx=");
-                                                print_u64((evidence.interrupt_context != 0) as u64);
-                                                print_str(b" dma_adapter=");
-                                                print_u64(evidence.dma_adapter_created() as u64);
-                                                print_str(b" dma_common=");
-                                                print_u64(evidence.dma_common_allocated() as u64);
-                                                print_str(b" dma_len=");
-                                                print_u64(evidence.dma_common_len);
-                                                print_str(b" root_started=");
-                                                print_u64(evidence.root_pdo_started as u64);
-                                                print_str(b"\n");
-                                            }
-                                        }
-                                    }
-                                    Err(status) => {
-                                        print_str(b"[driver-launch] StartDevice failed service=");
-                                        print_str(spec.service_name.as_bytes());
-                                        print_str(b" devnode=");
-                                        print_str(devnode.instance_id.as_bytes());
-                                        print_str(b" status=0x");
-                                        print_hex(status.raw() as u32);
-                                        print_str(b"\n");
-                                    }
-                                }
-                            }
-                            Err(status) => {
-                                print_str(b"[driver-launch] AddDevice failed service=");
-                                print_str(spec.service_name.as_bytes());
-                                print_str(b" devnode=");
-                                print_str(devnode.instance_id.as_bytes());
-                                print_str(b" status=0x");
-                                print_hex(status.raw() as u32);
-                                print_str(b"\n");
-                            }
-                        }
-                    }
+                    let start_report = start_inline_driver_service_devnodes(
+                        &dc,
+                        spec,
+                        HostedPnpStartOptions::boot_service(),
+                    );
+                    generic_hw_granted |= start_report.resource_granted;
+                    generic_hw_mmio_mapped |= start_report.mmio_mapped;
+                    generic_hw_interrupt_connected |= start_report.interrupt_connected;
+                    generic_hw_dma_adapter |= start_report.dma_adapter;
+                    generic_hw_dma_common |= start_report.dma_common;
+                    generic_hw_root_started |= start_report.root_started;
                 }
                 let device_path =
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
@@ -20489,191 +20364,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     proof_pnp_spec.class,
                     proof_pnp_spec.driver_object_path.as_str(),
                 ) {
-                    generic_hw_driver_loaded |= (dc.verdict & V_ENTERED) != 0 && dc.add_device != 0;
-                    for devnode in &proof_pnp_spec.devnodes[..proof_pnp_spec.devnode_count] {
-                        let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
-                        let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
-                        let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
-                        let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
-                        let class_guid = if proof_pnp_spec.class_guid_present {
-                            Some(proof_pnp_spec.class_guid.as_str())
-                        } else {
-                            None
-                        };
-                        let driver_key = if devnode.driver_key_present {
-                            Some(devnode.driver_key.as_str())
-                        } else {
-                            None
-                        };
-
-                        match driver_launch::call_add_device_for_driver(
-                            dc.driver_id,
-                            proof_pnp_spec.service_name.as_str(),
-                            class_guid,
-                            driver_key,
-                            devnode.instance_id.as_str(),
-                            hardware_refs,
-                            compatible_refs,
-                        ) {
-                            Ok(device_id) => {
-                                generic_hw_add_device = true;
-                                print_str(b"[driver-launch] generic hardware AddDevice service=");
-                                print_str(proof_pnp_spec.service_name.as_bytes());
-                                print_str(b" devnode=");
-                                print_str(devnode.instance_id.as_bytes());
-                                print_str(b" device_id=");
-                                print_u64(device_id);
-                                print_str(b"\n");
-
-                                let resource_grant = grant_hosted_devnode_resources(
-                                    device_id,
-                                    devnode.instance_id.as_str(),
-                                    hardware_refs,
-                                    compatible_refs,
-                                    &pci_devices,
-                                    nic_bar_base,
-                                    nic_mmio,
-                                    nic_dma_frame,
-                                    &mut root_dma_mmio_frame,
-                                    &mut root_dma_common_frame,
-                                );
-                                let start_status = match resource_grant {
-                                    Ok(Some(grant)) => {
-                                        print_hosted_devnode_grant(
-                                            proof_pnp_spec.service_name.as_bytes(),
-                                            devnode.instance_id.as_bytes(),
-                                            &grant,
-                                        );
-                                        driver_launch::start_hosted_device(
-                                            device_id,
-                                            &grant.resource_list,
-                                        )
-                                    }
-                                    Ok(None) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-                                    Err(status) => {
-                                        print_str(
-                                            b"[driver-launch] generic hardware resource grant failed status=0x",
-                                        );
-                                        print_hex(status.raw() as u32);
-                                        print_str(b"\n");
-                                        Err(status)
-                                    }
-                                };
-                                let start_ok = start_status.is_ok();
-                                generic_hw_start_ok |= start_ok;
-                                let start_status_raw = match start_status {
-                                    Ok(()) => 0,
-                                    Err(status) => status.raw() as u32,
-                                };
-                                if let Some(mut evidence) =
-                                    driver_launch::hosted_hardware_evidence(device_id)
-                                {
-                                    if start_ok
-                                        && evidence.mmio_mapped()
-                                        && evidence.interrupt_connected()
-                                    {
-                                        core::ptr::write_volatile(
-                                            (ROOT_DMA_PROOF_MMIO_SEED_VADDR
-                                                + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
-                                                as *mut u32,
-                                            0,
-                                        );
-                                        core::ptr::write_volatile(
-                                            (ROOT_DMA_PROOF_MMIO_SEED_VADDR
-                                                + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET)
-                                                as *mut u32,
-                                            1,
-                                        );
-                                        match driver_launch::inject_hosted_device_interrupt(
-                                            device_id,
-                                        ) {
-                                            Ok(delivery) => {
-                                                let ack = core::ptr::read_volatile(
-                                                    (ROOT_DMA_PROOF_MMIO_SEED_VADDR
-                                                        + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
-                                                        as *const u32,
-                                                );
-                                                generic_hw_interrupt_acknowledged |= ack == 1;
-                                                print_str(
-                                                    b"[driver-launch] generic hardware interrupt delivery service=",
-                                                );
-                                                print_str(proof_pnp_spec.service_name.as_bytes());
-                                                print_str(b" devnode=");
-                                                print_str(devnode.instance_id.as_bytes());
-                                                print_str(b" id=");
-                                                print_u64(delivery.interrupt_id);
-                                                print_str(b" vector=");
-                                                print_u64(delivery.vector as u64);
-                                                print_str(b" claimed=");
-                                                print_u64(delivery.claimed as u64);
-                                                print_str(b" ack=");
-                                                print_u64(ack as u64);
-                                                print_str(b"\n");
-                                            }
-                                            Err(status) => {
-                                                print_str(
-                                                    b"[driver-launch] generic hardware interrupt delivery failed status=0x",
-                                                );
-                                                print_hex(status.raw() as u32);
-                                                print_str(b"\n");
-                                            }
-                                        }
-                                        if let Some(after_delivery) =
-                                            driver_launch::hosted_hardware_evidence(device_id)
-                                        {
-                                            evidence = after_delivery;
-                                        }
-                                    }
-                                    if evidence.resource_granted() {
-                                        generic_hw_granted = true;
-                                        generic_hw_mmio_mapped |= evidence.mmio_mapped();
-                                        generic_hw_interrupt_connected |=
-                                            evidence.interrupt_connected();
-                                        generic_hw_interrupt_delivered |=
-                                            evidence.interrupt_delivered();
-                                        generic_hw_dpc_delivered |= evidence.dpc_delivered();
-                                        generic_hw_dma_adapter |= evidence.dma_adapter_created();
-                                        generic_hw_dma_common |= evidence.dma_common_allocated();
-                                        generic_hw_root_started |= evidence.root_pdo_started;
-                                    }
-                                    print_str(b"[driver-launch] generic hardware evidence service=");
-                                    print_str(proof_pnp_spec.service_name.as_bytes());
-                                    print_str(b" devnode=");
-                                    print_str(devnode.instance_id.as_bytes());
-                                    print_str(b" start=0x");
-                                    print_hex(start_status_raw);
-                                    print_str(b" mmio=");
-                                    print_u64(evidence.mmio_mapped() as u64);
-                                    print_str(b" int=");
-                                    print_u64(evidence.interrupt_connected() as u64);
-                                    print_str(b" int_delivered=");
-                                    print_u64(evidence.interrupt_delivered() as u64);
-                                    print_str(b" int_count=");
-                                    print_u64(evidence.interrupt_deliveries);
-                                    print_str(b" dpc=");
-                                    print_u64(evidence.dpc_delivered() as u64);
-                                    print_str(b" dpc_count=");
-                                    print_u64(evidence.dpc_deliveries);
-                                    print_str(b" dpc_drops=");
-                                    print_u64(evidence.dpc_drops);
-                                    print_str(b" dma_adapter=");
-                                    print_u64(evidence.dma_adapter_created() as u64);
-                                    print_str(b" dma_common=");
-                                    print_u64(evidence.dma_common_allocated() as u64);
-                                    print_str(b" root_started=");
-                                    print_u64(evidence.root_pdo_started as u64);
-                                    print_str(b"\n");
-                                }
-                            }
-                            Err(status) => {
-                                print_str(
-                                    b"[driver-launch] generic hardware AddDevice failed status=0x",
-                                );
-                                print_hex(status.raw() as u32);
-                                print_str(b"\n");
-                            }
-                        }
-                    }
+                    let start_report = start_inline_driver_service_devnodes(
+                        &dc,
+                        proof_pnp_spec,
+                        HostedPnpStartOptions::hardware_proof(),
+                    );
+                    generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
+                    generic_hw_add_device |= start_report.add_device;
+                    generic_hw_start_ok |= start_report.start_ok;
+                    generic_hw_granted |= start_report.resource_granted;
+                    generic_hw_mmio_mapped |= start_report.mmio_mapped;
+                    generic_hw_interrupt_connected |= start_report.interrupt_connected;
+                    generic_hw_interrupt_delivered |= start_report.interrupt_delivered;
+                    generic_hw_interrupt_acknowledged |= start_report.interrupt_acknowledged;
+                    generic_hw_dpc_delivered |= start_report.dpc_delivered;
+                    generic_hw_dma_adapter |= start_report.dma_adapter;
+                    generic_hw_dma_common |= start_report.dma_common;
+                    generic_hw_root_started |= start_report.root_started;
                 } else {
                     print_str(
                         b"[driver-launch] registry-selected PnP driver launch returned None service=",
