@@ -313,6 +313,17 @@ pub(crate) fn writable_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
     nt_fs::writable_mount_relative(name, b"reactos", WRITABLE_PREFIXES)
 }
 
+pub(crate) fn writable_path_into(
+    name: &[u16],
+    folded: &mut [u8],
+    relative: &mut [u8],
+) -> Option<usize> {
+    if !WRITABLE_OVERLAY_MOUNTED {
+        return None;
+    }
+    nt_fs::writable_mount_relative_into(name, b"reactos", WRITABLE_PREFIXES, folded, relative)
+}
+
 /// `NtCreateFile` / `NtOpenFile` against the writable volume. Returns
 /// `(status, Some(volume file-object id), information)`.
 pub(crate) unsafe fn create(
@@ -356,11 +367,12 @@ pub(crate) unsafe fn create(
     }
 }
 
-/// `NtQueryAttributesFile` — by PATH, no file object. `None` when the path does not exist.
-pub(crate) unsafe fn query_attributes(relative: &[u8]) -> Option<nt_fs::StandardInformation> {
+pub(crate) unsafe fn query_attributes_relative(
+    relative: &[u8],
+) -> Option<nt_fs::StandardInformation> {
     OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
     let fs = writable_fs()?;
-    let info = fs.query_attributes(&volume_path(relative))?;
+    let info = fs.query_attributes_relative(relative)?;
     OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
     Some(info)
 }

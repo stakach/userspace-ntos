@@ -9,6 +9,8 @@ pub(crate) const SYSTEM_MODULE_REGISTRY_CAP: usize = 64;
 
 static mut SYSTEM_MODULES: [SystemModuleEntry; SYSTEM_MODULE_REGISTRY_CAP] =
     [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
+static mut SYSTEM_MODULE_SNAPSHOT_WORK: [SystemModuleEntry; SYSTEM_MODULE_REGISTRY_CAP] =
+    [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
 
 pub(crate) fn register_system_module(path: &[u8], image_base: u64, image_size: u32) -> bool {
     register_system_module_ex(path, image_base, image_base, image_size, 0, 1)
@@ -77,6 +79,12 @@ pub(crate) fn snapshot_system_modules(out: &mut [SystemModuleEntry]) -> usize {
         count += 1;
     }
     count
+}
+
+pub(crate) fn system_module_snapshot_scratch() -> (&'static [SystemModuleEntry], usize) {
+    let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_MODULE_SNAPSHOT_WORK) };
+    let count = snapshot_system_modules(snapshot);
+    (&snapshot[..count], count)
 }
 
 fn canonical_module_path(path: &[u8], out: &mut [u8]) -> Option<usize> {

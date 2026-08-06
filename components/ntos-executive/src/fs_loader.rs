@@ -445,17 +445,17 @@ pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
     }
 }
 
-/// Resolve any local NT/DOS path against the mounted read-only FAT volume and return its native
-/// file attributes. The shared canonicalizer maps `C:\Windows` onto the staged `reactos` directory,
-/// so callers see the same namespace for `\SystemRoot` and DOS-drive spellings. Writable mounts are
-/// checked by the syscall layer first and therefore retain longest-prefix precedence.
-pub(crate) unsafe fn query_nt_path_attributes(name: &[u16]) -> Option<u32> {
-    let relative = nt_fs::nt_path_to_volume_relative(name, b"reactos")?;
-    if relative.is_empty() {
+pub(crate) unsafe fn query_nt_path_attributes_into(
+    name: &[u16],
+    folded: &mut [u8],
+    relative: &mut [u8],
+) -> Option<u32> {
+    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
+    if len == 0 {
         return Some(nt_fs::FILE_ATTRIBUTE_DIRECTORY);
     }
     let fs = exec_fs()?;
-    let (_, _, fat_attributes) = fat_open_path_entry(&fs, &relative)?;
+    let (_, _, fat_attributes) = fat_open_path_entry(&fs, &relative[..len])?;
     Some(nt_fs::file_attributes_from_fat(fat_attributes))
 }
 

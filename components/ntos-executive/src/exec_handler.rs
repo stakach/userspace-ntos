@@ -10,12 +10,70 @@ use nt_io_abi::major;
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
+static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
+static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
+static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; 1024] = [0; 1024];
+type ExecServiceHandler = unsafe extern "C" fn(*mut ExecNtHandler, *const u64, usize) -> u32;
+#[used]
+static NT_OPEN_FILE_SERVICE_ENTRY: ExecServiceHandler = exec_nt_open_file_service_entry;
+#[used]
+static NT_CREATE_PROCESS_SERVICE_ENTRY: ExecServiceHandler = exec_nt_create_process_service_entry;
+#[used]
+static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
+    exec_nt_wait_for_debug_event_service_entry;
+#[used]
+static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
+    exec_nt_query_attributes_file_service_entry;
 const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn exec_nt_open_file_service_entry(
+    handler: *mut ExecNtHandler,
+    args_ptr: *const u64,
+    args_len: usize,
+) -> u32 {
+    let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
+    unsafe { (&mut *handler).nt_open_file_service(args) }
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn exec_nt_create_process_service_entry(
+    handler: *mut ExecNtHandler,
+    args_ptr: *const u64,
+    args_len: usize,
+) -> u32 {
+    let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
+    unsafe { (&mut *handler).nt_create_process_service(args) }
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn exec_nt_wait_for_debug_event_service_entry(
+    handler: *mut ExecNtHandler,
+    args_ptr: *const u64,
+    args_len: usize,
+) -> u32 {
+    let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
+    unsafe { (&mut *handler).nt_wait_for_debug_event_service(args) }
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn exec_nt_query_attributes_file_service_entry(
+    handler: *mut ExecNtHandler,
+    args_ptr: *const u64,
+    args_len: usize,
+) -> u32 {
+    let args = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
+    unsafe { (&mut *handler).nt_query_attributes_file_service(args) }
+}
 
 fn image_metadata_from_pe(
     pe: &nt_pe_loader::PeFile<'static>,
@@ -564,14 +622,8 @@ impl ExecNtHandler {
             global_atoms,
             nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(GLOBAL_ATOM_CAPACITY).unwrap()
         );
-        write_field!(
-            io_completion_ports,
-            nt_io_completion::CompletionPortTable::new()
-        );
-        write_field!(
-            file_completion,
-            nt_io_completion::FileCompletionTable::new()
-        );
+        write_field!(io_completion_ports, ExecIoCompletionPorts::reset());
+        write_field!(file_completion, ExecFileCompletion::reset());
         write_field!(directory_opens, ExecDirectoryOpens::reset());
         write_field!(pi, 0);
         write_field!(current_tid, 0);
@@ -629,14 +681,11 @@ impl ExecNtHandler {
         write_field!(winlogon_csr_view, 0);
         write_field!(csr_view_mask, 0);
         write_field!(pm, pm);
-        write_field!(
-            process_mechanisms,
-            nt_user_host::ProcessMechanismTable::new()
-        );
+        write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, [0; MAX_PI]);
         write_field!(temporary_process_slots, [0; MAX_PI]);
-        write_field!(thread_mechanisms, nt_user_host::ThreadMechanismTable::new());
+        write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
         write_field!(pool_used, [0; MAX_PI]);
         write_field!(pool_suspended, [0; MAX_PI]);
         write_field!(tp_worker_window_used, [0; MAX_PI]);
@@ -8379,6 +8428,39 @@ impl ExecNtHandler {
         out
     }
 
+    unsafe fn read_ustr_pe_into(&self, ustr_va: u64, out: &mut [u16]) -> Option<usize> {
+        if ustr_va == 0 {
+            return None;
+        }
+        let mut header = [0u8; 16];
+        if !self.xas_read(ustr_va, &mut header) {
+            return None;
+        }
+        let byte_len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let maximum_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let buffer_va = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if byte_len & 1 != 0 || byte_len > maximum_len || byte_len / 2 > out.len() {
+            return None;
+        }
+        if byte_len == 0 {
+            return Some(0);
+        }
+        if buffer_va == 0 {
+            return None;
+        }
+        let units = byte_len / 2;
+        let mut i = 0usize;
+        while i < units {
+            let mut w = [0u8; 2];
+            if !self.xas_read(buffer_va + (i as u64) * 2, &mut w) {
+                return None;
+            }
+            out[i] = u16::from_le_bytes(w);
+            i += 1;
+        }
+        Some(units)
+    }
+
     unsafe fn read_directory_pattern(
         &self,
         ustr_va: u64,
@@ -8428,6 +8510,18 @@ impl ExecNtHandler {
             return alloc::vec::Vec::new();
         }
         self.read_ustr_pe(objname)
+    }
+
+    unsafe fn read_objattr_name_pe_into(&self, oa_va: u64, out: &mut [u16]) -> Option<usize> {
+        let mut p = [0u8; 8];
+        if !self.xas_read(oa_va + 0x10, &mut p) {
+            return None;
+        }
+        let objname = u64::from_le_bytes(p);
+        if objname == 0 {
+            return Some(0);
+        }
+        self.read_ustr_pe_into(objname, out)
     }
 
     /// Render a complete FILE_BASIC_INFORMATION with the backing volume's real attributes. This
@@ -9641,6 +9735,617 @@ impl NativeSyscallHandler for &mut ExecNtHandler {
 }
 
 impl ExecNtHandler {
+    #[inline(never)]
+    unsafe fn nt_query_attributes_file_service(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        let ctx = self.loop_ctx.unwrap();
+        let reg = unsafe { &*ctx.reg };
+        let name16_buf = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_NAME16_SCRATCH) };
+        let Some(name16_len) = (unsafe { self.read_objattr_name_pe_into(args[0], name16_buf) })
+        else {
+            return STATUS_OBJECT_NAME_INVALID;
+        };
+        let name16 = &name16_buf[..name16_len];
+        if name16.is_empty() {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+        // The writable overlay answers by-path attribute queries for its own namespace. A miss here
+        // is authoritative, not a synthetic success.
+        let folded_scratch =
+            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+        let relative_scratch =
+            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
+        if let Some(relative_len) =
+            crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
+        {
+            return match crate::writable_fs::query_attributes_relative(
+                &relative_scratch[..relative_len],
+            ) {
+                Some(info) if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } => {
+                    nt_fs::STATUS_SUCCESS
+                }
+                Some(_) => STATUS_ACCESS_VIOLATION,
+                None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+            };
+        }
+        // General read-only namespace lookup. This is intentionally below the writable mount so
+        // profile paths stay overlay-backed, but above loader-specific EXE/DLL probes.
+        if let Some(attributes) =
+            crate::fs_loader::query_nt_path_attributes_into(name16, folded_scratch, relative_scratch)
+        {
+            return if unsafe { self.write_file_basic_attributes(args[1], attributes) } {
+                nt_fs::STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
+        }
+        let mut nb = [0u8; 96];
+        let mut nlen = 0;
+        for &w in name16 {
+            if nlen >= nb.len() {
+                break;
+            }
+            nb[nlen] = (w as u8).to_ascii_lowercase();
+            nlen += 1;
+        }
+        // Report EXISTS for hosted EXE probes and registered DLLs. The registry rejects SxS probes
+        // itself so the loader does not take the .Local/manifest path.
+        let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
+        let catalog = unsafe { &*ctx.exe_image_catalog };
+        let exe_exists = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
+            .is_some_and(Self::hosted_image_exists);
+        let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
+        let status: u32 = if exe_exists {
+            if unsafe { self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) } {
+                0
+            } else {
+                STATUS_ACCESS_VIOLATION
+            }
+        } else if dll_exists {
+            if unsafe { self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) } {
+                0
+            } else {
+                STATUS_ACCESS_VIOLATION
+            }
+        } else {
+            if self.pi >= 1 && self.pi != 2 {
+                print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
+                for &w in name16.iter().take(96) {
+                    debug_put_char(if (0x20..0x7f).contains(&w) {
+                        w as u8
+                    } else {
+                        b'?'
+                    });
+                }
+                print_str(b"\"\n");
+            }
+            0xC000_0034
+        };
+        unsafe {
+            loader_trace_record(
+                self.pi,
+                LoaderOp::QueryAttributesFile,
+                status,
+                reg.resolve_name(&nb[..nlen]),
+                0,
+                0,
+                &nb[..nlen],
+            );
+        }
+        status
+    }
+
+    #[inline(never)]
+    unsafe fn nt_open_file_service(&mut self, args: &[u64]) -> u32 {
+        let ctx = self.loop_ctx.unwrap();
+        let reg = &mut *ctx.reg;
+        const FILE_DIRECTORY_FILE: u64 = 0x01;
+        let sp = get_recv_mr(16);
+        {
+            let oa_probe = get_recv_mr(7);
+            let nm = self.read_objattr_name_pe(oa_probe);
+            if boot_status_path_matches(&nm) {
+                let options = smss_stack_read(sp + 0x30) as u32;
+                let mut status = nt_fs::STATUS_SUCCESS;
+                let mut opened_handle = None;
+                if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                    status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                } else {
+                    ensure_boot_status_data();
+                    opened_handle = self.mint_boot_status_handle(args[1] as u32);
+                    if opened_handle.is_none() {
+                        status = 0xC000_009A;
+                    }
+                }
+                if let Some(handle) = opened_handle {
+                    self.queue_write(get_recv_mr(9), handle);
+                }
+                let iosb = get_recv_mr(8);
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    let info = if status == nt_fs::STATUS_SUCCESS {
+                        nt_fs::FILE_OPENED as u64
+                    } else {
+                        0
+                    };
+                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                let lc: alloc::vec::Vec<u8> =
+                    nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    None,
+                    0,
+                    opened_handle.unwrap_or(0),
+                    &lc,
+                );
+                return status;
+            }
+        }
+        // Named-pipe client open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
+        // npfs (IRP_MJ_CREATE = client connect -> finds the FCB via the real prefix tree).
+        {
+            let oa_probe = get_recv_mr(7);
+            let nm = self.read_objattr_name_pe(oa_probe);
+            let lc: alloc::vec::Vec<u8> =
+                nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
+            let is_pipe = nt_fs::is_named_pipe_path(&nm);
+            if is_pipe && driver_launch::npfs_ready() {
+                let leaf = Self::pipe_leaf16(&nm);
+                if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
+                    let mut status = st as u32;
+                    let opened_handle = if status == 0 && fid != 0 {
+                        let options = args[5] as u32;
+                        let synchronous = options
+                            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                            != 0;
+                        let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
+                        if handle.is_none() {
+                            status = 0xC000_009A;
+                        }
+                        handle
+                    } else {
+                        if status == 0 {
+                            status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        }
+                        None
+                    };
+                    if let Some(handle) = opened_handle {
+                        self.queue_write(get_recv_mr(9), handle);
+                        if status == 0 {
+                            self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
+                            crate::pipe_fid_name_remember(
+                                fid,
+                                nt_io_manager::pipe_name_hash(&leaf),
+                            );
+                        }
+                    }
+                    let iosb = get_recv_mr(8);
+                    if iosb != 0 {
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        let info = if status == 0 { 1u64 } else { 0 };
+                        self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        status,
+                        None,
+                        0,
+                        opened_handle.unwrap_or(0),
+                        &lc,
+                    );
+                    return status;
+                }
+            }
+        }
+        // Read through the hosted process address space: activation-context filenames may live on
+        // ntdll's process heap, not in the legacy boot mirror.
+        let name16 = self.read_objattr_name_pe(get_recv_mr(7));
+        let mut nb = [0u8; 96];
+        let nlen = {
+            let mut n = 0;
+            for &w in &name16 {
+                if n >= nb.len() {
+                    break;
+                }
+                nb[n] = (w as u8).to_ascii_lowercase();
+                n += 1;
+            }
+            n
+        };
+        if let Some(relative) = crate::writable_fs::writable_path(&name16) {
+            let (mut status, file_id, information) = crate::writable_fs::create(
+                &relative,
+                args[1] as u32,
+                0,
+                smss_stack_read(sp + 0x28) as u32,
+                nt_fs::FILE_OPEN,
+                smss_stack_read(sp + 0x30) as u32,
+            );
+            let mut opened_handle = 0u64;
+            if let Some(file_id) = file_id {
+                self.writable_fs_dirty = true;
+                match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                    Some(handle) => {
+                        opened_handle = handle;
+                        self.queue_write(get_recv_mr(9), handle);
+                    }
+                    None => status = 0xC000_009A,
+                }
+            }
+            let iosb = get_recv_mr(8);
+            if iosb != 0 {
+                self.xas_write_buf(iosb, &status.to_le_bytes());
+                let info = if status == nt_fs::STATUS_SUCCESS {
+                    information
+                } else {
+                    0
+                };
+                self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+            }
+            loader_trace_record(
+                self.pi,
+                LoaderOp::OpenFile,
+                status,
+                None,
+                0,
+                opened_handle,
+                &nb[..nlen],
+            );
+            return status;
+        }
+        // Classify SxS/activation-context paths without admitting them to image loading.
+        let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
+            || nb[..nlen].windows(9).any(|w| w == b".manifest")
+            || nb[..nlen].windows(7).any(|w| w == b".config");
+        let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
+        let open_options = smss_stack_read(sp + 0x30) as u32;
+        let desired_access = args[1] as u32;
+        let disk_entry = Self::readonly_disk_open_entry(&name16, desired_access, open_options);
+        if let Some((first_cluster, file_size)) = disk_entry {
+            let mut status = nt_fs::STATUS_SUCCESS;
+            let opened_handle =
+                self.mint_disk_file_handle(first_cluster, file_size, desired_access);
+            if let Some(handle) = opened_handle {
+                self.queue_write(get_recv_mr(9), handle);
+            } else {
+                status = 0xC000_009A;
+            }
+            let iosb = get_recv_mr(8);
+            if iosb != 0 {
+                self.xas_write_buf(iosb, &status.to_le_bytes());
+                self.xas_write_buf(
+                    iosb + 8,
+                    &(if status == nt_fs::STATUS_SUCCESS {
+                        1u64
+                    } else {
+                        0
+                    })
+                    .to_le_bytes(),
+                );
+            }
+            loader_trace_record(
+                self.pi,
+                LoaderOp::OpenFile,
+                status,
+                None,
+                0,
+                opened_handle.unwrap_or(0),
+                &nb[..nlen],
+            );
+            return status;
+        }
+        // Directory opens resolve authoritatively against the mounted FAT volume. The empty
+        // volume-relative path denotes the FAT root directory.
+        let volume_entry =
+            nt_fs::nt_path_to_volume_relative(&name16, b"reactos").and_then(|path| {
+                exec_fs().and_then(|fs| {
+                    if path.is_empty() {
+                        Some((fs.root_cl, 0, 0x10))
+                    } else {
+                        fat_open_path_entry(&fs, &path)
+                    }
+                })
+            });
+        let volume_directory = if want_dir {
+            volume_entry
+                .filter(|(_, _, attributes)| attributes & 0x10 != 0)
+                .map(|(first_cluster, _, _)| first_cluster)
+        } else {
+            None
+        };
+        let volume_not_directory =
+            volume_entry.is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
+        let catalog = &*ctx.exe_image_catalog;
+        let hosted_exe_image = (!want_dir)
+            .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
+            .flatten()
+            .filter(|image| Self::hosted_image_exists(*image));
+        let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
+        let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
+            if nb[..nlen].windows(8).any(|w| w == b"explorer") {
+                Some(b"explorer.exe" as &[u8])
+            } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
+                Some(b"cmd.exe" as &[u8])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(leaf) = userinit_shell_probe {
+            let attempt = USERINIT_SHELL_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                bump_progress();
+            }
+            if leaf == b"explorer.exe" {
+                USERINIT_EXPLORER_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            }
+            if attempt < 8 {
+                print_str(b"[userinit-shell] NtOpenFile shell image probe ");
+                print_str(leaf);
+                print_str(b" raw=");
+                print_str(&nb[..nlen.min(80)]);
+                print_str(b"\n");
+            }
+        }
+        if self.current_process_is_winlogon()
+            && !want_dir
+            && nb[..nlen].windows(8).any(|w| w == b"userinit")
+        {
+            WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut dll_i = if self.pi >= 1 && !want_dir {
+            reg.resolve_name(&nb[..nlen])
+        } else {
+            None
+        };
+        if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
+            let load = demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen]);
+            match load {
+                Ok(slot) => {
+                    self.dll_loaded_dirty = true;
+                    dll_i = Some(slot);
+                }
+                Err(err) => {
+                    if !self.current_process_is_winlogon()
+                        && (nb[..nlen].ends_with(b".dll")
+                            || nb[..nlen].windows(4).any(|w| w == b".dll"))
+                    {
+                        print_str(b"[demand-miss] pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" reason=");
+                        print_str(err.tag());
+                        match err {
+                            DemandLoadError::StoreTooSmall { slot, store_len } => {
+                                print_str(b" slot=");
+                                print_u64(slot as u64);
+                                print_str(b" store_len=");
+                                print_u64(store_len as u64);
+                            }
+                            DemandLoadError::PoolExhausted { size } => {
+                                print_str(b" size=");
+                                print_u64(size as u64);
+                            }
+                            DemandLoadError::ShortRead { expected, actual } => {
+                                print_str(b" expected=");
+                                print_u64(expected as u64);
+                                print_str(b" actual=");
+                                print_u64(actual as u64);
+                            }
+                            DemandLoadError::ArenaExhausted { image_size } => {
+                                print_str(b" image_size=");
+                                print_u64(image_size);
+                            }
+                            DemandLoadError::UnsupportedImageName
+                            | DemandLoadError::SxsProbe
+                            | DemandLoadError::DeniedDiverter
+                            | DemandLoadError::NoReservedSlot
+                            | DemandLoadError::NoMountedFs
+                            | DemandLoadError::FileMissing
+                            | DemandLoadError::EmptyFile
+                            | DemandLoadError::PeParseFailed => {}
+                        }
+                        print_str(b" name=");
+                        print_str(&nb[..nlen.min(64)]);
+                        print_str(b"\n");
+                    }
+                }
+            }
+        }
+        let mut opened_handle = 0;
+        let status: u32 =
+            if volume_directory.is_some() || hosted_exe_leaf.is_some() || dll_i.is_some() {
+                let h = if let Some(first_cluster) = volume_directory {
+                    self.mint_directory_handle(first_cluster, desired_access)
+                } else {
+                    Some(self.mint_handle())
+                };
+                let Some(h) = h else {
+                    let status = 0xC000_009A;
+                    let iosb = get_recv_mr(8);
+                    if iosb != 0 {
+                        smss_stack_write32(iosb, status);
+                        smss_stack_write(iosb + 8, 0);
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        status,
+                        dll_i,
+                        0,
+                        0,
+                        &nb[..nlen],
+                    );
+                    return status;
+                };
+                opened_handle = h;
+                smss_stack_write(get_recv_mr(9), h);
+                if let Some(image) = hosted_exe_image {
+                    let _ = record_hosted_child_exe_open(ctx, self.pi, image, h);
+                }
+                if let Some(i) = dll_i {
+                    reg.set_file_handle(self.pi, i, h);
+                }
+                let iosb = get_recv_mr(8);
+                if iosb != 0 {
+                    smss_stack_write32(iosb, 0);
+                    smss_stack_write(iosb + 8, 1);
+                }
+                0
+            } else {
+                if self.current_process_is_lsass() {
+                    print_str(b"[lsass-open-miss] name=");
+                    print_str(&nb[..nlen.min(80)]);
+                    print_str(b" -> 0xC0000034\n");
+                }
+                if volume_not_directory {
+                    0xC000_0103
+                } else {
+                    0xC000_0034
+                }
+            };
+        loader_trace_record(
+            self.pi,
+            LoaderOp::OpenFile,
+            status,
+            dll_i,
+            0,
+            opened_handle,
+            &nb[..nlen],
+        );
+        status
+    }
+
+    #[inline(never)]
+    unsafe fn nt_create_process_service(&mut self, args: &[u64]) -> u32 {
+        let ctx = self.loop_ctx.unwrap();
+        let sp = get_recv_mr(16);
+        let sect = smss_stack_read(sp + 0x30);
+        let slot_info = {
+            let table = &*ctx.exe_images;
+            table.index_for_section(self.pi, sect).and_then(|index| {
+                table.get(index).map(|slot| {
+                    let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
+                    let leaf_len = slot.leaf().len();
+                    leaf[..leaf_len].copy_from_slice(slot.leaf());
+                    (index, leaf, leaf_len)
+                })
+            })
+        };
+        let Some((slot_index, leaf, leaf_len)) = slot_info else {
+            self.stop = true;
+            return 0xC000_0002;
+        };
+        let leaf = &leaf[..leaf_len];
+        if self.current_process_is_winlogon() || self.current_process_is_userinit() {
+            print_str(if self.current_process_is_winlogon() {
+                b"[wl-createproc] pi=2 sect=0x" as &[u8]
+            } else {
+                b"[userinit-createproc] pi=5 sect=0x" as &[u8]
+            });
+            print_hex(sect as u32);
+            print_str(b" exe-slot=");
+            print_u64(slot_index as u64 + 1);
+            print_str(b"\n");
+        }
+        let catalog = &*ctx.exe_image_catalog;
+        let Some(image) = catalog.get_by_leaf(leaf) else {
+            self.stop = true;
+            return 0xC000_0002;
+        };
+        if let Err(status) = self.allocate_hosted_process_slot(self.pi, image) {
+            return status;
+        }
+        match image.role {
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
+                USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            nt_exe_image::HostedProcessRole::InteractiveShell => {
+                EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
+            return nt_process::STATUS_INVALID_HANDLE;
+        }
+        let table = &mut *ctx.exe_images;
+        match table.reserve_spawn_owned_registered(
+            catalog,
+            self.pi,
+            sect,
+            args[1] as u32,
+            get_recv_mr(9),
+        ) {
+            Ok(request) => {
+                self.exe_spawn_request = Some(request);
+                0
+            }
+            Err(_) => 0xC000_000D,
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn nt_wait_for_debug_event_service(&mut self, args: &[u64]) -> u32 {
+        let object = match self
+            .debug_object_for_handle(args[0], nt_process::dbgk::DEBUG_OBJECT_WAIT_STATE_CHANGE)
+        {
+            Ok(object) => object,
+            Err(status) => return status,
+        };
+        let state_change = args[3];
+        if state_change == 0 {
+            return 0xC000_0005;
+        }
+        if !self.probe_user_output(state_change, nt_process::dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE) {
+            return 0xC000_0005;
+        }
+        let debugger = self.pm_pid_for_pi(self.pi).unwrap_or(0);
+        let result = match self.pm.wait_for_debug_event(object, debugger) {
+            Ok(result) => result,
+            Err(status) => return status,
+        };
+        self.sync_debug_object_signal(object);
+        if let Some(result) = result {
+            if !self.xas_try_write_buf(state_change, &result.state_change) {
+                return 0xC000_0005;
+            }
+            DBGK_WAITS_SERVED.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        // Nothing reportable. An immediate (zero/positive) timeout returns STATUS_TIMEOUT;
+        // anything else parks the caller on the object's EventsPresent dispatcher event, so the
+        // queue-side signal wakes it through the ordinary wait machinery.
+        let timeout_ptr = args[2];
+        if timeout_ptr != 0 {
+            let interval = smss_stack_read(timeout_ptr) as i64;
+            match nt_delay_execution::due_time(
+                interval,
+                monotonic_time_100ns(),
+                nt_system_time_100ns(),
+            ) {
+                nt_delay_execution::Due::Immediate => return 0x102,
+                nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                    self.wait_deadline_100ns = deadline;
+                }
+            }
+        }
+        match self.pm.debug_object(object).map(|o| o.host_event) {
+            Some(key) if key != 0 => {
+                self.wait_park_event = (key - 1) as i64;
+                0x102
+            }
+            // No dispatcher object could be bound at create time — report the timeout rather than
+            // parking on nothing.
+            _ => 0x102,
+        }
+    }
+
     fn handle_service(
         &mut self,
         ctx: &NativeCallContext,
@@ -11304,8 +12009,8 @@ impl ExecNtHandler {
                 use nt_syscall::system_information::{
                     encode_system_module_information, query_plan,
                     system_module_information_required_length, SystemInformationKind,
-                    SystemModuleEntry, SystemTimeOfDayInformation,
-                    RTL_PROCESS_MODULES_HEADER_SIZE, SYSTEM_MODULE_INFORMATION_CLASS,
+                    SystemTimeOfDayInformation, RTL_PROCESS_MODULES_HEADER_SIZE,
+                    SYSTEM_MODULE_INFORMATION_CLASS,
                     SYSTEM_BASIC_INFORMATION_CLASS,
                     SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
                     SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
@@ -11349,8 +12054,7 @@ impl ExecNtHandler {
                 }
 
                 if class == SYSTEM_MODULE_INFORMATION_CLASS {
-                    let mut snapshot = [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
-                    let module_count = snapshot_system_modules(&mut snapshot);
+                    let (snapshot, module_count) = system_module_snapshot_scratch();
                     let required_length =
                         system_module_information_required_length(module_count).unwrap_or(usize::MAX);
                     let return_length = required_length.min(u32::MAX as usize) as u32;
@@ -11364,12 +12068,10 @@ impl ExecNtHandler {
 
                     let copy_length = len.min(required_length);
                     let mut output = alloc::vec![0u8; copy_length];
-                    let status =
-                        match encode_system_module_information(&mut output, &snapshot[..module_count])
-                        {
-                            Ok(_) => 0,
-                            Err(error) => error.status,
-                        };
+                    let status = match encode_system_module_information(&mut output, snapshot) {
+                        Ok(_) => 0,
+                        Err(error) => error.status,
+                    };
                     if !self.xas_try_write_buf(buf, &output) {
                         return STATUS_ACCESS_VIOLATION;
                     }
@@ -14724,104 +15426,10 @@ impl ExecNtHandler {
             // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
             // → not-found so the loader's manifest probes keep failing.
             NativeService::NtQueryAttributesFile => unsafe {
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-                let ctx = self.loop_ctx.unwrap();
-                let reg = &*ctx.reg;
-                let name16 = self.read_objattr_name_pe(args[0]);
-                if name16.is_empty() {
-                    return STATUS_OBJECT_NAME_INVALID;
-                }
-                // ★ THE WRITABLE FILESYSTEM OVERLAY answers by-path attribute queries for its own
-                // namespace — `GetFileAttributesW` is how `LoadUserProfileW` (profile.c:2085) asks
-                // whether the user's hive already exists, and how `CreateDirectoryPath` probes.
-                // A miss here is a REAL miss (the file is not on the volume), never a fake EXISTS.
-                if let Some(relative) = crate::writable_fs::writable_path(&name16) {
-                    return match crate::writable_fs::query_attributes(&relative) {
-                        Some(info)
-                            if self.write_file_basic_attributes(args[1], info.attributes) =>
-                        {
-                            nt_fs::STATUS_SUCCESS
-                        }
-                        Some(_) => STATUS_ACCESS_VIOLATION,
-                        None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
-                    };
-                }
-                // General read-only namespace lookup. This is intentionally below the writable
-                // mount so C:\Profiles remains overlay-backed, but above the loader-specific EXE/DLL
-                // probes. In particular msgina passes C:\Windows as userinit's current directory;
-                // the canonicalizer maps it to the real FAT `reactos` directory and this returns its
-                // genuine FILE_ATTRIBUTE_DIRECTORY bit.
-                if let Some(attributes) = crate::fs_loader::query_nt_path_attributes(&name16) {
-                    return if self.write_file_basic_attributes(args[1], attributes) {
-                        nt_fs::STATUS_SUCCESS
-                    } else {
-                        STATUS_ACCESS_VIOLATION
-                    };
-                }
-                let mut nb = [0u8; 96];
-                let mut nlen = 0;
-                for &w in &name16 {
-                    if nlen >= nb.len() {
-                        break;
-                    }
-                    nb[nlen] = (w as u8).to_ascii_lowercase();
-                    nlen += 1;
-                }
-                // Report EXISTS for csrss.exe + any registry DLL (csrsrv/basesrv/winsrv). The registry
-                // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
-                // so the loader doesn't take the .Local\ redirection or a manifest path.
-                let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
-                // The hosted-process EXE probes (csrss/winlogon/services/lsass) are the case where a
-                // pi==0 (smss) OR winlogon probe must resolve EXISTS even though the general DLL
-                // existence path below is gated pi>=1 (so smss's KnownDLLs probes fail → it launches
-                // csrss/winlogon). Existence comes from the REAL \reactos FS by-path and the shared
-                // hosted-image catalog root — no hand-maintained list — keyed on the CANONICAL leaf
-                // the substring classifies (ReactOS sometimes builds a malformed probe path, e.g.
-                // `\??\C:\Windowsservices.exe` with no separator, so the extracted leaf is garbage;
-                // the substring reliably says WHICH EXE it wants). SxS probes are rejected (loader
-                // must not take the .Local\/manifest path). Content delivery stays on nt-dll-registry.
-                let catalog = &*ctx.exe_image_catalog;
-                let exe_exists = Self::exe_probe_image(catalog, &nb[..nlen], is_sxs)
-                    .is_some_and(Self::hosted_image_exists);
-                // General DLL existence (pi>=1) also comes from the real FS by-path.
-                let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
-                let status: u32 = if exe_exists {
-                    // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
-                    if self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) {
-                        0
-                    } else {
-                        STATUS_ACCESS_VIOLATION
-                    }
-                } else if dll_exists {
-                    if self.write_file_basic_attributes(args[1], nt_fs::FILE_ATTRIBUTE_NORMAL) {
-                        0
-                    } else {
-                        STATUS_ACCESS_VIOLATION
-                    }
-                } else {
-                    // DIAG: log the not-found probes from a DLL-loading process (csrss/winlogon) —
-                    // a DllMain probes several files before failing init; we need to know which are
-                    // load-bearing.
-                    if self.pi >= 1 && self.pi != 2 {
-                        print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
-                        for &w in name16.iter().take(96) {
-                            debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
-                        }
-                        print_str(b"\"\n");
-                    }
-                    0xC0000034
-                };
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::QueryAttributesFile,
-                    status,
-                    reg.resolve_name(&nb[..nlen]),
-                    0,
-                    0,
-                    &nb[..nlen],
-                );
-                status
+                let service = core::ptr::read_volatile(core::ptr::addr_of!(
+                    NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY
+                ));
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
             // NtCreateIoCompletion(*Handle, DesiredAccess, *OA, NumberOfConcurrentThreads).
             // The NT object and its packet queue live in the executive; SURT is only the transport
@@ -16159,436 +16767,10 @@ impl ExecNtHandler {
             // Hand back a directory handle so it proceeds; a plain FILE open (an individual
             // KnownDLL) still fails → smss `continue`s past each DLL and completes the loop.
             NativeService::NtOpenFile => unsafe {
-                let ctx = self.loop_ctx.unwrap();
-                let reg = &mut *ctx.reg;
-                const FILE_DIRECTORY_FILE: u64 = 0x01;
-                let sp = get_recv_mr(16);
-                {
-                    let oa_probe = get_recv_mr(7);
-                    let nm = self.read_objattr_name_pe(oa_probe);
-                    if boot_status_path_matches(&nm) {
-                        let options = smss_stack_read(sp + 0x30) as u32;
-                        let mut status = nt_fs::STATUS_SUCCESS;
-                        let mut opened_handle = None;
-                        if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                            status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                        } else {
-                            ensure_boot_status_data();
-                            opened_handle = self.mint_boot_status_handle(args[1] as u32);
-                            if opened_handle.is_none() {
-                                status = 0xC000_009A;
-                            }
-                        }
-                        if let Some(handle) = opened_handle {
-                            self.queue_write(get_recv_mr(9), handle);
-                        }
-                        let iosb = get_recv_mr(8);
-                        if iosb != 0 {
-                            self.xas_write_buf(iosb, &status.to_le_bytes());
-                            let info = if status == nt_fs::STATUS_SUCCESS {
-                                nt_fs::FILE_OPENED as u64
-                            } else {
-                                0
-                            };
-                            self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                        }
-                        let lc: alloc::vec::Vec<u8> = nm
-                            .iter()
-                            .map(|&w| (w as u8).to_ascii_lowercase())
-                            .collect();
-                        loader_trace_record(
-                            self.pi,
-                            LoaderOp::OpenFile,
-                            status,
-                            None,
-                            0,
-                            opened_handle.unwrap_or(0),
-                            &lc,
-                        );
-                        return status;
-                    }
-                }
-                // Named-pipe client open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
-                // npfs (IRP_MJ_CREATE = client connect → finds the FCB via the real prefix tree). Placed
-                // before the FS name-scope so a pipe path never falls into the DLL/System32 fakes.
-                {
-                    let oa_probe = get_recv_mr(7);
-                    let nm = self.read_objattr_name_pe(oa_probe);
-                    let lc: alloc::vec::Vec<u8> = nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
-                    let is_pipe = nt_fs::is_named_pipe_path(&nm);
-                    if is_pipe && driver_launch::npfs_ready() {
-                        let leaf = Self::pipe_leaf16(&nm);
-                        if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
-                            let mut status = st as u32;
-                            let opened_handle = if status == 0 && fid != 0 {
-                                let options = args[5] as u32;
-                                let synchronous = options
-                                    & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
-                                        | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-                                    != 0;
-                                let handle =
-                                    self.mint_file_handle(fid, args[1] as u32, synchronous);
-                                if handle.is_none() { status = 0xC000_009A; }
-                                handle
-                            } else {
-                                if status == 0 { status = nt_fs::STATUS_INVALID_DEVICE_REQUEST; }
-                                None
-                            };
-                            if let Some(handle) = opened_handle {
-                                self.queue_write(get_recv_mr(9), handle);
-                                // ★ BATCH 34: a successful client CONNECT (IRP_MJ_CREATE paired the
-                                // client to a server end by name in npfs) must complete the pending
-                                // async server FSCTL_PIPE_LISTEN FOR THAT PIPE NAME — signal its
-                                // completion event so the server's NtWaitForMultipleObjects wakes and
-                                // reads the client's PDU. Name-scoped (no spurious cross-server wake).
-                                if status == 0 {
-                                    self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
-                                    // Remember the CLIENT end's fid→pipe-name too (the server end is
-                                    // registered at NtCreateNamedPipeFile). This is what lets the LSA
-                                    // self-RPC instrumentation below be NAME-SCOPED to `\lsarpc`
-                                    // rather than "any pi-4 pipe write".
-                                    crate::pipe_fid_name_remember(
-                                        fid,
-                                        nt_io_manager::pipe_name_hash(&leaf),
-                                    );
-                                }
-                            }
-                            let iosb = get_recv_mr(8);
-                            if iosb != 0 {
-                                self.xas_write_buf(iosb, &status.to_le_bytes());
-                                let info = if status == 0 { 1u64 } else { 0 };
-                                self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                            }
-                            loader_trace_record(
-                                self.pi,
-                                LoaderOp::OpenFile,
-                                status,
-                                None,
-                                0,
-                                opened_handle.unwrap_or(0),
-                                &lc,
-                            );
-                            return status;
-                        }
-                    }
-                }
-                // Read through the hosted process address space: activation-context filenames may
-                // live on ntdll's process heap, not in the legacy boot mirror.
-                let name16 = self.read_objattr_name_pe(get_recv_mr(7));
-                let mut nb = [0u8; 96];
-                let nlen = {
-                    let mut n = 0;
-                    for &w in &name16 {
-                        if n >= nb.len() {
-                            break;
-                        }
-                        nb[n] = (w as u8).to_ascii_lowercase();
-                        n += 1;
-                    }
-                    n
-                };
-                // ★ THE WRITABLE FILESYSTEM OVERLAY (see the same route in NtCreateFile). An open
-                // inside a declared writable mount prefix is served by the writable volume — never
-                // by the read-only FAT reader or the DLL/System32 existence fakes below, which is
-                // why this is placed BEFORE all of them. `NtOpenFile` is `NtCreateFile` with
-                // disposition FILE_OPEN, so a missing path misses honestly.
-                if let Some(relative) = crate::writable_fs::writable_path(&name16) {
-                    let (mut status, file_id, information) = crate::writable_fs::create(
-                        &relative,
-                        args[1] as u32,                      // DesiredAccess (RDX)
-                        0,                                   // FileAttributes: N/A to an open
-                        smss_stack_read(sp + 0x28) as u32,   // ShareAccess
-                        nt_fs::FILE_OPEN,
-                        smss_stack_read(sp + 0x30) as u32,   // OpenOptions
-                    );
-                    let mut opened_handle = 0u64;
-                    if let Some(file_id) = file_id {
-                        self.writable_fs_dirty = true;
-                        match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                            Some(handle) => {
-                                opened_handle = handle;
-                                self.queue_write(get_recv_mr(9), handle);
-                            }
-                            None => status = 0xC000_009A, // STATUS_INSUFFICIENT_RESOURCES
-                        }
-                    }
-                    let iosb = get_recv_mr(8);
-                    if iosb != 0 {
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        let info = if status == nt_fs::STATUS_SUCCESS {
-                            information
-                        } else {
-                            0
-                        };
-                        self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                    }
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::OpenFile,
-                        status,
-                        None,
-                        0,
-                        opened_handle,
-                        &nb[..nlen],
-                    );
-                    return status;
-                }
-                // Classify SxS/activation-context paths without admitting them to image loading.
-                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
-                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
-                    || nb[..nlen].windows(7).any(|w| w == b".config");
-                let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
-                let open_options = smss_stack_read(sp + 0x30) as u32;
-                let desired_access = args[1] as u32;
-                let disk_entry =
-                    Self::readonly_disk_open_entry(&name16, desired_access, open_options);
-                if let Some((first_cluster, file_size)) = disk_entry {
-                    let mut status = nt_fs::STATUS_SUCCESS;
-                    let opened_handle = self.mint_disk_file_handle(
-                        first_cluster,
-                        file_size,
-                        desired_access,
-                    );
-                    if let Some(handle) = opened_handle {
-                        self.queue_write(get_recv_mr(9), handle);
-                    } else {
-                        status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                    }
-                    let iosb = get_recv_mr(8);
-                    if iosb != 0 {
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        self.xas_write_buf(
-                            iosb + 8,
-                            &(if status == nt_fs::STATUS_SUCCESS { 1u64 } else { 0 }).to_le_bytes(),
-                        );
-                    }
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::OpenFile,
-                        status,
-                        None,
-                        0,
-                        opened_handle.unwrap_or(0),
-                        &nb[..nlen],
-                    );
-                    return status;
-                }
-                // Directory opens resolve authoritatively against the mounted FAT volume. The
-                // empty volume-relative path denotes the FAT root directory.
-                let volume_entry =
-                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos").and_then(|path| {
-                        exec_fs().and_then(|fs| {
-                            if path.is_empty() {
-                                Some((fs.root_cl, 0, 0x10))
-                            } else {
-                                fat_open_path_entry(&fs, &path)
-                            }
-                        })
-                    });
-                let volume_directory = if want_dir {
-                    volume_entry
-                        .filter(|(_, _, attributes)| attributes & 0x10 != 0)
-                        .map(|(first_cluster, _, _)| first_cluster)
-                } else {
-                    None
-                };
-                let volume_not_directory = volume_entry
-                    .is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
-                // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
-                // RtlCreateUserProcess / winlogon's CreateProcessInternalW): the substring classifies
-                // WHICH EXE, existence resolves against its CANONICAL leaf + root on the real
-                // \reactos FS (runtime hosted-image catalog) — path-form/malformed-path
-                // independent, no hand-maintained list. Loader manifest opens are unaffected (SxS
-                // rejected).
-                let catalog = &*ctx.exe_image_catalog;
-                let hosted_exe_image =
-                    (!want_dir)
-                        .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
-                        .flatten()
-                        .filter(|image| Self::hosted_image_exists(*image));
-                let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
-                let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
-                    if nb[..nlen].windows(8).any(|w| w == b"explorer") {
-                        Some(b"explorer.exe" as &[u8])
-                    } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
-                        Some(b"cmd.exe" as &[u8])
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(leaf) = userinit_shell_probe {
-                    let attempt = USERINIT_SHELL_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-                    if attempt == 0 {
-                        bump_progress();
-                    }
-                    if leaf == b"explorer.exe" {
-                        USERINIT_EXPLORER_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if attempt < 8 {
-                        print_str(b"[userinit-shell] NtOpenFile shell image probe ");
-                        print_str(leaf);
-                        print_str(b" raw=");
-                        print_str(&nb[..nlen.min(80)]);
-                        print_str(b"\n");
-                    }
-                }
-                // ★ THE 6TH PROCESS' IMAGE OPEN. `msgina!WlxActivateUserShell` →
-                // `WlxStartApplication` → `CreateProcessAsUserW` reaches
-                // `kernel32!CreateProcessInternalW`'s image open for `userinit.exe`
-                // (`proc.c:2745`). Counted separately from success: the generic image table now
-                // accepts the real file and carries it through SectionImageInformation, while pi=5
-                // process publication remains the next mechanism boundary.
-                if self.current_process_is_winlogon()
-                    && !want_dir
-                    && nb[..nlen].windows(8).any(|w| w == b"userinit")
-                {
-                    WINLOGON_USERINIT_IMAGE_OPENS.fetch_add(1, Ordering::Relaxed);
-                }
-                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
-                // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
-                // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
-                // smss skips them and launches csrss. Only csrss's loader should resolve these DLLs.
-                // nt-dll-registry keeps the image base/geometry role for CONTENT (SEC_IMAGE); nt-fs
-                // owns namespace/existence (csrss.exe + System32 dir here). pi>=1 = csrss OR winlogon
-                // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
-                // launches csrss/winlogon.
-                let mut dll_i = if self.pi >= 1 && !want_dir {
-                    reg.resolve_name(&nb[..nlen])
-                } else {
-                    None
-                };
-                // TRUE syscall-time DEMAND-LOAD: a DLL-loading process (pi>=1) whose loader requests a
-                // DLL not yet registered (resolve miss) + not an SxS probe → resolve it BY PATH from
-                // the real \reactos\system32 FS, load into the pool, activate a reserved registry slot,
-                // relocate, and stash its parsed PE. From here it behaves exactly like a boot-pinned
-                // DLL (NtCreateSection/NtMapViewOfSection/the fault router all go through the registry +
-                // dll_pes). This is what retires the eager DLL list — no maintained table.
-                if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
-                    let load =
-                        demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen]);
-                    match load {
-                        Ok(slot) => {
-                            // Pin the heap mark past the load's registry allocations (service loop consumes).
-                            self.dll_loaded_dirty = true;
-                            dll_i = Some(slot);
-                        }
-                        Err(err) => {
-                            // DIAG: a .dll open that missed the registry AND failed to demand-load —
-                            // log it so we can see which dependency the loader requested that we
-                            // couldn't satisfy.
-                            if !self.current_process_is_winlogon()
-                                && (nb[..nlen].ends_with(b".dll")
-                                    || nb[..nlen].windows(4).any(|w| w == b".dll"))
-                            {
-                                print_str(b"[demand-miss] pi=");
-                                print_u64(self.pi as u64);
-                                print_str(b" reason=");
-                                print_str(err.tag());
-                                match err {
-                                    DemandLoadError::StoreTooSmall { slot, store_len } => {
-                                        print_str(b" slot=");
-                                        print_u64(slot as u64);
-                                        print_str(b" store_len=");
-                                        print_u64(store_len as u64);
-                                    }
-                                    DemandLoadError::PoolExhausted { size } => {
-                                        print_str(b" size=");
-                                        print_u64(size as u64);
-                                    }
-                                    DemandLoadError::ShortRead { expected, actual } => {
-                                        print_str(b" expected=");
-                                        print_u64(expected as u64);
-                                        print_str(b" actual=");
-                                        print_u64(actual as u64);
-                                    }
-                                    DemandLoadError::ArenaExhausted { image_size } => {
-                                        print_str(b" image_size=");
-                                        print_u64(image_size);
-                                    }
-                                    DemandLoadError::UnsupportedImageName
-                                    | DemandLoadError::SxsProbe
-                                    | DemandLoadError::DeniedDiverter
-                                    | DemandLoadError::NoReservedSlot
-                                    | DemandLoadError::NoMountedFs
-                                    | DemandLoadError::FileMissing
-                                    | DemandLoadError::EmptyFile
-                                    | DemandLoadError::PeParseFailed => {}
-                                }
-                                print_str(b" name=");
-                                print_str(&nb[..nlen.min(64)]);
-                                print_str(b"\n");
-                            }
-                        }
-                    }
-                }
-                let mut opened_handle = 0;
-                let status: u32 = if volume_directory.is_some()
-                    || hosted_exe_leaf.is_some()
-                    || dll_i.is_some()
-                {
-                    let h = if let Some(first_cluster) = volume_directory {
-                        self.mint_directory_handle(first_cluster, desired_access)
-                    } else {
-                        Some(self.mint_handle())
-                    };
-                    let Some(h) = h else {
-                        let status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                        let iosb = get_recv_mr(8);
-                        if iosb != 0 {
-                            smss_stack_write32(iosb, status);
-                            smss_stack_write(iosb + 8, 0);
-                        }
-                        loader_trace_record(
-                            self.pi,
-                            LoaderOp::OpenFile,
-                            status,
-                            dll_i,
-                            0,
-                            0,
-                            &nb[..nlen],
-                        );
-                        return status;
-                    };
-                    opened_handle = h;
-                    smss_stack_write(get_recv_mr(9), h); // *FileHandle
-                    if let Some(image) = hosted_exe_image {
-                        let _ = record_hosted_child_exe_open(ctx, self.pi, image, h);
-                    }
-                    if let Some(i) = dll_i {
-                        reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
-                    }
-                    let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
-                        smss_stack_write(iosb + 8, 1); // Information = FILE_OPENED
-                    }
-                    0
-                } else {
-                    // DIAG (BATCH 23): log lsass.exe's unresolved NtOpenFile — its LSA init opens a
-                    // named object we don't model and bails with OBJECT_NAME_NOT_FOUND. Surface the name.
-                    if self.current_process_is_lsass() {
-                        print_str(b"[lsass-open-miss] name=");
-                        print_str(&nb[..nlen.min(80)]);
-                        print_str(b" -> 0xC0000034\n");
-                    }
-                    if volume_not_directory {
-                        0xC000_0103 // STATUS_NOT_A_DIRECTORY
-                    } else {
-                        0xC000_0034 // no filesystem yet → not found (smss skips / uses defaults)
-                    }
-                };
-                loader_trace_record(
-                    self.pi,
-                    LoaderOp::OpenFile,
-                    status,
-                    dll_i,
-                    0,
-                    opened_handle,
-                    &nb[..nlen],
-                );
-                status
+                let service = core::ptr::read_volatile(core::ptr::addr_of!(
+                    NT_OPEN_FILE_SERVICE_ENTRY
+                ));
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
             // NtQuerySection(SectionHandle[R10], class[RDX]=args[1], buf[R8], len[R9], *ResultLen[sp+0x28]).
             // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's entry
@@ -17314,73 +17496,10 @@ impl ExecNtHandler {
             // SectionHandle through the executable image table, reserve the process publication, then
             // let the loop build the seL4 mechanism from the same SpawnRequest used by Win32 children.
             NativeService::NtCreateProcess => unsafe {
-                let ctx = self.loop_ctx.unwrap();
-                let sp = get_recv_mr(16);
-                let sect = smss_stack_read(sp + 0x30); // SectionHandle
-                let slot_info = {
-                    let table = &*ctx.exe_images;
-                    table.index_for_section(self.pi, sect).and_then(|index| {
-                        table.get(index).map(|slot| {
-                            let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
-                            let leaf_len = slot.leaf().len();
-                            leaf[..leaf_len].copy_from_slice(slot.leaf());
-                            (index, leaf, leaf_len)
-                        })
-                    })
-                };
-                let Some((slot_index, leaf, leaf_len)) = slot_info else {
-                    self.stop = true;
-                    return 0xC000_0002;
-                };
-                let leaf = &leaf[..leaf_len];
-                if self.current_process_is_winlogon() || self.current_process_is_userinit() {
-                    print_str(if self.current_process_is_winlogon() {
-                        b"[wl-createproc] pi=2 sect=0x" as &[u8]
-                    } else {
-                        b"[userinit-createproc] pi=5 sect=0x" as &[u8]
-                    });
-                    print_hex(sect as u32);
-                    print_str(b" exe-slot=");
-                    print_u64(slot_index as u64 + 1);
-                    print_str(b"\n");
-                }
-                let catalog = &*ctx.exe_image_catalog;
-                let Some(image) = catalog.get_by_leaf(leaf) else {
-                    self.stop = true;
-                    return 0xC000_0002;
-                };
-                if let Err(status) = self.allocate_hosted_process_slot(self.pi, image) {
-                    return status;
-                }
-                match image.role {
-                    nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
-                        USERINIT_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    nt_exe_image::HostedProcessRole::InteractiveShell => {
-                        EXPLORER_CREATE_PROCESS_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {}
-                }
-                // RtlCreateUserProcess/CreateProcessAsUserW names the parent process with a real
-                // process handle (commonly NtCurrentProcess). Keep image launch policy out of the
-                // catalog; the parent check belongs to the handle table.
-                if self.resolve_process_handle(args[3]) != self.pm_pid_for_pi(self.pi) {
-                    return nt_process::STATUS_INVALID_HANDLE;
-                }
-                let table = &mut *ctx.exe_images;
-                match table.reserve_spawn_owned_registered(
-                    catalog,
-                    self.pi,
-                    sect,
-                    args[1] as u32,
-                    get_recv_mr(9),
-                ) {
-                    Ok(request) => {
-                        self.exe_spawn_request = Some(request);
-                        0
-                    }
-                    Err(_) => 0xC000_000D,
-                }
+                let service = core::ptr::read_volatile(core::ptr::addr_of!(
+                    NT_CREATE_PROCESS_SERVICE_ENTRY
+                ));
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
             // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route NT's two
             // user-mode shutdown phases through pm: NULL means terminate every other thread and return
@@ -17649,62 +17768,10 @@ impl ExecNtHandler {
             // NtWaitForDebugEvent(DebugHandle[R10]=args[0], Alertable, *Timeout=args[2],
             //                     *StateChange=args[3]).
             NativeService::NtWaitForDebugEvent => unsafe {
-                let object = match self.debug_object_for_handle(
-                    args[0],
-                    nt_process::dbgk::DEBUG_OBJECT_WAIT_STATE_CHANGE,
-                ) {
-                    Ok(object) => object,
-                    Err(status) => return status,
-                };
-                let state_change = args[3];
-                if state_change == 0 {
-                    return 0xC000_0005;
-                }
-                if !self.probe_user_output(
-                    state_change,
-                    nt_process::dbgk::DBGUI_WAIT_STATE_CHANGE_SIZE,
-                ) {
-                    return 0xC000_0005;
-                }
-                let debugger = self.pm_pid_for_pi(self.pi).unwrap_or(0);
-                let result = match self.pm.wait_for_debug_event(object, debugger) {
-                    Ok(result) => result,
-                    Err(status) => return status,
-                };
-                self.sync_debug_object_signal(object);
-                if let Some(result) = result {
-                    if !self.xas_try_write_buf(state_change, &result.state_change) {
-                        return 0xC000_0005;
-                    }
-                    DBGK_WAITS_SERVED.fetch_add(1, Ordering::Relaxed);
-                    return 0;
-                }
-                // Nothing reportable. An immediate (zero/positive) timeout returns STATUS_TIMEOUT;
-                // anything else parks the caller on the object's EventsPresent dispatcher event, so
-                // the queue-side signal wakes it through the ordinary wait machinery.
-                let timeout_ptr = args[2];
-                if timeout_ptr != 0 {
-                    let interval = smss_stack_read(timeout_ptr) as i64;
-                    match nt_delay_execution::due_time(
-                        interval,
-                        monotonic_time_100ns(),
-                        nt_system_time_100ns(),
-                    ) {
-                        nt_delay_execution::Due::Immediate => return 0x102, // STATUS_TIMEOUT
-                        nt_delay_execution::Due::Monotonic100ns(deadline) => {
-                            self.wait_deadline_100ns = deadline;
-                        }
-                    }
-                }
-                match self.pm.debug_object(object).map(|o| o.host_event) {
-                    Some(key) if key != 0 => {
-                        self.wait_park_event = (key - 1) as i64;
-                        0x102 // parked; the loop ignores this sentinel
-                    }
-                    // No dispatcher object could be bound at create time — report the timeout
-                    // rather than parking on nothing.
-                    _ => 0x102,
-                }
+                let service = core::ptr::read_volatile(core::ptr::addr_of!(
+                    NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY
+                ));
+                service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
 
             // NtDebugContinue(DebugHandle[R10]=args[0], *AppClientId=args[1], ContinueStatus).

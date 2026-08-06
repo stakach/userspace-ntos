@@ -11391,6 +11391,7 @@ struct ConfigHiveDriverLaunchSpec {
     class: driver_launch::DriverClass,
 }
 
+#[allow(dead_code)]
 pub(crate) struct DriverServiceLaunchSpec {
     pub(crate) service_name: alloc::string::String,
     pub(crate) driver_object_path: alloc::string::String,
@@ -11407,6 +11408,147 @@ pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) hardware_ids: alloc::vec::Vec<alloc::string::String>,
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
+
+const BOOT_DRIVER_PLAN_MAX: usize = 8;
+const BOOT_DRIVER_DEVNODE_MAX: usize = 2;
+const BOOT_DRIVER_ID_MAX: usize = 4;
+const BOOT_DRIVER_SERVICE_NAME_MAX: usize = 64;
+const BOOT_DRIVER_OBJECT_PATH_MAX: usize = 96;
+const BOOT_DRIVER_IMAGE_PATH_MAX: usize = 180;
+const BOOT_DRIVER_DEVNODE_PATH_MAX: usize = 128;
+const BOOT_DRIVER_ID_BYTES_MAX: usize = 96;
+
+#[derive(Clone, Copy)]
+struct InlineAscii<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> InlineAscii<N> {
+    const fn empty() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn set_bytes(&mut self, src: &[u8]) -> bool {
+        if src.len() > N || src.iter().any(|&b| b > 0x7f) {
+            return false;
+        }
+        self.bytes[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+        true
+    }
+
+    fn set_str(&mut self, src: &str) -> bool {
+        self.set_bytes(src.as_bytes())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineDriverDevnodeSpec {
+    instance_id: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    pdo_name: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    pdo_name_present: bool,
+    hardware_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
+    hardware_id_count: usize,
+    compatible_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
+    compatible_id_count: usize,
+}
+
+impl InlineDriverDevnodeSpec {
+    const fn empty() -> Self {
+        Self {
+            instance_id: InlineAscii::empty(),
+            pdo_name: InlineAscii::empty(),
+            pdo_name_present: false,
+            hardware_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
+            hardware_id_count: 0,
+            compatible_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
+            compatible_id_count: 0,
+        }
+    }
+
+    fn hardware_refs<'a>(&'a self, out: &'a mut [&'a str; BOOT_DRIVER_ID_MAX]) -> &'a [&'a str] {
+        let mut n = 0usize;
+        while n < self.hardware_id_count && n < BOOT_DRIVER_ID_MAX {
+            out[n] = self.hardware_ids[n].as_str();
+            n += 1;
+        }
+        &out[..n]
+    }
+
+    fn compatible_refs<'a>(&'a self, out: &'a mut [&'a str; BOOT_DRIVER_ID_MAX]) -> &'a [&'a str] {
+        let mut n = 0usize;
+        while n < self.compatible_id_count && n < BOOT_DRIVER_ID_MAX {
+            out[n] = self.compatible_ids[n].as_str();
+            n += 1;
+        }
+        &out[..n]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineDriverLaunchSpec {
+    service_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    driver_object_path: InlineAscii<BOOT_DRIVER_OBJECT_PATH_MAX>,
+    image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    class: driver_launch::DriverClass,
+    devnodes: [InlineDriverDevnodeSpec; BOOT_DRIVER_DEVNODE_MAX],
+    devnode_count: usize,
+}
+
+impl InlineDriverLaunchSpec {
+    const fn empty() -> Self {
+        Self {
+            service_name: InlineAscii::empty(),
+            driver_object_path: InlineAscii::empty(),
+            image_path: InlineAscii::empty(),
+            class: driver_launch::DriverClass::Fsd,
+            devnodes: [InlineDriverDevnodeSpec::empty(); BOOT_DRIVER_DEVNODE_MAX],
+            devnode_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineDriverLaunchPlan {
+    specs: [InlineDriverLaunchSpec; BOOT_DRIVER_PLAN_MAX],
+    len: usize,
+}
+
+impl InlineDriverLaunchPlan {
+    const fn empty() -> Self {
+        Self {
+            specs: [InlineDriverLaunchSpec::empty(); BOOT_DRIVER_PLAN_MAX],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, spec: InlineDriverLaunchSpec) -> bool {
+        if self.len >= BOOT_DRIVER_PLAN_MAX {
+            return false;
+        }
+        self.specs[self.len] = spec;
+        self.len += 1;
+        true
+    }
+
+    fn as_slice(&self) -> &[InlineDriverLaunchSpec] {
+        &self.specs[..self.len]
+    }
+}
+
+static mut SYSTEM_BOOT_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLaunchPlan::empty();
 
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
 
@@ -11475,6 +11617,70 @@ fn driver_service_devnode_specs(
         .collect()
 }
 
+fn copy_inline_string_list<const N: usize>(
+    src: &[alloc::string::String],
+    dst: &mut [InlineAscii<N>],
+) -> usize {
+    let mut count = 0usize;
+    for value in src {
+        if count >= dst.len() {
+            break;
+        }
+        if dst[count].set_str(value) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn fill_inline_devnodes(
+    cm: &nt_config_manager::ConfigManager,
+    service_name: &str,
+    out: &mut [InlineDriverDevnodeSpec],
+) -> usize {
+    let mut count = 0usize;
+    for devnode in cm.devnodes_for_service(service_name) {
+        if count >= out.len() {
+            break;
+        }
+        let mut dst = InlineDriverDevnodeSpec::empty();
+        if !dst.instance_id.set_str(&devnode.instance_id) {
+            continue;
+        }
+        if let Some(pdo_name) = devnode.pdo_name.as_deref() {
+            dst.pdo_name_present = dst.pdo_name.set_str(pdo_name);
+        }
+        dst.hardware_id_count =
+            copy_inline_string_list(&devnode.hardware_ids, &mut dst.hardware_ids);
+        dst.compatible_id_count =
+            copy_inline_string_list(&devnode.compatible_ids, &mut dst.compatible_ids);
+        out[count] = dst;
+        count += 1;
+    }
+    count
+}
+
+fn inline_driver_launch_spec_from_service_metadata(
+    cm: &nt_config_manager::ConfigManager,
+    service: &nt_config_manager::ServiceMetadata,
+    max_start: u32,
+) -> Option<InlineDriverLaunchSpec> {
+    let mut image_path = [0u8; BOOT_DRIVER_IMAGE_PATH_MAX];
+    let (image_path_len, class) =
+        driver_launch_spec_from_service_metadata(service, &mut image_path, max_start)?;
+    let driver_object_path = service.driver_object_path()?;
+    let mut spec = InlineDriverLaunchSpec::empty();
+    if !spec.service_name.set_str(&service.name)
+        || !spec.driver_object_path.set_str(&driver_object_path)
+        || !spec.image_path.set_bytes(&image_path[..image_path_len])
+    {
+        return None;
+    }
+    spec.class = class;
+    spec.devnode_count = fill_inline_devnodes(cm, &service.name, &mut spec.devnodes);
+    Some(spec)
+}
+
 fn config_hive_boot_system_driver_launch_spec(
     out_path: &mut [u8],
 ) -> Option<ConfigHiveDriverLaunchSpec> {
@@ -11522,18 +11728,30 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     Some(cm)
 }
 
-fn system_hive_boot_driver_launch_specs() -> alloc::vec::Vec<DriverServiceLaunchSpec> {
-    let Some(cm) = system_hive_config_manager() else {
-        return alloc::vec::Vec::new();
-    };
-    cm.boot_system_driver_candidates()
-        .into_iter()
-        .filter(|service| current_driver_host_can_boot_launch(&cm, service))
-        .filter_map(|service| {
-            let devnodes = driver_service_devnode_specs(&cm, &service.name);
-            owned_driver_launch_spec_from_service_metadata(service, SERVICE_SYSTEM_START, devnodes)
-        })
-        .collect()
+fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+    let heap_mark = allocator::mark();
+    let plan = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_BOOT_DRIVER_PLAN) };
+    *plan = InlineDriverLaunchPlan::empty();
+    {
+        if let Some(cm) = system_hive_config_manager() {
+            for service in cm.boot_system_driver_candidates() {
+                if !current_driver_host_can_boot_launch(&cm, &service) {
+                    continue;
+                }
+                if let Some(spec) = inline_driver_launch_spec_from_service_metadata(
+                    &cm,
+                    &service,
+                    SERVICE_SYSTEM_START,
+                ) {
+                    if !plan.push(spec) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    unsafe { allocator::reset_to(heap_mark) };
+    plan
 }
 
 pub(crate) fn system_hive_driver_service_launch_spec(
@@ -12532,12 +12750,12 @@ struct ExecNtHandler {
     /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
     /// shared across every hosted process (`pi`).
     global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
-    /// Fixed executive completion-port objects and packet queues. SURT remains the cross-component
-    /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
-    io_completion_ports: nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>,
-    /// Shared FILE_OBJECT completion associations. Duplicate handles and pending operations retain
-    /// the same entry; the associated port reference is released with the final reference.
-    file_completion: nt_io_completion::FileCompletionTable<128>,
+    /// Fixed executive completion-port objects and packet queues. The backing table lives in BSS so
+    /// `ExecNtHandler::initialize_in` does not materialize it on the early root task stack.
+    io_completion_ports: ExecIoCompletionPorts,
+    /// Shared FILE_OBJECT completion associations. Backed by BSS for the same bounded-stack reason
+    /// as the completion-port table.
+    file_completion: ExecFileCompletion,
     /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
     /// The backing table lives in BSS to keep it off the bounded rootserver stack.
     directory_opens: ExecDirectoryOpens,
@@ -12712,8 +12930,9 @@ struct ExecNtHandler {
     /// VSpace/CSpace/TCB caps + mirror/scratch VAs stay executive-side because only the trusted root
     /// task holds those caps, linked to an EPROCESS through the process mechanism table.
     pm: nt_process::ProcessManager,
-    /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge.
-    process_mechanisms: nt_user_host::ProcessMechanismTable<MAX_PI>,
+    /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge. Backed by BSS;
+    /// the handler owns only the exclusive wrapper while it is live.
+    process_mechanisms: ExecProcessMechanisms,
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
@@ -12722,8 +12941,9 @@ struct ExecNtHandler {
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
     temporary_process_slots: [nt_process::ProcessId; MAX_PI],
-    /// Allocation-free hosted main/pool ETHREAD identities.
-    thread_mechanisms: nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>,
+    /// Allocation-free hosted main/pool ETHREAD identities. Backed by BSS to keep handler
+    /// construction independent of table size.
+    thread_mechanisms: ExecThreadMechanisms,
     /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
     pool_used: [u64; MAX_PI],
     /// Runtime suspended-on-create mask for claimed pool ETHREADs.
@@ -12786,6 +13006,229 @@ unsafe fn reset_exec_nt_handler(
     // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
     // contents, matching the rest of the rootserver bootstrap allocator model.
     ExecNtHandler::initialize_in(slot, hosted_images)
+}
+
+type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8, 64>;
+type ExecFileCompletionTable = nt_io_completion::FileCompletionTable<128>;
+type ExecProcessMechanismTable = nt_user_host::ProcessMechanismTable<MAX_PI>;
+type ExecThreadMechanismTable = nt_user_host::ThreadMechanismTable<MAX_PI, PM_RUNTIME_THREAD_SLOTS>;
+
+static mut IO_COMPLETION_PORT_WORK: ExecIoCompletionPortTable = ExecIoCompletionPortTable::new();
+static mut FILE_COMPLETION_WORK: ExecFileCompletionTable = ExecFileCompletionTable::new();
+static mut PROCESS_MECHANISM_WORK: ExecProcessMechanismTable = ExecProcessMechanismTable::new();
+static mut THREAD_MECHANISM_WORK: ExecThreadMechanismTable = ExecThreadMechanismTable::new();
+
+struct ExecIoCompletionPorts {
+    table: *mut ExecIoCompletionPortTable,
+}
+
+impl ExecIoCompletionPorts {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(IO_COMPLETION_PORT_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been dropped before this
+        // wrapper is reissued, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn create(
+        &mut self,
+        name: &[u16],
+        concurrency: u32,
+        case_insensitive: bool,
+    ) -> Result<nt_io_completion::CreateResult, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).create(name, concurrency, case_insensitive) }
+    }
+
+    fn open(&mut self, name: &[u16], case_insensitive: bool) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).open(name, case_insensitive) }
+    }
+
+    fn retain(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain(id) }
+    }
+
+    fn release(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release(id) }
+    }
+
+    fn enqueue(&mut self, id: u32, packet: nt_io_completion::CompletionPacket) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).enqueue(id, packet) }
+    }
+
+    fn remove(
+        &mut self,
+        id: u32,
+        mode: nt_io_completion::RemoveMode,
+    ) -> Result<nt_io_completion::RemoveResult, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).remove(id, mode) }
+    }
+
+    fn depth(&self, id: u32) -> Result<u32, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).depth(id) }
+    }
+}
+
+struct ExecFileCompletion {
+    table: *mut ExecFileCompletionTable,
+}
+
+impl ExecFileCompletion {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(FILE_COMPLETION_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been dropped before this
+        // wrapper is reissued, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn insert_file(&mut self, file_id: u64, synchronous: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).insert_file(file_id, synchronous) }
+    }
+
+    fn retain_file(&mut self, file_id: u64) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_file(file_id) }
+    }
+
+    fn release_file(&mut self, file_id: u64) -> Result<Option<u32>, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_file(file_id) }
+    }
+
+    fn associate(
+        &mut self,
+        file_id: u64,
+        binding: nt_io_completion::FileCompletionBinding,
+    ) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).associate(file_id, binding) }
+    }
+
+    fn can_associate(&self, file_id: u64) -> Result<(), u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).can_associate(file_id) }
+    }
+
+    fn binding(&self, file_id: u64) -> Option<nt_io_completion::FileCompletionBinding> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).binding(file_id) }
+    }
+
+    fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_synchronous(file_id) }
+    }
+}
+
+struct ExecProcessMechanisms {
+    table: *mut ExecProcessMechanismTable,
+}
+
+impl ExecProcessMechanisms {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(PROCESS_MECHANISM_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been dropped before this
+        // wrapper is reissued, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn claim_or_get(
+        &mut self,
+        pi: usize,
+        pid: u32,
+        main_tid: u32,
+        top_badge: u64,
+    ) -> Result<nt_user_host::ProcessMechanism, nt_user_host::MechanismError> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).claim_or_get(pi, pid, main_tid, top_badge) }
+    }
+
+    fn pid_for_pi(&self, pi: usize) -> Option<u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).pid_for_pi(pi) }
+    }
+
+    fn pi_for_pid(&self, pid: u32) -> Option<usize> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).pi_for_pid(pid) }
+    }
+}
+
+struct ExecThreadMechanisms {
+    table: *mut ExecThreadMechanismTable,
+}
+
+impl ExecThreadMechanisms {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(THREAD_MECHANISM_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been dropped before this
+        // wrapper is reissued, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn claim_main(
+        &mut self,
+        pi: usize,
+        tid: u32,
+    ) -> Result<nt_user_host::ThreadMechanism, nt_user_host::MechanismError> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).claim_main(pi, tid) }
+    }
+
+    fn claim_pool(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: u32,
+    ) -> Result<nt_user_host::ThreadMechanism, nt_user_host::MechanismError> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).claim_pool(pi, slot, tid) }
+    }
+
+    fn release_main(&mut self, pi: usize) -> Option<nt_user_host::ThreadMechanism> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_main(pi) }
+    }
+
+    fn release_pool(
+        &mut self,
+        pi: usize,
+        pool_slot: usize,
+    ) -> Option<nt_user_host::ThreadMechanism> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_pool(pi, pool_slot) }
+    }
+
+    fn main_tid_for_pi(&self, pi: usize) -> Option<u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).main_tid_for_pi(pi) }
+    }
+
+    fn pool_tid_for_slot(&self, pi: usize, pool_slot: usize) -> Option<u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).pool_tid_for_slot(pi, pool_slot) }
+    }
+
+    fn get_by_tid(&self, tid: u32) -> Option<nt_user_host::ThreadMechanism> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get_by_tid(tid) }
+    }
+
+    fn pool_slot_for_tid(&self, tid: u32) -> Option<(usize, usize)> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).pool_slot_for_tid(tid) }
+    }
 }
 
 /// Exclusive pointer to the serialized executive's fixed directory-open table.
@@ -18904,8 +19347,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_dma_adapter = false;
         let mut generic_hw_dma_common = false;
         let mut generic_hw_root_started = false;
-        for spec in system_hive_boot_driver_launch_specs() {
-            if driver_launch::driver_id_by_name(&spec.driver_object_path).is_some() {
+        for spec in system_hive_boot_driver_launch_plan().as_slice() {
+            if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
                 print_str(spec.service_name.as_bytes());
                 print_str(b"\n");
@@ -18914,24 +19357,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[driver-launch] launching boot/system service ");
             print_str(spec.service_name.as_bytes());
             print_str(b" path=");
-            print_str(&spec.image_path);
-            if !spec.devnodes.is_empty() {
+            print_str(spec.image_path.as_bytes());
+            if spec.devnode_count != 0 {
                 print_str(b" devnodes=");
-                print_u64(spec.devnodes.len() as u64);
+                print_u64(spec.devnode_count as u64);
                 print_str(b" first=");
                 print_str(spec.devnodes[0].instance_id.as_bytes());
             }
             print_str(b"\n");
-            if let Some(dc) =
-                load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
-            {
+            if let Some(dc) = load_driver(
+                &fs,
+                spec.image_path.as_bytes(),
+                spec.class,
+                spec.driver_object_path.as_str(),
+            ) {
                 if spec.class == driver_launch::DriverClass::Device {
-                    for devnode in &spec.devnodes {
+                    for devnode in &spec.devnodes[..spec.devnode_count] {
+                        let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
+                        let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
+                        let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
+                        let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
                         match driver_launch::call_add_device_for_driver(
                             dc.driver_id,
-                            &devnode.instance_id,
-                            &devnode.hardware_ids,
-                            &devnode.compatible_ids,
+                            devnode.instance_id.as_str(),
+                            hardware_refs,
+                            compatible_refs,
                         ) {
                             Ok(device_id) => {
                                 print_str(b"[driver-launch] AddDevice service=");
@@ -18943,7 +19393,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 print_str(b"\n");
                                 let mut start_resources = alloc::vec::Vec::new();
                                 if let Some(grant) = assign_devnode_pci_resources(
-                                    devnode,
+                                    devnode.instance_id.as_str(),
+                                    hardware_refs,
+                                    compatible_refs,
                                     &pci_devices,
                                     NIC_MSI_VECTOR as u32,
                                     true,
@@ -19118,7 +19570,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
         }
         if let Some((dc, driver_object_path)) = named_pipe_provider {
-            publish_npfs_io_objects(&mut c, &dc, &driver_object_path, &mut passed);
+            publish_npfs_io_objects(&mut c, &dc, driver_object_path.as_str(), &mut passed);
             // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
             check(
                 b"npfs_driver_entry_entered",

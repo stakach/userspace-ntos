@@ -113,7 +113,43 @@ pub fn is_named_pipe_path(path: &[u16]) -> bool {
 
 /// Translate the local NT/DOS path forms used by user-mode file opens into a lowercase,
 /// root-relative path for the executive's mounted FAT volume.
-pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Vec<u8>> {
+fn push_relative_component(out: &mut [u8], len: &mut usize, component: &[u8]) -> Option<()> {
+    if component.is_empty() || component == b"." {
+        return Some(());
+    }
+    if component == b".." || component.contains(&b':') {
+        return None;
+    }
+    if *len != 0 {
+        if *len >= out.len() {
+            return None;
+        }
+        out[*len] = b'\\';
+        *len += 1;
+    }
+    if out.len().saturating_sub(*len) < component.len() {
+        return None;
+    }
+    for &byte in component {
+        out[*len] = byte.to_ascii_lowercase();
+        *len += 1;
+    }
+    Some(())
+}
+
+fn push_relative_suffix(out: &mut [u8], len: &mut usize, suffix: &[u8]) -> Option<()> {
+    for component in suffix.split(|byte| *byte == b'\\') {
+        push_relative_component(out, len, component)?;
+    }
+    Some(())
+}
+
+pub fn nt_path_to_volume_relative_into(
+    path: &[u16],
+    system_root: &[u8],
+    folded: &mut [u8],
+    out: &mut [u8],
+) -> Option<usize> {
     if system_root.is_empty()
         || system_root
             .iter()
@@ -121,7 +157,10 @@ pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Ve
     {
         return None;
     }
-    let mut folded = Vec::with_capacity(path.len());
+    if folded.len() < path.len() {
+        return None;
+    }
+    let mut folded_len = 0usize;
     let mut previous_separator = false;
     for &unit in path {
         if unit > 0x7f {
@@ -139,60 +178,68 @@ pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Ve
         } else {
             previous_separator = false;
         }
-        folded.push(byte);
+        folded[folded_len] = byte;
+        folded_len += 1;
     }
+    let folded = &folded[..folded_len];
 
     let system_prefix = b"\\systemroot";
     let dos_prefix = b"\\??\\c:\\";
     let dos_devices_prefix = b"\\dosdevices\\c:\\";
     let drive_prefix = b"c:\\";
-    let mut relative = Vec::new();
-    let from_dos_drive;
+
+    let mut out_len = 0usize;
     if folded.starts_with(system_prefix)
         && folded
             .get(system_prefix.len())
             .is_none_or(|byte| *byte == b'\\')
     {
-        from_dos_drive = false;
-        relative.extend(system_root.iter().map(u8::to_ascii_lowercase));
-        relative.extend_from_slice(&folded[system_prefix.len()..]);
+        push_relative_component(out, &mut out_len, system_root)?;
+        push_relative_suffix(out, &mut out_len, &folded[system_prefix.len()..])?;
     } else if folded.starts_with(dos_prefix) {
-        from_dos_drive = true;
-        relative.extend_from_slice(&folded[dos_prefix.len()..]);
+        push_drive_relative_into(system_root, &folded[dos_prefix.len()..], out, &mut out_len)?;
     } else if folded.starts_with(dos_devices_prefix) {
-        from_dos_drive = true;
-        relative.extend_from_slice(&folded[dos_devices_prefix.len()..]);
+        push_drive_relative_into(
+            system_root,
+            &folded[dos_devices_prefix.len()..],
+            out,
+            &mut out_len,
+        )?;
     } else if folded.starts_with(drive_prefix) {
-        from_dos_drive = true;
-        relative.extend_from_slice(&folded[drive_prefix.len()..]);
+        push_drive_relative_into(
+            system_root,
+            &folded[drive_prefix.len()..],
+            out,
+            &mut out_len,
+        )?;
     } else {
         return None;
     }
+    Some(out_len)
+}
 
+fn push_drive_relative_into(
+    system_root: &[u8],
+    relative: &[u8],
+    out: &mut [u8],
+    out_len: &mut usize,
+) -> Option<()> {
     // The hosted PEB exposes the canonical DOS SystemRoot as C:\Windows while the ReactOS tree is
     // mounted under system_root on the FAT volume. Resolve both spellings to the same directory.
-    if from_dos_drive && (relative == b"windows" || relative.starts_with(b"windows\\")) {
-        let suffix = &relative[b"windows".len()..];
-        let mut rooted = Vec::with_capacity(system_root.len() + suffix.len());
-        rooted.extend(system_root.iter().map(u8::to_ascii_lowercase));
-        rooted.extend_from_slice(suffix);
-        relative = rooted;
+    if relative == b"windows" || relative.starts_with(b"windows\\") {
+        push_relative_component(out, out_len, system_root)?;
+        push_relative_suffix(out, out_len, &relative[b"windows".len()..])
+    } else {
+        push_relative_suffix(out, out_len, relative)
     }
+}
 
-    let mut normalized = Vec::with_capacity(relative.len());
-    for component in relative.split(|byte| *byte == b'\\') {
-        if component.is_empty() || component == b"." {
-            continue;
-        }
-        if component == b".." || component.contains(&b':') {
-            return None;
-        }
-        if !normalized.is_empty() {
-            normalized.push(b'\\');
-        }
-        normalized.extend_from_slice(component);
-    }
-    Some(normalized)
+pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Vec<u8>> {
+    let mut folded = alloc::vec![0u8; path.len()];
+    let mut out = alloc::vec![0u8; path.len().saturating_add(system_root.len())];
+    let len = nt_path_to_volume_relative_into(path, system_root, &mut folded, &mut out)?;
+    out.truncate(len);
+    Some(out)
 }
 
 /// Whether `volume_relative` (the output of [`nt_path_to_volume_relative`] — lowercase, no leading
@@ -225,6 +272,17 @@ pub fn writable_mount_relative(
 ) -> Option<Vec<u8>> {
     let relative = nt_path_to_volume_relative(path, system_root)?;
     is_under_prefix(&relative, prefixes).then_some(relative)
+}
+
+pub fn writable_mount_relative_into(
+    path: &[u16],
+    system_root: &[u8],
+    prefixes: &[&[u8]],
+    folded: &mut [u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let len = nt_path_to_volume_relative_into(path, system_root, folded, out)?;
+    is_under_prefix(&out[..len], prefixes).then_some(len)
 }
 
 /// Case-insensitive component-wise prefix test.

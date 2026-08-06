@@ -83,6 +83,14 @@ impl MemFs {
             .map(|(_, _, id)| *id)
     }
 
+    fn child_folded_bytes(&self, dir: u64, name: &[u8]) -> Option<u64> {
+        self.node(dir)?
+            .children
+            .iter()
+            .find(|(n, _, _)| n.as_bytes() == name)
+            .map(|(_, _, id)| *id)
+    }
+
     fn create_child(&mut self, parent: u64, name: &str, is_dir: bool) -> u64 {
         let id = self.nodes.len() as u64;
         self.nodes.push(Some(MemFsNode {
@@ -137,6 +145,14 @@ impl MemFs {
         let mut cur = 0;
         for comp in path.split('\\').filter(|c| !c.is_empty()) {
             cur = self.child(cur, comp)?;
+        }
+        Some(cur)
+    }
+
+    fn lookup_folded_relative(&self, path: &[u8]) -> Option<u64> {
+        let mut cur = 0;
+        for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
+            cur = self.child_folded_bytes(cur, comp)?;
         }
         Some(cur)
     }
@@ -221,6 +237,15 @@ impl MemFs {
     /// the node, no `FILE_OBJECT` allocated). `None` if the path does not resolve.
     fn query(&self, rel_path: &str) -> Option<StandardInformation> {
         let id = self.lookup(rel_path)?;
+        Some(StandardInformation {
+            end_of_file: self.size(id),
+            is_directory: self.is_dir(id),
+            attributes: self.attributes(id),
+        })
+    }
+
+    fn query_folded_relative(&self, rel_path: &[u8]) -> Option<StandardInformation> {
+        let id = self.lookup_folded_relative(rel_path)?;
         Some(StandardInformation {
             end_of_file: self.size(id),
             is_directory: self.is_dir(id),
@@ -667,6 +692,13 @@ impl FileSystem {
     pub fn query_attributes(&self, path: &str) -> Option<StandardInformation> {
         let rel = self.to_relative(&normalize_separators(path))?;
         self.volume.query(&rel)
+    }
+
+    /// Query a lowercase volume-relative path produced by `nt_path_to_volume_relative{,_into}`.
+    /// This avoids allocating a temporary NT path string on hot syscall paths that already own a
+    /// canonical relative path.
+    pub fn query_attributes_relative(&self, relative: &[u8]) -> Option<StandardInformation> {
+        self.volume.query_folded_relative(relative)
     }
 
     /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object. A file object

@@ -4096,8 +4096,8 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
 unsafe fn register_hosted_root_pdo(
     pdo_object: u64,
     instance_path: &str,
-    hardware_ids: &[String],
-    compatible_ids: &[String],
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
 ) {
     if pdo_object == 0 {
         return;
@@ -4107,16 +4107,17 @@ unsafe fn register_hosted_root_pdo(
         return;
     }
     let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
-    let mut hardware_refs: Vec<&str> = hardware_ids.iter().map(|id| id.as_str()).collect();
-    if hardware_refs.is_empty() {
-        hardware_refs.push(device_id);
-    }
-    let compatible_refs: Vec<&str> = compatible_ids.iter().map(|id| id.as_str()).collect();
+    let fallback_hardware = [device_id];
+    let hardware_refs = if hardware_ids.is_empty() {
+        &fallback_hardware[..]
+    } else {
+        hardware_ids
+    };
     bus.create_pdo(
         pdo_object,
         device_id,
-        &hardware_refs,
-        &compatible_refs,
+        hardware_refs,
+        compatible_ids,
         instance_id,
     );
 }
@@ -4508,8 +4509,8 @@ unsafe fn dispatch_add_device_for_instance(
 pub(crate) unsafe fn call_add_device_for_driver(
     driver_id: u64,
     instance_path: &str,
-    hardware_ids: &[String],
-    compatible_ids: &[String],
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
 ) -> Result<u64, nt_status::NtStatus> {
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;

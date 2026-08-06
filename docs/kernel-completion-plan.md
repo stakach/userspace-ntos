@@ -342,3 +342,38 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: the next B3 slice should run the boot, inspect this generic evidence trace, and
   convert the dynamic evidence into real gates once the registry-selected path is confirmed.
+- B3 continued. Headless boot `desktop-render-r104-generic-hw-evidence-20260806-093752` reached
+  winlogon profile loading but stopped at the executive bump allocator after writable overlay mount.
+  The trace showed no generic hardware evidence because the real SYSTEM hive currently selected only
+  FSD boot services (`Msfs`, `Npfs`) for the hosted path, and the service-loop heap watermark was
+  already `5957452/6291456` before profile loading. The executive boot/system driver plan now copies
+  CM-selected service/devnode metadata into a bounded static snapshot and rewinds the large
+  ConfigManager import scratch before loading drivers; AddDevice/PnP resource helpers now consume
+  borrowed devnode ID slices so the snapshot does not need heap-backed `String` clones. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: rerun the boot to confirm the heap regression is gone, then add a
+  registry-selected device-driver proof fixture or real seeded service/devnode so the generic
+  hardware evidence path can be gated and the bespoke NIC proof can be retired.
+- B3 frontier validation continued. Headless boot
+  `desktop-render-r109-dispatch-frame-split-20260806-102452` passed the previous boot/system plan
+  heap wall and advanced through real winlogon dialog paint into profile loading. The trace shows
+  real api0 `WM_PAINT` dispatches plus `NtUserBeginPaint`, `NtUserEndPaint`, and
+  `NtGdiGetTextExtentExW`; it then stopped on an executive stack fault while servicing
+  `NtQueryAttributesFile` during `LoadUserProfileW`. The large `ExecNtHandler::handle_service`
+  frame has been split behind raw service-entry veneers, and the SSN 145 path now uses bounded
+  no-allocation object-name/path buffers plus host-tested `nt-fs` relative-path helpers instead of
+  growing `Vec`/`String` state at the profile frontier. Validation: `cargo test -p nt-fs` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: run a staged release boot to confirm profile loading passes this stack wall,
+  then reclassify the next real frontier before adding the generic hardware evidence gate.
+- B3 frontier validation passed through the profile path and restored the full desktop baseline.
+  `NtQueryAttributesFile` now runs through the split raw service entry with fixed-size object-name
+  and folded relative path scratch buffers, and the old allocating attribute-query wrappers in the
+  executive filesystem bridge were removed. Spawned service heap reservation was reduced to the
+  smaller working set the current services actually use, restoring untyped-pool headroom without
+  hiding failure paths. Validation: `cargo test -p nt-fs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` passing `287/287` gates including
+  `exec_explorer_shell_chrome_painted` and `exec_vm_pool_headroom`. Review adjustment: B3 remains
+  active, but the baseline is clean again; resume with a registry-selected device-driver hardware
+  proof and turn the generic hardware evidence trace into a gate before retiring the old NIC proof.

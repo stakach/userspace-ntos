@@ -405,10 +405,7 @@ impl PciIdPattern {
     }
 }
 
-fn find_device_for_id_pattern<'a>(
-    devices: &'a [PciDevice],
-    id: &str,
-) -> Option<&'a PciDevice> {
+fn find_device_for_id_pattern<'a>(devices: &'a [PciDevice], id: &str) -> Option<&'a PciDevice> {
     let pattern = parse_pci_id_pattern(id)?;
     devices.iter().find(|device| pattern.matches(device))
 }

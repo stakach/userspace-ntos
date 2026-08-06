@@ -33,12 +33,11 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// and the per-user hive load need headroom above that, so the executive gets it.
 pub const HEAP_FRAMES: u64 = 1536;
 /// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
-/// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would cost
-/// `services x 1024` extra frames of boot budget for heaps that never exceed a few KiB (the
-/// recorded lesson: growing the shared value starves spawns). The documented consequence is that a
-/// spawned service allocating past its own 2 MiB now FAULTS instead of returning null; nothing
-/// comes remotely close (the old shared 32-frame heap sufficed for them).
-pub const SERVICE_HEAP_FRAMES: u64 = 512;
+/// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
+/// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The
+/// documented consequence is that a spawned service allocating past its own 1 MiB faults instead of
+/// returning null; nothing comes remotely close (the old shared 32-frame heap sufficed for them).
+pub const SERVICE_HEAP_FRAMES: u64 = 256;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap

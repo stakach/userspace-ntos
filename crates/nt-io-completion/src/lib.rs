@@ -46,6 +46,12 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         }
     }
 
+    pub fn clear(&mut self) {
+        for entry in self.entries.iter_mut() {
+            *entry = FileCompletionEntry::default();
+        }
+    }
+
     pub fn insert_file(&mut self, file_id: u64, synchronous: bool) -> Result<(), u32> {
         if file_id == 0 {
             return Err(STATUS_INVALID_HANDLE);
@@ -378,6 +384,12 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         assert!(PACKETS > 0);
         Self {
             ports: [CompletionPort::empty(); PORTS],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for port in self.ports.iter_mut() {
+            port.reset();
         }
     }
 

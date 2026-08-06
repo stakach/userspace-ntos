@@ -210,6 +210,44 @@ fn query_attributes_by_path_no_handle() {
 }
 
 #[test]
+fn path_to_volume_relative_into_matches_allocating_api() {
+    let path = wide(r"\??\C:\Windows\System32\Config\SYSTEM");
+    let mut folded = [0u8; 128];
+    let mut out = [0u8; 128];
+    let len = nt_path_to_volume_relative_into(&path, b"reactos", &mut folded, &mut out)
+        .expect("path should resolve");
+    assert_eq!(&out[..len], b"reactos\\system32\\config\\system");
+    assert_eq!(
+        nt_path_to_volume_relative(&path, b"reactos").as_deref(),
+        Some(&out[..len])
+    );
+
+    let root = wide(r"\??\C:\");
+    let len = nt_path_to_volume_relative_into(&root, b"reactos", &mut folded, &mut out)
+        .expect("drive root should resolve");
+    assert_eq!(&out[..len], b"");
+}
+
+#[test]
+fn writable_mount_relative_into_and_relative_query_are_canonical() {
+    const PREFIXES: &[&[u8]] = &[b"profiles"];
+    let path = wide(r"\DosDevices\C:\PROFILES\Administrator\ntuser.dat");
+    let mut folded = [0u8; 128];
+    let mut relative = [0u8; 128];
+    let len = writable_mount_relative_into(&path, b"reactos", PREFIXES, &mut folded, &mut relative)
+        .expect("path should resolve under writable prefix");
+    assert_eq!(&relative[..len], b"profiles\\administrator\\ntuser.dat");
+
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles\Administrator"));
+    assert!(fs.provision_file(r"\??\C:\profiles\Administrator\ntuser.dat", b"regf"));
+    let attrs = fs
+        .query_attributes_relative(&relative[..len])
+        .expect("relative query should find provisioned file");
+    assert!(!attrs.is_directory);
+}
+
+#[test]
 fn create_dispositions() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     // OPEN an existing fixture hive file.

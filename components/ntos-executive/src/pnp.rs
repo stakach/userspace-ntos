@@ -77,19 +77,17 @@ pub(crate) struct DevnodePciResourceGrant {
 /// Resolve a registry-selected devnode against the enumerated PCI bus and build the physical
 /// `CM_RESOURCE_LIST` that will be passed to the hosted driver's `IRP_MN_START_DEVICE`.
 pub(crate) fn assign_devnode_pci_resources(
-    devnode: &crate::DriverServiceDevnodeSpec,
+    instance_id: &str,
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
     devices: &[PciDevice],
     int_vector: u32,
     int_latched: bool,
     dma_len: u64,
     granted_mmio_len: u32,
 ) -> Option<DevnodePciResourceGrant> {
-    let device = nt_pnp::find_pci_device_for_devnode(
-        devices,
-        &devnode.instance_id,
-        &devnode.hardware_ids,
-        &devnode.compatible_ids,
-    )?;
+    let device =
+        nt_pnp::find_pci_device_for_devnode(devices, instance_id, hardware_ids, compatible_ids)?;
     let assignment = assign_resources(
         device,
         int_vector,

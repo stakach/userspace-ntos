@@ -96,6 +96,17 @@ impl<const P: usize, const S: usize> ThreadMechanismTable<P, S> {
         }
     }
 
+    pub fn clear(&mut self) {
+        for slot in self.main.iter_mut() {
+            *slot = ThreadMechanism::empty();
+        }
+        for slots in self.pool.iter_mut() {
+            for slot in slots.iter_mut() {
+                *slot = ThreadMechanism::empty();
+            }
+        }
+    }
+
     pub fn claim_main(&mut self, pi: usize, tid: u32) -> Result<ThreadMechanism, MechanismError> {
         if pi >= P {
             return Err(MechanismError::SlotOutOfRange);
@@ -240,6 +251,12 @@ impl<const N: usize> ProcessMechanismTable<N> {
     pub const fn new() -> Self {
         Self {
             slots: [ProcessMechanism::empty(); N],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for slot in self.slots.iter_mut() {
+            *slot = ProcessMechanism::empty();
         }
     }
 
