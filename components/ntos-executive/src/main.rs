@@ -1250,7 +1250,6 @@ pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
 /// Where the executive maps the full real PCI NIC BAR for the raw hardware proof and KMDF fixture.
 /// Hosted PnP drivers get per-device component windows published through `HostedPnpPciResourceWindow`.
 pub const NIC_VADDR: u64 = 0x0000_0100_10D0_0000;
-pub const NIC_BAR_PAGES: u64 = 32;
 pub const NIC_DMA_PAGES: u64 = 66;
 pub const NIC_DMA_LEN: u64 = NIC_DMA_PAGES * 0x1000;
 /// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
@@ -11829,6 +11828,33 @@ static mut CONFIG_BOOT_PNP_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLau
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
 
 #[derive(Clone, Copy)]
+struct HostedPciDmaGrant {
+    frame_base: u64,
+    pages: u64,
+    logical: u64,
+    len: u64,
+}
+
+impl HostedPciDmaGrant {
+    const fn new(frame_base: u64, pages: u64, logical: u64, len: u64) -> Self {
+        Self {
+            frame_base,
+            pages,
+            logical,
+            len,
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.frame_base != 0
+            && self.pages != 0
+            && self.logical != 0
+            && self.len != 0
+            && self.len <= self.pages.saturating_mul(0x1000)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct HostedPciHardwareGrant {
     bus: u8,
     dev: u8,
@@ -11845,6 +11871,44 @@ struct HostedPciHardwareGrant {
 }
 
 impl HostedPciHardwareGrant {
+    fn for_device(
+        device: &nt_pnp::PciDevice,
+        mmio_frame_base: u64,
+        mmio_pages: u64,
+        interrupt_vector: u32,
+        interrupt_latched: bool,
+        dma: Option<HostedPciDmaGrant>,
+    ) -> Option<Self> {
+        let mem_bar = device.first_memory_bar()?;
+        if mmio_frame_base == 0
+            || mmio_pages == 0
+            || mem_bar.size == 0
+            || mem_bar.size > mmio_pages.saturating_mul(0x1000)
+            || interrupt_vector == 0
+        {
+            return None;
+        }
+        let (dma_frame_base, dma_pages, dma_logical, dma_len) = match dma {
+            Some(dma) if dma.valid() => (dma.frame_base, dma.pages, dma.logical, dma.len),
+            Some(_) => return None,
+            None => (0, 0, 0, 0),
+        };
+        Some(Self {
+            bus: device.bus,
+            dev: device.dev,
+            func: device.func,
+            mmio_phys: mem_bar.base,
+            mmio_frame_base,
+            mmio_pages,
+            interrupt_vector,
+            interrupt_latched,
+            dma_frame_base,
+            dma_pages,
+            dma_logical,
+            dma_len,
+        })
+    }
+
     fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
         self.bus == device.bus && self.dev == device.dev && self.func == device.func
     }
@@ -11879,6 +11943,17 @@ fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
     } else {
         Some(device.irq_line as u32)
     }
+}
+
+fn hosted_pci_device_by_location<'a>(
+    devices: &'a [nt_pnp::PciDevice],
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Option<&'a nt_pnp::PciDevice> {
+    devices
+        .iter()
+        .find(|device| device.bus == bus && device.dev == dev && device.func == func)
 }
 
 unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
@@ -11932,20 +12007,18 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.claim_failures += 1;
                     continue;
                 }
-                grants.push(HostedPciHardwareGrant {
-                    bus: device.bus,
-                    dev: device.dev,
-                    func: device.func,
-                    mmio_phys: mem_bar.base,
+                let Some(grant) = HostedPciHardwareGrant::for_device(
+                    device,
                     mmio_frame_base,
                     mmio_pages,
                     interrupt_vector,
-                    interrupt_latched: false,
-                    dma_frame_base: 0,
-                    dma_pages: 0,
-                    dma_logical: 0,
-                    dma_len: 0,
-                });
+                    false,
+                    None,
+                ) else {
+                    report.claim_failures += 1;
+                    continue;
+                };
+                grants.push(grant);
                 report.claimed_grants += 1;
             }
         }
@@ -17889,7 +17962,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
     let (mut storage_dev, mut storage_func) = (0u8, 0u8);
-    let (mut nic_bar0, mut nic_irq, mut found_nic) = (0u32, 0u32, false);
+    let (mut nic_irq, mut found_nic) = (0u32, false);
     let (mut nic_dev, mut nic_func) = (0u8, 0u8);
     for d in &pci_devices {
         count += 1;
@@ -17924,7 +17997,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // P1 capstone (its MMIO BAR0 + interrupt line). nt-pnp binds it below.
         if d.base_class() == nt_pnp::PCI_CLASS_NETWORK {
             found_nic = true;
-            nic_bar0 = bar0;
             nic_irq = irq;
             nic_dev = dev;
             nic_func = func;
@@ -17956,20 +18028,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                       // the FS is mounted, so the driver `.sys` can be loaded BY-PATH (no baked include_bytes!). Hoist
                                       // the handful of locals the deferred hosting block needs to function scope.
     let mut nic_bar_base = 0u64;
-    let mut nic_mmio = 0u64;
+    let mut nic_bar_pages = 0u64;
     let mut nic_dma_frame = 0u64;
     if found_nic {
-        nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
-        print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000 NIC BAR0 ");
-        print_hex(nic_mmio as u32);
-        print_str(b" (irq ");
-        print_u64(nic_irq as u64);
-        print_str(b")\n");
-        // Map the complete BAR. The raw NIC proof only touches the first few pages, but the real
-        // ReactOS miniport validates and maps the full 128 KiB resource.
-        nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, NIC_BAR_PAGES);
-        check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
-        kmdf_nic_bar_base = nic_bar_base; // hand the real BAR to the KMDF host later
+        if let Some(device) = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func) {
+            if let Some(mem_bar) = device.first_memory_bar() {
+                let nic_mmio = mem_bar.base;
+                nic_bar_pages = mem_bar.size.div_ceil(0x1000).max(1);
+                print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000 NIC BAR0 ");
+                print_hex(nic_mmio as u32);
+                print_str(b" pages=");
+                print_u64(nic_bar_pages);
+                print_str(b" (irq ");
+                print_u64(nic_irq as u64);
+                print_str(b")\n");
+                // Map the complete enumerated BAR. The raw NIC proof only touches the first few pages,
+                // but the real ReactOS miniport validates and maps the full resource.
+                nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, nic_bar_pages);
+                check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
+                kmdf_nic_bar_base = nic_bar_base; // hand the real BAR to the KMDF host later
+            } else {
+                check(b"exec_nic_bar_mapped", false, &mut passed);
+            }
+        } else {
+            check(b"exec_nic_bar_mapped", false, &mut passed);
+        }
         if nic_bar_base != 0 {
             // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
             let ctrl = core::ptr::read_volatile((NIC_VADDR + 0x00) as *const u32);
@@ -18183,22 +18266,44 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
 
     let mut hosted_pci_hardware_grants = Vec::new();
+    let mut hosted_pci_existing_grants = 0u64;
+    let mut hosted_pci_existing_grant_failures = 0u64;
     if nic_bar_base != 0 && nic_dma_frame != 0 {
-        hosted_pci_hardware_grants.push(HostedPciHardwareGrant {
-            bus: 0,
-            dev: nic_dev,
-            func: nic_func,
-            mmio_phys: nic_mmio,
-            mmio_frame_base: nic_bar_base,
-            mmio_pages: NIC_BAR_PAGES,
-            interrupt_vector: NIC_MSI_VECTOR as u32,
-            interrupt_latched: true,
-            dma_frame_base: nic_dma_frame,
-            dma_pages: NIC_DMA_PAGES,
-            dma_logical: NIC_IOVA,
-            dma_len: NIC_DMA_LEN,
-        });
+        let grant = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func).and_then(
+            |device| {
+                HostedPciHardwareGrant::for_device(
+                    device,
+                    nic_bar_base,
+                    nic_bar_pages,
+                    NIC_MSI_VECTOR as u32,
+                    true,
+                    Some(HostedPciDmaGrant::new(
+                        nic_dma_frame,
+                        NIC_DMA_PAGES,
+                        NIC_IOVA,
+                        NIC_DMA_LEN,
+                    )),
+                )
+            },
+        );
+        if let Some(grant) = grant {
+            hosted_pci_hardware_grants.push(grant);
+            hosted_pci_existing_grants += 1;
+        } else {
+            hosted_pci_existing_grant_failures += 1;
+        }
     }
+    print_str(b"[driver-launch] hosted existing PCI grant registration count=");
+    print_u64(hosted_pci_existing_grants);
+    print_str(b" failures=");
+    print_u64(hosted_pci_existing_grant_failures);
+    print_str(b"\n");
+    check(
+        b"exec_hosted_pci_existing_grant_brokered",
+        !found_nic
+            || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
+        &mut passed,
+    );
     publish_hosted_pnp_resource_context(&pci_devices, &[], &[]);
 
     // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
@@ -18956,9 +19061,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 regions[3] = Region {
                     source: FrameSource::Alias(kmdf_nic_bar_base),
                     base_va: NIC_VADDR,
-                    count: NIC_BAR_PAGES,
+                    count: nic_bar_pages,
                     rights: Rights::Uniform(RW_NX),
-                    pts: pts_for(NIC_BAR_PAGES),
+                    pts: pts_for(nic_bar_pages),
                 };
             }
             let d = ComponentDescriptor {

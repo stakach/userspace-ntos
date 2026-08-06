@@ -90,10 +90,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    Hosted PCI and root-bus resource grants now use selected per-devnode component windows instead
    of NIC-named globals or root-bus proof VAs, publication is selected from the boot/system PnP
    launch plans, and the PCI broker discovers grant material for every registry-selected eligible
-   PCI function. The current `E1000` path still enters with an existing raw DMA/IOMMU grant; newly
-   discovered PCI grants are BAR/interrupt-only unless a real DMA grant exists. The next B3 target is
-   moving DMA/IOMMU grant construction behind the same generic broker boundary and replacing bounded
-   hosted window/instance tables where they block arbitrary multi-driver scale.
+   PCI function. Existing `E1000` PCI grant registration now goes through the same generic
+   `HostedPciHardwareGrant::for_device`/`HostedPciDmaGrant` constructor as discovery and derives
+   BAR size from the enumerated device, but the raw direct proof still performs DMA/IOMMU allocation
+   before handing broker material to hosted PnP. The next B3 target is moving DMA/IOMMU grant
+   construction behind a broker API and replacing bounded hosted window/instance tables where they
+   block arbitrary multi-driver scale.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -754,3 +756,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   DMA/common-buffer/IOMMU setup itself out of the raw proof block into generic broker grant
   construction, then replace fixed hosted instance/window caps with growable or per-launch
   allocation.
+- B3 cleanup continued. Existing PCI grant registration now uses the same broker constructor as
+  registry-selected PCI grant discovery: the E1000 path resolves the enumerated PCI device by
+  bus/dev/function, derives BAR base and page count from the device's memory BAR, removes the fixed
+  `NIC_BAR_PAGES` constant, and records the existing DMA/IOMMU grant only when the DMA grant is
+  internally consistent. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-brokered-existing-pci-grant-20260807.log`.
+  Result: `exec_hosted_pci_existing_grant_brokered` passes with `count=1 failures=0`, PCI/root
+  window publication remains registry-selected, ReactOS `E1000` and `DmaPnpPowerTest` still start
+  through the generic hosted PnP path, and the boot reaches genuine explorer shell chrome with
+  `293/293` checks passing. Review adjustment: the remaining B3 cleanup is moving DMA/common-buffer
+  and IOMMU allocation itself behind the broker boundary, then replacing fixed hosted
+  window/instance caps where they block arbitrary multi-driver scale.
