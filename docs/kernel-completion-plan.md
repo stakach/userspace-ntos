@@ -391,3 +391,24 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_generic_hw_root_pdo_started`. Review adjustment: B3's remaining cleanup is to deliver a real
   interrupt through the connected ISR token on the generic grant and then remove the older bespoke
   NIC proof machinery.
+- B3 continued. Generic hosted device drivers now keep the canonical
+  `nt-resource-manager` interrupt connection id in their shared evidence, and the executive can
+  inject that exact id through the existing hosted-component dispatch pump. The component dispatcher
+  executes the registered ISR in the driver's own VSpace using the `IoConnectInterrupt`
+  PKINTERRUPT/service-context projection, records claimed/vector/delivery-count evidence, and the
+  generated root-bus DMA proof asserts its test MMIO status register before requiring ISR claim plus
+  MMIO acknowledgement in the new `exec_generic_hw_interrupt_delivered` gate. Validation so far:
+  `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `./components/ntos-executive/build.sh`. Review adjustment: run the staged boot and inspect the
+  new gate before removing any bespoke NIC proof machinery; the old NIC proof should remain until the
+  generic path proves equivalent hardware interrupt/DMA behavior.
+- B3 validation update. `./run.sh` booted through genuine explorer shell chrome again with
+  `285/287` checks passing; the only failing checks in the streamed summary were the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. The new
+  `exec_generic_hw_interrupt_delivered` gate is therefore green along with the existing generic
+  registry/MMIO/interrupt/DMA/root-PDO gates. Review adjustment: do not delete the old raw NIC proof
+  yet. The generic path now proves dynamic hosted-driver MMIO, DMA, and connected-ISR delivery for
+  the root-bus DMA fixture; the remaining B3 cleanup is to move real PCI interrupt/DMA hardware
+  evidence onto the same generic resource boundary, then remove the bespoke NIC-specific proof once
+  that equivalence is demonstrated.

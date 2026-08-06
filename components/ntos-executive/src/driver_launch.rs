@@ -198,6 +198,10 @@ pub const SH_DMA_REQUESTED_LEN: u64 = 0x430; // out: AllocateCommonBuffer reques
 pub const SH_DMA_ALLOCATED_VA: u64 = 0x438; // out: AllocateCommonBuffer CPU VA
 pub const SH_DMA_ALLOCATED_LOGICAL: u64 = 0x440; // out: AllocateCommonBuffer logical address
 pub const SH_DMA_FREED_LOGICAL: u64 = 0x448; // out: last FreeCommonBuffer logical address
+pub const SH_RESOURCE_INTERRUPT_ID: u64 = 0x450; // out: canonical nt-resource-manager interrupt id
+pub const SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR: u64 = 0x458; // out: last delivered vector
+pub const SH_RESOURCE_INTERRUPT_ISR_CLAIMED: u64 = 0x460; // out: last ISR BOOLEAN result
+pub const SH_RESOURCE_INTERRUPT_DELIVERIES: u64 = 0x468; // out: ISR delivery count
 
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
@@ -227,6 +231,7 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
+pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -1596,6 +1601,22 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                0,
+            );
         }
     }
 }
@@ -2689,6 +2710,46 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let f: extern "win64" fn(u64) = core::mem::transmute(unload as *const ());
         f(req.drv);
         return (0, 0);
+    }
+    if major == FSD_DISPATCH_INTERRUPT {
+        let interrupt_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let vector = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        let expected_id = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+        let expected_vector =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+        let interrupt_object =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
+        let service_routine =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
+        let service_context =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64);
+        if interrupt_id == 0
+            || interrupt_id != expected_id
+            || expected_vector == 0
+            || vector != expected_vector as u64
+            || interrupt_object == 0
+            || service_routine == 0
+        {
+            return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
+        }
+        let isr: extern "win64" fn(u64, u64) -> u8 =
+            core::mem::transmute(service_routine as *const ());
+        let claimed = isr(interrupt_object, service_context);
+        let deliveries =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
+            vector,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+            (claimed != 0) as u64,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+            deliveries.saturating_add(1),
+        );
+        return (0, (claimed != 0) as u64);
     }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
@@ -4465,9 +4526,13 @@ pub(crate) struct HostedHardwareEvidence {
     pub mmio_mapped_phys: u64,
     pub mmio_mapped_len: u64,
     pub interrupt_vector: u32,
+    pub interrupt_id: u64,
     pub interrupt_object: u64,
     pub interrupt_routine: u64,
     pub interrupt_context: u64,
+    pub interrupt_delivered_vector: u64,
+    pub interrupt_isr_claimed: u64,
+    pub interrupt_deliveries: u64,
     pub dma_adapter_id: u64,
     pub dma_adapter_blob: u64,
     pub dma_common_va: u64,
@@ -4492,7 +4557,14 @@ impl HostedHardwareEvidence {
     }
 
     pub(crate) fn interrupt_connected(self) -> bool {
-        self.interrupt_object != 0 && self.interrupt_routine != 0
+        self.interrupt_id != 0 && self.interrupt_object != 0 && self.interrupt_routine != 0
+    }
+
+    pub(crate) fn interrupt_delivered(self) -> bool {
+        self.interrupt_connected()
+            && self.interrupt_deliveries != 0
+            && self.interrupt_isr_claimed != 0
+            && self.interrupt_delivered_vector == self.interrupt_vector as u64
     }
 
     pub(crate) fn dma_adapter_created(self) -> bool {
@@ -4502,6 +4574,13 @@ impl HostedHardwareEvidence {
     pub(crate) fn dma_common_allocated(self) -> bool {
         self.dma_allocated_va != 0 && self.dma_allocated_logical != 0 && self.dma_requested_len != 0
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostedInterruptDelivery {
+    pub interrupt_id: u64,
+    pub vector: u32,
+    pub claimed: bool,
 }
 
 const MAX_HOSTED_DEVICE_BINDINGS: usize = 16;
@@ -4607,6 +4686,10 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
@@ -4764,9 +4847,19 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
             mmio_mapped_phys: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
             mmio_mapped_len: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
             interrupt_vector: read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32),
+            interrupt_id: read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64),
             interrupt_object: read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64),
             interrupt_routine: read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64),
             interrupt_context: read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64),
+            interrupt_delivered_vector: read_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *const u64,
+            ),
+            interrupt_isr_claimed: read_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *const u64,
+            ),
+            interrupt_deliveries: read_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64,
+            ),
             dma_adapter_id: read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64),
             dma_adapter_blob: read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64),
             dma_common_va: read_volatile((sh + SH_DMA_COMMON_VA) as *const u64),
@@ -5257,6 +5350,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, dma_va);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, mapped_dma_len);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, dma_logical);
@@ -5318,6 +5415,7 @@ unsafe fn record_hosted_resource_usage(
         if connected == 0 {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
+        write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
     }
 
     let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
@@ -5404,6 +5502,62 @@ pub(crate) unsafe fn start_hosted_device(
         nt_status::NtStatus(root_status).to_result()?;
     }
     Ok(())
+}
+
+/// Deliver one interrupt to a hosted device through its connected generic resource grant.
+///
+/// The executive resolves the canonical `nt-resource-manager` interrupt id for the devnode, then
+/// drives the hosted component's dispatcher so the driver's ISR runs in the same VSpace that
+/// registered it with `IoConnectInterrupt`.
+pub(crate) unsafe fn inject_hosted_device_interrupt(
+    device_id: u64,
+) -> Result<HostedInterruptDelivery, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if !inst.ready {
+        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+    }
+
+    let sh = inst.exec_shared_va;
+    let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+    let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+    let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
+    let service_context = read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64);
+    if interrupt_id == 0 || interrupt_vector == 0 || service_routine == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let tokens = hosted_resource_manager_mut()
+        .inject_interrupt(interrupt_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if tokens.vector != interrupt_vector
+        || tokens.service_routine_token != service_routine
+        || tokens.service_context_token != service_context
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let mut out = [];
+    let (status, info) = dispatch_irp_for_instance(
+        binding.instance,
+        FSD_DISPATCH_INTERRUPT,
+        tokens.vector as u64,
+        binding.device_object,
+        0,
+        tokens.interrupt_id,
+        &[],
+        &mut out,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    nt_status::NtStatus(status).to_result()?;
+
+    Ok(HostedInterruptDelivery {
+        interrupt_id: tokens.interrupt_id,
+        vector: tokens.vector,
+        claimed: info != 0,
+    })
 }
 
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove

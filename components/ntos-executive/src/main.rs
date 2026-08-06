@@ -1841,6 +1841,8 @@ pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 pub const DMA_VADDR: u64 = 0x0000_0100_10C0_0000;
 const ROOT_DMA_PROOF_MMIO_SEED_VADDR: u64 = DMA_VADDR + 0x1000;
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
+const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
+const ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET: u64 = 0x0c;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -20293,6 +20295,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_granted = false;
     let mut generic_hw_mmio_mapped = false;
     let mut generic_hw_interrupt_connected = false;
+    let mut generic_hw_interrupt_delivered = false;
+    let mut generic_hw_interrupt_acknowledged = false;
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
     let mut generic_hw_root_started = false;
@@ -20477,16 +20481,74 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         } else {
                             Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
                         };
-                        generic_hw_start_ok |= start_status.is_ok();
+                        let start_ok = start_status.is_ok();
+                        generic_hw_start_ok |= start_ok;
                         let start_status_raw = match start_status {
                             Ok(()) => 0,
                             Err(status) => status.raw() as u32,
                         };
-                        if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
+                        if let Some(mut evidence) =
+                            driver_launch::hosted_hardware_evidence(device_id)
+                        {
+                            if start_ok
+                                && evidence.mmio_mapped()
+                                && evidence.interrupt_connected()
+                            {
+                                core::ptr::write_volatile(
+                                    (ROOT_DMA_PROOF_MMIO_SEED_VADDR
+                                        + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
+                                        as *mut u32,
+                                    0,
+                                );
+                                core::ptr::write_volatile(
+                                    (ROOT_DMA_PROOF_MMIO_SEED_VADDR
+                                        + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET)
+                                        as *mut u32,
+                                    1,
+                                );
+                                match driver_launch::inject_hosted_device_interrupt(device_id) {
+                                    Ok(delivery) => {
+                                        let ack = core::ptr::read_volatile(
+                                            (ROOT_DMA_PROOF_MMIO_SEED_VADDR
+                                                + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
+                                                as *const u32,
+                                        );
+                                        generic_hw_interrupt_acknowledged |= ack == 1;
+                                        print_str(
+                                            b"[driver-launch] generic hardware interrupt delivery service=",
+                                        );
+                                        print_str(proof_pnp_spec.service_name.as_bytes());
+                                        print_str(b" devnode=");
+                                        print_str(devnode.instance_id.as_bytes());
+                                        print_str(b" id=");
+                                        print_u64(delivery.interrupt_id);
+                                        print_str(b" vector=");
+                                        print_u64(delivery.vector as u64);
+                                        print_str(b" claimed=");
+                                        print_u64(delivery.claimed as u64);
+                                        print_str(b" ack=");
+                                        print_u64(ack as u64);
+                                        print_str(b"\n");
+                                    }
+                                    Err(status) => {
+                                        print_str(
+                                            b"[driver-launch] generic hardware interrupt delivery failed status=0x",
+                                        );
+                                        print_hex(status.raw() as u32);
+                                        print_str(b"\n");
+                                    }
+                                }
+                                if let Some(after_delivery) =
+                                    driver_launch::hosted_hardware_evidence(device_id)
+                                {
+                                    evidence = after_delivery;
+                                }
+                            }
                             if evidence.resource_granted() {
                                 generic_hw_granted = true;
                                 generic_hw_mmio_mapped |= evidence.mmio_mapped();
                                 generic_hw_interrupt_connected |= evidence.interrupt_connected();
+                                generic_hw_interrupt_delivered |= evidence.interrupt_delivered();
                                 generic_hw_dma_adapter |= evidence.dma_adapter_created();
                                 generic_hw_dma_common |= evidence.dma_common_allocated();
                                 generic_hw_root_started |= evidence.root_pdo_started;
@@ -20501,6 +20563,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64(evidence.mmio_mapped() as u64);
                             print_str(b" int=");
                             print_u64(evidence.interrupt_connected() as u64);
+                            print_str(b" int_delivered=");
+                            print_u64(evidence.interrupt_delivered() as u64);
+                            print_str(b" int_count=");
+                            print_u64(evidence.interrupt_deliveries);
                             print_str(b" dma_adapter=");
                             print_u64(evidence.dma_adapter_created() as u64);
                             print_str(b" dma_common=");
@@ -20545,6 +20611,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_generic_hw_root_pdo_started",
         generic_hw_start_ok && generic_hw_root_started,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_hw_interrupt_delivered",
+        generic_hw_interrupt_connected
+            && generic_hw_interrupt_delivered
+            && generic_hw_interrupt_acknowledged,
         &mut passed,
     );
 
