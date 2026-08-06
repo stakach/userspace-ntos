@@ -225,8 +225,7 @@ pub const SH_DPC_QUEUE_HEAD: u64 = 0x470; // out: bounded KDPC queue consumer in
 pub const SH_DPC_QUEUE_TAIL: u64 = 0x478; // out: bounded KDPC queue producer index
 pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: failed inserts due to full queue
 pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
-pub const SH_DPC_QUEUE_BASE: u64 = 0x490; // out: queued KDPC pointers
-pub const SH_DPC_QUEUE_SLOTS: u64 = 4;
+pub const SH_DPC_QUEUE_CAPACITY: u64 = 0x490; // out: active KDPC queue entries in the shared arena
 pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: optional support DriverEntry RVA relative to image base
 pub const SH_SUPPORT_DE_STATUS: u64 = 0x4B8; // out: support DriverEntry NTSTATUS
 pub const SH_SUPPORT_VERDICT: u64 = 0x4C0; // out: support DriverEntry verdict bits
@@ -257,10 +256,21 @@ pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
 pub const SH_DEVICE_INTERFACE_LINK_BUF: u64 = 0x790; // out: UTF-16LE path capture
 pub const SH_DEVICE_INTERFACE_TARGET_BUF: u64 = 0x890; // out: UTF-16LE path capture
 pub const SH_HOSTED_CURRENT_IRQL: u64 = 0x990; // in/out: hosted KIRQL byte for patched CR8 helpers
-pub const SH_DMA_ALLOC_RECORDS: u64 = 0xA00; // out: [logical,len,va] allocation records
-pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
+pub const SH_HANDOFF_ARENA_BASE: u64 = 0xA00;
+pub const SH_HANDOFF_ARENA_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
+pub const SH_DPC_QUEUE_BASE: u64 = SH_HANDOFF_ARENA_BASE; // out: queued KDPC pointers
+pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
+pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
+    ((SH_HANDOFF_ARENA_LIMIT - SH_HANDOFF_ARENA_BASE) / 8) & !0x7;
+pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 =
+    SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
+pub const SH_DMA_ALLOC_RECORDS: u64 =
+    SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
+pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
+const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
+const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -5049,15 +5059,33 @@ const KDPC_SYSTEM_ARGUMENT2_OFFSET: u64 = 0x30;
 const KDPC_QUEUED_OFFSET: u64 = 0x38;
 const KDPC_SIZE: u64 = 0x40;
 
+unsafe fn dpc_queue_capacity(sh: u64) -> u64 {
+    let capacity = read_volatile((sh + SH_DPC_QUEUE_CAPACITY) as *const u64);
+    if capacity == 0 || capacity > SH_DPC_QUEUE_DERIVED_CAPACITY {
+        0
+    } else {
+        capacity
+    }
+}
+
+#[inline]
+fn dpc_queue_slot(sh: u64, index: u64, capacity: u64) -> u64 {
+    sh + SH_DPC_QUEUE_BASE + (index % capacity) * SH_DPC_QUEUE_ENTRY_SIZE
+}
+
 unsafe fn clear_dpc_queue_projection(sh: u64) {
     write_volatile((sh + SH_DPC_QUEUE_HEAD) as *mut u64, 0);
     write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
     write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, 0);
     write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_DPC_QUEUE_CAPACITY) as *mut u64,
+        SH_DPC_QUEUE_DERIVED_CAPACITY,
+    );
     let mut slot = 0u64;
-    while slot < SH_DPC_QUEUE_SLOTS {
+    while slot < SH_DPC_QUEUE_DERIVED_CAPACITY {
         write_volatile(
-            (sh + SH_DPC_QUEUE_BASE + slot * 8) as *mut u64,
+            (sh + SH_DPC_QUEUE_BASE + slot * SH_DPC_QUEUE_ENTRY_SIZE) as *mut u64,
             0,
         );
         slot += 1;
@@ -5089,9 +5117,18 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
         {
             return 0;
         }
+        let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
+        if capacity == 0 {
+            let drops = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *const u64);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *mut u64,
+                drops.saturating_add(1),
+            );
+            return 0;
+        }
         let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
         let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
-        if tail.saturating_sub(head) >= SH_DPC_QUEUE_SLOTS {
+        if tail.saturating_sub(head) >= capacity {
             let drops = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *const u64);
             write_volatile(
                 (FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *mut u64,
@@ -5102,7 +5139,7 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
         write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, arg1);
         write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, arg2);
         write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
-        let slot = FSD_SHARED_VADDR + SH_DPC_QUEUE_BASE + (tail % SH_DPC_QUEUE_SLOTS) * 8;
+        let slot = dpc_queue_slot(FSD_SHARED_VADDR, tail, capacity);
         write_volatile(slot as *mut u64, dpc);
         write_volatile(
             (FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *mut u64,
@@ -5164,15 +5201,19 @@ extern "win64" fn s_ke_synchronize_execution(_interrupt: u64, routine: u64, cont
 }
 
 unsafe fn fsd_drain_queued_dpcs() -> u64 {
+    let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
+    if capacity == 0 {
+        return 0;
+    }
     let mut inspected = 0u64;
     let mut delivered = 0u64;
-    while inspected < SH_DPC_QUEUE_SLOTS {
+    while inspected < capacity {
         let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
         let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
         if head == tail {
             break;
         }
-        let slot = FSD_SHARED_VADDR + SH_DPC_QUEUE_BASE + (head % SH_DPC_QUEUE_SLOTS) * 8;
+        let slot = dpc_queue_slot(FSD_SHARED_VADDR, head, capacity);
         let dpc = read_volatile(slot as *const u64);
         write_volatile(slot as *mut u64, 0);
         write_volatile(

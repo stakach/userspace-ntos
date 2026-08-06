@@ -97,11 +97,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    window caps. Hosted driver instance, reply-cap, and executive alias bookkeeping now grows on
    demand; per-instance executive VAs come from a checked high arena with on-demand PD/PT coverage.
    Hosted common-buffer allocation records now use the per-instance shared arena capacity instead of
-   a fixed eight-record table, and hosted device bindings, root-PDO bindings, and registry identities
-   now grow on demand while reusing teardown holes. The raw direct TX proof remains only as a hardware
-   liveness proof before VT-d mapping. The next B3 target is replacing the remaining shared-frame DPC
-   queue policy with a capacity-aware design, then retiring the direct raw proof once generic PCI
-   evidence fully covers it.
+   a fixed eight-record table, hosted device bindings, root-PDO bindings, registry identities, and
+   hosted launch side tables now grow on demand while reusing teardown holes, and the shared-frame DPC
+   queue now publishes arena-derived capacity instead of using a fixed inline queue. The raw direct TX
+   proof remains only as a hardware liveness proof before VT-d mapping. The remaining B3 cleanup is to
+   retire or reclassify that direct raw proof once generic PCI evidence fully owns the driver path.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -877,3 +877,20 @@ in SCM, user-mode system processes, and our ntdll where possible.
   remaining B3 launch-state cap is the shared-frame DPC queue. Treat it as an ABI cleanup, not a
   Rust table conversion: publish queue capacity in shared metadata, move queue storage into the
   existing shared handoff arena, and keep overflow as a real drop/failure signal.
+- B3 cleanup continued. The shared-frame KDPC queue no longer uses the fixed four-entry inline queue
+  at `0x490`. The shared ABI now publishes `SH_DPC_QUEUE_CAPACITY`, stores queued KDPC pointers in an
+  arena-derived prefix of the shared handoff arena, and moves DMA allocation records after that queue
+  region so both queue and DMA records derive capacity from the mapped shared arena. Enqueue/drain
+  paths validate the published capacity and preserve real drop accounting on overflow or invalid
+  capacity. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-dpc-queue-20260807.log`. Result: `exec_generic_hw_mmio_interrupt_dma`,
+  `exec_generic_hw_dpc_delivered`, `exec_generic_pci_registry_selected`,
+  `exec_generic_pci_support_driver_entry`, `exec_generic_pci_add_device_reached`,
+  `exec_generic_pci_io_port_out32`, `exec_fsd_on_shared_harness`,
+  `exec_msgina_logon_dialog_painted`, `exec_vm_pool_headroom`, and
+  `exec_explorer_shell_chrome_painted` pass with `294/294` checks passing. Review adjustment: B3
+  launch-state fixed caps are closed; remaining B3 cleanup is to retire or reclassify the direct raw
+  NIC liveness proof now that generic PCI evidence owns the driver path.
