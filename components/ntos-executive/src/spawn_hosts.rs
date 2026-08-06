@@ -364,9 +364,10 @@ pub(crate) unsafe fn spawn_isr(
 }
 
 /// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a
-/// DMA frame + a shared word, so it drives the disk entirely from its own VSpace. The
+/// DMA frame + a small shared metadata/data run, so it drives the disk entirely from its own VSpace. The
 /// executive (Tier-1 broker) has already enabled Bus Master; the host gets no PCI-config
-/// access. `shared` carries `dma_paddr` in (@0) and the verdict + INITRD info out.
+/// access. `shared` carries `dma_paddr` in (@0), the verdict + INITRD info out, and the generated
+/// hive on page 1.
 pub(crate) unsafe fn spawn_storage_host(
     entry: unsafe extern "C" fn() -> !,
     result_cap: u64,
@@ -374,7 +375,7 @@ pub(crate) unsafe fn spawn_storage_host(
     prio: u64,
     ahci_bar_frame: u64,
     dma_frame: u64,
-    shared_frame: u64,
+    shared_start: u64,
     filebuf_start: u64,
     ntdllbuf_start: u64,
     srvbuf_start: u64,
@@ -388,7 +389,7 @@ pub(crate) unsafe fn spawn_storage_host(
     winlogonbuf_start: u64,
 ) {
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
-    // Device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA frame, shared word.
+    // Device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA frame, shared run.
     // Then the staging buffers, each with its own dedicated PT(s). NLS + SYSTEM-hive share one
     // input page table with each other, distinct from the relocated NTDLLBUF.
     let mut regions: [Region; 32] = [Region {
@@ -416,9 +417,9 @@ pub(crate) unsafe fn spawn_storage_host(
     };
     n += 1;
     regions[n] = Region {
-        source: FrameSource::Alias(shared_frame),
+        source: FrameSource::Alias(shared_start),
         base_va: STORAGE_SHARED_VADDR,
-        count: 1,
+        count: STORAGE_SHARED_FRAMES,
         rights: Rights::Uniform(RW_NX),
         pts: 0,
     };

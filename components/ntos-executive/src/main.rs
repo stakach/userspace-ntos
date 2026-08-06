@@ -1256,6 +1256,11 @@ pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
 /// INITRD cluster @0x10, size @0x14 out.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_105F_6000;
+pub const STORAGE_SHARED_FRAMES: u64 = 2;
+pub const STORAGE_HIVE_IMAGE_OFFSET: u64 = 0x1000;
+pub const STORAGE_IMPORTS_IMAGE_OFFSET: u64 = 0x800;
+pub const STORAGE_HIVE_IMAGE_CAP: usize =
+    (STORAGE_SHARED_FRAMES as usize * 0x1000) - STORAGE_HIVE_IMAGE_OFFSET as usize;
 /// A multi-frame file buffer shared between the executive and the storage host: the host reads
 /// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
@@ -11622,6 +11627,7 @@ pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) instance_id: alloc::string::String,
     pub(crate) pdo_name: Option<alloc::string::String>,
     pub(crate) driver_key: Option<alloc::string::String>,
+    pub(crate) linkage_export: Option<alloc::string::String>,
     pub(crate) hardware_ids: alloc::vec::Vec<alloc::string::String>,
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
@@ -11672,6 +11678,20 @@ impl<const N: usize> InlineAscii<N> {
     }
 }
 
+fn ascii_starts_with_ignore_case(text: &[u8], prefix: &[u8]) -> bool {
+    if text.len() < prefix.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() {
+        if text[i].to_ascii_uppercase() != prefix[i].to_ascii_uppercase() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 struct InlineDriverDevnodeSpec {
     instance_id: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
@@ -11679,6 +11699,8 @@ struct InlineDriverDevnodeSpec {
     pdo_name_present: bool,
     driver_key: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
     driver_key_present: bool,
+    linkage_export: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    linkage_export_present: bool,
     hardware_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
     hardware_id_count: usize,
     compatible_ids: [InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>; BOOT_DRIVER_ID_MAX],
@@ -11693,6 +11715,8 @@ impl InlineDriverDevnodeSpec {
             pdo_name_present: false,
             driver_key: InlineAscii::empty(),
             driver_key_present: false,
+            linkage_export: InlineAscii::empty(),
+            linkage_export_present: false,
             hardware_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
             hardware_id_count: 0,
             compatible_ids: [InlineAscii::empty(); BOOT_DRIVER_ID_MAX],
@@ -11744,6 +11768,15 @@ impl InlineDriverLaunchSpec {
             devnode_count: 0,
         }
     }
+}
+
+fn inline_launch_spec_has_pci_devnode(spec: &InlineDriverLaunchSpec) -> bool {
+    for devnode in &spec.devnodes[..spec.devnode_count] {
+        if ascii_starts_with_ignore_case(devnode.instance_id.as_bytes(), b"PCI\\") {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -11841,6 +11874,7 @@ fn driver_service_devnode_specs(
             instance_id: devnode.instance_id.clone(),
             pdo_name: devnode.pdo_name.clone(),
             driver_key: devnode.driver_key.clone(),
+            linkage_export: cm.devnode_linkage_export(devnode),
             hardware_ids: devnode.hardware_ids.clone(),
             compatible_ids: devnode.compatible_ids.clone(),
         })
@@ -11864,6 +11898,7 @@ fn copy_inline_string_list<const N: usize>(
 }
 
 fn inline_devnode_spec_from_record(
+    cm: &nt_config_manager::ConfigManager,
     devnode: &nt_config_manager::DevnodeRecord,
 ) -> Option<InlineDriverDevnodeSpec> {
     let mut dst = InlineDriverDevnodeSpec::empty();
@@ -11879,6 +11914,12 @@ fn inline_devnode_spec_from_record(
         }
         dst.driver_key_present = true;
     }
+    if let Some(linkage_export) = cm.devnode_linkage_export(devnode).as_deref() {
+        if !dst.linkage_export.set_str(linkage_export) {
+            return None;
+        }
+        dst.linkage_export_present = true;
+    }
     dst.hardware_id_count = copy_inline_string_list(&devnode.hardware_ids, &mut dst.hardware_ids);
     dst.compatible_id_count =
         copy_inline_string_list(&devnode.compatible_ids, &mut dst.compatible_ids);
@@ -11886,6 +11927,7 @@ fn inline_devnode_spec_from_record(
 }
 
 fn fill_inline_devnodes_from_records(
+    cm: &nt_config_manager::ConfigManager,
     records: &[nt_config_manager::DevnodeRecord],
     out: &mut [InlineDriverDevnodeSpec],
 ) -> usize {
@@ -11894,7 +11936,7 @@ fn fill_inline_devnodes_from_records(
         if count >= out.len() {
             break;
         }
-        if let Some(dst) = inline_devnode_spec_from_record(devnode) {
+        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
             out[count] = dst;
             count += 1;
         }
@@ -11912,7 +11954,7 @@ fn fill_inline_devnodes(
         if count >= out.len() {
             break;
         }
-        if let Some(dst) = inline_devnode_spec_from_record(devnode) {
+        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
             out[count] = dst;
             count += 1;
         }
@@ -11948,6 +11990,7 @@ fn inline_driver_launch_spec_from_service_metadata(
 }
 
 fn inline_driver_launch_spec_from_pnp_binding(
+    cm: &nt_config_manager::ConfigManager,
     binding: nt_config_manager::PnpDriverBinding,
     max_start: u32,
 ) -> Option<InlineDriverLaunchSpec> {
@@ -11969,18 +12012,22 @@ fn inline_driver_launch_spec_from_pnp_binding(
         spec.class_guid_present = true;
     }
     spec.class = class;
-    spec.devnode_count = fill_inline_devnodes_from_records(&binding.devnodes, &mut spec.devnodes);
+    spec.devnode_count =
+        fill_inline_devnodes_from_records(cm, &binding.devnodes, &mut spec.devnodes);
     (spec.devnode_count != 0).then_some(spec)
 }
 
 fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     let hive_size =
         unsafe { core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) } as usize;
-    if hive_size == 0 || hive_size > 0x0f00 {
+    if hive_size == 0 || hive_size > STORAGE_HIVE_IMAGE_CAP {
         return None;
     }
     let hive_bytes = unsafe {
-        core::slice::from_raw_parts((STORAGE_SHARED_VADDR + 0x100) as *const u8, hive_size)
+        core::slice::from_raw_parts(
+            (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET) as *const u8,
+            hive_size,
+        )
     };
     let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
     let mut cm = nt_config_manager::ConfigManager::new();
@@ -11993,6 +12040,11 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
         return None;
     }
     let _ = nt_hive_core::import_control_set_enum_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_class_into_config_manager(
         &hive,
         &mut cm,
         nt_hive_core::CURRENT_CONTROL_SET_TARGET,
@@ -12028,7 +12080,7 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
             if let Some(spec) =
-                inline_driver_launch_spec_from_pnp_binding(binding, SERVICE_SYSTEM_START)
+                inline_driver_launch_spec_from_pnp_binding(&cm, binding, SERVICE_SYSTEM_START)
             {
                 if !plan.push(spec) {
                     break;
@@ -18047,12 +18099,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(map_err);
             print_str(b"\n");
             check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
-            // Shared word: the AHCI's DEVICE address — now the IOVA (VT-d maps it to the
-            // frame) — in @0; verdict + INITRD info out.
-            let shared = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, shared);
-            let sh_exec = copy_cap(shared);
-            let _ = page_map(sh_exec, STORAGE_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            // Shared storage run: page 0 carries AHCI IOVA + verdict/size metadata + imports.bin;
+            // page 1 carries the generated SYSTEM.DAT hive.
+            let shared_start = alloc_frame();
+            for _ in 1..STORAGE_SHARED_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..STORAGE_SHARED_FRAMES {
+                let _ = page_map(
+                    copy_cap(shared_start + i),
+                    STORAGE_SHARED_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
             core::ptr::write_volatile(STORAGE_SHARED_VADDR as *mut u64, AHCI_IOVA);
             core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, 0);
             // The shared file buffer: FILEBUF_FRAMES consecutive frames, mapped contiguously in
@@ -18387,7 +18447,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 100,
                 ahci_frame,
                 dma_frame,
-                shared,
+                shared_start,
                 fb_start,
                 nb_start,
                 srvbuf_start,
@@ -18537,14 +18597,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
 
             // --- P2 finale: the Config Manager parses the registry hive the isolated storage
-            // host read off the FS (an nt-hive-core image at STORAGE_SHARED_VADDR+0x100) and
+            // host read off the FS (an nt-hive-core image at STORAGE_HIVE_IMAGE_OFFSET) and
             // reads a known value back — disk -> volume -> FS -> REGISTRY, end to end.
             let hive_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32);
-            let hive_bytes = core::slice::from_raw_parts(
-                (STORAGE_SHARED_VADDR + 0x100) as *const u8,
-                hive_size as usize,
-            );
-            match nt_hive_core::decode_image(hive_bytes) {
+            let hive_decode = if hive_size as usize <= STORAGE_HIVE_IMAGE_CAP {
+                let hive_bytes = core::slice::from_raw_parts(
+                    (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET) as *const u8,
+                    hive_size as usize,
+                );
+                nt_hive_core::decode_image(hive_bytes)
+            } else {
+                Err(nt_hive_core::HiveDecodeError::Truncated)
+            };
+            match hive_decode {
                 Ok(hive) => {
                     print_str(b"[ntos-exec] Config Manager decoded hive (");
                     print_u64(hive_size as u64);
@@ -18573,8 +18638,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // first page IN — so a page of a real on-disk file arrives in the process only when touched.
     let hive_len = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32);
     if found_storage && hive_len > 0 {
-        // Copy the disk hive (shared frame @+0x100) into a dedicated file frame. The hive is
-        // only `hive_len` bytes — don't read off the end of the 1-page shared frame. ldff is
+        // Copy the disk hive (shared run page 1) into a dedicated file frame. The hive is
+        // only `hive_len` bytes — don't read off the end of the shared hive window. ldff is
         // retype-zeroed, so the rest stays 0.
         let ldff = alloc_frame();
         let _ = page_map(
@@ -18583,9 +18648,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             RW_NX,
             CAP_INIT_THREAD_VSPACE,
         );
-        let n = (hive_len as u64).min(0xF00);
+        let n = (hive_len as u64).min(STORAGE_HIVE_IMAGE_CAP as u64);
         for i in 0..n {
-            let b = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x100 + i) as *const u8);
+            let b = core::ptr::read_volatile(
+                (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET + i) as *const u8,
+            );
             core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x3000 + i) as *mut u8, b);
         }
         let ld_fault = make_object(OBJ_ENDPOINT);
@@ -20343,11 +20410,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
     let mut generic_hw_root_started = false;
+    let mut generic_pci_registry_selected = false;
+    let mut generic_pci_support_driver_entry = false;
+    let mut generic_pci_add_device = false;
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
     if !config_pnp_plan.as_slice().is_empty() {
         if let Some(fs) = exec_fs() {
             for proof_pnp_spec in config_pnp_plan.as_slice() {
+                let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(proof_pnp_spec);
                 generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
+                generic_pci_registry_selected |= spec_has_pci_devnode;
                 print_str(b"[driver-launch] launching PnP service ");
                 print_str(proof_pnp_spec.service_name.as_bytes());
                 print_str(b" from config hive path=");
@@ -20364,6 +20436,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     proof_pnp_spec.class,
                     proof_pnp_spec.driver_object_path.as_str(),
                 ) {
+                    if spec_has_pci_devnode {
+                        generic_pci_support_driver_entry |= dc.support_status == 0
+                            && (dc.support_verdict & V_SUCCESS) != 0;
+                    }
                     let start_report = start_inline_driver_service_devnodes(
                         &dc,
                         proof_pnp_spec,
@@ -20371,6 +20447,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
                     generic_hw_add_device |= start_report.add_device;
+                    if spec_has_pci_devnode {
+                        generic_pci_add_device |= start_report.add_device;
+                    }
                     generic_hw_start_ok |= start_report.start_ok;
                     generic_hw_granted |= start_report.resource_granted;
                     generic_hw_mmio_mapped |= start_report.mmio_mapped;
@@ -20412,6 +20491,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_generic_hw_root_pdo_started",
         generic_hw_start_ok && generic_hw_root_started,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pci_registry_selected",
+        generic_pci_registry_selected,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pci_support_driver_entry",
+        generic_pci_support_driver_entry,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_pci_add_device_reached",
+        generic_pci_add_device,
         &mut passed,
     );
     check(
@@ -20503,17 +20597,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
 
                 // Resolve smss's ntdll imports: apply the build-time patch table (imports.bin,
-                // read off disk into STORAGE_SHARED+0x800) to smss's IAT in the file buffer —
+                // read off disk into STORAGE_IMPORTS_IMAGE_OFFSET) to smss's IAT in the file buffer —
                 // each slot := NTDLL_BASE + the import's real ntdll export RVA. So smss's ntdll
                 // calls now target real ntdll addresses instead of unresolved file thunks.
                 let imports_size =
                     core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
                 let mut resolved = 0u32;
                 if imports_size >= 4 {
-                    let count =
-                        core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x800) as *const u32);
+                    let count = core::ptr::read_volatile(
+                        (STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET) as *const u32,
+                    );
                     for i in 0..count as u64 {
-                        let ent = STORAGE_SHARED_VADDR + 0x804 + i * 8;
+                        let ent = STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET + 4 + i * 8;
                         let off = core::ptr::read_volatile(ent as *const u32) as u64;
                         let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
                         core::ptr::write_volatile(

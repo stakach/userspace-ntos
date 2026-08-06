@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 
-use nt_config_manager::{ConfigManager, Registry, RegistryKeyId, ENUM_PATH, SERVICES_PATH};
+use nt_config_manager::{
+    ConfigManager, Registry, RegistryKeyId, CONTROL_CLASS_PATH, ENUM_PATH, SERVICES_PATH,
+};
 
 use crate::Hive;
 
@@ -50,6 +52,31 @@ pub fn import_control_set_enum_into_config_manager(
     let dst_enum = cm.registry_mut().create_key(ENUM_PATH);
     import_hive_key(hive, src_enum, cm.registry_mut(), dst_enum);
     cm.index_registry_devnodes()
+}
+
+/// Import `ControlSetXXX\Control\Class` from a hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\Class`.
+pub fn import_control_set_class_into_config_manager(
+    hive: &Hive,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_class_path = alloc::string::String::from(control_set);
+    src_class_path.push_str("\\Control\\Class");
+    let Some(src_class) = hive.open_key(&src_class_path) else {
+        return 0;
+    };
+    let dst_class = cm.registry_mut().create_key(CONTROL_CLASS_PATH);
+    let class_names = hive.enum_subkeys(src_class);
+    let count = class_names.len();
+    for name in class_names {
+        let Some(src_child) = hive.open_subkey(src_class, &name) else {
+            continue;
+        };
+        let dst_child = cm.registry_mut().create_subkey(dst_class, &name);
+        import_hive_key(hive, src_child, cm.registry_mut(), dst_child);
+    }
+    count
 }
 
 fn import_hive_key(hive: &Hive, src: crate::CellId, dst: &mut Registry, dst_key: RegistryKeyId) {

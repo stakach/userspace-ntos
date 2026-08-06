@@ -8,6 +8,11 @@ use nt_config_manager::{
 };
 use nt_hive_core::{encode_image, Hive, HiveKind, RegistryValueType};
 
+const NET_CLASS_GUID: &str = "{4D36E972-E325-11CE-BFC1-08002BE10318}";
+const E1000_DRIVER_KEY: &str = r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000";
+const E1000_INSTANCE_ID: &str = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
+const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
+
 fn utf16le_sz(s: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     for unit in s.encode_utf16().chain(core::iter::once(0)) {
@@ -74,6 +79,69 @@ fn build_hive() -> Hive {
         encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"]),
     );
 
+    // ReactOS Intel PRO/1000 miniport. The kernel discovers this via ordinary boot/system driver
+    // and devnode metadata; NDIS consumes the class Linkage\Export value during AddDevice.
+    let key = hive.create_key(r"ControlSet001\Services\E1000");
+    hive.set_value(
+        key,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"system32\drivers\e1000.sys"),
+    );
+    hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
+    hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
+    hive.set_dword(key, "ErrorControl", 0x1);
+    hive.set_value(key, "Group", RegistryValueType::Sz, utf16le_sz("NDIS"));
+    hive.set_value(
+        key,
+        "ClassGUID",
+        RegistryValueType::Sz,
+        utf16le_sz(NET_CLASS_GUID),
+    );
+
+    let devnode_path = format!(r"ControlSet001\Enum\{}", E1000_INSTANCE_ID);
+    let devnode = hive.create_key(&devnode_path);
+    hive.set_value(
+        devnode,
+        "Service",
+        RegistryValueType::Sz,
+        utf16le_sz("E1000"),
+    );
+    hive.set_value(
+        devnode,
+        "PdoName",
+        RegistryValueType::Sz,
+        utf16le_sz(r"\Device\NTPNP_PCI0001"),
+    );
+    hive.set_value(
+        devnode,
+        "Driver",
+        RegistryValueType::Sz,
+        utf16le_sz(E1000_DRIVER_KEY),
+    );
+    hive.set_value(
+        devnode,
+        "HardwareID",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E", r"PCI\VEN_8086"]),
+    );
+    hive.set_value(
+        devnode,
+        "CompatibleIDs",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(&[r"PCI\CC_020000", r"PCI\CC_0200"]),
+    );
+
+    let linkage_path =
+        r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage";
+    let linkage = hive.create_key(linkage_path);
+    hive.set_value(
+        linkage,
+        "Export",
+        RegistryValueType::Sz,
+        utf16le_sz(E1000_EXPORT_NAME),
+    );
+
     hive
 }
 
@@ -90,6 +158,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nt_hive_core::decode_image;
 
     #[test]
     fn generated_hive_declares_irp_fsd_test_service() {
@@ -132,6 +201,78 @@ mod tests {
             Some((
                 RegistryValueType::Sz,
                 utf16le_sz("DmaPnpPowerTest").as_slice()
+            ))
+        );
+    }
+
+    #[test]
+    fn generated_hive_declares_registry_selected_e1000_pci_driver() {
+        let hive = build_hive();
+        let key = hive
+            .open_key(r"ControlSet001\Services\E1000")
+            .expect("service key");
+        assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_KERNEL_DRIVER));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(key, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\e1000.sys").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(key, "Group"),
+            Some((RegistryValueType::Sz, utf16le_sz("NDIS").as_slice()))
+        );
+        assert_eq!(
+            hive.query_value(key, "ClassGUID"),
+            Some((RegistryValueType::Sz, utf16le_sz(NET_CLASS_GUID).as_slice()))
+        );
+
+        let dn = hive
+            .open_key(&format!(r"ControlSet001\Enum\{}", E1000_INSTANCE_ID))
+            .expect("devnode key");
+        assert_eq!(
+            hive.query_value(dn, "Service"),
+            Some((RegistryValueType::Sz, utf16le_sz("E1000").as_slice()))
+        );
+        assert_eq!(
+            hive.query_value(dn, "Driver"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_DRIVER_KEY).as_slice()
+            ))
+        );
+
+        let linkage = hive
+            .open_key(
+                r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage",
+            )
+            .expect("linkage key");
+        assert_eq!(
+            hive.query_value(linkage, "Export"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_EXPORT_NAME).as_slice()
+            ))
+        );
+    }
+
+    #[test]
+    fn generated_hive_image_decodes_and_fits_storage_window() {
+        let bytes = encode_image(&build_hive());
+        assert!(bytes.len() <= 4096);
+        let hive = decode_image(&bytes).expect("generated hive decodes");
+        let linkage = hive
+            .open_key(
+                r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage",
+            )
+            .expect("linkage key");
+        assert_eq!(
+            hive.query_value(linkage, "Export"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_EXPORT_NAME).as_slice()
             ))
         );
     }

@@ -30,6 +30,7 @@ pub const SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Ser
 pub const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 pub const DEVICE_CLASSES_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\DeviceClasses";
+pub const CONTROL_CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
 pub const SERVICE_GROUP_ORDER_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder";
 
@@ -690,6 +691,20 @@ impl ConfigManager {
                 .as_deref()
                 .is_some_and(|s| s.eq_ignore_ascii_case(service))
         })
+    }
+    pub fn linkage_export_for_driver_key(&self, driver_key: &str) -> Option<String> {
+        if driver_key.is_empty() {
+            return None;
+        }
+        let mut path = String::from(CONTROL_CLASS_PATH);
+        path.push('\\');
+        path.push_str(driver_key);
+        path.push_str("\\Linkage");
+        let key = self.registry.open_key(&path)?;
+        self.registry.query_string(key, "Export")
+    }
+    pub fn devnode_linkage_export(&self, devnode: &DevnodeRecord) -> Option<String> {
+        self.linkage_export_for_driver_key(devnode.driver_key.as_deref()?)
     }
     pub fn devnode_count(&self) -> usize {
         self.devnodes.len()
@@ -1374,6 +1389,13 @@ mod tests {
         cm.registry_mut().create_key(
             r"\Registry\Machine\System\CurrentControlSet\Enum\PCI\VEN_8086&DEV_100E\Properties",
         );
+        let linkage = cm
+            .registry_mut()
+            .create_key(
+                r"\Registry\Machine\System\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage",
+            );
+        cm.registry_mut()
+            .set_string(linkage, "Export", r"\Device\E1000_0000");
 
         assert_eq!(cm.index_registry_devnodes(), 1);
         assert_eq!(cm.index_registry_devnodes(), 0);
@@ -1401,6 +1423,10 @@ mod tests {
             alloc::vec![String::from(r"PCI\CC_020000"), String::from(r"PCI\CC_0200"),]
         );
         assert_eq!(cm.devnodes_for_service("e1000").len(), 1);
+        assert_eq!(
+            cm.devnode_linkage_export(dn).as_deref(),
+            Some(r"\Device\E1000_0000")
+        );
         assert_eq!(
             cm.index_registry_devnode(r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"),
             Some(dn_id)

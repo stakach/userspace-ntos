@@ -25,8 +25,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_config_manager::{
-    ConfigManager, Registry, RegistryKeyId, RegistryValueType, ENUM_PATH, SERVICES_PATH,
-    SERVICE_GROUP_ORDER_PATH,
+    ConfigManager, Registry, RegistryKeyId, RegistryValueType, CONTROL_CLASS_PATH, ENUM_PATH,
+    SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
 };
 
 const HBIN_BASE: usize = 0x1000;
@@ -395,6 +395,7 @@ impl<'a> RegfHive<'a> {
 pub struct ControlSetImportCounts {
     pub services: usize,
     pub enum_devnodes: usize,
+    pub class_keys: usize,
     pub service_group_order_values: usize,
 }
 
@@ -407,6 +408,7 @@ pub fn import_control_set_boot_config_into_config_manager(
     ControlSetImportCounts {
         services: import_control_set_services_into_config_manager(hive, cm, control_set),
         enum_devnodes: import_control_set_enum_into_config_manager(hive, cm, control_set),
+        class_keys: import_control_set_class_into_config_manager(hive, cm, control_set),
         service_group_order_values: import_control_set_service_group_order_into_config_manager(
             hive,
             cm,
@@ -453,6 +455,28 @@ pub fn import_control_set_enum_into_config_manager(
     let dst_enum = cm.registry_mut().create_key(ENUM_PATH);
     import_regf_key(hive, src_enum, cm.registry_mut(), dst_enum);
     cm.index_registry_devnodes()
+}
+
+/// Import `ControlSetXXX\Control\Class` from a read-only REGF hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\Class`.
+pub fn import_control_set_class_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_path = String::from(control_set);
+    src_path.push_str("\\Control\\Class");
+    let Some(src_class) = hive.open_key(&src_path) else {
+        return 0;
+    };
+    let dst_class = cm.registry_mut().create_key(CONTROL_CLASS_PATH);
+    let class_names = hive.subkeys_raw(src_class);
+    let count = class_names.len();
+    for (name, src_child) in class_names {
+        let dst_child = cm.registry_mut().create_subkey(dst_class, &name);
+        import_regf_key(hive, src_child, cm.registry_mut(), dst_child);
+    }
+    count
 }
 
 /// Import `ControlSetXXX\Control\ServiceGroupOrder` from a read-only REGF hive into
@@ -871,6 +895,7 @@ mod tests {
             ControlSetImportCounts {
                 services: 1,
                 enum_devnodes: 1,
+                class_keys: 0,
                 service_group_order_values: 1,
             }
         );

@@ -7,7 +7,8 @@
 //! Cap layout (all in this host's own VSpace):
 //!   * `AHCI_VADDR`           — the AHCI ABAR MMIO (granted BAR frame)
 //!   * `AHCI_DMA_VADDR`       — the DMA frame (command list + FIS + command table + data)
-//!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8, INITRD cluster @0x10, size @0x14 out
+//!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8, INITRD cluster @0x10, size @0x14 out,
+//!     import table at page-0 offset, generated hive at page-1 offset
 
 use crate::*;
 
@@ -24,8 +25,8 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
 
     // The entire storage stack — AHCI bring-up, sector-0 MBR read, FAT32 parse, root-dir
     // listing, BOOTBOOT/INITRD read, and the SYSTEM.DAT registry hive read — runs here in the
-    // isolated host's VSpace. The hive lands in the shared frame at +0x100 (past the metadata)
-    // for the executive's Config Manager to parse.
+    // isolated host's VSpace. The generated hive uses page 1 of the shared run so it cannot
+    // overlap the page-0 metadata or IMPORTS.BIN table.
     let (
         verdict,
         cluster,
@@ -41,9 +42,9 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
         AHCI_VADDR,
         AHCI_DMA_VADDR,
         dma_paddr,
-        STORAGE_SHARED_VADDR + 0x100,
+        STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET,
         FILEBUF_VADDR,
-        STORAGE_SHARED_VADDR + 0x800,
+        STORAGE_SHARED_VADDR + STORAGE_IMPORTS_IMAGE_OFFSET,
         NTDLLBUF_VADDR,
         SRVBUF_VADDR,
         WIN32BUF_VADDR,

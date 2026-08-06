@@ -70,6 +70,7 @@ pub(crate) struct HostedPnpStartReport {
 struct HostedPnpDevnodeStart<'a> {
     instance_id: &'a str,
     driver_key: Option<&'a str>,
+    linkage_export: Option<&'a str>,
     hardware_ids: &'a [&'a str],
     compatible_ids: &'a [&'a str],
 }
@@ -115,6 +116,11 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
         } else {
             None
         };
+        let linkage_export = if devnode.linkage_export_present {
+            Some(devnode.linkage_export.as_str())
+        } else {
+            None
+        };
         start_one_devnode(
             dc,
             spec.service_name.as_str(),
@@ -122,6 +128,7 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
             HostedPnpDevnodeStart {
                 instance_id: devnode.instance_id.as_str(),
                 driver_key,
+                linkage_export,
                 hardware_ids: hardware_refs,
                 compatible_ids: compatible_refs,
             },
@@ -156,6 +163,7 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
             HostedPnpDevnodeStart {
                 instance_id: &devnode.instance_id,
                 driver_key: devnode.driver_key.as_deref(),
+                linkage_export: devnode.linkage_export.as_deref(),
                 hardware_ids: &hardware_refs[..hardware_count],
                 compatible_ids: &compatible_refs[..compatible_count],
             },
@@ -198,9 +206,9 @@ unsafe fn start_one_devnode(
     report.attempted += 1;
     match driver_launch::call_add_device_for_driver(
         dc.driver_id,
-        service_name,
         class_guid,
         devnode.driver_key,
+        devnode.linkage_export,
         devnode.instance_id,
         devnode.hardware_ids,
         devnode.compatible_ids,

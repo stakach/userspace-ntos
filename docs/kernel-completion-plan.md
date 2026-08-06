@@ -80,13 +80,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: devnode/driver registry identity now
-   flows toward `DevicePropertyDriverKeyName` and the miniport `Linkage` key, and the generated-hive
-   PnP proof now consumes every CM-selected binding instead of one `.next()` result. Boot and
-   demand-start device services now share one AddDevice/StartDevice path backed by the published
-   PCI/root-bus resource context, and unassigned devnode resources fail instead of taking an empty
-   START shortcut. Next drive real NDIS support initialization and miniport adapter resources through
-   that generic grant.
+1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive state now carries
+   the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and explicit
+   `Linkage\Export`; the storage shared area keeps the generated hive on page 1 so it no longer
+   overlaps the import table; hosted registry identity is published through the driver shared frame
+   and refuses to synthesize missing exports; and hosted driver slots reserve/free from the live
+   table while unmapping exec windows before reuse. Boot gates now prove PCI registry selection,
+   real `ndis.sys` support `DriverEntry`, and `e1000.sys` AddDevice. Next implement the honest
+   NDIS `IRP_MN_START_DEVICE` path: adapter configuration/resource queries, PCI config reads,
+   interface enable, interrupt/DMA bring-up, and miniport initialization through the generic PCI
+   grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -553,3 +556,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   adjustment: continue B3 at the NDIS boundary: support-driver initialization, miniport
   AddDevice/StartDevice, and adapter resource queries should now ride the generic demand-start PnP
   path.
+- B3 cleanup continued. The generated SYSTEM hive now seeds a real registry-selected E1000 PCI
+  service/devnode/class-linkage identity, and boot imports `Control\Class` alongside `Services`,
+  `Enum`, and service-group order into Config Manager. The generated hive moved to the second
+  storage shared page to avoid import-table overlap. Hosted registry identity is now explicit:
+  devnodes carry `Linkage\Export` from the class key, hosted registry handles copy that identity,
+  AddDevice publishes it through the shared frame, and the driver launch path rejects missing exports
+  instead of deriving synthetic device names. Hosted driver instance slots now reserve the first free
+  slot, clear stale mappings before reuse, and record exec-frame mappings for teardown. Validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `cargo test -p nt-config-manager`, `cargo test -p nt-hive-core`,
+  `cargo test -p nt-hive-regf`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and `./run.sh` proof
+  `.tmp/full-boot-e1000-pci-proof-5-20260806.log`. The boot reached genuine explorer shell chrome
+  with `288/291` checks passing; `exec_generic_pci_registry_selected`,
+  `exec_generic_pci_support_driver_entry`, and `exec_generic_pci_add_device_reached` are green. The
+  remaining failures are the known transport-accounting gates
+  `exec_irp_transport_call_bound`/`exec_client_reply_bound` plus `exec_vm_pool_headroom`. Review
+  adjustment: B3 remains open at real ReactOS NDIS/e1000 `START_DEVICE`, which currently returns
+  `STATUS_INVALID_DEVICE_REQUEST` before MMIO, interrupt, or DMA evidence is produced.
