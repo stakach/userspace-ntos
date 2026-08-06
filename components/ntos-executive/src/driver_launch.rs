@@ -1092,15 +1092,13 @@ const ANSI_STRING_BUFFER_OFFSET: u64 = 8;
 
 static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
 
-const DRIVER_OBJECT_EXTENSION_SLOTS: usize = 16;
-const DRIVER_REGISTRY_HANDLE_SLOTS: usize = 8;
 const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_FF00_4452_0000;
+const DRIVER_REGISTRY_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
 const HOSTED_INSTANCE_PATH_MAX: usize = 128;
 const HOSTED_DRIVER_KEY_NAME_MAX: usize = 128;
 const HOSTED_REGISTRY_PATH_MAX: usize = 192;
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
-const HOSTED_INTERFACE_REGISTRATION_SLOTS: usize = 16;
 type HostedRegistryIdentityId = usize;
 const INVALID_HOSTED_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId = usize::MAX;
 
@@ -1112,13 +1110,7 @@ struct DriverObjectExtensionSlot {
     used: bool,
 }
 
-static mut DRIVER_OBJECT_EXTENSIONS: [DriverObjectExtensionSlot; DRIVER_OBJECT_EXTENSION_SLOTS] =
-    [DriverObjectExtensionSlot {
-        driver_object: 0,
-        client_id: 0,
-        extension: 0,
-        used: false,
-    }; DRIVER_OBJECT_EXTENSION_SLOTS];
+static mut DRIVER_OBJECT_EXTENSIONS: Option<Vec<DriverObjectExtensionSlot>> = None;
 
 #[derive(Clone, Copy)]
 struct HostedAscii<const N: usize> {
@@ -1260,14 +1252,12 @@ const EMPTY_DRIVER_REGISTRY_HANDLE_SLOT: DriverRegistryHandleSlot = DriverRegist
     used: false,
 };
 
-static mut DRIVER_REGISTRY_HANDLES: Option<
-    Box<[DriverRegistryHandleSlot; DRIVER_REGISTRY_HANDLE_SLOTS]>,
-> = None;
+static mut DRIVER_REGISTRY_HANDLES: Option<Vec<DriverRegistryHandleSlot>> = None;
 static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
 static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
     INVALID_HOSTED_REGISTRY_IDENTITY_ID;
 static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<
-    Box<[HostedDeviceInterfaceRegistration; HOSTED_INTERFACE_REGISTRATION_SLOTS]>,
+    Vec<HostedDeviceInterfaceRegistration>,
 > = None;
 
 #[inline]
@@ -2508,7 +2498,7 @@ extern "win64" fn s_io_allocate_driver_object_extension(
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS);
+        let table = driver_object_extensions_mut();
         if table
             .iter()
             .any(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
@@ -2516,22 +2506,24 @@ extern "win64" fn s_io_allocate_driver_object_extension(
             write_unaligned(extension_out as *mut u64, 0);
             return STATUS_OBJECT_NAME_COLLISION;
         }
-        let Some(slot) = table.iter_mut().find(|slot| !slot.used) else {
-            write_unaligned(extension_out as *mut u64, 0);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        };
+        let reusable = table.iter().position(|slot| !slot.used);
         let extension = pool_alloc(size as u64);
         if extension == 0 {
             write_unaligned(extension_out as *mut u64, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         core::ptr::write_bytes(extension as *mut u8, 0, size as usize);
-        *slot = DriverObjectExtensionSlot {
+        let slot = DriverObjectExtensionSlot {
             driver_object,
             client_id,
             extension,
             used: true,
         };
+        if let Some(idx) = reusable {
+            table[idx] = slot;
+        } else {
+            table.push(slot);
+        }
         write_unaligned(extension_out as *mut u64, extension);
     }
     STATUS_SUCCESS
@@ -2540,7 +2532,9 @@ extern "win64" fn s_io_allocate_driver_object_extension(
 /// `PVOID IoGetDriverObjectExtension(PDRIVER_OBJECT, PVOID ClientId)`.
 extern "win64" fn s_io_get_driver_object_extension(driver_object: u64, client_id: u64) -> u64 {
     unsafe {
-        let table = &*core::ptr::addr_of!(DRIVER_OBJECT_EXTENSIONS);
+        let Some(table) = driver_object_extensions() else {
+            return 0;
+        };
         table
             .iter()
             .find(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
@@ -2549,13 +2543,39 @@ extern "win64" fn s_io_get_driver_object_extension(driver_object: u64, client_id
     }
 }
 
-unsafe fn driver_registry_handles_mut(
-) -> &'static mut [DriverRegistryHandleSlot; DRIVER_REGISTRY_HANDLE_SLOTS] {
+unsafe fn driver_object_extensions_mut() -> &'static mut Vec<DriverObjectExtensionSlot> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn driver_object_extensions() -> Option<&'static Vec<DriverObjectExtensionSlot>> {
+    (*core::ptr::addr_of!(DRIVER_OBJECT_EXTENSIONS)).as_ref()
+}
+
+unsafe fn clear_driver_object_extensions_for_driver_object(driver_object: u64) {
+    if driver_object == 0 {
+        return;
+    }
+    let Some(table) = (*core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS)).as_mut() else {
+        return;
+    };
+    for slot in table.iter_mut() {
+        if slot.used && slot.driver_object == driver_object {
+            slot.driver_object = 0;
+            slot.client_id = 0;
+            slot.extension = 0;
+            slot.used = false;
+        }
+    }
+}
+
+unsafe fn driver_registry_handles_mut() -> &'static mut Vec<DriverRegistryHandleSlot> {
     let slot = &mut *core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES);
     if slot.is_none() {
-        *slot = Some(Box::new(
-            [EMPTY_DRIVER_REGISTRY_HANDLE_SLOT; DRIVER_REGISTRY_HANDLE_SLOTS],
-        ));
+        *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
 }
@@ -2635,6 +2655,9 @@ unsafe fn allocate_driver_registry_handle(
     let table = driver_registry_handles_mut();
     for (idx, slot) in table.iter_mut().enumerate() {
         if !slot.used {
+            if idx as u64 > DRIVER_REGISTRY_HANDLE_INDEX_MASK {
+                return None;
+            }
             let handle = DRIVER_REGISTRY_HANDLE_BASE | idx as u64;
             *slot = DriverRegistryHandleSlot {
                 handle,
@@ -2645,14 +2668,25 @@ unsafe fn allocate_driver_registry_handle(
             return Some(handle);
         }
     }
-    None
+    if table.len() as u64 > DRIVER_REGISTRY_HANDLE_INDEX_MASK {
+        return None;
+    }
+    let idx = table.len();
+    let handle = DRIVER_REGISTRY_HANDLE_BASE | idx as u64;
+    table.push(DriverRegistryHandleSlot {
+        handle,
+        kind,
+        identity,
+        used: true,
+    });
+    Some(handle)
 }
 
 unsafe fn close_driver_registry_handle(handle: u64) -> bool {
-    if (handle & !0xFF) != DRIVER_REGISTRY_HANDLE_BASE {
+    if (handle & !DRIVER_REGISTRY_HANDLE_INDEX_MASK) != DRIVER_REGISTRY_HANDLE_BASE {
         return false;
     }
-    let idx = (handle & 0xFF) as usize;
+    let idx = (handle & DRIVER_REGISTRY_HANDLE_INDEX_MASK) as usize;
     let Some(table) = (*core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES)).as_mut() else {
         return false;
     };
@@ -2664,10 +2698,10 @@ unsafe fn close_driver_registry_handle(handle: u64) -> bool {
 }
 
 unsafe fn driver_registry_handle_slot(handle: u64) -> Option<DriverRegistryHandleSlot> {
-    if (handle & !0xFF) != DRIVER_REGISTRY_HANDLE_BASE {
+    if (handle & !DRIVER_REGISTRY_HANDLE_INDEX_MASK) != DRIVER_REGISTRY_HANDLE_BASE {
         return None;
     }
-    let idx = (handle & 0xFF) as usize;
+    let idx = (handle & DRIVER_REGISTRY_HANDLE_INDEX_MASK) as usize;
     let table = (*core::ptr::addr_of!(DRIVER_REGISTRY_HANDLES)).as_ref()?;
     if idx < table.len() && table[idx].used && table[idx].handle == handle {
         Some(table[idx])
@@ -2988,12 +3022,10 @@ unsafe fn shared_device_name_ascii() -> Option<HostedAscii<HOSTED_EXPORT_NAME_MA
 }
 
 unsafe fn hosted_device_interface_registrations_mut(
-) -> &'static mut [HostedDeviceInterfaceRegistration; HOSTED_INTERFACE_REGISTRATION_SLOTS] {
+) -> &'static mut Vec<HostedDeviceInterfaceRegistration> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS);
     if slot.is_none() {
-        *slot = Some(Box::new(
-            [EMPTY_HOSTED_DEVICE_INTERFACE_REGISTRATION; HOSTED_INTERFACE_REGISTRATION_SLOTS],
-        ));
+        *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
 }
@@ -3020,7 +3052,13 @@ unsafe fn upsert_hosted_device_interface(
             return Ok(());
         }
     }
-    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+    table.push(HostedDeviceInterfaceRegistration {
+        symbolic_link,
+        target,
+        enabled: false,
+        used: true,
+    });
+    Ok(())
 }
 
 unsafe fn clear_hosted_device_interface<const N: usize>(symbolic_link: &HostedAscii<N>) {
@@ -8080,6 +8118,7 @@ unsafe fn load_driver_reserved(
         print_str(b"[driver-launch] DriverEntry failed; refusing to register ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
+        clear_driver_object_extensions_for_driver_object(drvobj);
         return None;
     }
 
@@ -8117,6 +8156,7 @@ unsafe fn load_driver_reserved(
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
+            clear_driver_object_extensions_for_driver_object(drvobj);
             destroy_registered_driver(driver_id);
             return None;
         }
@@ -8128,6 +8168,7 @@ unsafe fn load_driver_reserved(
         print_str(b" for ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
+        clear_driver_object_extensions_for_driver_object(drvobj);
         destroy_registered_driver(driver_id);
         return None;
     }
@@ -9626,6 +9667,11 @@ pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
 
 fn clear_instance(i: usize) {
     clear_hosted_device_bindings_for_instance(i);
+    if let Some(inst) = instance(i) {
+        unsafe {
+            clear_driver_object_extensions_for_driver_object(inst.driver_object);
+        }
+    }
     let t = unsafe { driver_instances_mut() };
     if i < t.len() {
         let sh = t[i].exec_shared_va;

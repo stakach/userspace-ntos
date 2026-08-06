@@ -99,9 +99,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
    Hosted common-buffer allocation records now use the per-instance shared arena capacity instead of
    a fixed eight-record table, and hosted device bindings, root-PDO bindings, and registry identities
    now grow on demand while reusing teardown holes. The raw direct TX proof remains only as a hardware
-   liveness proof before VT-d mapping. The next B3 target is replacing remaining small launch-state
-   caps such as driver registry handles, hosted interface registrations, driver-object extensions if
-   real drivers need more, and DPC queue policy; then retire the direct raw proof once generic PCI
+   liveness proof before VT-d mapping. The next B3 target is replacing the remaining shared-frame DPC
+   queue policy with a capacity-aware design, then retiring the direct raw proof once generic PCI
    evidence fully covers it.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
@@ -860,3 +859,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   remaining B3 launch scaling debt is now driver registry handle slots, hosted interface
   registration slots, driver object extension slots if real drivers need more, and the small DPC queue
   policy; after those, retire the direct raw NIC proof.
+- B3 cleanup continued. The remaining executive-side hosted launch tables now grow on demand:
+  driver registry handles are `Vec`-backed with a widened low-16-bit handle index, hosted device
+  interface registrations append dynamically while preserving idempotent updates, and driver object
+  extension records append dynamically with stale extension metadata cleared on failed registration
+  and unload. The old `DRIVER_REGISTRY_HANDLE_SLOTS`, `HOSTED_INTERFACE_REGISTRATION_SLOTS`, and
+  `DRIVER_OBJECT_EXTENSION_SLOTS` fixed tables were removed. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-dynamic-hosted-side-tables-20260807.log`. Result: `DmaPnpPowerTest` and ReactOS `E1000`
+  generic hardware evidence stayed green, `exec_generic_hw_mmio_interrupt_dma`,
+  `exec_generic_pci_registry_selected`, `exec_generic_pci_support_driver_entry`,
+  `exec_generic_pci_add_device_reached`, `exec_generic_pci_io_port_out32`,
+  `exec_fsd_on_shared_harness`, `exec_msgina_logon_dialog_painted`, `exec_vm_pool_headroom`, and
+  `exec_explorer_shell_chrome_painted` pass with `294/294` checks passing. Review adjustment: the
+  remaining B3 launch-state cap is the shared-frame DPC queue. Treat it as an ABI cleanup, not a
+  Rust table conversion: publish queue capacity in shared metadata, move queue storage into the
+  existing shared handoff arena, and keep overflow as a real drop/failure signal.
