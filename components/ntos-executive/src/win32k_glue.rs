@@ -1731,6 +1731,9 @@ unsafe fn resume_suspended_user_callback_component(
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
+            wall_flags: 0,
+            wall_exception: 0,
+            wall_code: 0,
             faults: 0,
             demand: 0,
         };
@@ -1781,6 +1784,9 @@ unsafe fn resume_suspended_user_callback_component(
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
+            wall_flags: 0,
+            wall_exception: 0,
+            wall_code: 0,
             faults: 0,
             demand: 0,
         };

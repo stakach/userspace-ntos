@@ -80,22 +80,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Continue the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive state now carries
-   the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and explicit
-   `Linkage\Export`; the storage shared area keeps the generated hive on page 1 so it no longer
-   overlaps the import table; hosted registry identity is published through the driver shared frame
-   and refuses to synthesize missing exports; and hosted driver slots reserve/free from the live
-   table while unmapping exec windows before reuse. Boot gates now prove PCI registry selection,
-   real `ndis.sys` support `DriverEntry`, `e1000.sys` AddDevice, NT-style PCI config reads, full
+1. Continue B3 cleanup after the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive
+   state carries the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and
+   explicit `Linkage\Export`; `E1000` now completes `AddDevice` and `START_DEVICE` with
+   `STATUS_SUCCESS`; the generic grant path proves NT-style PCI config reads, full
    MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
-   per-devnode DMA grant, cap-backed servicing of inline `out dx,eax` I/O-port faults inside the
-   PnP-granted I/O BAR, and executive-side publication of device-interface state requested by
-   `IoSetDeviceInterfaceState`. `E1000` now completes `AddDevice` and `START_DEVICE` with
-   `STATUS_SUCCESS`. Next continue the honest NDIS/e1000 path at the explicit interrupt-delivery
-   frontier: invoking the connected E1000 ISR after start walls inside the hosted component at
-   `label=3 ip=0x0e014abd addr=0x1000f01fd88`. Identify the NDIS interrupt state, adapter mapping,
-   or ISR context contract that is still missing, wire it to real kernel functionality, and keep the
-   generic PCI grant path scalable for multiple devnodes/NICs.
+   per-devnode DMA grant, cap-backed inline `out dx,eax` I/O-port service, `IoSetDeviceInterfaceState`
+   publication, connected-ISR dispatch, and KDPC bottom-half delivery. The next B3 targets are cleanup
+   rather than synthetic bring-up: retire or replace the old direct `exec_nic_*` proof gates with
+   generic resource-manager/device-interrupt evidence, fix the remaining transport-accounting gates,
+   restore VM pool headroom, and replace fixed hosted proof arenas with per-devnode dynamic windows so
+   multiple NICs and arbitrary boot PnP drivers can load through the same boundary.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -636,3 +631,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   the rootserver `RingChannel::raw` null-destination wall is gone; the B3 frontier has moved to the
   explicit E1000 interrupt-delivery proof, which now walls at `label=3 ip=0x0e014abd
   addr=0x1000f01fd88` after start while ISR/DPC evidence for that PCI device is still absent.
+- B3 continued. Hosted driver IRQL state is now per-component shared-frame state instead of a
+  PASSIVE-only CR8 rewrite. ReactOS CR8 helper reads are patched to load that byte, hosted spin-lock
+  imports raise/lower it according to the NT contract, `KeReleaseSpinLockFromDpcLevel` no longer
+  lowers IRQL, `KeGetCurrentIrql` is a real trampoline, and queued KDPC routines run at
+  `DISPATCH_LEVEL`. The pump also records label-3 exception/code details for future hosted-driver
+  walls. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-hosted-irql-20260806.log`. Result: boot
+  reaches genuine explorer shell chrome with `286/292` checks passing; `E1000` reports
+  `start=0x00000000`, `int_delivered=1`, `dpc=1`, `dpc_count=1`, `dpc_drops=0`, DMA common-buffer
+  evidence, and generic PCI I/O-port evidence. The new generic gates
+  `exec_generic_hw_interrupt_delivered` and `exec_generic_hw_dpc_delivered` pass for the real
+  registry-selected E1000 path. Review adjustment: B3 is no longer blocked on E1000 ISR/DPC
+  delivery. The remaining failures are the legacy direct NIC proof gates
+  `exec_nic_has_msi_capability`/`exec_nic_raised_real_interrupt`/
+  `exec_nic_irq_reached_isolated_host`, transport-accounting gates
+  `exec_irp_transport_call_bound`/`exec_client_reply_bound`, and `exec_vm_pool_headroom`.

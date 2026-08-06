@@ -239,6 +239,7 @@ pub const SH_DEVICE_INTERFACE_TARGET_LEN: u64 = 0x782; // out: target DeviceName
 pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
 pub const SH_DEVICE_INTERFACE_LINK_BUF: u64 = 0x790; // out: UTF-16LE path capture
 pub const SH_DEVICE_INTERFACE_TARGET_BUF: u64 = 0x890; // out: UTF-16LE path capture
+pub const SH_HOSTED_CURRENT_IRQL: u64 = 0x990; // in/out: hosted KIRQL byte for patched CR8 helpers
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -265,6 +266,9 @@ pub const V_MJ: u32 = 0x10; // DriverObject->MajorFunction[IRP_MJ_CREATE] is non
 pub const V_REGFS: u32 = 0x20; // IoRegisterFileSystem was called
 pub const V_NAMED_DEVICE: u32 = 0x40; // IoCreateDevice declared a valid NT DeviceName
 pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/target
+
+const PASSIVE_LEVEL: u8 = 0;
+const DISPATCH_LEVEL: u8 = 2;
 
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
@@ -4819,23 +4823,54 @@ extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
     }
 }
 
+#[inline]
+unsafe fn hosted_current_irql() -> u8 {
+    read_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *const u8)
+}
+
+#[inline]
+unsafe fn hosted_set_current_irql(irql: u8) {
+    write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
+}
+
+#[inline]
+unsafe fn hosted_raise_irql(irql: u8) -> u8 {
+    let old = hosted_current_irql();
+    if irql > old {
+        hosted_set_current_irql(irql);
+    }
+    old
+}
+
+#[inline]
+unsafe fn hosted_lower_irql(irql: u8) {
+    hosted_set_current_irql(irql);
+}
+
+/// `KIRQL KeGetCurrentIrql()`.
+extern "win64" fn s_ke_get_current_irql() -> u8 {
+    unsafe { hosted_current_irql() }
+}
+
 /// `KIRQL KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK)` — single-threaded hosted drivers never spin, but
 /// the lock's driver-visible storage records ownership until release.
 extern "win64" fn s_ke_acquire_spin_lock_raise_to_dpc(lock: u64) -> u8 {
     unsafe {
+        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
         if lock != 0 {
             write_unaligned(lock as *mut u64, 1);
         }
+        old_irql
     }
-    0 // previous IRQL: PASSIVE_LEVEL
 }
 
 /// `void KeReleaseSpinLock(PKSPIN_LOCK, KIRQL)`.
-extern "win64" fn s_ke_release_spin_lock(lock: u64, _old_irql: u8) {
+extern "win64" fn s_ke_release_spin_lock(lock: u64, old_irql: u8) {
     unsafe {
         if lock != 0 {
             write_unaligned(lock as *mut u64, 0);
         }
+        hosted_lower_irql(old_irql);
     }
 }
 
@@ -4844,6 +4879,15 @@ extern "win64" fn s_ke_acquire_spin_lock_at_dpc_level(lock: u64) {
     unsafe {
         if lock != 0 {
             write_unaligned(lock as *mut u64, 1);
+        }
+    }
+}
+
+/// `VOID KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK)`.
+extern "win64" fn s_ke_release_spin_lock_from_dpc_level(lock: u64) {
+    unsafe {
+        if lock != 0 {
+            write_unaligned(lock as *mut u64, 0);
         }
     }
 }
@@ -5057,7 +5101,9 @@ unsafe fn fsd_drain_queued_dpcs() -> u64 {
         let arg2 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *const u64);
         let f: extern "win64" fn(u64, u64, u64, u64) =
             core::mem::transmute(routine as *const ());
+        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
         f(dpc, context, arg1, arg2);
+        hosted_lower_irql(old_irql);
         delivered += 1;
     }
     if delivered != 0 {
@@ -6125,7 +6171,11 @@ fn register_fsd_trampolines() {
     );
     reg.bind(
         "KeReleaseSpinLockFromDpcLevel",
-        s_ke_release_spin_lock as *const () as usize as u64,
+        s_ke_release_spin_lock_from_dpc_level as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeGetCurrentIrql",
+        s_ke_get_current_irql as *const () as usize as u64,
     );
     reg.bind("KeEnterCriticalRegion", s_void as usize as u64);
     reg.bind("KeLeaveCriticalRegion", s_void as usize as u64);
@@ -7486,12 +7536,13 @@ unsafe fn load_pe_into(
         }
     }
 
-    // PASSIVE-level transform (documented; the win32k `KeGetCurrentIrql`-cr8 precedent): a kernel
-    // driver reads the current IRQL as `mov %cr8, %reg` — a PRIVILEGED instruction that #GPs in the
-    // component's usermode context (a UserException the fault-reply path can't set RAX through). npfs
-    // runs entirely at PASSIVE_LEVEL (0) in this host, so neutralize each `REX.W 0f 20 c0` (mov %cr8,
-    // %rax) into `xor %eax,%eax; nop` (`31 c0 90 90`, 4 bytes, result 0 = PASSIVE_LEVEL) and each
-    // `mov %reg,%cr8` (`0f 22`, KeLowerIrql, 3 bytes) into `nop`s. Scan the whole loaded image.
+    // CR8 transform (documented; the win32k `KeGetCurrentIrql`-cr8 precedent): a kernel driver reads
+    // the current IRQL as `mov %cr8, %reg` — a privileged instruction that #GPs in the component's
+    // usermode context. ReactOS x64 helpers use `44 0f 20 c0; c3` (`mov %cr8,%rax; ret`); expand that
+    // helper in place to `movzx eax, byte ptr [rip+SH_HOSTED_CURRENT_IRQL]; ret`, so DPC delivery can
+    // report DISPATCH_LEVEL while ordinary dispatch remains PASSIVE_LEVEL. Short inline reads that do
+    // not have a helper-sized padding budget are still neutralized to PASSIVE_LEVEL. CR8 writes are
+    // nopped; hosted IRQL transitions are owned by the ntoskrnl import trampolines and DPC pump.
     {
         let scan = (size_of_image as u64).min(cap);
         let mut p = 0u64;
@@ -7505,10 +7556,32 @@ unsafe fn load_pe_into(
                 let modrm = read_unaligned((dst_va + p + 3) as *const u8);
                 // ModRM = 11 000 rrr (reg field 000 = crN, rm = dest GPR). REX.R (b0 & 4) selects cr8.
                 if (modrm & 0xC0) == 0xC0 && (modrm & 0x38) == 0x00 {
+                    if (b0 & 0x04) != 0
+                        && modrm == 0xC0
+                        && p + 8 <= scan
+                        && read_unaligned((dst_va + p + 4) as *const u8) == 0xC3
+                    {
+                        let target = FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL;
+                        let next_rip = run_va + p + 7;
+                        let disp = target as i64 - next_rip as i64;
+                        if disp >= i32::MIN as i64 && disp <= i32::MAX as i64 {
+                            let d = disp as u32;
+                            write_unaligned((dst_va + p) as *mut u8, 0x0F); // movzx eax, byte ptr [rip+disp32]
+                            write_unaligned((dst_va + p + 1) as *mut u8, 0xB6);
+                            write_unaligned((dst_va + p + 2) as *mut u8, 0x05);
+                            write_unaligned((dst_va + p + 3) as *mut u8, d as u8);
+                            write_unaligned((dst_va + p + 4) as *mut u8, (d >> 8) as u8);
+                            write_unaligned((dst_va + p + 5) as *mut u8, (d >> 16) as u8);
+                            write_unaligned((dst_va + p + 6) as *mut u8, (d >> 24) as u8);
+                            write_unaligned((dst_va + p + 7) as *mut u8, 0xC3); // ret
+                            p += 8;
+                            continue;
+                        }
+                    }
                     write_unaligned((dst_va + p) as *mut u8, 0x31); // xor
                     write_unaligned((dst_va + p + 1) as *mut u8, 0xC0); // eax,eax
-                    write_unaligned((dst_va + p + 2) as *mut u8, 0x90); // nop
-                    write_unaligned((dst_va + p + 3) as *mut u8, 0x90); // nop
+                    write_unaligned((dst_va + p + 2) as *mut u8, 0xB0); // mov al,
+                    write_unaligned((dst_va + p + 3) as *mut u8, PASSIVE_LEVEL);
                     p += 4;
                     continue;
                 }
@@ -7829,6 +7902,10 @@ unsafe fn load_driver_reserved(
     write_volatile((win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64, support_entry_rva);
     write_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
     write_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
+    write_volatile(
+        (win.shared_va + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+        PASSIVE_LEVEL,
+    );
     clear_shared_device_interface_state_at(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);
 

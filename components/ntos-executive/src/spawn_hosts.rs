@@ -852,6 +852,7 @@ struct PumpMessage {
     m1: u64,
     m2: u64,
     m3: u64,
+    m4: u64,
 }
 
 impl PumpMessage {
@@ -901,7 +902,8 @@ macro_rules! pump_recv_into {
                 }
                 continue;
             }
-            $msg = PumpMessage { mi, m0, m1, m2, m3 };
+            let m4 = if (mi & 0x7F) > 4 { crate::get_recv_mr(4) } else { 0 };
+            $msg = PumpMessage { mi, m0, m1, m2, m3, m4 };
             break;
         }
     }};
@@ -939,6 +941,9 @@ struct PumpLoopOutcome {
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
+    wall_flags: u64,
+    wall_exception: u64,
+    wall_code: u64,
     faults: u64,
     demand: u64,
 }
@@ -952,16 +957,22 @@ impl PumpLoopOutcome {
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
+            wall_flags: 0,
+            wall_exception: 0,
+            wall_code: 0,
             faults: 0,
             demand: 0,
         }
     }
 
     #[inline]
-    fn wall(&mut self, ip: u64, addr: u64, label: u64) {
-        self.wall_ip = ip;
-        self.wall_addr = addr;
-        self.wall_label = label;
+    fn wall(&mut self, msg: PumpMessage) {
+        self.wall_ip = msg.m0;
+        self.wall_addr = msg.m1;
+        self.wall_label = msg.label();
+        self.wall_flags = msg.m2;
+        self.wall_exception = msg.m3;
+        self.wall_code = msg.m4;
     }
 }
 
@@ -1028,7 +1039,12 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
             }
             continue;
         }
-        return PumpMessage { mi, m0, m1, m2, m3 };
+        let m4 = if (mi & 0x7F) > 4 {
+            crate::get_recv_mr(4)
+        } else {
+            0
+        };
+        return PumpMessage { mi, m0, m1, m2, m3, m4 };
     }
 }
 
@@ -1046,6 +1062,9 @@ pub(crate) struct PumpResult {
     pub wall_ip: u64,
     pub wall_addr: u64,
     pub wall_label: u64,
+    pub wall_flags: u64,
+    pub wall_exception: u64,
+    pub wall_code: u64,
     pub faults: u64,
     pub demand: u64,
 }
@@ -1159,7 +1178,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
         {
             let disposition = pump_service_user_callback(ch);
             let Some(disposition) = disposition else {
-                outcome.wall(msg.m0, msg.m1, label);
+                outcome.wall(msg);
                 break;
             };
             if disposition == crate::win32k_glue::UserCallbackDisposition::SuspendComponent {
@@ -1195,7 +1214,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 outcome.faults,
                 outcome.demand,
             ) {
-                outcome.wall(msg.m0, msg.m1, label);
+                outcome.wall(msg);
                 break;
             }
             outcome.demand += 1;
@@ -1211,7 +1230,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 pump_reply_recv_into!(ch, msg, 1, next_ip);
                 continue;
             }
-            outcome.wall(msg.m0, msg.m1, label);
+            outcome.wall(msg);
             break;
         } else if label == 3 && ch.caps.assert_skip {
             // ── win32k checked-build int-0x2c ASSERT-SKIP (relocated VERBATIM). Verify CD 2C via the
@@ -1243,7 +1262,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 win32k_wall_diag(ch, label, msg.m0, msg.m1, msg.m2, msg.m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
-            outcome.wall(msg.m0, msg.m1, label);
+            outcome.wall(msg);
             break;
         } else {
             // Any other fault — a real wall inside the handler.
@@ -1251,7 +1270,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 win32k_wall_diag(ch, label, msg.m0, msg.m1, msg.m2, msg.m3);
                 crate::win32k_glue::win32k_dispatch_backtrace();
             }
-            outcome.wall(msg.m0, msg.m1, label);
+            outcome.wall(msg);
             break;
         }
     }
@@ -1564,10 +1583,20 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         crate::print_str(b"[pump] WALL label=");
         crate::print_u64(outcome.wall_label);
         crate::print_str(b" ip=0x");
+        crate::print_hex((outcome.wall_ip >> 32) as u32);
         crate::print_hex(outcome.wall_ip as u32);
         crate::print_str(b" addr=0x");
         crate::print_hex((outcome.wall_addr >> 32) as u32);
         crate::print_hex(outcome.wall_addr as u32);
+        if outcome.wall_label == 3 {
+            crate::print_str(b" exc#=");
+            crate::print_u64(outcome.wall_exception);
+            crate::print_str(b" code=0x");
+            crate::print_hex((outcome.wall_code >> 32) as u32);
+            crate::print_hex(outcome.wall_code as u32);
+            crate::print_str(b" flags=0x");
+            crate::print_hex(outcome.wall_flags as u32);
+        }
         crate::print_str(b" -> TCB_Suspend(component) e=");
         crate::print_u64(e);
         crate::print_str(
@@ -1611,6 +1640,9 @@ unsafe fn pump_result_from_outcome(ch: &PumpChannel, outcome: PumpLoopOutcome) -
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,
+        wall_flags: outcome.wall_flags,
+        wall_exception: outcome.wall_exception,
+        wall_code: outcome.wall_code,
         faults: outcome.faults,
         demand: outcome.demand,
     }
