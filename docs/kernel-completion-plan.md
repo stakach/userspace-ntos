@@ -98,10 +98,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    demand; per-instance executive VAs come from a checked high arena with on-demand PD/PT coverage.
    Hosted common-buffer allocation records now use the per-instance shared arena capacity instead of
    a fixed eight-record table, hosted device bindings, root-PDO bindings, registry identities, and
-   hosted launch side tables now grow on demand while reusing teardown holes, and the shared-frame DPC
-   queue now publishes arena-derived capacity instead of using a fixed inline queue. The raw direct TX
-   proof remains only as a hardware liveness proof before VT-d mapping. The remaining B3 cleanup is to
-   retire or reclassify that direct raw proof once generic PCI evidence fully owns the driver path.
+   hosted launch side tables now grow on demand while reusing teardown holes, the shared-frame DPC
+   queue now publishes arena-derived capacity instead of using a fixed inline queue, and the old raw
+   e1000 TX liveness proof has been retired. Pre-storage PCI setup now registers a generic hosted PCI
+   BAR/common-buffer/IOMMU grant without hand-programming NIC TX registers, and later registry-selected
+   discovery reuses or creates those grants for selected PCI devnodes. Remaining B3 cleanup is the
+   static driver-object construction audit below.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -894,3 +896,25 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_explorer_shell_chrome_painted` pass with `294/294` checks passing. Review adjustment: B3
   launch-state fixed caps are closed; remaining B3 cleanup is to retire or reclassify the direct raw
   NIC liveness proof now that generic PCI evidence owns the driver path.
+- B3 cleanup continued. The old direct e1000 TX liveness proof has been retired from the executive:
+  the raw TX descriptor programming, NIC-specific DMA scratch mapping, `exec_nic_*` gates, and
+  e1000 transmit-register constants are gone. The pre-storage step now only registers a generic
+  hosted PCI grant for the enumerated device: it maps the BAR cap run needed by the legacy KMDF
+  fixture, allocates a per-device common-buffer frame run, maps that grant into the PCI requester's
+  IOMMU domain, and publishes it as an existing hosted PCI grant for later registry-selected launch
+  discovery. Registry-selected PCI grant discovery now also allocates and IOMMU-maps DMA/common-buffer
+  grants for newly claimed PCI devnodes, and its gate requires zero DMA failures for claimed grants.
+  Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-remove-raw-nic-proof-20260807.log`. Result:
+  `exec_hosted_pci_existing_grant_brokered`, `exec_hosted_pci_dma_grant_iommu_brokered`,
+  `exec_hosted_pci_grants_discovered_from_registry`, `exec_generic_hw_mmio_interrupt_dma`,
+  `exec_generic_hw_dpc_delivered`, `exec_generic_pci_registry_selected`,
+  `exec_generic_pci_support_driver_entry`, `exec_generic_pci_add_device_reached`,
+  `exec_generic_pci_io_port_out32`, `exec_fsd_on_shared_harness`,
+  `exec_msgina_logon_dialog_painted`, `exec_vm_pool_headroom`, and
+  `exec_explorer_shell_chrome_painted` pass with `287/287` checks passing. Review adjustment: B3 raw
+  NIC proof cleanup is closed; next B3 work is auditing remaining static driver-object construction
+  sites and deciding which are fixtures versus real dynamic-boundary debt.
