@@ -22,10 +22,11 @@
 //! mechanism.
 
 /// Capacity of the fixed name->VA binding array. Sized for the largest hosted
-/// driver class: win32k.sys (the Subsystem class) registers ~110 distinct
-/// trampolines + data cells; FSD drivers (npfs) register ~35. A generous cap
-/// covers fastfat/ntfs + aliases too.
-pub const DRIVER_TRAMPOLINE_CAP: usize = 160;
+/// driver class: the FSD/device host surface is now shared by real ReactOS
+/// support images such as ndis.sys and registers over 180 distinct NT/HAL
+/// trampolines + aliases. Keep headroom so adding exact imports fails in review
+/// before it fails at boot.
+pub const DRIVER_TRAMPOLINE_CAP: usize = 256;
 
 /// A heap-free, registration-driven resolver for a hosted driver's `ntoskrnl.exe`
 /// imports. Driver-agnostic: the executive owns one per driver class (or shares
@@ -35,6 +36,7 @@ pub struct DriverExportRegistry {
     names: [&'static str; DRIVER_TRAMPOLINE_CAP],
     vas: [u64; DRIVER_TRAMPOLINE_CAP],
     len: usize,
+    exhausted: bool,
 }
 
 impl DriverExportRegistry {
@@ -44,6 +46,7 @@ impl DriverExportRegistry {
             names: [""; DRIVER_TRAMPOLINE_CAP],
             vas: [0; DRIVER_TRAMPOLINE_CAP],
             len: 0,
+            exhausted: false,
         }
     }
 
@@ -57,6 +60,7 @@ impl DriverExportRegistry {
             }
         }
         if self.len >= DRIVER_TRAMPOLINE_CAP {
+            self.exhausted = true;
             return false;
         }
         self.names[self.len] = name;
@@ -88,6 +92,11 @@ impl DriverExportRegistry {
     /// True if no trampolines are bound.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// True once any new binding was rejected because the fixed array was full.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 }
 
@@ -142,8 +151,10 @@ mod tests {
             assert!(reg.bind(name, i as u64 + 1));
         }
         assert_eq!(reg.len(), DRIVER_TRAMPOLINE_CAP);
+        assert!(!reg.is_exhausted());
         // A brand-new name past capacity is rejected.
         assert!(!reg.bind("overflow_name", 0xFFFF));
+        assert!(reg.is_exhausted());
         // But re-binding an already-present name still works.
         assert!(reg.bind(names[0], 0x1234));
         assert_eq!(reg.lookup(names[0]), Some(0x1234));

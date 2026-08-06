@@ -1379,6 +1379,14 @@ pub(crate) struct DriverObjectSpec {
     /// bump allocator over `WIN32K_POOL_VADDR`). `component_main` builds the DRIVER_OBJECT / ext /
     /// RegistryPath from THIS pool — win32k's DriverEntry + `SH_POOL_USED` readback need its own pool.
     pub pool: unsafe fn(u64) -> u64,
+    /// Optional shared-frame offset containing a support image `DriverEntry` RVA relative to
+    /// `code_va`. `u64::MAX` disables support-driver initialization for hosted kinds that do not use
+    /// dependency images.
+    pub support_entry_rva_off: u64,
+    /// Optional shared-frame offset receiving the support image `DriverEntry` status.
+    pub support_status_off: u64,
+    /// Optional shared-frame offset receiving support image verdict bits.
+    pub support_verdict_off: u64,
 }
 
 /// One dispatched request handed to the component-side `dispatch` callback. For the FSD, `sel` is
@@ -1391,10 +1399,11 @@ pub(crate) struct DispatchReq {
 }
 
 /// The component-side shared entry (Family A): read the DriverEntry RVA from the shared frame, build
-/// a `DriverObjectSpec`-shaped DRIVER_OBJECT + a zero-length RegistryPath from the pool, mark
-/// `V_ENTERED`, call `DriverEntry`, record the verdict/status, run `post_driver_entry` (win32k:
-/// establish-client; FSD: no-op — MUST run between DriverEntry and the FIRST completion `Call`),
-/// then loop `call_on(completion) → dispatch(request) → write SH_REQ_STATUS`.
+/// a `DriverObjectSpec`-shaped DRIVER_OBJECT + a zero-length RegistryPath from the pool, optionally
+/// initialize a support image first, call the primary `DriverEntry`, record the verdict/status, run
+/// `post_driver_entry` (win32k: establish-client; FSD: no-op — MUST run between DriverEntry and the
+/// FIRST completion `Call`), then loop `call_on(completion) → dispatch(request) → write
+/// SH_REQ_STATUS`.
 ///
 /// `code_va` is the loaded image base (DriverEntry = code_va + entry_rva). `dispatch` is the KIND
 /// router (FSD: major→run_irp; win32k: ssn→dispatch_ssn). This is the shape both
@@ -1410,46 +1419,52 @@ pub(crate) unsafe fn component_main(
 ) -> ! {
     let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
 
-    // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension at the NT x64 offset, DriverUnload=0,
-    // MajorFunction@spec.mj).
-    let drv = (spec.pool)(spec.size);
-    let ext = (spec.pool)(spec.ext_size);
-    let mut j = 0u64;
-    while j < spec.ext_size {
-        core::ptr::write_unaligned((ext + j) as *mut u64, 0);
-        j += 8;
+    let (drv, reg_path) = component_driver_entry_context(spec);
+
+    let support_entry_rva = if spec.support_entry_rva_off == u64::MAX {
+        0
+    } else {
+        core::ptr::read_volatile((shared_va + spec.support_entry_rva_off) as *const u64)
+    };
+    let mut status = 0;
+    if support_entry_rva != 0 {
+        let (support_drv, support_reg_path) = component_driver_entry_context(spec);
+        if spec.support_verdict_off != u64::MAX {
+            core::ptr::write_volatile(
+                (shared_va + spec.support_verdict_off) as *mut u32,
+                crate::driver_launch::V_ENTERED,
+            );
+        }
+        let support_entry = code_va + support_entry_rva;
+        let support_de: extern "win64" fn(u64, u64) -> i32 =
+            core::mem::transmute(support_entry as *const ());
+        status = support_de(support_drv, support_reg_path);
+        if spec.support_status_off != u64::MAX {
+            core::ptr::write_volatile((shared_va + spec.support_status_off) as *mut i32, status);
+        }
+        if spec.support_verdict_off != u64::MAX {
+            let mut support_v =
+                core::ptr::read_volatile((shared_va + spec.support_verdict_off) as *const u32);
+            support_v |= crate::driver_launch::V_RETURNED;
+            if status == 0 {
+                support_v |= crate::driver_launch::V_SUCCESS;
+            }
+            core::ptr::write_volatile(
+                (shared_va + spec.support_verdict_off) as *mut u32,
+                support_v,
+            );
+        }
     }
-    let driver_bytes = core::slice::from_raw_parts_mut(drv as *mut u8, spec.size as usize);
-    if write_wdm_driver_object(
-        driver_bytes,
-        WdmDriverObjectInit {
-            size_field: spec.size_field,
-            device_object: 0,
-            driver_extension: ext,
-            driver_unload: 0,
-        },
-    )
-    .is_err()
-    {
-        panic!("invalid DriverObjectSpec");
+
+    if status == 0 {
+        core::ptr::write_volatile(
+            (shared_va + SH_VERDICT_H) as *mut u32,
+            crate::driver_launch::V_ENTERED,
+        );
+        let entry = code_va + entry_rva as u64;
+        let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
+        status = de(drv, reg_path);
     }
-
-    // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
-    let reg_path = (spec.pool)(0x18);
-    let reg_buf = (spec.pool)(0x10);
-    core::ptr::write_unaligned(reg_buf as *mut u16, 0);
-    core::ptr::write_unaligned(reg_path as *mut u16, 0);
-    core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
-    core::ptr::write_unaligned((reg_path + 8) as *mut u64, reg_buf);
-
-    core::ptr::write_volatile(
-        (shared_va + SH_VERDICT_H) as *mut u32,
-        crate::driver_launch::V_ENTERED,
-    );
-
-    let entry = code_va + entry_rva as u64;
-    let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
-    let status = de(drv, reg_path);
 
     let mj_base = drv + spec.mj;
     let mj_create = core::ptr::read_unaligned(mj_base as *const u64);
@@ -1515,6 +1530,41 @@ const SH_DE_STATUS_H: u64 = 0x10;
 const SH_REQ_SEL_H: u64 = 0x40;
 /// IoStatus.Information out (FSD @0x78). win32k does not use this field.
 const SH_REQ_INFO_H: u64 = 0x78;
+
+unsafe fn component_driver_entry_context(spec: DriverObjectSpec) -> (u64, u64) {
+    // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension at the NT x64 offset, DriverUnload=0,
+    // MajorFunction@spec.mj).
+    let drv = (spec.pool)(spec.size);
+    let ext = (spec.pool)(spec.ext_size);
+    let mut j = 0u64;
+    while j < spec.ext_size {
+        core::ptr::write_unaligned((ext + j) as *mut u64, 0);
+        j += 8;
+    }
+    let driver_bytes = core::slice::from_raw_parts_mut(drv as *mut u8, spec.size as usize);
+    if write_wdm_driver_object(
+        driver_bytes,
+        WdmDriverObjectInit {
+            size_field: spec.size_field,
+            device_object: 0,
+            driver_extension: ext,
+            driver_unload: 0,
+        },
+    )
+    .is_err()
+    {
+        panic!("invalid DriverObjectSpec");
+    }
+
+    // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
+    let reg_path = (spec.pool)(0x18);
+    let reg_buf = (spec.pool)(0x10);
+    core::ptr::write_unaligned(reg_buf as *mut u16, 0);
+    core::ptr::write_unaligned(reg_path as *mut u16, 0);
+    core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
+    core::ptr::write_unaligned((reg_path + 8) as *mut u64, reg_buf);
+    (drv, reg_path)
+}
 
 /// Family-B one-shot epilogue: run `body` to a verdict, store it at `verdict_va`, signal
 /// `CT_RESULT_NTFN` once, and park. STEP 0 skeleton (Family B folds onto this in the OPTIONAL

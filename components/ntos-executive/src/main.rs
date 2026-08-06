@@ -8739,6 +8739,16 @@ unsafe fn grant_hosted_devnode_resources(
         let mmio_len = grant.assignment.mmio_len.min(0x4000);
         driver_launch::grant_hosted_device_resources(
             device_id,
+            driver_launch::HostedBusIdentity::pci(
+                grant.device.bus,
+                grant.device.dev,
+                grant.device.func,
+                grant.device.vendor,
+                grant.device.device,
+                grant.device.class,
+                grant.device.irq_line,
+                grant.device.irq_pin,
+            ),
             grant.assignment.mmio_phys,
             mmio_len,
             NIC_VADDR,
@@ -8781,6 +8791,7 @@ unsafe fn grant_hosted_devnode_resources(
         let mmio_len = grant.assignment.mmio_len.min(0x1000);
         driver_launch::grant_hosted_device_resources(
             device_id,
+            driver_launch::HostedBusIdentity::root_bus(),
             grant.assignment.mmio_phys,
             mmio_len,
             NIC_VADDR,

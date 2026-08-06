@@ -80,9 +80,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ## Immediate Iteration
 
-1. Move PCI-backed hosted device proof onto the generic grant boundary: either add a real
-   PCI-capable WDM fixture that consumes the e1000 BAR honestly, or advance enough NDIS/ReactOS
-   driver support for `e1000.sys` to bind through the same dynamic resource path.
+1. Complete the NDIS-backed PCI path for ReactOS `e1000.sys`: project devnode/driver registry
+   identity into `DevicePropertyDriverKeyName` and the miniport `Linkage` key, then drive real NDIS
+   AddDevice/StartDevice/miniport initialization through the generic PCI MMIO/interrupt/DMA grant.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -476,3 +476,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
   adjustment: next B3 work should implement the real NT/HAL import surface required by ReactOS
   `ndis.sys`, then initialize the NDIS support driver before binding `e1000.sys` through generic PCI
   grants.
+- B3 cleanup continued. The hosted component harness can now initialize an optional support driver
+  image before the primary hosted driver's `DriverEntry`, and support failure prevents the primary
+  image from being marked entered or registered. ReactOS `ndis.sys` remains a real loaded PE support
+  image: all NT/HAL imports from its import table have exact trampoline bindings, including RTL
+  ANSI/Unicode/integer helpers, driver-object extensions, interlocked lists/SLists, work items,
+  MDL/memory helpers, timers/DPC/spin helpers, bounded Zw registry/file failures, and grant-bound HAL
+  bus translation/interrupt/PCI config reads. Generic hosted resource grants now also carry bus
+  identity, PCI address, vendor/device/class, and interrupt line/pin so `IoGetDeviceProperty` and
+  `HalGetBusDataByOffset` answer from assigned devnode state instead of hardcoded process identity.
+  Validation found and fixed one harness-limit regression: the shared `DriverExportRegistry` was
+  still capped at 160 entries while the real FSD/NDIS surface now binds 184 names, causing late
+  imports such as `DbgPrint` to fail silently and preventing `Msfs`/`Npfs` from loading. The registry
+  cap is now 256, exhaustion is tracked/tested, and FSD registration panics if capacity is exceeded.
+  Validation: `cargo fmt --all`, `cargo test -p nt-compat-exports`, static `ndis.sys`/`npfs.sys`/
+  `msfs.sys` import comparison against `register_fsd_trampolines()`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` through genuine explorer shell chrome with
+  `286/288` checks passing; the only failing checks remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates.
+  Review adjustment: `e1000.sys` still cannot complete AddDevice because NDIS asks for
+  `DevicePropertyDriverKeyName`/miniport `Linkage` registry data, and the hosted driver registry
+  handle is currently an empty key that returns truthful missing/unsupported statuses. The next B3
+  slice should project devnode-backed driver-key registry state, then run the staged boot and convert
+  the real NDIS/e1000 startup evidence into gates before removing the old bespoke NIC proof.

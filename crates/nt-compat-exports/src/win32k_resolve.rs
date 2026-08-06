@@ -60,6 +60,8 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::ExportStatus;
+    use std::boxed::Box;
+    use std::vec::Vec;
 
     /// The first batch migrated onto the registry (pool + RTL-atom + Ob groups).
     /// Every one must be a *declared* export backed by a real `nt-*` subsystem
@@ -116,28 +118,21 @@ mod tests {
 
     #[test]
     fn capacity_boundary() {
-        // The executive binds ~41 distinct trampolines (aliases share a VA), well
-        // under the cap. Exercise the boundary directly: fill to capacity from the
-        // declared import surface, then confirm the next *new* name is rejected
-        // while a re-bind of an existing name still succeeds.
-        assert!(
-            crate::WIN32K_NTOSKRNL_IMPORTS.len() > WIN32K_TRAMPOLINE_CAP,
-            "need more distinct names than the cap to test the boundary"
-        );
+        // Exercise the shared registry boundary directly with generated static names.
         let mut reg = Win32kExportRegistry::new();
-        for (i, name) in crate::WIN32K_NTOSKRNL_IMPORTS
-            .iter()
-            .take(WIN32K_TRAMPOLINE_CAP)
-            .enumerate()
-        {
+        let names: Vec<&'static str> = (0..WIN32K_TRAMPOLINE_CAP)
+            .map(|i| &*Box::leak(std::format!("w{i}").into_boxed_str()))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
             assert!(reg.bind(name, i as u64 + 1));
         }
         assert_eq!(reg.len(), WIN32K_TRAMPOLINE_CAP);
+        assert!(!reg.is_exhausted());
         // A new name past capacity is rejected.
-        let overflow = crate::WIN32K_NTOSKRNL_IMPORTS[WIN32K_TRAMPOLINE_CAP];
-        assert!(!reg.bind(overflow, 0xFFFF));
+        assert!(!reg.bind("overflow_name", 0xFFFF));
+        assert!(reg.is_exhausted());
         // But re-binding an already-present name still works (no growth needed).
-        let existing = crate::WIN32K_NTOSKRNL_IMPORTS[0];
+        let existing = names[0];
         assert!(reg.bind(existing, 0x1234));
         assert_eq!(reg.lookup(existing), Some(0x1234));
     }

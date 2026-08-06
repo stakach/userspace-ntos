@@ -209,6 +209,15 @@ pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: failed inserts due to full qu
 pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
 pub const SH_DPC_QUEUE_BASE: u64 = 0x490; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_SLOTS: u64 = 4;
+pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: optional support DriverEntry RVA relative to image base
+pub const SH_SUPPORT_DE_STATUS: u64 = 0x4B8; // out: support DriverEntry NTSTATUS
+pub const SH_SUPPORT_VERDICT: u64 = 0x4C0; // out: support DriverEntry verdict bits
+pub const SH_RESOURCE_INTERFACE_TYPE: u64 = 0x4C8; // in: granted INTERFACE_TYPE for bus APIs
+pub const SH_RESOURCE_BUS_NUMBER: u64 = 0x4D0; // in: granted bus number
+pub const SH_RESOURCE_ADDRESS: u64 = 0x4D8; // in: DevicePropertyAddress value
+pub const SH_RESOURCE_PCI_VENDOR_DEVICE: u64 = 0x4E0; // in: PCI config dword 0x00
+pub const SH_RESOURCE_PCI_CLASS_REV: u64 = 0x4E8; // in: PCI config dword 0x08
+pub const SH_RESOURCE_PCI_IRQ: u64 = 0x4F0; // in: PCI interrupt line/pin bytes
 
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
@@ -989,6 +998,10 @@ extern "win64" fn s_ke_set_timer(_timer: u64, _due_time: u64, _dpc: u64) -> u8 {
     0
 }
 
+extern "win64" fn s_ke_set_timer_ex(_timer: u64, _due_time: u64, _period: i32, _dpc: u64) -> u8 {
+    0
+}
+
 extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
     let mut spins = 0u32;
     let limit = microseconds.min(1000).saturating_mul(64);
@@ -1014,12 +1027,53 @@ extern "win64" fn s_c_specific_handler(
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
+const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 
 const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
 const UNICODE_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
 const UNICODE_STRING_BUFFER_OFFSET: u64 = 8;
+const ANSI_STRING_LENGTH_OFFSET: u64 = 0;
+const ANSI_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
+const ANSI_STRING_BUFFER_OFFSET: u64 = 8;
+
+static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
+
+const DRIVER_OBJECT_EXTENSION_SLOTS: usize = 16;
+const DRIVER_REGISTRY_HANDLE_SLOTS: usize = 8;
+const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_FF00_4452_0000;
+
+#[derive(Clone, Copy)]
+struct DriverObjectExtensionSlot {
+    driver_object: u64,
+    client_id: u64,
+    extension: u64,
+    used: bool,
+}
+
+static mut DRIVER_OBJECT_EXTENSIONS: [DriverObjectExtensionSlot; DRIVER_OBJECT_EXTENSION_SLOTS] =
+    [DriverObjectExtensionSlot {
+        driver_object: 0,
+        client_id: 0,
+        extension: 0,
+        used: false,
+    }; DRIVER_OBJECT_EXTENSION_SLOTS];
+
+#[derive(Clone, Copy)]
+struct DriverRegistryHandleSlot {
+    handle: u64,
+    used: bool,
+}
+
+static mut DRIVER_REGISTRY_HANDLES: [DriverRegistryHandleSlot; DRIVER_REGISTRY_HANDLE_SLOTS] =
+    [DriverRegistryHandleSlot {
+        handle: 0,
+        used: false,
+    }; DRIVER_REGISTRY_HANDLE_SLOTS];
 
 #[inline]
 fn ascii_upcase_u16(c: u16) -> u16 {
@@ -1241,6 +1295,416 @@ extern "win64" fn s_rtl_upcase_unicode_string(dst: u64, src: u64, allocate: u8) 
     STATUS_SUCCESS
 }
 
+/// `NTSTATUS RtlAppendUnicodeStringToString(PUNICODE_STRING Dest, PCUNICODE_STRING Src)`.
+extern "win64" fn s_rtl_append_unicode_string_to_string(dst: u64, src: u64) -> i32 {
+    if dst == 0 || src == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let dst_len = read_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *const u16) & !1;
+        let dst_max =
+            read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+        let dst_buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+        let (src_len, _src_max, src_buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
+        if dst_buf == 0 || (src_len != 0 && src_buf == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if src_len > dst_max.saturating_sub(dst_len) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        copy_bytes_unchecked(dst_buf + dst_len as u64, src_buf, src_len as u64);
+        let new_len = dst_len + src_len;
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, new_len);
+        if new_len <= dst_max.saturating_sub(2) {
+            write_unaligned((dst_buf + new_len as u64) as *mut u16, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlAppendUnicodeToString(PUNICODE_STRING Dest, PCWSTR Src)`.
+extern "win64" fn s_rtl_append_unicode_to_string(dst: u64, src: u64) -> i32 {
+    if dst == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if src == 0 {
+        return STATUS_SUCCESS;
+    }
+    unsafe {
+        let dst_len = read_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *const u16) & !1;
+        let dst_max =
+            read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+        let dst_buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+        if dst_buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let src_chars = s_wcslen(src) as u16;
+        let src_len = src_chars.saturating_mul(2);
+        if src_len > dst_max.saturating_sub(dst_len) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        copy_bytes_unchecked(dst_buf + dst_len as u64, src, src_len as u64);
+        let new_len = dst_len + src_len;
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, new_len);
+        if new_len <= dst_max.saturating_sub(2) {
+            write_unaligned((dst_buf + new_len as u64) as *mut u16, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_equal_unicode_string(left: u64, right: u64, case_insensitive: u8) -> u8 {
+    (s_rtl_compare_unicode_string(left, right, case_insensitive) == 0) as u8
+}
+
+unsafe fn ansi_string_triplet(s: u64) -> Option<(u16, u16, u64)> {
+    if s == 0 {
+        return None;
+    }
+    Some((
+        read_unaligned((s + ANSI_STRING_LENGTH_OFFSET) as *const u16),
+        read_unaligned((s + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16),
+        read_unaligned((s + ANSI_STRING_BUFFER_OFFSET) as *const u64),
+    ))
+}
+
+unsafe fn strlen8(src: u64) -> u16 {
+    if src == 0 {
+        return 0;
+    }
+    let mut n = 0u64;
+    while n < u16::MAX as u64 && read_unaligned((src + n) as *const u8) != 0 {
+        n += 1;
+    }
+    n as u16
+}
+
+/// `VOID RtlInitAnsiString(PANSI_STRING Dest, PCSZ Source)` / `RtlInitString`.
+extern "win64" fn s_rtl_init_ansi_string(dst: u64, src: u64) {
+    if dst == 0 {
+        return;
+    }
+    unsafe {
+        let len = strlen8(src);
+        write_unaligned((dst + ANSI_STRING_LENGTH_OFFSET) as *mut u16, len);
+        write_unaligned(
+            (dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+            if src == 0 { 0 } else { len.saturating_add(1) },
+        );
+        write_unaligned((dst + ANSI_STRING_BUFFER_OFFSET) as *mut u64, src);
+    }
+}
+
+/// `NTSTATUS RtlAnsiStringToUnicodeString(PUNICODE_STRING, PCANSI_STRING, BOOLEAN Allocate)`.
+extern "win64" fn s_rtl_ansi_string_to_unicode_string(dst: u64, src: u64, allocate: u8) -> i32 {
+    if dst == 0 || src == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let (src_len, _src_max, src_buf) = ansi_string_triplet(src).unwrap_or((0, 0, 0));
+        if src_len != 0 && src_buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let out_len = src_len.saturating_mul(2);
+        let dst_buf = if allocate != 0 {
+            let alloc_len = (out_len as u64).saturating_add(2);
+            let p = pool_alloc(alloc_len);
+            if p == 0 {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            write_unaligned(
+                (dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+                alloc_len as u16,
+            );
+            write_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, p);
+            p
+        } else {
+            let max_len = read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16);
+            let p = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+            if out_len > max_len || (out_len != 0 && p == 0) {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            p
+        };
+        let mut i = 0u64;
+        while i < src_len as u64 {
+            let b = read_unaligned((src_buf + i) as *const u8);
+            write_unaligned((dst_buf + i * 2) as *mut u16, b as u16);
+            i += 1;
+        }
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, out_len);
+        if out_len <= read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16).saturating_sub(2) {
+            write_unaligned((dst_buf + out_len as u64) as *mut u16, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN Allocate)`.
+extern "win64" fn s_rtl_unicode_string_to_ansi_string(dst: u64, src: u64, allocate: u8) -> i32 {
+    if dst == 0 || src == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let (src_len, _src_max, src_buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
+        if src_len != 0 && src_buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let out_len = src_len / 2;
+        let dst_buf = if allocate != 0 {
+            let alloc_len = (out_len as u64).saturating_add(1);
+            let p = pool_alloc(alloc_len);
+            if p == 0 {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            write_unaligned(
+                (dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+                alloc_len as u16,
+            );
+            write_unaligned((dst + ANSI_STRING_BUFFER_OFFSET) as *mut u64, p);
+            p
+        } else {
+            let max_len = read_unaligned((dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16);
+            let p = read_unaligned((dst + ANSI_STRING_BUFFER_OFFSET) as *const u64);
+            if out_len > max_len || (out_len != 0 && p == 0) {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            p
+        };
+        let mut i = 0u64;
+        while i < out_len as u64 {
+            let w = read_unaligned((src_buf + i * 2) as *const u16);
+            write_unaligned(
+                (dst_buf + i) as *mut u8,
+                if w <= 0x7f { w as u8 } else { b'?' },
+            );
+            i += 1;
+        }
+        write_unaligned((dst + ANSI_STRING_LENGTH_OFFSET) as *mut u16, out_len);
+        if out_len <= read_unaligned((dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16).saturating_sub(1) {
+            write_unaligned((dst_buf + out_len as u64) as *mut u8, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `LONG RtlCompareString(PCANSI_STRING, PCANSI_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_compare_string(left: u64, right: u64, case_insensitive: u8) -> i32 {
+    unsafe {
+        let (left_len, _left_max, left_buf) = ansi_string_triplet(left).unwrap_or((0, 0, 0));
+        let (right_len, _right_max, right_buf) = ansi_string_triplet(right).unwrap_or((0, 0, 0));
+        let common = (left_len as u64).min(right_len as u64);
+        let mut i = 0u64;
+        while i < common {
+            let mut a = if left_buf == 0 {
+                0
+            } else {
+                read_unaligned((left_buf + i) as *const u8)
+            };
+            let mut b = if right_buf == 0 {
+                0
+            } else {
+                read_unaligned((right_buf + i) as *const u8)
+            };
+            if case_insensitive != 0 {
+                a = ascii_upcase_u8(a);
+                b = ascii_upcase_u8(b);
+            }
+            if a != b {
+                return a as i32 - b as i32;
+            }
+            i += 1;
+        }
+        left_len as i32 - right_len as i32
+    }
+}
+
+/// `NTSTATUS RtlIntegerToUnicodeString(ULONG Value, ULONG Base, PUNICODE_STRING String)`.
+extern "win64" fn s_rtl_integer_to_unicode_string(value: u32, base: u32, dst: u64) -> i32 {
+    if dst == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let radix = if base == 0 { 10 } else { base };
+    if !(2..=16).contains(&radix) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let max_len = read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+        let buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
+        if buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mut tmp = [0u16; 32];
+        let mut n = 0usize;
+        let mut v = value;
+        loop {
+            let d = (v % radix) as u8;
+            tmp[n] = if d < 10 {
+                (b'0' + d) as u16
+            } else {
+                (b'A' + d - 10) as u16
+            };
+            n += 1;
+            v /= radix;
+            if v == 0 {
+                break;
+            }
+        }
+        let need = (n * 2) as u16;
+        if need > max_len {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let mut i = 0usize;
+        while i < n {
+            write_unaligned((buf + (i as u64) * 2) as *mut u16, tmp[n - 1 - i]);
+            i += 1;
+        }
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, need);
+        if need <= max_len.saturating_sub(2) {
+            write_unaligned((buf + need as u64) as *mut u16, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlUnicodeStringToInteger(PCUNICODE_STRING String, ULONG Base, PULONG Value)`.
+extern "win64" fn s_rtl_unicode_string_to_integer(src: u64, base: u32, value_out: u64) -> i32 {
+    if src == 0 || value_out == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut radix = if base == 0 { 10 } else { base };
+    if !(2..=16).contains(&radix) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let (len, _max, buf) = unicode_string_triplet(src).unwrap_or((0, 0, 0));
+        if len != 0 && buf == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let chars = (len / 2) as u64;
+        let mut i = 0u64;
+        while i < chars && read_unaligned((buf + i * 2) as *const u16) == b' ' as u16 {
+            i += 1;
+        }
+        if base == 0
+            && i + 1 < chars
+            && read_unaligned((buf + i * 2) as *const u16) == b'0' as u16
+            && ascii_upcase_u16(read_unaligned((buf + (i + 1) * 2) as *const u16)) == b'X' as u16
+        {
+            radix = 16;
+            i += 2;
+        }
+        let mut value = 0u32;
+        let mut saw_digit = false;
+        while i < chars {
+            let c = ascii_upcase_u16(read_unaligned((buf + i * 2) as *const u16));
+            let digit = if (b'0' as u16..=b'9' as u16).contains(&c) {
+                c - b'0' as u16
+            } else if (b'A' as u16..=b'F' as u16).contains(&c) {
+                c - b'A' as u16 + 10
+            } else {
+                break;
+            };
+            if digit as u32 >= radix {
+                break;
+            }
+            value = value.saturating_mul(radix).saturating_add(digit as u32);
+            saw_digit = true;
+            i += 1;
+        }
+        if !saw_digit {
+            return STATUS_INVALID_PARAMETER;
+        }
+        write_unaligned(value_out as *mut u32, value);
+    }
+    STATUS_SUCCESS
+}
+
+/// `wcsncmp`.
+extern "win64" fn s_wcsncmp(left: u64, right: u64, count: u64) -> i32 {
+    unsafe {
+        let mut i = 0u64;
+        while i < count {
+            let a = if left == 0 { 0 } else { read_unaligned((left + i * 2) as *const u16) };
+            let b = if right == 0 { 0 } else { read_unaligned((right + i * 2) as *const u16) };
+            if a != b || a == 0 || b == 0 {
+                return a as i32 - b as i32;
+            }
+            i += 1;
+        }
+    }
+    0
+}
+
+extern "win64" fn s_wcscpy(dst: u64, src: u64) -> u64 {
+    unsafe {
+        let mut i = 0u64;
+        loop {
+            let c = if src == 0 { 0 } else { read_unaligned((src + i * 2) as *const u16) };
+            write_unaligned((dst + i * 2) as *mut u16, c);
+            i += 1;
+            if c == 0 {
+                break;
+            }
+        }
+    }
+    dst
+}
+
+extern "win64" fn s_wcsncpy(dst: u64, src: u64, count: u64) -> u64 {
+    unsafe {
+        let mut i = 0u64;
+        let mut padding = false;
+        while i < count {
+            let c = if padding || src == 0 {
+                0
+            } else {
+                read_unaligned((src + i * 2) as *const u16)
+            };
+            write_unaligned((dst + i * 2) as *mut u16, c);
+            if c == 0 {
+                padding = true;
+            }
+            i += 1;
+        }
+    }
+    dst
+}
+
+unsafe fn wcs_end(mut s: u64) -> u64 {
+    while read_unaligned(s as *const u16) != 0 {
+        s += 2;
+    }
+    s
+}
+
+extern "win64" fn s_wcscat(dst: u64, src: u64) -> u64 {
+    unsafe {
+        let end = wcs_end(dst);
+        let _ = s_wcscpy(end, src);
+    }
+    dst
+}
+
+extern "win64" fn s_wcsncat(dst: u64, src: u64, count: u64) -> u64 {
+    unsafe {
+        let mut out = wcs_end(dst);
+        let mut i = 0u64;
+        while i < count {
+            let c = if src == 0 { 0 } else { read_unaligned((src + i * 2) as *const u16) };
+            if c == 0 {
+                break;
+            }
+            write_unaligned(out as *mut u16, c);
+            out += 2;
+            i += 1;
+        }
+        write_unaligned(out as *mut u16, 0);
+    }
+    dst
+}
+
 unsafe fn unicode_string_parts(us: u64) -> Option<(u64, u16)> {
     if us == 0 {
         return None;
@@ -1354,6 +1818,278 @@ extern "win64" fn s_io_delete_device(dev: u64) {
         }
     }
 }
+
+/// `NTSTATUS IoAllocateDriverObjectExtension(PDRIVER_OBJECT, PVOID ClientId, ULONG Size, PVOID *Out)`.
+extern "win64" fn s_io_allocate_driver_object_extension(
+    driver_object: u64,
+    client_id: u64,
+    size: u32,
+    extension_out: u64,
+) -> i32 {
+    if driver_object == 0 || extension_out == 0 || size == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(DRIVER_OBJECT_EXTENSIONS);
+        if table
+            .iter()
+            .any(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
+        {
+            write_unaligned(extension_out as *mut u64, 0);
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+        let Some(slot) = table.iter_mut().find(|slot| !slot.used) else {
+            write_unaligned(extension_out as *mut u64, 0);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let extension = pool_alloc(size as u64);
+        if extension == 0 {
+            write_unaligned(extension_out as *mut u64, 0);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        core::ptr::write_bytes(extension as *mut u8, 0, size as usize);
+        *slot = DriverObjectExtensionSlot {
+            driver_object,
+            client_id,
+            extension,
+            used: true,
+        };
+        write_unaligned(extension_out as *mut u64, extension);
+    }
+    STATUS_SUCCESS
+}
+
+/// `PVOID IoGetDriverObjectExtension(PDRIVER_OBJECT, PVOID ClientId)`.
+extern "win64" fn s_io_get_driver_object_extension(driver_object: u64, client_id: u64) -> u64 {
+    unsafe {
+        let table = &*core::ptr::addr_of!(DRIVER_OBJECT_EXTENSIONS);
+        table
+            .iter()
+            .find(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
+            .map(|slot| slot.extension)
+            .unwrap_or(0)
+    }
+}
+
+unsafe fn allocate_driver_registry_handle() -> Option<u64> {
+    let table = &mut *core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES);
+    for (idx, slot) in table.iter_mut().enumerate() {
+        if !slot.used {
+            let handle = DRIVER_REGISTRY_HANDLE_BASE | idx as u64;
+            *slot = DriverRegistryHandleSlot { handle, used: true };
+            return Some(handle);
+        }
+    }
+    None
+}
+
+unsafe fn close_driver_registry_handle(handle: u64) -> bool {
+    if (handle & !0xFF) != DRIVER_REGISTRY_HANDLE_BASE {
+        return false;
+    }
+    let idx = (handle & 0xFF) as usize;
+    let table = &mut *core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES);
+    if idx >= table.len() || !table[idx].used || table[idx].handle != handle {
+        return false;
+    }
+    table[idx] = DriverRegistryHandleSlot {
+        handle: 0,
+        used: false,
+    };
+    true
+}
+
+unsafe fn driver_registry_handle_live(handle: u64) -> bool {
+    if (handle & !0xFF) != DRIVER_REGISTRY_HANDLE_BASE {
+        return false;
+    }
+    let idx = (handle & 0xFF) as usize;
+    let table = &*core::ptr::addr_of!(DRIVER_REGISTRY_HANDLES);
+    idx < table.len() && table[idx].used && table[idx].handle == handle
+}
+
+/// `NTSTATUS IoOpenDeviceRegistryKey(PDEVICE_OBJECT, ULONG, ACCESS_MASK, PHANDLE)`.
+extern "win64" fn s_io_open_device_registry_key(
+    pdo: u64,
+    _dev_inst_key_type: u32,
+    _desired_access: u32,
+    handle_out: u64,
+) -> i32 {
+    if handle_out == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if unsafe { !hosted_pdo_known(pdo) } {
+        unsafe {
+            write_unaligned(handle_out as *mut u64, 0);
+        }
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let Some(handle) = allocate_driver_registry_handle() else {
+            write_unaligned(handle_out as *mut u64, 0);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        write_unaligned(handle_out as *mut u64, handle);
+    }
+    STATUS_SUCCESS
+}
+
+const DEVICE_PROPERTY_DRIVER_KEY_NAME: u32 = 0x7;
+const DEVICE_PROPERTY_LEGACY_BUS_TYPE: u32 = 0xD;
+const DEVICE_PROPERTY_BUS_NUMBER: u32 = 0xE;
+const DEVICE_PROPERTY_ADDRESS: u32 = 0x10;
+pub(crate) const HOSTED_INTERFACE_TYPE_INTERNAL: u32 = 0;
+pub(crate) const HOSTED_INTERFACE_TYPE_PCIBUS: u32 = 5;
+const BUS_DATA_TYPE_PCI_CONFIGURATION: u32 = 4;
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedBusIdentity {
+    pub interface_type: u32,
+    pub bus_number: u32,
+    pub address: u32,
+    pub pci_vendor_id: u16,
+    pub pci_device_id: u16,
+    pub pci_class: u32,
+    pub pci_irq_line: u8,
+    pub pci_irq_pin: u8,
+}
+
+impl HostedBusIdentity {
+    pub(crate) const fn root_bus() -> Self {
+        Self {
+            interface_type: HOSTED_INTERFACE_TYPE_INTERNAL,
+            bus_number: 0,
+            address: 0,
+            pci_vendor_id: 0,
+            pci_device_id: 0,
+            pci_class: 0,
+            pci_irq_line: 0,
+            pci_irq_pin: 0,
+        }
+    }
+
+    pub(crate) const fn pci(
+        bus: u8,
+        dev: u8,
+        func: u8,
+        vendor: u16,
+        device: u16,
+        class: u32,
+        irq_line: u8,
+        irq_pin: u8,
+    ) -> Self {
+        Self {
+            interface_type: HOSTED_INTERFACE_TYPE_PCIBUS,
+            bus_number: bus as u32,
+            address: ((dev as u32) << 16) | func as u32,
+            pci_vendor_id: vendor,
+            pci_device_id: device,
+            pci_class: class,
+            pci_irq_line: irq_line,
+            pci_irq_pin: irq_pin,
+        }
+    }
+}
+
+unsafe fn write_u32_property(buffer_len: u32, buffer: u64, result_len: u64, value: u32) -> i32 {
+    if result_len != 0 {
+        write_unaligned(result_len as *mut u32, 4);
+    }
+    if buffer_len < 4 || buffer == 0 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    write_unaligned(buffer as *mut u32, value);
+    STATUS_SUCCESS
+}
+
+unsafe fn hosted_resource_identity_active() -> bool {
+    read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64) != 0
+        || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32) != 0
+        || read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64) != 0
+}
+
+unsafe fn hosted_pdo_known(pdo: u64) -> bool {
+    pdo != 0
+        && (hosted_device_binding_by_pdo_object(pdo).is_some()
+            || read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64) == pdo)
+}
+
+/// `NTSTATUS IoGetDeviceProperty(PDEVICE_OBJECT, DEVICE_REGISTRY_PROPERTY, ULONG, PVOID, PULONG)`.
+extern "win64" fn s_io_get_device_property(
+    pdo: u64,
+    property: u32,
+    buffer_len: u32,
+    buffer: u64,
+    result_len: u64,
+) -> i32 {
+    unsafe {
+        if !hosted_pdo_known(pdo) {
+            if result_len != 0 {
+                write_unaligned(result_len as *mut u32, 0);
+            }
+            return STATUS_INVALID_PARAMETER;
+        }
+        if !hosted_resource_identity_active() {
+            if result_len != 0 {
+                write_unaligned(result_len as *mut u32, 0);
+            }
+            return STATUS_NOT_SUPPORTED;
+        }
+        match property {
+            DEVICE_PROPERTY_LEGACY_BUS_TYPE => {
+                let value =
+                    read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
+                write_u32_property(buffer_len, buffer, result_len, value)
+            }
+            DEVICE_PROPERTY_BUS_NUMBER | DEVICE_PROPERTY_ADDRESS => {
+                let value = if property == DEVICE_PROPERTY_BUS_NUMBER {
+                    read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+                } else {
+                    read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_ADDRESS) as *const u32)
+                };
+                write_u32_property(buffer_len, buffer, result_len, value)
+            }
+            DEVICE_PROPERTY_DRIVER_KEY_NAME => {
+                if result_len != 0 {
+                    write_unaligned(result_len as *mut u32, 0);
+                }
+                STATUS_NOT_SUPPORTED
+            }
+            _ => STATUS_NOT_SUPPORTED,
+        }
+    }
+}
+
+/// `NTSTATUS IoRegisterDeviceInterface(...)`.
+extern "win64" fn s_io_register_device_interface(
+    _pdo: u64,
+    _class_guid: u64,
+    _reference_string: u64,
+    symbolic_link_name: u64,
+) -> i32 {
+    if symbolic_link_name == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        write_unaligned((symbolic_link_name + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
+        write_unaligned(
+            (symbolic_link_name + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+            0,
+        );
+        write_unaligned((symbolic_link_name + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, 0);
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+extern "win64" fn s_io_set_device_interface_state(_symbolic_link_name: u64, _enable: u8) -> i32 {
+    STATUS_NOT_SUPPORTED
+}
+
+extern "win64" fn s_io_register_shutdown_notification(_device: u64) -> i32 {
+    STATUS_NOT_SUPPORTED
+}
+
+extern "win64" fn s_io_unregister_shutdown_notification(_device: u64) {}
 
 fn nt_path_ascii_string(path: &NtPath) -> Option<String> {
     let mut out = String::new();
@@ -1544,6 +2280,45 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
 extern "win64" fn s_io_free_irp(irp: u64) {
     unsafe {
         pool_free(irp);
+    }
+}
+
+/// `PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT)`.
+extern "win64" fn s_io_allocate_work_item(device_object: u64) -> u64 {
+    unsafe {
+        let work_item = pool_alloc(0x40);
+        if work_item == 0 {
+            return 0;
+        }
+        core::ptr::write_bytes(work_item as *mut u8, 0, 0x40);
+        write_unaligned((work_item + 0x20) as *mut u64, device_object);
+        work_item
+    }
+}
+
+/// `VOID IoQueueWorkItem(PIO_WORKITEM, PIO_WORKITEM_ROUTINE, WORK_QUEUE_TYPE, PVOID)`.
+extern "win64" fn s_io_queue_work_item(
+    work_item: u64,
+    worker_routine: u64,
+    _queue_type: u32,
+    context: u64,
+) {
+    if work_item == 0 || worker_routine == 0 {
+        return;
+    }
+    unsafe {
+        let device_object = read_unaligned((work_item + 0x20) as *const u64);
+        write_unaligned((work_item + 0x28) as *mut u64, worker_routine);
+        write_unaligned((work_item + 0x30) as *mut u64, context);
+        let f: extern "win64" fn(u64, u64) = core::mem::transmute(worker_routine as *const ());
+        f(device_object, context);
+    }
+}
+
+/// `VOID IoFreeWorkItem(PIO_WORKITEM)`.
+extern "win64" fn s_io_free_work_item(work_item: u64) {
+    unsafe {
+        pool_free(work_item);
     }
 }
 
@@ -1857,6 +2632,46 @@ extern "win64" fn s_io_free_mdl(mdl: u64) {
     }
 }
 
+/// `VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length)`.
+extern "win64" fn s_io_build_partial_mdl(source_mdl: u64, target_mdl: u64, virtual_address: u64, length: u32) {
+    if source_mdl == 0 || target_mdl == 0 {
+        return;
+    }
+    unsafe {
+        let source_start = read_unaligned((source_mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+        let source_offset = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+        let source_len = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32);
+        let va = if virtual_address != 0 {
+            virtual_address
+        } else {
+            source_start + source_offset as u64
+        };
+        let len = if length != 0 { length } else { source_len };
+        write_unaligned((target_mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
+            nt_mdl::MDL_SIZE as i16,
+        );
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+            nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
+        );
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
+            va & !0xFFF,
+        );
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
+            len,
+        );
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
+            (va & 0xFFF) as u32,
+        );
+        write_unaligned((target_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64, va);
+    }
+}
+
 /// `VOID MmBuildMdlForNonPagedPool(PMDL)` — mark the MDL nonpaged and set `MappedSystemVa`.
 extern "win64" fn s_mm_build_mdl_for_nonpaged_pool(mdl: u64) {
     unsafe {
@@ -1899,6 +2714,42 @@ extern "win64" fn s_mm_map_locked_pages_specify_cache(
         let start = read_unaligned((mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
         let offset = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
         start + offset as u64
+    }
+}
+
+/// `PVOID MmMapLockedPages(PMDL, KPROCESSOR_MODE)`.
+extern "win64" fn s_mm_map_locked_pages(mdl: u64, access_mode: u8) -> u64 {
+    s_mm_map_locked_pages_specify_cache(mdl, access_mode, 0, 0, 0, 0)
+}
+
+/// `PVOID MmAllocateContiguousMemorySpecifyCache(...)`.
+extern "win64" fn s_mm_allocate_contiguous_memory_specify_cache(
+    number_of_bytes: u64,
+    _lowest: u64,
+    _highest: u64,
+    _boundary: u64,
+    _cache_type: u32,
+) -> u64 {
+    unsafe { pool_alloc(number_of_bytes) }
+}
+
+extern "win64" fn s_mm_free_contiguous_memory_specify_cache(
+    base: u64,
+    _number_of_bytes: u64,
+    _cache_type: u32,
+) {
+    unsafe {
+        pool_free(base);
+    }
+}
+
+extern "win64" fn s_mm_allocate_non_cached_memory(number_of_bytes: u64) -> u64 {
+    unsafe { pool_alloc(number_of_bytes) }
+}
+
+extern "win64" fn s_mm_free_non_cached_memory(base: u64, _number_of_bytes: u64) {
+    unsafe {
+        pool_free(base);
     }
 }
 
@@ -2641,6 +3492,126 @@ extern "win64" fn s_rtl_query_registry_values(
     STATUS_SUCCESS
 }
 
+unsafe fn list_insert_between(entry: u64, prev: u64, next: u64) {
+    write_unaligned(entry as *mut u64, next);
+    write_unaligned((entry + 8) as *mut u64, prev);
+    write_unaligned((prev) as *mut u64, entry);
+    write_unaligned((next + 8) as *mut u64, entry);
+}
+
+/// `PLIST_ENTRY ExInterlockedInsertTailList(PLIST_ENTRY Head, PLIST_ENTRY Entry, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_insert_tail_list(head: u64, entry: u64, _lock: u64) -> u64 {
+    if head == 0 || entry == 0 {
+        return 0;
+    }
+    unsafe {
+        let old_tail = read_unaligned((head + 8) as *const u64);
+        let tail = if old_tail == 0 { head } else { old_tail };
+        list_insert_between(entry, tail, head);
+        old_tail
+    }
+}
+
+/// `PLIST_ENTRY ExInterlockedInsertHeadList(PLIST_ENTRY Head, PLIST_ENTRY Entry, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_insert_head_list(head: u64, entry: u64, _lock: u64) -> u64 {
+    if head == 0 || entry == 0 {
+        return 0;
+    }
+    unsafe {
+        let old_head = read_unaligned(head as *const u64);
+        let first = if old_head == 0 { head } else { old_head };
+        list_insert_between(entry, head, first);
+        old_head
+    }
+}
+
+/// `PLIST_ENTRY ExInterlockedRemoveHeadList(PLIST_ENTRY Head, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_remove_head_list(head: u64, _lock: u64) -> u64 {
+    if head == 0 {
+        return 0;
+    }
+    unsafe {
+        let first = read_unaligned(head as *const u64);
+        if first == 0 || first == head {
+            return 0;
+        }
+        let next = read_unaligned(first as *const u64);
+        write_unaligned(head as *mut u64, next);
+        write_unaligned((next + 8) as *mut u64, head);
+        write_unaligned(first as *mut u64, first);
+        write_unaligned((first + 8) as *mut u64, first);
+        first
+    }
+}
+
+/// `LARGE_INTEGER ExInterlockedAddLargeInteger(PLARGE_INTEGER, LARGE_INTEGER, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_add_large_integer(addend: u64, increment: i64, _lock: u64) -> i64 {
+    unsafe {
+        if addend == 0 {
+            return 0;
+        }
+        let old = read_unaligned(addend as *const i64);
+        write_unaligned(addend as *mut i64, old.wrapping_add(increment));
+        old
+    }
+}
+
+/// `ULONG ExInterlockedAddUlong(PULONG, ULONG, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_add_ulong(addend: u64, increment: u32, _lock: u64) -> u32 {
+    unsafe {
+        if addend == 0 {
+            return 0;
+        }
+        let old = read_unaligned(addend as *const u32);
+        write_unaligned(addend as *mut u32, old.wrapping_add(increment));
+        old
+    }
+}
+
+/// `PSLIST_ENTRY ExpInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY)`.
+extern "win64" fn s_exp_interlocked_push_entry_slist(head: u64, entry: u64) -> u64 {
+    if head == 0 || entry == 0 {
+        return 0;
+    }
+    unsafe {
+        let old = read_unaligned(head as *const u64);
+        write_unaligned(entry as *mut u64, old);
+        write_unaligned(head as *mut u64, entry);
+        old
+    }
+}
+
+/// `PSLIST_ENTRY ExpInterlockedPopEntrySList(PSLIST_HEADER)`.
+extern "win64" fn s_exp_interlocked_pop_entry_slist(head: u64) -> u64 {
+    if head == 0 {
+        return 0;
+    }
+    unsafe {
+        let old = read_unaligned(head as *const u64);
+        if old != 0 {
+            let next = read_unaligned(old as *const u64);
+            write_unaligned(head as *mut u64, next);
+            write_unaligned(old as *mut u64, 0);
+        }
+        old
+    }
+}
+
+/// `VOID ExQueueWorkItem(PWORK_QUEUE_ITEM, WORK_QUEUE_TYPE)`.
+extern "win64" fn s_ex_queue_work_item(work_item: u64, _queue_type: u32) {
+    if work_item == 0 {
+        return;
+    }
+    unsafe {
+        let routine = read_unaligned((work_item + 0x10) as *const u64);
+        let parameter = read_unaligned((work_item + 0x18) as *const u64);
+        if routine != 0 {
+            let f: extern "win64" fn(u64) = core::mem::transmute(routine as *const ());
+            f(parameter);
+        }
+    }
+}
+
 /// `NTSTATUS ExInitializeResourceLite(PERESOURCE)` / `void KeInitializeSpinLock(PKSPIN_LOCK)` /
 /// `KeInitializeEvent` / timers / DPCs — zero a small struct + return success. Single-threaded host.
 extern "win64" fn s_init_small_struct(p: u64) -> i32 {
@@ -2681,6 +3652,15 @@ extern "win64" fn s_ke_release_spin_lock(lock: u64, _old_irql: u8) {
     unsafe {
         if lock != 0 {
             write_unaligned(lock as *mut u64, 0);
+        }
+    }
+}
+
+/// `VOID KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK)`.
+extern "win64" fn s_ke_acquire_spin_lock_at_dpc_level(lock: u64) {
+    unsafe {
+        if lock != 0 {
+            write_unaligned(lock as *mut u64, 1);
         }
     }
 }
@@ -2811,6 +3791,57 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
         );
     }
     1
+}
+
+/// `ULONG KeQueryTimeIncrement()`.
+extern "win64" fn s_ke_query_time_increment() -> u32 {
+    156_250
+}
+
+/// `ULONG KeGetRecommendedSharedDataAlignment()`.
+extern "win64" fn s_ke_get_recommended_shared_data_alignment() -> u32 {
+    64
+}
+
+/// `BOOLEAN KeRegisterBugCheckCallback(...)`.
+extern "win64" fn s_ke_register_bug_check_callback(
+    record: u64,
+    callback: u64,
+    buffer: u64,
+    length: u32,
+    component: u64,
+) -> u8 {
+    if record == 0 || callback == 0 {
+        return 0;
+    }
+    unsafe {
+        write_unaligned(record as *mut u64, callback);
+        write_unaligned((record + 8) as *mut u64, buffer);
+        write_unaligned((record + 16) as *mut u32, length);
+        write_unaligned((record + 24) as *mut u64, component);
+    }
+    1
+}
+
+/// `BOOLEAN KeDeregisterBugCheckCallback(PKBUGCHECK_CALLBACK_RECORD)`.
+extern "win64" fn s_ke_deregister_bug_check_callback(record: u64) -> u8 {
+    if record != 0 {
+        unsafe {
+            write_unaligned(record as *mut u64, 0);
+        }
+    }
+    1
+}
+
+/// `BOOLEAN KeSynchronizeExecution(PKINTERRUPT, PKSYNCHRONIZE_ROUTINE, PVOID)`.
+extern "win64" fn s_ke_synchronize_execution(_interrupt: u64, routine: u64, context: u64) -> u8 {
+    if routine == 0 {
+        return 0;
+    }
+    unsafe {
+        let f: extern "win64" fn(u64) -> u8 = core::mem::transmute(routine as *const ());
+        f(context)
+    }
 }
 
 unsafe fn fsd_drain_queued_dpcs() -> u64 {
@@ -3047,6 +4078,304 @@ extern "win64" fn s_io_get_current_process() -> u64 {
     FSD_DATA_VADDR
 }
 
+/// `NTSTATUS ZwClose(HANDLE)`.
+extern "win64" fn s_zw_close(handle: u64) -> i32 {
+    unsafe {
+        if close_driver_registry_handle(handle) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_HANDLE
+        }
+    }
+}
+
+/// `NTSTATUS ZwOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)`.
+extern "win64" fn s_zw_open_key(handle_out: u64, _desired_access: u32, _object_attributes: u64) -> i32 {
+    if handle_out != 0 {
+        unsafe {
+            write_unaligned(handle_out as *mut u64, 0);
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+/// `NTSTATUS ZwEnumerateKey(...)`.
+extern "win64" fn s_zw_enumerate_key(
+    handle: u64,
+    _index: u32,
+    _key_information_class: u32,
+    _key_information: u64,
+    _length: u32,
+    result_length: u64,
+) -> i32 {
+    unsafe {
+        if !driver_registry_handle_live(handle) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if result_length != 0 {
+            write_unaligned(result_length as *mut u32, 0);
+        }
+    }
+    STATUS_NO_MORE_ENTRIES
+}
+
+/// `NTSTATUS ZwQueryValueKey(...)` against a hosted driver registry handle.
+extern "win64" fn s_zw_query_value_key(
+    handle: u64,
+    _value_name: u64,
+    _key_value_information_class: u32,
+    _key_value_information: u64,
+    _length: u32,
+    result_length: u64,
+) -> i32 {
+    unsafe {
+        if !driver_registry_handle_live(handle) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if result_length != 0 {
+            write_unaligned(result_length as *mut u32, 0);
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+/// `NTSTATUS ZwSetValueKey(...)`.
+extern "win64" fn s_zw_set_value_key(
+    handle: u64,
+    _value_name: u64,
+    _title_index: u32,
+    _typ: u32,
+    _data: u64,
+    _data_size: u32,
+) -> i32 {
+    unsafe {
+        if !driver_registry_handle_live(handle) {
+            return STATUS_INVALID_HANDLE;
+        }
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+extern "win64" fn s_zw_create_file(
+    file_handle_out: u64,
+    _desired_access: u32,
+    _object_attributes: u64,
+    _io_status_block: u64,
+    _allocation_size: u64,
+    _file_attributes: u32,
+    _share_access: u32,
+    _create_disposition: u32,
+    _create_options: u32,
+    _ea_buffer: u64,
+    _ea_length: u32,
+) -> i32 {
+    if file_handle_out != 0 {
+        unsafe {
+            write_unaligned(file_handle_out as *mut u64, 0);
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+extern "win64" fn s_zw_query_information_file(
+    _file_handle: u64,
+    io_status_block: u64,
+    _file_information: u64,
+    _length: u32,
+    _file_information_class: u32,
+) -> i32 {
+    if io_status_block != 0 {
+        unsafe {
+            write_unaligned(io_status_block as *mut i32, STATUS_OBJECT_NAME_NOT_FOUND);
+            write_unaligned((io_status_block + 8) as *mut u64, 0);
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+extern "win64" fn s_zw_read_file(
+    _file_handle: u64,
+    _event: u64,
+    _apc_routine: u64,
+    _apc_context: u64,
+    io_status_block: u64,
+    _buffer: u64,
+    _length: u32,
+    _byte_offset: u64,
+    _key: u64,
+) -> i32 {
+    if io_status_block != 0 {
+        unsafe {
+            write_unaligned(io_status_block as *mut i32, STATUS_OBJECT_NAME_NOT_FOUND);
+            write_unaligned((io_status_block + 8) as *mut u64, 0);
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+extern "win64" fn s_ex_get_current_processor_counts(idle: u64, kernel: u64, user: u64) {
+    unsafe {
+        if idle != 0 {
+            write_unaligned(idle as *mut u32, 0);
+        }
+        if kernel != 0 {
+            write_unaligned(kernel as *mut u32, 0);
+        }
+        if user != 0 {
+            write_unaligned(user as *mut u32, 0);
+        }
+    }
+}
+
+extern "win64" fn s_ex_get_current_processor_cpu_usage(_processor: u32) -> u32 {
+    0
+}
+
+extern "win64" fn s_hal_translate_bus_address(
+    interface_type: u32,
+    bus_number: u32,
+    bus_address: u64,
+    address_space: u64,
+    translated_address: u64,
+) -> u8 {
+    unsafe {
+        if !hosted_resource_identity_active()
+            || interface_type
+                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+        {
+            return 0;
+        }
+        let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
+        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        if grant_phys == 0
+            || grant_len == 0
+            || bus_address < grant_phys
+            || bus_address >= grant_phys.saturating_add(grant_len)
+        {
+            return 0;
+        }
+        if address_space != 0 {
+            write_unaligned(address_space as *mut u32, 0);
+        }
+        if translated_address != 0 {
+            write_unaligned(translated_address as *mut u64, bus_address);
+        }
+    }
+    1
+}
+
+extern "win64" fn s_hal_get_interrupt_vector(
+    interface_type: u32,
+    bus_number: u32,
+    _bus_interrupt_level: u32,
+    bus_interrupt_vector: u32,
+    irql_out: u64,
+    affinity_out: u64,
+) -> u32 {
+    unsafe {
+        if !hosted_resource_identity_active()
+            || interface_type
+                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+        {
+            return 0;
+        }
+        let granted_vector =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+        if granted_vector == 0 || (bus_interrupt_vector != 0 && bus_interrupt_vector != granted_vector)
+        {
+            return 0;
+        }
+        if irql_out != 0 {
+            write_unaligned(irql_out as *mut u8, granted_vector.min(0xF) as u8);
+        }
+        if affinity_out != 0 {
+            let affinity =
+                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
+            write_unaligned(affinity_out as *mut u64, if affinity == 0 { 1 } else { affinity });
+        }
+        granted_vector
+    }
+}
+
+unsafe fn hosted_pci_slot_number() -> u32 {
+    let address = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_ADDRESS) as *const u32);
+    let dev = (address >> 16) & 0x1F;
+    let func = address & 0x7;
+    (dev << 3) | func
+}
+
+unsafe fn hosted_pci_config_byte(offset: u32) -> u8 {
+    let vendor_device =
+        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
+    let class_rev = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_CLASS_REV) as *const u32);
+    let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64) as u32;
+    let pci_irq = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_IRQ) as *const u32);
+    let value = match offset {
+        0x00..=0x03 => vendor_device,
+        0x04..=0x07 => 0x0000_0006, // COMMAND: memory space + bus master enabled, STATUS clear.
+        0x08..=0x0B => class_rev,
+        0x10..=0x13 => grant_phys & 0xFFFF_FFF0,
+        0x2C..=0x2F => 0,
+        0x3C..=0x3F => pci_irq,
+        _ => 0,
+    };
+    ((value >> ((offset & 3) * 8)) & 0xFF) as u8
+}
+
+extern "win64" fn s_hal_get_bus_data_by_offset(
+    bus_data_type: u32,
+    bus_number: u32,
+    slot_number: u32,
+    buffer: u64,
+    offset: u32,
+    length: u32,
+) -> u32 {
+    if buffer == 0 || length == 0 {
+        return 0;
+    }
+    unsafe {
+        if bus_data_type != BUS_DATA_TYPE_PCI_CONFIGURATION
+            || !hosted_resource_identity_active()
+            || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+                != HOSTED_INTERFACE_TYPE_PCIBUS
+            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+            || slot_number != hosted_pci_slot_number()
+        {
+            return 0;
+        }
+        let mut copied = 0u32;
+        while copied < length && offset.saturating_add(copied) < 0x100 {
+            let b = hosted_pci_config_byte(offset + copied);
+            write_unaligned((buffer + copied as u64) as *mut u8, b);
+            copied += 1;
+        }
+        copied
+    }
+}
+
+extern "win64" fn s_hal_get_bus_data(
+    bus_data_type: u32,
+    bus_number: u32,
+    slot_number: u32,
+    buffer: u64,
+    length: u32,
+) -> u32 {
+    s_hal_get_bus_data_by_offset(bus_data_type, bus_number, slot_number, buffer, 0, length)
+}
+
+extern "win64" fn s_hal_set_bus_data_by_offset(
+    _bus_data_type: u32,
+    _bus_number: u32,
+    _slot_number: u32,
+    _buffer: u64,
+    _offset: u32,
+    _length: u32,
+) -> u32 {
+    0
+}
+
 /// Serial debug print forwarder (`vDbgPrintExWithPrefix` etc.) — swallow.
 extern "win64" fn s_dbg_print() -> i32 {
     0
@@ -3126,6 +4455,36 @@ fn register_fsd_trampolines() {
         s_rtl_upcase_unicode_string as usize as u64,
     );
     reg.bind(
+        "RtlAppendUnicodeStringToString",
+        s_rtl_append_unicode_string_to_string as usize as u64,
+    );
+    reg.bind(
+        "RtlAppendUnicodeToString",
+        s_rtl_append_unicode_to_string as usize as u64,
+    );
+    reg.bind(
+        "RtlIntegerToUnicodeString",
+        s_rtl_integer_to_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeStringToInteger",
+        s_rtl_unicode_string_to_integer as usize as u64,
+    );
+    reg.bind(
+        "RtlAnsiStringToUnicodeString",
+        s_rtl_ansi_string_to_unicode_string as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeStringToAnsiString",
+        s_rtl_unicode_string_to_ansi_string as usize as u64,
+    );
+    reg.bind(
+        "RtlEqualUnicodeString",
+        s_rtl_equal_unicode_string as usize as u64,
+    );
+    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
+    reg.bind("RtlInitString", s_rtl_init_ansi_string as usize as u64);
+    reg.bind(
         "RtlQueryRegistryValues",
         s_rtl_query_registry_values as usize as u64,
     );
@@ -3134,6 +4493,38 @@ fn register_fsd_trampolines() {
     reg.bind(
         "IoDeleteDevice",
         s_io_delete_device as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoAllocateDriverObjectExtension",
+        s_io_allocate_driver_object_extension as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDriverObjectExtension",
+        s_io_get_driver_object_extension as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoOpenDeviceRegistryKey",
+        s_io_open_device_registry_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetDeviceProperty",
+        s_io_get_device_property as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterDeviceInterface",
+        s_io_register_device_interface as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetDeviceInterfaceState",
+        s_io_set_device_interface_state as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterShutdownNotification",
+        s_io_register_shutdown_notification as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoUnregisterShutdownNotification",
+        s_io_unregister_shutdown_notification as *const () as usize as u64,
     );
     reg.bind(
         "IoAttachDeviceToDeviceStack",
@@ -3209,8 +4600,24 @@ fn register_fsd_trampolines() {
         s_io_get_dma_adapter as *const () as usize as u64,
     );
     reg.bind(
+        "IoAllocateWorkItem",
+        s_io_allocate_work_item as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoQueueWorkItem",
+        s_io_queue_work_item as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoFreeWorkItem",
+        s_io_free_work_item as *const () as usize as u64,
+    );
+    reg.bind(
         "IoAllocateMdl",
         s_io_allocate_mdl as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoBuildPartialMdl",
+        s_io_build_partial_mdl as *const () as usize as u64,
     );
     reg.bind("IoFreeMdl", s_io_free_mdl as *const () as usize as u64);
     reg.bind(
@@ -3218,8 +4625,28 @@ fn register_fsd_trampolines() {
         s_mm_build_mdl_for_nonpaged_pool as *const () as usize as u64,
     );
     reg.bind(
+        "MmMapLockedPages",
+        s_mm_map_locked_pages as *const () as usize as u64,
+    );
+    reg.bind(
         "MmMapLockedPagesSpecifyCache",
         s_mm_map_locked_pages_specify_cache as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmAllocateContiguousMemorySpecifyCache",
+        s_mm_allocate_contiguous_memory_specify_cache as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreeContiguousMemorySpecifyCache",
+        s_mm_free_contiguous_memory_specify_cache as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmAllocateNonCachedMemory",
+        s_mm_allocate_non_cached_memory as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmFreeNonCachedMemory",
+        s_mm_free_non_cached_memory as *const () as usize as u64,
     );
     reg.bind(
         "MmMapIoSpace",
@@ -3321,11 +4748,57 @@ fn register_fsd_trampolines() {
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
     reg.bind("wcslen", s_wcslen as usize as u64);
+    reg.bind("wcsncmp", s_wcsncmp as usize as u64);
+    reg.bind("wcsncpy", s_wcsncpy as usize as u64);
+    reg.bind("wcscat", s_wcscat as usize as u64);
+    reg.bind("wcscpy", s_wcscpy as usize as u64);
+    reg.bind("wcsncat", s_wcsncat as usize as u64);
     reg.bind(
         "RtlCompareMemoryUlong",
         s_rtl_compare_memory as usize as u64,
     );
+    reg.bind("RtlCompareString", s_rtl_compare_string as usize as u64);
     reg.bind("RtlUpcaseUnicodeChar", s_rtl_upcase_char as usize as u64);
+    reg.bind("ZwClose", s_zw_close as usize as u64);
+    reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
+    reg.bind("ZwEnumerateKey", s_zw_enumerate_key as usize as u64);
+    reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind("ZwSetValueKey", s_zw_set_value_key as usize as u64);
+    reg.bind("ZwCreateFile", s_zw_create_file as usize as u64);
+    reg.bind(
+        "ZwQueryInformationFile",
+        s_zw_query_information_file as usize as u64,
+    );
+    reg.bind("ZwReadFile", s_zw_read_file as usize as u64);
+    reg.bind(
+        "ExInterlockedInsertTailList",
+        s_ex_interlocked_insert_tail_list as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedInsertHeadList",
+        s_ex_interlocked_insert_head_list as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedRemoveHeadList",
+        s_ex_interlocked_remove_head_list as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedAddLargeInteger",
+        s_ex_interlocked_add_large_integer as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedAddUlong",
+        s_ex_interlocked_add_ulong as usize as u64,
+    );
+    reg.bind(
+        "ExpInterlockedPushEntrySList",
+        s_exp_interlocked_push_entry_slist as usize as u64,
+    );
+    reg.bind(
+        "ExpInterlockedPopEntrySList",
+        s_exp_interlocked_pop_entry_slist as usize as u64,
+    );
+    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as usize as u64);
     // small-struct init (spinlock/event/timer/dpc/mutex/semaphore/ERESOURCE init)
     reg.bind(
         "ExInitializeResourceLite",
@@ -3338,6 +4811,10 @@ fn register_fsd_trampolines() {
     reg.bind(
         "KeAcquireSpinLockRaiseToDpc",
         s_ke_acquire_spin_lock_raise_to_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeAcquireSpinLockAtDpcLevel",
+        s_ke_acquire_spin_lock_at_dpc_level as *const () as usize as u64,
     );
     reg.bind(
         "KeReleaseSpinLock",
@@ -3368,6 +4845,7 @@ fn register_fsd_trampolines() {
     reg.bind("KeInitializeTimer", s_init_small_struct as usize as u64);
     reg.bind("KeCancelTimer", s_ke_cancel_timer as usize as u64);
     reg.bind("KeSetTimer", s_ke_set_timer as usize as u64);
+    reg.bind("KeSetTimerEx", s_ke_set_timer_ex as usize as u64);
     reg.bind(
         "KeStallExecutionProcessor",
         s_ke_stall_execution_processor as *const () as usize as u64,
@@ -3379,6 +4857,27 @@ fn register_fsd_trampolines() {
     reg.bind(
         "KeInsertQueueDpc",
         s_ke_insert_queue_dpc as *const () as usize as u64,
+    );
+    reg.bind("KeQueryTimeIncrement", s_ke_query_time_increment as usize as u64);
+    reg.bind(
+        "KeGetRecommendedSharedDataAlignment",
+        s_ke_get_recommended_shared_data_alignment as usize as u64,
+    );
+    reg.bind(
+        "KeRegisterBugCheckCallback",
+        s_ke_register_bug_check_callback as usize as u64,
+    );
+    reg.bind(
+        "KeDeregisterBugCheckCallback",
+        s_ke_deregister_bug_check_callback as usize as u64,
+    );
+    reg.bind(
+        "KeSynchronizeExecution",
+        s_ke_synchronize_execution as usize as u64,
+    );
+    reg.bind(
+        "KeNumberProcessors",
+        core::ptr::addr_of!(KE_NUMBER_PROCESSORS_VALUE) as usize as u64,
     );
     reg.bind("ExInitializeFastMutex", s_init_small_struct as usize as u64);
     reg.bind("KeInitializeMutex", s_init_small_struct as usize as u64);
@@ -3449,6 +4948,35 @@ fn register_fsd_trampolines() {
     reg.bind("vDbgPrintEx", s_dbg_print as usize as u64);
     reg.bind("DbgPrint", s_dbg_print as usize as u64);
     reg.bind("DbgPrintEx", s_dbg_print as usize as u64);
+    reg.bind(
+        "ExGetCurrentProcessorCounts",
+        s_ex_get_current_processor_counts as usize as u64,
+    );
+    reg.bind(
+        "ExGetCurrentProcessorCpuUsage",
+        s_ex_get_current_processor_cpu_usage as usize as u64,
+    );
+    reg.bind(
+        "HalTranslateBusAddress",
+        s_hal_translate_bus_address as usize as u64,
+    );
+    reg.bind(
+        "HalGetInterruptVector",
+        s_hal_get_interrupt_vector as usize as u64,
+    );
+    reg.bind("HalGetBusData", s_hal_get_bus_data as usize as u64);
+    reg.bind(
+        "HalGetBusDataByOffset",
+        s_hal_get_bus_data_by_offset as usize as u64,
+    );
+    reg.bind(
+        "HalSetBusDataByOffset",
+        s_hal_set_bus_data_by_offset as usize as u64,
+    );
+
+    if reg.is_exhausted() {
+        panic!("FSD export registry capacity exhausted");
+    }
 }
 
 fn hosted_kernel_provider_dll(dll: &str) -> bool {
@@ -3551,6 +5079,9 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
             mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
             pool: pool_alloc,
+            support_entry_rva_off: SH_SUPPORT_ENTRY_RVA,
+            support_status_off: SH_SUPPORT_DE_STATUS,
+            support_verdict_off: SH_SUPPORT_VERDICT,
         },
         SH_REQ_STATUS,      // FSD status offset (0x70)
         FSD_DISPATCH_LABEL, // 0x771
@@ -4788,14 +6319,14 @@ unsafe fn load_hosted_dependency_images(
     run_va: u64,
     img_frames: u64,
     rights: &mut [u64],
-) -> Option<()> {
+) -> Option<u64> {
     NDIS_DEP_IMAGE = LoadedDependencyImage::empty();
 
     let mut provider_buf = [0u8; HOSTED_DEP_PROVIDER_MAX];
     let Some(provider) =
         raw_pe_find_hosted_dependency(primary_src_va, primary_src_size, &mut provider_buf)
     else {
-        return Some(());
+        return Some(0);
     };
     let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
     let dep_offset = align_up_4k(primary_image_len)?;
@@ -4850,7 +6381,7 @@ unsafe fn load_hosted_dependency_images(
     print_str(b" entry=0x");
     print_hex(dep_entry_rva);
     print_str(b"\n");
-    Some(())
+    Some(dep_offset + dep_entry_rva as u64)
 }
 
 /// Next free instance slot. Slots are retired on unload, but the bump id is not reused yet because
@@ -4980,7 +6511,8 @@ pub(crate) unsafe fn load_driver(
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
     let rights = &mut (*core::ptr::addr_of_mut!(FSD_RIGHTS))[instance];
-    load_hosted_dependency_images(fs, src_va, src_size, code_va, run_va, img_frames, rights)?;
+    let support_entry_rva =
+        load_hosted_dependency_images(fs, src_va, src_size, code_va, run_va, img_frames, rights)?;
     let (entry_rva, image_len) =
         load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
     let _ = register_system_module(path, code_va, image_len);
@@ -4990,6 +6522,9 @@ pub(crate) unsafe fn load_driver(
     write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
+    write_volatile((win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64, support_entry_rva);
+    write_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
+    write_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -5044,6 +6579,8 @@ pub(crate) unsafe fn load_driver(
 
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
+    let support_status = read_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *const i32);
+    let support_verdict = read_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *const u32);
     let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     let driver_unload = read_volatile((win.shared_va + SH_DRIVER_UNLOAD) as *const u64);
@@ -5078,6 +6615,12 @@ pub(crate) unsafe fn load_driver(
     print_str(b" devobj=0x");
     print_hex((devobj >> 32) as u32);
     print_hex(devobj as u32);
+    if support_entry_rva != 0 {
+        print_str(b" support_status=0x");
+        print_hex(support_status as u32);
+        print_str(b" support_verdict=0x");
+        print_hex(support_verdict);
+    }
     print_str(b" unload=0x");
     print_hex((driver_unload >> 32) as u32);
     print_hex(driver_unload as u32);
@@ -6017,6 +7560,15 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
+        HOSTED_INTERFACE_TYPE_INTERNAL,
+    );
+    write_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_ADDRESS) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_PCI_IRQ) as *mut u32, 0);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
@@ -6156,6 +7708,14 @@ fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDe
         .iter()
         .copied()
         .find(|slot| slot.used && slot.device_object == device_object)
+}
+
+fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBinding> {
+    let bindings = unsafe { &*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS) };
+    bindings
+        .iter()
+        .copied()
+        .find(|slot| slot.used && slot.pdo_object == pdo_object)
 }
 
 pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
@@ -6550,6 +8110,7 @@ pub(crate) unsafe fn call_add_device_for_driver(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn grant_hosted_device_resources(
     device_id: u64,
+    bus_identity: HostedBusIdentity,
     mmio_phys: u64,
     mmio_len: u64,
     mmio_va: u64,
@@ -6674,6 +8235,27 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
         interrupt_affinity,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
+        bus_identity.interface_type,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_BUS_NUMBER) as *mut u32,
+        bus_identity.bus_number,
+    );
+    write_volatile((sh + SH_RESOURCE_ADDRESS) as *mut u32, bus_identity.address);
+    write_volatile(
+        (sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *mut u32,
+        (bus_identity.pci_device_id as u32) << 16 | bus_identity.pci_vendor_id as u32,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_PCI_CLASS_REV) as *mut u32,
+        (bus_identity.pci_class & 0x00FF_FFFF) << 8,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_PCI_IRQ) as *mut u32,
+        bus_identity.pci_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
     );
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
