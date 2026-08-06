@@ -437,8 +437,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
   B3 work is either a real PCI-capable hosted test driver that consumes the e1000 BAR honestly, or
   enough NDIS/ReactOS driver support to let `e1000.sys` bind through the same generic grant helper.
 - B3 cleanup continued. The hosted FSD PE import resolver no longer has a generic success fallback:
-  unknown imports now log `[fsd-import] unresolved <name>` and fail image loading before
-  `DriverEntry`. The old prefix-matched no-op machinery was replaced with exact bindings for the
+  unknown imports now fail image loading before `DriverEntry`. The old prefix-matched no-op
+  machinery was replaced with exact bindings for the
   ReactOS `npfs.sys`/`msfs.sys` surface, including Unicode string helpers, optional registry query
   defaults, security/object helpers, cancel-safe queue callbacks, dynamic IRP allocation, timers,
   probes, and cleanup routines. Validation: `cargo fmt --all`,
@@ -448,3 +448,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
   adjustment: with the hosted FSD fallback removed, resume B3 at the PCI/NDIS equivalence frontier
   before deleting the old bespoke NIC proof.
+- B3 cleanup continued. The hosted driver PE resolver is now provider-DLL-aware: imports are resolved
+  as `dll!symbol`, `ntoskrnl.exe`/`hal.dll` exact imports bind through the executive registry, malformed
+  import tables and ordinal imports fail closed, and unsupported dependency DLLs such as `ndis.sys`
+  report the missing `dll!symbol` before `DriverEntry` instead of colliding on name-only exports.
+  `hal!KeStallExecutionProcessor` is explicitly bound as a HAL timing primitive for the ReactOS e1000
+  import surface, but `ndis.sys` remains a real dependency image frontier rather than an executive shim.
+  Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` through genuine explorer shell chrome with
+  `286/288` checks passing; the only failing checks remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
+  adjustment: next B3 work should load and resolve real dependency images such as `ndis.sys` (or add an
+  honest PCI WDM fixture) before retiring the bespoke NIC proof.

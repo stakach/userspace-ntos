@@ -58,9 +58,10 @@ use crate::*;
 // its OWN VSpace/CNode/TCB (an FSD-class descriptor, NO device caps). The trampolines + entry +
 // IRP dispatch loop below are GENERIC to any FSD — they are NOT npfs-specific machinery:
 //   * the ntoskrnl-import TRAMPOLINES are the SHARED ntoskrnl surface an FSD links against. The
-//     executive registers each trampoline VA by import name into a [`DriverExportRegistry`]
-//     (`nt-compat-exports`, the same mechanism win32k uses); the loader resolves the driver's IAT
-//     through it ([`fsd_export_addr`]). The pure prefix-match logic is `nt_kernel_exec::np_prefix`.
+//     executive registers each trampoline VA by import provider DLL + name into a
+//     [`DriverExportRegistry`] (`nt-compat-exports`, the same mechanism win32k uses); the loader
+//     resolves the driver's IAT through it ([`fsd_export_addr`]). The pure prefix-match logic is
+//     `nt_kernel_exec::np_prefix`.
 //   * the COMPONENT ENTRY ([`fsd_component_entry`]) runs the driver's real DriverEntry, captures the
 //     DriverObject->MajorFunction[] table + control device, then serves file IRPs in a dispatch loop.
 //
@@ -967,8 +968,8 @@ extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u6
 
 // --- ntoskrnl trampolines (extern "win64"; args = rcx, rdx, r8, r9, then stack) --------------
 
-/// Bounded count of unresolved FSD imports logged before the PE load is rejected.
-static mut FSD_UNRESOLVED_IMPORTS_LOGGED: u32 = 0;
+/// Bounded count of unresolved hosted-driver imports logged before the PE load is rejected.
+static mut DRIVER_UNRESOLVED_IMPORTS_LOGGED: u32 = 0;
 
 extern "win64" fn s_zero() -> u64 {
     0
@@ -986,6 +987,15 @@ extern "win64" fn s_ke_cancel_timer(_timer: u64) -> u8 {
 
 extern "win64" fn s_ke_set_timer(_timer: u64, _due_time: u64, _dpc: u64) -> u8 {
     0
+}
+
+extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
+    let mut spins = 0u32;
+    let limit = microseconds.min(1000).saturating_mul(64);
+    while spins < limit {
+        core::hint::spin_loop();
+        spins += 1;
+    }
 }
 
 extern "win64" fn s_probe_for_read(_address: u64, _length: u64, _alignment: u64) {}
@@ -1018,6 +1028,31 @@ fn ascii_upcase_u16(c: u16) -> u16 {
     } else {
         c
     }
+}
+
+#[inline]
+fn ascii_upcase_u8(c: u8) -> u8 {
+    if c.is_ascii_lowercase() {
+        c - 32
+    } else {
+        c
+    }
+}
+
+fn ascii_eq_ignore_case(a: &str, b: &str) -> bool {
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    if aa.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < aa.len() {
+        if ascii_upcase_u8(aa[i]) != ascii_upcase_u8(bb[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 unsafe fn unicode_string_triplet(us: u64) -> Option<(u16, u16, u64)> {
@@ -3307,6 +3342,10 @@ fn register_fsd_trampolines() {
     reg.bind("KeCancelTimer", s_ke_cancel_timer as usize as u64);
     reg.bind("KeSetTimer", s_ke_set_timer as usize as u64);
     reg.bind(
+        "KeStallExecutionProcessor",
+        s_ke_stall_execution_processor as *const () as usize as u64,
+    );
+    reg.bind(
         "KeInitializeDpc",
         s_ke_initialize_dpc as *const () as usize as u64,
     );
@@ -3385,11 +3424,39 @@ fn register_fsd_trampolines() {
     reg.bind("DbgPrintEx", s_dbg_print as usize as u64);
 }
 
-/// Resolve an FSD ntoskrnl/hal/fsrtl import NAME to its IAT-slot trampoline VA through the SHARED
-/// [`DriverExportRegistry`]. Registered names resolve to their explicit trampoline. Unknown names
-/// return `None`, causing the PE load to fail before `DriverEntry`; the host no longer masks missing
-/// kernel behavior behind a success-returning import.
-pub fn fsd_export_addr(name: &str) -> Option<u64> {
+fn hosted_kernel_provider_dll(dll: &str) -> bool {
+    ascii_eq_ignore_case(dll, "ntoskrnl.exe")
+        || ascii_eq_ignore_case(dll, "ntoskrnl")
+        || ascii_eq_ignore_case(dll, "hal.dll")
+        || ascii_eq_ignore_case(dll, "hal")
+}
+
+unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
+    if DRIVER_UNRESOLVED_IMPORTS_LOGGED < 48 {
+        DRIVER_UNRESOLVED_IMPORTS_LOGGED += 1;
+        print_str(b"[driver-import] unresolved ");
+        for &b in dll.as_bytes() {
+            debug_put_char(b);
+        }
+        debug_put_char(b'!');
+        for &b in name.as_bytes() {
+            debug_put_char(b);
+        }
+        print_str(b"\n");
+    }
+}
+
+/// Resolve a hosted-driver import `DLL!NAME` to its IAT-slot trampoline VA through the SHARED
+/// [`DriverExportRegistry`]. Only kernel-provider DLLs backed by the executive (`ntoskrnl` and `hal`)
+/// are accepted here; dependency images such as `ndis.sys` must be mapped and resolved as real images.
+/// Unknown provider DLLs or names return `None`, causing the PE load to fail before `DriverEntry`.
+pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
+    if !hosted_kernel_provider_dll(dll) {
+        unsafe {
+            log_unresolved_driver_import(dll, name);
+        }
+        return None;
+    }
     // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
     unsafe {
         if !FSD_EXPORTS_READY {
@@ -3401,14 +3468,7 @@ pub fn fsd_export_addr(name: &str) -> Option<u64> {
         }
     }
     unsafe {
-        if FSD_UNRESOLVED_IMPORTS_LOGGED < 48 {
-            FSD_UNRESOLVED_IMPORTS_LOGGED += 1;
-            print_str(b"[fsd-import] unresolved ");
-            for &b in name.as_bytes() {
-                debug_put_char(b);
-            }
-            print_str(b"\n");
-        }
+        log_unresolved_driver_import(dll, name);
     }
     None
 }
@@ -4130,20 +4190,53 @@ unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
     }
 }
 
+unsafe fn read_pe_ascii<'a>(
+    image_va: u64,
+    image_cap: u64,
+    rva: u64,
+    skip: u64,
+    buf: &'a mut [u8],
+) -> Option<&'a str> {
+    let start = rva.checked_add(skip)?;
+    if start >= image_cap || buf.is_empty() {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < buf.len() {
+        let off = start.checked_add(n as u64)?;
+        if off >= image_cap {
+            return None;
+        }
+        let c = read_volatile((image_va + off) as *const u8);
+        if c == 0 {
+            if n == 0 {
+                return None;
+            }
+            return Some(core::str::from_utf8_unchecked(&buf[..n]));
+        }
+        if !(0x20..=0x7e).contains(&c) {
+            return None;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    None
+}
+
 /// Parse a driver PE at `src_va` (raw file bytes), copy its sections into `dst_va` (frames pre-mapped
 /// RW in BOTH the executive and the component), apply DIR64 relocations for the load at `dst_va`, and
-/// patch the IAT resolving each import name through `resolve`. Records per-frame W^X rights into
+/// patch the IAT resolving each provider DLL + import name through `resolve`. Records per-frame W^X rights into
 /// `rights_out`. Returns `(DriverEntryRva, SizeOfImage)`, or None. Fully HEAP-FREE.
 ///
 /// This is the generic PE-load mechanism (the win32k `load_driver_into` shape, but with an injected
-/// name resolver so it's driver-agnostic — the general dynamic path).
+/// provider-aware resolver so it's driver-agnostic — the general dynamic path).
 unsafe fn load_pe_into(
     src_va: u64,
     dst_va: u64,
     run_va: u64,
     max_frames: u64,
     rights_out: &mut [u64],
-    resolve: fn(&str) -> Option<u64>,
+    resolve: fn(&str, &str) -> Option<u64>,
 ) -> Option<(u32, u32)> {
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va + e;
@@ -4285,43 +4378,62 @@ unsafe fn load_pe_into(
         }
     }
 
-    // Patch the IAT: resolve each import name through `resolve`.
+    // Patch the IAT: resolve each provider DLL + import name through `resolve`.
     let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
     if imp_rva != 0 {
-        let mut desc = dst_va + imp_rva;
+        let mut desc_rva = imp_rva;
         loop {
+            if desc_rva > cap.saturating_sub(20) {
+                return None;
+            }
+            let desc = dst_va + desc_rva;
             let ilt = read_unaligned(desc as *const u32) as u64;
+            let dll_rva = read_unaligned((desc + 12) as *const u32) as u64;
             let iat = read_unaligned((desc + 16) as *const u32) as u64;
             if ilt == 0 && iat == 0 {
                 break;
             }
-            let names = dst_va + if ilt != 0 { ilt } else { iat };
-            let slots = dst_va + iat;
+            if iat == 0 {
+                return None;
+            }
+            let mut dll_buf = [0u8; 64];
+            let dll = read_pe_ascii(dst_va, cap, dll_rva, 0, &mut dll_buf)?;
+            let names_rva = if ilt != 0 { ilt } else { iat };
             let mut k = 0u64;
             loop {
-                let thunk = read_unaligned((names + k * 8) as *const u64);
+                let entry_rva = names_rva.checked_add(k.checked_mul(8)?)?;
+                if entry_rva > cap.saturating_sub(8) {
+                    return None;
+                }
+                let thunk = read_unaligned((dst_va + entry_rva) as *const u64);
                 if thunk == 0 {
                     break;
                 }
-                if thunk & 0x8000_0000_0000_0000 == 0 {
-                    let name_ptr = dst_va + (thunk & 0x7FFF_FFFF) + 2;
-                    let mut buf = [0u8; 64];
-                    let mut n = 0usize;
-                    while n < 63 {
-                        let c = read_volatile((name_ptr + n as u64) as *const u8);
-                        if c == 0 {
-                            break;
-                        }
-                        buf[n] = c;
-                        n += 1;
-                    }
-                    let name = core::str::from_utf8_unchecked(&buf[..n]);
-                    let addr = resolve(name)?;
-                    write_unaligned((slots + k * 8) as *mut u64, addr);
+                let slot_rva = iat.checked_add(k.checked_mul(8)?)?;
+                if slot_rva > cap.saturating_sub(8) {
+                    return None;
                 }
-                k += 1;
+                if thunk & 0x8000_0000_0000_0000 != 0 {
+                    print_str(b"[driver-import] ordinal imports unsupported in ");
+                    for &b in dll.as_bytes() {
+                        debug_put_char(b);
+                    }
+                    print_str(b"\n");
+                    return None;
+                }
+                let mut name_buf = [0u8; 128];
+                let name = read_pe_ascii(
+                    dst_va,
+                    cap,
+                    thunk & 0x7FFF_FFFF_FFFF_FFFF,
+                    2,
+                    &mut name_buf,
+                )?;
+                let addr = resolve(dll, name)?;
+                write_unaligned((dst_va + slot_rva) as *mut u64, addr);
+                k = k.checked_add(1)?;
             }
-            desc += 20;
+            desc_rva = desc_rva.checked_add(20)?;
         }
     }
 

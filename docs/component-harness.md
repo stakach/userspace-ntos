@@ -434,11 +434,11 @@ close.
   (g) returns a `DriverComponent { pml4, fault_ep, code_va, mj_table, devobj, verdict, finished }`
   `:1121-1136`, `:1487`.
 
-* **The IAT resolver is already generic:** `load_pe_into` takes `resolve: fn(&str) -> u64` `:1164`; the
-  FSD passes `fsd_export_addr` `:745-770` which resolves ntoskrnl imports through a
-  `DriverExportRegistry` (`FSD_EXPORTS` `:668`) — the SAME mechanism win32k + KMDF use
-  (`nt-compat-exports`). Unbound names fail soft to `s_true`/`s_zero` with an audit log `:745-774`. This
-  is reusable across drivers UNCHANGED (comment `:667` "Reusable for the next FSD (fastfat) unchanged").
+* **The IAT resolver is provider-aware:** `load_pe_into` takes `resolve: fn(&str, &str) -> Option<u64>`;
+  the FSD path passes `fsd_export_addr`, which resolves supported kernel-provider imports
+  (`ntoskrnl.exe`/`hal.dll`) through a `DriverExportRegistry` (`FSD_EXPORTS`) — the SAME mechanism
+  win32k + KMDF use (`nt-compat-exports`). Unbound providers or names now fail image loading before
+  `DriverEntry`; dependency DLLs such as `ndis.sys` must be mapped and resolved as real support images.
 
 * **The persistent IRP dispatch server:** `fsd_component_entry` `:785-852` (DriverEntry → `dispatch_loop`)
   + the executive per-IRP pump `npfs_dispatch_irp` `:1584-1654`, keyed off `DriverObject->
