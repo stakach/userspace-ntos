@@ -42,7 +42,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   service metadata.
 - `[ ]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
   the policy boundary.
-- `[ ]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
+- `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
 
 ### B. Driver Stack Bring-Up From Service Metadata
@@ -112,8 +112,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
    the kernel should only expose generic process/section/token/thread primitives.
 3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
    policy from executive start paths once SCM consumes service metadata.
-4. Add boot gates for the first auto-start and demand-start service selections once SCM is consuming
-   the seeded Configuration Manager authority.
+4. Continue A3/A4 by routing concrete SCM Win32 service start requests through generic process
+   creation metadata instead of adding executive-side service-name policy.
 
 ## Review Log
 
@@ -931,3 +931,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo test -p nt-io-manager`. Review adjustment: current B3 cleanup is closed; the remaining real
   display debt is future videoprt/miniport hosting, while the immediate kernel-completion work should
   return to A3/A4 SCM-owned Win32 service starts and A5 service-selection gates.
+- A5 complete. `nt-config-manager` now has named selectors for demand-start Win32 services and
+  demand-start driver services, backed by the existing generic start/type filter and host tests.
+  The executive imports the real SYSTEM hive into Config Manager, copies the first auto-start Win32,
+  demand-start Win32, and demand-start driver selections into inline proof storage, and gates that
+  the selections have registry-owned service names and `ImagePath` values; demand-start driver
+  selection also proves the NT service-key driver-object path. Boot evidence in
+  `.tmp/boot-scm-service-selection-20260807.log`: auto-start Win32 count 14, first `Browser`;
+  demand-start Win32 count 8, first `BITS`; demand-start driver count 12, first `btrfs` with object
+  `\FileSystem\btrfs`; `exec_scm_autostart_win32_selected_from_registry`,
+  `exec_scm_demandstart_win32_selected_from_registry`, and
+  `exec_ntloaddriver_demand_driver_selected_from_registry` pass. Validation: `cargo fmt --all`,
+  `cargo test -p nt-config-manager`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` proof
+  `.tmp/boot-scm-service-selection-20260807.log` with `290/290` checks passing. Review adjustment:
+  next work is A3/A4: turn SCM's actual Win32 service start requests into generic process creation
+  from `ServiceMetadata`, without putting service-name policy back in the kernel.

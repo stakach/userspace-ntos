@@ -415,6 +415,16 @@ impl ConfigManager {
         self.service_candidates_by_start_and_type(&[SERVICE_AUTO_START], SERVICE_WIN32_TYPE_MASK)
     }
 
+    /// Registry-declared Win32 services that SCM may demand-start.
+    pub fn demand_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
+        self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_WIN32_TYPE_MASK)
+    }
+
+    /// Registry-declared drivers that SCM or `NtLoadDriver` may demand-start.
+    pub fn demand_start_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_DRIVER_TYPE_MASK)
+    }
+
     /// The `Control\ServiceGroupOrder\List` load-order group sequence.
     pub fn service_group_order(&self) -> Vec<String> {
         let Some(key) = self.registry.open_key(SERVICE_GROUP_ORDER_PATH) else {
@@ -1011,6 +1021,24 @@ mod tests {
             1,
         );
         cm.register_typed_service(
+            "PlugPlay",
+            r"%SystemRoot%\system32\services.exe",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_typed_service(
+            "E1000",
+            r"system32\drivers\e1000.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_typed_service(
             "DisabledSvc",
             r"%SystemRoot%\system32\disabled.exe",
             SERVICE_WIN32_OWN_PROCESS,
@@ -1053,6 +1081,18 @@ mod tests {
         );
         assert_eq!(all_auto.len(), 1);
         assert_eq!(all_auto[0].name, "RpcSs");
+
+        let demand_win32 = cm.demand_start_win32_service_candidates();
+        assert_eq!(demand_win32.len(), 1);
+        assert_eq!(demand_win32[0].name, "PlugPlay");
+
+        let demand_drivers = cm.demand_start_driver_candidates();
+        assert_eq!(demand_drivers.len(), 1);
+        assert_eq!(demand_drivers[0].name, "E1000");
+        assert_eq!(
+            demand_drivers[0].driver_service_class(),
+            Some(DriverServiceClass::Device)
+        );
     }
 
     #[test]

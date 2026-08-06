@@ -11802,6 +11802,56 @@ impl InlineDriverLaunchPlan {
 static mut SYSTEM_BOOT_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLaunchPlan::empty();
 static mut CONFIG_BOOT_PNP_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLaunchPlan::empty();
 
+#[derive(Clone, Copy)]
+struct InlineServiceSelectionReport {
+    auto_win32_count: u64,
+    auto_win32_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    auto_win32_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    demand_win32_count: u64,
+    demand_win32_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    demand_win32_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    demand_driver_count: u64,
+    demand_driver_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    demand_driver_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    demand_driver_object_path: InlineAscii<BOOT_DRIVER_OBJECT_PATH_MAX>,
+}
+
+impl InlineServiceSelectionReport {
+    const fn empty() -> Self {
+        Self {
+            auto_win32_count: 0,
+            auto_win32_name: InlineAscii::empty(),
+            auto_win32_image_path: InlineAscii::empty(),
+            demand_win32_count: 0,
+            demand_win32_name: InlineAscii::empty(),
+            demand_win32_image_path: InlineAscii::empty(),
+            demand_driver_count: 0,
+            demand_driver_name: InlineAscii::empty(),
+            demand_driver_image_path: InlineAscii::empty(),
+            demand_driver_object_path: InlineAscii::empty(),
+        }
+    }
+
+    fn auto_win32_ready(&self) -> bool {
+        self.auto_win32_count != 0
+            && self.auto_win32_name.len != 0
+            && self.auto_win32_image_path.len != 0
+    }
+
+    fn demand_win32_ready(&self) -> bool {
+        self.demand_win32_count != 0
+            && self.demand_win32_name.len != 0
+            && self.demand_win32_image_path.len != 0
+    }
+
+    fn demand_driver_ready(&self) -> bool {
+        self.demand_driver_count != 0
+            && self.demand_driver_name.len != 0
+            && self.demand_driver_image_path.len != 0
+            && self.demand_driver_object_path.len != 0
+    }
+}
+
 const FILE_SYSTEM_LOAD_ORDER_GROUP: &str = "File System";
 
 #[derive(Clone, Copy)]
@@ -12601,6 +12651,59 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
         return None;
     }
     Some(cm)
+}
+
+fn copy_service_selection(
+    service: &nt_config_manager::ServiceMetadata,
+    name: &mut InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
+    image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+) -> bool {
+    name.set_str(&service.name)
+        && service
+            .image_path
+            .as_deref()
+            .is_some_and(|path| image_path.set_str(path))
+}
+
+fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
+    let heap_mark = allocator::mark();
+    let mut report = InlineServiceSelectionReport::empty();
+    if let Some(cm) = system_hive_config_manager() {
+        let auto_win32 = cm.auto_start_win32_service_candidates();
+        report.auto_win32_count = auto_win32.len() as u64;
+        if let Some(service) = auto_win32.first() {
+            let _ = copy_service_selection(
+                service,
+                &mut report.auto_win32_name,
+                &mut report.auto_win32_image_path,
+            );
+        }
+
+        let demand_win32 = cm.demand_start_win32_service_candidates();
+        report.demand_win32_count = demand_win32.len() as u64;
+        if let Some(service) = demand_win32.first() {
+            let _ = copy_service_selection(
+                service,
+                &mut report.demand_win32_name,
+                &mut report.demand_win32_image_path,
+            );
+        }
+
+        let demand_drivers = cm.demand_start_driver_candidates();
+        report.demand_driver_count = demand_drivers.len() as u64;
+        if let Some(service) = demand_drivers.first() {
+            let _ = copy_service_selection(
+                service,
+                &mut report.demand_driver_name,
+                &mut report.demand_driver_image_path,
+            );
+            if let Some(object_path) = service.driver_object_path() {
+                let _ = report.demand_driver_object_path.set_str(&object_path);
+            }
+        }
+    }
+    unsafe { allocator::reset_to(heap_mark) };
+    report
 }
 
 fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
@@ -19824,6 +19927,45 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
+    let scm_service_selection = system_hive_service_selection_report();
+    print_str(b"[scm-select] auto-win32 count=");
+    print_u64(scm_service_selection.auto_win32_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.auto_win32_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.auto_win32_image_path.as_bytes());
+    print_str(b"\n");
+    print_str(b"[scm-select] demand-win32 count=");
+    print_u64(scm_service_selection.demand_win32_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.demand_win32_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.demand_win32_image_path.as_bytes());
+    print_str(b"\n");
+    print_str(b"[scm-select] demand-driver count=");
+    print_u64(scm_service_selection.demand_driver_count);
+    print_str(b" first=");
+    print_str(scm_service_selection.demand_driver_name.as_bytes());
+    print_str(b" image=");
+    print_str(scm_service_selection.demand_driver_image_path.as_bytes());
+    print_str(b" object=");
+    print_str(scm_service_selection.demand_driver_object_path.as_bytes());
+    print_str(b"\n");
+    check(
+        b"exec_scm_autostart_win32_selected_from_registry",
+        scm_service_selection.auto_win32_ready(),
+        &mut passed,
+    );
+    check(
+        b"exec_scm_demandstart_win32_selected_from_registry",
+        scm_service_selection.demand_win32_ready(),
+        &mut passed,
+    );
+    check(
+        b"exec_ntloaddriver_demand_driver_selected_from_registry",
+        scm_service_selection.demand_driver_ready(),
+        &mut passed,
+    );
     let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
         bi,
         &pci_devices,
