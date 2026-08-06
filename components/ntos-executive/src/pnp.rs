@@ -23,8 +23,10 @@ use crate::*;
 use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
     find_device_for_class, DriverClass, PciDevice, ResourceAssignment,
-    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
+
+static ROOT_BUS_RESOURCE_PROFILES: [RootBusResourceProfile; 1] = [ROOT_DMA_TEST_RESOURCE_PROFILE];
 
 /// Enumerate PCI bus 0 through `nt-pnp` using the executive's port-I/O config access. The reader
 /// closures drive `pci_read32`/`pci_write32` (0xCF8/0xCFC via `pci_io`); the writer is used by
@@ -81,6 +83,21 @@ pub(crate) struct DevnodeRootResourceGrant {
     pub resource_list: Vec<u8>,
 }
 
+pub(crate) fn root_bus_resource_profile_for_devnode(
+    instance_id: &str,
+    hardware_ids: &[&str],
+    compatible_ids: &[&str],
+) -> Option<&'static RootBusResourceProfile> {
+    ROOT_BUS_RESOURCE_PROFILES.iter().find(|profile| {
+        nt_pnp::devnode_matches_root_bus_profile(
+            instance_id,
+            hardware_ids,
+            compatible_ids,
+            profile,
+        )
+    })
+}
+
 /// Build the physical START resources for an already-selected PCI function.
 pub(crate) fn build_devnode_pci_resource_grant(
     device: &PciDevice,
@@ -127,11 +144,12 @@ pub(crate) fn assign_devnode_root_dma_resources(
     dma_len: u64,
     granted_mmio_len: u32,
 ) -> Option<DevnodeRootResourceGrant> {
+    let profile = root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)?;
     let assignment = assign_root_bus_resources(
         instance_id,
         hardware_ids,
         compatible_ids,
-        &ROOT_DMA_TEST_RESOURCE_PROFILE,
+        profile,
         int_vector,
         int_latched,
         /*affinity=*/ 1,

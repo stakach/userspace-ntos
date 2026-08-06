@@ -87,10 +87,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    MMIO/I/O/interrupt resource-list projection, multiple common-buffer allocations from the
    per-devnode DMA grant, cap-backed inline `out dx,eax` I/O-port service,
    `IoSetDeviceInterfaceState` publication, connected-ISR dispatch, and KDPC bottom-half delivery.
-   Hosted PCI resource grants now use bus/dev/function keyed per-devnode component windows, and
-   publication is selected from the boot/system PnP launch plans instead of a NIC-named global. The
-   next B3 target is retiring the remaining root-bus proof VAs, then generalizing broker grants for
-   every eligible PCI function so arbitrary boot PnP drivers ride the same dynamic boundary.
+   Hosted PCI and root-bus resource grants now use selected per-devnode component windows instead
+   of NIC-named globals or root-bus proof VAs, and publication is selected from the boot/system PnP
+   launch plans. The next B3 target is generalizing broker grant discovery for every eligible PCI
+   function and replacing bounded hosted window/instance tables where they block arbitrary
+   multi-driver scale.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata should choose process creation;
    the kernel should only expose generic process/section/token/thread primitives.
 3. Audit remaining static driver-object construction sites that are not service-key-derived,
@@ -713,3 +714,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   no longer tied to a pre-published E1000 identity; remaining B3 resource-window debt is the fixed
   root-bus proof VAs and the bounded hosted window/instance tables before arbitrary multi-driver
   scale can be considered complete.
+- B3 cleanup continued. Root-bus proof resources now use the same published resource-window
+  boundary as PCI. `nt-pnp` exposes a tested root-bus profile matcher, the executive builds root
+  windows only for registry-selected launch-plan devnodes, and the old static
+  `HOSTED_PNP_ROOT_DMA_*` frame globals plus `NIC_VADDR`/`DMA_VADDR`/`NIC_IOVA` reuse were removed
+  from the root grant path. The root proof still has an executive seed alias for its synthetic MMIO
+  register page, but that alias is allocated by root-window index and looked up through the active
+  resource evidence before interrupt injection. Validation: `cargo fmt --all`, `cargo test -p
+  nt-pnp`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  `./rust-micro/scripts/run_specs.sh` proof `.tmp/boot-root-resource-windows-20260807.log`.
+  Result: `pci-selected=1 pci-published=1 root-selected=1 root-published=1`, both
+  `exec_hosted_pci_windows_selected_from_registry` and
+  `exec_hosted_root_windows_selected_from_registry` pass, `DmaPnpPowerTest` and ReactOS `E1000`
+  both receive resources through the generic hosted PnP path, and the boot reaches genuine explorer
+  shell chrome with `291/291` checks passing. Review adjustment: the remaining B3 resource debt is
+  no longer static hosted identity; it is bounded scaling and broker coverage. Next work should make
+  hardware-grant discovery enumerate/claim every registry-selected eligible PCI function instead of
+  carrying only the raw E1000 claim, then address fixed hosted instance/window caps where they become
+  practical blockers.

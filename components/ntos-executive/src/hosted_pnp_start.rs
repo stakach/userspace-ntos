@@ -3,14 +3,20 @@ use crate::*;
 
 static mut HOSTED_PNP_PCI_DEVICES: Option<Vec<nt_pnp::PciDevice>> = None;
 static mut HOSTED_PNP_PCI_WINDOWS: Option<Vec<HostedPnpPciResourceWindow>> = None;
-static mut HOSTED_PNP_ROOT_DMA_MMIO_FRAME: u64 = 0;
-static mut HOSTED_PNP_ROOT_DMA_COMMON_FRAME: u64 = 0;
+static mut HOSTED_PNP_ROOT_WINDOWS: Option<Vec<HostedPnpRootResourceWindow>> = None;
 
 const STATUS_DEVICE_NOT_READY: nt_status::NtStatus = nt_status::NtStatus(0xC000_00A3u32 as i32);
 const HOSTED_PCI_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
 const HOSTED_PCI_MMIO_VA_BASE: u64 = 0x0000_0100_1600_0000;
 const HOSTED_PCI_DMA_VA_BASE: u64 = 0x0000_0100_1800_0000;
 pub(crate) const HOSTED_PCI_RESOURCE_WINDOW_CAP: usize = 16;
+pub(crate) const HOSTED_ROOT_RESOURCE_WINDOW_CAP: usize = 8;
+const HOSTED_ROOT_MMIO_VA_BASE: u64 = HOSTED_PCI_DMA_VA_BASE
+    + (HOSTED_PCI_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE;
+const HOSTED_ROOT_DMA_VA_BASE: u64 = HOSTED_ROOT_MMIO_VA_BASE
+    + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE;
+const HOSTED_ROOT_SEED_VA_BASE: u64 = 0x0000_0100_1100_0000;
+const HOSTED_ROOT_DMA_LOGICAL_BASE: u64 = 0x0010_0000;
 
 const _: () = assert!(HOSTED_PCI_MMIO_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(HOSTED_PCI_DMA_VA_BASE & 0x1F_FFFF == 0);
@@ -22,7 +28,23 @@ const _: () = assert!(
 const _: () = assert!(
     HOSTED_PCI_DMA_VA_BASE
         + (HOSTED_PCI_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        <= HOSTED_ROOT_MMIO_VA_BASE
+);
+const _: () = assert!(
+    HOSTED_ROOT_MMIO_VA_BASE
+        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        <= HOSTED_ROOT_DMA_VA_BASE
+);
+const _: () = assert!(
+    HOSTED_ROOT_DMA_VA_BASE
+        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
         <= crate::allocator::HEAP_BASE as u64
+);
+const _: () = assert!(HOSTED_ROOT_SEED_VA_BASE & 0x1F_FFFF == 0);
+const _: () = assert!(
+    HOSTED_ROOT_SEED_VA_BASE
+        + (HOSTED_ROOT_RESOURCE_WINDOW_CAP as u64) * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+        <= 0x0000_0100_1200_0000
 );
 
 #[derive(Clone, Copy)]
@@ -79,6 +101,67 @@ impl HostedPnpPciResourceWindow {
 
     pub(crate) fn matches(&self, device: &nt_pnp::PciDevice) -> bool {
         self.bus == device.bus && self.dev == device.dev && self.func == device.func
+    }
+
+    pub(crate) fn granted_mmio_len(&self) -> u32 {
+        self.mmio_pages
+            .saturating_mul(0x1000)
+            .min(u32::MAX as u64) as u32
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedPnpRootResourceWindow {
+    pub(crate) device_id: &'static str,
+    pub(crate) mmio_phys: u64,
+    pub(crate) mmio_frame_base: u64,
+    pub(crate) mmio_pages: u64,
+    pub(crate) mmio_va: u64,
+    pub(crate) mmio_seed_va: u64,
+    pub(crate) interrupt_vector: u32,
+    pub(crate) interrupt_latched: bool,
+    pub(crate) dma_frame_base: u64,
+    pub(crate) dma_pages: u64,
+    pub(crate) dma_va: u64,
+    pub(crate) dma_logical: u64,
+    pub(crate) dma_len: u64,
+}
+
+impl HostedPnpRootResourceWindow {
+    pub(crate) fn for_index(
+        index: u64,
+        profile: &'static nt_pnp::RootBusResourceProfile,
+        mmio_frame_base: u64,
+        mmio_pages: u64,
+        interrupt_vector: u32,
+        interrupt_latched: bool,
+        dma_frame_base: u64,
+        dma_pages: u64,
+        dma_len: u64,
+    ) -> Self {
+        Self {
+            device_id: profile.device_id,
+            mmio_phys: profile.mmio_phys,
+            mmio_frame_base,
+            mmio_pages,
+            mmio_va: HOSTED_ROOT_MMIO_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            mmio_seed_va: Self::seed_va_for_index(index),
+            interrupt_vector,
+            interrupt_latched,
+            dma_frame_base,
+            dma_pages,
+            dma_va: HOSTED_ROOT_DMA_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            dma_logical: HOSTED_ROOT_DMA_LOGICAL_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE,
+            dma_len,
+        }
+    }
+
+    pub(crate) const fn seed_va_for_index(index: u64) -> u64 {
+        HOSTED_ROOT_SEED_VA_BASE + index * HOSTED_PCI_RESOURCE_WINDOW_STRIDE
+    }
+
+    pub(crate) fn matches_profile(&self, profile: &nt_pnp::RootBusResourceProfile) -> bool {
+        self.device_id.eq_ignore_ascii_case(profile.device_id)
     }
 
     pub(crate) fn granted_mmio_len(&self) -> u32 {
@@ -166,6 +249,7 @@ struct HostedPnpDevnodeStart<'a> {
 pub(crate) unsafe fn publish_hosted_pnp_resource_context(
     pci_devices: &[nt_pnp::PciDevice],
     pci_windows: &[HostedPnpPciResourceWindow],
+    root_windows: &[HostedPnpRootResourceWindow],
 ) {
     let new_devices = Vec::from(pci_devices);
     let old = core::ptr::replace(
@@ -177,6 +261,12 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
     let old = core::ptr::replace(
         core::ptr::addr_of_mut!(HOSTED_PNP_PCI_WINDOWS),
         Some(new_windows),
+    );
+    drop(old);
+    let new_root_windows = Vec::from(root_windows);
+    let old = core::ptr::replace(
+        core::ptr::addr_of_mut!(HOSTED_PNP_ROOT_WINDOWS),
+        Some(new_root_windows),
     );
     drop(old);
 }
@@ -358,29 +448,18 @@ unsafe fn grant_current_hosted_devnode_resources(
     let pci_windows = (*core::ptr::addr_of!(HOSTED_PNP_PCI_WINDOWS))
         .as_ref()
         .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let mut root_dma_mmio_frame =
-        core::ptr::read_volatile(core::ptr::addr_of!(HOSTED_PNP_ROOT_DMA_MMIO_FRAME));
-    let mut root_dma_common_frame =
-        core::ptr::read_volatile(core::ptr::addr_of!(HOSTED_PNP_ROOT_DMA_COMMON_FRAME));
-    let result = grant_hosted_devnode_resources(
+    let root_windows = (*core::ptr::addr_of!(HOSTED_PNP_ROOT_WINDOWS))
+        .as_ref()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    grant_hosted_devnode_resources(
         device_id,
         instance_id,
         hardware_refs,
         compatible_refs,
         devices.as_slice(),
         pci_windows.as_slice(),
-        &mut root_dma_mmio_frame,
-        &mut root_dma_common_frame,
-    );
-    core::ptr::write_volatile(
-        core::ptr::addr_of_mut!(HOSTED_PNP_ROOT_DMA_MMIO_FRAME),
-        root_dma_mmio_frame,
-    );
-    core::ptr::write_volatile(
-        core::ptr::addr_of_mut!(HOSTED_PNP_ROOT_DMA_COMMON_FRAME),
-        root_dma_common_frame,
-    );
-    result
+        root_windows.as_slice(),
+    )
 }
 
 fn remember_error(report: &mut HostedPnpStartReport, status: nt_status::NtStatus) {
@@ -398,27 +477,28 @@ unsafe fn inject_proof_interrupt(
 ) {
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
         if evidence.mmio_mapped() && evidence.interrupt_connected() {
+            let Some(window) = root_window_for_evidence(evidence) else {
+                return;
+            };
             core::ptr::write_volatile(
-                (ROOT_DMA_PROOF_MMIO_SEED_VADDR + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *mut u32,
+                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *mut u32,
                 0,
             );
             core::ptr::write_volatile(
-                (ROOT_DMA_PROOF_MMIO_SEED_VADDR + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET)
-                    as *mut u32,
+                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET) as *mut u32,
                 1,
             );
             match driver_launch::inject_hosted_device_interrupt(device_id) {
                 Ok(delivery) => {
                     let ack = core::ptr::read_volatile(
-                (ROOT_DMA_PROOF_MMIO_SEED_VADDR + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
-                    as *const u32,
-            );
-            report.interrupt_acknowledged |= ack == 1;
-            if ack == 1 {
-                report.interrupt_acknowledged_count += 1;
-            }
-            print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
-        }
+                        (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *const u32,
+                    );
+                    report.interrupt_acknowledged |= ack == 1;
+                    if ack == 1 {
+                        report.interrupt_acknowledged_count += 1;
+                    }
+                    print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
+                }
                 Err(status) => {
                     print_interrupt_delivery_failure(trace, status);
                     remember_error(report, status);
@@ -426,6 +506,20 @@ unsafe fn inject_proof_interrupt(
             }
         }
     }
+}
+
+unsafe fn root_window_for_evidence(
+    evidence: driver_launch::HostedHardwareEvidence,
+) -> Option<HostedPnpRootResourceWindow> {
+    (*core::ptr::addr_of!(HOSTED_PNP_ROOT_WINDOWS))
+        .as_ref()?
+        .iter()
+        .copied()
+        .find(|window| {
+            window.mmio_phys == evidence.resource_mmio_phys
+                && window.dma_va == evidence.dma_common_va
+                && window.dma_logical == evidence.dma_common_logical
+        })
 }
 
 fn collect_hardware_evidence(

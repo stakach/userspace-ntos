@@ -1852,10 +1852,10 @@ pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 // so the DD writeback never appeared in the polled frame. A dedicated PT guarantees a free slot.
 pub const DMA_VADDR: u64 = 0x0000_0100_10C0_0000;
 const _: () = assert!(NIC_DMA_LEN <= 0x20_0000);
-const ROOT_DMA_PROOF_MMIO_SEED_VADDR: u64 = DMA_VADDR + 0x1000;
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
 const ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET: u64 = 0x0c;
+const ROOT_DMA_PROOF_INTERRUPT_VECTOR: u32 = 5;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -8655,7 +8655,7 @@ unsafe fn alloc_frame_r() -> (u64, u64) {
     (s, e)
 }
 
-unsafe fn alloc_seeded_root_dma_mmio_frame() -> u64 {
+unsafe fn alloc_seeded_root_dma_mmio_frame(seed_va: u64) -> u64 {
     let (frame, frame_err) = alloc_frame_r();
     if frame_err != 0 {
         return 0;
@@ -8671,46 +8671,19 @@ unsafe fn alloc_seeded_root_dma_mmio_frame() -> u64 {
     let _ = paging_struct_map_r(
         pt,
         LBL_X86_PAGE_TABLE_MAP,
-        ROOT_DMA_PROOF_MMIO_SEED_VADDR,
+        seed_va,
         CAP_INIT_THREAD_VSPACE,
     );
-    if page_map_r(
-        frame,
-        ROOT_DMA_PROOF_MMIO_SEED_VADDR,
-        RW_NX,
-        CAP_INIT_THREAD_VSPACE,
-    ) != 0
-    {
+    if page_map_r(frame, seed_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         return 0;
     }
     let mut offset = 0u64;
     while offset < 0x1000 {
-        core::ptr::write_volatile((ROOT_DMA_PROOF_MMIO_SEED_VADDR + offset) as *mut u8, 0);
+        core::ptr::write_volatile((seed_va + offset) as *mut u8, 0);
         offset += 1;
     }
-    core::ptr::write_volatile(
-        ROOT_DMA_PROOF_MMIO_SEED_VADDR as *mut u32,
-        ROOT_DMA_PROOF_ID_VALUE,
-    );
+    core::ptr::write_volatile(seed_va as *mut u32, ROOT_DMA_PROOF_ID_VALUE);
     frame
-}
-
-unsafe fn ensure_root_dma_resource_frames(mmio_frame: &mut u64, common_frame: &mut u64) -> bool {
-    if *mmio_frame == 0 {
-        let frame = alloc_seeded_root_dma_mmio_frame();
-        if frame == 0 {
-            return false;
-        }
-        *mmio_frame = frame;
-    }
-    if *common_frame == 0 {
-        let (frame, frame_err) = alloc_frame_r();
-        if frame_err != 0 {
-            return false;
-        }
-        *common_frame = frame;
-    }
-    true
 }
 
 enum HostedDevnodeGrantKind {
@@ -8772,8 +8745,7 @@ unsafe fn grant_hosted_devnode_resources(
     compatible_refs: &[&str],
     pci_devices: &[nt_pnp::PciDevice],
     pci_windows: &[HostedPnpPciResourceWindow],
-    root_dma_mmio_frame: &mut u64,
-    root_dma_common_frame: &mut u64,
+    root_windows: &[HostedPnpRootResourceWindow],
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
     if let Some(device) = nt_pnp::find_pci_device_for_devnode(
         pci_devices,
@@ -8846,19 +8818,36 @@ unsafe fn grant_hosted_devnode_resources(
         }));
     }
 
-    if let Some(grant) = assign_devnode_root_dma_resources(
-        instance_id,
-        hardware_refs,
-        compatible_refs,
-        NIC_MSI_VECTOR as u32,
-        false,
-        0x1000,
-        0x1000,
-    ) {
-        if !ensure_root_dma_resource_frames(root_dma_mmio_frame, root_dma_common_frame) {
-            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    if let Some(profile) =
+        root_bus_resource_profile_for_devnode(instance_id, hardware_refs, compatible_refs)
+    {
+        let Some(window) = root_windows
+            .iter()
+            .find(|window| window.matches_profile(profile))
+        else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        let Some(grant) = assign_devnode_root_dma_resources(
+            instance_id,
+            hardware_refs,
+            compatible_refs,
+            window.interrupt_vector,
+            window.interrupt_latched,
+            window.dma_len,
+            window.granted_mmio_len(),
+        ) else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        if grant.assignment.mmio_phys != window.mmio_phys
+            || window.mmio_frame_base == 0
+            || window.dma_frame_base == 0
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let mmio_len = grant.assignment.mmio_len.min(0x1000);
+        let mmio_len = grant.assignment.mmio_len.min(window.mmio_pages * 0x1000);
+        if mmio_len == 0 || mmio_len > window.mmio_pages * 0x1000 {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
         driver_launch::grant_hosted_device_resources(
             device_id,
             driver_launch::HostedBusIdentity::root_bus(),
@@ -8866,16 +8855,16 @@ unsafe fn grant_hosted_devnode_resources(
             mmio_len,
             0,
             0,
-            NIC_VADDR,
-            *root_dma_mmio_frame,
-            1,
+            window.mmio_va,
+            window.mmio_frame_base,
+            window.mmio_pages,
             grant.assignment.int_vector,
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
-            DMA_VADDR,
-            *root_dma_common_frame,
-            1,
-            NIC_IOVA,
+            window.dma_va,
+            window.dma_frame_base,
+            window.dma_pages,
+            window.dma_logical,
             grant.assignment.dma_len,
         )?;
         return Ok(Some(HostedDevnodeGrant {
@@ -11867,6 +11856,10 @@ struct HostedPciWindowPublishReport {
     published_windows: u64,
     missing_grants: u64,
     cap_exhausted: bool,
+    selected_root_devnodes: u64,
+    published_root_windows: u64,
+    missing_root_grants: u64,
+    root_cap_exhausted: bool,
 }
 
 unsafe fn publish_hosted_pnp_context_for_launch_plans(
@@ -11876,6 +11869,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
 ) -> HostedPciWindowPublishReport {
     let mut report = HostedPciWindowPublishReport::default();
     let mut windows: Vec<HostedPnpPciResourceWindow> = Vec::new();
+    let mut root_windows: Vec<HostedPnpRootResourceWindow> = Vec::new();
     for plan in plans {
         for spec in plan.as_slice() {
             for devnode in &spec.devnodes[..spec.devnode_count] {
@@ -11883,57 +11877,97 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                 let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
                 let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
                 let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
-                let Some(device) = nt_pnp::find_pci_device_for_devnode(
+                if let Some(device) = nt_pnp::find_pci_device_for_devnode(
                     pci_devices,
+                    devnode.instance_id.as_str(),
+                    hardware_refs,
+                    compatible_refs,
+                ) {
+                    report.selected_devnodes += 1;
+                    if windows.iter().any(|window| window.matches(device)) {
+                        continue;
+                    }
+                    let Some(grant) = grants.iter().find(|grant| grant.matches(device)) else {
+                        report.missing_grants += 1;
+                        continue;
+                    };
+                    let Some(mem_bar) = device.first_memory_bar() else {
+                        report.missing_grants += 1;
+                        continue;
+                    };
+                    if grant.mmio_phys != mem_bar.base
+                        || grant.mmio_frame_base == 0
+                        || grant.dma_frame_base == 0
+                    {
+                        report.missing_grants += 1;
+                        continue;
+                    }
+                    if windows.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
+                        report.cap_exhausted = true;
+                        continue;
+                    }
+                    windows.push(HostedPnpPciResourceWindow::for_index(
+                        windows.len() as u64,
+                        device.bus,
+                        device.dev,
+                        device.func,
+                        grant.mmio_phys,
+                        grant.mmio_frame_base,
+                        grant.mmio_pages,
+                        grant.interrupt_vector,
+                        grant.interrupt_latched,
+                        grant.dma_frame_base,
+                        grant.dma_pages,
+                        grant.dma_logical,
+                        grant.dma_len,
+                    ));
+                    continue;
+                }
+
+                let Some(profile) = root_bus_resource_profile_for_devnode(
                     devnode.instance_id.as_str(),
                     hardware_refs,
                     compatible_refs,
                 ) else {
                     continue;
                 };
-                report.selected_devnodes += 1;
-                if windows.iter().any(|window| window.matches(device)) {
-                    continue;
-                }
-                let Some(grant) = grants.iter().find(|grant| grant.matches(device)) else {
-                    report.missing_grants += 1;
-                    continue;
-                };
-                let Some(mem_bar) = device.first_memory_bar() else {
-                    report.missing_grants += 1;
-                    continue;
-                };
-                if grant.mmio_phys != mem_bar.base
-                    || grant.mmio_frame_base == 0
-                    || grant.dma_frame_base == 0
+                report.selected_root_devnodes += 1;
+                if root_windows
+                    .iter()
+                    .any(|window| window.matches_profile(profile))
                 {
-                    report.missing_grants += 1;
                     continue;
                 }
-                if windows.len() >= HOSTED_PCI_RESOURCE_WINDOW_CAP {
-                    report.cap_exhausted = true;
+                if root_windows.len() >= HOSTED_ROOT_RESOURCE_WINDOW_CAP {
+                    report.root_cap_exhausted = true;
                     continue;
                 }
-                windows.push(HostedPnpPciResourceWindow::for_index(
-                    windows.len() as u64,
-                    device.bus,
-                    device.dev,
-                    device.func,
-                    grant.mmio_phys,
-                    grant.mmio_frame_base,
-                    grant.mmio_pages,
-                    grant.interrupt_vector,
-                    grant.interrupt_latched,
-                    grant.dma_frame_base,
-                    grant.dma_pages,
-                    grant.dma_logical,
-                    grant.dma_len,
+                let seed_va = HostedPnpRootResourceWindow::seed_va_for_index(
+                    root_windows.len() as u64,
+                );
+                let mmio_frame = alloc_seeded_root_dma_mmio_frame(seed_va);
+                let (dma_frame, dma_frame_err) = alloc_frame_r();
+                if mmio_frame == 0 || dma_frame_err != 0 {
+                    report.missing_root_grants += 1;
+                    continue;
+                }
+                root_windows.push(HostedPnpRootResourceWindow::for_index(
+                    root_windows.len() as u64,
+                    profile,
+                    mmio_frame,
+                    profile.mmio_len.div_ceil(0x1000).max(1),
+                    ROOT_DMA_PROOF_INTERRUPT_VECTOR,
+                    false,
+                    dma_frame,
+                    1,
+                    0x1000,
                 ));
             }
         }
     }
     report.published_windows = windows.len() as u64;
-    publish_hosted_pnp_resource_context(pci_devices, windows.as_slice());
+    report.published_root_windows = root_windows.len() as u64;
+    publish_hosted_pnp_resource_context(pci_devices, windows.as_slice(), root_windows.as_slice());
     report
 }
 
@@ -18029,7 +18063,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             dma_len: NIC_DMA_LEN,
         });
     }
-    publish_hosted_pnp_resource_context(&pci_devices, &[]);
+    publish_hosted_pnp_resource_context(&pci_devices, &[], &[]);
 
     // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
     // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
@@ -19607,20 +19641,36 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &[system_boot_driver_plan, config_pnp_plan],
         hosted_pci_hardware_grants.as_slice(),
     );
-    print_str(b"[driver-launch] hosted PCI windows selected=");
+    print_str(b"[driver-launch] hosted resource windows pci-selected=");
     print_u64(hosted_pci_window_publish.selected_devnodes);
-    print_str(b" published=");
+    print_str(b" pci-published=");
     print_u64(hosted_pci_window_publish.published_windows);
-    print_str(b" missing-grants=");
+    print_str(b" pci-missing-grants=");
     print_u64(hosted_pci_window_publish.missing_grants);
-    print_str(b" cap-exhausted=");
+    print_str(b" pci-cap-exhausted=");
     print_u64(hosted_pci_window_publish.cap_exhausted as u64);
+    print_str(b" root-selected=");
+    print_u64(hosted_pci_window_publish.selected_root_devnodes);
+    print_str(b" root-published=");
+    print_u64(hosted_pci_window_publish.published_root_windows);
+    print_str(b" root-missing-grants=");
+    print_u64(hosted_pci_window_publish.missing_root_grants);
+    print_str(b" root-cap-exhausted=");
+    print_u64(hosted_pci_window_publish.root_cap_exhausted as u64);
     print_str(b"\n");
     check(
         b"exec_hosted_pci_windows_selected_from_registry",
         hosted_pci_window_publish.published_windows != 0
             && hosted_pci_window_publish.missing_grants == 0
             && !hosted_pci_window_publish.cap_exhausted,
+        &mut passed,
+    );
+    check(
+        b"exec_hosted_root_windows_selected_from_registry",
+        hosted_pci_window_publish.selected_root_devnodes == 0
+            || (hosted_pci_window_publish.published_root_windows != 0
+                && hosted_pci_window_publish.missing_root_grants == 0
+                && !hosted_pci_window_publish.root_cap_exhausted),
         &mut passed,
     );
 
