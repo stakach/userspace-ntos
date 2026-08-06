@@ -412,3 +412,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   the root-bus DMA fixture; the remaining B3 cleanup is to move real PCI interrupt/DMA hardware
   evidence onto the same generic resource boundary, then remove the bespoke NIC-specific proof once
   that equivalence is demonstrated.
+- B3 continued. Generic hosted device drivers now drain bounded KDPC work queued by the connected
+  ISR before returning from the interrupt-dispatch pump. `KeInsertQueueDpc` records real KDPC
+  pointers and system arguments in the hosted shared frame, the component dispatcher invokes each
+  driver's deferred routine in the hosted driver address space, and boot evidence requires
+  zero-drop DPC delivery in the new `exec_generic_hw_dpc_delivered` gate. Validation:
+  `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and `./run.sh` through genuine explorer shell chrome with
+  `286/288` checks passing. The only failing checks remain the known
+  `exec_irp_transport_call_bound` and `exec_client_reply_bound` transport-accounting gates. Review
+  adjustment: the generic root-bus fixture now proves MMIO, DMA common-buffer allocation,
+  connected-ISR execution, and DPC bottom-half execution. The next B3 slice should move the old real
+  PCI/NIC hardware proof onto this generic resource boundary, then remove the bespoke NIC proof only
+  after equivalent PCI-backed evidence is green.

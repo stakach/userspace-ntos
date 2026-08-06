@@ -202,6 +202,12 @@ pub const SH_RESOURCE_INTERRUPT_ID: u64 = 0x450; // out: canonical nt-resource-m
 pub const SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR: u64 = 0x458; // out: last delivered vector
 pub const SH_RESOURCE_INTERRUPT_ISR_CLAIMED: u64 = 0x460; // out: last ISR BOOLEAN result
 pub const SH_RESOURCE_INTERRUPT_DELIVERIES: u64 = 0x468; // out: ISR delivery count
+pub const SH_DPC_QUEUE_HEAD: u64 = 0x470; // out: bounded KDPC queue consumer index
+pub const SH_DPC_QUEUE_TAIL: u64 = 0x478; // out: bounded KDPC queue producer index
+pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: failed inserts due to full queue
+pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
+pub const SH_DPC_QUEUE_BASE: u64 = 0x490; // out: queued KDPC pointers
+pub const SH_DPC_QUEUE_SLOTS: u64 = 4;
 
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
@@ -1617,6 +1623,7 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
                 0,
             );
+            clear_dpc_queue_projection(FSD_SHARED_VADDR);
         }
     }
 }
@@ -2204,6 +2211,21 @@ const KDPC_SYSTEM_ARGUMENT2_OFFSET: u64 = 0x30;
 const KDPC_QUEUED_OFFSET: u64 = 0x38;
 const KDPC_SIZE: u64 = 0x40;
 
+unsafe fn clear_dpc_queue_projection(sh: u64) {
+    write_volatile((sh + SH_DPC_QUEUE_HEAD) as *mut u64, 0);
+    write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
+    write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, 0);
+    write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, 0);
+    let mut slot = 0u64;
+    while slot < SH_DPC_QUEUE_SLOTS {
+        write_volatile(
+            (sh + SH_DPC_QUEUE_BASE + slot * 8) as *mut u64,
+            0,
+        );
+        slot += 1;
+    }
+}
+
 /// `void KeInitializeDpc(PRKDPC, PKDEFERRED_ROUTINE, PVOID)`.
 extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: u64) {
     unsafe {
@@ -2229,11 +2251,70 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
         {
             return 0;
         }
+        let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
+        let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
+        if tail.saturating_sub(head) >= SH_DPC_QUEUE_SLOTS {
+            let drops = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *const u64);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *mut u64,
+                drops.saturating_add(1),
+            );
+            return 0;
+        }
         write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, arg1);
         write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, arg2);
         write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
+        let slot = FSD_SHARED_VADDR + SH_DPC_QUEUE_BASE + (tail % SH_DPC_QUEUE_SLOTS) * 8;
+        write_volatile(slot as *mut u64, dpc);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *mut u64,
+            tail.saturating_add(1),
+        );
     }
     1
+}
+
+unsafe fn fsd_drain_queued_dpcs() -> u64 {
+    let mut inspected = 0u64;
+    let mut delivered = 0u64;
+    while inspected < SH_DPC_QUEUE_SLOTS {
+        let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
+        let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
+        if head == tail {
+            break;
+        }
+        let slot = FSD_SHARED_VADDR + SH_DPC_QUEUE_BASE + (head % SH_DPC_QUEUE_SLOTS) * 8;
+        let dpc = read_volatile(slot as *const u64);
+        write_volatile(slot as *mut u64, 0);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *mut u64,
+            head.saturating_add(1),
+        );
+        inspected += 1;
+        if dpc == 0 {
+            continue;
+        }
+        let routine = read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
+        write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 0);
+        if routine == 0 {
+            continue;
+        }
+        let context = read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
+        let arg1 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *const u64);
+        let arg2 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *const u64);
+        let f: extern "win64" fn(u64, u64, u64, u64) =
+            core::mem::transmute(routine as *const ());
+        f(dpc, context, arg1, arg2);
+        delivered += 1;
+    }
+    if delivered != 0 {
+        let total = read_volatile((FSD_SHARED_VADDR + SH_DPC_DELIVERIES) as *const u64);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_DPC_DELIVERIES) as *mut u64,
+            total.saturating_add(delivered),
+        );
+    }
+    delivered
 }
 
 /// `BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE, BOOLEAN Wait)` /
@@ -2735,6 +2816,7 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let isr: extern "win64" fn(u64, u64) -> u8 =
             core::mem::transmute(service_routine as *const ());
         let claimed = isr(interrupt_object, service_context);
+        let _ = fsd_drain_queued_dpcs();
         let deliveries =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
         write_volatile(
@@ -4533,6 +4615,8 @@ pub(crate) struct HostedHardwareEvidence {
     pub interrupt_delivered_vector: u64,
     pub interrupt_isr_claimed: u64,
     pub interrupt_deliveries: u64,
+    pub dpc_deliveries: u64,
+    pub dpc_drops: u64,
     pub dma_adapter_id: u64,
     pub dma_adapter_blob: u64,
     pub dma_common_va: u64,
@@ -4565,6 +4649,10 @@ impl HostedHardwareEvidence {
             && self.interrupt_deliveries != 0
             && self.interrupt_isr_claimed != 0
             && self.interrupt_delivered_vector == self.interrupt_vector as u64
+    }
+
+    pub(crate) fn dpc_delivered(self) -> bool {
+        self.dpc_deliveries != 0 && self.dpc_drops == 0
     }
 
     pub(crate) fn dma_adapter_created(self) -> bool {
@@ -4690,6 +4778,7 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+    clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
@@ -4860,6 +4949,8 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
             interrupt_deliveries: read_volatile(
                 (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64,
             ),
+            dpc_deliveries: read_volatile((sh + SH_DPC_DELIVERIES) as *const u64),
+            dpc_drops: read_volatile((sh + SH_DPC_QUEUE_DROPS) as *const u64),
             dma_adapter_id: read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64),
             dma_adapter_blob: read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64),
             dma_common_va: read_volatile((sh + SH_DMA_COMMON_VA) as *const u64),
@@ -5354,6 +5445,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
+    clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, dma_va);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, mapped_dma_len);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, dma_logical);

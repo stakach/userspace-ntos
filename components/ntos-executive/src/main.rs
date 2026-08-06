@@ -20297,6 +20297,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_interrupt_connected = false;
     let mut generic_hw_interrupt_delivered = false;
     let mut generic_hw_interrupt_acknowledged = false;
+    let mut generic_hw_dpc_delivered = false;
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
     let mut generic_hw_root_started = false;
@@ -20549,6 +20550,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 generic_hw_mmio_mapped |= evidence.mmio_mapped();
                                 generic_hw_interrupt_connected |= evidence.interrupt_connected();
                                 generic_hw_interrupt_delivered |= evidence.interrupt_delivered();
+                                generic_hw_dpc_delivered |= evidence.dpc_delivered();
                                 generic_hw_dma_adapter |= evidence.dma_adapter_created();
                                 generic_hw_dma_common |= evidence.dma_common_allocated();
                                 generic_hw_root_started |= evidence.root_pdo_started;
@@ -20567,6 +20569,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             print_u64(evidence.interrupt_delivered() as u64);
                             print_str(b" int_count=");
                             print_u64(evidence.interrupt_deliveries);
+                            print_str(b" dpc=");
+                            print_u64(evidence.dpc_delivered() as u64);
+                            print_str(b" dpc_count=");
+                            print_u64(evidence.dpc_deliveries);
+                            print_str(b" dpc_drops=");
+                            print_u64(evidence.dpc_drops);
                             print_str(b" dma_adapter=");
                             print_u64(evidence.dma_adapter_created() as u64);
                             print_str(b" dma_common=");
@@ -20618,6 +20626,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         generic_hw_interrupt_connected
             && generic_hw_interrupt_delivered
             && generic_hw_interrupt_acknowledged,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_hw_dpc_delivered",
+        generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
         &mut passed,
     );
 
