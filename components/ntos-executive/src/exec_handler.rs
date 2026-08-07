@@ -125,6 +125,133 @@ unsafe fn record_hosted_child_exe_open(
     opened
 }
 
+fn dynamic_hosted_nt_image_path(
+    volume_relative: &[u8],
+    leaf: &[u8],
+    out: &mut [u8; nt_exe_image::MAX_NT_IMAGE_PATH],
+) -> Option<(usize, nt_exe_image::HostedImageRoot)> {
+    let (prefix, root) = if volume_relative
+        .strip_prefix(br"reactos\system32\")
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
+    {
+        (
+            b"\\SystemRoot\\System32\\" as &[u8],
+            nt_exe_image::HostedImageRoot::System32,
+        )
+    } else if volume_relative
+        .strip_prefix(br"reactos\")
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(leaf))
+    {
+        (
+            b"\\SystemRoot\\" as &[u8],
+            nt_exe_image::HostedImageRoot::SystemRoot,
+        )
+    } else {
+        return None;
+    };
+    let len = prefix.len().checked_add(leaf.len())?;
+    if len > out.len() {
+        return None;
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..len].copy_from_slice(leaf);
+    Some((len, root))
+}
+
+unsafe fn load_hosted_executable_from_volume_path(
+    volume_relative: &[u8],
+    leaf: &[u8],
+) -> Option<(nt_pe_loader::PeFile<'static>, u64)> {
+    let fs = exec_fs()?;
+    let (va, size) = load_file_to_pool(&fs, volume_relative)?;
+    let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, size as usize);
+    let pe = match nt_pe_loader::PeFile::parse(bytes) {
+        Ok(pe) => pe,
+        Err(_) => {
+            print_str(b"[hosted-exe] PE parse failed for ");
+            print_str(leaf);
+            print_str(b"\n");
+            return None;
+        }
+    };
+    apply_relocations_to_buf(&pe, va, PE_LOAD_BASE);
+    let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
+    core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    print_str(b"[hosted-exe] loaded ");
+    print_str(leaf);
+    print_str(b": ");
+    print_u64(size as u64);
+    print_str(b" bytes, PE32+ @pool=0x");
+    print_hex((va >> 32) as u32);
+    print_hex(va as u32);
+    print_str(b"\n");
+    Some((pe, va))
+}
+
+unsafe fn admit_dynamic_hosted_exe(
+    ctx: ExecLoopCtx,
+    role: Option<nt_exe_image::HostedProcessRole>,
+    name16: &[u16],
+    folded_name: &[u8],
+    is_sxs: bool,
+) -> Option<nt_exe_image::HostedProcessImageRef<'static>> {
+    if is_sxs {
+        return None;
+    }
+    let role = role?;
+    let volume_relative = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+    let leaf = nt_exe_image::canonical_exe_leaf(&volume_relative)?;
+    if !folded_name
+        .windows(leaf.len())
+        .any(|window| window.eq_ignore_ascii_case(leaf))
+    {
+        return None;
+    }
+    let mut nt_image_path = [0u8; nt_exe_image::MAX_NT_IMAGE_PATH];
+    let (nt_image_path_len, image_root) =
+        dynamic_hosted_nt_image_path(&volume_relative, leaf, &mut nt_image_path)?;
+    let catalog: &'static nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
+        &*ctx.exe_image_catalog;
+    if let Some(existing) = catalog.get_by_leaf(leaf) {
+        return Some(existing);
+    }
+    let (pe, pool_va) = load_hosted_executable_from_volume_path(&volume_relative, leaf)?;
+    let catalog: &'static mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
+        &mut *ctx.exe_image_catalog;
+    let pi = match catalog.admit_dynamic_executable(
+        leaf,
+        role,
+        &nt_image_path[..nt_image_path_len],
+        &nt_image_path[..nt_image_path_len],
+        image_root,
+        MAX_PI,
+    ) {
+        Ok(pi) => pi,
+        Err(err) => {
+            print_str(b"[hosted-exe] dynamic admission failed for ");
+            print_str(leaf);
+            print_str(b" err=");
+            print_u64(err as u64);
+            print_str(b"\n");
+            return None;
+        }
+    };
+    let image = catalog.get_by_pi(pi)?;
+    register_hosted_process_runtime_for_image(image)
+        .expect("dynamic hosted executable runtime layout must register once");
+    (&mut *ctx.hosted_loaded_images)
+        .register_if_loaded(image, Some(pe), pool_va)
+        .expect("dynamic hosted executable PE must register once");
+    print_str(b"[hosted-exe] admitted dynamic image pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(image.top_badge);
+    print_str(b" leaf=");
+    print_str(image.leaf);
+    print_str(b"\n");
+    Some(image)
+}
+
 /// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
 /// cross-address-space copy-in behind the pure `nt_security::ClientMemory` capture contract.
 /// `xas_read` resolves the stack/heap/image mirrors, the persistent frame aliases, and finally the
@@ -2657,8 +2784,9 @@ impl ExecNtHandler {
         pi: usize,
     ) -> Option<nt_exe_image::HostedProcessImageRef<'_>> {
         // SAFETY: `service_sec_image` constructs the handler after the loop-owned catalog and drops
-        // it before the catalog. Catalog mutations are confined to the service loop/bootstrap path;
-        // handler lookups only publish or consume already-registered metadata.
+        // it before the catalog. Catalog mutations occur inside the same serialized service loop:
+        // bootstrap seeds the initial images, and NtOpenFile may admit later executable images before
+        // their NtCreateSection/NtCreateProcess path consumes the metadata.
         unsafe { (&*self.hosted_images).get_by_pi(pi) }
     }
 
@@ -9698,6 +9826,19 @@ impl ExecNtHandler {
         }
     }
 
+    fn dynamic_child_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
+        match self.current_hosted_process_role()? {
+            nt_exe_image::HostedProcessRole::NonInteractiveService => {
+                Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
+            }
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
+            | nt_exe_image::HostedProcessRole::InteractiveShell => {
+                Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+            }
+            _ => None,
+        }
+    }
+
     /// Classify a folded probe path through the runtime hosted-executable catalog and return the
     /// registered image entry, so existence resolves against the real file and its registered root
     /// rather than a possibly-malformed extracted leaf.
@@ -10070,11 +10211,18 @@ impl ExecNtHandler {
         };
         let volume_not_directory =
             volume_entry.is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
-        let catalog = &*ctx.exe_image_catalog;
-        let hosted_exe_image = (!want_dir)
-            .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
-            .flatten()
-            .filter(|image| Self::hosted_image_exists(*image));
+        let mut hosted_exe_image = {
+            let catalog = &*ctx.exe_image_catalog;
+            (!want_dir)
+                .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
+                .flatten()
+                .filter(|image| Self::hosted_image_exists(*image))
+        };
+        if hosted_exe_image.is_none() && !want_dir {
+            let dynamic_role = self.dynamic_child_role();
+            hosted_exe_image =
+                admit_dynamic_hosted_exe(ctx, dynamic_role, &name16, &nb[..nlen], is_sxs);
+        }
         let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
         let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
             if nb[..nlen].windows(8).any(|w| w == b"explorer") {

@@ -44,10 +44,6 @@ static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
 static mut SERVICE_DLL_PD_CREATED_WORK: [bool; MAX_PI] = [false; MAX_PI];
 static mut SERVICE_DLL_PT_BITS_WORK: [[u64; DLL_ARENA_PT_WORDS]; MAX_PI] =
     [[0; DLL_ARENA_PT_WORDS]; MAX_PI];
-static mut SERVICE_HOSTED_BOOTSTRAP_PES_WORK: [Option<nt_pe_loader::PeFile<'static>>;
-    HOSTED_BOOTSTRAP_LOAD_COUNT] = [const { None }; HOSTED_BOOTSTRAP_LOAD_COUNT];
-static mut SERVICE_HOSTED_BOOTSTRAP_POOL_VAS_WORK: [u64; HOSTED_BOOTSTRAP_LOAD_COUNT] =
-    [0; HOSTED_BOOTSTRAP_LOAD_COUNT];
 static mut SERVICE_PROCS_WORK: [ProcExec; MAX_PI] = [ProcExec::empty(); MAX_PI];
 static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
     nt_exe_image::ImageTable::new();
@@ -722,9 +718,10 @@ unsafe fn reset_service_delay_queue_work() -> &'static mut nt_delay_execution::Q
 
 unsafe fn load_hosted_bootstrap_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    loaded_images: &mut HostedLoadedImageTable,
     enabled: bool,
     spec: HostedBootstrapLoadSpec,
-) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
+) {
     let (pe, va) = if enabled {
         load_dll_from_fs(spec.disk_path, spec.stem)
     } else {
@@ -735,19 +732,11 @@ unsafe fn load_hosted_bootstrap_image(
         let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
-    register_loaded_hosted_image(catalog, spec.image, pe.is_some())
+    let loaded = pe.is_some();
+    register_loaded_hosted_image(catalog, spec.image, loaded)
         .expect("hosted bootstrap image metadata must register once when loaded");
-    (pe, va)
-}
-
-fn register_loaded_hosted_bootstrap_pe(
-    loaded_images: &mut HostedLoadedImageTable,
-    spec: HostedBootstrapLoadSpec,
-    pe: &Option<nt_pe_loader::PeFile<'static>>,
-    pool_va: u64,
-) {
     loaded_images
-        .register_if_loaded(spec.image, pe, pool_va)
+        .register_if_loaded(spec.image, pe, va)
         .expect("loaded hosted executable PE metadata must register once");
 }
 
@@ -3453,28 +3442,15 @@ pub(crate) unsafe fn service_sec_image(
         csrss_pi != usize::MAX,
         "bootstrap manifest must include CSRSS"
     );
-    let hosted_bootstrap_pes = &mut *core::ptr::addr_of_mut!(SERVICE_HOSTED_BOOTSTRAP_PES_WORK);
-    for entry in hosted_bootstrap_pes.iter_mut() {
-        *entry = None;
-    }
-    let hosted_bootstrap_pool_vas =
-        &mut *core::ptr::addr_of_mut!(SERVICE_HOSTED_BOOTSTRAP_POOL_VAS_WORK);
-    hosted_bootstrap_pool_vas.fill(0);
-    for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
-        let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
-        let (loaded_pe, pool_va) =
-            load_hosted_bootstrap_image(exe_image_catalog, ntdll.is_some(), spec);
-        hosted_bootstrap_pes[index] = loaded_pe;
-        hosted_bootstrap_pool_vas[index] = pool_va;
-    }
     let hosted_loaded_images = reset_service_hosted_loaded_images_work();
+    let hosted_loaded_images_ptr = hosted_loaded_images as *mut HostedLoadedImageTable;
     for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
         let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
-        register_loaded_hosted_bootstrap_pe(
+        load_hosted_bootstrap_image(
+            exe_image_catalog,
             hosted_loaded_images,
+            ntdll.is_some(),
             spec,
-            &hosted_bootstrap_pes[index],
-            hosted_bootstrap_pool_vas[index],
         );
     }
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
@@ -6592,7 +6568,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
-                    hosted_loaded_images: hosted_loaded_images as *const HostedLoadedImageTable,
+                    hosted_loaded_images: hosted_loaded_images_ptr,
                     exe_images: exe_images
                         as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
                     exe_image_catalog: exe_image_catalog

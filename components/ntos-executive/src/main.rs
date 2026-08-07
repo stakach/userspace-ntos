@@ -13781,9 +13781,10 @@ struct ExecLoopCtx {
     /// per-DLL file/section-handle tracking, and image-info synthesis for the file/section fakes.
     reg: *mut nt_dll_registry::Registry,
     /// Loop-owned parsed hosted EXE PEs and backing pool addresses, keyed by the runtime hosted
-    /// image catalog. The PE bytes remain loop-local; syscall handlers consume this registry for
-    /// metadata and demand-fill lookups instead of naming bootstrap image locals directly.
-    hosted_loaded_images: *const HostedLoadedImageTable,
+    /// image catalog. NtOpenFile can extend this table with later executable images loaded from the
+    /// real volume; syscall handlers consume it for metadata and demand-fill lookups instead of
+    /// naming bootstrap image locals directly.
+    hosted_loaded_images: *mut HostedLoadedImageTable,
     /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
     /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
     exe_images: *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,

@@ -40,7 +40,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   boot/system driver candidates, without embedding launch policy in the kernel.
 - `[~]` A3: Route SCM start requests through generic process creation or `NtLoadDriver` based on
   service metadata.
-- `[ ]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
+- `[~]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
   the policy boundary.
 - `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
@@ -120,9 +120,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    process role policy with dynamic process/runtime allocation state. The hosted executable catalog
    and open/section/spawn table now size to `MAX_PI` instead of the historical eight-image cap; the
    hosted runtime table now preserves byte-identical static lanes for `pi=0..6` and assigns later
-   process lanes from a checked high executive scratch/mirror arena. The next blocker is real
-   non-bootstrap executable image storage/loading: today the catalog can admit more process
-   identities, but the loaded PE backing table is still populated only by bootstrap images.
+   process lanes from a checked high executive scratch/mirror arena. Hosted loaded executable PE
+   storage is now table-owned instead of bootstrap-array-owned, and `NtOpenFile` can admit later
+   executable images from the real mounted volume for SCM/service and shell descendants. The next
+   blocker is making services.exe consume SCM-owned Win32 launch specs so a non-bootstrap service
+   executable exercises the generic open/section/process path.
 
 ## Review Log
 
@@ -1025,3 +1027,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   storage for non-bootstrap children. Dynamic catalog/runtime admission is possible structurally, but
   `HostedLoadedImageTable` still points at PE objects from the bootstrap-only
   `SERVICE_HOSTED_BOOTSTRAP_PES_WORK` array.
+- A4 continued. `HostedLoadedImageTable` now owns parsed hosted executable PEs and resident pool VAs
+  directly, so the old `SERVICE_HOSTED_BOOTSTRAP_PES_WORK` and pool-VA side arrays were removed.
+  Bootstrap images and later executable images register through the same loaded-image table.
+  `NtOpenFile` now admits a non-registered `.exe` opened by an eligible hosted parent by resolving the
+  exact NT path to the mounted FAT volume, loading and relocating that PE into the resident pool,
+  adding a fixed-copy catalog identity at the next post-bootstrap `pi`, registering the dynamic
+  runtime lane, and then using the existing owner-local open/section/process table. The dynamic role
+  is derived from the creator's hosted role: service descendants are non-interactive services, and
+  shell descendants are interactive shell processes. Validation: `cargo fmt --all`,
+  `cargo test -p nt-exe-image`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` captured in
+  `.tmp/boot-dynamic-hosted-exe-20260807.log`; the proof run reached
+  `exec_msgina_logon_dialog_painted`, `exec_explorer_shell_chrome_painted`, dynamic process
+  allocation gates, and `290/290` executive checks with no `FAIL` or `exec-paging` markers. Review
+  adjustment: A3 should now make services.exe consume `Win32ServiceLaunchSpec` for real Win32 service
+  process creation, which will give A4 a live non-bootstrap child process gate.

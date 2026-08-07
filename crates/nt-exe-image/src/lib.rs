@@ -16,6 +16,14 @@ pub const SERVICES_TOP_BADGE: u64 = 6;
 pub const LSASS_TOP_BADGE: u64 = 8;
 pub const USERINIT_TOP_BADGE: u64 = 27;
 pub const EXPLORER_TOP_BADGE: u64 = 28;
+pub const DYNAMIC_PROCESS_FIRST_PI: usize = 7;
+pub const DYNAMIC_TOP_BADGE_BASE: u64 = 29;
+
+pub fn dynamic_top_badge_for_pi(pi: usize) -> Option<u64> {
+    let offset = pi.checked_sub(DYNAMIC_PROCESS_FIRST_PI)? as u64;
+    let badge = DYNAMIC_TOP_BADGE_BASE.checked_add(offset)?;
+    (badge < 64).then_some(badge)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageMetadata {
@@ -502,6 +510,42 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries[index].copy_from_ref(image)?;
         self.used[index] = true;
         Ok(index)
+    }
+
+    pub fn next_free_pi(&self, first_pi: usize, max_pi: usize) -> Option<usize> {
+        if first_pi >= max_pi {
+            return None;
+        }
+        (first_pi..max_pi).find(|&pi| self.get_by_pi(pi).is_none())
+    }
+
+    pub fn admit_dynamic_executable(
+        &mut self,
+        leaf: &[u8],
+        role: HostedProcessRole,
+        nt_image_path: &[u8],
+        command_line: &[u8],
+        image_root: HostedImageRoot,
+        max_pi: usize,
+    ) -> Result<usize, HostedImageRegistrationError> {
+        let pi = self
+            .next_free_pi(DYNAMIC_PROCESS_FIRST_PI, max_pi)
+            .ok_or(HostedImageRegistrationError::Full)?;
+        let top_badge =
+            dynamic_top_badge_for_pi(pi).ok_or(HostedImageRegistrationError::InvalidPath)?;
+        let image = OwnedHostedProcessImage::new(
+            pi,
+            top_badge,
+            leaf,
+            leaf,
+            role,
+            nt_image_path,
+            command_line,
+            image_root,
+            leaf,
+        )?;
+        self.register(image)?;
+        Ok(pi)
     }
 
     pub fn count(&self) -> usize {
@@ -1442,6 +1486,81 @@ mod tests {
             FixedBytes::<4>::from_slice(b"12345"),
             Err(HostedImageRegistrationError::FieldTooLong)
         );
+    }
+
+    #[test]
+    fn owned_catalog_admits_post_bootstrap_executables_densely() {
+        let boot = boot_owned_catalog();
+        let mut catalog = OwnedHostedImageCatalog::<9>::new();
+        for image in boot.entries {
+            if !image.leaf().is_empty() {
+                catalog.register(image).unwrap();
+            }
+        }
+
+        let first = catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+        let second = catalog
+            .admit_dynamic_executable(
+                b"cmd.exe",
+                HostedProcessRole::InteractiveShell,
+                b"\\SystemRoot\\System32\\cmd.exe",
+                b"\\SystemRoot\\System32\\cmd.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+
+        assert_eq!(first, DYNAMIC_PROCESS_FIRST_PI);
+        assert_eq!(second, DYNAMIC_PROCESS_FIRST_PI + 1);
+        assert_eq!(
+            catalog.get_by_leaf(b"SVCHOST.EXE").unwrap().top_badge,
+            DYNAMIC_TOP_BADGE_BASE
+        );
+        assert_eq!(
+            catalog.get_by_pi(second).unwrap().top_badge,
+            DYNAMIC_TOP_BADGE_BASE + 1
+        );
+        assert_eq!(
+            catalog.probe_leaf(br"\SystemRoot\System32\cmd.exe", false),
+            Some(b"cmd.exe" as &[u8])
+        );
+    }
+
+    #[test]
+    fn owned_catalog_dynamic_admission_rejects_full_state() {
+        let mut catalog = OwnedHostedImageCatalog::<1>::new();
+        catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 1,
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog.admit_dynamic_executable(
+                b"cmd.exe",
+                HostedProcessRole::InteractiveShell,
+                b"\\SystemRoot\\System32\\cmd.exe",
+                b"\\SystemRoot\\System32\\cmd.exe",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            ),
+            Err(HostedImageRegistrationError::Full)
+        );
+        assert_eq!(dynamic_top_badge_for_pi(DYNAMIC_PROCESS_FIRST_PI - 1), None);
     }
 
     #[test]

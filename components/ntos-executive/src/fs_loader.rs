@@ -492,8 +492,8 @@ pub(crate) unsafe fn exec_fs() -> Option<Fat32> {
 
 /// Load `path` (root-relative) from the executive's live FS into the pool and PE32+-parse it — the
 /// generic replacement for a per-binary staging block. Returns `(Some(pe), pool_va)` on success (the
-/// bytes stay resident in the pool for the demand-fault router), or `(None, 0)` so the caller can
-/// fall back to a fixed staging buffer during the hybrid migration. `name` is for the boot log.
+/// bytes stay resident in the pool for the demand-fault router), or `(None, 0)` when the file is not
+/// available as a valid PE. `name` is for the boot log.
 pub(crate) unsafe fn load_dll_from_fs(
     path: &[u8],
     name: &[u8],
@@ -514,7 +514,7 @@ pub(crate) unsafe fn load_dll_from_fs(
             }
             print_str(b"[ntos-exec] FS-by-path ");
             print_str(name);
-            print_str(b": PARSE FAILED (fallback to staged buffer)\n");
+            print_str(b": PARSE FAILED\n");
         }
     }
     (None, 0)
