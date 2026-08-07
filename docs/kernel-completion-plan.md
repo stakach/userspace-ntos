@@ -117,9 +117,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
-   classes, and non-background shell chrome pixels. The remaining gates are debug syscall dispatch
-   proofs, stale user-callback dead-client/nested proof bits after real explorer activity, and VM
-   pool-headroom accounting.
+   classes, and non-background shell chrome pixels. Directory and symbolic-link object opens now
+   return process-local handles instead of new callers receiving legacy `OBJ_HANDLE_BASE` indexes,
+   and `RootDirectory`/`NtQueryDirectoryObject` resolve through the same handle-table path. The
+   remaining gates are debug syscall dispatch proofs, stale user-callback dead-client/nested proof
+   bits after real explorer activity, VM pool-headroom accounting, and explorer's still-real
+   post-render `NtOpenDirectoryObject` loop.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -1122,3 +1125,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   completes at `282/290`. Review adjustment: next work should close the remaining proof gates
   (`Dbgk*`, user-callback nested/dead-client bits, win32k nested transport bit) and then reduce or
   re-baseline VM pool headroom with real accounting rather than a resource-cap shortcut.
+- Object-namespace handle cleanup. `NtOpenDirectoryObject`, `NtCreateDirectoryObject`,
+  `NtOpenSymbolicLinkObject`, and `NtCreateSymbolicLinkObject` now publish real process-local
+  `EPROCESS` handle-table entries tagged with the namespace object index and mapped directory/link
+  access rights. `RootDirectory`, `NtQueryDirectoryObject`, `NtQueryObject`, and
+  `ObjectSessionInformation` resolve both those handles and the older high namespace indexes, so
+  existing compatibility callers still work while new opens have normal `NtClose` lifetime.
+  Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-object-namespace-handles-20260807.log`. Result: no regression,
+  `exec_explorer_shell_chrome_painted` still passes, final heap is `5942512/6291456`, and the run
+  remains at `282/290`. Review adjustment: explorer still reaches the iteration backstop on repeated
+  `NtOpenDirectoryObject` after rendering, so the next slice should capture and fix the actual object
+  path/status driving that loop rather than changing callback proof gates.

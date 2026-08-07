@@ -3337,6 +3337,120 @@ impl ExecNtHandler {
         h
     }
 
+    fn map_directory_object_access(mut access: u32) -> u32 {
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const DIRECTORY_ALL_ACCESS: u32 = 0x000F_0000 | 0x000F;
+        if access & 0x8000_0000 != 0 {
+            access |= READ_CONTROL | DIRECTORY_QUERY_ACCESS | DIRECTORY_TRAVERSE_ACCESS;
+        }
+        if access & 0x4000_0000 != 0 {
+            access |= READ_CONTROL | DIRECTORY_CREATE_OBJECT_ACCESS | DIRECTORY_CREATE_SUBDIRECTORY_ACCESS;
+        }
+        if access & 0x2000_0000 != 0 {
+            access |= READ_CONTROL | DIRECTORY_TRAVERSE_ACCESS;
+        }
+        if access & (0x1000_0000 | 0x0200_0000) != 0 {
+            access |= DIRECTORY_ALL_ACCESS;
+        }
+        access & !(0xF000_0000 | 0x0200_0000)
+    }
+
+    fn map_symbolic_link_object_access(mut access: u32) -> u32 {
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const SYMBOLIC_LINK_ALL_ACCESS: u32 = 0x000F_0000 | SYMBOLIC_LINK_QUERY_ACCESS;
+        if access & 0x8000_0000 != 0 {
+            access |= READ_CONTROL | SYMBOLIC_LINK_QUERY_ACCESS;
+        }
+        if access & 0x2000_0000 != 0 {
+            access |= READ_CONTROL | SYMBOLIC_LINK_QUERY_ACCESS;
+        }
+        if access & (0x1000_0000 | 0x0200_0000) != 0 {
+            access |= SYMBOLIC_LINK_ALL_ACCESS;
+        }
+        access & !(0xF000_0000 | 0x0200_0000)
+    }
+
+    fn object_namespace_handle_tag(kind: u8, index: usize) -> Option<u64> {
+        let tag = match kind {
+            OBJ_KIND_DIRECTORY => DIRECTORY_OBJECT_HANDLE_TAG,
+            OBJ_KIND_SYMBOLIC_LINK => SYMBOLIC_LINK_HANDLE_TAG,
+            _ => return None,
+        };
+        Some(tag | index as u64)
+    }
+
+    fn object_namespace_tag_kind(tag: u64) -> Option<u8> {
+        match tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK {
+            DIRECTORY_OBJECT_HANDLE_TAG => Some(OBJ_KIND_DIRECTORY),
+            SYMBOLIC_LINK_HANDLE_TAG => Some(OBJ_KIND_SYMBOLIC_LINK),
+            _ => None,
+        }
+    }
+
+    fn object_namespace_mapped_access(kind: u8, desired_access: u32) -> Option<u32> {
+        match kind {
+            OBJ_KIND_DIRECTORY => Some(Self::map_directory_object_access(desired_access)),
+            OBJ_KIND_SYMBOLIC_LINK => Some(Self::map_symbolic_link_object_access(desired_access)),
+            _ => None,
+        }
+    }
+
+    fn mint_object_namespace_handle(&mut self, index: usize, desired_access: u32) -> Option<u64> {
+        let entry = self.obj_ns.get(index)?;
+        let tag = Self::object_namespace_handle_tag(entry.kind, index)?;
+        let access = Self::object_namespace_mapped_access(entry.kind, desired_access)?;
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        self.insert_process_handle(pid, nt_process::HandleObject::Opaque(tag), access)
+            .ok()
+            .map(|handle| handle as u64)
+    }
+
+    fn object_namespace_index_for_handle(
+        &self,
+        handle: u64,
+        required_kind: Option<u8>,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            let entry = self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
+            if required_kind.is_some_and(|kind| entry.kind != kind) {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+            return Ok(index);
+        }
+        if handle > u32::MAX as u64 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let handle = handle as nt_process::Handle;
+        let tag = match self.pm.lookup_handle(pid, handle) {
+            Some(nt_process::HandleObject::Opaque(tag)) => tag,
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(STATUS_INVALID_HANDLE),
+        };
+        let tag_kind = Self::object_namespace_tag_kind(tag).ok_or(STATUS_OBJECT_TYPE_MISMATCH)?;
+        if required_kind.is_some_and(|kind| tag_kind != kind) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let granted = self
+            .pm
+            .handle_access(pid, handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let index = (tag & 0xFFFF_FFFF) as usize;
+        let entry = self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.kind != tag_kind {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        Ok(index)
+    }
+
     /// Mint a process-local handle for an anonymous keyed event. The wait/release rendezvous is
     /// currently keyed by the caller's raw `Key` value, so the object only needs durable handle-table
     /// ownership plus a non-NULL value for ReactOS' per-process RTL keyed-event global.
@@ -6322,6 +6436,16 @@ impl ExecNtHandler {
                 {
                     b"Mutant"
                 }
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG =>
+                {
+                    b"Directory"
+                }
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == SYMBOLIC_LINK_HANDLE_TAG =>
+                {
+                    b"SymbolicLink"
+                }
                 nt_process::HandleObject::Opaque(tag) if tag == KEYEDEVENT_HANDLE_TAG => {
                     b"KeyedEvent"
                 }
@@ -6345,6 +6469,8 @@ impl ExecNtHandler {
         let index = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG
             || tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG
             || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
+            || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG
+            || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == SYMBOLIC_LINK_HANDLE_TAG
         {
             (tag & 0xFFFF_FFFF) as usize
         } else {
@@ -6724,14 +6850,13 @@ impl ExecNtHandler {
                     .map_or_else(|status| status, |_| 0)
             }
             OBJECT_SESSION_INFORMATION => {
-                if handle < OBJ_HANDLE_BASE {
-                    return STATUS_INVALID_HANDLE;
-                }
-                let index = (handle - OBJ_HANDLE_BASE) as usize;
-                match self.obj_ns.get(index) {
-                    Some(entry) if entry.kind == 0 => 0,
-                    Some(_) => STATUS_INVALID_HANDLE,
-                    None => STATUS_INVALID_HANDLE,
+                match self.object_namespace_index_for_handle(
+                    handle,
+                    Some(OBJ_KIND_DIRECTORY),
+                    0,
+                ) {
+                    Ok(_) => 0,
+                    Err(_) => STATUS_INVALID_HANDLE,
                 }
             }
             _ => STATUS_INVALID_INFO_CLASS,
@@ -8942,17 +9067,13 @@ impl ExecNtHandler {
     }
 
     fn event_root_index(&self, root: u64) -> Result<usize, u32> {
-        if root == 0 {
-            return Ok(0);
-        }
-        if root < OBJ_HANDLE_BASE {
-            return Err(0xC000_0008); // STATUS_INVALID_HANDLE
-        }
-        let index = (root - OBJ_HANDLE_BASE) as usize;
-        match self.obj_ns.get(index) {
-            Some(entry) if entry.kind == 0 => Ok(index),
-            Some(_) => Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
-            None => Err(0xC000_0008),    // STATUS_INVALID_HANDLE
+        match root {
+            0 => Ok(0),
+            _ => self.object_namespace_index_for_handle(
+                root,
+                Some(OBJ_KIND_DIRECTORY),
+                DIRECTORY_TRAVERSE_ACCESS,
+            ),
         }
     }
 
@@ -9011,6 +9132,12 @@ impl ExecNtHandler {
         if index + 1 == self.obj_ns.len() {
             self.obj_ns.pop();
             self.mutants.remove(index as u64);
+        }
+    }
+
+    fn rollback_new_namespace_object(&mut self, index: usize) {
+        if index + 1 == self.obj_ns.len() {
+            self.obj_ns.pop();
         }
     }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
@@ -12673,10 +12800,16 @@ impl ExecNtHandler {
                 let mut root_bytes = [0u8; 8];
                 let _ = self.xas_read(args[1] + 8, &mut root_bytes);
                 let root_dir = u64::from_le_bytes(root_bytes);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
+                let root_idx = match root_dir {
+                    0 => 0,
+                    _ => match self.object_namespace_index_for_handle(
+                        root_dir,
+                        Some(OBJ_KIND_DIRECTORY),
+                        0,
+                    ) {
+                        Ok(index) => index,
+                        Err(status) => return status,
+                    },
                 };
 
                 let Some(client) = lpc_client() else {
@@ -15021,6 +15154,7 @@ impl ExecNtHandler {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
                 };
+                let mut created = false;
                 let index = if ctx.service == NativeService::NtCreateDirectoryObject {
                     match self.obj_resolve(path, root_idx) {
                         Some(index) if self.obj_ns[index].kind == OBJ_KIND_DIRECTORY => index,
@@ -15028,7 +15162,10 @@ impl ExecNtHandler {
                             return 0xC000_0024;
                         } // STATUS_OBJECT_TYPE_MISMATCH
                         None => match self.obj_create(path, root_idx, OBJ_KIND_DIRECTORY, &[]) {
-                            Some(index) => index,
+                            Some(index) => {
+                                created = true;
+                                index
+                            }
                             None => return 0xC000_003A, // STATUS_OBJECT_PATH_NOT_FOUND
                         },
                     }
@@ -15041,7 +15178,19 @@ impl ExecNtHandler {
                     }
                     index
                 };
-                if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                let Some(handle) = self.mint_object_namespace_handle(index, args[1] as u32) else {
+                    if created {
+                        self.rollback_new_namespace_object(index);
+                    }
+                    return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                };
+                if !self.xas_write_u64(out, handle) {
+                    if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                        let _ = self.close_process_handle(pid, handle);
+                    }
+                    if created {
+                        self.rollback_new_namespace_object(index);
+                    }
                     return 0xC000_0005;
                 }
                 0
@@ -15063,11 +15212,13 @@ impl ExecNtHandler {
                 let restart_scan = args[4] as u8 != 0;
                 let context_ptr = args[5];
                 let retlen_ptr = args[6];
-                let dir_idx = if dir_handle >= OBJ_HANDLE_BASE {
-                    (dir_handle - OBJ_HANDLE_BASE) as usize
-                } else {
-                    // A predefined \BaseNamedObjects handle we may not have minted (defensive).
-                    self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                let dir_idx = match self.object_namespace_index_for_handle(
+                    dir_handle,
+                    Some(OBJ_KIND_DIRECTORY),
+                    DIRECTORY_QUERY_ACCESS,
+                ) {
+                    Ok(index) => index,
+                    Err(status) => return status,
                 };
                 // Starting child ordinal: 0 on RestartScan, else the captured Context.
                 let mut start = if restart_scan {
@@ -15233,7 +15384,15 @@ impl ExecNtHandler {
                 }
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
-                        if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                        let Some(handle) =
+                            self.mint_object_namespace_handle(index, args[1] as u32)
+                        else {
+                            return 0xC000_009A;
+                        };
+                        if !self.xas_write_u64(out, handle) {
+                            if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                                let _ = self.close_process_handle(pid, handle);
+                            }
                             return 0xC000_0005;
                         }
                         0
@@ -15242,7 +15401,17 @@ impl ExecNtHandler {
                     None => match self.obj_create(path, root_idx, OBJ_KIND_SYMBOLIC_LINK, &tbuf[..tl])
                     {
                         Some(index) => {
-                            if !self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64) {
+                            let Some(handle) =
+                                self.mint_object_namespace_handle(index, args[1] as u32)
+                            else {
+                                self.rollback_new_namespace_object(index);
+                                return 0xC000_009A;
+                            };
+                            if !self.xas_write_u64(out, handle) {
+                                if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                                    let _ = self.close_process_handle(pid, handle);
+                                }
+                                self.rollback_new_namespace_object(index);
                                 return 0xC000_0005;
                             }
                             0
@@ -15275,7 +15444,14 @@ impl ExecNtHandler {
                 };
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(i) if self.obj_ns[i].kind == 1 => {
-                        if !self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64) {
+                        let Some(handle) = self.mint_object_namespace_handle(i, args[1] as u32)
+                        else {
+                            return 0xC000_009A;
+                        };
+                        if !self.xas_write_u64(out, handle) {
+                            if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                                let _ = self.close_process_handle(pid, handle);
+                            }
                             return 0xC000_0005;
                         }
                         0
