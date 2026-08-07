@@ -135,6 +135,21 @@ impl<'a> RegfHive<'a> {
         Some(s)
     }
 
+    fn key_name_utf16_len(&self, nk: KeyRef) -> Option<usize> {
+        let b = self.cell_body(nk)?;
+        if b.get(0..2)? != b"nk" {
+            return None;
+        }
+        let flags = u16le(b, 0x02)?;
+        let name_len = u16le(b, 0x48)? as usize;
+        b.get(0x4c..0x4c + name_len)?;
+        if flags & 0x20 != 0 {
+            Some(name_len)
+        } else {
+            Some(name_len / 2)
+        }
+    }
+
     /// Reconstruct a key's `\`-separated path relative to the hive root.
     ///
     /// The root itself is `""`. Malformed parent links, cycles, and paths deeper than 256 keys are
@@ -207,6 +222,12 @@ impl<'a> RegfHive<'a> {
         };
         let mut remaining = index;
         self.subkey_by_index_in_list(list_off, &mut remaining, 0, false)
+    }
+
+    /// UTF-16 code units in the original-case immediate subkey name at `index`.
+    pub fn subkey_name_utf16_len_by_index(&self, nk: KeyRef, index: usize) -> Option<usize> {
+        let (_, cell) = self.subkey_by_index(nk, index)?;
+        self.key_name_utf16_len(cell)
     }
 
     /// Walk a subkey-list cell (lf/lh/li/ri), pushing `(name, nk_off)`. `ri` recurses into its
@@ -336,10 +357,15 @@ impl<'a> RegfHive<'a> {
     /// Open the immediate subkey named `name` (case-insensitive) under `nk`.
     pub fn open_subkey(&self, nk: KeyRef, name: &str) -> Option<KeyRef> {
         let want = fold(name);
-        self.subkeys(nk)
-            .into_iter()
-            .find(|(n, _)| *n == want)
-            .map(|(_, o)| o)
+        for index in 0.. {
+            let Some((folded, cell)) = self.subkey_by_index(nk, index) else {
+                break;
+            };
+            if folded == want {
+                return Some(cell);
+            }
+        }
+        None
     }
 
     /// Resolve a `\`-separated relative path from `from` (empty components ignored).
@@ -403,6 +429,22 @@ impl<'a> RegfHive<'a> {
         u32le(list, index * 4)
     }
 
+    fn value_cell_by_name(&self, nk: KeyRef, name: &str) -> Option<u32> {
+        let want = fold(name);
+        for index in 0..self.value_count(nk) {
+            let Some(vk) = self.value_cell_by_index(nk, index) else {
+                continue;
+            };
+            if self
+                .value_name_folded(vk)
+                .is_some_and(|folded| folded == want)
+            {
+                return Some(vk);
+            }
+        }
+        None
+    }
+
     fn value_name_folded(&self, vk: u32) -> Option<String> {
         let b = self.cell_body(vk)?;
         if b.get(0..2)? != b"vk" {
@@ -421,16 +463,34 @@ impl<'a> RegfHive<'a> {
         Some(s)
     }
 
+    fn value_name_utf16_len(&self, vk: u32) -> Option<usize> {
+        let b = self.cell_body(vk)?;
+        if b.get(0..2)? != b"vk" {
+            return None;
+        }
+        let name_len = u16le(b, 0x02)? as usize;
+        b.get(0x14..0x14 + name_len)?;
+        if name_len == 0 {
+            return Some(0);
+        }
+        let flags = u16le(b, 0x10)?;
+        if flags & 1 != 0 {
+            Some(name_len)
+        } else {
+            Some(name_len / 2)
+        }
+    }
+
     /// Read a value by name (case-insensitive) under `nk`: returns `(reg_type, data_bytes)`.
     /// Handles small (≤4 B) inline data (data-length top bit set).
     pub fn value(&self, nk: KeyRef, name: &str) -> Option<(u32, Vec<u8>)> {
-        let want = fold(name);
-        let vk = self
-            .values(nk)
-            .into_iter()
-            .find(|(n, _)| *n == want)
-            .map(|(_, o)| o)?;
+        let vk = self.value_cell_by_name(nk, name)?;
         self.value_data(vk)
+    }
+
+    /// Whether a value exists by name without cloning the complete value list or data body.
+    pub fn value_exists(&self, nk: KeyRef, name: &str) -> bool {
+        self.value_cell_by_name(nk, name).is_some()
     }
 
     /// The original-case (unfolded) name of a value cell — for enumeration output.
@@ -468,6 +528,20 @@ impl<'a> RegfHive<'a> {
         Some((name, ty, data))
     }
 
+    /// Original-case value name at `index` without cloning its data body.
+    pub fn value_name_by_index(&self, nk: KeyRef, index: usize) -> Option<String> {
+        let vk = self.value_cell_by_index(nk, index)?;
+        self.value_name_raw(vk)
+    }
+
+    /// Lengths for the value at `index`: `(name_utf16_bytes, data_bytes)`.
+    pub fn value_lengths_by_index(&self, nk: KeyRef, index: usize) -> Option<(usize, usize)> {
+        let vk = self.value_cell_by_index(nk, index)?;
+        let name_bytes = self.value_name_utf16_len(vk)?.checked_mul(2)?;
+        let data_bytes = self.value_data_len(vk)?;
+        Some((name_bytes, data_bytes))
+    }
+
     fn value_data(&self, vk: u32) -> Option<(u32, Vec<u8>)> {
         let b = self.cell_body(vk)?;
         let data_len_raw = u32le(b, 0x04)?;
@@ -482,6 +556,20 @@ impl<'a> RegfHive<'a> {
         } else {
             let db = self.cell_body(data_off)?;
             Some((reg_type, db.get(..len.min(db.len()))?.to_vec()))
+        }
+    }
+
+    fn value_data_len(&self, vk: u32) -> Option<usize> {
+        let b = self.cell_body(vk)?;
+        let data_len_raw = u32le(b, 0x04)?;
+        let data_off = u32le(b, 0x08)?;
+        let inline = data_len_raw & 0x8000_0000 != 0;
+        let len = (data_len_raw & 0x7fff_ffff) as usize;
+        if inline {
+            Some(len.min(4))
+        } else {
+            let db = self.cell_body(data_off)?;
+            Some(len.min(db.len()))
         }
     }
 }
@@ -957,13 +1045,23 @@ mod tests {
                 .as_deref(),
             Some("npfs")
         );
+        assert_eq!(hive.subkey_name_utf16_len_by_index(services, 0), Some(4));
         assert!(hive.subkey_by_index(services, 1).is_none());
         let npfs = hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
         assert_eq!(hive.value_count(npfs), 4);
+        assert!(hive.value_exists(npfs, "ImagePath"));
+        assert!(!hive.value_exists(npfs, "Missing"));
         let (name, ty, data) = hive.value_by_index(npfs, 0).unwrap();
         assert_eq!(name, "ImagePath");
         assert_eq!(ty, RegistryValueType::ExpandSz as u32);
         assert_eq!(data, utf16le_sz(r"system32\drivers\npfs.sys"));
+        assert_eq!(
+            hive.value_lengths_by_index(npfs, 0),
+            Some((
+                "ImagePath".len() * 2,
+                utf16le_sz(r"system32\drivers\npfs.sys").len()
+            ))
+        );
 
         let mut cm = ConfigManager::new();
         assert_eq!(

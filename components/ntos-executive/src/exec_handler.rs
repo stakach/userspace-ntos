@@ -31,6 +31,34 @@ static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
+#[derive(Clone, Copy, Default)]
+struct RegistryKeyStats {
+    subkeys: u32,
+    max_subkey_name_bytes: u32,
+    values: u32,
+    max_value_name_bytes: u32,
+    max_value_data_bytes: u32,
+}
+
+impl RegistryKeyStats {
+    fn add_subkey(&mut self, name_bytes: usize) {
+        self.subkeys = self.subkeys.saturating_add(1);
+        self.max_subkey_name_bytes = self
+            .max_subkey_name_bytes
+            .max(name_bytes.min(u32::MAX as usize) as u32);
+    }
+
+    fn add_value(&mut self, name_bytes: usize, data_bytes: usize) {
+        self.values = self.values.saturating_add(1);
+        self.max_value_name_bytes = self
+            .max_value_name_bytes
+            .max(name_bytes.min(u32::MAX as usize) as u32);
+        self.max_value_data_bytes = self
+            .max_value_data_bytes
+            .max(data_bytes.min(u32::MAX as usize) as u32);
+    }
+}
+
 #[unsafe(no_mangle)]
 #[inline(never)]
 unsafe extern "C" fn exec_nt_open_file_service_entry(
@@ -2147,59 +2175,6 @@ impl ExecNtHandler {
         hive.value(cell, name)
     }
 
-    fn registry_values(
-        &self,
-        target: KeyRef,
-    ) -> alloc::vec::Vec<(alloc::string::String, u32, alloc::vec::Vec<u8>)> {
-        let mut values = alloc::vec::Vec::new();
-        let overlay_index = self.registry_overlay_index(target);
-        let base_key = if let Some(index) = overlay_index {
-            self.overlay
-                .path(index)
-                .and_then(|path| self.resolve_key(path))
-        } else if !is_virtual_registry_key(target) {
-            Some(target)
-        } else {
-            None
-        };
-        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
-            let count = hive.values(base).len();
-            for index in 0..count {
-                let Some((name, ty, data)) = hive.value_by_index(base, index) else {
-                    continue;
-                };
-                if let Some(overlay) = overlay_index {
-                    if self.overlay.value_is_deleted(overlay, &name) {
-                        continue;
-                    }
-                    if let Some((overlay_ty, overlay_data)) = self.overlay.value(overlay, &name) {
-                        values.push((name, overlay_ty, overlay_data.to_vec()));
-                        continue;
-                    }
-                }
-                values.push((name, ty, data));
-            }
-        }
-        if let Some(overlay) = overlay_index {
-            let live = self.overlay.values_len(overlay);
-            for index in 0..live {
-                let Some((name, ty, data)) = self.overlay.value_by_index(overlay, index) else {
-                    continue;
-                };
-                let exists_in_base = base_key
-                    .and_then(|key| {
-                        let (hive, base) = self.base_hive(key)?;
-                        hive.value(base, name)
-                    })
-                    .is_some();
-                if !exists_in_base {
-                    values.push((alloc::string::String::from(name), ty, data.to_vec()));
-                }
-            }
-        }
-        values
-    }
-
     fn registry_value_by_index(
         &self,
         target: KeyRef,
@@ -2221,17 +2196,19 @@ impl ExecNtHandler {
                 let Some((name, ty, data)) = hive.value_by_index(base, index) else {
                     continue;
                 };
-                let (ty, data) = if let Some(overlay) = overlay_index {
+                if let Some(overlay) = overlay_index {
                     if self.overlay.value_is_deleted(overlay, &name) {
                         continue;
                     }
-                    self.overlay
-                        .value(overlay, &name)
-                        .map(|(overlay_ty, overlay_data)| (overlay_ty, overlay_data.to_vec()))
-                        .unwrap_or((ty, data))
-                } else {
-                    (ty, data)
-                };
+                    if visible_index == requested_index {
+                        if let Some((overlay_ty, overlay_data)) = self.overlay.value(overlay, &name) {
+                            return Some((name, overlay_ty, overlay_data.to_vec()));
+                        }
+                        return Some((name, ty, data));
+                    }
+                    visible_index += 1;
+                    continue;
+                }
                 if visible_index == requested_index {
                     return Some((name, ty, data));
                 }
@@ -2246,7 +2223,7 @@ impl ExecNtHandler {
                 let exists_in_base = base_key
                     .and_then(|key| {
                         let (hive, base) = self.base_hive(key)?;
-                        hive.value(base, name)
+                        hive.value_exists(base, name).then_some(())
                     })
                     .is_some();
                 if exists_in_base {
@@ -2261,9 +2238,10 @@ impl ExecNtHandler {
         None
     }
 
-    fn registry_subkeys(&self, target: KeyRef) -> alloc::vec::Vec<alloc::string::String> {
-        let mut subkeys = alloc::vec::Vec::new();
+    fn registry_key_stats(&self, target: KeyRef) -> RegistryKeyStats {
+        let mut stats = RegistryKeyStats::default();
         let path = self.registry_target_path(target);
+        let overlay_index = self.registry_overlay_index(target);
         let base_key = if let Some(index) = overlay_key_idx(target) {
             self.overlay
                 .path(index)
@@ -2274,19 +2252,63 @@ impl ExecNtHandler {
             None
         };
         if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
-            subkeys.extend(hive.subkeys(base).into_iter().map(|(name, _)| name));
-        }
-        if let Some(path) = path.as_deref() {
-            for name in self.overlay.subkeys(path) {
-                if !subkeys
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(name))
-                {
-                    subkeys.push(alloc::string::String::from(name));
+            for index in 0.. {
+                let Some(name_len) = hive.subkey_name_utf16_len_by_index(base, index) else {
+                    break;
+                };
+                stats.add_subkey(name_len.saturating_mul(2));
+            }
+            for index in 0..hive.value_count(base) {
+                let Some(name) = hive.value_name_by_index(base, index) else {
+                    continue;
+                };
+                if let Some(overlay) = overlay_index {
+                    if self.overlay.value_is_deleted(overlay, &name) {
+                        continue;
+                    }
+                    if let Some((_, overlay_data)) = self.overlay.value(overlay, &name) {
+                        stats.add_value(name.encode_utf16().count().saturating_mul(2), overlay_data.len());
+                        continue;
+                    }
+                }
+                if let Some((name_bytes, data_bytes)) = hive.value_lengths_by_index(base, index) {
+                    stats.add_value(name_bytes, data_bytes);
                 }
             }
         }
-        subkeys
+        if let Some(path) = path.as_deref() {
+            for index in 0..self.overlay.subkeys_len(path) {
+                let Some(name) = self.overlay.subkey_by_index(path, index) else {
+                    continue;
+                };
+                let exists_in_base = base_key
+                    .and_then(|key| {
+                        let (hive, base) = self.base_hive(key)?;
+                        hive.open_subkey(base, name)
+                    })
+                    .is_some();
+                if !exists_in_base {
+                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2));
+                }
+            }
+        }
+        if let Some(overlay) = overlay_index {
+            for index in 0..self.overlay.values_len(overlay) {
+                let Some((name, _, data)) = self.overlay.value_by_index(overlay, index) else {
+                    continue;
+                };
+                let exists_in_base = base_key
+                    .and_then(|key| {
+                        let (hive, base) = self.base_hive(key)?;
+                        hive.value_exists(base, name).then_some(())
+                    })
+                    .is_some();
+                if !exists_in_base {
+                    stats.add_value(name.encode_utf16().count().saturating_mul(2), data.len());
+                }
+            }
+        }
+        stats
     }
 
     fn registry_subkey_by_index(
@@ -2317,7 +2339,10 @@ impl ExecNtHandler {
             }
         }
         if let Some(path) = path.as_deref() {
-            for name in self.overlay.subkeys(path) {
+            for index in 0..self.overlay.subkeys_len(path) {
+                let Some(name) = self.overlay.subkey_by_index(path, index) else {
+                    continue;
+                };
                 let exists_in_base = base_key
                     .and_then(|key| {
                         let (hive, base) = self.base_hive(key)?;
@@ -11801,16 +11826,9 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let use_xas_write = self.pi >= 2;
-                let subs = self.registry_subkeys(key);
-                let vals = self.registry_values(key);
+                let stats = self.registry_key_stats(key);
                 let info_class = args[1] as u32;
                 let output_length = args[3] as u32 as usize;
-                let subkeys = subs.len() as u32;
-                let max_name = subs.iter().map(|name| name.len()).max().unwrap_or(0) as u32 * 2;
-                let values = vals.len() as u32;
-                let max_vname = vals.iter().map(|(name, _, _)| name.len()).max().unwrap_or(0) as u32
-                    * 2;
-                let max_vdata = vals.iter().map(|(_, _, data)| data.len()).max().unwrap_or(0) as u32;
                 // class 2 = KeyFullInformation {LastWriteTime@0(8), TitleIndex@8, ClassOffset@0xc,
                 // ClassLength@0x10, SubKeys@0x14, MaxNameLen@0x18, MaxClassLen@0x1c, Values@0x20,
                 // MaxValueNameLen@0x24, MaxValueDataLen@0x28, Class@0x2c}. We report no Class.
@@ -11823,19 +11841,19 @@ impl ExecNtHandler {
                 let mut info = [0u8; 0x2c];
                 info[0x0c..0x10].copy_from_slice(&struct_size.to_le_bytes()); // ClassOffset
                 // ClassLength@0x10 = 0
-                info[0x14..0x18].copy_from_slice(&subkeys.to_le_bytes());
-                info[0x18..0x1c].copy_from_slice(&max_name.to_le_bytes());
+                info[0x14..0x18].copy_from_slice(&stats.subkeys.to_le_bytes());
+                info[0x18..0x1c].copy_from_slice(&stats.max_subkey_name_bytes.to_le_bytes());
                 // MaxClassLen@0x1c = 0
-                info[0x20..0x24].copy_from_slice(&values.to_le_bytes());
-                info[0x24..0x28].copy_from_slice(&max_vname.to_le_bytes());
-                info[0x28..0x2c].copy_from_slice(&max_vdata.to_le_bytes());
+                info[0x20..0x24].copy_from_slice(&stats.values.to_le_bytes());
+                info[0x24..0x28].copy_from_slice(&stats.max_value_name_bytes.to_le_bytes());
+                info[0x28..0x2c].copy_from_slice(&stats.max_value_data_bytes.to_le_bytes());
                 if self
                     .registry_target_path(key)
                     .as_deref()
                     .is_some_and(Self::is_dynamic_user_volatile_env_canon)
                 {
                     USER_VOLATILE_ENV_QUERIED.fetch_add(1, Ordering::Relaxed);
-                    USER_VOLATILE_ENV_QUERY_VALUE_COUNT.store(values as u64, Ordering::Relaxed);
+                    USER_VOLATILE_ENV_QUERY_VALUE_COUNT.store(stats.values as u64, Ordering::Relaxed);
                 }
                 let total = struct_size.to_le_bytes();
                 if use_xas_write {

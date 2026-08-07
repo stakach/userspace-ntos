@@ -296,6 +296,47 @@ impl RegistryOverlay {
         }
         out
     }
+
+    /// Number of unique immediate child key-name components under `parent_canon`.
+    pub fn subkeys_len(&self, parent_canon: &str) -> usize {
+        let mut count = 0;
+        for (idx, key) in self.keys.iter().enumerate().filter(|(_, k)| !k.detached) {
+            let Some(child) = immediate_child(&key.path, parent_canon) else {
+                continue;
+            };
+            if !self.subkey_seen_before(parent_canon, idx, child) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Borrow the `index`th unique immediate child key-name component under `parent_canon`.
+    pub fn subkey_by_index(&self, parent_canon: &str, index: usize) -> Option<&str> {
+        let mut visible = 0;
+        for (idx, key) in self.keys.iter().enumerate().filter(|(_, k)| !k.detached) {
+            let Some(child) = immediate_child(&key.path, parent_canon) else {
+                continue;
+            };
+            if self.subkey_seen_before(parent_canon, idx, child) {
+                continue;
+            }
+            if visible == index {
+                return Some(child);
+            }
+            visible += 1;
+        }
+        None
+    }
+
+    fn subkey_seen_before(&self, parent_canon: &str, before: usize, child: &str) -> bool {
+        self.keys
+            .iter()
+            .take(before)
+            .filter(|k| !k.detached)
+            .filter_map(|k| immediate_child(&k.path, parent_canon))
+            .any(|prior| prior == child)
+    }
 }
 
 /// If `path` is an immediate child of `parent` (both canonical), return the leaf component.
@@ -488,6 +529,16 @@ mod tests {
         let mut kids = ov.subkeys(r"\registry\machine\system");
         kids.sort();
         assert_eq!(kids, alloc::vec!["a", "c"]);
+        assert_eq!(ov.subkeys_len(r"\registry\machine\system"), 2);
+        assert_eq!(
+            ov.subkey_by_index(r"\registry\machine\system", 0),
+            Some("a")
+        );
+        assert_eq!(
+            ov.subkey_by_index(r"\registry\machine\system", 1),
+            Some("c")
+        );
+        assert_eq!(ov.subkey_by_index(r"\registry\machine\system", 2), None);
         assert_eq!(ov.subkeys(r"\registry\machine\system\a"), alloc::vec!["b"]);
     }
 }

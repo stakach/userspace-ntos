@@ -114,17 +114,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `CheckForLiveCD`/control-set copy path is no longer corrupting its advapi32 `RegCopyTreeW`
    buffers. The next SCM step is still making the actual services.exe start path consume those specs
    for generic process creation, without adding kernel-side service-name policy.
-3. Work the current explorer frontier before relying on shell gates as completion proof. The
+3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
-   profile hive mount/read-back, and genuine explorer launch. The previous callback frontier also
-   advanced: out-of-order `NtCallbackReturn` replies now defer and drain across nested explorer
-   shell callbacks. The remaining boot blocker is allocator pressure during deeper explorer
-   shell/menu/property-bag/window creation, not fabricated logon state.
+   profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
+   classes, and non-background shell chrome pixels. The remaining gates are debug syscall dispatch
+   proofs, stale user-callback dead-client/nested proof bits after real explorer activity, and VM
+   pool-headroom accounting.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
-   mounted base/user-profile hives into the overlay just to open existing keys, but D2/D4 still need
-   the Configuration Manager/Hive Manager to become the live authority for mutable hives, durable
-   setup/profile state, and allocation-conscious registry reads instead of long-lived executive
-   clones.
+   mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
+   now computes merged key counts/max lengths with length-only indexed reads instead of cloning
+   whole subkey/value snapshots. D2/D4 still need the Configuration Manager/Hive Manager to become
+   the live authority for mutable hives, durable setup/profile state, and remaining long-lived
+   registry data.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -1109,3 +1110,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   adjustment: current blocker is allocator high-water at `6194072/6291456` followed by `alloc.rs:573`
   during deeper explorer shell chrome setup, so the next work should remove persistent registry/shell
   allocations before considering resource-budget changes.
+- Registry query stats slice. `NtQueryKey(KeyFullInformation)` no longer materializes full merged
+  subkey/value vectors just to compute counts and maximum lengths. `nt-hive-regf` now has direct
+  subkey open, value-exists, value-name-only, and value-length-only indexed accessors; the overlay
+  has borrowed unique child count/index helpers; the executive merge layer uses those helpers for
+  allocation-conscious query-info. Validation: `cargo fmt --all`, full `cargo test -p nt-hive-regf`,
+  full `cargo test -p nt-hive-core`, executive target check,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-registry-query-stats-20260807.log`. Result: the prior allocator panic is
+  gone, `exec_explorer_shell_chrome_painted` passes, final heap is `5942200/6291456`, and the run
+  completes at `282/290`. Review adjustment: next work should close the remaining proof gates
+  (`Dbgk*`, user-callback nested/dead-client bits, win32k nested transport bit) and then reduce or
+  re-baseline VM pool headroom with real accounting rather than a resource-cap shortcut.
