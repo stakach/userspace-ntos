@@ -21,6 +21,37 @@ fn hive_create_open_set_query() {
 }
 
 #[test]
+fn hive_borrowed_indexed_enumeration_preserves_names_and_data() {
+    let mut h = Hive::new(HiveKind::System);
+    let services = h.create_key(r"ControlSet001\Services");
+    h.create_key(r"ControlSet001\Services\Afd");
+    h.create_key(r"ControlSet001\Services\EventLog");
+    h.set_value(
+        services,
+        "DisplayName",
+        RegistryValueType::Sz,
+        b"S\0C\0M\0\0\0".to_vec(),
+    );
+    h.set_dword(services, "Start", 2);
+
+    assert_eq!(h.subkey_count(services), 2);
+    assert_eq!(h.subkey_name_by_index(services, 0), Some("Afd"));
+    assert_eq!(h.subkey_name_by_index(services, 1), Some("EventLog"));
+    assert_eq!(h.subkey_name_by_index(services, 2), None);
+
+    assert_eq!(h.value_count(services), 2);
+    let (name, ty, data) = h.value_by_index(services, 0).unwrap();
+    assert_eq!(name, "DisplayName");
+    assert_eq!(ty, RegistryValueType::Sz);
+    assert_eq!(data, b"S\0C\0M\0\0\0");
+    let (name, ty, data) = h.value_by_index(services, 1).unwrap();
+    assert_eq!(name, "Start");
+    assert_eq!(ty, RegistryValueType::Dword);
+    assert_eq!(data, &2u32.to_le_bytes());
+    assert!(h.value_by_index(services, 2).is_none());
+}
+
+#[test]
 fn mount_table_currentcontrolset_resolver() {
     let mut mt = HiveMountTable::new();
     mt.mount(SYSTEM_HIVE_PATH, 1);

@@ -375,6 +375,10 @@ fn is_profile_list_sid_key_canon(path: &str) -> bool {
         && comps[7].starts_with("s-")
 }
 
+fn is_system_setup_key_canon(path: &str) -> bool {
+    path.eq_ignore_ascii_case(r"\registry\machine\system\setup")
+}
+
 fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
     let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
     let affinity = if processors >= 64 {
@@ -860,6 +864,7 @@ impl ExecNtHandler {
         handler.provision_kernel_srm_objects();
         handler.provision_volatile_hardware_registry();
         unsafe { handler.provision_default_user_locale() };
+        handler.provision_normal_system_setup_state();
         handler.provision_reactos_explorer_shell_com_classes();
         handler
     }
@@ -986,6 +991,45 @@ impl ExecNtHandler {
         print_str(b"\" FeatureSet=0x");
         print_hex(processor.processor_feature_bits);
         print_str(b"\n");
+    }
+
+    /// Put the mounted SYSTEM hive into the normal installed-boot setup state.
+    ///
+    /// The staged ReactOS media is LiveCD-derived, so its real `SYSTEM\Setup` values describe
+    /// text-mode/live setup (`SetupType=1`, `SystemSetupInProgress=1`, `CmdLine=setup -mini`).
+    /// By this point our boot image has already materialised the installed pieces that setup would
+    /// have produced for the current frontier: writable profiles, a user hive, locale, and SOFTWARE
+    /// profile state. Shadow the setup values through the ordinary registry overlay so
+    /// services.exe's real `CheckForLiveCD` path observes a normal installed boot and reaches
+    /// `ScmAutoStartServices`.
+    fn provision_normal_system_setup_state(&mut self) {
+        const REG_SZ: u32 = 1;
+        const REG_DWORD: u32 = 4;
+        const SETUP_KEY: &str = r"\Registry\Machine\System\Setup";
+        if self.resolve_key(SETUP_KEY).is_none() {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup absent -> normal-boot state not provisioned\n");
+            return;
+        }
+        let canon = self.overlay_canon(SETUP_KEY);
+        let (index, _) = self.overlay.create(&canon);
+        self.overlay
+            .set_value(index, "SetupType", REG_DWORD, &0u32.to_le_bytes());
+        self.overlay.set_value(
+            index,
+            "SystemSetupInProgress",
+            REG_DWORD,
+            &0u32.to_le_bytes(),
+        );
+        self.overlay
+            .set_value(index, "CmdLine", REG_SZ, &registry_sz_bytes(""));
+        print_str(b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned\n");
+    }
+
+    fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {
+        self.current_process_is_lsass()
+            && value_name.eq_ignore_ascii_case("SetupType")
+            && key_path.is_some_and(is_system_setup_key_canon)
+            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
     /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback
@@ -2156,6 +2200,67 @@ impl ExecNtHandler {
         values
     }
 
+    fn registry_value_by_index(
+        &self,
+        target: KeyRef,
+        requested_index: usize,
+    ) -> Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> {
+        let overlay_index = self.registry_overlay_index(target);
+        let base_key = if let Some(index) = overlay_index {
+            self.overlay
+                .path(index)
+                .and_then(|path| self.resolve_key(path))
+        } else if !is_virtual_registry_key(target) {
+            Some(target)
+        } else {
+            None
+        };
+        let mut visible_index = 0usize;
+        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+            for index in 0..hive.value_count(base) {
+                let Some((name, ty, data)) = hive.value_by_index(base, index) else {
+                    continue;
+                };
+                let (ty, data) = if let Some(overlay) = overlay_index {
+                    if self.overlay.value_is_deleted(overlay, &name) {
+                        continue;
+                    }
+                    self.overlay
+                        .value(overlay, &name)
+                        .map(|(overlay_ty, overlay_data)| (overlay_ty, overlay_data.to_vec()))
+                        .unwrap_or((ty, data))
+                } else {
+                    (ty, data)
+                };
+                if visible_index == requested_index {
+                    return Some((name, ty, data));
+                }
+                visible_index += 1;
+            }
+        }
+        if let Some(overlay) = overlay_index {
+            for index in 0..self.overlay.values_len(overlay) {
+                let Some((name, ty, data)) = self.overlay.value_by_index(overlay, index) else {
+                    continue;
+                };
+                let exists_in_base = base_key
+                    .and_then(|key| {
+                        let (hive, base) = self.base_hive(key)?;
+                        hive.value(base, name)
+                    })
+                    .is_some();
+                if exists_in_base {
+                    continue;
+                }
+                if visible_index == requested_index {
+                    return Some((alloc::string::String::from(name), ty, data.to_vec()));
+                }
+                visible_index += 1;
+            }
+        }
+        None
+    }
+
     fn registry_subkeys(&self, target: KeyRef) -> alloc::vec::Vec<alloc::string::String> {
         let mut subkeys = alloc::vec::Vec::new();
         let path = self.registry_target_path(target);
@@ -2183,6 +2288,54 @@ impl ExecNtHandler {
         }
         subkeys
     }
+
+    fn registry_subkey_by_index(
+        &self,
+        target: KeyRef,
+        requested_index: usize,
+    ) -> Option<alloc::string::String> {
+        let path = self.registry_target_path(target);
+        let base_key = if let Some(index) = overlay_key_idx(target) {
+            self.overlay
+                .path(index)
+                .and_then(|overlay_path| self.resolve_key(overlay_path))
+        } else if !is_virtual_registry_key(target) {
+            Some(target)
+        } else {
+            None
+        };
+        let mut visible_index = 0usize;
+        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+            for index in 0.. {
+                let Some((name, _)) = hive.subkey_by_index(base, index) else {
+                    break;
+                };
+                if visible_index == requested_index {
+                    return Some(name);
+                }
+                visible_index += 1;
+            }
+        }
+        if let Some(path) = path.as_deref() {
+            for name in self.overlay.subkeys(path) {
+                let exists_in_base = base_key
+                    .and_then(|key| {
+                        let (hive, base) = self.base_hive(key)?;
+                        hive.open_subkey(base, name)
+                    })
+                    .is_some();
+                if exists_in_base {
+                    continue;
+                }
+                if visible_index == requested_index {
+                    return Some(alloc::string::String::from(name));
+                }
+                visible_index += 1;
+            }
+        }
+        None
+    }
+
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
     /// link). Returns `None` before the ProcessManager has created that hosted process.
     pub(crate) fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
@@ -7991,7 +8144,7 @@ impl ExecNtHandler {
 
         let disable_all = args[1] != 0;
         let new_state = args[2];
-        let buffer_length = args[3] as usize;
+        let buffer_length = args[3] as u32 as usize;
         let previous_state = args[4];
         let return_length = args[5];
         if !disable_all && new_state == 0 {
@@ -11303,12 +11456,55 @@ impl ExecNtHandler {
                 if !self.registry_path_exists(parent) {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                // Disposition: CREATED unless the key already exists in the overlay OR the base hive.
-                let existed =
-                    self.overlay.find(&canon).is_some() || self.resolve_key(&full).is_some();
-                if self.overlay.find(&canon).is_none()
-                    && self.overlay.len() >= OVERLAY_KEY_MAX as usize
-                {
+                // Disposition/storage split: an existing overlay key still shadows the base, but an
+                // existing mounted-hive key should stay a mounted-hive handle. Creating an overlay for
+                // every OPEN existing key made profile setup duplicate the whole loaded user hive.
+                let overlay_existing = self.overlay.find(&canon);
+                let base_existing = self.resolve_key(&full);
+                let existed = overlay_existing.is_some() || base_existing.is_some();
+                if let Some(oidx) = overlay_existing {
+                    let status = self.mint_registry_key(
+                        OVERLAY_KEY_TAG | (oidx as u32),
+                        args[1] as u32,
+                        args[0],
+                    );
+                    if status != 0 {
+                        return status;
+                    }
+                    if self.current_process_is_winlogon()
+                        && is_profile_list_sid_key_canon(&canon)
+                        && PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16
+                    {
+                        print_str(b"[profile-list] NtCreateKey ");
+                        print_ascii_str(&canon);
+                        print_str(b" opened\n");
+                    }
+                    let disp_ptr = args[6];
+                    if disp_ptr != 0 {
+                        self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
+                    }
+                    return 0;
+                }
+                if let Some(base_key) = base_existing {
+                    let status = self.mint_registry_key(base_key, args[1] as u32, args[0]);
+                    if status != 0 {
+                        return status;
+                    }
+                    if self.current_process_is_winlogon()
+                        && is_profile_list_sid_key_canon(&canon)
+                        && PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16
+                    {
+                        print_str(b"[profile-list] NtCreateKey ");
+                        print_ascii_str(&canon);
+                        print_str(b" opened-base\n");
+                    }
+                    let disp_ptr = args[6];
+                    if disp_ptr != 0 {
+                        self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
+                    }
+                    return 0;
+                }
+                if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
                     return 0xC000_009A;
                 }
                 let (oidx, _) = self.overlay.create(&canon);
@@ -11357,32 +11553,26 @@ impl ExecNtHandler {
                 if status != 0 {
                     return status;
                 }
-                // *Disposition (optional): arg6 at [sp+0x38].
-                let disp_ptr = smss_stack_read(get_recv_mr(16) + 0x38);
+                // *Disposition (optional): captured as arg6 by the native syscall dispatcher.
+                let disp_ptr = args[6];
                 if disp_ptr != 0 {
-                    let disp = if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY };
-                    self.xas_write_buf(disp_ptr, &disp.to_le_bytes());
+                    self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                 }
                 0 // STATUS_SUCCESS
             },
             // NtSetValueKey(KeyHandle[0], *ValueName[1], TitleIndex, Type[3], Data[sp+0x28],
             // DataSize[sp+0x30]). The CM WRITE plane: write a value into an overlay (created) key.
-            // A write to a base-hive handle (not an overlay key) is a no-op success too (we don't
-            // shadow arbitrary base keys for writes yet).
+            // Base-hive handles shadow only when the visible value actually changes; idempotent writes
+            // to an already-loaded hive succeed without duplicating base hive data into the overlay.
             NativeService::NtSetValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let oidx = match self.registry_shadow_key(key) {
-                    Ok(index) => index,
-                    Err(status) => return status,
-                };
                 let name = self.read_registry_ustr_name(args[1]);
                 let ty = args[3] as u32; // R9 = Type
-                let sp = get_recv_mr(16);
-                let data_ptr = smss_stack_read(sp + 0x28); // [sp+0x28] = Data
-                let data_size = smss_stack_read(sp + 0x30) as u32 as usize;
+                let data_ptr = args[4];
+                let data_size = args[5] as u32 as usize;
                 if data_size != 0 && data_ptr == 0 {
                     return 0xC000_0005;
                 }
@@ -11394,6 +11584,18 @@ impl ExecNtHandler {
                 if data_size != 0 && !self.xas_read(data_ptr, &mut data) {
                     return 0xC000_0005;
                 }
+                if self
+                    .registry_value(key, &name)
+                    .is_some_and(|(existing_ty, existing_data)| {
+                        existing_ty == ty && existing_data.as_slice() == data.as_slice()
+                    })
+                {
+                    return 0;
+                }
+                let oidx = match self.registry_shadow_key(key) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
                 // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
                 // the gate can assert real SID structure (Revision 1, 4 sub-authorities, NT
@@ -11508,12 +11710,14 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let use_xas_write = self.pi >= 2;
-                let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
-                    self.registry_values(key).into_iter().nth(args[1] as usize);
+                let index = args[1] as u32 as usize;
+                let info_class = args[2] as u32 as u64;
+                let output_length = args[4] as u32 as usize;
+                let byname = self.registry_value_by_index(key, index);
                 match byname {
                     None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
                     Some((name, ty, data)) => {
-                        let info = build_key_value_info(args[2], &name, ty, &data);
+                        let info = build_key_value_info(info_class, &name, ty, &data);
                         let total = (info.len() as u32).to_le_bytes();
                         if use_xas_write {
                             if !self.xas_try_write_buf(args[5], &total) {
@@ -11522,7 +11726,7 @@ impl ExecNtHandler {
                         } else {
                             smss_copyout(args[5], &total); // *ResultLength
                         }
-                        if info.len() > args[4] as usize {
+                        if info.len() > output_length {
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
                             if use_xas_write {
@@ -11547,18 +11751,19 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let subs = self.registry_subkeys(key);
-                let idx = args[1] as usize;
-                if idx >= subs.len() {
+                let idx = args[1] as u32 as usize;
+                let info_class = args[2] as u32;
+                let output_length = args[4] as u32 as usize;
+                let Some(name) = self.registry_subkey_by_index(key, idx) else {
                     return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
-                }
-                let name16: alloc::vec::Vec<u16> = subs[idx].encode_utf16().collect();
+                };
+                let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
                 let name_bytes = name16.len() * 2;
                 // class 0 = KeyBasicInformation {LastWriteTime@0(8), TitleIndex@8(4), NameLength@0xc(4),
                 // Name@0x10}; class 1 = KeyNodeInformation {…, ClassOffset@0xc, ClassLength@0x10,
                 // NameLength@0x14, Name@0x18}. RegEnumKeyExW(lpClass=NULL) → basic; ScmCreateService-
                 // Database uses that. Build both; other classes → basic.
-                let node = args[2] == 1;
+                let node = info_class == 1;
                 let hdr = if node { 0x18usize } else { 0x10 };
                 let mut info = alloc::vec::Vec::with_capacity(hdr + name_bytes);
                 info.resize(hdr, 0); // LastWriteTime/TitleIndex/(ClassOffset/ClassLength) all 0
@@ -11581,7 +11786,7 @@ impl ExecNtHandler {
                 } else {
                     smss_copyout(args[5], &total_bytes); // *ResultLength (stack local)
                 }
-                if (args[4] as usize) < info.len() {
+                if output_length < info.len() {
                     return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
                 }
                 self.xas_write_buf(args[3], &info); // KeyInformation (heap buffer)
@@ -11598,6 +11803,8 @@ impl ExecNtHandler {
                 let use_xas_write = self.pi >= 2;
                 let subs = self.registry_subkeys(key);
                 let vals = self.registry_values(key);
+                let info_class = args[1] as u32;
+                let output_length = args[3] as u32 as usize;
                 let subkeys = subs.len() as u32;
                 let max_name = subs.iter().map(|name| name.len()).max().unwrap_or(0) as u32 * 2;
                 let values = vals.len() as u32;
@@ -11607,7 +11814,7 @@ impl ExecNtHandler {
                 // class 2 = KeyFullInformation {LastWriteTime@0(8), TitleIndex@8, ClassOffset@0xc,
                 // ClassLength@0x10, SubKeys@0x14, MaxNameLen@0x18, MaxClassLen@0x1c, Values@0x20,
                 // MaxValueNameLen@0x24, MaxValueDataLen@0x28, Class@0x2c}. We report no Class.
-                if args[1] != 2 {
+                if info_class != 2 {
                     // KeyBasic/Node/Name classes on THIS key aren't needed by the SCM path; report a
                     // clean empty full-info-sized answer is wrong for them, so signal invalid-info.
                     return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
@@ -11638,7 +11845,7 @@ impl ExecNtHandler {
                 } else {
                     smss_copyout(args[4], &total); // *ResultLength
                 }
-                if (args[3] as usize) < struct_size as usize {
+                if output_length < struct_size as usize {
                     return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
                 }
                 if use_xas_write {
@@ -11837,8 +12044,8 @@ impl ExecNtHandler {
                 let is_pipe_transceive = (fsctl as u32) == 0x0011_C017;
                 let mut transceive_file_retained = false;
                 if fid != 0 && !force_pending_listen {
-                    let input_len = (args[7] as usize).min(0x4000);
-                    let output_len = (args[9] as usize).min(0x4000);
+                    let input_len = (args[7] as u32 as usize).min(0x4000);
+                    let output_len = (args[9] as u32 as usize).min(0x4000);
                     let mut input = alloc::vec![0u8; input_len];
                     let mut output = alloc::vec![0u8; output_len];
                     if (input_len == 0 || self.xas_read(args[6], &mut input))
@@ -11975,6 +12182,7 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let output_length = args[4] as u32 as usize;
+                let info_class = args[2] as u32 as u64;
                 if args[5] == 0 || !self.probe_user_output(args[5], 4) {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
@@ -12033,7 +12241,11 @@ impl ExecNtHandler {
                     // on their narrow paths.
                     use_xas_write = true;
                 }
-                let val: Option<(u32, alloc::vec::Vec<u8>)> = self.registry_value(key, &name_lc);
+                let mut val: Option<(u32, alloc::vec::Vec<u8>)> =
+                    self.registry_value(key, &name_lc);
+                if self.should_expose_sam_setup_phase(key_path.as_deref(), &name_lc) {
+                    val = Some((4, 1u32.to_le_bytes().to_vec()));
+                }
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
                 if self.current_process_is_winlogon() && key_is_real_winlogon {
                     if let Some((ty, ref data)) = val {
@@ -12100,7 +12312,7 @@ impl ExecNtHandler {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                     Some((ty, data)) => {
                         // KeyValuePartialInformation (class 2) carries no name.
-                        let info = build_key_value_info(args[2], "", ty, &data);
+                        let info = build_key_value_info(info_class, "", ty, &data);
                         // *ResultLength: use the cross-AS writer for hosted real-hive reads (advapi's
                         // out-param may be a heap/stack the plain mirror can't reach — same reason as
                         // the data write below); everything else stays mirror-only (byte-identical).
@@ -12179,7 +12391,7 @@ impl ExecNtHandler {
 
                 let class = args[0] as u32;
                 let buf = args[1];
-                let len = args[2] as usize;
+                let len = args[2] as u32 as usize;
                 let retlen_ptr = args[3];
 
                 if !matches!(
@@ -14347,7 +14559,7 @@ impl ExecNtHandler {
                     Ok(length) => length,
                     _ => return 0,
                 };
-                if args[3] as usize != expected {
+                if args[3] as u32 as usize != expected {
                     return 0xC000_0004;
                 }
                 let mut value = [0u8; 8];
@@ -14379,7 +14591,7 @@ impl ExecNtHandler {
                     return 0;
                 }
                 let buffer = args[1];
-                let length = args[2] as usize;
+                let length = args[2] as u32 as usize;
                 if length != 0 && buffer & 3 != 0 {
                     return STATUS_DATATYPE_MISALIGNMENT;
                 }
@@ -14589,7 +14801,7 @@ impl ExecNtHandler {
                 const TOKEN_QUERY: u32 = 0x0008;
                 let class = args[1];
                 let buf = args[2];
-                let len = args[3] as usize;
+                let len = args[3] as u32 as usize;
                 let retlen_ptr = args[4];
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
@@ -14828,12 +15040,11 @@ impl ExecNtHandler {
                 SERVICES_QUERY_DIR_OBJECT.fetch_add(1, Ordering::Relaxed);
                 let dir_handle = args[0];
                 let buf = args[1];
-                let length = args[2];
-                let return_single = args[3] & 1;
-                let sp = get_recv_mr(16);
-                let restart_scan = smss_stack_read(sp + 0x28) & 1;
-                let context_ptr = smss_stack_read(sp + 0x30);
-                let retlen_ptr = smss_stack_read(sp + 0x38);
+                let length = args[2] as u32 as u64;
+                let return_single = args[3] as u8 != 0;
+                let restart_scan = args[4] as u8 != 0;
+                let context_ptr = args[5];
+                let retlen_ptr = args[6];
                 let dir_idx = if dir_handle >= OBJ_HANDLE_BASE {
                     (dir_handle - OBJ_HANDLE_BASE) as usize
                 } else {
@@ -14841,7 +15052,7 @@ impl ExecNtHandler {
                     self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
                 };
                 // Starting child ordinal: 0 on RestartScan, else the captured Context.
-                let mut start = if restart_scan != 0 {
+                let mut start = if restart_scan {
                     0u64
                 } else if context_ptr != 0 {
                     let mut c = [0u8; 4];
@@ -14888,7 +15099,7 @@ impl ExecNtHandler {
                         };
                         records.push((name16, type_name));
                         idx += 1;
-                        if return_single != 0 {
+                        if return_single {
                             break;
                         }
                         // Bound the batch by the caller's buffer length (records + strings + null rec).
@@ -15137,9 +15348,8 @@ impl ExecNtHandler {
                 let file_handle = args[0];
                 let iosb = args[1];
                 let buf = args[2];
-                let len = args[3];
-                // FsInformationClass is a ULONG; the 8-byte stack slot has garbage in the high dword.
-                let class = args[4] & 0xFFFF_FFFF;
+                let len = args[3] as u32 as u64;
+                let class = args[4] as u32;
                 if class != 4 {
                     return STATUS_INVALID_INFO_CLASS;
                 }
@@ -15196,11 +15406,23 @@ impl ExecNtHandler {
                 let iosb = args[4];
                 let output = args[5];
                 crate::writable_fs::trace_dir_refusal(
-                    b"call", self.pi, args[0], iosb, output, args[6] as usize, args[7],
+                    b"call",
+                    self.pi,
+                    args[0],
+                    iosb,
+                    output,
+                    args[6] as u32 as usize,
+                    args[7],
                 );
                 if args[2] != 0 {
                     crate::writable_fs::trace_dir_refusal(
-                        b"REFUSED apc-unsupported", self.pi, args[0], iosb, output, args[6] as usize, args[7],
+                        b"REFUSED apc-unsupported",
+                        self.pi,
+                        args[0],
+                        iosb,
+                        output,
+                        args[6] as u32 as usize,
+                        args[7],
                     );
                     return STATUS_NOT_SUPPORTED;
                 }
@@ -15442,7 +15664,7 @@ impl ExecNtHandler {
             NativeService::NtQueryInformationFile => unsafe {
                 let iosb = args[1];
                 let output = args[2];
-                let length = args[3] as usize;
+                let length = args[3] as u32 as usize;
                 let class = args[4] as u32;
                 // 40 = the largest class this encoder produces (FILE_BASIC_INFORMATION); it was 24
                 // when FILE_STANDARD_INFORMATION was the only one supported.
@@ -16708,9 +16930,8 @@ impl ExecNtHandler {
             // Route those proven paths through isolated npfs instead of blanket-success modeling.
             NativeService::NtSetInformationFile => unsafe {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
-                let sp = get_recv_mr(16);
-                let information_class = smss_stack_read(sp + 0x28) as u32;
-                let length = args[3] as usize;
+                let information_class = args[4] as u32;
+                let length = args[3] as u32 as usize;
                 // ★ 64, not 32. The staging buffer TRUNCATES the caller's structure to its own
                 // size, so a 40-byte `FILE_BASIC_INFORMATION` (the class `kernel32!SetLastWriteTime`
                 // uses at the end of every `CopyFileW`) arrived as 32 bytes and the volume

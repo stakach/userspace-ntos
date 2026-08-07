@@ -191,6 +191,24 @@ impl<'a> RegfHive<'a> {
         out
     }
 
+    /// Number of immediate subkeys recorded on `nk`.
+    pub fn subkey_count(&self, nk: KeyRef) -> usize {
+        self.cell_body(nk)
+            .and_then(|body| u32le(body, 0x14))
+            .unwrap_or(0) as usize
+    }
+
+    /// Enumerate one immediate subkey without materializing the complete child list.
+    pub fn subkey_by_index(&self, nk: KeyRef, index: usize) -> Option<(String, KeyRef)> {
+        let body = self.cell_body(nk)?;
+        let list_off = match u32le(body, 0x1c) {
+            Some(o) if o != 0 && o != u32::MAX => o,
+            _ => return None,
+        };
+        let mut remaining = index;
+        self.subkey_by_index_in_list(list_off, &mut remaining, 0, false)
+    }
+
     /// Walk a subkey-list cell (lf/lh/li/ri), pushing `(name, nk_off)`. `ri` recurses into its
     /// sub-lists; `depth` guards against a malformed cyclic hive.
     fn collect_subkeys(
@@ -258,6 +276,63 @@ impl<'a> RegfHive<'a> {
         }
     }
 
+    fn subkey_by_index_in_list(
+        &self,
+        list_off: u32,
+        remaining: &mut usize,
+        depth: u32,
+        raw_names: bool,
+    ) -> Option<(String, KeyRef)> {
+        if depth > 8 {
+            return None;
+        }
+        let b = self.cell_body(list_off)?;
+        let sig = b.get(0..2)?;
+        let count = u16le(b, 0x02)? as usize;
+        match sig {
+            b"lf" | b"lh" => {
+                for i in 0..count {
+                    let off = u32le(b, 0x04 + i * 8)?;
+                    if *remaining == 0 {
+                        let name = if raw_names {
+                            self.key_name_raw(off)?
+                        } else {
+                            self.key_name_folded(off)?
+                        };
+                        return Some((name, off));
+                    }
+                    *remaining -= 1;
+                }
+            }
+            b"li" => {
+                for i in 0..count {
+                    let off = u32le(b, 0x04 + i * 4)?;
+                    if *remaining == 0 {
+                        let name = if raw_names {
+                            self.key_name_raw(off)?
+                        } else {
+                            self.key_name_folded(off)?
+                        };
+                        return Some((name, off));
+                    }
+                    *remaining -= 1;
+                }
+            }
+            b"ri" => {
+                for i in 0..count {
+                    let sub = u32le(b, 0x04 + i * 4)?;
+                    if let Some(found) =
+                        self.subkey_by_index_in_list(sub, remaining, depth + 1, raw_names)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Open the immediate subkey named `name` (case-insensitive) under `nk`.
     pub fn open_subkey(&self, nk: KeyRef, name: &str) -> Option<KeyRef> {
         let want = fold(name);
@@ -305,6 +380,27 @@ impl<'a> RegfHive<'a> {
             }
         }
         out
+    }
+
+    /// Number of values recorded on `nk`.
+    pub fn value_count(&self, nk: KeyRef) -> usize {
+        self.cell_body(nk)
+            .and_then(|body| u32le(body, 0x24))
+            .unwrap_or(0) as usize
+    }
+
+    fn value_cell_by_index(&self, nk: KeyRef, index: usize) -> Option<u32> {
+        let body = self.cell_body(nk)?;
+        let count = u32le(body, 0x24)? as usize;
+        if index >= count {
+            return None;
+        }
+        let list_off = match u32le(body, 0x28) {
+            Some(o) if o != 0 && o != u32::MAX => o,
+            _ => return None,
+        };
+        let list = self.cell_body(list_off)?;
+        u32le(list, index * 4)
     }
 
     fn value_name_folded(&self, vk: u32) -> Option<String> {
@@ -366,7 +462,7 @@ impl<'a> RegfHive<'a> {
 
     /// Enumerate the value at `index` under `nk`: `(name, reg_type, data_bytes)` in stored order.
     pub fn value_by_index(&self, nk: KeyRef, index: usize) -> Option<(String, u32, Vec<u8>)> {
-        let (_, vk) = self.values(nk).into_iter().nth(index)?;
+        let vk = self.value_cell_by_index(nk, index)?;
         let name = self.value_name_raw(vk)?;
         let (ty, data) = self.value_data(vk)?;
         Some((name, ty, data))
@@ -855,6 +951,19 @@ mod tests {
                 .map(|(name, _)| name.as_str()),
             Some("Npfs")
         );
+        assert_eq!(
+            hive.subkey_by_index(services, 0)
+                .map(|(name, _)| name)
+                .as_deref(),
+            Some("npfs")
+        );
+        assert!(hive.subkey_by_index(services, 1).is_none());
+        let npfs = hive.open_key(r"ControlSet001\Services\Npfs").unwrap();
+        assert_eq!(hive.value_count(npfs), 4);
+        let (name, ty, data) = hive.value_by_index(npfs, 0).unwrap();
+        assert_eq!(name, "ImagePath");
+        assert_eq!(ty, RegistryValueType::ExpandSz as u32);
+        assert_eq!(data, utf16le_sz(r"system32\drivers\npfs.sys"));
 
         let mut cm = ConfigManager::new();
         assert_eq!(

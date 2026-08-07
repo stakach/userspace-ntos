@@ -117,7 +117,7 @@ const CURSORDATA_AICUR_OFF: usize = 0x70;
 const CURSORDATA_AJIFRATE_OFF: usize = 0x78;
 const CURSORF_ACON: u32 = 0x0008;
 const CURSORDATA_ACON_LIMIT: u32 = 1000;
-const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_ACTIVE_CALLBACK_DEPTH;
+const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
 
 #[derive(Clone, Copy)]
 struct DeferredCallbackReturn {
@@ -180,6 +180,26 @@ unsafe fn steal_main_reply() -> Option<u64> {
     None
 }
 
+fn trace_deferred_user_callback_return_refusal(reason: &[u8]) {
+    let n = USER_CALLBACK_DEFERRED_RETURNS_FULL.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+        print_str(b"[user-callback] deferred NtCallbackReturn refused: ");
+        print_str(reason);
+        print_str(b" active-depth=");
+        print_u64(active_depth as u64);
+        print_str(b" continuation-depth=");
+        print_u64(continuation_depth as u64);
+        print_str(b" reply-used=0x");
+        print_hex_u64(WAIT_REPLY_POOL_USED.load(Ordering::Relaxed));
+        print_str(b" reply-pool=");
+        print_u64(WAIT_REPLY_POOL_N as u64);
+        print_str(b" active-reply=0x");
+        print_hex_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+}
+
 unsafe fn defer_user_callback_return(
     pi: u32,
     badge: u64,
@@ -190,11 +210,11 @@ unsafe fn defer_user_callback_return(
 ) -> bool {
     let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
     let Some(slot) = (0..DEFERRED_CALLBACK_RETURN_N).find(|&index| !table[index].used) else {
-        USER_CALLBACK_DEFERRED_RETURNS_FULL.fetch_add(1, Ordering::Relaxed);
+        trace_deferred_user_callback_return_refusal(b"table-full");
         return false;
     };
     let Some(reply_cap) = steal_main_reply() else {
-        USER_CALLBACK_DEFERRED_RETURNS_FULL.fetch_add(1, Ordering::Relaxed);
+        trace_deferred_user_callback_return_refusal(b"reply-pool-empty");
         return false;
     };
     table[slot] = DeferredCallbackReturn {

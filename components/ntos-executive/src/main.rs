@@ -2056,7 +2056,7 @@ pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
 /// subsequent recvs. On `NtSetEvent(that event)` the loop does `client_reply_on(stolen_cap, WAIT_0)` to
 /// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
-const WAIT_REPLY_POOL_N: usize = 16;
+const WAIT_REPLY_POOL_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
 /// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
 /// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
 /// (into a waiter slot) and installs a free spare as the new active.

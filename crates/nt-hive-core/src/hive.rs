@@ -312,6 +312,32 @@ impl Hive {
             .unwrap_or_default()
     }
 
+    /// Number of immediate subkeys on `key`.
+    pub fn subkey_count(&self, key: CellId) -> usize {
+        self.key(key).map_or(0, |k| k.subkeys.len())
+    }
+
+    /// Borrow the original-case name of the immediate subkey at `index`.
+    pub fn subkey_name_by_index(&self, key: CellId, index: usize) -> Option<&str> {
+        let child = self.key(key)?.subkeys.get(index)?.1;
+        self.key(child).map(|k| k.name.as_str())
+    }
+
+    /// Number of values on `key`.
+    pub fn value_count(&self, key: CellId) -> usize {
+        self.key(key).map_or(0, |k| k.values.len())
+    }
+
+    /// Borrow the value at `index` without cloning its name or data.
+    pub fn value_by_index(
+        &self,
+        key: CellId,
+        index: usize,
+    ) -> Option<(&str, RegistryValueType, &[u8])> {
+        let value = self.value(*self.key(key)?.values.get(index)?)?;
+        Some((value.name.as_str(), value.value_type, value.data.as_slice()))
+    }
+
     /// The relative path of a key cell within the hive (`\Sub\Key`).
     pub fn key_path(&self, id: CellId) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();

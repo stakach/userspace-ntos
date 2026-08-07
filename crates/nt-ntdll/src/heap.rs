@@ -1692,6 +1692,111 @@ mod tests {
     }
 
     #[test]
+    fn regcopytree_realloc_buffer_does_not_overlap_queue_nodes() {
+        const REGP_COPY_KEYS_SIZE: usize = 0x20;
+        const LIST_ENTRY_SIZE: usize = 0x10;
+        let mut h = heap(32 * 1024);
+        let mut buffer_size = 0x200usize;
+        let mut buffer = h.allocate(buffer_size).unwrap();
+        let mut nodes: Vec<*mut u8> = Vec::new();
+
+        unsafe fn seed_node(node: *mut u8, index: usize) {
+            let words = node as *mut usize;
+            words.write(0xfeed_0000_0000_0000usize | index);
+            words.add(1).write(0xbeef_0000_0000_0000usize | index);
+            words.add(2).write(0x1000usize + index);
+            words.add(3).write(0x2000usize + index);
+        }
+
+        unsafe fn assert_node(node: *mut u8, index: usize) {
+            let words = node as *const usize;
+            assert_eq!(words.read(), 0xfeed_0000_0000_0000usize | index);
+            assert_eq!(words.add(1).read(), 0xbeef_0000_0000_0000usize | index);
+            assert_eq!(words.add(2).read(), 0x1000usize + index);
+            assert_eq!(words.add(3).read(), 0x2000usize + index);
+        }
+
+        let root = h.allocate(REGP_COPY_KEYS_SIZE).unwrap();
+        unsafe { seed_node(root, 0) };
+        nodes.push(root);
+
+        for step in 0..96usize {
+            let required = match step % 12 {
+                0 => buffer_size + 0x18,
+                1 => buffer_size + 0x120,
+                2 => buffer_size,
+                3 => buffer_size + 0x10,
+                4 => buffer_size + 0x358,
+                _ => buffer_size,
+            };
+            if required > buffer_size {
+                buffer = unsafe { h.reallocate(buffer, required).unwrap() };
+                buffer_size = required;
+            }
+
+            // RegpCopyTree reuses one enumeration buffer for value/key information. Fill the
+            // complete returned region with UTF-16-looking bytes; if the allocator ever overlaps it
+            // with a queue node, that node's LIST_ENTRY sentinels will change.
+            unsafe {
+                for offset in (0..buffer_size).step_by(2) {
+                    let ch = if ((offset / 2) + step) % 2 == 0 {
+                        b'e'
+                    } else {
+                        b'm'
+                    };
+                    buffer.add(offset).write(ch);
+                    if offset + 1 < buffer_size {
+                        buffer.add(offset + 1).write(0);
+                    }
+                }
+            }
+
+            if step % 3 != 2 {
+                let node = h.allocate(REGP_COPY_KEYS_SIZE).unwrap();
+                let index = nodes.len();
+                unsafe { seed_node(node, index) };
+                nodes.push(node);
+            }
+            if step % 11 == 10 && nodes.len() > 3 {
+                let index = nodes.len() / 2;
+                let node = nodes.swap_remove(index);
+                unsafe { assert!(h.free(node)) };
+                for (new_index, &node) in nodes.iter().enumerate() {
+                    unsafe { seed_node(node, new_index) };
+                }
+            }
+
+            let buffer_start = buffer as usize;
+            let buffer_end = buffer_start + buffer_size;
+            for (index, &node) in nodes.iter().enumerate() {
+                unsafe { assert_node(node, index) };
+                let node_start = node as usize;
+                let node_end = node_start + REGP_COPY_KEYS_SIZE;
+                assert!(
+                    node_end <= buffer_start || buffer_end <= node_start,
+                    "enumeration buffer overlaps REGP_COPY_KEYS node at step {step}"
+                );
+            }
+            assert!(
+                h.validate(None),
+                "invalid heap after RegpCopyTree step {step}"
+            );
+        }
+
+        for (index, node) in nodes.into_iter().enumerate() {
+            unsafe {
+                assert_node(node, index);
+                assert!(h.free(node));
+            }
+        }
+        unsafe {
+            core::ptr::write_bytes(buffer, 0xa5, buffer_size.min(LIST_ENTRY_SIZE));
+            assert!(h.free(buffer));
+        }
+        assert!(h.validate(None));
+    }
+
+    #[test]
     fn distinct_allocations_do_not_overlap() {
         let mut h = heap(4096);
         let a = h.allocate(64).unwrap();

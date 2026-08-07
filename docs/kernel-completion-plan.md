@@ -108,23 +108,29 @@ in SCM, user-mode system processes, and our ntdll where possible.
    boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
    projection helper. Remaining display debt is hosting real videoprt/miniport instead of the
    boot-framebuffer bridge.
-2. Continue A3 for Win32 service starts: SCM-owned service metadata now produces typed
-   `Win32ServiceLaunchSpec` records with image path, own/shared process kind, interactive flag,
-   account, display name, and dependencies. Service start classification now also produces
-   `ServiceStartSpec::{Win32, Driver}` from one service key so SCM can route Win32 starts to generic
-   process creation and driver starts to `NtLoadDriver` without kernel-side service-name policy. The
-   next step is making the actual services.exe start path consume those specs for process creation.
-3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
-   policy from executive start paths once SCM consumes the launch specs.
-4. Continue A3/A4 by replacing any hosted executable catalog decisions that still encode service or
-   process role policy with dynamic process/runtime allocation state. The hosted executable catalog
-   and open/section/spawn table now size to `MAX_PI` instead of the historical eight-image cap; the
-   hosted runtime table now preserves byte-identical static lanes for `pi=0..6` and assigns later
-   process lanes from a checked high executive scratch/mirror arena. Hosted loaded executable PE
-   storage is now table-owned instead of bootstrap-array-owned, and `NtOpenFile` can admit later
-   executable images from the real mounted volume for SCM/service and shell descendants. The next
-   blocker is making services.exe consume SCM-owned Win32 launch specs so a non-bootstrap service
-   executable exercises the generic open/section/process path.
+2. Continue A3/A4 for Win32 service starts. SCM-owned service metadata now produces typed
+   `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
+   catalog/runtime lanes can admit non-bootstrap children dynamically, and services.exe's real
+   `CheckForLiveCD`/control-set copy path is no longer corrupting its advapi32 `RegCopyTreeW`
+   buffers. The next SCM step is still making the actual services.exe start path consume those specs
+   for generic process creation, without adding kernel-side service-name policy.
+3. Work the current explorer frontier before relying on shell gates as completion proof. The
+   SAM/setup bridge is green through real SAM database creation, Administrator token minting,
+   profile hive mount/read-back, and genuine explorer launch. The previous callback frontier also
+   advanced: out-of-order `NtCallbackReturn` replies now defer and drain across nested explorer
+   shell callbacks. The remaining boot blocker is allocator pressure during deeper explorer
+   shell/menu/property-bag/window creation, not fabricated logon state.
+4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
+   mounted base/user-profile hives into the overlay just to open existing keys, but D2/D4 still need
+   the Configuration Manager/Hive Manager to become the live authority for mutable hives, durable
+   setup/profile state, and allocation-conscious registry reads instead of long-lived executive
+   clones.
+5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
+   stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
+   values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
+   manual stack rereads for services whose metadata already carries all arguments, and then remove
+   any old scoped exceptions such as the read-only `NtQueryDirectoryFile` length path once the
+   directory scan cache/per-file state makes the genuine path affordable.
 
 ## Review Log
 
@@ -1045,3 +1051,61 @@ in SCM, user-mode system processes, and our ntdll where possible.
   allocation gates, and `290/290` executive checks with no `FAIL` or `exec-paging` markers. Review
   adjustment: A3 should now make services.exe consume `Win32ServiceLaunchSpec` for real Win32 service
   process creation, which will give A4 a live non-bootstrap child process gate.
+- A3/A4 unblocker. services.exe now gets through its real `CheckForLiveCD`/control-set copy route
+  without corrupting advapi32's `RegCopyTreeW` work queue: native registry syscalls truncate `ULONG`
+  arguments captured from x64 syscall frames before using `Index`, `InfoClass`, and `Length`; the
+  executive registry merge path can enumerate one value/subkey by index instead of materializing full
+  snapshots; `nt-hive-core` and `nt-hive-regf` expose host-tested indexed subkey/value reads. The
+  `NtCreateKey` disposition pointer and `NtSetValueKey` data pointer/size are also taken from the
+  captured syscall arguments rather than stale stack reads. Validation before cleanup:
+  `cargo test -p nt-hive-core hive_borrowed_indexed_enumeration_preserves_names_and_data`,
+  `cargo test -p nt-hive-regf imports_services_into_config_manager`,
+  `cargo test -p nt-ntdll regcopytree_realloc_buffer_does_not_overlap_queue_nodes`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-registry-indexed-enum-20260807.log`. Result: no SCM registry-copy crash
+  or allocator OOM; desktop/msgina paint and credential input still pass; the frontier moves to
+  LSA/SAM/token/profile with `253/290` checks while old explorer/profile gates fail honestly because
+  winlogon has not received a real logon token. Review adjustment: finish the LSA self-RPC/SAM
+  validation/token chain before treating shell chrome as a reliable end-to-end gate again.
+- Native argument-width cleanup continued. The same high-half leak showed up once `lsass.exe`
+  reached object-directory enumeration: `NtQueryDirectoryObject` was seeing an 8192-byte buffer as
+  `1099511635968` bytes because `Length` was treated as a full `u64`; that syscall now uses the
+  dispatcher-captured stack arguments and truncates `ULONG`/`BOOLEAN` parameters at the NT ABI
+  boundary. Nearby native `ULONG` lengths for token adjustment, system information, token
+  information, file/volume information, file set-information, and pipe device-control buffers were
+  narrowed too. Validation: the targeted hive/heap tests above, executive target check,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-native-ulong-clean-20260807.log`. Result: `NtQueryDirectoryObject`
+  logs `len=8192`, SCM registry copy and heap remain stable, and the honest frontier is unchanged at
+  LSA/SAM/token/profile with `253/290` checks. Review adjustment: continue the declared-width audit
+  and then route the LSA self-RPC/SAM validation worker so `NtCreateToken` can run for a real logon.
+- LSA/SAM root cause update. The `253/290` boot showed `SamValidateNormalUser()` returning
+  `STATUS_NO_SUCH_USER` while `SAM_SETUP_KEYS_CREATED` stayed `0`: the global normal-boot setup
+  overlay made `samsrv!SampIsSetupRunning()` skip `SampInitializeRegistry()`, so the empty staged
+  SAM hive never received the real `SAM\Domains\...\Users\Names\Administrator` database tree. The
+  setup bridge is now narrower: Winlogon/SCM still see installed boot, but LSASS sees the SAM setup
+  phase while the SAM database is absent, forcing ReactOS `samsrv` to build the database through real
+  registry writes instead of fabricating validation. Review adjustment: validate that `sam-setup-keys`
+  advances and then follow the resulting frontier, likely LSA self-RPC worker activity or
+  `NtCreateToken`.
+- SAM/token/profile slice. The narrow SAM setup bridge plus existing-key base-hive opens moved boot
+  past `STATUS_NO_SUCH_USER`: `samsrv` creates the real SAM database, winlogon receives an
+  Administrator token from `NtCreateToken`, userenv materializes and mounts
+  `C:\Profiles\Administrator\ntuser.dat`, and explorer starts from the genuine shell launch path.
+  Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core hive_borrowed_indexed_enumeration_preserves_names_and_data`,
+  `cargo test -p nt-hive-regf imports_services_into_config_manager`,
+  `cargo test -p nt-ntdll regcopytree_realloc_buffer_does_not_overlap_queue_nodes`,
+  executive target check, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-profile-overlay-base-open-20260807.log`. Review adjustment: the next frontier was nested
+  explorer callback returns.
+- Explorer callback-return slice. The wait-reply pool and deferred callback-return queue now size to
+  `MAX_CONTINUATION_DEPTH`; the explorer run shows six successful out-of-order `NtCallbackReturn`
+  defer/drain pairs with no callback-return refusal and no old debug-exception/callback-not-redirected
+  unwind. Validation: the same targeted hive/heap tests, executive target check, executive build,
+  rootserver image build, and boot proof `.tmp/boot-callback-reply-budget-20260807.log`. Review
+  adjustment: current blocker is allocator high-water at `6194072/6291456` followed by `alloc.rs:573`
+  during deeper explorer shell chrome setup, so the next work should remove persistent registry/shell
+  allocations before considering resource-budget changes.
