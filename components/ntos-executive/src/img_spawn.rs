@@ -336,7 +336,14 @@ pub(crate) unsafe fn spawn_pe_thread(
     // The Windows TEB anchor: GS base = TEB_VA, so the PE's `GS:[0x30]` is the TEB self-pointer.
     let _ = tcb_set_gs_base(tcb, TEB_VA);
     let _ = tcb_set_priority(tcb, 100);
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] image SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     let _ = tcb_resume(tcb);
     pml4
 }
@@ -1002,7 +1009,14 @@ pub(crate) unsafe fn spawn_sec_image(
     let _native_transport = effective_ldrp_rva(ldrpinit_rva) != 0;
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] secimage SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     if pi == 0 {
         let _ = tcb_resume(tcb);
     }

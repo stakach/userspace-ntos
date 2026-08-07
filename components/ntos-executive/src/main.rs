@@ -9073,17 +9073,64 @@ unsafe fn untyped_retype_from_r(untyped: u64, obj: u64, bits: u32, num: u32, des
     label
 }
 
-unsafe fn attach_sched_context(tcb: u64) {
-    let sc = alloc_slot();
-    let _ = untyped_retype(
+unsafe fn sched_control_configure_r(sc: u64, budget: u64, period: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") SLOT_SCHED_CONTROL => _,
+        inout("rsi") LBL_SCHED_CONTROL_CONFIGURE << 12 => reply,
+        inout("r10") sc => _,
+        inout("r8") budget => _,
+        inout("r9") period => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") sc => _,
+        inout("rsi") LBL_SCHED_CONTEXT_BIND << 12 => reply,
+        inout("r10") tcb => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn attach_sched_context(tcb: u64) -> Result<u64, u64> {
+    let Some(sc) = try_alloc_slot() else {
+        return Err(u64::MAX);
+    };
+    let e_retype = untyped_retype_r(
         CAP_INIT_UNTYPED,
         OBJ_SCHED_CONTEXT,
         SCHED_CONTEXT_BITS,
         1,
         sc,
     );
-    let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 10, 10);
-    let _ = sched_context_bind(sc, tcb);
+    if e_retype != 0 {
+        recycle_deleted_root_slot(sc);
+        return Err(e_retype);
+    }
+    let e_configure = sched_control_configure_r(sc, 10, 10);
+    if e_configure != 0 {
+        let _ = cnode_delete_recycle_r(sc);
+        return Err(e_configure);
+    }
+    let e_bind = sched_context_bind_r(sc, tcb);
+    if e_bind != 0 {
+        let _ = cnode_delete_recycle_r(sc);
+        return Err(e_bind);
+    }
+    Ok(sc)
 }
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
@@ -9255,7 +9302,14 @@ unsafe fn spawn_service(
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, 100);
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] service SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     let _ = tcb_resume(tcb);
 }
 
@@ -10618,6 +10672,11 @@ unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
     if !mechanism.is_live() {
         return;
     }
+    let sc_delete = if mechanism.sched_context != 0 {
+        cnode_delete_recycle_r(mechanism.sched_context)
+    } else {
+        0
+    };
     let cnode_delete = if mechanism.cnode != 0 {
         cnode_delete_recycle_r(mechanism.cnode)
     } else {
@@ -10628,17 +10687,21 @@ unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
     } else {
         0
     };
-    if cnode_delete == 0 && raw_delete == 0 {
+    if sc_delete == 0 && cnode_delete == 0 && raw_delete == 0 {
         HOSTED_THREAD_CNODE_RELEASES.fetch_add(1, Ordering::Relaxed);
     } else {
         if HOSTED_THREAD_CNODE_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[thread-term] mechanism CNode release failed tid=");
             print_u64(runtime.tid);
+            print_str(b" sc=0x");
+            print_hex_u64(mechanism.sched_context);
             print_str(b" cnode=0x");
             print_hex_u64(mechanism.cnode);
             print_str(b" raw=0x");
             print_hex_u64(mechanism.raw_cnode);
             print_str(b" delete=");
+            print_u64(sc_delete);
+            print_str(b"/");
             print_u64(cnode_delete);
             print_str(b"/");
             print_u64(raw_delete);
@@ -10693,7 +10756,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     };
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
-        cnode_delete_r(tcb)
+        cnode_delete_recycle_r(tcb)
     } else {
         u64::MAX
     };
@@ -14528,6 +14591,7 @@ pub(crate) fn publish_hosted_thread_runtime_gate(pi: usize, role: HostedThreadRo
 pub(crate) struct HostedThreadMechanismCaps {
     raw_cnode: u64,
     cnode: u64,
+    sched_context: u64,
 }
 
 impl HostedThreadMechanismCaps {
@@ -14535,15 +14599,20 @@ impl HostedThreadMechanismCaps {
         Self {
             raw_cnode: 0,
             cnode: 0,
+            sched_context: 0,
         }
     }
 
-    const fn new(raw_cnode: u64, cnode: u64) -> Self {
-        Self { raw_cnode, cnode }
+    const fn new(raw_cnode: u64, cnode: u64, sched_context: u64) -> Self {
+        Self {
+            raw_cnode,
+            cnode,
+            sched_context,
+        }
     }
 
     pub(crate) const fn is_live(self) -> bool {
-        self.raw_cnode != 0 || self.cnode != 0
+        self.raw_cnode != 0 || self.cnode != 0 || self.sched_context != 0
     }
 }
 
@@ -15477,7 +15546,14 @@ unsafe fn spawn_user_thread(
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, prio);
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] initial SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     let _ = tcb_resume(tcb);
     pml4 // the executive keeps this cap to map on-demand NtAllocateVirtualMemory frames
 }
@@ -15527,7 +15603,14 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
     );
     let _ = tcb_write_registers(tcb, entry, stack_base + 0x4000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] legacy SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     let _ = tcb_resume(tcb);
     tcb
 }
@@ -16105,11 +16188,27 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     let _native_transport = t.native;
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
-    attach_sched_context(tcb);
+    let sched_context = match attach_sched_context(tcb) {
+        Ok(sc) => sc,
+        Err(e_sc) => {
+            print_str(b"[thread-life] hosted SC attach failed tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" error=");
+            print_u64(e_sc);
+            print_str(b"\n");
+            let _ = cnode_delete_recycle_r(tcb);
+            let _ = cnode_delete_recycle_r(cnode);
+            let _ = cnode_delete_recycle_r(raw);
+            if let Some(slot) = resource_slot {
+                release_hosted_tp_worker_window_resources(resource_pi, slot);
+            }
+            return HostedThreadSpawnResult::failed();
+        }
+    };
     if t.resume {
         let _ = tcb_resume(tcb);
     }
-    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode))
+    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode, sched_context))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).

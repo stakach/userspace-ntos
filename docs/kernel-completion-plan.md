@@ -121,11 +121,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    return process-local handles instead of new callers receiving legacy `OBJ_HANDLE_BASE` indexes,
    and `RootDirectory`/`NtQueryDirectoryObject` resolve through the same handle-table path. ReactOS
    `GetDriveType(C:\)` now sees the mounted DOS drive through `ProcessDeviceMap`, so the previous
-   `CStartMenu`/`startmnu` `ERROR_PATH_NOT_FOUND` route is gone. The remaining gates are debug
+   `CStartMenu`/`startmnu` `ERROR_PATH_NOT_FOUND` route is gone. Generic hosted-thread
+   sched-context ownership now keeps explorer/RPC worker churn from leaking seL4 SC objects: SC
+   attach is checked, hosted thread mechanisms own the SC cap, and thread teardown recycles the SC
+   plus TCB root slot. The old `retype: sc pool exhausted`, `failed to create thread, error=5aa`,
+   and local worker `0xff` frontier is gone in the latest boot. The remaining gates are debug
    syscall dispatch proofs, stale user-callback dead-client/nested proof bits after real explorer
-   activity, VM pool-headroom accounting, and the new post-render resource frontier: explorer/RPC
-   worker creation reaches the bounded local worker/pool slots (`0xff`), reports `failed to create
-   thread, error=5aa`, and can exhaust the seL4 SC pool.
+   activity, VM pool-headroom accounting, and the next functional frontier around a generic worker
+   parked on unserviced syscall `SSN=188` with later win32k `ClientThreadSetup` failures.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -1190,3 +1193,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
   explorer/RPC worker creation exhausts bounded local worker/pool slots and eventually the seL4 SC
   pool. Review adjustment: do not add path fallbacks; the next work is generic worker/thread/SC pool
   capacity and accounting under real explorer activity.
+- Hosted-thread sched-context lifecycle slice. `attach_sched_context` now uses checked `SYS_CALL`
+  invocations for SC retype/configure/bind and returns the allocated SC cap. Isolated
+  component/image spawners stop on attach failure, while hosted NT second-thread spawn unwinds the
+  TCB/CNode/window reservation and returns real thread-creation failure instead of publishing an
+  unschedulable worker. `HostedThreadMechanismCaps` now carries the SC cap, and hosted thread
+  teardown recycles both the bound SC and the deleted TCB root slot. Validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-sc-reclaim-20260807.log`. Result: genuine explorer shell chrome still passes,
+  `win32k-pool-exhaustions=0`, final pool census has `ut-fails=0`, and the previous
+  `retype: sc pool exhausted`/`failed to create thread`/local worker exhaustion loop does not recur.
+  The run exits at `282/290` with the remaining known gates: dbgk syscall/wait wake proofs,
+  user-callback nested/dead-client proof bits, win32k nested transport accounting, and VM
+  pool-headroom accounting. Review adjustment: next work should debug unserviced worker syscall
+  `SSN=188` and the later win32k `ClientThreadSetup` failures without adding fallback success paths.

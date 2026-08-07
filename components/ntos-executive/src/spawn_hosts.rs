@@ -286,7 +286,14 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     if let Some(gs) = d.gs_base {
         let _ = tcb_set_gs_base(tcb, gs);
     }
-    attach_sched_context(tcb);
+    if let Err(e_sc) = attach_sched_context(tcb) {
+        print_str(b"[thread-life] component SC attach failed tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(e_sc);
+        print_str(b"\n");
+        park();
+    }
     let _ = tcb_resume(tcb);
     SpawnedComponent {
         pml4,
