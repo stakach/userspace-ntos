@@ -49,8 +49,11 @@ static mut SERVICE_HOSTED_BOOTSTRAP_PES_WORK: [Option<nt_pe_loader::PeFile<'stat
 static mut SERVICE_HOSTED_BOOTSTRAP_POOL_VAS_WORK: [u64; HOSTED_BOOTSTRAP_LOAD_COUNT] =
     [0; HOSTED_BOOTSTRAP_LOAD_COUNT];
 static mut SERVICE_PROCS_WORK: [ProcExec; MAX_PI] = [ProcExec::empty(); MAX_PI];
-static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<8> = nt_exe_image::ImageTable::new();
-static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog<8> =
+static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
+    nt_exe_image::ImageTable::new();
+static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog<
+    HOSTED_PROCESS_IMAGE_CAP,
+> =
     nt_exe_image::OwnedHostedImageCatalog::new();
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
@@ -543,7 +546,8 @@ fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
 }
 
 #[inline(never)]
-unsafe fn reset_service_exe_images_work() -> &'static mut nt_exe_image::ImageTable<8> {
+unsafe fn reset_service_exe_images_work(
+) -> &'static mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> {
     let slot = core::ptr::addr_of_mut!(SERVICE_EXE_IMAGES_WORK);
     core::ptr::write(slot, nt_exe_image::ImageTable::new());
     &mut *slot
@@ -551,7 +555,7 @@ unsafe fn reset_service_exe_images_work() -> &'static mut nt_exe_image::ImageTab
 
 #[inline(never)]
 unsafe fn reset_service_exe_image_catalog_work(
-) -> &'static mut nt_exe_image::OwnedHostedImageCatalog<8> {
+) -> &'static mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> {
     let catalog = &mut *core::ptr::addr_of_mut!(SERVICE_EXE_IMAGE_CATALOG_WORK);
     catalog.clear();
     catalog
@@ -717,7 +721,7 @@ unsafe fn reset_service_delay_queue_work() -> &'static mut nt_delay_execution::Q
 }
 
 unsafe fn load_hosted_bootstrap_image(
-    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     enabled: bool,
     spec: HostedBootstrapLoadSpec,
 ) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
@@ -1389,7 +1393,7 @@ fn hosted_multiplexed_thread_spawn_for(
 
 fn hosted_exe_spawn_for<'a>(
     request: nt_exe_image::SpawnRequest,
-    catalog: &'a nt_exe_image::OwnedHostedImageCatalog<8>,
+    catalog: &'a nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     loaded_images: &'a HostedLoadedImageTable,
 ) -> Option<HostedExeSpawn<'a>> {
     let target = request.target?;
@@ -1414,7 +1418,7 @@ unsafe fn spawn_requested_hosted_exe(
     fault_ep: u64,
     procs: &mut [ProcExec; MAX_PI],
     nt_handler: &mut ExecNtHandler,
-    exe_images: &mut nt_exe_image::ImageTable<8>,
+    exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
 ) -> Result<u64, u32> {
     let pi = spec.image.pi;
     let child_pid = nt_handler
@@ -3558,7 +3562,10 @@ pub(crate) unsafe fn service_sec_image(
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler =
-        reset_exec_nt_handler(exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<8>);
+        reset_exec_nt_handler(
+            exe_image_catalog
+                as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+        );
     nt_handler.register_main_thread_tcb(0, main_tcb);
     let delay_queue = reset_service_delay_queue_work();
     if ntdll.is_some() {
@@ -6586,9 +6593,10 @@ pub(crate) unsafe fn service_sec_image(
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
                     hosted_loaded_images: hosted_loaded_images as *const HostedLoadedImageTable,
-                    exe_images: exe_images as *mut nt_exe_image::ImageTable<8>,
+                    exe_images: exe_images
+                        as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
                     exe_image_catalog: exe_image_catalog
-                        as *mut nt_exe_image::OwnedHostedImageCatalog<8>,
+                        as *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
                     filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
                     scratch_base,

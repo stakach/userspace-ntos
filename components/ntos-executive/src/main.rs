@@ -1360,6 +1360,7 @@ pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WI
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
+pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI;
 /// Per-process VAD extents. A real NT process's VAD is an unbounded AVL tree; ours is a fixed slot
 /// array, and `insert` returns STATUS_INSUFFICIENT_RESOURCES once it is full.
 ///
@@ -13694,11 +13695,11 @@ struct ExecLoopCtx {
     hosted_loaded_images: *const HostedLoadedImageTable,
     /// Generic owner-local executable handle/state table for Win32 child processes. The PE bytes
     /// remain loop-owned; this table validates open -> section -> spawn -> publish transitions.
-    exe_images: *mut nt_exe_image::ImageTable<8>,
+    exe_images: *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
     /// Runtime-owned identity catalog for hosted executable images admitted through file/section
     /// creation. `NtCreateProcess` consumes this as the target authority instead of re-resolving
     /// static leaf metadata at spawn time.
-    exe_image_catalog: *mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    exe_image_catalog: *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 512],
@@ -14008,7 +14009,7 @@ struct ExecNtHandler {
     process_mechanisms: ExecProcessMechanisms,
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
-    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
+    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: [u64; MAX_PI],
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
@@ -14072,7 +14073,7 @@ static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
 
 #[inline(never)]
 unsafe fn reset_exec_nt_handler(
-    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
+    hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
 ) -> &'static mut ExecNtHandler {
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
     // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the

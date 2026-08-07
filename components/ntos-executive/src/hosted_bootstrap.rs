@@ -5,7 +5,7 @@
 //! reach back into the historical descriptor table.
 #![allow(clippy::all)]
 
-use crate::register_hosted_process_runtime_for_image;
+use crate::{register_hosted_process_runtime_for_image, HOSTED_PROCESS_IMAGE_CAP};
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedBootstrapLoadSpec {
@@ -147,7 +147,7 @@ pub(crate) fn hosted_bootstrap_load_spec(index: usize) -> Option<HostedBootstrap
 }
 
 pub(crate) fn register_loaded_hosted_image(
-    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<8>,
+    catalog: &mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     image: nt_exe_image::HostedProcessImageRef<'_>,
     loaded: bool,
 ) -> Result<(), nt_exe_image::HostedImageRegistrationError> {

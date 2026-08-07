@@ -117,7 +117,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
 3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
    policy from executive start paths once SCM consumes the launch specs.
 4. Continue A3/A4 by replacing any hosted executable catalog decisions that still encode service or
-   process role policy with dynamic process/runtime allocation state.
+   process role policy with dynamic process/runtime allocation state. The hosted executable catalog
+   and open/section/spawn table now size to `MAX_PI` instead of the historical eight-image cap; the
+   next blocker is the runtime VA layout because the existing `SMSS_SCRATCH_BASE + pi *
+   DEMAND_SCRATCH_WINDOW` rule is non-overlapping only through explorer (`pi=6`) and collides with
+   the explorer mirror band at `pi=7`.
 
 ## Review Log
 
@@ -990,3 +994,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_msgina_logon_dialog_painted`, and `exec_explorer_shell_chrome_painted`; executive summary
   stayed at 290/290. Review adjustment: wire the concrete services.exe start path to the Win32 branch
   and start retiring the hosted executable catalog admission rule.
+- A4 started. The hosted executable catalog and owner-local executable open/section/spawn table no
+  longer use the historical `8`-slot type; both are now sized by `HOSTED_PROCESS_IMAGE_CAP`, tied to
+  the existing `MAX_PI` process mechanism ceiling. This removes one static admission limit without
+  pretending dynamic service-process execution works yet. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` with proof in
+  `.tmp/boot-hosted-image-cap-20260807.log`; the SCM selection gates, IDD_LOGON paint, explorer shell
+  chrome paint, and 290/290 executive summary all passed. Review adjustment: solve the runtime VA
+  layout next. The current demand-scratch formula reaches explorer at `pi=6`; a dynamic service at
+  `pi=7` would start at `0x100_3D00_0000`, which is already explorer's stack mirror, so dynamic
+  process runtime registration must get a new non-overlapping scratch/mirror allocator before
+  services.exe can admit arbitrary Win32 service children.

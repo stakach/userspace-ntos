@@ -486,7 +486,7 @@ impl ExecNtHandler {
     #[inline(never)]
     pub(crate) unsafe fn initialize_in(
         slot: *mut ExecNtHandler,
-        hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<8>,
+        hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     ) -> &'static mut Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
         // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
@@ -9705,7 +9705,7 @@ impl ExecNtHandler {
     /// the loader doesn't take the .Local\/manifest path). The caller still confirms the leaf on the
     /// real FS.
     fn exe_probe_image<'a>(
-        catalog: &'a nt_exe_image::OwnedHostedImageCatalog<8>,
+        catalog: &'a nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         folded: &[u8],
         is_sxs: bool,
     ) -> Option<nt_exe_image::HostedProcessImageRef<'a>> {
