@@ -11983,11 +11983,15 @@ struct InlineServiceSelectionReport {
     auto_win32_count: u64,
     auto_win32_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     auto_win32_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    auto_win32_nt_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    auto_win32_command_line: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     auto_win32_process_kind: u8,
     auto_win32_interactive: bool,
     demand_win32_count: u64,
     demand_win32_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     demand_win32_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    demand_win32_nt_image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    demand_win32_command_line: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     demand_win32_process_kind: u8,
     demand_win32_interactive: bool,
     demand_driver_count: u64,
@@ -12002,11 +12006,15 @@ impl InlineServiceSelectionReport {
             auto_win32_count: 0,
             auto_win32_name: InlineAscii::empty(),
             auto_win32_image_path: InlineAscii::empty(),
+            auto_win32_nt_image_path: InlineAscii::empty(),
+            auto_win32_command_line: InlineAscii::empty(),
             auto_win32_process_kind: WIN32_SERVICE_PROCESS_KIND_NONE,
             auto_win32_interactive: false,
             demand_win32_count: 0,
             demand_win32_name: InlineAscii::empty(),
             demand_win32_image_path: InlineAscii::empty(),
+            demand_win32_nt_image_path: InlineAscii::empty(),
+            demand_win32_command_line: InlineAscii::empty(),
             demand_win32_process_kind: WIN32_SERVICE_PROCESS_KIND_NONE,
             demand_win32_interactive: false,
             demand_driver_count: 0,
@@ -12020,6 +12028,8 @@ impl InlineServiceSelectionReport {
         self.auto_win32_count != 0
             && self.auto_win32_name.len != 0
             && self.auto_win32_image_path.len != 0
+            && self.auto_win32_nt_image_path.len != 0
+            && self.auto_win32_command_line.len != 0
             && self.auto_win32_process_kind != WIN32_SERVICE_PROCESS_KIND_NONE
     }
 
@@ -12027,6 +12037,8 @@ impl InlineServiceSelectionReport {
         self.demand_win32_count != 0
             && self.demand_win32_name.len != 0
             && self.demand_win32_image_path.len != 0
+            && self.demand_win32_nt_image_path.len != 0
+            && self.demand_win32_command_line.len != 0
             && self.demand_win32_process_kind != WIN32_SERVICE_PROCESS_KIND_NONE
     }
 
@@ -12870,10 +12882,19 @@ fn copy_win32_service_launch_selection(
     spec: &nt_config_manager::Win32ServiceLaunchSpec,
     name: &mut InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    nt_image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    command_line: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     process_kind: &mut u8,
     interactive: &mut bool,
 ) -> bool {
-    if !name.set_str(&spec.service_name) || !image_path.set_str(&spec.image_path) {
+    let Ok(process_launch) = spec.process_launch() else {
+        return false;
+    };
+    if !name.set_str(&spec.service_name)
+        || !image_path.set_str(&spec.image_path)
+        || !nt_image_path.set_str(&process_launch.nt_image_path)
+        || !command_line.set_str(&process_launch.command_line)
+    {
         return false;
     }
     *process_kind = win32_service_process_kind_code(spec.process_kind);
@@ -12900,6 +12921,8 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
                 spec,
                 &mut report.auto_win32_name,
                 &mut report.auto_win32_image_path,
+                &mut report.auto_win32_nt_image_path,
+                &mut report.auto_win32_command_line,
                 &mut report.auto_win32_process_kind,
                 &mut report.auto_win32_interactive,
             );
@@ -12912,6 +12935,8 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
                 spec,
                 &mut report.demand_win32_name,
                 &mut report.demand_win32_image_path,
+                &mut report.demand_win32_nt_image_path,
+                &mut report.demand_win32_command_line,
                 &mut report.demand_win32_process_kind,
                 &mut report.demand_win32_interactive,
             );
@@ -20228,6 +20253,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(scm_service_selection.auto_win32_name.as_bytes());
     print_str(b" image=");
     print_str(scm_service_selection.auto_win32_image_path.as_bytes());
+    print_str(b" nt-image=");
+    print_str(scm_service_selection.auto_win32_nt_image_path.as_bytes());
+    print_str(b" cmd=");
+    print_str(scm_service_selection.auto_win32_command_line.as_bytes());
     print_str(b" kind=");
     print_str(win32_service_process_kind_label(
         scm_service_selection.auto_win32_process_kind,
@@ -20245,6 +20274,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(scm_service_selection.demand_win32_name.as_bytes());
     print_str(b" image=");
     print_str(scm_service_selection.demand_win32_image_path.as_bytes());
+    print_str(b" nt-image=");
+    print_str(scm_service_selection.demand_win32_nt_image_path.as_bytes());
+    print_str(b" cmd=");
+    print_str(scm_service_selection.demand_win32_command_line.as_bytes());
     print_str(b" kind=");
     print_str(win32_service_process_kind_label(
         scm_service_selection.demand_win32_process_kind,

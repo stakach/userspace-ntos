@@ -112,8 +112,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
    catalog/runtime lanes can admit non-bootstrap children dynamically, and services.exe's real
    `CheckForLiveCD`/control-set copy path is no longer corrupting its advapi32 `RegCopyTreeW`
-   buffers. The next SCM step is still making the actual services.exe start path consume those specs
-   for generic process creation, without adding kernel-side service-name policy.
+   buffers. `Win32ServiceLaunchSpec` now also projects the service `ImagePath` into a generic
+   process-launch command line plus normalized NT image path, and the executive SCM selection gate
+   requires that projection for both auto-start and demand-start Win32 services. The next SCM step is
+   still live proof that services.exe's real auto-start path reaches a non-bootstrap Win32 service
+   child through the ordinary CreateProcess/NtOpenFile/NtCreateSection/NtCreateProcess route, without
+   adding kernel-side service-name policy.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
@@ -132,8 +136,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The old fixed
    object-namespace ceiling is also gone: object entries now grow by checked reserve, so late debug
    objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
-   slots. The latest boot reaches genuine explorer shell chrome with every dbgk, user-callback, and
-   win32k nested-transport proof green; the only remaining red gate is VM pool-headroom accounting.
+   slots. The latest boot reaches genuine explorer shell chrome with every dbgk, user-callback,
+   win32k nested-transport, and VM pool-headroom proof green (`290/290`). Continue from the larger
+   completion plan rather than adding more boot-frontier special cases.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -1258,3 +1263,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   sentinel code `3` after `[microtest sentinel matched -- exiting QEMU]`). Review adjustment: the
   immediate desktop frontier is green again; continue with the larger completion plan rather than
   adding more boot-frontier special cases.
+- A3/A4 continued. `nt-config-manager` now projects a Win32 service `ImagePath` into the generic
+  process-creation inputs services.exe ultimately drives: parsed executable path, normalized NT image
+  path, and command line. The projection is host-tested for unquoted `%SystemRoot%\system32\svchost`
+  service command lines, quoted executable paths, SystemRoot-relative paths, demand-start services,
+  and malformed/unsupported values, including lookalike SystemRoot prefixes. The executive SCM
+  selection proof now copies and requires the projected NT image path and command line for the first
+  auto-start and demand-start Win32 services, so the gate proves registry data is launchable through
+  the generic process path rather than only selected by name/type. Validation: `cargo fmt --all`,
+  `cargo test -p nt-config-manager`, the executive x86_64 no-std `cargo check`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and the boot proof log
+  `.tmp/boot-service-process-launch-20260807-rerun.log` (`290/290`, SCM launch-spec gates,
+  services.exe, VM pool headroom, explorer shell chrome, and sentinel green). Review adjustment: keep
+  A3 focused on live services.exe auto-start child proof without kernel-side service-name policy.

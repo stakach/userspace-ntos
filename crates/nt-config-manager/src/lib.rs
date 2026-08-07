@@ -99,6 +99,28 @@ pub struct Win32ServiceLaunchSpec {
     pub dependencies: Vec<String>,
 }
 
+/// Generic process-creation input derived from a Win32 service `ImagePath`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Win32ServiceProcessLaunch {
+    pub service_name: String,
+    pub service_key: RegistryKeyId,
+    pub executable_path: String,
+    pub nt_image_path: String,
+    pub command_line: String,
+    pub process_kind: Win32ServiceProcessKind,
+    pub interactive: bool,
+    pub account_name: Option<String>,
+    pub display_name: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Win32ServiceProcessLaunchError {
+    EmptyImagePath,
+    UnterminatedQuote,
+    UnsupportedImagePath,
+}
+
 /// Registry-selected driver load metadata for `NtLoadDriver`/SCM driver starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriverServiceLaunchSpec {
@@ -128,6 +150,124 @@ pub fn driver_service_class_from_type(service_type: u32) -> Option<DriverService
         Some(DriverServiceClass::Device)
     } else {
         None
+    }
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    (value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix))
+        .then_some(&value[prefix.len()..])
+}
+
+fn strip_rooted_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = strip_ascii_prefix(value, prefix)?;
+    (suffix.is_empty() || path_starts_with_sep(suffix)).then_some(suffix)
+}
+
+fn path_starts_with_sep(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|b| *b == b'\\' || *b == b'/')
+}
+
+fn push_backslash_path(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        out.push(if ch == '/' { '\\' } else { ch });
+    }
+}
+
+fn system_root_nt_path_from_suffix(suffix: &str) -> String {
+    let mut out = String::from(r"\SystemRoot");
+    let suffix = suffix.trim_start();
+    if suffix.is_empty() {
+        return out;
+    }
+    if path_starts_with_sep(suffix) {
+        push_backslash_path(&mut out, suffix);
+    } else {
+        out.push('\\');
+        push_backslash_path(&mut out, suffix);
+    }
+    out
+}
+
+fn normalize_win32_service_executable_path(
+    executable_path: &str,
+) -> Result<String, Win32ServiceProcessLaunchError> {
+    let path = executable_path.trim();
+    if path.is_empty() {
+        return Err(Win32ServiceProcessLaunchError::EmptyImagePath);
+    }
+
+    if let Some(suffix) = strip_rooted_ascii_prefix(path, "%SystemRoot%") {
+        return Ok(system_root_nt_path_from_suffix(suffix));
+    }
+    if let Some(suffix) = strip_rooted_ascii_prefix(path, r"\SystemRoot") {
+        return Ok(system_root_nt_path_from_suffix(suffix));
+    }
+    if strip_ascii_prefix(path, r"system32\").is_some()
+        || strip_ascii_prefix(path, "system32/").is_some()
+    {
+        return Ok(system_root_nt_path_from_suffix(path));
+    }
+
+    for prefix in [
+        r"\??\C:\ReactOS\",
+        r"\??\C:\Windows\",
+        r"C:\ReactOS\",
+        r"C:\Windows\",
+    ] {
+        if let Some(suffix) = strip_ascii_prefix(path, prefix) {
+            return Ok(system_root_nt_path_from_suffix(suffix));
+        }
+    }
+
+    Err(Win32ServiceProcessLaunchError::UnsupportedImagePath)
+}
+
+fn split_win32_service_image_path(
+    image_path: &str,
+) -> Result<(&str, &str), Win32ServiceProcessLaunchError> {
+    let command_line = image_path.trim();
+    if command_line.is_empty() {
+        return Err(Win32ServiceProcessLaunchError::EmptyImagePath);
+    }
+    if let Some(rest) = command_line.strip_prefix('"') {
+        let end = rest
+            .find('"')
+            .ok_or(Win32ServiceProcessLaunchError::UnterminatedQuote)?;
+        let executable = &rest[..end];
+        if executable.trim().is_empty() {
+            return Err(Win32ServiceProcessLaunchError::EmptyImagePath);
+        }
+        return Ok((executable, command_line));
+    }
+    let end = command_line
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(command_line.len());
+    Ok((&command_line[..end], command_line))
+}
+
+impl Win32ServiceLaunchSpec {
+    pub fn process_launch(
+        &self,
+    ) -> Result<Win32ServiceProcessLaunch, Win32ServiceProcessLaunchError> {
+        let (executable_path, command_line) = split_win32_service_image_path(&self.image_path)?;
+        let nt_image_path = normalize_win32_service_executable_path(executable_path)?;
+        Ok(Win32ServiceProcessLaunch {
+            service_name: self.service_name.clone(),
+            service_key: self.service_key,
+            executable_path: executable_path.into(),
+            nt_image_path,
+            command_line: command_line.into(),
+            process_kind: self.process_kind,
+            interactive: self.interactive,
+            account_name: self.account_name.clone(),
+            display_name: self.display_name.clone(),
+            dependencies: self.dependencies.clone(),
+        })
     }
 }
 
@@ -530,6 +670,10 @@ impl ConfigManager {
         self.win32_service_launch_specs_by_start(&[SERVICE_AUTO_START])
     }
 
+    pub fn auto_start_win32_service_process_launches(&self) -> Vec<Win32ServiceProcessLaunch> {
+        self.win32_service_process_launches_by_start(&[SERVICE_AUTO_START])
+    }
+
     /// Registry-declared Win32 services that SCM may demand-start.
     pub fn demand_start_win32_service_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_WIN32_TYPE_MASK)
@@ -537,6 +681,10 @@ impl ConfigManager {
 
     pub fn demand_start_win32_service_launch_specs(&self) -> Vec<Win32ServiceLaunchSpec> {
         self.win32_service_launch_specs_by_start(&[SERVICE_DEMAND_START])
+    }
+
+    pub fn demand_start_win32_service_process_launches(&self) -> Vec<Win32ServiceProcessLaunch> {
+        self.win32_service_process_launches_by_start(&[SERVICE_DEMAND_START])
     }
 
     pub fn service_start_spec(&self, name: &str) -> Option<ServiceStartSpec> {
@@ -568,6 +716,17 @@ impl ConfigManager {
                     .is_some_and(|start| start_types.contains(&start))
             })
             .filter_map(|service| service.win32_launch_spec())
+            .collect()
+    }
+
+    /// Generic process-creation inputs for registry-declared Win32 service starts.
+    pub fn win32_service_process_launches_by_start(
+        &self,
+        start_types: &[u32],
+    ) -> Vec<Win32ServiceProcessLaunch> {
+        self.win32_service_launch_specs_by_start(start_types)
+            .into_iter()
+            .filter_map(|spec| spec.process_launch().ok())
             .collect()
     }
 
@@ -1387,6 +1546,138 @@ mod tests {
         assert_eq!(demand[0].service_name, "DemandOwn");
         assert_eq!(demand[0].process_kind, Win32ServiceProcessKind::Own);
         assert!(!demand[0].interactive);
+    }
+
+    #[test]
+    fn win32_service_process_launches_project_generic_create_process_inputs() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "RpcSs",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "QuotedOwn",
+            r#""C:\ReactOS\System32\quoted service.exe" -service"#,
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "RelativeOwn",
+            r"system32\relative.exe /svc",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "DemandOwn",
+            r"\SystemRoot\System32\demand.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            1,
+        );
+        cm.register_typed_service(
+            "Unsupported",
+            r"\\server\share\unsupported.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "BrokenQuote",
+            r#""C:\ReactOS\System32\broken.exe"#,
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "BadRoot",
+            r"\SystemRooted\bad.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+
+        let auto_specs = cm.auto_start_win32_service_launch_specs();
+        assert_eq!(auto_specs.len(), 6);
+        let auto_launches = cm.auto_start_win32_service_process_launches();
+        assert_eq!(auto_launches.len(), 3);
+
+        let rpcss = auto_launches
+            .iter()
+            .find(|launch| launch.service_name == "RpcSs")
+            .unwrap();
+        assert_eq!(rpcss.executable_path, r"%SystemRoot%\system32\svchost.exe");
+        assert_eq!(rpcss.nt_image_path, r"\SystemRoot\system32\svchost.exe");
+        assert_eq!(
+            rpcss.command_line,
+            r"%SystemRoot%\system32\svchost.exe -k rpcss"
+        );
+        assert_eq!(rpcss.process_kind, Win32ServiceProcessKind::Shared);
+
+        let quoted = auto_launches
+            .iter()
+            .find(|launch| launch.service_name == "QuotedOwn")
+            .unwrap();
+        assert_eq!(
+            quoted.executable_path,
+            r"C:\ReactOS\System32\quoted service.exe"
+        );
+        assert_eq!(
+            quoted.nt_image_path,
+            r"\SystemRoot\System32\quoted service.exe"
+        );
+        assert_eq!(
+            quoted.command_line,
+            r#""C:\ReactOS\System32\quoted service.exe" -service"#
+        );
+
+        let relative = auto_launches
+            .iter()
+            .find(|launch| launch.service_name == "RelativeOwn")
+            .unwrap();
+        assert_eq!(relative.nt_image_path, r"\SystemRoot\system32\relative.exe");
+        assert_eq!(relative.command_line, r"system32\relative.exe /svc");
+
+        let demand = cm.demand_start_win32_service_process_launches();
+        assert_eq!(demand.len(), 1);
+        assert_eq!(demand[0].service_name, "DemandOwn");
+        assert_eq!(demand[0].nt_image_path, r"\SystemRoot\System32\demand.exe");
+
+        let broken = auto_specs
+            .iter()
+            .find(|spec| spec.service_name == "BrokenQuote")
+            .unwrap();
+        assert_eq!(
+            broken.process_launch().unwrap_err(),
+            Win32ServiceProcessLaunchError::UnterminatedQuote
+        );
+
+        let bad_root = auto_specs
+            .iter()
+            .find(|spec| spec.service_name == "BadRoot")
+            .unwrap();
+        assert_eq!(
+            bad_root.process_launch().unwrap_err(),
+            Win32ServiceProcessLaunchError::UnsupportedImagePath
+        );
     }
 
     #[test]
