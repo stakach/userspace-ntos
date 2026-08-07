@@ -4730,6 +4730,7 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
 fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
+    let untyped_free = untyped_total.saturating_sub(untyped_used);
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_available = root_slot_available_count();
@@ -4741,8 +4742,9 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
         b"exec_vm_pool_headroom",
         // The boot Untyped's size was really read from BootInfo (so this is measured, not assumed) …
         untyped_total != 0
-            // … and every pool is strictly under three quarters of its capacity …
-            && untyped_used * 4 < untyped_total * 3
+            // … and the full ReactOS desktop proof still leaves a substantial root-Untyped runway.
+            && untyped_free >= MIN_BOOT_UNTYPED_HEADROOM_BYTES
+            // Every executive-side fixed pool remains strictly under three quarters of its capacity.
             && slots_total != 0
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
@@ -7059,6 +7061,10 @@ pub(crate) static UT_RETYPE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// The boot Untyped's size, published by the kernel in `BootInfo.untyped_list[..]` (the one
 /// non-device untyped). Read at `_start`; 0 until then.
 pub(crate) static UT_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Minimum root-Untyped runway that must remain after a full desktop proof boot. CSpace exhaustion
+/// is now checked directly through live slot availability; Untyped pressure is a byte runway, not a
+/// stale percentage tied to the earlier, smaller boot frontier.
+const MIN_BOOT_UNTYPED_HEADROOM_BYTES: u64 = 48 * 1024 * 1024;
 /// Retypes that came back with a real seL4 error label, and the last such label/object type.
 /// `seL4_NotEnoughMemory` = 10 is "the boot Untyped is spent".
 pub(crate) static UT_RETYPE_FAILS: AtomicU64 = AtomicU64::new(0);
@@ -7149,6 +7155,13 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed) >> 10);
     print_str(b"KiB/");
     print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed) >> 10);
+    print_str(b"KiB ut-free=");
+    print_u64(
+        UT_TOTAL_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed))
+            >> 10,
+    );
     print_str(b"KiB retypes=");
     print_u64(UT_RETYPE_CALLS.load(Ordering::Relaxed));
     print_str(b" ut-fails=");

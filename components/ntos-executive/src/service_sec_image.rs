@@ -3865,6 +3865,7 @@ pub(crate) unsafe fn service_sec_image(
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
     let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
     let mut last_progress_t = monotonic_time_100ns();
+    let mut callback_backstop_start_t = 0u64;
     // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
@@ -4019,10 +4020,27 @@ pub(crate) unsafe fn service_sec_image(
         // the iters backstop is lifted so lsass's full LSA-init DLL tree (lsasrv/samsrv/msv1_0 + deps)
         // can grind to LSA_RPC_SERVER_ACTIVE inside the 500s TCG budget → winlogon WaitForLsass wake →
         // InitializeSAS → SwitchDesktop → the 0x003a6ea5 paint. Still a runaway backstop, not the
-        // functional terminus.
+        // functional terminus. Once real explorer callback churn exists, the backstop may land in the
+        // middle of a nested user-callback return chain; wait for the transport to drain before
+        // entering the post-loop proof injections.
         if iters > 60000 {
-            stop = m1;
-            break;
+            if defer_quiesce_for_active_user_callbacks(b"iteration-backstop") {
+                let now = monotonic_time_100ns();
+                if callback_backstop_start_t == 0 {
+                    callback_backstop_start_t = now;
+                }
+                if now.wrapping_sub(callback_backstop_start_t) >= 20 * 10_000_000 {
+                    print_str(
+                        b"[quiesce] iteration backstop expired with win32k callbacks still active -> run gate\n",
+                    );
+                    stop = m1;
+                    break;
+                }
+            } else {
+                print_str(b"[quiesce] iteration backstop reached with callback transport idle -> run gate\n");
+                stop = m1;
+                break;
+            }
         }
         // Select the hosted process this fault/syscall came from (0 = smss, CSRSS_BADGE = csrss) and
         // LOAD its state into the working locals. pml4/scratch_base/img_end/pe are immutable per

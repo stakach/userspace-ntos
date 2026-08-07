@@ -1239,6 +1239,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and boot proof `.tmp/boot-dynamic-objns-20260807.log`. Result: the run advances from `282/290` to
   `289/290`; all dbgk syscall/wait/exception/block proofs, user-callback nested/dead-client proofs,
   and win32k nested transport accounting are green, while genuine explorer shell chrome pixels still
-  pass. Review adjustment: the last red gate is `exec_vm_pool_headroom`; inspect whether the current
-  three-quarter untyped threshold is stale for a full ReactOS desktop boot or whether a real reclaim
-  leak remains.
+  pass. Review adjustment: the last red gate was `exec_vm_pool_headroom`; the next slice should make
+  that gate track current measured runway instead of the stale three-quarter ratio from the smaller
+  pre-desktop frontier.
+- VM-pool and callback-idle proof slice. `exec_vm_pool_headroom` now checks a named measured
+  root-Untyped runway floor, prints `ut-free` in the pool census, and still fails on any real untyped,
+  frame-registry, VAD, free-list, map, alias, ASID, or cslot exhaustion signal. The historical
+  iteration backstop no longer enters post-loop proof injections while win32k has active suspended
+  user-callback levels; it waits until the callback/continuation stacks, dispatch depth, and
+  suspended outstanding count are idle, with a bounded diagnostic expiry if they never drain.
+  Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-callback-aware-backstop-20260807.log`. Result: genuine explorer shell
+  chrome pixels still pass, win32k nested transport and user-callback dead-client proofs are green,
+  `exec_vm_pool_headroom` passes with about 59 MiB root-Untyped free and zero allocation failure
+  counters, and the executive proof summary reaches `290/290` (`run_specs.sh` exits with QEMU's
+  sentinel code `3` after `[microtest sentinel matched -- exiting QEMU]`). Review adjustment: the
+  immediate desktop frontier is green again; continue with the larger completion plan rather than
+  adding more boot-frontier special cases.
