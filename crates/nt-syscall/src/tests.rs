@@ -768,6 +768,20 @@ fn terminate_thread_uses_two_argument_native_abi() {
 }
 
 #[test]
+fn queue_apc_thread_registers_with_native_abi() {
+    assert_eq!(NativeService::NtQueueApcThread.name(), "NtQueueApcThread");
+    assert_eq!(NativeService::NtQueueApcThread.arg_count(), (5, 5));
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtQueueApcThread, 188)],
+    );
+    let entry = table.lookup(188).unwrap();
+    assert_eq!(entry.service, NativeService::NtQueueApcThread);
+    assert_eq!(table.number_of(NativeService::NtQueueApcThread), Some(188));
+    assert_eq!((entry.min_args, entry.max_args), (5, 5));
+}
+
+#[test]
 fn user_probe_copyin_ranges() {
     let mut p = UserProbe::new();
     p.add_range(0x1_0000, 0x1000, false); // read-only

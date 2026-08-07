@@ -1048,6 +1048,8 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
 pub const SSN_NT_TEST_ALERT: u64 = 268;
+/// ntdll's NtQueueApcThread SSN (RTL work items queue user APCs to alertable worker threads).
+pub const SSN_NT_QUEUE_APC_THREAD: u64 = 188;
 /// NtInitializeRegistry — smss tells the Config Manager it's safe to enable registry writes
 /// (sminit.c:2429, CM_BOOT_FLAG_SMSS). We don't model CM write-enable → no-op success.
 pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
@@ -14006,6 +14008,10 @@ struct ExecNtHandler {
     pi: usize,
     current_tid: u64,
     current_badge: u64,
+    current_resume_ip: u64,
+    current_sp: u64,
+    current_flags: u64,
+    user_apc_redirected: bool,
     post_action: ExecPostAction,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
@@ -15211,6 +15217,10 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_SET_INFO_PROCESS as u32,
             ),
             (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
+            (
+                NativeService::NtQueueApcThread,
+                SSN_NT_QUEUE_APC_THREAD as u32,
+            ),
             (
                 NativeService::NtFlushInstructionCache,
                 SSN_NT_FLUSH_INSTRUCTION_CACHE as u32,
@@ -21515,6 +21525,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let apc_dispatcher_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "KiUserApcDispatcher")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
                     let ldr_initialize_thunk_rva = ntdll_pe
                         .exports()
                         .ok()
@@ -21550,6 +21569,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .store(ldr_initialize_thunk_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA
                         .store(callback_dispatcher_rva, Ordering::Relaxed);
+                    img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA
+                        .store(apc_dispatcher_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_COMPLETION_WORKER_RVA
                         .store(tp_completion_worker_rva, Ordering::Relaxed);

@@ -6450,6 +6450,7 @@ pub(crate) unsafe fn service_sec_image(
             // onto the caller's bound `REPLY_MAIN`. Every reply takes the bound object now, so there
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
+            let mut redirected_user_apc = false;
             // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
             // by withholding a reply. Self-termination does not use this flag: its explicit post
             // action deletes the bound Reply cap and caller TCB before receiving again.
@@ -6494,6 +6495,9 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.pi = pi;
             nt_handler.current_badge = badge;
             nt_handler.current_tid = current_tid;
+            nt_handler.current_resume_ip = resume_ip;
+            nt_handler.current_sp = sp;
+            nt_handler.current_flags = flags;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -6535,6 +6539,7 @@ pub(crate) unsafe fn service_sec_image(
                 // + out-write queue so a migrated handler can raise them (group A/B signals).
                 nt_handler.post_action = ExecPostAction::None;
                 nt_handler.stop = false;
+                nt_handler.user_apc_redirected = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
                 nt_handler.token_dirty = false;
@@ -6637,6 +6642,9 @@ pub(crate) unsafe fn service_sec_image(
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                     result = res.status as u64;
+                    if nt_handler.user_apc_redirected {
+                        redirected_user_apc = true;
+                    }
                     if nt_handler.stop {
                         handled = false; // handler couldn't service → stop with the SSN recorded
                     }
@@ -7477,6 +7485,7 @@ pub(crate) unsafe fn service_sec_image(
                 let count = get_recv_mr(9) as usize; // R10 = ObjectCount
                 let harr = m3; // RDX = HandleArray
                 let wait_type = get_recv_mr(7); // R8 = WaitType (1=Any, 0=All)
+                let alertable = get_recv_mr(8) as u8 != 0; // R9 = Alertable BOOLEAN
                 let wait_all = wait_type == 0;
                 let mut nev = 0usize;
                 let mut any_signalled_idx: i64 = -1; // handle-array index (k) of the first signalled
@@ -7597,6 +7606,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(if wait_all { b" all" } else { b" any" });
                     print_str(b" waitable=");
                     print_u64(nev as u64);
+                    print_str(b" alertable=");
+                    print_u64(alertable as u64);
                     print_str(if zero_timeout {
                         b" timeout=zero\n"
                     } else if timeout_ptr == 0 {
@@ -7605,7 +7616,23 @@ pub(crate) unsafe fn service_sec_image(
                         b" timeout=finite\n"
                     });
                 }
-                if let Some(status) = wait_error {
+                let mut delivered_user_apc = false;
+                let mut user_apc_error = None;
+                if wait_error.is_none() && alertable {
+                    match unsafe { nt_handler.try_deliver_current_user_apc() } {
+                        Ok(true) => {
+                            delivered_user_apc = true;
+                            redirected_user_apc = true;
+                        }
+                        Ok(false) => {}
+                        Err(status) => user_apc_error = Some(status),
+                    }
+                }
+                if delivered_user_apc {
+                    result = 0x0000_00C0;
+                } else if let Some(status) = user_apc_error {
+                    result = status as u64;
+                } else if let Some(status) = wait_error {
                     result = status as u64;
                 } else if wait_all {
                     if has_wait_object && all_signalled {
@@ -12467,9 +12494,12 @@ pub(crate) unsafe fn service_sec_image(
                 recv_full_r12(fault_ep, reply_main)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
-                // fault reply the redirect staged, not with a syscall result.
-                let len = if redirected_user_callback { 0 } else { 18 };
-                let (r0, r1, r3) = if redirected_user_callback {
+                // fault reply the redirect staged, not with a syscall result. User APC delivery uses
+                // the same shape because the APC dispatcher frame already carries the eventual
+                // STATUS_USER_APC return in the restored context.
+                let redirected_user_control = redirected_user_callback || redirected_user_apc;
+                let len = if redirected_user_control { 0 } else { 18 };
+                let (r0, r1, r3) = if redirected_user_control {
                     (0, 0, 0)
                 } else {
                     (result, m1, m3)

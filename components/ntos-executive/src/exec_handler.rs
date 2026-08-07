@@ -8,6 +8,7 @@ use crate::*;
 use nt_io_abi::major;
 
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
@@ -793,6 +794,10 @@ impl ExecNtHandler {
         write_field!(pi, 0);
         write_field!(current_tid, 0);
         write_field!(current_badge, 0);
+        write_field!(current_resume_ip, 0);
+        write_field!(current_sp, 0);
+        write_field!(current_flags, 0);
+        write_field!(user_apc_redirected, false);
         write_field!(post_action, ExecPostAction::None);
         write_field!(stop, false);
         write_field!(next_handle, FAKE_HANDLE);
@@ -2686,6 +2691,88 @@ impl ExecNtHandler {
 
     pub(crate) fn hosted_thread_tcb(&self, tid: u64) -> Option<u64> {
         self.thread_runtime.tcb_by_tid(tid)
+    }
+
+    pub(crate) unsafe fn try_deliver_current_user_apc(&mut self) -> Result<bool, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+        const STATUS_USER_APC: u32 = 0x0000_00C0;
+
+        let current_tid = match u32::try_from(self.current_tid) {
+            Ok(tid) => tid,
+            Err(_) => return Err(nt_process::STATUS_INVALID_HANDLE),
+        };
+        let Some(apc) = self.pm.peek_user_apc(current_tid) else {
+            return Ok(false);
+        };
+        let dispatcher_rva = crate::img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA.load(Ordering::Relaxed);
+        if dispatcher_rva == 0 {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        let Some(dispatcher) = NTDLL_BASE.checked_add(dispatcher_rva) else {
+            return Err(STATUS_UNSUCCESSFUL);
+        };
+        let Some(tcb) = self.hosted_thread_tcb(self.current_tid).filter(|tcb| *tcb > 1) else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        let Some(frame_base) = self
+            .current_sp
+            .checked_sub(nt_thread_start::AMD64_CONTEXT_SIZE as u64)
+        else {
+            return Err(STATUS_ACCESS_VIOLATION);
+        };
+        let frame_va = frame_base & !0xf;
+
+        let mut saved = [0u64; 20];
+        crate::win32k_glue::tcb_read_regs20(tcb, &mut saved);
+        let mut frame = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+        if !nt_thread_start::initialize_amd64_user_apc_context(
+            &mut frame,
+            &saved,
+            self.current_resume_ip,
+            self.current_sp,
+            self.current_flags,
+            STATUS_USER_APC as u64,
+            apc.routine,
+            apc.normal_context,
+            apc.system_argument1,
+            apc.system_argument2,
+        ) {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        if !self.xas_try_write_buf(frame_va, &frame) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+
+        saved[nt_user_callback::USER_CONTEXT_RIP] = dispatcher;
+        saved[nt_user_callback::USER_CONTEXT_RSP] = frame_va;
+        saved[nt_user_callback::USER_CONTEXT_RAX] = 0;
+        saved[nt_user_callback::USER_CONTEXT_RCX] = dispatcher;
+        saved[nt_user_callback::USER_CONTEXT_R10] = 0;
+        saved[nt_user_callback::USER_CONTEXT_R11] =
+            saved[nt_user_callback::USER_CONTEXT_RFLAGS];
+        let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &saved, false);
+        if write_error != 0 {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        let _ = self.pm.take_user_apc(current_tid);
+        self.user_apc_redirected = true;
+
+        let trace = USER_APC_DELIVERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 16 {
+            print_str(b"[apc] deliver pi=");
+            print_u64(self.pi as u64);
+            print_str(b" tid=");
+            print_u64(self.current_tid);
+            print_str(b" dispatcher=0x");
+            print_hex_u64(dispatcher);
+            print_str(b" frame=0x");
+            print_hex_u64(frame_va);
+            print_str(b" routine=0x");
+            print_hex_u64(apc.routine);
+            print_str(b"\n");
+        }
+        Ok(true)
     }
 
     pub(crate) fn hosted_thread_role(&self, tid: u64) -> Option<HostedThreadRole> {
@@ -10966,6 +11053,38 @@ impl ExecNtHandler {
             NativeService::NtOpenThread => unsafe {
                 self.nt_open_thread(args[0], args[1] as u32, args[2], args[3])
             },
+            NativeService::NtQueueApcThread => {
+                let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                let Ok(current_tid) = nt_process::ThreadId::try_from(self.current_tid) else {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                };
+                let apc = nt_process::UserApc {
+                    routine: args[1],
+                    normal_context: args[2],
+                    system_argument1: args[3],
+                    system_argument2: args[4],
+                };
+                match self
+                    .pm
+                    .queue_user_apc(caller_pid, current_tid, args[0], apc)
+                {
+                    Ok(target_tid) => {
+                        print_str(b"[apc] NtQueueApcThread pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" caller_tid=");
+                        print_u64(self.current_tid);
+                        print_str(b" target_tid=");
+                        print_u64(target_tid as u64);
+                        print_str(b" routine=0x");
+                        print_hex_u64(apc.routine);
+                        print_str(b"\n");
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
             NativeService::NtQueryInformationThread => unsafe {
                 self.nt_query_information_thread(
                     args[0],
@@ -14933,8 +15052,12 @@ impl ExecNtHandler {
                 self.dbgk_module_unload(target_pi, base);
                 0
             }
-            NativeService::NtTestAlert
-            | NativeService::NtInitializeRegistry
+            NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc() } {
+                Ok(true) => 0x0000_00C0,
+                Ok(false) => 0,
+                Err(status) => status,
+            },
+            NativeService::NtInitializeRegistry
             | NativeService::NtSetSecurityObject
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
             // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
@@ -15193,8 +15316,16 @@ impl ExecNtHandler {
             // handles must resolve through `wait_object_for_handle`.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
+                let alertable = args[1] as u8 != 0;
                 match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
+                        if alertable {
+                            match unsafe { self.try_deliver_current_user_apc() } {
+                                Ok(true) => return 0x0000_00C0,
+                                Ok(false) => {}
+                                Err(status) => return status,
+                            }
+                        }
                         if self.wait_object_ready(object) {
                             print_str(b"[wait] pi=");
                             print_u64(self.pi as u64);
@@ -15590,6 +15721,13 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 let interval = i64::from_le_bytes(bytes);
+                if alertable {
+                    match unsafe { self.try_deliver_current_user_apc() } {
+                        Ok(true) => return 0x0000_00C0,
+                        Ok(false) => {}
+                        Err(status) => return status,
+                    }
+                }
                 self.delay_requested = true;
                 self.delay_interval_100ns = interval;
                 self.delay_alertable = alertable;
@@ -15616,8 +15754,6 @@ impl ExecNtHandler {
                     }
                     print_str(b"\n");
                 }
-                // This executive has no queued user APC object yet. Alertable delays therefore wait
-                // normally; STATUS_USER_APC is returned only when a real APC queue can prove one.
                 0
             }
             // NtQueryPerformanceCounter(*Counter[R10]=args[0], *Frequency[RDX]=args[1] optional).

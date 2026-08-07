@@ -2,10 +2,28 @@
 
 pub const CONTEXT_RCX_OFFSET: u64 = 0x80;
 pub const CONTEXT_RDX_OFFSET: u64 = 0x88;
+pub const CONTEXT_RAX_OFFSET: u64 = 0x78;
+pub const CONTEXT_RBX_OFFSET: u64 = 0x90;
 pub const CONTEXT_RSP_OFFSET: u64 = 0x98;
+pub const CONTEXT_RBP_OFFSET: u64 = 0xa0;
+pub const CONTEXT_RSI_OFFSET: u64 = 0xa8;
+pub const CONTEXT_RDI_OFFSET: u64 = 0xb0;
+pub const CONTEXT_R8_OFFSET: u64 = 0xb8;
+pub const CONTEXT_R9_OFFSET: u64 = 0xc0;
+pub const CONTEXT_R10_OFFSET: u64 = 0xc8;
+pub const CONTEXT_R11_OFFSET: u64 = 0xd0;
+pub const CONTEXT_R12_OFFSET: u64 = 0xd8;
+pub const CONTEXT_R13_OFFSET: u64 = 0xe0;
+pub const CONTEXT_R14_OFFSET: u64 = 0xe8;
+pub const CONTEXT_R15_OFFSET: u64 = 0xf0;
 pub const CONTEXT_RIP_OFFSET: u64 = 0xf8;
 pub const AMD64_CONTEXT_SIZE: usize = 0x4d0;
 pub const USER_PAGE_SIZE: u64 = 0x1000;
+
+pub const CONTEXT_P1_HOME_OFFSET: u64 = 0x00;
+pub const CONTEXT_P2_HOME_OFFSET: u64 = 0x08;
+pub const CONTEXT_P3_HOME_OFFSET: u64 = 0x10;
+pub const CONTEXT_P4_HOME_OFFSET: u64 = 0x18;
 
 const CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const CONTEXT_MXCSR_OFFSET: usize = 0x34;
@@ -137,6 +155,70 @@ pub fn initialize_amd64_user_context(
     true
 }
 
+/// Build the AMD64 `CONTEXT` frame used by `KiUserApcDispatcher`.
+///
+/// `saved_registers` uses the seL4 x86-64 `UserContext` order used by the executive:
+/// `[rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15, fs_base, gs_base]`.
+/// The APC home slots are filled as ReactOS/Windows expect, while the resumable context is shaped
+/// like a native syscall return: `Rip/Rsp` resume after the syscall, `Rax` carries the wait status,
+/// and `Rcx/R11` hold the sysret aliases.
+#[allow(clippy::too_many_arguments)]
+pub fn initialize_amd64_user_apc_context(
+    context: &mut [u8],
+    saved_registers: &[u64; 20],
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+    return_status: u64,
+    normal_routine: u64,
+    normal_context: u64,
+    system_argument1: u64,
+    system_argument2: u64,
+) -> bool {
+    if context.len() < AMD64_CONTEXT_SIZE {
+        return false;
+    }
+    context[..AMD64_CONTEXT_SIZE].fill(0);
+
+    put_u64(context, CONTEXT_P1_HOME_OFFSET as usize, normal_context);
+    put_u64(context, CONTEXT_P2_HOME_OFFSET as usize, system_argument1);
+    put_u64(context, CONTEXT_P3_HOME_OFFSET as usize, system_argument2);
+    put_u64(context, CONTEXT_P4_HOME_OFFSET as usize, normal_routine);
+
+    put_u32(
+        context,
+        CONTEXT_FLAGS_OFFSET,
+        CONTEXT_AMD64_FULL_WITH_SEGMENTS,
+    );
+    put_u32(context, CONTEXT_MXCSR_OFFSET, INITIAL_MXCSR);
+    put_u16(context, CONTEXT_SEG_CS_OFFSET, USER_CODE_SELECTOR);
+    put_u16(context, CONTEXT_SEG_DS_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_ES_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_FS_OFFSET, USER_CMTEB_SELECTOR);
+    put_u16(context, CONTEXT_SEG_GS_OFFSET, USER_DATA_SELECTOR);
+    put_u16(context, CONTEXT_SEG_SS_OFFSET, USER_DATA_SELECTOR);
+    put_u32(context, CONTEXT_EFLAGS_OFFSET, resume_flags as u32);
+
+    put_u64(context, CONTEXT_RAX_OFFSET as usize, return_status);
+    put_u64(context, CONTEXT_RCX_OFFSET as usize, resume_ip);
+    put_u64(context, CONTEXT_RDX_OFFSET as usize, saved_registers[6]);
+    put_u64(context, CONTEXT_RBX_OFFSET as usize, saved_registers[4]);
+    put_u64(context, CONTEXT_RSP_OFFSET as usize, resume_sp);
+    put_u64(context, CONTEXT_RBP_OFFSET as usize, saved_registers[9]);
+    put_u64(context, CONTEXT_RSI_OFFSET as usize, saved_registers[7]);
+    put_u64(context, CONTEXT_RDI_OFFSET as usize, saved_registers[8]);
+    put_u64(context, CONTEXT_R8_OFFSET as usize, saved_registers[10]);
+    put_u64(context, CONTEXT_R9_OFFSET as usize, saved_registers[11]);
+    put_u64(context, CONTEXT_R10_OFFSET as usize, saved_registers[12]);
+    put_u64(context, CONTEXT_R11_OFFSET as usize, resume_flags);
+    put_u64(context, CONTEXT_R12_OFFSET as usize, saved_registers[14]);
+    put_u64(context, CONTEXT_R13_OFFSET as usize, saved_registers[15]);
+    put_u64(context, CONTEXT_R14_OFFSET as usize, saved_registers[16]);
+    put_u64(context, CONTEXT_R15_OFFSET as usize, saved_registers[17]);
+    put_u64(context, CONTEXT_RIP_OFFSET as usize, resume_ip);
+    true
+}
+
 fn put_u16(buffer: &mut [u8], offset: usize, value: u16) {
     buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -262,9 +344,71 @@ mod tests {
     }
 
     #[test]
+    fn initializes_amd64_user_apc_dispatch_context_contract() {
+        let mut saved = [0u64; 20];
+        for (index, slot) in saved.iter_mut().enumerate() {
+            *slot = 0x1000 + index as u64;
+        }
+        let mut bytes = [0xa5; AMD64_CONTEXT_SIZE];
+        assert!(initialize_amd64_user_apc_context(
+            &mut bytes,
+            &saved,
+            0x7fff_1234,
+            0x7000_ff00,
+            0x246,
+            0xc0,
+            0x1111_2222,
+            0x3333_4444,
+            0x5555_6666,
+            0x7777_8888,
+        ));
+        let read_u64 = |offset: u64| {
+            let offset = offset as usize;
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        };
+        assert_eq!(read_u64(CONTEXT_P1_HOME_OFFSET), 0x3333_4444);
+        assert_eq!(read_u64(CONTEXT_P2_HOME_OFFSET), 0x5555_6666);
+        assert_eq!(read_u64(CONTEXT_P3_HOME_OFFSET), 0x7777_8888);
+        assert_eq!(read_u64(CONTEXT_P4_HOME_OFFSET), 0x1111_2222);
+        assert_eq!(read_u64(CONTEXT_RAX_OFFSET), 0xc0);
+        assert_eq!(read_u64(CONTEXT_RCX_OFFSET), 0x7fff_1234);
+        assert_eq!(read_u64(CONTEXT_RDX_OFFSET), saved[6]);
+        assert_eq!(read_u64(CONTEXT_RBX_OFFSET), saved[4]);
+        assert_eq!(read_u64(CONTEXT_RSP_OFFSET), 0x7000_ff00);
+        assert_eq!(read_u64(CONTEXT_RBP_OFFSET), saved[9]);
+        assert_eq!(read_u64(CONTEXT_RSI_OFFSET), saved[7]);
+        assert_eq!(read_u64(CONTEXT_RDI_OFFSET), saved[8]);
+        assert_eq!(read_u64(CONTEXT_R8_OFFSET), saved[10]);
+        assert_eq!(read_u64(CONTEXT_R9_OFFSET), saved[11]);
+        assert_eq!(read_u64(CONTEXT_R10_OFFSET), saved[12]);
+        assert_eq!(read_u64(CONTEXT_R11_OFFSET), 0x246);
+        assert_eq!(read_u64(CONTEXT_R12_OFFSET), saved[14]);
+        assert_eq!(read_u64(CONTEXT_R13_OFFSET), saved[15]);
+        assert_eq!(read_u64(CONTEXT_R14_OFFSET), saved[16]);
+        assert_eq!(read_u64(CONTEXT_R15_OFFSET), saved[17]);
+        assert_eq!(read_u64(CONTEXT_RIP_OFFSET), 0x7fff_1234);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()),
+            0x246
+        );
+    }
+
+    #[test]
     fn context_initializer_rejects_short_storage() {
         let mut bytes = [0u8; AMD64_CONTEXT_SIZE - 1];
         assert!(!initialize_amd64_user_context(&mut bytes, 1, 2, 3));
+        assert!(!initialize_amd64_user_apc_context(
+            &mut bytes,
+            &[0u64; 20],
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+        ));
     }
 
     #[test]

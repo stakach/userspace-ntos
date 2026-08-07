@@ -1499,7 +1499,7 @@ pub(crate) unsafe fn service_user_callback(
     }
 }
 
-unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: bool) -> u64 {
+pub(crate) unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: bool) -> u64 {
     for (index, register) in registers.iter().enumerate().skip(2) {
         set_reply_mr(index + 2, *register);
     }

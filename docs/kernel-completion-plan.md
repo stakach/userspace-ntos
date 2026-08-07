@@ -125,10 +125,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    sched-context ownership now keeps explorer/RPC worker churn from leaking seL4 SC objects: SC
    attach is checked, hosted thread mechanisms own the SC cap, and thread teardown recycles the SC
    plus TCB root slot. The old `retype: sc pool exhausted`, `failed to create thread, error=5aa`,
-   and local worker `0xff` frontier is gone in the latest boot. The remaining gates are debug
-   syscall dispatch proofs, stale user-callback dead-client/nested proof bits after real explorer
-   activity, VM pool-headroom accounting, and the next functional frontier around a generic worker
-   parked on unserviced syscall `SSN=188` with later win32k `ClientThreadSetup` failures.
+   and local worker `0xff` frontier is gone in the latest boot. `SSN=188` is now routed as
+   `NtQueueApcThread`: process-manager ETHREADs carry bounded user APC queues, alertable
+   `NtDelayExecution`, `NtWaitForSingleObject`, `NtWaitForMultipleObjects`, and `NtTestAlert` can
+   redirect the current hosted thread into ntdll's real `KiUserApcDispatcher`, and the ordinary
+   syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The remaining gates
+   are debug syscall dispatch proofs, stale user-callback dead-client/nested proof bits after real
+   explorer activity, VM pool-headroom accounting, and boot-validating the new APC route against the
+   later win32k `ClientThreadSetup` failures.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -1209,3 +1213,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   user-callback nested/dead-client proof bits, win32k nested transport accounting, and VM
   pool-headroom accounting. Review adjustment: next work should debug unserviced worker syscall
   `SSN=188` and the later win32k `ClientThreadSetup` failures without adding fallback success paths.
+- User APC syscall slice. `NtQueueApcThread` is registered at ReactOS/Win7 SSN 188 and backed by a
+  real bounded `NtThread` user APC queue with `THREAD_SET_CONTEXT` handle checks, system-thread
+  rejection, FIFO delivery, capacity failure, and lifecycle clearing on termination/reuse.
+  `nt-thread-start` now owns the host-tested AMD64 APC `CONTEXT` frame layout expected by
+  `KiUserApcDispatcher`; the executive resolves that ntdll export dynamically, writes APC frames to
+  the current thread's user stack, rewrites the hosted TCB registers, and uses a length-0 fault reply
+  so the restored context, not the syscall reply, returns `STATUS_USER_APC`. Alertable
+  `NtDelayExecution`, `NtWaitForSingleObject`, the legacy `NtWaitForMultipleObjects` ladder, and
+  `NtTestAlert` all share the same delivery primitive. Validation so far: `cargo fmt --all`,
+  `cargo test -p nt-process`, `cargo test -p nt-thread-start`, `cargo test -p nt-syscall`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: run the full rootserver/kernel build and boot proof next; if `ClientThreadSetup`
+  still fails, inspect whether the APC normal routine ran and whether follow-on waits should wake
+  queued APC targets rather than only delivering when they re-enter the kernel.

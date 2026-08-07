@@ -125,6 +125,150 @@ fn handle_table_operations() {
 }
 
 #[test]
+fn queue_user_apc_requires_thread_set_context_access() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let current = pm.create_thread(caller, 0x1000, 0, false).unwrap();
+    let target = pm.create_thread(caller, 0x2000, 0, false).unwrap();
+    let read_only = pm
+        .insert_handle(caller, HandleObject::Thread(target), THREAD_GENERIC_READ)
+        .unwrap();
+    let writable = pm
+        .insert_handle(caller, HandleObject::Thread(target), THREAD_SET_CONTEXT)
+        .unwrap();
+    let apc = UserApc {
+        routine: 0x1111,
+        normal_context: 0x2222,
+        system_argument1: 0x3333,
+        system_argument2: 0x4444,
+    };
+
+    assert_eq!(
+        pm.queue_user_apc(caller, current, read_only as u64, apc),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        pm.queue_user_apc(caller, current, writable as u64, apc),
+        Ok(target)
+    );
+    assert!(pm.has_user_apc(target));
+    assert_eq!(pm.peek_user_apc(target), Some(apc));
+    assert_eq!(pm.take_user_apc(target), Some(apc));
+    assert_eq!(pm.take_user_apc(target), None);
+}
+
+#[test]
+fn queue_user_apc_supports_current_thread_pseudo_handle() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("self.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let apc = UserApc {
+        routine: 0x10,
+        normal_context: 0x20,
+        system_argument1: 0x30,
+        system_argument2: 0x40,
+    };
+
+    assert_eq!(pm.queue_user_apc(pid, tid, u64::MAX - 1, apc), Ok(tid));
+    assert_eq!(pm.take_user_apc(tid), Some(apc));
+}
+
+#[test]
+fn user_apc_queue_is_fifo_and_bounded() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("fifo.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    for index in 0..THREAD_USER_APC_QUEUE_CAP {
+        assert_eq!(
+            pm.queue_user_apc(
+                pid,
+                tid,
+                u64::MAX - 1,
+                UserApc {
+                    routine: index as u64,
+                    normal_context: index as u64 + 0x100,
+                    system_argument1: index as u64 + 0x200,
+                    system_argument2: index as u64 + 0x300,
+                },
+            ),
+            Ok(tid)
+        );
+    }
+    assert_eq!(
+        pm.queue_user_apc(
+            pid,
+            tid,
+            u64::MAX - 1,
+            UserApc {
+                routine: 0xffff,
+                normal_context: 0,
+                system_argument1: 0,
+                system_argument2: 0,
+            },
+        ),
+        Err(STATUS_NO_MEMORY)
+    );
+    for index in 0..THREAD_USER_APC_QUEUE_CAP {
+        assert_eq!(
+            pm.take_user_apc(tid),
+            Some(UserApc {
+                routine: index as u64,
+                normal_context: index as u64 + 0x100,
+                system_argument1: index as u64 + 0x200,
+                system_argument2: index as u64 + 0x300,
+            })
+        );
+    }
+    assert_eq!(pm.take_user_apc(tid), None);
+}
+
+#[test]
+fn user_apc_queue_rejects_system_and_terminated_threads() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("lifecycle.exe", None, None);
+    let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+    let system = pm.create_thread(pid, 0x3000, 0, true).unwrap();
+    let worker_handle = pm
+        .insert_handle(pid, HandleObject::Thread(worker), THREAD_SET_CONTEXT)
+        .unwrap();
+    let system_handle = pm
+        .insert_handle(pid, HandleObject::Thread(system), THREAD_SET_CONTEXT)
+        .unwrap();
+    let apc = UserApc {
+        routine: 1,
+        normal_context: 2,
+        system_argument1: 3,
+        system_argument2: 4,
+    };
+
+    assert_eq!(
+        pm.queue_user_apc(pid, main, system_handle as u64, apc),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.queue_user_apc(pid, main, worker_handle as u64, apc),
+        Ok(worker)
+    );
+    assert!(pm.has_user_apc(worker));
+    pm.terminate_thread(worker, 0).unwrap();
+    assert!(!pm.has_user_apc(worker));
+    assert_eq!(
+        pm.queue_user_apc(pid, main, worker_handle as u64, apc),
+        Err(STATUS_UNSUCCESSFUL)
+    );
+    pm.close_handle(pid, worker_handle).unwrap();
+    assert_eq!(pm.queue_user_apc(pid, main, u64::MAX - 1, apc), Ok(main));
+    pm.clear_user_apcs(main);
+    assert_eq!(
+        pm.queue_user_apc(pid, main, worker_handle as u64, apc),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    pm.reuse_reclaimed_thread(worker, 0x4000, false).unwrap();
+    assert_eq!(pm.take_user_apc(worker), None);
+}
+
+#[test]
 fn open_process_by_client_id_mints_local_access_checked_handles() {
     const PROCESS_CREATE_THREAD: u32 = 0x0002;
     const PROCESS_QUERY_INFORMATION: u32 = 0x0400;

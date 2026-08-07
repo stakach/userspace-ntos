@@ -32,6 +32,7 @@ pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
@@ -49,6 +50,7 @@ pub const THREAD_GENERIC_READ: u32 = 0x0002_0048;
 pub const THREAD_GENERIC_WRITE: u32 = 0x0002_0037;
 pub const THREAD_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const THREAD_SET_CONTEXT: u32 = 0x0010;
 pub const PROCESS_PRIORITY_CLASS_INVALID: u8 = 0;
 pub const PROCESS_PRIORITY_CLASS_IDLE: u8 = 1;
 pub const PROCESS_PRIORITY_CLASS_NORMAL: u8 = 2;
@@ -114,6 +116,16 @@ pub type ThreadId = u32;
 pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
+
+pub const THREAD_USER_APC_QUEUE_CAP: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserApc {
+    pub routine: u64,
+    pub normal_context: u64,
+    pub system_argument1: u64,
+    pub system_argument2: u64,
+}
 
 struct IdTable<T> {
     entries: Vec<(u32, T)>,
@@ -586,6 +598,9 @@ pub struct NtThread {
     hide_from_debugger: bool,
     thread_name_len: u16,
     thread_name: Vec<u16>,
+    user_apc_queue: [UserApc; THREAD_USER_APC_QUEUE_CAP],
+    user_apc_head: u8,
+    user_apc_len: u8,
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -1024,6 +1039,9 @@ impl ProcessManager {
                 hide_from_debugger: false,
                 thread_name_len: 0,
                 thread_name: alloc::vec![0; THREAD_NAME_MAX_UNITS],
+                user_apc_queue: [UserApc::default(); THREAD_USER_APC_QUEUE_CAP],
+                user_apc_head: 0,
+                user_apc_len: 0,
             },
         );
         // Dbgk event source: a thread create in a debugged process reports DbgKmCreateThreadApi —
@@ -1360,6 +1378,71 @@ impl ProcessManager {
         Ok(length)
     }
 
+    pub fn queue_user_apc(
+        &mut self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        thread_handle: u64,
+        apc: UserApc,
+    ) -> Result<ThreadId, u32> {
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, thread_handle, THREAD_SET_CONTEXT)?;
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.is_system_thread {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if thread.state == ThreadState::Terminated {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        if thread.user_apc_len as usize >= THREAD_USER_APC_QUEUE_CAP {
+            return Err(STATUS_NO_MEMORY);
+        }
+        let tail = (thread.user_apc_head as usize + thread.user_apc_len as usize)
+            % THREAD_USER_APC_QUEUE_CAP;
+        thread.user_apc_queue[tail] = apc;
+        thread.user_apc_len += 1;
+        Ok(tid)
+    }
+
+    pub fn has_user_apc(&self, tid: ThreadId) -> bool {
+        self.threads
+            .get(&tid)
+            .is_some_and(|thread| thread.user_apc_len != 0)
+    }
+
+    pub fn peek_user_apc(&self, tid: ThreadId) -> Option<UserApc> {
+        let thread = self.threads.get(&tid)?;
+        (thread.user_apc_len != 0).then_some(thread.user_apc_queue[thread.user_apc_head as usize])
+    }
+
+    pub fn take_user_apc(&mut self, tid: ThreadId) -> Option<UserApc> {
+        let thread = self.threads.get_mut(&tid)?;
+        if thread.user_apc_len == 0 {
+            return None;
+        }
+        let index = thread.user_apc_head as usize;
+        let apc = thread.user_apc_queue[index];
+        thread.user_apc_queue[index] = UserApc::default();
+        thread.user_apc_len -= 1;
+        if thread.user_apc_len == 0 {
+            thread.user_apc_head = 0;
+        } else {
+            thread.user_apc_head =
+                ((thread.user_apc_head as usize + 1) % THREAD_USER_APC_QUEUE_CAP) as u8;
+        }
+        Some(apc)
+    }
+
+    pub fn clear_user_apcs(&mut self, tid: ThreadId) -> bool {
+        let Some(thread) = self.threads.get_mut(&tid) else {
+            return false;
+        };
+        thread.user_apc_queue.fill(UserApc::default());
+        thread.user_apc_head = 0;
+        thread.user_apc_len = 0;
+        true
+    }
+
     /// Resolve a caller-local thread handle for an operation requiring `required_access`.
     /// `NtCurrentThread` resolves to the supplied scheduling identity rather than assuming the
     /// process main thread, which is essential once multiple user threads share one process.
@@ -1643,6 +1726,9 @@ impl ProcessManager {
         thread.hide_from_debugger = false;
         thread.thread_name_len = 0;
         thread.thread_name.fill(0);
+        thread.user_apc_queue.fill(UserApc::default());
+        thread.user_apc_head = 0;
+        thread.user_apc_len = 0;
         Ok(())
     }
 
@@ -1703,6 +1789,11 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         t.state = state;
+        if state == ThreadState::Terminated {
+            t.user_apc_queue.fill(UserApc::default());
+            t.user_apc_head = 0;
+            t.user_apc_len = 0;
+        }
         Ok(())
     }
 
@@ -1761,6 +1852,9 @@ impl ProcessManager {
             if transitioned {
                 t.state = ThreadState::Terminated;
                 t.exit_status = Some(exit_status);
+                t.user_apc_queue.fill(UserApc::default());
+                t.user_apc_head = 0;
+                t.user_apc_len = 0;
                 if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                     t.exit_time_100ns = exit_time_100ns;
                 }
@@ -1813,6 +1907,9 @@ impl ProcessManager {
         if transitioned {
             t.state = ThreadState::Terminated;
             t.exit_status = Some(exit_status);
+            t.user_apc_queue.fill(UserApc::default());
+            t.user_apc_head = 0;
+            t.user_apc_len = 0;
             if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                 t.exit_time_100ns = exit_time_100ns;
             }
@@ -1854,6 +1951,9 @@ impl ProcessManager {
                 if t.state != ThreadState::Terminated {
                     t.state = ThreadState::Terminated;
                     t.exit_status = Some(exit_status);
+                    t.user_apc_queue.fill(UserApc::default());
+                    t.user_apc_head = 0;
+                    t.user_apc_len = 0;
                     if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
                         t.exit_time_100ns = exit_time_100ns;
                     }
