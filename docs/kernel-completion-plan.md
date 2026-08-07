@@ -110,8 +110,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    boot-framebuffer bridge.
 2. Continue A3 for Win32 service starts: SCM-owned service metadata now produces typed
    `Win32ServiceLaunchSpec` records with image path, own/shared process kind, interactive flag,
-   account, display name, and dependencies. The next step is making the actual SCM start path consume
-   those specs and call generic process creation, while driver starts continue through `NtLoadDriver`.
+   account, display name, and dependencies. Service start classification now also produces
+   `ServiceStartSpec::{Win32, Driver}` from one service key so SCM can route Win32 starts to generic
+   process creation and driver starts to `NtLoadDriver` without kernel-side service-name policy. The
+   next step is making the actual services.exe start path consume those specs for process creation.
 3. Continue A3/A4 cleanup for Win32 service starts and remove any remaining executable/service-name
    policy from executive start paths once SCM consumes the launch specs.
 4. Continue A3/A4 by replacing any hosted executable catalog decisions that still encode service or
@@ -970,3 +972,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   checks passing. Review adjustment: next A3 work is the concrete SCM service-start route:
   services.exe should use these launch specs to choose `CreateProcessW`/`CreateProcessAsUserW`, while
   the kernel exposes only generic process, section, token, and thread mechanisms.
+- A3 continued. `nt-config-manager` now exposes a unified `ServiceStartSpec` that routes a service
+  key to either a Win32 process launch spec or a driver load spec based solely on registry `Type`
+  metadata. The driver spec carries service name, service key, image path, resolved NT driver-object
+  path, driver class, start type, error control, group, class GUID, and tag. Mixed driver+Win32 type
+  bits, disabled services, and missing image paths are rejected instead of treated as fallbacks. The
+  executive demand-driver selection proof and `NtLoadDriver` lookup now consume
+  `ServiceStartSpec::Driver`; the old local metadata-to-driver launch helper was removed. Validation:
+  `cargo fmt --all`, `cargo test -p nt-config-manager`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` with proof in
+  `.tmp/boot-service-start-spec-20260807.log`. Gates passed:
+  `exec_scm_autostart_win32_launch_spec_from_registry`,
+  `exec_scm_demandstart_win32_launch_spec_from_registry`,
+  `exec_ntloaddriver_demand_driver_selected_from_registry`,
+  `exec_msgina_logon_dialog_painted`, and `exec_explorer_shell_chrome_painted`; executive summary
+  stayed at 290/290. Review adjustment: wire the concrete services.exe start path to the Win32 branch
+  and start retiring the hosted executable catalog admission rule.

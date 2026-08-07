@@ -12373,21 +12373,33 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     report
 }
 
+fn driver_class_from_config(class: DriverServiceClass) -> driver_launch::DriverClass {
+    match class {
+        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
+        DriverServiceClass::Device => driver_launch::DriverClass::Device,
+    }
+}
+
+fn driver_launch_spec_from_config_driver_spec(
+    service: &nt_config_manager::DriverServiceLaunchSpec,
+    out_path: &mut [u8],
+    max_start: u32,
+) -> Option<(usize, driver_launch::DriverClass)> {
+    if service.start_type > max_start || service.start_type >= SERVICE_DISABLED {
+        return None;
+    };
+    let class = driver_class_from_config(service.class);
+    let path_len = registry_ascii_path(&service.image_path, out_path)?;
+    Some((path_len, class))
+}
+
 fn driver_launch_spec_from_service_metadata(
     service: &nt_config_manager::ServiceMetadata,
     out_path: &mut [u8],
     max_start: u32,
 ) -> Option<(usize, driver_launch::DriverClass)> {
-    let start_value = service.start_type?;
-    if start_value > max_start || start_value >= SERVICE_DISABLED {
-        return None;
-    };
-    let class = match service.driver_service_class()? {
-        DriverServiceClass::FileSystem => driver_launch::DriverClass::Fsd,
-        DriverServiceClass::Device => driver_launch::DriverClass::Device,
-    };
-    let path_len = registry_ascii_path(service.image_path.as_deref()?, out_path)?;
-    Some((path_len, class))
+    let service = service.driver_launch_spec()?;
+    driver_launch_spec_from_config_driver_spec(&service, out_path, max_start)
 }
 
 fn current_driver_host_can_boot_launch(
@@ -12404,16 +12416,16 @@ fn current_driver_host_can_boot_launch(
     }
 }
 
-fn owned_driver_launch_spec_from_service_metadata(
-    service: nt_config_manager::ServiceMetadata,
+fn owned_driver_launch_spec_from_config_driver_spec(
+    service: nt_config_manager::DriverServiceLaunchSpec,
     max_start: u32,
     devnodes: alloc::vec::Vec<DriverServiceDevnodeSpec>,
 ) -> Option<DriverServiceLaunchSpec> {
     let mut image_path = [0u8; 180];
     let (image_path_len, class) =
-        driver_launch_spec_from_service_metadata(&service, &mut image_path, max_start)?;
-    let driver_object_path = service.driver_object_path()?;
-    let service_name = service.name;
+        driver_launch_spec_from_config_driver_spec(&service, &mut image_path, max_start)?;
+    let driver_object_path = service.driver_object_path;
+    let service_name = service.service_name;
     let class_guid = service.class_guid;
     Some(DriverServiceLaunchSpec {
         service_name,
@@ -12698,15 +12710,11 @@ fn copy_win32_service_launch_selection(
 }
 
 fn copy_driver_service_selection(
-    service: &nt_config_manager::ServiceMetadata,
+    service: &nt_config_manager::DriverServiceLaunchSpec,
     name: &mut InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
     image_path: &mut InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
 ) -> bool {
-    name.set_str(&service.name)
-        && service
-            .image_path
-            .as_deref()
-            .is_some_and(|path| image_path.set_str(path))
+    name.set_str(&service.service_name) && image_path.set_str(&service.image_path)
 }
 
 fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
@@ -12737,7 +12745,7 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
             );
         }
 
-        let demand_drivers = cm.demand_start_driver_candidates();
+        let demand_drivers = cm.demand_start_driver_launch_specs();
         report.demand_driver_count = demand_drivers.len() as u64;
         if let Some(service) = demand_drivers.first() {
             let _ = copy_driver_service_selection(
@@ -12745,9 +12753,9 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
                 &mut report.demand_driver_name,
                 &mut report.demand_driver_image_path,
             );
-            if let Some(object_path) = service.driver_object_path() {
-                let _ = report.demand_driver_object_path.set_str(&object_path);
-            }
+            let _ = report
+                .demand_driver_object_path
+                .set_str(&service.driver_object_path);
         }
     }
     unsafe { allocator::reset_to(heap_mark) };
@@ -12785,9 +12793,12 @@ pub(crate) fn system_hive_driver_service_launch_spec(
     max_start: u32,
 ) -> Option<DriverServiceLaunchSpec> {
     let cm = system_hive_config_manager()?;
-    let service = cm.service_metadata(service_name)?;
+    let nt_config_manager::ServiceStartSpec::Driver(service) = cm.service_start_spec(service_name)?
+    else {
+        return None;
+    };
     let devnodes = driver_service_devnode_specs(&cm, service_name);
-    owned_driver_launch_spec_from_service_metadata(service, max_start, devnodes)
+    owned_driver_launch_spec_from_config_driver_spec(service, max_start, devnodes)
 }
 
 pub(crate) fn system_hive_driver_service_object_path(
@@ -12795,12 +12806,14 @@ pub(crate) fn system_hive_driver_service_object_path(
     max_start: u32,
 ) -> Option<alloc::string::String> {
     let cm = system_hive_config_manager()?;
-    let service = cm.service_metadata(service_name)?;
-    let start_value = service.start_type?;
-    if start_value > max_start || start_value >= SERVICE_DISABLED {
+    let nt_config_manager::ServiceStartSpec::Driver(service) = cm.service_start_spec(service_name)?
+    else {
         return None;
     };
-    service.driver_object_path()
+    if service.start_type > max_start || service.start_type >= SERVICE_DISABLED {
+        return None;
+    };
+    Some(service.driver_object_path)
 }
 
 fn registry_ascii_hex_digit(b: u8) -> bool {

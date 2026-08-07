@@ -99,6 +99,28 @@ pub struct Win32ServiceLaunchSpec {
     pub dependencies: Vec<String>,
 }
 
+/// Registry-selected driver load metadata for `NtLoadDriver`/SCM driver starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverServiceLaunchSpec {
+    pub service_name: String,
+    pub service_key: RegistryKeyId,
+    pub image_path: String,
+    pub driver_object_path: String,
+    pub class: DriverServiceClass,
+    pub start_type: u32,
+    pub error_control: Option<u32>,
+    pub load_order_group: Option<String>,
+    pub class_guid: Option<String>,
+    pub tag: Option<u32>,
+}
+
+/// The start action implied by a service key's `Type` metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceStartSpec {
+    Driver(DriverServiceLaunchSpec),
+    Win32(Win32ServiceLaunchSpec),
+}
+
 pub fn driver_service_class_from_type(service_type: u32) -> Option<DriverServiceClass> {
     if service_type & (SERVICE_FILE_SYSTEM_DRIVER | SERVICE_RECOGNIZER_DRIVER) != 0 {
         Some(DriverServiceClass::FileSystem)
@@ -156,6 +178,9 @@ impl ServiceMetadata {
 
     pub fn win32_process_kind(&self) -> Option<Win32ServiceProcessKind> {
         let service_type = self.service_type?;
+        if service_type & SERVICE_DRIVER_TYPE_MASK != 0 {
+            return None;
+        }
         let owns_process = service_type & SERVICE_WIN32_OWN_PROCESS != 0;
         let shares_process = service_type & SERVICE_WIN32_SHARE_PROCESS != 0;
         match (owns_process, shares_process) {
@@ -183,6 +208,41 @@ impl ServiceMetadata {
             display_name: self.display_name.clone(),
             dependencies: self.dependencies.clone(),
         })
+    }
+
+    pub fn driver_launch_spec(&self) -> Option<DriverServiceLaunchSpec> {
+        if self.is_disabled() {
+            return None;
+        }
+        let service_type = self.service_type?;
+        if service_type & SERVICE_WIN32_TYPE_MASK != 0 {
+            return None;
+        }
+        let class = self.driver_service_class()?;
+        let image_path = self.image_path.as_deref().filter(|path| !path.is_empty())?;
+        Some(DriverServiceLaunchSpec {
+            service_name: self.name.clone(),
+            service_key: self.service_key,
+            image_path: image_path.into(),
+            driver_object_path: self.driver_object_path()?,
+            class,
+            start_type: self.start_type?,
+            error_control: self.error_control,
+            load_order_group: self.load_order_group.clone(),
+            class_guid: self.class_guid.clone(),
+            tag: self.tag,
+        })
+    }
+
+    pub fn start_spec(&self) -> Option<ServiceStartSpec> {
+        let service_type = self.service_type?;
+        let is_driver = service_type & SERVICE_DRIVER_TYPE_MASK != 0;
+        let is_win32 = service_type & SERVICE_WIN32_TYPE_MASK != 0;
+        match (is_driver, is_win32) {
+            (true, false) => self.driver_launch_spec().map(ServiceStartSpec::Driver),
+            (false, true) => self.win32_launch_spec().map(ServiceStartSpec::Win32),
+            _ => None,
+        }
     }
 
     pub fn driver_service_class(&self) -> Option<DriverServiceClass> {
@@ -479,6 +539,22 @@ impl ConfigManager {
         self.win32_service_launch_specs_by_start(&[SERVICE_DEMAND_START])
     }
 
+    pub fn service_start_spec(&self, name: &str) -> Option<ServiceStartSpec> {
+        self.service_metadata(name)?.start_spec()
+    }
+
+    pub fn service_start_specs_by_start(&self, start_types: &[u32]) -> Vec<ServiceStartSpec> {
+        self.service_metadata_list()
+            .into_iter()
+            .filter(|service| {
+                service
+                    .start_type
+                    .is_some_and(|start| start_types.contains(&start))
+            })
+            .filter_map(|service| service.start_spec())
+            .collect()
+    }
+
     /// Registry-declared Win32 service process creation metadata for SCM-owned launch decisions.
     pub fn win32_service_launch_specs_by_start(
         &self,
@@ -495,9 +571,28 @@ impl ConfigManager {
             .collect()
     }
 
+    pub fn driver_service_launch_specs_by_start(
+        &self,
+        start_types: &[u32],
+    ) -> Vec<DriverServiceLaunchSpec> {
+        self.service_metadata_list()
+            .into_iter()
+            .filter(|service| {
+                service
+                    .start_type
+                    .is_some_and(|start| start_types.contains(&start))
+            })
+            .filter_map(|service| service.driver_launch_spec())
+            .collect()
+    }
+
     /// Registry-declared drivers that SCM or `NtLoadDriver` may demand-start.
     pub fn demand_start_driver_candidates(&self) -> Vec<ServiceMetadata> {
         self.service_candidates_by_start_and_type(&[SERVICE_DEMAND_START], SERVICE_DRIVER_TYPE_MASK)
+    }
+
+    pub fn demand_start_driver_launch_specs(&self) -> Vec<DriverServiceLaunchSpec> {
+        self.driver_service_launch_specs_by_start(&[SERVICE_DEMAND_START])
     }
 
     /// The `Control\ServiceGroupOrder\List` load-order group sequence.
@@ -1243,6 +1338,15 @@ mod tests {
             SERVICE_AUTO_START,
             1,
         );
+        cm.register_typed_service(
+            "MixedType",
+            r"%SystemRoot%\system32\mixed.exe",
+            SERVICE_WIN32_OWN_PROCESS | SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
         let no_image = cm
             .registry_mut()
             .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\NoImage");
@@ -1283,6 +1387,90 @@ mod tests {
         assert_eq!(demand[0].service_name, "DemandOwn");
         assert_eq!(demand[0].process_kind, Win32ServiceProcessKind::Own);
         assert!(!demand[0].interactive);
+    }
+
+    #[test]
+    fn service_start_specs_route_by_registry_type() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "RpcSs",
+            r"%SystemRoot%\system32\svchost.exe -k rpcss",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "E1000",
+            r"system32\drivers\e1000.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            Some("{4D36E972-E325-11CE-BFC1-08002BE10318}"),
+            SERVICE_DEMAND_START,
+            1,
+        );
+        let e1000_key = cm.service_metadata("E1000").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(e1000_key, "ObjectName", r"\Driver\IntelE1000");
+        cm.registry_mut().set_string(e1000_key, "Group", "NDIS");
+        cm.registry_mut().set_dword(e1000_key, "Tag", 3);
+        cm.register_typed_service(
+            "MixedType",
+            r"%SystemRoot%\system32\mixed.exe",
+            SERVICE_WIN32_OWN_PROCESS | SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "DisabledDriver",
+            r"system32\drivers\disabled.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DISABLED,
+            1,
+        );
+
+        match cm.service_start_spec("RpcSs").unwrap() {
+            ServiceStartSpec::Win32(spec) => {
+                assert_eq!(spec.service_name, "RpcSs");
+                assert_eq!(spec.process_kind, Win32ServiceProcessKind::Shared);
+            }
+            ServiceStartSpec::Driver(_) => panic!("RpcSs must route as Win32"),
+        }
+
+        match cm.service_start_spec("e1000").unwrap() {
+            ServiceStartSpec::Driver(spec) => {
+                assert_eq!(spec.service_name, "E1000");
+                assert_eq!(spec.service_key, e1000_key);
+                assert_eq!(spec.class, DriverServiceClass::Device);
+                assert_eq!(spec.start_type, SERVICE_DEMAND_START);
+                assert_eq!(spec.error_control, Some(1));
+                assert_eq!(spec.load_order_group.as_deref(), Some("NDIS"));
+                assert_eq!(
+                    spec.class_guid.as_deref(),
+                    Some("{4D36E972-E325-11CE-BFC1-08002BE10318}")
+                );
+                assert_eq!(spec.tag, Some(3));
+                assert_eq!(spec.image_path, r"system32\drivers\e1000.sys");
+                assert_eq!(spec.driver_object_path, r"\Driver\IntelE1000");
+            }
+            ServiceStartSpec::Win32(_) => panic!("E1000 must route as a driver"),
+        }
+
+        assert_eq!(cm.service_start_spec("MixedType"), None);
+        assert_eq!(cm.service_start_spec("DisabledDriver"), None);
+
+        let demand_drivers = cm.demand_start_driver_launch_specs();
+        assert_eq!(demand_drivers.len(), 1);
+        assert_eq!(demand_drivers[0].service_name, "E1000");
+
+        let auto_specs = cm.service_start_specs_by_start(&[SERVICE_AUTO_START]);
+        assert_eq!(auto_specs.len(), 1);
+        assert!(matches!(auto_specs[0], ServiceStartSpec::Win32(_)));
     }
 
     #[test]
