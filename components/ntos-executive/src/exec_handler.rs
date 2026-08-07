@@ -5999,6 +5999,9 @@ impl ExecNtHandler {
                     handle,
                     nt_process::PROCESS_QUERY_INFORMATION,
                 )?;
+                let (drive_map, drive_type) = nt_fs::MountManager::new().process_device_map();
+                put_u32(&mut output, 0, drive_map);
+                output[4..0x24].copy_from_slice(&drive_type);
                 0x24
             }
             24 => {
@@ -10396,12 +10399,11 @@ impl ExecNtHandler {
         let ctx = self.loop_ctx.unwrap();
         let reg = &mut *ctx.reg;
         const FILE_DIRECTORY_FILE: u64 = 0x01;
-        let sp = get_recv_mr(16);
         {
             let oa_probe = get_recv_mr(7);
             let nm = self.read_objattr_name_pe(oa_probe);
             if boot_status_path_matches(&nm) {
-                let options = smss_stack_read(sp + 0x30) as u32;
+                let options = args[5] as u32;
                 let mut status = nt_fs::STATUS_SUCCESS;
                 let mut opened_handle = None;
                 if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
@@ -10518,9 +10520,9 @@ impl ExecNtHandler {
                 &relative,
                 args[1] as u32,
                 0,
-                smss_stack_read(sp + 0x28) as u32,
+                args[4] as u32,
                 nt_fs::FILE_OPEN,
-                smss_stack_read(sp + 0x30) as u32,
+                args[5] as u32,
             );
             let mut opened_handle = 0u64;
             if let Some(file_id) = file_id {
@@ -10558,8 +10560,8 @@ impl ExecNtHandler {
         let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
             || nb[..nlen].windows(9).any(|w| w == b".manifest")
             || nb[..nlen].windows(7).any(|w| w == b".config");
-        let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
-        let open_options = smss_stack_read(sp + 0x30) as u32;
+        let want_dir = args[5] as u32 & FILE_DIRECTORY_FILE as u32 != 0;
+        let open_options = args[5] as u32;
         let desired_access = args[1] as u32;
         let disk_entry = Self::readonly_disk_open_entry(&name16, desired_access, open_options);
         if let Some((first_cluster, file_size)) = disk_entry {

@@ -111,6 +111,9 @@ fn mount_resolver() {
     let (vol, rel) = mm.resolve(r"\??\C:\Temp\x").unwrap();
     assert_eq!(vol, MEMFS_VOLUME);
     assert_eq!(rel, r"\Temp\x");
+    let (drive_map, drive_type) = mm.process_device_map();
+    assert_eq!(drive_map & (1 << 2), 1 << 2);
+    assert_eq!(drive_type[2], DOS_DRIVE_FIXED);
     // Forward slashes normalize.
     assert_eq!(
         mm.resolve("/SystemRoot/System32").unwrap().1,
@@ -165,6 +168,25 @@ fn local_nt_paths_resolve_to_the_fat_volume() {
         nt_path_to_volume_relative(&utf16(r"\??\C:\"), b"reactos").unwrap(),
         b""
     );
+    assert_eq!(
+        nt_path_to_volume_relative(&utf16(r"\??\C:"), b"reactos").unwrap(),
+        b""
+    );
+    assert_eq!(
+        nt_path_to_volume_relative(&utf16(r"\DosDevices\C:"), b"reactos").unwrap(),
+        b""
+    );
+}
+
+#[test]
+fn mounted_dos_drives_publish_process_device_map() {
+    let mut mm = MountManager::new();
+    mm.mount(r"\??\D:", MEMFS_VOLUME);
+    let (drive_map, drive_type) = mm.process_device_map();
+    assert_eq!(drive_map & (1 << 2), 1 << 2);
+    assert_eq!(drive_map & (1 << 3), 1 << 3);
+    assert_eq!(drive_type[2], DOS_DRIVE_FIXED);
+    assert_eq!(drive_type[3], DOS_DRIVE_FIXED);
 }
 
 #[test]

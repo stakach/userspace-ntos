@@ -119,11 +119,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
    classes, and non-background shell chrome pixels. Directory and symbolic-link object opens now
    return process-local handles instead of new callers receiving legacy `OBJ_HANDLE_BASE` indexes,
-   and `RootDirectory`/`NtQueryDirectoryObject` resolve through the same handle-table path. The
-   remaining gates are debug syscall dispatch proofs, stale user-callback dead-client/nested proof
-   bits after real explorer activity, VM pool-headroom accounting, and explorer's still-real
-   post-render `NtWaitForSingleObject` activity while shell debug logging reports missing shell
-   paths.
+   and `RootDirectory`/`NtQueryDirectoryObject` resolve through the same handle-table path. ReactOS
+   `GetDriveType(C:\)` now sees the mounted DOS drive through `ProcessDeviceMap`, so the previous
+   `CStartMenu`/`startmnu` `ERROR_PATH_NOT_FOUND` route is gone. The remaining gates are debug
+   syscall dispatch proofs, stale user-callback dead-client/nested proof bits after real explorer
+   activity, VM pool-headroom accounting, and the new post-render resource frontier: explorer/RPC
+   worker creation reaches the bounded local worker/pool slots (`0xff`), reports `failed to create
+   thread, error=5aa`, and can exhaust the seL4 SC pool.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -136,9 +138,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    manual stack rereads for services whose metadata already carries all arguments. The old
    read-only `NtQueryDirectoryFile` width exception is gone and the genuine FAT path stayed inside
    the boot budget. `NtQueryFullAttributesFile` is now registered at its ReactOS SSN and implemented
-   against the same writable-overlay/FAT path authorities as `NtQueryAttributesFile`; the latest boot
-   did not exercise SSN 156, so the next slices should audit remaining stack-captured native services
-   and shell path/status failures rather than adding syscall-local exceptions.
+   against the same writable-overlay/FAT path authorities as `NtQueryAttributesFile`; `NtOpenFile`
+   now consumes dispatcher-captured `ShareAccess`/`OpenOptions` instead of rereading stack slots. The
+   next slices should continue auditing remaining native stack arguments while the shell frontier
+   moves to real resource capacity instead of path-status failures.
 
 ## Review Log
 
@@ -1173,3 +1176,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)` from `CStartMenu`/`startmnu`, so the next shell-path
   slice should trace the real `SHGetSpecialFolderLocation`/PIDL route rather than treating DBWIN
   debug-output waits as the cause.
+- Shell path/device-map slice. ReactOS `GetDriveTypeW` now receives a real
+  `PROCESS_DEVICEMAP_INFORMATION.Query` view from the mounted DOS drives, and `nt-fs` resolves both
+  `\??\C:` and `\DosDevices\C:` as the FAT volume root. Directory/file mismatch statuses now match
+  NT create semantics (`STATUS_NOT_A_DIRECTORY`/`STATUS_FILE_IS_A_DIRECTORY`), and `NtOpenFile` uses
+  dispatcher-captured `ShareAccess`/`OpenOptions` values instead of manual x64 stack rereads.
+  Validation: `cargo fmt --all`, `cargo test -p nt-fs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, and
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`. Boot proof
+  `.tmp/boot-device-map-root-20260807.log` was interrupted after it advanced beyond the old
+  `CStartMenu`/`startmnu` `ERROR_PATH_NOT_FOUND` route and reached the next frontier:
+  explorer/RPC worker creation exhausts bounded local worker/pool slots and eventually the seL4 SC
+  pool. Review adjustment: do not add path fallbacks; the next work is generic worker/thread/SC pool
+  capacity and accounting under real explorer activity.

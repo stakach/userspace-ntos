@@ -178,10 +178,11 @@ impl MemFs {
         match existing {
             Some(id) => {
                 let is_dir = self.node(id).unwrap().is_dir;
-                if want_dir && !is_dir
-                    || !want_dir && is_dir && options & FILE_NON_DIRECTORY_FILE != 0
-                {
-                    return Err(STATUS_OBJECT_NAME_COLLISION);
+                if want_dir && !is_dir {
+                    return Err(STATUS_NOT_A_DIRECTORY);
+                }
+                if !want_dir && is_dir && options & FILE_NON_DIRECTORY_FILE != 0 {
+                    return Err(STATUS_FILE_IS_A_DIRECTORY);
                 }
                 match disposition {
                     FILE_OPEN | FILE_OPEN_IF => Ok((id, FILE_OPENED)),

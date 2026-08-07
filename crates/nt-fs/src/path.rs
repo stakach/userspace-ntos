@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 /// The v0.1 volume device (spec §6.3).
 pub const MEMFS_VOLUME: &str = r"\Device\MemFsVolume0";
+pub const DOS_DRIVE_FIXED: u8 = 3;
 
 /// One namespace mount: `prefix` → `target` (a volume-device-relative root) (spec §6.4).
 struct Mount {
@@ -44,6 +45,21 @@ impl MountManager {
             prefix: prefix.into(),
             target: target.into(),
         });
+    }
+
+    /// Return the NT `PROCESS_DEVICEMAP_INFORMATION.Query` view for the mounted DOS drive letters.
+    pub fn process_device_map(&self) -> (u32, [u8; 32]) {
+        let mut drive_map = 0u32;
+        let mut drive_type = [0u8; 32];
+        for mount in &self.mounts {
+            if let Some(index) = dos_drive_index(&mount.prefix) {
+                drive_map |= 1u32 << index;
+                if drive_type[index] == 0 {
+                    drive_type[index] = DOS_DRIVE_FIXED;
+                }
+            }
+        }
+        (drive_map, drive_type)
     }
 
     /// Resolve a full NT path to `(volume_device, volume_relative_path)` by longest-prefix match
@@ -144,6 +160,23 @@ fn push_relative_suffix(out: &mut [u8], len: &mut usize, suffix: &[u8]) -> Optio
     Some(())
 }
 
+fn dos_drive_index(prefix: &str) -> Option<usize> {
+    let norm = normalize_separators(prefix);
+    let bytes = norm.as_bytes();
+    for base in [b"\\??\\" as &[u8], b"\\dosdevices\\" as &[u8]] {
+        if bytes.len() == base.len() + 2
+            && bytes[..base.len()].eq_ignore_ascii_case(base)
+            && bytes[base.len() + 1] == b':'
+        {
+            let drive = bytes[base.len()].to_ascii_uppercase();
+            if drive.is_ascii_uppercase() {
+                return Some((drive - b'A') as usize);
+            }
+        }
+    }
+    None
+}
+
 pub fn nt_path_to_volume_relative_into(
     path: &[u16],
     system_root: &[u8],
@@ -184,7 +217,9 @@ pub fn nt_path_to_volume_relative_into(
     let folded = &folded[..folded_len];
 
     let system_prefix = b"\\systemroot";
+    let dos_root = b"\\??\\c:";
     let dos_prefix = b"\\??\\c:\\";
+    let dos_devices_root = b"\\dosdevices\\c:";
     let dos_devices_prefix = b"\\dosdevices\\c:\\";
     let drive_prefix = b"c:\\";
 
@@ -196,8 +231,10 @@ pub fn nt_path_to_volume_relative_into(
     {
         push_relative_component(out, &mut out_len, system_root)?;
         push_relative_suffix(out, &mut out_len, &folded[system_prefix.len()..])?;
+    } else if folded == dos_root {
     } else if folded.starts_with(dos_prefix) {
         push_drive_relative_into(system_root, &folded[dos_prefix.len()..], out, &mut out_len)?;
+    } else if folded == dos_devices_root {
     } else if folded.starts_with(dos_devices_prefix) {
         push_drive_relative_into(
             system_root,
