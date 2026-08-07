@@ -129,10 +129,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `NtQueueApcThread`: process-manager ETHREADs carry bounded user APC queues, alertable
    `NtDelayExecution`, `NtWaitForSingleObject`, `NtWaitForMultipleObjects`, and `NtTestAlert` can
    redirect the current hosted thread into ntdll's real `KiUserApcDispatcher`, and the ordinary
-   syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The remaining gates
-   are debug syscall dispatch proofs, stale user-callback dead-client/nested proof bits after real
-   explorer activity, VM pool-headroom accounting, and boot-validating the new APC route against the
-   later win32k `ClientThreadSetup` failures.
+   syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The old fixed
+   object-namespace ceiling is also gone: object entries now grow by checked reserve, so late debug
+   objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
+   slots. The latest boot reaches genuine explorer shell chrome with every dbgk, user-callback, and
+   win32k nested-transport proof green; the only remaining red gate is VM pool-headroom accounting.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -1227,3 +1228,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: run the full rootserver/kernel build and boot proof next; if `ClientThreadSetup`
   still fails, inspect whether the APC normal routine ran and whether follow-on waits should wake
   queued APC targets rather than only delivering when they re-enter the kernel.
+- Dynamic object-namespace headroom slice. The object namespace no longer treats the original
+  192-entry reservation as a hard limit: `ObjEntry` insertion now performs checked growth, and the
+  anonymous event/semaphore/mutant helpers no longer reject creation solely because the initial
+  reservation is full. This removes a real object-manager fixed-capacity wall that only showed up
+  after genuine explorer activity filled the namespace before the post-loop dbgk proofs created
+  debug-object `EventsPresent` events. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-dynamic-objns-20260807.log`. Result: the run advances from `282/290` to
+  `289/290`; all dbgk syscall/wait/exception/block proofs, user-callback nested/dead-client proofs,
+  and win32k nested transport accounting are green, while genuine explorer shell chrome pixels still
+  pass. Review adjustment: the last red gate is `exec_vm_pool_headroom`; inspect whether the current
+  three-quarter untyped threshold is stale for a full ReactOS desktop boot or whether a real reclaim
+  leak remains.

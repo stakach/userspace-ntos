@@ -13732,15 +13732,19 @@ struct ObjEntry {
 }
 impl ObjEntry {
     fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
-        if entries.len() >= entries.capacity() {
-            return None;
+        if entries.len() == entries.capacity() {
+            entries.try_reserve(64).ok()?;
         }
         let index = entries.len();
-        let slot = entries.spare_capacity_mut().first_mut()?.as_mut_ptr();
-        unsafe {
-            core::ptr::write_bytes(slot as *mut u8, 0, core::mem::size_of::<Self>());
-            entries.set_len(index + 1);
-        }
+        entries.push(Self {
+            name: [0; OBJ_NAME_CAP],
+            name_len: 0,
+            parent: 0,
+            kind: 0,
+            target: [0; OBJ_NAME_CAP],
+            target_len: 0,
+            payload: 0,
+        });
         Some(index)
     }
 

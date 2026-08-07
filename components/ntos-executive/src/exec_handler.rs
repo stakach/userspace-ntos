@@ -10028,9 +10028,6 @@ impl ExecNtHandler {
         auto_reset: bool,
         initial_state: bool,
     ) -> Option<usize> {
-        if self.obj_ns.len() >= self.obj_ns.capacity() {
-            return None;
-        }
         // Unique 4-byte synthetic name "a" + a 24-bit counter, so obj_child never matches two anon
         // events (they live under a private parent id 250 that no name walk reaches).
         let n = self.anon_event_seq;
@@ -10059,9 +10056,6 @@ impl ExecNtHandler {
         initial: i32,
         maximum: i32,
     ) -> Option<usize> {
-        if self.obj_ns.len() >= self.obj_ns.capacity() {
-            return None;
-        }
         let n = self.anon_event_seq;
         self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
         let name = [
@@ -10089,9 +10083,6 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn obj_create_anon_mutant(&mut self, initial_owner: Option<u64>) -> Option<usize> {
-        if self.obj_ns.len() >= self.obj_ns.capacity() {
-            return None;
-        }
         let n = self.anon_event_seq;
         self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
         let name = [
