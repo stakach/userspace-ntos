@@ -1,0 +1,17 @@
+[package]
+name = "nt-hosted-runtime"
+description = "Pure hosted-process runtime VA layout helpers: checked scratch/mirror arenas and non-overlap validation for the ntos executive."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -119,9 +119,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
 4. Continue A3/A4 by replacing any hosted executable catalog decisions that still encode service or
    process role policy with dynamic process/runtime allocation state. The hosted executable catalog
    and open/section/spawn table now size to `MAX_PI` instead of the historical eight-image cap; the
-   next blocker is the runtime VA layout because the existing `SMSS_SCRATCH_BASE + pi *
-   DEMAND_SCRATCH_WINDOW` rule is non-overlapping only through explorer (`pi=6`) and collides with
-   the explorer mirror band at `pi=7`.
+   hosted runtime table now preserves byte-identical static lanes for `pi=0..6` and assigns later
+   process lanes from a checked high executive scratch/mirror arena. The next blocker is real
+   non-bootstrap executable image storage/loading: today the catalog can admit more process
+   identities, but the loaded PE backing table is still populated only by bootstrap images.
 
 ## Review Log
 
@@ -1007,3 +1008,20 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `pi=7` would start at `0x100_3D00_0000`, which is already explorer's stack mirror, so dynamic
   process runtime registration must get a new non-overlapping scratch/mirror allocator before
   services.exe can admit arbitrary Win32 service children.
+- A4 continued. Added pure `nt-hosted-runtime` layout helpers for checked runtime VA ranges and a
+  dense high-arena allocator. The executive now keeps the existing `pi=0..6` hosted-process runtime
+  layout byte-identical, assigns `pi>=7` scratch/stack/env/heap/image mirror lanes from a separate
+  high arena above the hosted-driver executive alias range, and replaces fixed spawned-state matches
+  for future process slots with table-backed dynamic spawned signals. Executive demand-scratch and
+  SEC_IMAGE mirror PT setup now use a generic paging-chain helper instead of assuming the root VSpace
+  already has the relevant PD/PDPT coverage. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hosted-runtime`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and `./rust-micro/scripts/run_specs.sh` captured in
+  `.tmp/boot-dynamic-runtime-layout-20260807.log`; the run reached
+  `exec_msgina_logon_dialog_painted`, `exec_explorer_shell_chrome_painted`, and
+  `290/290` executive checks. Review adjustment: the remaining A4 blocker is loaded executable
+  storage for non-bootstrap children. Dynamic catalog/runtime admission is possible structurally, but
+  `HostedLoadedImageTable` still points at PE objects from the bootstrap-only
+  `SERVICE_HOSTED_BOOTSTRAP_PES_WORK` array.

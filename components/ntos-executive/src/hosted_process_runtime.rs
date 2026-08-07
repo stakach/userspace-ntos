@@ -5,6 +5,7 @@
 //! `HostedProcessRuntime` constants around as identity.
 #![allow(clippy::all)]
 use crate::*;
+use nt_hosted_runtime::{DynamicRuntimeArena, ProcessRuntimeLayout};
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedProcessRuntime {
@@ -65,6 +66,7 @@ static mut HOSTED_PROCESS_RUNTIMES: HostedProcessRuntimeTable = HostedProcessRun
 
 pub(crate) fn reset_hosted_process_runtimes() {
     unsafe { (&mut *core::ptr::addr_of_mut!(HOSTED_PROCESS_RUNTIMES)).reset() };
+    reset_dynamic_spawned_signals();
 }
 
 pub(crate) fn register_hosted_process_runtime(
@@ -79,6 +81,7 @@ pub(crate) fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRu
 
 #[derive(Clone, Copy)]
 struct HostedProcessAddressLayout {
+    scratch_base: u64,
     env_scratch_va: u64,
     stack_mirror_va: u64,
     heap_mirror_va: u64,
@@ -88,6 +91,44 @@ struct HostedProcessAddressLayout {
 const HOSTED_PROCESS_PRIORITY_BASE: u64 = 100;
 const SMSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1074_0000;
 const CSRSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1078_0000;
+const HOSTED_DYNAMIC_FIRST_PI: usize = 7;
+const HOSTED_DYNAMIC_RUNTIME_BASE: u64 = 0x0000_0101_6000_0000;
+const HOSTED_DYNAMIC_RUNTIME_STRIDE: u64 = 0x0800_0000;
+const HOSTED_DYNAMIC_RUNTIME_LIMIT: u64 =
+    HOSTED_DYNAMIC_RUNTIME_BASE + (MAX_PI - HOSTED_DYNAMIC_FIRST_PI) as u64 * HOSTED_DYNAMIC_RUNTIME_STRIDE;
+const HOSTED_ENV_SCRATCH_WINDOW: u64 = 0x9000;
+const HOSTED_MIRROR_WINDOW: u64 = 0x20_0000;
+const HOSTED_DYNAMIC_RUNTIME_ARENA: DynamicRuntimeArena = DynamicRuntimeArena {
+    first_pi: HOSTED_DYNAMIC_FIRST_PI,
+    max_pi: MAX_PI,
+    base: HOSTED_DYNAMIC_RUNTIME_BASE,
+    limit: HOSTED_DYNAMIC_RUNTIME_LIMIT,
+    stride: HOSTED_DYNAMIC_RUNTIME_STRIDE,
+    scratch_offset: 0,
+    stack_offset: DEMAND_SCRATCH_WINDOW,
+    env_offset: DEMAND_SCRATCH_WINDOW + 0x10_0000,
+    heap_offset: DEMAND_SCRATCH_WINDOW + 0x20_0000,
+    image_offset: DEMAND_SCRATCH_WINDOW + 0x40_0000,
+    scratch_len: DEMAND_SCRATCH_WINDOW,
+    stack_len: STACK_FRAMES * 0x1000,
+    env_len: HOSTED_ENV_SCRATCH_WINDOW,
+    heap_len: HOSTED_MIRROR_WINDOW,
+    image_len: HOSTED_MIRROR_WINDOW,
+};
+const _: () = {
+    assert!(HOSTED_DYNAMIC_RUNTIME_BASE >= driver_launch::FSD_EXEC_LIMIT);
+    assert!(HOSTED_DYNAMIC_RUNTIME_BASE & 0x1f_ffff == 0);
+    assert!(HOSTED_DYNAMIC_RUNTIME_STRIDE & 0x1f_ffff == 0);
+    assert!(HOSTED_DYNAMIC_RUNTIME_LIMIT >= HOSTED_DYNAMIC_RUNTIME_BASE);
+};
+
+static HOSTED_DYNAMIC_SPAWNED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+
+fn reset_dynamic_spawned_signals() {
+    for spawned in HOSTED_DYNAMIC_SPAWNED.iter() {
+        spawned.store(0, Ordering::Relaxed);
+    }
+}
 
 fn spawned_signal_for_pi(pi: usize) -> Option<&'static AtomicU64> {
     match pi {
@@ -97,6 +138,7 @@ fn spawned_signal_for_pi(pi: usize) -> Option<&'static AtomicU64> {
         4 => Some(&LSASS_SPAWNED),
         5 => Some(&USERINIT_SPAWNED),
         6 => Some(&EXPLORER_SPAWNED),
+        HOSTED_DYNAMIC_FIRST_PI..MAX_PI => HOSTED_DYNAMIC_SPAWNED.get(pi),
         _ => None,
     }
 }
@@ -120,6 +162,7 @@ fn core_service_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
     };
     let heap_mirror_va = WINLOGON_HEAP_MIRROR_VA + service_index * 0x40_0000;
     Some(HostedProcessAddressLayout {
+        scratch_base: SMSS_SCRATCH_BASE + pi as u64 * DEMAND_SCRATCH_WINDOW,
         env_scratch_va,
         stack_mirror_va,
         heap_mirror_va,
@@ -133,12 +176,35 @@ fn shell_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
         6 => EXPLORER_STACK_MIRROR_VA,
         _ => return None,
     };
+    let scratch_base = match pi {
+        5 => USERINIT_SCRATCH_BASE,
+        6 => EXPLORER_SCRATCH_BASE,
+        _ => return None,
+    };
     Some(HostedProcessAddressLayout {
+        scratch_base,
         env_scratch_va: stack_mirror_va + 0x10_0000,
         stack_mirror_va,
         heap_mirror_va: stack_mirror_va + 0x20_0000,
         image_mirror_va: stack_mirror_va + 0x40_0000,
     })
+}
+
+fn dynamic_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
+    let layout = HOSTED_DYNAMIC_RUNTIME_ARENA.layout_for_pi(pi).ok()?;
+    Some(address_layout_from_runtime_layout(layout))
+}
+
+fn address_layout_from_runtime_layout(
+    layout: ProcessRuntimeLayout,
+) -> HostedProcessAddressLayout {
+    HostedProcessAddressLayout {
+        scratch_base: layout.scratch_base,
+        env_scratch_va: layout.env_scratch_va,
+        stack_mirror_va: layout.stack_mirror_va,
+        heap_mirror_va: layout.heap_mirror_va,
+        image_mirror_va: layout.image_mirror_va,
+    }
 }
 
 fn address_layout_for_image(
@@ -147,6 +213,7 @@ fn address_layout_for_image(
     match image.role {
         nt_exe_image::HostedProcessRole::NativeSession if image.pi == 0 => {
             Some(HostedProcessAddressLayout {
+                scratch_base: SMSS_SCRATCH_BASE,
                 env_scratch_va: SMSS_ENV_SCRATCH_VA,
                 stack_mirror_va: SMSS_STACK_MIRROR_VA,
                 heap_mirror_va: SMSS_HEAP_MIRROR_VA,
@@ -155,6 +222,7 @@ fn address_layout_for_image(
         }
         nt_exe_image::HostedProcessRole::Win32Subsystem if image.pi == 1 => {
             Some(HostedProcessAddressLayout {
+                scratch_base: CSRSS_SCRATCH_BASE,
                 env_scratch_va: CSRSS_ENV_SCRATCH_VA,
                 stack_mirror_va: CSRSS_STACK_MIRROR_VA,
                 heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
@@ -162,9 +230,13 @@ fn address_layout_for_image(
             })
         }
         nt_exe_image::HostedProcessRole::InteractiveLogon
-        | nt_exe_image::HostedProcessRole::NonInteractiveService => core_service_layout(image.pi),
+        | nt_exe_image::HostedProcessRole::NonInteractiveService => {
+            core_service_layout(image.pi).or_else(|| dynamic_layout(image.pi))
+        }
         nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
-        | nt_exe_image::HostedProcessRole::InteractiveShell => shell_layout(image.pi),
+        | nt_exe_image::HostedProcessRole::InteractiveShell => {
+            shell_layout(image.pi).or_else(|| dynamic_layout(image.pi))
+        }
         nt_exe_image::HostedProcessRole::NativeSession
         | nt_exe_image::HostedProcessRole::Win32Subsystem => None,
     }
@@ -192,7 +264,7 @@ fn runtime_for_image(
         heap_mirror_va: layout.heap_mirror_va,
         active_image_mirror_va: layout.image_mirror_va,
         spawn_image_mirror_va,
-        scratch_base: SMSS_SCRATCH_BASE + image.pi as u64 * DEMAND_SCRATCH_WINDOW,
+        scratch_base: layout.scratch_base,
         spawned,
     })
 }

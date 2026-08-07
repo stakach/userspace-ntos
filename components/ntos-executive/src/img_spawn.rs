@@ -477,27 +477,12 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
     }
     if setup_env {
-        // Reserve a PT in the EXECUTIVE's own VSpace for the heap copyin mirror window.
-        let hpt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
-        let _ = paging_struct_map(
-            hpt,
-            LBL_X86_PAGE_TABLE_MAP,
-            heap_mirror,
-            CAP_INIT_THREAD_VSPACE,
-        );
-        // A dedicated PT for the IMAGE copyin mirror, when the process needs its own (winlogon: its
-        // image mirror is a fresh VA with no pre-existing PT, unlike smss's IMAGE_MIRROR (FILEBUF PT)
-        // and csrss's CSRSS_IMAGE_MIRROR (NTDLLBUF PT), which pass image_mirror=0 to reuse those).
+        assert!(ensure_executive_paging(stack_mirror));
+        assert!(ensure_executive_paging(scr_base));
+        assert!(ensure_executive_paging(heap_mirror));
+        // A dedicated PT for the IMAGE copyin mirror, when the process needs its own.
         if image_mirror != 0 {
-            let ipt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ipt);
-            let _ = paging_struct_map(
-                ipt,
-                LBL_X86_PAGE_TABLE_MAP,
-                image_mirror,
-                CAP_INIT_THREAD_VSPACE,
-            );
+            assert!(ensure_executive_paging(image_mirror));
         }
     }
     for i in 0..STACK_FRAMES {

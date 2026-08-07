@@ -8864,6 +8864,104 @@ unsafe fn make_object(obj: u64) -> u64 {
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
     s
 }
+
+static mut EXEC_PAGING_SEEN: [u64; 8192] = [0; 8192];
+static mut EXEC_PAGING_SEEN_N: usize = 0;
+const EXEC_PAGING_SEEN_PDPT: u64 = 1u64 << 60;
+const EXEC_PAGING_SEEN_PD: u64 = 2u64 << 60;
+const EXEC_PAGING_SEEN_PT: u64 = 3u64 << 60;
+const SEL4_DELETE_FIRST: u64 = 8;
+
+unsafe fn exec_paging_seen(key: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(EXEC_PAGING_SEEN_N));
+    let entries = core::ptr::addr_of!(EXEC_PAGING_SEEN) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(entries.add(i)) == key {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn exec_paging_mark(key: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(EXEC_PAGING_SEEN_N));
+    if n < 8192 {
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(EXEC_PAGING_SEEN) as *mut u64).add(n),
+            key,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!(EXEC_PAGING_SEEN_N), n + 1);
+    }
+}
+
+#[inline]
+fn exec_paging_keys(page: u64) -> (u64, u64, u64) {
+    (
+        EXEC_PAGING_SEEN_PDPT | (page >> 39),
+        EXEC_PAGING_SEEN_PD | (page >> 30),
+        EXEC_PAGING_SEEN_PT | (page >> 21),
+    )
+}
+
+unsafe fn ensure_executive_paging_level(
+    key: u64,
+    object_type: u64,
+    map_label: u64,
+    page: u64,
+    level: &[u8],
+) -> bool {
+    if exec_paging_seen(key) {
+        return true;
+    }
+    let slot = alloc_slot();
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
+    if retype != 0 {
+        print_str(b"[exec-paging] retype ");
+        print_str(level);
+        print_str(b" failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" error=");
+        print_u64(retype);
+        print_str(b"\n");
+        let _ = cnode_delete_recycle_r(slot);
+        return false;
+    }
+    let map = paging_struct_map_r(slot, map_label, page, CAP_INIT_THREAD_VSPACE);
+    if map == 0 {
+        exec_paging_mark(key);
+        return true;
+    }
+    if map == SEL4_DELETE_FIRST {
+        let _ = cnode_delete_recycle_r(slot);
+        exec_paging_mark(key);
+        return true;
+    }
+    print_str(b"[exec-paging] map ");
+    print_str(level);
+    print_str(b" failed page=0x");
+    print_hex((page >> 32) as u32);
+    print_hex(page as u32);
+    print_str(b" error=");
+    print_u64(map);
+    print_str(b"\n");
+    let _ = cnode_delete_recycle_r(slot);
+    false
+}
+
+pub(crate) unsafe fn ensure_executive_paging(page: u64) -> bool {
+    let (pdpt, pd, pt) = exec_paging_keys(page);
+    ensure_executive_paging_level(pdpt, OBJ_X86_PDPT, LBL_X86_PDPT_MAP, page, b"pdpt")
+        && ensure_executive_paging_level(
+            pd,
+            OBJ_X86_PAGE_DIRECTORY,
+            LBL_X86_PAGE_DIRECTORY_MAP,
+            page,
+            b"pd",
+        )
+        && ensure_executive_paging_level(pt, OBJ_X86_PAGE_TABLE, LBL_X86_PAGE_TABLE_MAP, page, b"pt")
+}
+
 /// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
 /// (`*_SCRATCH_BASE`) in the executive's own VSpace. Each demand fill takes a UNIQUE monotonic
 /// scratch slot within this window (`scratch_base + faults*0x1000`), so it must cover FAULT_CAP
@@ -8875,14 +8973,7 @@ pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
     // ~57 DLLs) can need well over 8192 slots. Backing the full window keeps the fresh-fill's unique
     // monotonic scratch slot (`scratch_base + faults*0x1000`) inside mapped PTs. Cheap (16 extra PTs).
     for k in 0..32u64 {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            base + k * 0x20_0000,
-            CAP_INIT_THREAD_VSPACE,
-        );
+        assert!(ensure_executive_paging(base + k * 0x20_0000));
     }
 }
 // --- ITEM 2b: seL4 MECHANISM teardown (reclamation) invocations, SYS_CALL so they RETURN the error
