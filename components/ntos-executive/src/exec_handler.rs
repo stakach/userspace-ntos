@@ -15628,43 +15628,17 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
-                // ★ STACK-ARGUMENT WIDTHS. `Length` is a **ULONG** and `ReturnSingleEntry` /
-                // `RestartScan` are **BOOLEAN**s, but they are 5th+ arguments and therefore live on
-                // the caller's stack: MSVC stores them with a 32-bit `mov dword ptr [rsp+N]` and
-                // leaves the upper half of the 8-byte slot holding whatever was there before (in
-                // practice the high half of a previously-stored pointer, `0x0000_0100`). Reading
-                // the slot as a full u64 saw `0x0000_0100_0000_4000` for a 16384-byte buffer, which
-                // failed the `MAX_QUERY_BUFFER` bound and returned STATUS_INSUFFICIENT_RESOURCES ⇒
-                // `GetLastError() == 1450` — the wall `CopyDirectory`'s `FindNextFileW` hit at
-                // `directory.c:160`. Truncating to the declared parameter width is what the real
-                // syscall stub does.
-                //
-                // ★ SCOPED, deliberately. The truncation is correct for EVERY caller, but applying
-                // it on the read-only FAT path also makes a large population of previously-failing
-                // loader enumerations succeed at once across smss/csrss/services/lsass — a real
-                // behaviour change which was MEASURED to destabilise the boot (each such call
-                // rescans a ~700-entry `\reactos` directory twice, and the boot stopped reaching
-                // its quiesce inside the gate's time budget). So it is applied to the WRITABLE
-                // VOLUME only; the read-only path keeps its pre-batch bound, unchanged. Widening
-                // the FAT path — with a per-`FILE_OBJECT` scan cache to pay for it — is a separate,
-                // tracked step, not something to smuggle in behind a profile batch.
-                let overlay_target = self
-                    .pm_pid_for_pi(self.pi)
-                    .and_then(|pid| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
-                    .is_some_and(|object| {
-                        matches!(object, nt_process::HandleObject::OverlayFile(_))
-                    });
-                let raw_length = if overlay_target { args[6] & 0xFFFF_FFFF } else { args[6] };
+                // `Length` is a ULONG and `ReturnSingleEntry` / `RestartScan` are BOOLEANs. They
+                // often live in stack slots whose high halves still contain older pointer data, so
+                // the ABI boundary must truncate them before validation for every filesystem path.
+                let raw_length = args[6] as u32 as u64;
                 let length = match usize::try_from(raw_length) {
                     Ok(length) if length <= MAX_QUERY_BUFFER => length,
                     _ => return STATUS_INSUFFICIENT_RESOURCES,
                 };
                 let information_class = args[7] as u32;
-                let (return_single_entry, restart_scan) = if overlay_target {
-                    (args[8] as u8 != 0, args[10] as u8 != 0)
-                } else {
-                    (args[8] != 0, args[10] != 0)
-                };
+                let return_single_entry = args[8] as u8 != 0;
+                let restart_scan = args[10] as u8 != 0;
                 if iosb == 0 || output == 0 {
                     return STATUS_ACCESS_VIOLATION;
                 }

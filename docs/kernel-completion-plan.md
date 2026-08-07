@@ -122,7 +122,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
    and `RootDirectory`/`NtQueryDirectoryObject` resolve through the same handle-table path. The
    remaining gates are debug syscall dispatch proofs, stale user-callback dead-client/nested proof
    bits after real explorer activity, VM pool-headroom accounting, and explorer's still-real
-   post-render `NtOpenDirectoryObject` loop.
+   post-render `NtWaitForSingleObject` activity while shell debug logging reports missing shell
+   paths.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads instead of cloning
@@ -132,9 +133,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
-   manual stack rereads for services whose metadata already carries all arguments, and then remove
-   any old scoped exceptions such as the read-only `NtQueryDirectoryFile` length path once the
-   directory scan cache/per-file state makes the genuine path affordable.
+   manual stack rereads for services whose metadata already carries all arguments. The old
+   read-only `NtQueryDirectoryFile` width exception is gone and the genuine FAT path stayed inside
+   the boot budget, so the next slices should audit remaining stack-captured native services rather
+   than adding syscall-local exceptions.
 
 ## Review Log
 
@@ -1136,6 +1138,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
   and boot proof `.tmp/boot-object-namespace-handles-20260807.log`. Result: no regression,
   `exec_explorer_shell_chrome_painted` still passes, final heap is `5942512/6291456`, and the run
-  remains at `282/290`. Review adjustment: explorer still reaches the iteration backstop on repeated
-  `NtOpenDirectoryObject` after rendering, so the next slice should capture and fix the actual object
-  path/status driving that loop rather than changing callback proof gates.
+  remains at `282/290`. Review adjustment: the repeated SSN at the iteration backstop is
+  `NtWaitForSingleObject` (SSN 281), not `NtOpenDirectoryObject`. The visible sequence waits on a
+  dispatcher object before each `OutputDebugString` DBWIN probe, so the next slice should capture the
+  actual wait object identity and fix the missing shell path/status driving that debug-output loop
+  rather than changing callback proof gates.
+- Native argument-width cleanup continued. `NtQueryDirectoryFile` now applies the NT ABI widths to
+  every filesystem path: `Length` is truncated as `ULONG`, and `ReturnSingleEntry`/`RestartScan` are
+  truncated as `BOOLEAN` before validation. This removes the old scoped writable-overlay-only
+  exception and lets read-only FAT directory queries execute the same declared-width path instead of
+  depending on high-half stack garbage. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-query-dir-widths-20260807.log`. Result: no regression,
+  `exec_explorer_shell_chrome_painted` still passes, final heap is `5944512/6291456`, and the run
+  remains at `282/290` with the same known `Dbgk*`, user-callback proof-bit, win32k nested transport,
+  and VM pool-headroom gates outstanding. Review adjustment: continue the ABI-width audit across
+  remaining native stack arguments while the proof frontier stays on the debug/callback accounting
+  gates and explorer's post-render wait/debug-output loop.
