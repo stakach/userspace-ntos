@@ -135,8 +135,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
    manual stack rereads for services whose metadata already carries all arguments. The old
    read-only `NtQueryDirectoryFile` width exception is gone and the genuine FAT path stayed inside
-   the boot budget, so the next slices should audit remaining stack-captured native services rather
-   than adding syscall-local exceptions.
+   the boot budget. `NtQueryFullAttributesFile` is now registered at its ReactOS SSN and implemented
+   against the same writable-overlay/FAT path authorities as `NtQueryAttributesFile`; the latest boot
+   did not exercise SSN 156, so the next slices should audit remaining stack-captured native services
+   and shell path/status failures rather than adding syscall-local exceptions.
 
 ## Review Log
 
@@ -1156,3 +1158,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and VM pool-headroom gates outstanding. Review adjustment: continue the ABI-width audit across
   remaining native stack arguments while the proof frontier stays on the debug/callback accounting
   gates and explorer's post-render wait/debug-output loop.
+- Native file-query surface cleanup. `NtQueryFullAttributesFile` is now present in
+  `NativeService`, registered in the Windows 7/ReactOS table at SSN 156, and backed by real path
+  state: writable overlay paths return `FILE_NETWORK_OPEN_INFORMATION` from `nt-fs`
+  `StandardInformation`, read-only install-tree paths return EOF/kind/attributes from the FAT
+  loader, and misses stay `STATUS_OBJECT_NAME_NOT_FOUND`. The new service deliberately does not add
+  the older hosted-image existence escape hatch. Validation: `cargo fmt --all`,
+  `cargo test -p nt-syscall`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-query-full-attrs-20260807.log`. Result: no regression,
+  `exec_explorer_shell_chrome_painted` still passes, final heap is `5944656/6291456`, and the run
+  remains at `282/290`. SSN 156 was not called in this boot; shell debug output still reports
+  `HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)` from `CStartMenu`/`startmnu`, so the next shell-path
+  slice should trace the real `SHGetSpecialFolderLocation`/PIDL route rather than treating DBWIN
+  debug-output waits as the cause.

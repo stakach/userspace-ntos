@@ -8979,6 +8979,25 @@ impl ExecNtHandler {
         self.xas_try_write_buf(output, &basic)
     }
 
+    /// Render FILE_NETWORK_OPEN_INFORMATION. The backing volumes currently expose timestamps as
+    /// unknown, so all four time fields remain zero; EOF/kind/attributes come from the real path.
+    unsafe fn write_file_network_open_information(
+        &self,
+        output: u64,
+        info: nt_fs::StandardInformation,
+    ) -> bool {
+        let mut network = [0u8; 56];
+        let allocation_size = if info.is_directory {
+            0
+        } else {
+            info.end_of_file.saturating_add(0xFFF) & !0xFFF
+        };
+        network[0x20..0x28].copy_from_slice(&allocation_size.to_le_bytes());
+        network[0x28..0x30].copy_from_slice(&info.end_of_file.to_le_bytes());
+        network[0x30..0x34].copy_from_slice(&info.attributes.to_le_bytes());
+        self.xas_try_write_buf(output, &network)
+    }
+
     /// Validate event OBJECT_ATTRIBUTES and return its root handle plus optional object name.
     pub(crate) unsafe fn read_event_object_attributes(
         &self,
@@ -10277,6 +10296,87 @@ impl ExecNtHandler {
             }
             0xC000_0034
         };
+        unsafe {
+            loader_trace_record(
+                self.pi,
+                LoaderOp::QueryAttributesFile,
+                status,
+                reg.resolve_name(&nb[..nlen]),
+                0,
+                0,
+                &nb[..nlen],
+            );
+        }
+        status
+    }
+
+    #[inline(never)]
+    unsafe fn nt_query_full_attributes_file_service(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        let ctx = self.loop_ctx.unwrap();
+        let reg = unsafe { &*ctx.reg };
+        let name16_buf = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_NAME16_SCRATCH) };
+        let Some(name16_len) = (unsafe { self.read_objattr_name_pe_into(args[0], name16_buf) })
+        else {
+            return STATUS_OBJECT_NAME_INVALID;
+        };
+        let name16 = &name16_buf[..name16_len];
+        if name16.is_empty() {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+
+        let folded_scratch =
+            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+        let relative_scratch =
+            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
+        if let Some(relative_len) =
+            crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
+        {
+            return match crate::writable_fs::query_attributes_relative(
+                &relative_scratch[..relative_len],
+            ) {
+                Some(info) if unsafe { self.write_file_network_open_information(args[1], info) } => {
+                    nt_fs::STATUS_SUCCESS
+                }
+                Some(_) => STATUS_ACCESS_VIOLATION,
+                None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+            };
+        }
+
+        if let Some(info) = crate::fs_loader::query_nt_path_standard_info_into(
+            name16,
+            folded_scratch,
+            relative_scratch,
+        ) {
+            return if unsafe { self.write_file_network_open_information(args[1], info) } {
+                nt_fs::STATUS_SUCCESS
+            } else {
+                STATUS_ACCESS_VIOLATION
+            };
+        }
+
+        let mut nb = [0u8; 96];
+        let mut nlen = 0;
+        for &w in name16 {
+            if nlen >= nb.len() {
+                break;
+            }
+            nb[nlen] = (w as u8).to_ascii_lowercase();
+            nlen += 1;
+        }
+        let status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
+        if self.pi >= 1 && self.pi != 2 {
+            print_str(b"[ntos-exec] NtQueryFullAttributesFile not-found: \"");
+            for &w in name16.iter().take(96) {
+                debug_put_char(if (0x20..0x7f).contains(&w) {
+                    w as u8
+                } else {
+                    b'?'
+                });
+            }
+            print_str(b"\"\n");
+        }
         unsafe {
             loader_trace_record(
                 self.pi,
@@ -15977,6 +16077,9 @@ impl ExecNtHandler {
                     NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY
                 ));
                 service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
+            },
+            NativeService::NtQueryFullAttributesFile => unsafe {
+                self.nt_query_full_attributes_file_service(args)
             },
             // NtCreateIoCompletion(*Handle, DesiredAccess, *OA, NumberOfConcurrentThreads).
             // The NT object and its packet queue live in the executive; SURT is only the transport

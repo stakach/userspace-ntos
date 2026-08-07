@@ -1194,10 +1194,12 @@ pub const SSN_NT_MAKE_TEMPORARY_OBJECT: u64 = 110;
 pub const SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT: u64 = 133;
 /// NtDisplayString SSN (smss prints a boot/status string). sysfuncs 71 − 1. Routed to serial.
 pub const SSN_NT_DISPLAY_STRING: u64 = 70;
-/// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
+/// ntdll's NtOpenFile SSN for path-based file opens.
 pub const SSN_NT_OPEN_FILE: u64 = 122;
-/// ntdll's NtQueryAttributesFile SSN (LdrpInitialize probes a file's existence; no FS → not-found).
+/// ntdll's NtQueryAttributesFile SSN for path-based FILE_BASIC_INFORMATION probes.
 pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
+/// NtQueryFullAttributesFile SSN. Path-based FILE_NETWORK_OPEN_INFORMATION over real FS state.
+pub const SSN_NT_QUERY_FULL_ATTRIBUTES_FILE: u64 = 156;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
 pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
@@ -15345,10 +15347,14 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_ALLOCATE_VM as u32,
             ),
             (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),
-            // Workstream A batch 6 (group C ladder migrations): name-scoped file fakes.
+            // Workstream A batch 6 (group C ladder migrations): path-scoped file probes.
             (
                 NativeService::NtQueryAttributesFile,
                 SSN_NT_QUERY_ATTRIBUTES_FILE as u32,
+            ),
+            (
+                NativeService::NtQueryFullAttributesFile,
+                SSN_NT_QUERY_FULL_ATTRIBUTES_FILE as u32,
             ),
             (NativeService::NtOpenFile, SSN_NT_OPEN_FILE as u32),
             // Workstream A batch 7 (group C): section-image query + locale demand-fill.

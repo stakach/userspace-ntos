@@ -191,6 +191,22 @@ fn query_directory_file_keeps_native_eleven_argument_contract() {
 }
 
 #[test]
+fn query_full_attributes_file_registers_with_native_contract() {
+    assert_eq!(
+        NativeService::NtQueryFullAttributesFile.name(),
+        "NtQueryFullAttributesFile"
+    );
+    assert_eq!(NativeService::NtQueryFullAttributesFile.arg_count(), (2, 2));
+    assert_eq!(
+        nt_syscall_abi::ssn_of("NtQueryFullAttributesFile"),
+        Some(156)
+    );
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtQueryFullAttributesFile)
+        .is_some());
+}
+
+#[test]
 fn unknown_service_rejected() {
     let d = dispatcher();
     let mut ks = services();

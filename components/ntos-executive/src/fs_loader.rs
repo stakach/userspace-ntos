@@ -470,6 +470,29 @@ pub(crate) unsafe fn query_nt_path_attributes_into(
     Some(nt_fs::file_attributes_from_fat(fat_attributes))
 }
 
+pub(crate) unsafe fn query_nt_path_standard_info_into(
+    name: &[u16],
+    folded: &mut [u8],
+    relative: &mut [u8],
+) -> Option<nt_fs::StandardInformation> {
+    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
+    if len == 0 {
+        return Some(nt_fs::StandardInformation {
+            end_of_file: 0,
+            is_directory: true,
+            attributes: nt_fs::FILE_ATTRIBUTE_DIRECTORY,
+        });
+    }
+    let fs = exec_fs()?;
+    let (_, size, fat_attributes) = fat_open_path_entry(&fs, &relative[..len])?;
+    let attributes = nt_fs::file_attributes_from_fat(fat_attributes);
+    Some(nt_fs::StandardInformation {
+        end_of_file: size as u64,
+        is_directory: attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0,
+        attributes,
+    })
+}
+
 // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------
 // After the isolated storage host reports and PARKS, the executive drives the SAME AHCI HBA itself
 // (it owns the BAR cap at AHCI_VADDR + the DMA frame cap + the VT-d IO mapping at AHCI_IOVA) to

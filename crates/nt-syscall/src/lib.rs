@@ -211,6 +211,7 @@ pub enum NativeService {
     // Group C: section/registry/spawn services entangled with the executive's fault-loop state.
     NtOpenSection,
     NtQueryAttributesFile,
+    NtQueryFullAttributesFile,
     NtQuerySection,
     NtQueryDefaultLocale,
     NtSetDefaultLocale,
@@ -356,6 +357,7 @@ impl NativeService {
             NtQueryVolumeInformationFile => "NtQueryVolumeInformationFile",
             NtOpenSection => "NtOpenSection",
             NtQueryAttributesFile => "NtQueryAttributesFile",
+            NtQueryFullAttributesFile => "NtQueryFullAttributesFile",
             NtQuerySection => "NtQuerySection",
             NtQueryDefaultLocale => "NtQueryDefaultLocale",
             NtSetDefaultLocale => "NtSetDefaultLocale",
@@ -512,6 +514,7 @@ impl NativeService {
         NativeService::NtCreateMutant,
         NativeService::NtOpenMutant,
         NativeService::NtReleaseMutant,
+        NativeService::NtQueryFullAttributesFile,
     ];
 }
 
