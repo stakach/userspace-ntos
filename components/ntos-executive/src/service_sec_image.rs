@@ -695,6 +695,12 @@ unsafe fn service_generic_section_fault(
     };
     let section_page_offset = view.section_offset + (page - view.base);
     let page_index = section_page_offset / 0x1000;
+    let Some(view_info) = process_committed_mapping_basic_information(pi as u64, page) else {
+        return Err(nt_address_space::STATUS_NOT_COMMITTED);
+    };
+    if view_info.type_ != nt_address_space::MEM_MAPPED {
+        return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+    }
     let frame = service_generic_section_frame(
         generic_sections,
         section_index,
@@ -710,7 +716,7 @@ unsafe fn service_generic_section_fault(
         }
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    let map_error = page_map_r(map_cap, page, vm_page_rights(view.protection), pml4);
+    let map_error = page_map_r(map_cap, page, vm_page_rights(view_info.protect), pml4);
     if map_error != 0 {
         let _ = cnode_delete_recycle_r(map_cap);
         if map_error == 8 && csrss_frame_get_exact(pi as u64, page).0 != 0 {

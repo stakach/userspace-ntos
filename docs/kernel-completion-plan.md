@@ -212,10 +212,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    slots cannot leak prior address-space state into a live process. Boot proof
    `.tmp/boot-committed-image-fault-owner-20260809-r2.log` is fully green at `291/291` with
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. The latest C3 mapped-view protection
+   slice moves mapped data-section `NtProtectVirtualMemory` ownership into the committed-view table:
+   the table can split committed mapped/image ranges on protect, generic section faults map pages
+   with the live committed protection, and the stale per-view protection field is gone. Boot proof
+   `.tmp/boot-committed-mapped-protect-20260809.log` is fully green at `291/291` with
+   `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
    shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
    structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, C3 mapped-data dirty/writeback and mapped-image protect
-   ownership, C4 regressions, and D1/D2 mutable registry/filesystem authority.
+   B3's real video/driver binding, C3 mapped-data dirty/writeback ownership plus MEM_IMAGE
+   protect/COW semantics, C4 regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1637,3 +1643,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_vm_pool_headroom` is green with `52069 KiB` root-Untyped free, and explorer shell chrome
   still paints `34873` non-background pixels. Review adjustment: continue C3 with mapped data-section
   dirty/writeback ownership and mapped-image protect semantics, then close the C4 regression gates.
+
+- C3 committed mapped-view protect slice. `VmCommittedRangeTable::protect` now validates committed
+  non-private views, rejects invalid section-cache flags and private writecopy upgrades, and rewrites
+  only the affected page-aligned committed runs while preserving allocation base/type ownership.
+  `NtProtectVirtualMemory` routes `MEM_MAPPED` committed views through committed-view snapshots before
+  falling through to private VADs, reprotects resident pages with rollback on failure, and writes the
+  normalized base/size plus old protection through the real syscall outputs. Generic section faults
+  now require a committed `MEM_MAPPED` owner and derive seL4 page rights from that live committed
+  protection, so the old `GenericSectionView.protection` field has been removed. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-committed-mapped-protect-20260809.log`. Result: kernel specs pass,
+  the full executive gate is `291/291`, `committed-map=233/512`, `committed-map-fails=0`,
+  `exec_vm_pool_headroom` is green with `52244 KiB` root-Untyped free, and explorer shell chrome
+  still paints `34873` non-background pixels. Review adjustment: remaining C3 work is mapped
+  data-section dirty/writeback ownership plus MEM_IMAGE protect/COW semantics, then the C4
+  overlap/decommit/protect/view-teardown regression gates.

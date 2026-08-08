@@ -1436,6 +1436,33 @@ pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
     core::ptr::write(table, nt_address_space::VmCommittedRangeTable::new());
 }
 
+pub(crate) unsafe fn process_committed_mapping_snapshot(
+    pi: u64,
+) -> Option<nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>> {
+    if pi as usize >= MAX_PI {
+        return None;
+    }
+    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
+        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    Some(*table)
+}
+
+pub(crate) unsafe fn process_committed_mapping_replace(
+    pi: u64,
+    replacement: nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
+) -> bool {
+    if pi as usize >= MAX_PI {
+        return false;
+    }
+    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
+        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    *table = replacement;
+    note_high_water(&VM_COMMITTED_MAPPING_HW, (*table).range_count() as u64);
+    true
+}
+
 pub(crate) unsafe fn process_committed_mapping_unregister(pi: u64, base: u64) -> bool {
     if pi as usize >= MAX_PI {
         return false;
@@ -1584,7 +1611,6 @@ pub(crate) struct GenericSectionView {
     pub(crate) base: u64,
     pub(crate) size: u64,
     pub(crate) section_offset: u64,
-    pub(crate) protection: u32,
 }
 
 impl GenericSectionView {
@@ -1596,7 +1622,6 @@ impl GenericSectionView {
             base: 0,
             size: 0,
             section_offset: 0,
-            protection: nt_address_space::PAGE_NOACCESS,
         }
     }
 
@@ -1736,7 +1761,6 @@ impl GenericSectionTable {
         base: u64,
         size: u64,
         section_offset: u64,
-        protection: u32,
     ) -> bool {
         if self.section(section_index).is_none() || base == 0 || size == 0 {
             return false;
@@ -1750,7 +1774,6 @@ impl GenericSectionTable {
                     base,
                     size,
                     section_offset,
-                    protection,
                 };
                 return true;
             }
@@ -1831,6 +1854,12 @@ pub(crate) static mut VM_MAP_BEFORE: nt_address_space::VmRegionMap<VM_REGION_CAP
     nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
 pub(crate) static mut VM_MAP_AFTER: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
     nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+pub(crate) static mut COMMITTED_MAP_BEFORE: nt_address_space::VmCommittedRangeTable<
+    PROCESS_COMMITTED_MAPPING_CAPACITY,
+> = nt_address_space::VmCommittedRangeTable::new();
+pub(crate) static mut COMMITTED_MAP_AFTER: nt_address_space::VmCommittedRangeTable<
+    PROCESS_COMMITTED_MAPPING_CAPACITY,
+> = nt_address_space::VmCommittedRangeTable::new();
 const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
 static mut PROCESS_VM_PT_CAPS: [[u64; PRIVATE_VM_PT_COUNT]; MAX_PI] =
     [[0; PRIVATE_VM_PT_COUNT]; MAX_PI];

@@ -7391,6 +7391,84 @@ impl ExecNtHandler {
         if target.pml4 == 0 || target.scratch_base == 0 {
             return nt_process::STATUS_INVALID_HANDLE;
         }
+        if process_committed_mapping_basic_information(target_pi as u64, base)
+            .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
+        {
+            let before_committed = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_BEFORE);
+            let after_committed = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER);
+            let Some(snapshot) = process_committed_mapping_snapshot(target_pi as u64) else {
+                return nt_process::STATUS_INVALID_HANDLE;
+            };
+            *before_committed = snapshot;
+            *after_committed = *before_committed;
+            let plan = match after_committed.protect(base, size, new_protection) {
+                Ok(plan) => plan,
+                Err(status) => return status,
+            };
+            let mut page = plan.base;
+            let mut changed_end = plan.base;
+            let mut map_status = 0u32;
+            while page < plan.base + plan.size {
+                let old = before_committed.query_basic(page);
+                let new = after_committed.query_basic(page);
+                if let (Some(old), Some(new)) = (old, new) {
+                    if old.protect != new.protect
+                        && csrss_frame_get_exact(target_pi as u64, page).0 != 0
+                    {
+                        if let Err(status) = vm_reprotect_private_page(
+                            target_pi,
+                            page,
+                            old.protect,
+                            new.protect,
+                            target.pml4,
+                        ) {
+                            map_status = status;
+                            break;
+                        }
+                    }
+                }
+                page += 0x1000;
+                changed_end = page;
+            }
+            if map_status != 0 {
+                page = plan.base;
+                while page < changed_end {
+                    let old = before_committed.query_basic(page);
+                    let new = after_committed.query_basic(page);
+                    if let (Some(old), Some(new)) = (old, new) {
+                        if old.protect != new.protect
+                            && csrss_frame_get_exact(target_pi as u64, page).0 != 0
+                        {
+                            let _ = vm_reprotect_private_page(
+                                target_pi,
+                                page,
+                                new.protect,
+                                old.protect,
+                                target.pml4,
+                            );
+                        }
+                    }
+                    page += 0x1000;
+                }
+                return map_status;
+            }
+            if !process_committed_mapping_replace(target_pi as u64, *after_committed) {
+                return nt_process::STATUS_INVALID_HANDLE;
+            }
+            loader_trace_record(
+                self.pi,
+                LoaderOp::ProtectVirtualMemory,
+                0,
+                None,
+                plan.base,
+                plan.size,
+                b"",
+            );
+            let _ = self.user_memory_write(memory, oldprot_ptr, &plan.old_protection.to_le_bytes());
+            let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
+            let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
+            return 0;
+        }
         let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
             as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
             .add(target_pi);
@@ -18753,7 +18831,6 @@ impl ExecNtHandler {
                         plan.base,
                         plan.size,
                         section_offset,
-                        view_protection,
                     ) {
                         core::ptr::write(vm_map, *before);
                         return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;

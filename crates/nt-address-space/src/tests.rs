@@ -1040,13 +1040,54 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
             allocation_end: 0x8000_3000,
         })
     );
+    assert_eq!(
+        table.protect(0x8000_1800, 0x800, PAGE_NOACCESS),
+        Ok(VmCommittedProtectPlan {
+            base: 0x8000_1000,
+            size: 0x1000,
+            old_protection: PAGE_EXECUTE_READ,
+            new_protection: PAGE_NOACCESS,
+        })
+    );
+    assert_eq!(
+        table.query_basic(0x8000_1000).unwrap().protect,
+        PAGE_NOACCESS
+    );
+    assert_eq!(
+        table.query_basic(0x8000_2000).unwrap().protect,
+        PAGE_EXECUTE_READ
+    );
+    assert_eq!(
+        table.image_allocation_for_page(0x8000_2123),
+        Some(VmImageAllocation {
+            allocation_base: 0x8000_0000,
+            allocation_end: 0x8000_3000,
+        })
+    );
+    assert_eq!(
+        table.protect(0x8000_1000, 0x1000, PAGE_READONLY | PAGE_NOCACHE),
+        Err(STATUS_INVALID_PARAMETER_4)
+    );
+    assert_eq!(
+        table.protect(0x9000_0000, 0x1000, PAGE_READWRITE),
+        Ok(VmCommittedProtectPlan {
+            base: 0x9000_0000,
+            size: 0x1000,
+            old_protection: PAGE_READONLY,
+            new_protection: PAGE_READWRITE,
+        })
+    );
+    assert_eq!(
+        table.query_basic(0x9000_0000).unwrap().protect,
+        PAGE_READWRITE
+    );
     assert_eq!(table.unregister_base(0x8000_0000), Some(headers));
     assert!(table.query_basic(0x8000_0123).is_none());
     assert_eq!(
         table.query_basic(0x8000_1000).unwrap().protect,
-        PAGE_EXECUTE_READ
+        PAGE_NOACCESS
     );
-    assert_eq!(table.unregister_allocation_base(0x8000_0000), 1);
+    assert_eq!(table.unregister_allocation_base(0x8000_0000), 2);
     assert!(table.query_basic(0x8000_1000).is_none());
     assert_eq!(table.image_allocation_for_page(0x8000_1000), None);
     assert_eq!(table.range_count(), 1);

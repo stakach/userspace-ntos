@@ -317,6 +317,14 @@ pub struct VmImageAllocation {
     pub allocation_end: u64,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmCommittedProtectPlan {
+    pub base: u64,
+    pub size: u64,
+    pub old_protection: u32,
+    pub new_protection: u32,
+}
+
 impl VmCommittedRange {
     pub const fn private(base: u64, size: u64, protect: u32) -> Self {
         Self {
@@ -490,6 +498,92 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         })
     }
 
+    pub fn protect(
+        &mut self,
+        address: u64,
+        size: u64,
+        new_protection: u32,
+    ) -> Result<VmCommittedProtectPlan, u32> {
+        validate_protect_parameters(new_protection)?;
+        let base = address & !(PAGE_SIZE - 1);
+        let Some(end_unrounded) = address.checked_add(size) else {
+            return Err(STATUS_INVALID_PARAMETER_3);
+        };
+        let end = end_unrounded
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+            .ok_or(STATUS_INVALID_PARAMETER_3)?;
+        if size == 0 || end <= base {
+            return Err(STATUS_INVALID_PARAMETER_3);
+        }
+        let first = self
+            .ranges
+            .iter()
+            .flatten()
+            .copied()
+            .find(|range| range.contains(base))
+            .ok_or(STATUS_CONFLICTING_ADDRESSES)?;
+        if first.type_ != MEM_PRIVATE && new_protection & (PAGE_NOCACHE | PAGE_WRITECOMBINE) != 0 {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        let new_base_protection = new_protection & 0xff;
+        if first.type_ == MEM_PRIVATE
+            && matches!(new_base_protection, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
+        {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+
+        let mut cursor = base;
+        while cursor < end {
+            let range = self
+                .ranges
+                .iter()
+                .flatten()
+                .copied()
+                .find(|range| range.contains(cursor))
+                .ok_or(STATUS_NOT_COMMITTED)?;
+            if range.allocation_base != first.allocation_base || range.type_ != first.type_ {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            cursor = range.end().min(end);
+        }
+
+        let mut replacement = [None; N];
+        let mut used = 0usize;
+        for range in self.ranges.iter().flatten().copied() {
+            if range.end() <= base || range.base >= end {
+                push_committed_range(&mut replacement, &mut used, range)?;
+                continue;
+            }
+            if range.base < base {
+                let mut left = range;
+                left.size = base - range.base;
+                push_committed_range(&mut replacement, &mut used, left)?;
+            }
+            let overlap_base = range.base.max(base);
+            let overlap_end = range.end().min(end);
+            let mut middle = range;
+            middle.base = overlap_base;
+            middle.size = overlap_end - overlap_base;
+            middle.protect = new_protection;
+            push_committed_range(&mut replacement, &mut used, middle)?;
+            if range.end() > end {
+                let mut right = range;
+                right.base = end;
+                right.size = range.end() - end;
+                push_committed_range(&mut replacement, &mut used, right)?;
+            }
+        }
+        self.ranges = replacement;
+        self.normalize();
+        Ok(VmCommittedProtectPlan {
+            base,
+            size: end - base,
+            old_protection: first.protect,
+            new_protection,
+        })
+    }
+
     pub fn next_base_after(&self, address: u64) -> Option<u64> {
         self.ranges
             .iter()
@@ -534,6 +628,22 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         }
         self.ranges[write..].fill(None);
     }
+}
+
+fn push_committed_range<const N: usize>(
+    ranges: &mut [Option<VmCommittedRange>; N],
+    used: &mut usize,
+    range: VmCommittedRange,
+) -> Result<(), u32> {
+    if range.size == 0 {
+        return Ok(());
+    }
+    if *used >= N {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    ranges[*used] = Some(range);
+    *used += 1;
+    Ok(())
 }
 
 /// A per-private-page protection override. ReactOS `MiProtectVirtualMemory` changes PTE
