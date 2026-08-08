@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
 
 ## Objective
 
@@ -114,10 +114,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `CheckForLiveCD`/control-set copy path is no longer corrupting its advapi32 `RegCopyTreeW`
    buffers. `Win32ServiceLaunchSpec` now also projects the service `ImagePath` into a generic
    process-launch command line plus normalized NT image path, and the executive SCM selection gate
-   requires that projection for both auto-start and demand-start Win32 services. The next SCM step is
-   still live proof that services.exe's real auto-start path reaches a non-bootstrap Win32 service
-   child through the ordinary CreateProcess/NtOpenFile/NtCreateSection/NtCreateProcess route, without
-   adding kernel-side service-name policy.
+   requires that projection for both auto-start and demand-start Win32 services. A registry syscall
+   prerequisite exposed by the latest desktop boot has also been removed: `NtQueryKey` now answers
+   the standard key information classes from the merged base-hive/overlay view instead of only
+   `KeyFullInformation`, so HKCR, SCM, shell, and driver registry consumers can size and retry those
+   queries normally. The next SCM step is still live proof that services.exe's real auto-start path
+   reaches a non-bootstrap Win32 service child through the ordinary
+   CreateProcess/NtOpenFile/NtCreateSection/NtCreateProcess route, without adding kernel-side
+   service-name policy.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
@@ -141,10 +145,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    completion plan rather than adding more boot-frontier special cases.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
-   now computes merged key counts/max lengths with length-only indexed reads instead of cloning
-   whole subkey/value snapshots. D2/D4 still need the Configuration Manager/Hive Manager to become
-   the live authority for mutable hives, durable setup/profile state, and remaining long-lived
-   registry data.
+   now computes merged key counts/max lengths with length-only indexed reads and returns
+   `KeyBasicInformation`, `KeyNodeInformation`, `KeyFullInformation`, `KeyNameInformation`,
+   `KeyCachedInformation`, and `KeyFlagsInformation` with NT buffer-retry statuses. D2/D4 still need
+   the Configuration Manager/Hive Manager to become the live authority for mutable hives, durable
+   setup/profile state, and remaining long-lived registry data.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -1277,3 +1282,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `.tmp/boot-service-process-launch-20260807-rerun.log` (`290/290`, SCM launch-spec gates,
   services.exe, VM pool headroom, explorer shell chrome, and sentinel green). Review adjustment: keep
   A3 focused on live services.exe auto-start child proof without kernel-side service-name policy.
+
+### 2026-08-08
+
+- Registry syscall prerequisite slice. `NtQueryKey` now answers the standard NT key-information
+  classes over the executive's merged base-hive/overlay registry view: basic, node, full, name,
+  cached, and key user flags. The handler now reports `STATUS_BUFFER_TOO_SMALL` for buffers shorter
+  than the fixed header, `STATUS_BUFFER_OVERFLOW` for retryable variable-length truncation, and the
+  real full path for `KeyNameInformation`, removing the previous `STATUS_INVALID_INFO_CLASS` wall
+  ReactOS advapi32 logged while resolving HKCR keys. Validation:
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: run the next single boot proof and inspect whether services.exe now advances
+  farther through SCM database/HKCR handling toward a real non-bootstrap service child spawn; keep
+  the proof dynamic and do not add service-name or executable-name launch policy.

@@ -60,6 +60,96 @@ impl RegistryKeyStats {
     }
 }
 
+fn utf16le_byte_len(s: &str) -> usize {
+    s.encode_utf16().count().saturating_mul(2)
+}
+
+fn append_utf16le(out: &mut alloc::vec::Vec<u8>, s: &str) {
+    for w in s.encode_utf16() {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+fn registry_query_leaf_name(path: &str) -> &str {
+    path.rsplit('\\')
+        .find(|component| !component.is_empty())
+        .unwrap_or(path)
+}
+
+fn build_registry_key_query_info(
+    info_class: u32,
+    full_path: &str,
+    stats: RegistryKeyStats,
+) -> Result<(alloc::vec::Vec<u8>, usize), u32> {
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    let leaf = registry_query_leaf_name(full_path);
+    let leaf_bytes = utf16le_byte_len(leaf);
+    match info_class {
+        0 => {
+            // KEY_BASIC_INFORMATION
+            let header = 0x10usize;
+            let mut info = alloc::vec::Vec::with_capacity(header + leaf_bytes);
+            info.resize(header, 0);
+            info[0x0c..0x10].copy_from_slice(&(leaf_bytes as u32).to_le_bytes());
+            append_utf16le(&mut info, leaf);
+            Ok((info, header))
+        }
+        1 => {
+            // KEY_NODE_INFORMATION. Mounted/overlay keys currently carry no class string.
+            let header = 0x18usize;
+            let mut info = alloc::vec::Vec::with_capacity(header + leaf_bytes);
+            info.resize(header, 0);
+            info[0x0c..0x10].copy_from_slice(&u32::MAX.to_le_bytes());
+            info[0x14..0x18].copy_from_slice(&(leaf_bytes as u32).to_le_bytes());
+            append_utf16le(&mut info, leaf);
+            Ok((info, header))
+        }
+        2 => {
+            // KEY_FULL_INFORMATION. No class string: ClassLength=0, ClassOffset=-1.
+            let header = 0x2cusize;
+            let mut info = alloc::vec::Vec::new();
+            info.resize(header, 0);
+            info[0x0c..0x10].copy_from_slice(&u32::MAX.to_le_bytes());
+            info[0x14..0x18].copy_from_slice(&stats.subkeys.to_le_bytes());
+            info[0x18..0x1c].copy_from_slice(&stats.max_subkey_name_bytes.to_le_bytes());
+            info[0x20..0x24].copy_from_slice(&stats.values.to_le_bytes());
+            info[0x24..0x28].copy_from_slice(&stats.max_value_name_bytes.to_le_bytes());
+            info[0x28..0x2c].copy_from_slice(&stats.max_value_data_bytes.to_le_bytes());
+            Ok((info, header))
+        }
+        3 => {
+            // KEY_NAME_INFORMATION
+            let header = 0x04usize;
+            let path_bytes = utf16le_byte_len(full_path);
+            let mut info = alloc::vec::Vec::with_capacity(header + path_bytes);
+            info.resize(header, 0);
+            info[0..4].copy_from_slice(&(path_bytes as u32).to_le_bytes());
+            append_utf16le(&mut info, full_path);
+            Ok((info, header))
+        }
+        4 => {
+            // KEY_CACHED_INFORMATION. sizeof is 0x28 on the x64 NT ABI due tail padding.
+            let header = 0x28usize;
+            let mut info = alloc::vec::Vec::new();
+            info.resize(header, 0);
+            info[0x0c..0x10].copy_from_slice(&stats.subkeys.to_le_bytes());
+            info[0x10..0x14].copy_from_slice(&stats.max_subkey_name_bytes.to_le_bytes());
+            info[0x14..0x18].copy_from_slice(&stats.values.to_le_bytes());
+            info[0x18..0x1c].copy_from_slice(&stats.max_value_name_bytes.to_le_bytes());
+            info[0x1c..0x20].copy_from_slice(&stats.max_value_data_bytes.to_le_bytes());
+            info[0x20..0x24].copy_from_slice(&(leaf_bytes as u32).to_le_bytes());
+            Ok((info, header))
+        }
+        5 => {
+            // KEY_USER_FLAGS_INFORMATION. No user flags are attached to our key bodies yet.
+            let mut info = alloc::vec::Vec::new();
+            info.resize(4, 0);
+            Ok((info, 4))
+        }
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
+}
+
 #[unsafe(no_mangle)]
 #[inline(never)]
 unsafe extern "C" fn exec_nt_open_file_service_entry(
@@ -12157,62 +12247,56 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS
             },
             // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
-            // *ResultLength[4]). RegQueryInfoKeyW (KeyFullInformation) reads the subkey/value
-            // counts + max name lengths of a hive key to size its RegEnumKeyExW buffers.
+            // *ResultLength[4]). Registry consumers use the standard key-info classes for sizing,
+            // HKCR path resolution, service enumeration, and cached count queries. Answer from the
+            // same merged base-hive/overlay view as NtEnumerateKey/NtQueryValueKey.
             NativeService::NtQueryKey => unsafe {
-                let key = match self.resolve_registry_key(args[0], 0x1) {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+                const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+                let info_class = args[1] as u32;
+                let required_access = if info_class == 3 { 0 } else { 0x1 };
+                let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
                 let use_xas_write = self.pi >= 2;
                 let stats = self.registry_key_stats(key);
-                let info_class = args[1] as u32;
                 let output_length = args[3] as u32 as usize;
-                // class 2 = KeyFullInformation {LastWriteTime@0(8), TitleIndex@8, ClassOffset@0xc,
-                // ClassLength@0x10, SubKeys@0x14, MaxNameLen@0x18, MaxClassLen@0x1c, Values@0x20,
-                // MaxValueNameLen@0x24, MaxValueDataLen@0x28, Class@0x2c}. We report no Class.
-                if info_class != 2 {
-                    // KeyBasic/Node/Name classes on THIS key aren't needed by the SCM path; report a
-                    // clean empty full-info-sized answer is wrong for them, so signal invalid-info.
-                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
-                }
-                let struct_size = 0x2cu32;
-                let mut info = [0u8; 0x2c];
-                info[0x0c..0x10].copy_from_slice(&struct_size.to_le_bytes()); // ClassOffset
-                // ClassLength@0x10 = 0
-                info[0x14..0x18].copy_from_slice(&stats.subkeys.to_le_bytes());
-                info[0x18..0x1c].copy_from_slice(&stats.max_subkey_name_bytes.to_le_bytes());
-                // MaxClassLen@0x1c = 0
-                info[0x20..0x24].copy_from_slice(&stats.values.to_le_bytes());
-                info[0x24..0x28].copy_from_slice(&stats.max_value_name_bytes.to_le_bytes());
-                info[0x28..0x2c].copy_from_slice(&stats.max_value_data_bytes.to_le_bytes());
-                if self
-                    .registry_target_path(key)
-                    .as_deref()
-                    .is_some_and(Self::is_dynamic_user_volatile_env_canon)
-                {
+                let full_path = self.registry_target_path(key).unwrap_or_default();
+                let (info, minimum_length) =
+                    match build_registry_key_query_info(info_class, &full_path, stats) {
+                        Ok(info) => info,
+                        Err(status) => return status,
+                    };
+                if Self::is_dynamic_user_volatile_env_canon(&full_path) {
                     USER_VOLATILE_ENV_QUERIED.fetch_add(1, Ordering::Relaxed);
                     USER_VOLATILE_ENV_QUERY_VALUE_COUNT.store(stats.values as u64, Ordering::Relaxed);
                 }
-                let total = struct_size.to_le_bytes();
+                let total = (info.len() as u32).to_le_bytes();
                 if use_xas_write {
                     if !self.xas_try_write_buf(args[4], &total) {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        return STATUS_ACCESS_VIOLATION;
                     }
                 } else {
                     smss_copyout(args[4], &total); // *ResultLength
                 }
-                if output_length < struct_size as usize {
-                    return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
+                if output_length < minimum_length {
+                    return STATUS_BUFFER_TOO_SMALL;
                 }
+                let copy_len = output_length.min(info.len());
                 if use_xas_write {
-                    if !self.xas_try_write_buf(args[2], &info) {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    if !self.xas_try_write_buf(args[2], &info[..copy_len]) {
+                        return STATUS_ACCESS_VIOLATION;
                     }
                 } else {
-                    self.xas_write_buf(args[2], &info);
+                    self.xas_write_buf(args[2], &info[..copy_len]);
                 }
-                0 // STATUS_SUCCESS
+                if output_length < info.len() {
+                    STATUS_BUFFER_OVERFLOW
+                } else {
+                    0
+                }
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
             // IoStatusBlock[R9], ...). winlogon's StartRpcServer → rpcrt4 ncacn_np creates
