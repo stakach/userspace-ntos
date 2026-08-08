@@ -73,6 +73,16 @@ unsafe fn registered_frame_basic_information(
     })
 }
 
+fn committed_mapping_effective_page_protection(
+    info: nt_address_space::VmBasicInformation,
+) -> u32 {
+    if info.type_ == nt_address_space::MEM_MAPPED {
+        nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection
+    } else {
+        info.protect
+    }
+}
+
 impl RegistryKeyStats {
     fn add_subkey(&mut self, name_bytes: usize) {
         self.subkeys = self.subkeys.saturating_add(1);
@@ -7391,9 +7401,7 @@ impl ExecNtHandler {
         if target.pml4 == 0 || target.scratch_base == 0 {
             return nt_process::STATUS_INVALID_HANDLE;
         }
-        if process_committed_mapping_basic_information(target_pi as u64, base)
-            .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
-        {
+        if process_committed_mapping_basic_information(target_pi as u64, base).is_some() {
             let before_committed = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_BEFORE);
             let after_committed = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER);
             let Some(snapshot) = process_committed_mapping_snapshot(target_pi as u64) else {
@@ -7415,12 +7423,8 @@ impl ExecNtHandler {
                     if old.protect != new.protect
                         && csrss_frame_get_exact(target_pi as u64, page).0 != 0
                     {
-                        let old_page_protection =
-                            nt_address_space::mapped_view_fault_plan(old.protect, false)
-                                .map_protection;
-                        let new_page_protection =
-                            nt_address_space::mapped_view_fault_plan(new.protect, false)
-                                .map_protection;
+                        let old_page_protection = committed_mapping_effective_page_protection(old);
+                        let new_page_protection = committed_mapping_effective_page_protection(new);
                         if let Err(status) = vm_reprotect_private_page(
                             target_pi,
                             page,
@@ -7446,11 +7450,9 @@ impl ExecNtHandler {
                             && csrss_frame_get_exact(target_pi as u64, page).0 != 0
                         {
                             let old_page_protection =
-                                nt_address_space::mapped_view_fault_plan(old.protect, false)
-                                    .map_protection;
+                                committed_mapping_effective_page_protection(old);
                             let new_page_protection =
-                                nt_address_space::mapped_view_fault_plan(new.protect, false)
-                                    .map_protection;
+                                committed_mapping_effective_page_protection(new);
                             let _ = vm_reprotect_private_page(
                                 target_pi,
                                 page,

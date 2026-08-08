@@ -232,10 +232,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    Boot proof `.tmp/boot-mapped-section-writeback-gate-20260809.log` is fully green at `292/292`:
    `exec_mapped_section_writeback` passes with proof `0x7f/0x7f`, `22` bytes written and read back,
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. The current MEM_IMAGE protect slice
+   routes `NtProtectVirtualMemory` for committed fixed mappings through the committed-view table
+   instead of falling through to private VADs, uses the data-section read-only dirty probe only for
+   `MEM_MAPPED`, keeps `MEM_IMAGE` resident page rights literal, and preserves execute rights for
+   `PAGE_EXECUTE_WRITECOPY`. Host tests cover image committed-view writecopy protection, and boot
+   proof `.tmp/boot-committed-image-protect-20260809.log` is fully green at `292/292` with
+   `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
    shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
    structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, MEM_IMAGE protect/COW semantics, broader C4 regressions, and
-   D1/D2 mutable registry/filesystem authority.
+   B3's real video/driver binding, true MEM_IMAGE write-fault COW shadows, broader C4 regressions,
+   and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns

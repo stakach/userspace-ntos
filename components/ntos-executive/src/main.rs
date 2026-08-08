@@ -8732,6 +8732,7 @@ fn vm_page_rights(protection: u32) -> u64 {
         nt_address_space::PAGE_EXECUTE
             | nt_address_space::PAGE_EXECUTE_READ
             | nt_address_space::PAGE_EXECUTE_READWRITE
+            | nt_address_space::PAGE_EXECUTE_WRITECOPY
     );
     (if base == nt_address_space::PAGE_NOACCESS || protection & nt_address_space::PAGE_GUARD != 0 {
         0

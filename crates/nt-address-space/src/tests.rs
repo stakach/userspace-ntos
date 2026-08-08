@@ -1058,6 +1058,19 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
         PAGE_EXECUTE_READ
     );
     assert_eq!(
+        table.protect(0x8000_2000, 0x1000, PAGE_EXECUTE_WRITECOPY),
+        Ok(VmCommittedProtectPlan {
+            base: 0x8000_2000,
+            size: 0x1000,
+            old_protection: PAGE_EXECUTE_READ,
+            new_protection: PAGE_EXECUTE_WRITECOPY,
+        })
+    );
+    assert_eq!(
+        table.query_basic(0x8000_2000).unwrap().protect,
+        PAGE_EXECUTE_WRITECOPY
+    );
+    assert_eq!(
         table.image_allocation_for_page(0x8000_2123),
         Some(VmImageAllocation {
             allocation_base: 0x8000_0000,
