@@ -41,6 +41,164 @@ struct RegistryKeyStats {
     max_value_data_bytes: u32,
 }
 
+#[derive(Clone, Copy)]
+struct MemoryBasicRange {
+    base: u64,
+    size: u64,
+    allocation_base: u64,
+    allocation_protect: u32,
+    protect: u32,
+    state: u32,
+    type_: u32,
+}
+
+impl MemoryBasicRange {
+    const fn private(base: u64, size: u64, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            allocation_base: base,
+            allocation_protect: protect,
+            protect,
+            state: nt_address_space::MEM_COMMIT,
+            type_: nt_address_space::MEM_PRIVATE,
+        }
+    }
+
+    const fn mapped(base: u64, size: u64, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            allocation_base: base,
+            allocation_protect: protect,
+            protect,
+            state: nt_address_space::MEM_COMMIT,
+            type_: nt_address_space::MEM_MAPPED,
+        }
+    }
+
+    fn contains(self, page: u64) -> bool {
+        page >= self.base && page < self.base + self.size
+    }
+
+    fn info_at(self, page: u64) -> nt_address_space::VmBasicInformation {
+        nt_address_space::VmBasicInformation {
+            base_address: page,
+            allocation_base: self.allocation_base,
+            allocation_protect: self.allocation_protect,
+            region_size: self.base + self.size - page,
+            state: self.state,
+            protect: self.protect,
+            type_: self.type_,
+        }
+    }
+}
+
+const SPAWN_STATIC_MEMORY_RANGES: [MemoryBasicRange; 8] = [
+    MemoryBasicRange::private(ACS_PAGE_VA, 0x1000, nt_address_space::PAGE_READWRITE),
+    MemoryBasicRange::private(SMSS_PARAMS_VA, 0x2000, nt_address_space::PAGE_READWRITE),
+    MemoryBasicRange::private(SMSS_DESKINFO_VA, 0x1000, nt_address_space::PAGE_READWRITE),
+    MemoryBasicRange::private(SMSS_TRAMP_VA, 0x1000, nt_address_space::PAGE_EXECUTE_READ),
+    MemoryBasicRange::private(IPCBUF_VADDR, 0x1000, nt_address_space::PAGE_READWRITE),
+    MemoryBasicRange::mapped(
+        NLS_SMSS_ANSI_VA,
+        NLS_ANSI_FRAMES * 0x1000,
+        nt_address_space::PAGE_READWRITE,
+    ),
+    MemoryBasicRange::mapped(
+        NLS_SMSS_OEM_VA,
+        NLS_OEM_FRAMES * 0x1000,
+        nt_address_space::PAGE_READWRITE,
+    ),
+    MemoryBasicRange::mapped(
+        NLS_SMSS_CASE_VA,
+        NLS_CASE_FRAMES * 0x1000,
+        nt_address_space::PAGE_READWRITE,
+    ),
+];
+
+fn static_spawn_mapping_at(page: u64) -> Option<nt_address_space::VmBasicInformation> {
+    SPAWN_STATIC_MEMORY_RANGES
+        .iter()
+        .copied()
+        .find(|range| range.contains(page))
+        .map(|range| range.info_at(page))
+}
+
+fn static_spawn_mapping_next_base_after(page: u64) -> Option<u64> {
+    SPAWN_STATIC_MEMORY_RANGES
+        .iter()
+        .filter(|range| range.base > page)
+        .map(|range| range.base)
+        .min()
+}
+
+unsafe fn registered_frame_basic_information(
+    pi: usize,
+    page: u64,
+) -> Option<nt_address_space::VmBasicInformation> {
+    if csrss_frame_get_exact(pi as u64, page).0 == 0 {
+        return None;
+    }
+    let mut allocation_base = page;
+    while allocation_base >= 0x1000 {
+        let previous = allocation_base - 0x1000;
+        if csrss_frame_get_exact(pi as u64, previous).0 == 0 {
+            break;
+        }
+        allocation_base = previous;
+    }
+    let mut end = page + 0x1000;
+    while end < USER_ADDRESS_LIMIT && csrss_frame_get_exact(pi as u64, end).0 != 0 {
+        end += 0x1000;
+    }
+    Some(nt_address_space::VmBasicInformation {
+        base_address: page,
+        allocation_base,
+        allocation_protect: nt_address_space::PAGE_READWRITE,
+        region_size: end - page,
+        state: nt_address_space::MEM_COMMIT,
+        protect: nt_address_space::PAGE_READWRITE,
+        type_: nt_address_space::MEM_PRIVATE,
+    })
+}
+
+unsafe fn image_page_protection(pe: &nt_pe_loader::PeFile, image_base: u64, page: u64) -> u32 {
+    let rights = img_spawn::page_rights(pe, (page - image_base) as u32);
+    if rights & PAGE_EXECUTE_NEVER == 0 {
+        nt_address_space::PAGE_EXECUTE_READ
+    } else if rights & 1 != 0 {
+        nt_address_space::PAGE_READWRITE
+    } else {
+        nt_address_space::PAGE_READONLY
+    }
+}
+
+unsafe fn image_basic_information(
+    pe: &nt_pe_loader::PeFile,
+    image_base: u64,
+    image_end: u64,
+    page: u64,
+) -> Option<nt_address_space::VmBasicInformation> {
+    if page < image_base || page >= image_end {
+        return None;
+    }
+    let protect = image_page_protection(pe, image_base, page);
+    let mut end = (page + 0x1000).min(image_end);
+    while end < image_end && image_page_protection(pe, image_base, end) == protect {
+        end += 0x1000;
+    }
+    Some(nt_address_space::VmBasicInformation {
+        base_address: page,
+        allocation_base: image_base,
+        allocation_protect: nt_address_space::PAGE_EXECUTE_WRITECOPY,
+        region_size: end - page,
+        state: nt_address_space::MEM_COMMIT,
+        protect,
+        type_: nt_address_space::MEM_IMAGE,
+    })
+}
+
 impl RegistryKeyStats {
     fn add_subkey(&mut self, name_bytes: usize) {
         self.subkeys = self.subkeys.saturating_add(1);
@@ -7405,6 +7563,206 @@ impl ExecNtHandler {
         let _ = self.user_memory_write(memory, oldprot_ptr, &plan.old_protection.to_le_bytes());
         let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
         let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
+        0
+    }
+
+    unsafe fn query_memory_basic_information(
+        &self,
+        target_pi: usize,
+        address: u64,
+    ) -> Result<nt_address_space::VmBasicInformation, u32> {
+        let page = address & !0xfffu64;
+        let Some(ctx) = self.loop_ctx else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        let procs = &*ctx.procs;
+        if target_pi >= MAX_PI || procs[target_pi].pml4 == 0 {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+
+        if page == KUSER_VA && kuser_page_alias_get(target_pi) != 0 {
+            return Ok(nt_address_space::VmBasicInformation {
+                base_address: page,
+                allocation_base: KUSER_VA,
+                allocation_protect: nt_address_space::PAGE_READONLY,
+                region_size: 0x1000,
+                state: nt_address_space::MEM_COMMIT,
+                protect: nt_address_space::PAGE_READONLY,
+                type_: nt_address_space::MEM_PRIVATE,
+            });
+        }
+
+        let loaded_images = &*ctx.hosted_loaded_images;
+        let main_pe = if target_pi == 0 {
+            (!ctx.pe.is_null()).then_some(&*ctx.pe)
+        } else {
+            loaded_images.pe_by_pi(target_pi)
+        };
+        if let Some(pe) = main_pe {
+            if let Some(info) = image_basic_information(pe, PE_LOAD_BASE, procs[target_pi].img_end, page) {
+                return Ok(info);
+            }
+        }
+        if !ctx.ntdll_pe.is_null() {
+            if let Some(info) = image_basic_information(&*ctx.ntdll_pe, ctx.nt_base, ctx.nt_end, page)
+            {
+                return Ok(info);
+            }
+        }
+
+        let reg = &*ctx.reg;
+        if let Some((index, _)) = reg.dll_for_page(page) {
+            let pe = ctx.dll_pes().get(index).and_then(|entry| entry.as_ref());
+            if let (Some(dll), Some(pe)) = (reg.get(index), pe) {
+                if let Some(info) =
+                    image_basic_information(pe, dll.base, dll.base + dll.image_size, page)
+                {
+                    return Ok(info);
+                }
+            }
+        }
+
+        let generic_sections = &*ctx.generic_sections;
+        if let Some((section_index, view)) = generic_sections.view_for_page(target_pi, page) {
+            if generic_sections.section(section_index).is_some() {
+                return Ok(nt_address_space::VmBasicInformation {
+                    base_address: page,
+                    allocation_base: view.base,
+                    allocation_protect: view.protection,
+                    region_size: view.base + view.size - page,
+                    state: nt_address_space::MEM_COMMIT,
+                    protect: view.protection,
+                    type_: nt_address_space::MEM_MAPPED,
+                });
+            }
+        }
+
+        let vm_map = &*((core::ptr::addr_of!(PROCESS_VM_REGIONS)
+            as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+            .add(target_pi));
+        if vm_map.extent_at(page).is_some() {
+            return vm_map.query_basic(page, USER_ADDRESS_LIMIT);
+        }
+
+        if let Some(info) = registered_frame_basic_information(target_pi, page) {
+            return Ok(info);
+        }
+
+        if let Some(info) = static_spawn_mapping_at(page) {
+            return Ok(info);
+        }
+
+        let mut next = USER_ADDRESS_LIMIT;
+        if let Some(candidate) = vm_map.next_extent_base_after(page) {
+            next = next.min(candidate);
+        }
+        if let Some(candidate) = generic_sections.next_view_base_after(target_pi, page) {
+            next = next.min(candidate);
+        }
+        if procs[target_pi].img_end > PE_LOAD_BASE && PE_LOAD_BASE > page {
+            next = next.min(PE_LOAD_BASE);
+        }
+        if !ctx.ntdll_pe.is_null() && ctx.nt_end > ctx.nt_base && ctx.nt_base > page {
+            next = next.min(ctx.nt_base);
+        }
+        for index in 0..reg.len() {
+            if let Some(dll) = reg.get(index) {
+                if dll.mapped && dll.base > page {
+                    next = next.min(dll.base);
+                }
+            }
+        }
+        if let Some(candidate) = csrss_frame_next_page_after(target_pi as u64, page) {
+            next = next.min(candidate);
+        }
+        if let Some(candidate) = static_spawn_mapping_next_base_after(page) {
+            next = next.min(candidate);
+        }
+        if KUSER_VA > page && kuser_page_alias_get(target_pi) != 0 {
+            next = next.min(KUSER_VA);
+        }
+
+        Ok(nt_address_space::VmBasicInformation {
+            base_address: page,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: next.saturating_sub(page),
+            state: nt_address_space::MEM_FREE,
+            protect: nt_address_space::PAGE_NOACCESS,
+            type_: 0,
+        })
+    }
+
+    pub(crate) unsafe fn nt_query_virtual_memory_with_user_memory(
+        &mut self,
+        args: &[u64],
+        memory: SyscallUserMemory,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+        let process_handle = args.first().copied().unwrap_or(0);
+        let base = args.get(1).copied().unwrap_or(0);
+        let info_class = args.get(2).copied().unwrap_or(u64::MAX);
+        let buffer = args.get(3).copied().unwrap_or(0);
+        let length = args.get(4).copied().unwrap_or(0);
+        let return_length = args.get(5).copied().unwrap_or(0);
+
+        if base > HIGHEST_USER_ADDRESS {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if info_class != 0 {
+            return STATUS_INVALID_INFO_CLASS;
+        }
+        if length < nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64 {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if buffer == 0
+            || !self.user_memory_probe_output(
+                memory,
+                buffer,
+                nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE,
+            )
+            || return_length != 0
+                && !self.user_memory_probe_output(
+                    memory,
+                    return_length,
+                    core::mem::size_of::<u64>(),
+                )
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(process_handle, nt_process::PROCESS_QUERY_INFORMATION)
+            {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+
+        let info = match self.query_memory_basic_information(target_pi, base) {
+            Ok(info) => info,
+            Err(status) => return status,
+        };
+        if !self.user_memory_write(memory, buffer, &info.encode_x64()) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if return_length != 0 {
+            let returned = nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64;
+            if !self.user_memory_write(memory, return_length, &returned.to_le_bytes()) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
         0
     }
 
@@ -15444,28 +15802,9 @@ impl ExecNtHandler {
                 0
             },
             // NtQueryVirtualMemory(Process, Base[RDX]=args[1], Class, Buffer[R9]=args[3], Len,
-            // *RetLen[arg6]=args[5]). LdrpInitialize queries MemoryBasicInformation (class 0) for
-            // [TEB+0x10]. Report a plausible committed private region; the env page is 1-page.
+            // *RetLen[arg6]=args[5]).
             NativeService::NtQueryVirtualMemory => unsafe {
-                let base = args[1];
-                let buf = args[3];
-                let retlen_ptr = args[5];
-                let page = base & !0xFFFu64;
-                // The env block is a SINGLE mapped page at SMSS_PARAMS_VA+0x1000; report the true
-                // 1-page region so ntdll's env-duplication memmove stays in bounds.
-                let is_env = page == SMSS_PARAMS_VA + 0x1000;
-                let region = if is_env { 0x1000u64 } else { 0x10000u64 };
-                let alloc_base = if is_env { page } else { base & !0xFFFFu64 };
-                smss_stack_write(buf + 0x00, page); // BaseAddress
-                smss_stack_write(buf + 0x08, alloc_base); // AllocationBase
-                smss_stack_write(buf + 0x10, 0x04); // AllocationProtect = PAGE_READWRITE
-                smss_stack_write(buf + 0x18, region); // RegionSize
-                smss_stack_write(buf + 0x20, 0x1000 | (0x04u64 << 32)); // State=MEM_COMMIT, Protect=RW
-                smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
-                if retlen_ptr != 0 {
-                    smss_stack_write(retlen_ptr, 0x30);
-                }
-                0
+                self.nt_query_virtual_memory_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
             // NtQueryInformationToken(TokenHandle, Class[RDX]=args[1], buf[R8]=args[2],
             // len[R9]=args[3], *RetLen[arg5]=args[4]). csrss runs as Local System (S-1-5-18).

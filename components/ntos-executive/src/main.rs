@@ -1666,6 +1666,14 @@ impl GenericSectionTable {
         None
     }
 
+    pub(crate) fn next_view_base_after(&self, pi: usize, page: u64) -> Option<u64> {
+        self.views
+            .iter()
+            .filter(|view| view.live && view.pi == pi && view.base > page)
+            .map(|view| view.base)
+            .min()
+    }
+
     pub(crate) fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
         self.pages
             .iter()
@@ -6765,6 +6773,21 @@ unsafe fn csrss_frame_get_exact(pi: u64, page: u64) -> (u64, usize) {
         }
     }
     (0, usize::MAX)
+}
+unsafe fn csrss_frame_next_page_after(pi: u64, page: u64) -> Option<u64> {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
+    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
+    let mut next = None;
+    for i in 0..n {
+        if core::ptr::read(pis.add(i)) as u64 == pi {
+            let candidate = core::ptr::read(vas.add(i));
+            if candidate > page && next.is_none_or(|current| candidate < current) {
+                next = Some(candidate);
+            }
+        }
+    }
+    next
 }
 unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
     let (_, index) = csrss_frame_get_exact(pi, page);

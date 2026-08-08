@@ -95,10 +95,14 @@ pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_DECOMMIT: u32 = 0x4000;
 pub const MEM_RELEASE: u32 = 0x8000;
+pub const MEM_FREE: u32 = 0x0001_0000;
+pub const MEM_PRIVATE: u32 = 0x0002_0000;
+pub const MEM_MAPPED: u32 = 0x0004_0000;
 pub const MEM_RESET: u32 = 0x0008_0000;
 pub const MEM_TOP_DOWN: u32 = 0x0010_0000;
 pub const MEM_WRITE_WATCH: u32 = 0x0020_0000;
 pub const MEM_PHYSICAL: u32 = 0x0040_0000;
+pub const MEM_IMAGE: u32 = 0x0100_0000;
 pub const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 
 // Page protection
@@ -114,6 +118,7 @@ pub const PAGE_GUARD: u32 = 0x100;
 pub const PAGE_NOCACHE: u32 = 0x200;
 pub const PAGE_WRITECOMBINE: u32 = 0x400;
 pub const VM_PROTECTION_OVERRIDE_CAPACITY: usize = 128;
+pub const MEMORY_BASIC_INFORMATION_X64_SIZE: usize = 0x30;
 
 fn writable(p: u32) -> bool {
     p == PAGE_READWRITE
@@ -265,6 +270,32 @@ pub struct VmProtectPlan {
     pub new_protection: u32,
 }
 
+/// The x64 `MEMORY_BASIC_INFORMATION` payload returned by `NtQueryVirtualMemory`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmBasicInformation {
+    pub base_address: u64,
+    pub allocation_base: u64,
+    pub allocation_protect: u32,
+    pub region_size: u64,
+    pub state: u32,
+    pub protect: u32,
+    pub type_: u32,
+}
+
+impl VmBasicInformation {
+    pub fn encode_x64(self) -> [u8; MEMORY_BASIC_INFORMATION_X64_SIZE] {
+        let mut out = [0u8; MEMORY_BASIC_INFORMATION_X64_SIZE];
+        out[0x00..0x08].copy_from_slice(&self.base_address.to_le_bytes());
+        out[0x08..0x10].copy_from_slice(&self.allocation_base.to_le_bytes());
+        out[0x10..0x14].copy_from_slice(&self.allocation_protect.to_le_bytes());
+        out[0x18..0x20].copy_from_slice(&self.region_size.to_le_bytes());
+        out[0x20..0x24].copy_from_slice(&self.state.to_le_bytes());
+        out[0x24..0x28].copy_from_slice(&self.protect.to_le_bytes());
+        out[0x28..0x2c].copy_from_slice(&self.type_.to_le_bytes());
+        out
+    }
+}
+
 /// A per-private-page protection override. ReactOS `MiProtectVirtualMemory` changes PTE
 /// protections for private pages; it does not split the VAD node for every protected subrange.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -306,6 +337,15 @@ impl<const N: usize> VmRegionMap<N> {
             .flatten()
             .copied()
             .find(|extent| address >= extent.base && address < extent.end())
+    }
+
+    pub fn next_extent_base_after(&self, address: u64) -> Option<u64> {
+        self.extents
+            .iter()
+            .flatten()
+            .filter(|extent| extent.base > address)
+            .map(|extent| extent.base)
+            .min()
     }
 
     pub fn protection_override_count(&self) -> usize {
@@ -357,6 +397,69 @@ impl<const N: usize> VmRegionMap<N> {
         value
             .checked_add(alignment - 1)
             .map(|value| value & !(alignment - 1))
+    }
+
+    fn basic_state_and_protection(&self, address: u64) -> Option<(u32, u32)> {
+        let extent = self.extent_at(address)?;
+        Some(match extent.state {
+            VmExtentState::Reserved => (MEM_RESERVE, 0),
+            VmExtentState::Committed => (
+                MEM_COMMIT,
+                self.override_protection_at(address)
+                    .unwrap_or(extent.protection),
+            ),
+        })
+    }
+
+    /// Query private VAD state for `address`, returning a ReactOS-compatible
+    /// `MEMORY_BASIC_INFORMATION` view. `address_space_end` is the exclusive user VA ceiling used
+    /// to size free gaps after the final VAD.
+    pub fn query_basic(
+        &self,
+        address: u64,
+        address_space_end: u64,
+    ) -> Result<VmBasicInformation, u32> {
+        let base = address & !(PAGE_SIZE - 1);
+        if base >= address_space_end {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if let Some(extent) = self.extent_at(base) {
+            let (state, protect) = self.basic_state_and_protection(base).unwrap();
+            let mut end = (base + PAGE_SIZE).min(extent.end()).min(address_space_end);
+            while end < extent.end() && end < address_space_end {
+                match self.basic_state_and_protection(end) {
+                    Some((next_state, next_protect))
+                        if next_state == state && next_protect == protect =>
+                    {
+                        end = (end + PAGE_SIZE).min(extent.end()).min(address_space_end);
+                    }
+                    _ => break,
+                }
+            }
+            Ok(VmBasicInformation {
+                base_address: base,
+                allocation_base: extent.allocation_base,
+                allocation_protect: extent.protection,
+                region_size: end - base,
+                state,
+                protect,
+                type_: MEM_PRIVATE,
+            })
+        } else {
+            let next = self
+                .next_extent_base_after(base)
+                .unwrap_or(address_space_end)
+                .min(address_space_end);
+            Ok(VmBasicInformation {
+                base_address: base,
+                allocation_base: 0,
+                allocation_protect: 0,
+                region_size: next.saturating_sub(base),
+                state: MEM_FREE,
+                protect: PAGE_NOACCESS,
+                type_: 0,
+            })
+        }
     }
 
     fn overlaps(&self, base: u64, end: u64) -> bool {

@@ -168,19 +168,28 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `win32k_dispatch_loop_roundtrip`, `win32k_dispatch_fault_via_reply_cap`,
    `exec_vm_pool_headroom`, `exec_desktop_shell_frontier`, and
    `exec_explorer_shell_chrome_painted` all pass, with no stale or unregistered user-callback
-  requests. The next C1/C2 slice replaces the old `NtProtectVirtualMemory` success shim with a real
-  private-memory path: ReactOS-compatible argument validation, process-handle access checks,
-  committed-range validation, old-protect/base/size writeback, and seL4 page-right reprotection.
-  The first real implementation exposed that protection changes must be modeled as PTE-level state,
-  not VAD extent splits. `nt-address-space` now keeps private allocation/commit extents separate
-  from per-page protection overrides, clears overrides on release/decommit/recommit, and the
-  executive pool census tracks those overrides as `prot-ovr`. Boot proof
-  `.tmp/boot-pte-protect-overrides-20260808.log` is fully green at `291/291`: `exec_vm_pool_headroom`
-  passes with `vad=40/64`, `prot-ovr=9/128`, and `51631 KiB` root-Untyped free, while genuine
-  explorer shell chrome still paints `34873` non-background pixels. Continue the plan from the
-  remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
-  coordination, B3's real video/driver binding, the rest of C1/C2/C3 VAD and section-view
-  correctness, and D1/D2 mutable registry/filesystem authority.
+   requests. The next C1/C2 slice replaces the old `NtProtectVirtualMemory` success shim with a real
+   private-memory path: ReactOS-compatible argument validation, process-handle access checks,
+   committed-range validation, old-protect/base/size writeback, and seL4 page-right reprotection.
+   The first real implementation exposed that protection changes must be modeled as PTE-level state,
+   not VAD extent splits. `nt-address-space` now keeps private allocation/commit extents separate from
+   per-page protection overrides, clears overrides on release/decommit/recommit, and the executive
+   pool census tracks those overrides as `prot-ovr`. Boot proof
+   `.tmp/boot-pte-protect-overrides-20260808.log` is fully green at `291/291`: `exec_vm_pool_headroom`
+   passes with `vad=40/64`, `prot-ovr=9/128`, and `51631 KiB` root-Untyped free, while genuine
+   explorer shell chrome still paints `34873` non-background pixels. `NtQueryVirtualMemory`
+   `MemoryBasicInformation` now uses the live VM authorities instead of the old committed-private
+   shim: private VADs report reserve/commit/protection overrides, generic section views report
+   `MEM_MAPPED`, loaded images/DLLs report `MEM_IMAGE` by PE section rights, registered client-frame
+   mappings and spawn-created bootstrap pages report their real ranges, and `MEM_FREE` spans are
+   bounded by the next known mapping. Boot proof
+   `.tmp/boot-query-virtual-memory-rerun-20260808.log` is fully green at `291/291` with `vad=40/64`,
+   `prot-ovr=9/128`, `51457 KiB` root-Untyped free, and
+   explorer shell chrome still paints `34873` non-background pixels. Continue the plan from the
+   remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
+   coordination, B3's real video/driver binding, the C1/C2/C3 move of image/data section views and
+   spawn bootstrap mappings into first-class per-process VAD/view ownership, and D1/D2 mutable
+   registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1505,3 +1514,20 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `exec_vm_pool_headroom` green, and explorer shell chrome still paints `34873` non-background
   pixels. Review adjustment: continue C1/C2 with query/protect coverage for mapped section views and
   the larger C3 move of image/data section views into the VAD/fault model.
+- Real `NtQueryVirtualMemory(MemoryBasicInformation)` over live mappings. `nt-address-space` now
+  encodes x64 `MEMORY_BASIC_INFORMATION` and host-tests private VAD queries for free gaps,
+  reserved/committed extents, and PTE-style protection override splits. The executive removed the old
+  synthetic committed-private writer and now resolves the queried process handle, probes user output,
+  and composes the result from private VADs, generic section views, loaded images, mapped DLLs,
+  registered client-frame mappings, KUSER, and existing spawn-created bootstrap mappings, with free
+  regions bounded by the next known mapping. Validation: `cargo fmt --all`,
+  `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-query-virtual-memory-rerun-20260808.log`. Result: the full executive
+  gate is `291/291`; `exec_vm_pool_headroom` remains green with `51457 KiB` root-Untyped free,
+  `vad=40/64`, `prot-ovr=9/128`, and explorer shell chrome still paints `34873` non-background
+  pixels. Review adjustment: C2/C3 should remove the query-only bootstrap mapping catalog by registering those
+  spawn-created pages in first-class per-process VAD/view state; mapped DLL ownership is still
+  process-global in the image registry and should become per-process mapped-view state before
+  cross-process virtual-memory queries are considered complete.

@@ -825,3 +825,116 @@ fn fixed_vm_map_protect_clears_overrides_on_default_recommit_and_free() {
     assert_eq!(map.extent_count(), 0);
     assert_eq!(map.protection_override_count(), 0);
 }
+
+#[test]
+fn fixed_vm_map_query_basic_reports_free_gap_to_next_vad() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    map.allocate(
+        Some(0x30000),
+        0x2000,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+
+    let free = map.query_basic(0x12345, 0x20_0000).unwrap();
+    assert_eq!(
+        free,
+        VmBasicInformation {
+            base_address: 0x12000,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: 0x1e000,
+            state: MEM_FREE,
+            protect: PAGE_NOACCESS,
+            type_: 0,
+        }
+    );
+}
+
+#[test]
+fn fixed_vm_map_query_basic_reports_reserved_and_committed_private_regions() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(None, 0x4000, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    map.allocate(
+        Some(allocation.base + 0x2000),
+        0x2000,
+        MEM_COMMIT,
+        PAGE_READONLY,
+    )
+    .unwrap();
+
+    let reserved = map.query_basic(allocation.base, 0x20_0000).unwrap();
+    assert_eq!(
+        reserved,
+        VmBasicInformation {
+            base_address: allocation.base,
+            allocation_base: allocation.base,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x2000,
+            state: MEM_RESERVE,
+            protect: 0,
+            type_: MEM_PRIVATE,
+        }
+    );
+
+    let committed = map
+        .query_basic(allocation.base + 0x2345, 0x20_0000)
+        .unwrap();
+    assert_eq!(
+        committed,
+        VmBasicInformation {
+            base_address: allocation.base + 0x2000,
+            allocation_base: allocation.base,
+            allocation_protect: PAGE_READONLY,
+            region_size: 0x2000,
+            state: MEM_COMMIT,
+            protect: PAGE_READONLY,
+            type_: MEM_PRIVATE,
+        }
+    );
+}
+
+#[test]
+fn fixed_vm_map_query_basic_splits_on_page_protection_override() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    map.protect(allocation.base + 0x1000, 0x1000, PAGE_READONLY)
+        .unwrap();
+
+    assert_eq!(
+        map.query_basic(allocation.base, 0x20_0000).unwrap(),
+        VmBasicInformation {
+            base_address: allocation.base,
+            allocation_base: allocation.base,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x1000,
+            state: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        }
+    );
+    assert_eq!(
+        map.query_basic(allocation.base + 0x1000, 0x20_0000)
+            .unwrap(),
+        VmBasicInformation {
+            base_address: allocation.base + 0x1000,
+            allocation_base: allocation.base,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x1000,
+            state: MEM_COMMIT,
+            protect: PAGE_READONLY,
+            type_: MEM_PRIVATE,
+        }
+    );
+    assert_eq!(
+        map.query_basic(allocation.base + 0x2000, 0x20_0000)
+            .unwrap()
+            .region_size,
+        0x1000
+    );
+}
